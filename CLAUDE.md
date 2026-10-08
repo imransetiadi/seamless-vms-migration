@@ -102,7 +102,7 @@ python3 -m pytest tests/unit/test_blocksync.py -v   # stdlib-only blocksync engi
 python3 tests/perf/bench_blocksync.py --size-gib 1  # throughput benchmark
 
 # Control plane (Track B)
-cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'
+cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 make seamless-test                           # = cd seamless && .venv/bin/pytest -q
 SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db>' make seamless-test   # + PostgreSQL store tests
 cd seamless && .venv/bin/ruff check .

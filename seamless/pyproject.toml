@@ -36,6 +36,14 @@ dev = [
   "pytest-asyncio>=0.24",
   "ruff>=0.6",
 ]
+# what `make seamless-check` needs to run the collection's unit and playbook tests from this venv
+collection = [
+  "ansible-core>=2.16",
+  "ansible-lint>=24",
+  "pytest-mock>=3.12",
+  "pyyaml>=6",
+  "openstacksdk>=4.5",
+]
 
 [project.scripts]
 seamless = "seamless_migrate.cli:main"

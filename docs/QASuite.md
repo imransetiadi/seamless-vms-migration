@@ -833,7 +833,7 @@ make test-ansible-lint test-ansible-sanity test-ansible-units
 
 ```bash
 cd seamless
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                                   # unit suites; SQLite store tests; live tests skip
 .venv/bin/ruff check .
 

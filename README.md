@@ -82,7 +82,7 @@ is reachable only from the control plane. The stack reaches your host's agentmem
 ### Without containers (control plane development)
 
 ```bash
-cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'
+cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                        # SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is set
 .venv/bin/seamless serve --demo            # http://127.0.0.1:8080 (demo mode on loopback needs no token)
 ```

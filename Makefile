@@ -498,6 +498,8 @@ seamless-test:
 # Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go.
 seamless-check: seamless-test
 	cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
+	@seamless/.venv/bin/python -c "import ansible, yaml, openstack" 2>/dev/null \
+	 || { echo "The collection tests need the 'collection' extra: cd seamless && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
 	@mkdir -p .cache/colltree/ansible_collections/os_migrate \
 	 && ln -sfn "$(CURDIR)" .cache/colltree/ansible_collections/os_migrate/os_migrate
 	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
