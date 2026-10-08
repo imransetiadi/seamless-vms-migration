@@ -1,0 +1,189 @@
+# Seamless Migrate CI (QASuite §13: unit suites on every push, scans S-17…S-20 nightly and on
+# release candidates). Lab (E3) cases are not run here: they need the reference lab (QASuite §7).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *" # nightly scans (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  control-plane:
+    name: control plane (py${{ matrix.python }}, SQLite + PostgreSQL)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: seamless
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: seamless_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U seamless -d seamless_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: seamless
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: seamless/pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,jev,openstack,vmware]" pytest-cov pip-audit
+      - name: Lint (ruff)
+        run: ruff check src tests && ruff format --check src tests
+      - name: Unit and integration tests with the coverage gate (NFR-11)
+        env:
+          SEAMLESS_TEST_PG_URL: postgresql+psycopg://seamless:ci-only@127.0.0.1:5432/seamless_test
+        run: pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
+      - name: Dependency audit (S-18)
+        run: pip-audit --progress-spinner off
+
+  collection:
+    name: collection (warm path, lint, syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ansible-core and the test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ansible-core>=2.16,<2.19" ansible-lint pytest pytest-mock pyyaml
+      - name: Lay the repository out as ansible_collections/os_migrate/os_migrate
+        run: |
+          mkdir -p "$RUNNER_TEMP/colltree/ansible_collections/os_migrate"
+          ln -s "$GITHUB_WORKSPACE" "$RUNNER_TEMP/colltree/ansible_collections/os_migrate/os_migrate"
+          echo "PYTHONPATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
+      - name: Warm-path unit tests (blocksync, modules, playbooks with stub modules)
+        working-directory: ${{ runner.temp }}/colltree/ansible_collections/os_migrate/os_migrate
+        run: |
+          python plugins/module_utils/blocksync.py --help > /dev/null
+          pytest -q tests/unit/test_blocksync.py tests/unit/test_warm_migration.py \
+                    tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py
+      - name: Playbook syntax checks
+        run: |
+          for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
+                    rollback_workloads.yml import_from_hypervisor.yml; do
+            ansible-playbook --syntax-check -i inventory/localhost.yml "playbooks/$pb"
+          done
+      - name: ansible-lint (production profile) on the new roles and playbooks
+        run: |
+          ansible-lint --offline roles/import_workloads_warm roles/import_from_hypervisor \
+            playbooks/import_workloads_precopy.yml playbooks/import_workloads_cutover.yml \
+            playbooks/rollback_workloads.yml
+
+  dashboard:
+    name: dashboard (typecheck, lint, tests, build, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Production dependency audit (S-18)
+        run: npm audit --omit=dev --audit-level=high
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+          retention-days: 7
+
+  security:
+    name: secrets and configuration scans (S-17, S-20)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (tree and history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_SUMMARY: "true"
+      - name: trivy config on the deployment manifests
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: deploy
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  image:
+    name: container image (build, trivy, SBOM)
+    # heavy: the UBI errata and the Galaxy downloads take minutes — main, nightly and manual runs only
+    if: github.event_name != 'pull_request'
+    needs: [control-plane, dashboard]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+      - name: Build
+        run: docker build -f seamless/Containerfile -t seamless-migrate:ci .
+      - name: Smoke the image (demo mode on SQLite; /health is public, everything else needs a token)
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:18080:8080 -e SEAMLESS_DEMO=true \
+            seamless-migrate:ci serve
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:18080/api/v1/health && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:18080/api/v1/health | grep -q '"db":"ok"'
+          docker logs smoke | tail -20
+          docker rm -f smoke
+      - name: trivy image — fixable HIGH/CRITICAL must be zero (S-19)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: seamless-migrate:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: seamless-migrate:ci
+          scan-type: image
+          format: cyclonedx
+          output: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
