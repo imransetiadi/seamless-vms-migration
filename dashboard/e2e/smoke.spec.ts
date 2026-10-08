@@ -46,10 +46,23 @@ test('the main journey renders: overview, plans, plan detail, migration detail',
   await expect(page.getByRole('heading', { name: /^estimates$/i })).toBeVisible();
 });
 
-test('a viewer cannot reach approver actions', async ({ page }) => {
+test('a viewer sees operator and approver actions soft-disabled', async ({ page }) => {
   await signIn(page, 'viewer');
   await page.goto('/plans');
-  await expect(page.getByRole('button', { name: /new plan/i })).toHaveCount(0);
+  // the control is rendered (so the viewer learns it exists) but disabled with the reason
+  const newPlan = page.getByRole('button', { name: /new plan/i }).first();
+  await expect(newPlan).toBeVisible();
+  await expect(newPlan).toHaveAttribute('aria-disabled', 'true');
+  // an approver action on a completed migration: Finalize stays disabled for a viewer
+  const planLink = page.locator('a[href^="/plans/plan-"]').first();
+  await planLink.click();
+  await page.locator('a[href^="/migrations/mig-"]').first().click();
+  await expect(page).toHaveURL(/\/migrations\/mig-/);
+  const actions = page.getByRole('group', { name: /migration actions/i });
+  await expect(actions).toBeVisible();
+  for (const button of await actions.getByRole('button').all()) {
+    await expect(button).toHaveAttribute('aria-disabled', 'true');
+  }
 });
 
 test('light theme switches the token values', async ({ page }) => {

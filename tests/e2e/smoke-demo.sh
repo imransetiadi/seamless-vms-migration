@@ -100,7 +100,7 @@ notes=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" | python
 echo "advisor notes: $notes"
 check "jev strategy note recorded"    '[[ "$notes" == *\"jev\"* ]]'
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
-check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]] || [[ "$advisor" != *candidates* ]]'
+check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]]'
 echo "advisor after: $advisor"
 
 echo "== $pass passed, $fail failed =="

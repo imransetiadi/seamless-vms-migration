@@ -543,6 +543,9 @@ async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):
     assert len(marks) == 1 and rec.downtime_marks == 1
     printed_at = float(mark_file.read_text())
     assert marks[0] >= printed_at - 0.01
+    # …and not later either: a mark taken when the playbook ended (0.3 s of fake sleep after
+    # the stop task) would under-report the downtime
+    assert marks[0] <= printed_at + 0.2
     # pre-copy prints no stop task: the only candidate was the cutover playbook
     assert [c["playbook"] for c in read_log(env.log)][-1] == "import_workloads_cutover.yml"
 
@@ -620,12 +623,23 @@ async def test_cancelled_step_kills_playbook_and_removes_secrets(env, monkeypatc
             break
     await asyncio.sleep(0.2)
     started = asyncio.get_running_loop().time()
+    pid = int(next(c["pid"] for c in read_log(env.log) if c["playbook"] == "import_workloads.yml"))
+    os.kill(pid, 0)  # alive while the step runs
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert asyncio.get_running_loop().time() - started < 15
     assert not (run_dir(env) / "secrets.yml").exists()
     assert not (run_dir(env) / "osm" / "clouds.yaml").exists()
+    # the data mover must be dead, not merely abandoned
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the playbook process survived the cancel")
 
 
 class FailingImpl:

@@ -26,7 +26,8 @@ SCRIPT = textwrap.dedent(
     import yaml
 
     argv = sys.argv[1:]
-    record = {{"argv": argv, "cwd": os.getcwd(), "env_keys": sorted(os.environ)}}
+    record = {{"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
+              "env_keys": sorted(os.environ)}}
     inventory = argv[argv.index("-i") + 1]
     playbook = argv[argv.index("-i") + 2]
     files = [a[1:] for a in argv if a.startswith("@")]

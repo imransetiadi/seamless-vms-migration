@@ -742,6 +742,16 @@ Twenty-three further iterations after the integration run, each verified with th
   (mapped to an absent project, or unmapped in a multi-project destination); an `image_root` disk counts
   towards the volume quota unless the plan is cold-only. Deferred: OpenStack `used_gb` (Cinder reports no
   usage), gate-time delta ageing in the shown estimate.
+* Test-suite review wave (independent reviewer, mutation probes): the finished-plan tick test now proves the
+  stale cutover is not counted (it hangs on a gate while plan 2 cuts over); the SDD §7.2 step-start fallback of
+  the downtime clock has a test; the auto-rollback test asserts the injected secret never reaches
+  `Migration.error` or an event; the cancel test asserts the playbook process is dead; the stop-task clock
+  test has an upper bound; CBT convergence asserts the tuple and a tight-SLO case; unbounded waits got
+  deadlines; the warm playbook story asserts the literal stop-task header the executor keys on; the demo
+  restart script fails DEMO-06 on gaps or FSM-invalid orderings; the viewer browser smoke asserts the
+  soft-disabled controls instead of their absence; every CI job has `timeout-minutes`. Deferred: argument
+  validation of the playbook-test stubs against the real modules, blocksync protocol-guard tests, mock/API
+  error-code alignment in the dashboard, behavioural tests for the migration/providers/inventory pages.
 
 ### 13.2 Exit criteria — release 0.1.0
 

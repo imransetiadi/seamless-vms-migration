@@ -285,7 +285,7 @@ async def test_cutover_window_respected_and_force_window(tmp_path, store):
     m2 = await h2.wait_phase((await h2.by_vm(plan2.id, "vm-5")).id, P.awaiting_cutover)
     out = await h2.orch.request_cutover(m2.id, "sari", force_window=True, comment="emergency")
     assert out.cutover_requested and out.force_window and out.approvals[-1].comment == "emergency"
-    # persisted: a restarted orchestrator still bypasses the window
+    # persisted on the migration document (a restarted orchestrator reads it back)
     assert (await h2.migration(m2.id)).force_window is True
     await h2.wait_phase(m2.id, P.completed)
     await h2.orch.stop()
@@ -441,8 +441,10 @@ async def test_vmware_warm_convergence_ignores_missing_byte_counts(tmp_path, sto
         }
     )
     converged, reason = h.orch._converged(cbt, plan)
-    assert not reason.startswith("converged: last pass changed"), reason
-    assert "CBT" in reason or "SLO" in reason or "max_sync_passes" in reason
+    assert (converged, reason) == (True, "estimated final downtime 365 s is within the SLO")
+    tight = plan.model_copy(update={"downtime_slo_s": 100})
+    converged, reason = h.orch._converged(cbt, tight)
+    assert converged is False and reason.startswith("another CBT pass: estimated downtime")
     warm = cbt.model_copy(update={"strategy": Strategy.warm})
     assert h.orch._converged(warm, plan) == (True, "converged: last pass changed 0 B")
 
@@ -629,6 +631,33 @@ async def test_max_concurrent_cutovers(tmp_path, store):
     await h.orch.stop()
 
 
+async def test_downtime_clock_falls_back_to_the_cutover_step_start(tmp_path, store):
+    """SDD §7.2: an executor that never reports the stop (no stop task line) still gets a
+    downtime window, bounded by the moment the cutover step began — exactly one event."""
+    settings = make_settings(tmp_path)
+
+    async def silent_cutover(ctx):
+        return StepResult(destination_server_id=f"dst-{ctx.migration.vm.source_id}")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: silent_cutover})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    from seamless_migrate.orchestrator import _phase_started
+
+    assert m.downtime_started_at == _phase_started(m, P.cutover)
+    assert m.downtime_ended_at is not None and m.actual_downtime_s is not None
+    assert h.kinds().count("migration.downtime_started") == 1
+
+
 async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     settings = make_settings(tmp_path)
 
@@ -651,6 +680,9 @@ async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     await h.orch.stop()
     assert h.history(m)[-4:] == [P.cutover, P.failed, P.rolling_back, P.rolled_back]
     assert m.error and "attach failed" in m.error
+    assert "hunter2" not in m.error, "Migration.error is redacted"
+    for e in h.store.events(since_seq=0, limit=1000):
+        assert "hunter2" not in e.message and "hunter2" not in str(e.data), e.kind
     assert m.downtime_started_at and m.downtime_ended_at and m.actual_downtime_s is not None
     assert [s for _, s in executor.calls] == [StepName.CUTOVER, StepName.ROLLBACK]
     assert "migration.error" in h.kinds()
@@ -701,7 +733,9 @@ async def test_rollback_request_during_step_is_serialized(tmp_path, store):
     )
     await run_plan(h, plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
+    deadline = asyncio.get_running_loop().time() + 5
     while not started:
+        assert asyncio.get_running_loop().time() < deadline, "cutover never started"
         await asyncio.sleep(0.01)
     out = await h.orch.rollback(mid, "bayu", "customer escalation")
     assert out.phase == P.rolling_back
@@ -855,9 +889,10 @@ async def test_resume_mid_cutover_is_idempotent(tmp_path, store):
     )
     await run_plan(h, plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
-    while cloud["stops"] == 0:
+    deadline = asyncio.get_running_loop().time() + 5
+    while cloud["stops"] == 0 or (await h.migration(mid)).downtime_started_at is None:
+        assert asyncio.get_running_loop().time() < deadline, "stop or downtime mark missing"
         await asyncio.sleep(0.01)
-    await asyncio.sleep(0.05)
     first = await h.migration(mid)
     assert first.phase == P.cutover and first.downtime_started_at is not None
     await h.orch.stop()  # crash
@@ -1156,13 +1191,26 @@ async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_
     stale.phase = P.cutover
     store.put("migration", stale)
     settings = make_settings(tmp_path, max_concurrent_cutovers=1)
-    h2 = build_harness(tmp_path, store, [vm(2)], settings=settings)
+    # the stale cutover, if the tick ever resumed it, hangs forever: a tick that counted it
+    # would hold the single cutover slot and plan 2 could never cut over
+    gates: dict[str, asyncio.Event] = {}
+    started: list[str] = []
+    gates["vm-2"] = asyncio.Event()
+    gates["vm-2"].set()
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: blocking_cutover(gates, started)}
+    )
+    h2 = build_harness(tmp_path, store, [vm(2)], settings=settings, executor=executor)
     plan2 = plan_for([vm(2)], default_strategy=Strategy.cold)
     store.put("plan", plan2)
     await run_plan(h2, plan2)
     done = await h2.wait_phase((await h2.by_vm(plan2.id, "vm-2")).id, P.completed)
     await h2.orch.stop()
     assert done.phase == P.completed
+    # start() resumes the in-flight stale cutover (SDD §8) and it hangs on its gate: plan 2
+    # still cut over, so the tick never counted it against the single cutover slot
+    assert "vm-2" in started
+    assert (await h2.migration(stale.id)).phase == P.cutover
 
 
 async def test_orchestrator_health_reports_loop_state(tmp_path, store):

@@ -362,6 +362,8 @@ def test_warm_playbooks_story(env):
     env.world["existing"] = []
     rc, out, calls = env.run("import_workloads_cutover")
     assert rc == 0, out
+    # the control plane's downtime clock keys on this task header (SDD §7.2, executors STOP_TASK)
+    assert "TASK [os_migrate.os_migrate.import_workloads_warm : Stop the source server]" in out
     assert modules_for(calls, "vm1", "srv-1") == []
     assert "server_action:stop" in modules_for(calls, "vm2", "srv-2")
     assert env.state("srv-2")["destination_server_id"] == "dst-vm2"
