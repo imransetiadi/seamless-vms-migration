@@ -217,7 +217,8 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             findings: list[Finding] = [], checkpoint: str|null,
             downtime_started_at: datetime|null, downtime_ended_at: datetime|null,
             actual_downtime_s: float|null, approvals: list[Approval] = [],
-            cutover_requested: bool = false, advisor_notes: list[AdvisorNote] = [],
+            cutover_requested: bool = false, force_window: bool = false,  # force_window: cutover window bypass granted with the request; persisted, so a restart keeps it
+            advisor_notes: list[AdvisorNote] = [],
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             created_at: datetime, updated_at: datetime }
@@ -297,7 +298,7 @@ A migration in `awaiting_cutover` (warm) or `ready` with a single-shot strategy 
 active enters `cutover` when all hold:
 
 1. `not plan.require_approval` **or** `len(approvals) >= 1`;
-2. `cutover_window is None` **or** now ∈ [start, end] — bypassed by `POST …/cutover {"force_window": true}`;
+2. `cutover_window is None` **or** now ∈ [start, end] — bypassed while `Migration.force_window` is set (`POST …/cutover {"force_window": true}`);
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
 
@@ -719,7 +720,8 @@ Finding catalog (code — severity — condition):
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
 | `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
 | `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty, and when a mapping's *target* type does not exist in the destination | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
-| `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes) |
+| `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume) |
+| `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
