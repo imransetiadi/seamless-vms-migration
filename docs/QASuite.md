@@ -851,7 +851,12 @@ Committed scripts (`export TOKEN=…` then run them): [`tests/e2e/smoke-demo.sh`
 covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
 decision on a fresh plan (exit code = failed checks); [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
 is the RBAC matrix below (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
-runs DEMO-04 and DEMO-06. The journey script below remains proposed.
+runs DEMO-04 and DEMO-06; [`tests/e2e/browser-demo.mjs`](../tests/e2e/browser-demo.mjs) (`TOKEN_FILE=…`) opens
+the dashboard in headless Chromium through the control plane — real security headers, CSP and API — signs
+in, visits every page, the first plan and its first migration, and fails on any console error, CSP
+violation, failed asset request, missing chart or theme token (it needs the dashboard's Playwright:
+`npm --prefix dashboard ci && npx --prefix dashboard playwright install chromium`). The journey script
+below remains proposed.
 
 *Proposed* files (`tests/e2e/demo-journey.sh`, `tests/e2e/rbac-live.sh`; not part of the plan). Both were verified
 against an SDD-shaped stub server and pass `shellcheck`.
