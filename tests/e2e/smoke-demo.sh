@@ -23,6 +23,7 @@ health=$(curl -fsS -m 10 "$BASE/api/v1/health" || echo '{}')
 echo "health: $health"
 check "health ok + db ok + demo"    '[[ "$health" == *\"status\":\"ok\"* && "$health" == *\"db\":\"ok\"* && "$health" == *\"demo\":true* ]]'
 check "unauthenticated /me is 401"  '[ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/v1/me")" = 401 ]'
+check "readiness is 200 with orchestrator healthy" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/v1/ready")" = 200 ] && curl -fsS -m 10 "$BASE/api/v1/ready" | grep -q "\"healthy\":true"'
 me=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/me" || echo '{}')
 check "/me is admin"                '[[ "$me" == *\"role\":\"admin\"* ]]'
 index=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$BASE/")
