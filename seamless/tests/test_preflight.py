@@ -356,3 +356,20 @@ def test_finding_handover_backend_unmapped():
     assert f.severity == Severity.info and f.strategies == [Strategy.storage_handover]
     ok = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@b#p"}))
     assert check(plan=ok) == []
+
+
+def test_catalog_matches_sdd_9_3():
+    """Every finding code of SDD §9.3 is in the catalog and vice versa, with the severity the
+    table states for its row (rows only; info variants named inside a row are checked by code)."""
+    import re
+
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 9.3") : sdd.index("### 9.4")]
+    codes = set(re.findall(r"`([A-Z][A-Z0-9_]{4,})`", section))
+    assert codes == set(CATALOG)
+    for code, severity in re.findall(
+        r"^\| `([A-Z0-9_]+)` \| (blocker|warning|info)", section, re.M
+    ):
+        assert CATALOG[code].severity == severity, code
