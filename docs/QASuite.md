@@ -703,9 +703,11 @@ Twenty-three further iterations after the integration run, each verified with th
   errors answer the JSON envelope with the security headers, `since`/`offset` above the column width are a
   422, provider error messages are redacted at the API, the lockout/audit tables are bounded, NUL is stripped
   from tenant strings and token names are length-checked (PostgreSQL column widths), an operator may re-send
-  a policy field at its current value on PATCH (as the defaults on POST). Deferred: aggregate queries for
-  `/metrics` and `/stats` (they load every migration per scrape), a `limit` on `GET /plans` (SDD amendment),
-  a PostgreSQL-backed API smoke test.
+  a policy field at its current value on PATCH (as the defaults on POST). Follow-ups done the same day:
+  `/stats` and `/metrics` reload their document lists only when the store's change stamp moved (SDD §11;
+  1,000 migrations: 19 ms load vs 0.2 ms stamp) and `test_api_journey_on_every_store_backend` runs the
+  request-path SQL (JSON-path filters, paging, replay, the stamp) on SQLite and PostgreSQL (CI's service and
+  the local `seamless-pg-test` container). Deferred: a `limit` on `GET /plans` (SDD amendment).
 
 ### 13.2 Exit criteria — release 0.1.0
 
