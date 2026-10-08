@@ -17,7 +17,10 @@ htmlcov/
 # Node / dashboard
 node_modules/
 dashboard/dist/
+dashboard/dist-mock/
 dashboard/coverage/
+dashboard/playwright-report/
+dashboard/test-results/
 
 # Seamless control plane runtime data
 seamless/*.db
