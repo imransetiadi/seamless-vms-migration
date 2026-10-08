@@ -264,7 +264,11 @@ Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second p
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
 else, appends a `PhaseChange`, and updates `updated_at`. `failed → cancelled` is only allowed when
 `downtime_started_at is None` (the source VM was never stopped). `failed → ready` (retry) increments
-`attempts`.
+`attempts`. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
+playbook) and then runs the `rollback` step once with `delete_dest_volumes` as a best-effort cleanup
+of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
+`cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
+`migration.error` naming the manual `rollback_workloads.yml` run.
 
 Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `completed`, `finalized`,
 `cancelled`, `rolled_back` (`failed` blocks a wave until an operator retries, rolls back or cancels).
