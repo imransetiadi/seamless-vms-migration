@@ -764,7 +764,9 @@ print(warm([500 * GiB], 300 * GiB, p)["down"],
 ```
 
 Cross-check the tool against the model with `seamless estimate -f vms.yaml --link-mbps 1000 --slo 600`
-(SDD §15) and the unit tests `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`,
+(SDD §15; `--link-mbps` is decimal, so 1000 Mbit/s is 119.2 MiB/s rather than the model's 125 MiB/s — the
+worked example then shows 3 passes and 1,940 s of pre-copy instead of 1,892 s, with the same 680 s downtime)
+and the unit tests `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`,
 `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`.
 The parallel-disk scan term, `Plan.estimator_overrides` and the per-pass calibration are covered by
 `test_warm_scan_uses_largest_disk_and_parallel_streams`, `test_sdd_worked_example`,
