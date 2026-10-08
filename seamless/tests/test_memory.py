@@ -35,6 +35,28 @@ def test_redact_removes_secrets():
     assert redact("Bearer abcdef0123456789") == "Bearer [REDACTED]"
 
 
+def test_redact_prefixed_credential_keys_and_cli_flags():
+    """The shapes OpenStack, Ansible and VMware errors actually use (Security.md R-08 review)."""
+    cases = {
+        "OS_PASSWORD=hunter2 export failed": "hunter2",
+        "vcenter_password=hunter2": "hunter2",
+        "ansible_become_pass=hunter2": "hunter2",
+        "ssh_password: hunter2": "hunter2",
+        "AWS_SECRET_ACCESS_KEY=AKIAxxxx": "AKIAxxxx",
+        "OS_AUTH_TOKEN=gAAAAABshorttoken": "gAAAAABshorttoken",
+        '"auth.password": "s3cr3t"': "s3cr3t",
+        "--os-password hunter2 --os-username admin": "hunter2",
+        "openstack --os-token=abc123 server list": "abc123",
+    }
+    for text, secret in cases.items():
+        out = redact(text)
+        assert secret not in out, (text, out)
+    assert "export failed" in redact("OS_PASSWORD=hunter2 export failed")
+    assert redact("--os-password hunter2 --os-username admin").endswith("--os-username admin")
+    # ordinary words that merely contain a keyword are untouched
+    assert redact("passthrough=1 tokenizer: fast") == "passthrough=1 tokenizer: fast"
+
+
 def test_redact_names_optional():
     text = "web-01 failed; web-010 is fine; db-02 too"
     assert redact(text) == text

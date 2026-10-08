@@ -52,6 +52,13 @@ def _non_default_policy_fields(body: PlanCreate) -> set[str]:
     }
 
 
+def _changed_policy_fields(body: dict[str, Any], plan: Plan) -> set[str]:
+    """PATCH counterpart of :func:`_non_default_policy_fields`: policy fields whose value
+    differs from the plan's current one (re-sending the current value changes nothing)."""
+    current = plan.model_dump(mode="json", include=POLICY_FIELDS)
+    return {name for name in set(body) & POLICY_FIELDS if body[name] != current.get(name)}
+
+
 async def _check_providers(request: Request, spec: PlanCreate) -> None:
     db = services(request).db
     for provider_id, role in (
@@ -115,8 +122,8 @@ async def update_plan(
     unknown = sorted(set(body) - PLAN_EDITABLE_FIELDS)
     if unknown:
         raise ApiError(422, "validation_error", f"fields cannot be changed: {', '.join(unknown)}")
-    await _check_policy_fields(request, set(body), principal)
     plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
+    await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
     if plan.status not in (PlanStatus.draft, PlanStatus.validated):
         raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
     try:

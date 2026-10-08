@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -45,6 +47,49 @@ def test_health_public_reports_db(api, monkeypatch):
     monkeypatch.undo()
     assert api.client.get("/api/v1/ready").status_code == 200
     assert api.client.get("/api/v1/ready").json()["status"] == "ok"
+
+
+def test_unhandled_errors_keep_the_envelope_and_headers(tmp_path):
+    settings, _ = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'err.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store), raise_server_exceptions=False) as client:
+
+        def boom() -> dict:
+            raise RuntimeError("db exploded password=hunter2")
+
+        client.app.state.services.orchestrator.health = boom
+        res = client.get("/api/v1/health")
+        assert res.status_code == 500
+        assert res.json() == {"error": {"code": "internal_error", "message": "internal error"}}
+        assert res.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
+    store.dispose()
+
+
+def test_out_of_range_query_integers_are_422(api):
+    for path in (
+        "/api/v1/events?since=99999999999999999999",
+        "/api/v1/migrations?offset=99999999999999999999",
+    ):
+        res = api.get(path)
+        assert res.status_code == 422, path
+        assert res.json()["error"]["code"] == "validation_error"
+    assert api.get("/api/v1/events?since=9223372036854775807").status_code == 200
+
+
+def test_provider_errors_are_redacted_in_the_api(api, monkeypatch):
+    from seamless_migrate.providers.base import ProviderError
+
+    class Broken:
+        async def list_vms(self):
+            raise ProviderError("src-osp: auth failed OS_PASSWORD=hunter2 at https://k:5000")
+
+    assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+    monkeypatch.setattr(api.client.app.state.services.providers, "get", lambda p: Broken())
+    res = api.get("/api/v1/providers/src-osp/inventory")
+    assert res.status_code == 502 and res.json()["error"]["code"] == "provider_error"
+    assert "hunter2" not in res.text and "auth failed" in res.text
 
 
 def test_unauthenticated_401_and_audit_event(api):
@@ -370,7 +415,18 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
             assert "fonts.gstatic.com" in res.headers["content-security-policy"]
         docs = client.get("/api/docs")
         assert docs.status_code == 200 and "swagger" in docs.text.lower()
-        assert "cdn.jsdelivr.net" in docs.headers["content-security-policy"]
+        csp = docs.headers["content-security-policy"]
+        assert "cdn.jsdelivr.net" in csp and "'unsafe-inline'" not in csp.split(";")[1]
+        # the inline bootstrap script carries the per-response nonce the CSP allows
+        [nonce] = re.findall(r"'nonce-([A-Za-z0-9_-]+)'", csp)
+        assert "<script>" not in docs.text and f'<script nonce="{nonce}">' in docs.text
+        assert (
+            nonce
+            != re.findall(
+                r"'nonce-([A-Za-z0-9_-]+)'",
+                client.get("/api/docs").headers["content-security-policy"],
+            )[0]
+        )
         spec = client.get("/api/openapi.json").json()
         assert "/api/v1/plans" in spec["paths"]
         assert "/api/openapi.json" not in spec["paths"], "docs routes stay out of the schema"

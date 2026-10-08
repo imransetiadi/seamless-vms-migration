@@ -30,7 +30,8 @@ def memory_with(results, seen, fail=False):
 async def test_knowledge_on_failure_attaches_hits(store):
     seen = []
     hits = [
-        {"title": f"incident {i}", "content": f"fix {i}", "score": 0.9 - i / 10} for i in range(5)
+        {"title": f"incident {i}", "content": f"fix {i} " + "y" * 3000, "score": 0.9 - i / 10}
+        for i in range(5)
     ]
     bus = EventBus(store)
     service = KnowledgeService(memory_with(hits, seen), store, bus)
@@ -40,6 +41,7 @@ async def test_knowledge_on_failure_attaches_hits(store):
 
     assert note.kind == "similar_incidents" and note.source == "memory"
     assert [h["title"] for h in note.data["hits"]] == ["incident 0", "incident 1", "incident 2"]
+    assert all(len(h["content"]) <= 1000 for h in note.data["hits"])
     search_path, search_body = seen[0]
     assert search_path == "/agentmemory/smart-search"
     assert search_body["query"].startswith("warm cutover PermanentStepError: dst conversion")

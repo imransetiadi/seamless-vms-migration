@@ -166,8 +166,17 @@ def test_plan_create_validate_start_flow(api):
         json={"description": "pilot", "downtime_slo_s": 600},
     )
     assert patched.status_code == 200 and patched.json()["downtime_slo_s"] == 600
+    # an operator may re-send a policy field at its current value (as the defaults on POST),
+    # but not change it
+    current = api.get(f"/api/v1/plans/{plan['id']}").json()["auto_cutover"]
     policy = api.client.patch(
-        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json={"auto_cutover": False}
+        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json={"auto_cutover": current}
+    )
+    assert policy.status_code == 200, policy.text
+    policy = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"auto_cutover": not current},
     )
     assert policy.status_code == 403
     policy = api.client.patch(

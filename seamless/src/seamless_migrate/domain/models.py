@@ -10,7 +10,7 @@ import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
 
@@ -108,6 +108,9 @@ PowerState = Literal["running", "stopped", "paused", "error", "unknown"]
 
 
 class VMRef(_Model):
+    """A source VM as inventoried (SDD §4.2). Tenant-controlled strings (name, tags, …) are
+    stored in JSON documents: PostgreSQL JSONB rejects NUL characters, so they are stripped."""
+
     source_id: str
     name: str
     project: str | None = None
@@ -124,6 +127,22 @@ class VMRef(_Model):
     cbt_enabled: bool | None = None
     snapshot_count: int = 0
     tools_ok: bool | None = None
+
+    @field_validator("name", "project", "flavor", "os_type", "host", mode="before")
+    @classmethod
+    def _strip_nul(cls, value: Any) -> Any:
+        return value.replace("\x00", "") if isinstance(value, str) else value
+
+    @field_validator("tags", "flavor_extra_specs", mode="before")
+    @classmethod
+    def _strip_nul_map(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(k).replace("\x00", ""): (v.replace("\x00", "") if isinstance(v, str) else v)
+                for k, v in value.items()
+            }
+        return value
+
     change_rate_bps: float | None = None
 
     @computed_field  # type: ignore[prop-decorator]

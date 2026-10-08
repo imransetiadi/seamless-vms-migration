@@ -291,7 +291,8 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # providers
     async def check_provider(self, provider_id: str, actor: str = "system") -> Provider:
-        provider = await self.db.get("provider", provider_id, Provider)
+        # versioned write: a provider deleted or edited while the check ran is not re-inserted
+        provider, version = await self.db.get_versioned("provider", provider_id, Provider)
         impl = self.providers.get(provider)
         try:
             caps = await impl.check()
@@ -300,7 +301,7 @@ class Orchestrator:
             update = {"status": "error", "status_message": redact(str(exc))[:500]}
         update["last_checked_at"] = self._now()
         updated = provider.model_copy(update=update)
-        await self.db.put("provider", updated)
+        await self.db.put("provider", updated, expected_version=version)
         await self._emit(
             "provider.checked",
             f"provider {provider.id}: {updated.status}",
@@ -1464,7 +1465,9 @@ class Orchestrator:
         if result is None:
             return
         note: AdvisorNote | None = None
-        if plan.verification.use_advisor and self.advisor is not None:
+        # SDD §14.2: the advisor may flag a *passed* verification; a failed one carries
+        # provider error text (endpoints) the review cannot change and must not ship
+        if plan.verification.use_advisor and self.advisor is not None and result.passed:
             try:
                 note = await self.advisor.review_verification(m.vm, result)
             except Exception:

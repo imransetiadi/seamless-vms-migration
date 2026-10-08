@@ -318,7 +318,9 @@ class Advisor:
         screen: dict[str, Any] = {}
         console = (result.evidence or {}).get("console")
         if console:
-            excerpt = str(console)[-CONSOLE_EXCERPT_CHARS:]
+            # SDD §13.4/§14.2: the excerpt is redacted before it is screened — it is the one
+            # place raw guest text leaves the control plane
+            excerpt = self._redact(str(console)[-CONSOLE_EXCERPT_CHARS:], [vm.name])
             try:
                 screened = await self.jev.screen(text=excerpt, purpose=SCREEN_PURPOSE)
                 rec = screened.get("recommendation") or {}
@@ -333,7 +335,7 @@ class Advisor:
                 review_required = True
                 review_reason = INJECTION_REASON
             elif screen.get("action") == "pass":
-                evidence.append({"id": "console", "text": self._redact(excerpt, [vm.name])})
+                evidence.append({"id": "console", "text": excerpt})
             # review / skip / unavailable: untrusted text stays out of the evidence
 
         results: list[dict[str, Any]] = []

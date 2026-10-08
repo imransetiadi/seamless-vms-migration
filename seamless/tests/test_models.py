@@ -149,3 +149,11 @@ def test_role_ordering():
     assert Role.viewer.rank < Role.operator.rank < Role.approver.rank < Role.admin.rank
     assert Role.approver.at_least(Role.operator)
     assert not Role.viewer.at_least(Role.operator)
+
+
+def test_vmref_strips_nul_from_tenant_strings():
+    """PostgreSQL JSONB rejects NUL characters; tenant-controlled strings are cleaned."""
+    vm = make_vm(name="web\x00-01", os_type="lin\x00ux", tags={"ow\x00ner": "fin\x00ance"})
+    assert vm.name == "web-01" and vm.os_type == "linux"
+    assert vm.tags == {"owner": "finance"}
+    assert "\x00" not in vm.model_dump_json()

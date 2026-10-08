@@ -16,6 +16,8 @@ from .memory import MemoryClient, redact
 log = logging.getLogger(__name__)
 GIB = 2**30
 MAX_HITS = 3
+#: Longest memory hit content copied into a note/event (hits are shown, never prompted).
+HIT_CONTENT_CHARS = 1000
 
 
 def size_bucket(disk_bytes: int) -> str:
@@ -76,7 +78,11 @@ class KnowledgeService:
                     data={
                         "query": query,
                         "hits": [
-                            {"title": h.title, "content": h.content, "score": h.score}
+                            {
+                                "title": h.title[:200],
+                                "content": h.content[:HIT_CONTENT_CHARS],
+                                "score": h.score,
+                            }
                             for h in hits[:MAX_HITS]
                         ],
                     },

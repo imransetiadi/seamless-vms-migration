@@ -198,7 +198,8 @@ def test_json_logging_covers_uvicorn_loggers(env, capsys, monkeypatch):
 
     settings = Settings(data_dir=env / "data", log_json=True, log_level="INFO")
     cli.configure_logging(settings)
-    logging.config.dictConfig(cli.uvicorn_log_config())
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # left over by a server
+    logging.config.dictConfig(cli.uvicorn_log_config(settings.log_level))
     try:
         logging.getLogger("uvicorn.access").info('127.0.0.1 - "GET /api/v1/health" 200')
         logging.getLogger("seamless_migrate.orchestrator").warning("tick slow")

@@ -19,6 +19,8 @@ import yaml
 from ..domain.enums import Role
 
 TOKEN_PREFIX = "smg_"
+#: Token names become the ``actor`` of audit events (String(128) in the events table).
+MAX_TOKEN_NAME = 128
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_NAMES = frozenset({"localhost"})
 
@@ -90,6 +92,8 @@ class TokenStore:
         for index, item in enumerate(items):
             if not isinstance(item, dict) or not item.get("name"):
                 raise AuthConfigError(f"token #{index} has no name")
+            if len(str(item["name"])) > MAX_TOKEN_NAME:
+                raise AuthConfigError(f"token #{index}: name longer than {MAX_TOKEN_NAME}")
             try:
                 role = Role(str(item.get("role")))
             except ValueError:

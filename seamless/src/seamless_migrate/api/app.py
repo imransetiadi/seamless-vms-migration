@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -20,7 +21,7 @@ from .. import __version__
 from ..ai.advisor import Advisor
 from ..ai.jev import JevClient
 from ..ai.knowledge import KnowledgeService
-from ..ai.memory import MemoryClient
+from ..ai.memory import MemoryClient, redact
 from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
@@ -101,7 +102,17 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ProviderError)
     async def provider_error(_: Request, exc: ProviderError) -> JSONResponse:
-        return _error(502, "provider_error", str(exc))
+        # SDK messages may carry endpoint URLs or credentials: same redaction as the orchestrator
+        return _error(502, "provider_error", redact(str(exc))[:500])
+
+    @app.exception_handler(Exception)
+    async def internal_error(request: Request, exc: Exception) -> JSONResponse:
+        # Starlette's ServerErrorMiddleware answers this one outside the headers middleware:
+        # keep the error envelope and the security headers universal (SDD §12, Security.md R-05)
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        response = _error(500, "internal_error", "internal error")
+        _apply_security_headers(response.headers, request.url.path)
+        return response
 
 
 #: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts) and the
@@ -111,26 +122,27 @@ _CSP_APP = (
     "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' "
     "data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 )
+#: Swagger UI boots from an inline script: it gets a per-response nonce (no 'unsafe-inline').
 _CSP_DOCS = (
-    "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' "
-    "'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; "
-    "connect-src 'self'; frame-ancestors 'none'"
+    "default-src 'self'; script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; style-src "
+    "'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: "
+    "https://fastapi.tiangolo.com; connect-src 'self'; frame-ancestors 'none'"
 )
+
+
+def _apply_security_headers(headers: Any, path: str) -> None:
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("X-Frame-Options", "DENY")
+    headers.setdefault("Referrer-Policy", "same-origin")
+    headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    headers.setdefault("Content-Security-Policy", _CSP_APP)
 
 
 def _install_security_headers(app: FastAPI) -> None:
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Any:
         response = await call_next(request)
-        headers = response.headers
-        headers.setdefault("X-Content-Type-Options", "nosniff")
-        headers.setdefault("X-Frame-Options", "DENY")
-        headers.setdefault("Referrer-Policy", "same-origin")
-        headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        headers.setdefault(
-            "Content-Security-Policy",
-            _CSP_DOCS if request.url.path == "/api/docs" else _CSP_APP,
-        )
+        _apply_security_headers(response.headers, request.url.path)
         return response
 
 
@@ -153,7 +165,12 @@ def _install_api_docs(app: FastAPI, settings: Settings) -> None:
     @app.get("/api/docs", include_in_schema=False)
     async def swagger_ui(request: Request) -> Any:
         await docs_access(request)
-        return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Seamless Migrate API")
+        page = get_swagger_ui_html(openapi_url="/api/openapi.json", title="Seamless Migrate API")
+        nonce = secrets.token_urlsafe(16)
+        html = page.body.decode("utf-8").replace("<script>", f'<script nonce="{nonce}">')
+        response = HTMLResponse(html, status_code=page.status_code)
+        response.headers["Content-Security-Policy"] = _CSP_DOCS.format(nonce=nonce)
+        return response
 
 
 def _install_spa(app: FastAPI, dist: Path) -> None:

@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,7 +11,14 @@ from seamless_migrate.ai.knowledge import KnowledgeService
 from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import Phase, PlanStatus, Strategy
-from seamless_migrate.domain.models import CutoverWindow, Nic, Plan, VerificationConfig, Wave
+from seamless_migrate.domain.models import (
+    CutoverWindow,
+    Nic,
+    Plan,
+    Provider,
+    VerificationConfig,
+    Wave,
+)
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -18,7 +26,7 @@ from seamless_migrate.executors.base import (
     TransientStepError,
 )
 from seamless_migrate.orchestrator import BadRequest, NotAllowed
-from seamless_migrate.store import NotFound
+from seamless_migrate.store import ConflictError, NotFound
 from tests.factories import make_disk, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 from tests.orch_support import (
@@ -336,6 +344,23 @@ def blocking_cutover(gates: dict[str, asyncio.Event], started: list[str]):
     return hook
 
 
+async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
+    """A provider deleted while its check ran is not re-inserted by the check's write."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    source_id = plan.source_provider_id
+
+    class Racing:
+        async def check(self):
+            await h.orch.db.delete("provider", source_id)
+            return {"admin": True}
+
+    h.orch.providers = SimpleNamespace(get=lambda p: Racing())
+    with pytest.raises((ConflictError, NotFound)):
+        await h.orch.check_provider(source_id, "alice")
+    with pytest.raises(NotFound):
+        await h.orch.db.get("provider", source_id, Provider)
+
+
 async def test_cancel_during_a_pass_rolls_the_data_path_back(tmp_path, store):
     """A cancel in precopy/syncing kills the pass and then runs the rollback step so the
     snapshots, temporary and destination volumes of the abandoned pass are removed."""
@@ -507,11 +532,21 @@ async def test_failed_verification_rolls_back(tmp_path, store):
         },
     )
     h.destination.status = "ERROR"
+    reviews: list[object] = []
+
+    async def review(vm_ref, result):
+        reviews.append(result)
+        return None
+
+    # SDD §14.2: the advisor may flag a passed verification; a failed one (provider error
+    # text, endpoints) is never sent to Jev
+    h.orch.advisor = SimpleNamespace(review_verification=review)
     await run_plan(h, plan)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
     await h.orch.stop()
     assert h.history(m)[-5:] == [P.cutover, P.verifying, P.failed, P.rolling_back, P.rolled_back]
     assert "server_active" in m.error
+    assert reviews == []
 
 
 async def test_rollback_request_during_step_is_serialized(tmp_path, store):
@@ -916,8 +951,6 @@ async def test_prestage_failure_fails_the_plan(tmp_path, store):
 
 
 async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, caplog):
-    from types import SimpleNamespace
-
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")
 

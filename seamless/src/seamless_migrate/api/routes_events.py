@@ -19,6 +19,9 @@ from ..events import Subscription
 from ..security.auth import Principal
 from .deps import require_role, services
 
+#: Largest sequence/offset the database integer columns hold (a bigger value is a 422, not a 500).
+MAX_SEQ = 2**63 - 1
+
 router = APIRouter(tags=["events"])
 HEARTBEAT = ": heartbeat\n\n"
 
@@ -51,7 +54,7 @@ async def sse_frames(
 @router.get("/events", response_model=list[Event])
 async def list_events(
     request: Request,
-    since: int = Query(default=0, ge=0),
+    since: int = Query(default=0, ge=0, le=MAX_SEQ),
     plan_id: str | None = None,
     migration_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
@@ -65,7 +68,7 @@ async def list_events(
 @router.get("/events/stream")
 async def stream_events(
     request: Request,
-    since: int | None = Query(default=None, ge=0),
+    since: int | None = Query(default=None, ge=0, le=MAX_SEQ),
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> StreamingResponse:
     svc = services(request)

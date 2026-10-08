@@ -21,6 +21,16 @@ from ..store import AsyncStore, Store
 log = logging.getLogger(__name__)
 
 #: at most this many auth.denied events per client per minute (protects the events table)
+#: Distinct client addresses tracked for audit throttling / lockout; the oldest are evicted.
+MAX_TRACKED_CLIENTS = 10_000
+
+
+def _bound(table: dict[str, Any], client: str) -> None:
+    """Keep ``table`` under MAX_TRACKED_CLIENTS entries (insertion order = oldest first)."""
+    while client not in table and len(table) >= MAX_TRACKED_CLIENTS:
+        table.pop(next(iter(table)))
+
+
 AUDIT_DENIED_PER_MINUTE = 30
 
 
@@ -65,14 +75,17 @@ class Services:
 
     def record_auth_failure(self, client: str) -> None:
         if self.settings.auth_lockout_per_minute > 0:
+            _bound(self._auth_failures, client)
             self._auth_failures[client].append(time.monotonic())
 
     def allow_audit(self, client: str) -> bool:
         now = time.monotonic()
+        _bound(self._denied, client)
         window = self._denied[client]
         while window and now - window[0] > 60:
             window.popleft()
         if len(window) >= AUDIT_DENIED_PER_MINUTE:
+            self._denied.pop(client) if not window else None
             return False
         window.append(now)
         return True

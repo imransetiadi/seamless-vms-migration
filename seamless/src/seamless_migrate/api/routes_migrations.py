@@ -29,7 +29,7 @@ async def list_migrations(
     phase: Phase | None = Query(default=None),
     wave_id: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=5000),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Migration]:
     """Migrations in creation order; ``limit``/``offset`` page large plans (SDD §12)."""
