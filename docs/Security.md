@@ -669,6 +669,9 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 - [ ] Secrets created from a secret manager or `oc create secret` — `secret-example.yaml` not applied.
 - [ ] Images pinned by digest; namespace carries the `restricted` pod-security labels.
 - [ ] `networkpolicy.yaml` egress tightened from `0.0.0.0/0` to your CIDRs; default-deny present.
+- [ ] `FORWARDED_ALLOW_IPS` on the control plane set to the router/ingress pod addresses (uvicorn then
+      takes the client address from `X-Forwarded-For` for the auth lockout and the audit log); never `*`
+      on a network where pods can reach the Service directly.
 - [ ] Route certificate trusted; HSTS and security headers added; ingress rate/connection limits configured.
 - [ ] PostgreSQL TLS or managed DB; encrypted storage class; backups encrypted and restore-tested.
 - [ ] `replicas: 1` and `strategy: Recreate` unchanged.
