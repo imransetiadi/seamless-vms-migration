@@ -261,7 +261,8 @@ def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api, monkeypa
     original = svc.db.list
 
     async def counting_list(kind, model_cls, **kw):
-        loads.append(kind)
+        if not kw:  # the cache loads whole kinds; the orchestrator tick lists running plans
+            loads.append(kind)
         return await original(kind, model_cls, **kw)
 
     monkeypatch.setattr(svc.db, "list", counting_list)
