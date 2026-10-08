@@ -135,7 +135,7 @@ jobs:
           GITLEAKS_CONFIG: .gitleaks.toml
           GITLEAKS_ENABLE_SUMMARY: "true"
       - name: trivy config on the deployment manifests
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: deploy
@@ -168,7 +168,7 @@ jobs:
           docker logs smoke | tail -20
           docker rm -f smoke
       - name: trivy image — fixable HIGH/CRITICAL must be zero (S-19)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: seamless-migrate:ci
           scanners: vuln
@@ -176,7 +176,7 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
       - name: SBOM (CycloneDX)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: seamless-migrate:ci
           scan-type: image
