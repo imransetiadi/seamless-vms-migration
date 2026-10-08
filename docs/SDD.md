@@ -1088,7 +1088,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 ## 17. Deployment
 
 * Container: `seamless/Containerfile` (UBI 9 Python 3.11 base; installs the control plane with
-  `[openstack,vmware,jev]` extras, `ansible-core`, this collection, `os_migrate.vmware_migration_kit`,
+  `[openstack,vmware,jev]` extras, `ansible-core`, this collection with the `openstack.cloud` modules the roles call as `os_migrate.os_migrate.<module>` vendored from the pinned Galaxy release (`scripts/vendor-openstack-cloud.sh`, `OS_CLOUD_VERSION` 2.5.0 — the checkout uses `make vendor-links` instead), `os_migrate.vmware_migration_kit`,
   Node 22 runtime for `npx`-launched Jev, and the built dashboard). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
