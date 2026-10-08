@@ -801,3 +801,24 @@ def test_randomized_engine_fuzz(tmp_path, seed):
     assert rc == 0, err
     assert again["chunks_changed"] == 0 and again["bytes_transferred"] == 0
     assert read(dst) == source
+
+
+def test_hash_chunk_zero_fast_path_matches_hashing(tmp_path):
+    """All-zero chunks take the cached zero digest; a chunk whose first 4 KiB are zero but
+    which has data later is hashed normally (the prefix check is only a cheap filter)."""
+    chunk = 64 * 1024
+    zero = b"\0" * chunk
+    late = b"\0" * 8192 + b"\x01" + b"\0" * (chunk - 8193)
+    early = b"\x01" + b"\0" * (chunk - 1)
+    tail = b"\0" * 100  # a short last chunk, all zero
+    path = write(tmp_path / "dev", zero + late + early + tail)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = 3 * chunk + 100
+        chunks = [blocksync._hash_chunk(fd, i, chunk, size, False) for i in range(4)]
+    finally:
+        os.close(fd)
+    assert chunks[0].digest == blocksync.zero_digest(chunk) == blocksync.chunk_digest(zero)
+    assert chunks[1].digest == blocksync.chunk_digest(late) != blocksync.zero_digest(chunk)
+    assert chunks[2].digest == blocksync.chunk_digest(early)
+    assert chunks[3].length == 100 and chunks[3].digest == blocksync.zero_digest(100)

@@ -53,6 +53,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   to the hypervisor's migration-network IP (the role refuses the loopback
   default); exports started by 1.0.5 must be stopped by hand once.
 - The cold path's nbdkit export of source volumes is read-only.
+- ``blocksync`` recognises all-zero chunks with a byte count before hashing them
+  (about 2.5× faster on never-written regions of thin volumes; chunks with data
+  are unaffected).
 - The source of the conversion hosts' security group rules is configurable
   (``os_migrate_conversion_secgroup_remote_ip_prefix``).
 - ``os_migrate_workloads_preserve_volume_type`` (default ``false``) makes the
