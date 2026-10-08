@@ -23,18 +23,6 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - Cert checks
 - update checksum to usedforsecurity=false
 
-1.1.0 (unreleased)
-------------------
-
-- Warm migration (``import_workloads_warm``, ``blocksync``): ``assume_zero``
-  is never applied to a final pass; a rollback with
-  ``os_migrate_rollback_delete_dest_volumes`` keeps a destination volume that
-  is still attached to a server other than the destination conversion host
-  (``kept_volume_ids``, new ``conversion_host`` option of
-  ``import_workload_rollback``); a cutover re-run fails instead of skipping a
-  recorded destination server that is in ``ERROR`` or gone; recorded
-  destination volumes without a source device are reported.
-
 1.0.5
 -----
 
@@ -78,3 +66,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - Remove the unused ``sshpass`` from bindep.
 - Resource files are now written with ``os_migrate_version: 1.1.0``: re-export
   data exported with 1.0.5.
+- Warm migration (``import_workloads_warm``, ``blocksync``): ``assume_zero``
+  is never applied to a final pass; a rollback with
+  ``os_migrate_rollback_delete_dest_volumes`` keeps a destination volume that
+  is still attached to a server other than the destination conversion host
+  (``kept_volume_ids``, new ``conversion_host`` option of
+  ``import_workload_rollback``); a cutover re-run fails instead of skipping a
+  recorded destination server that is in ``ERROR`` or gone; recorded
+  destination volumes without a source device are reported.

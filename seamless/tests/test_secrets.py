@@ -77,3 +77,15 @@ def test_write_secret_file_is_0600_and_removed(tmp_path):
     with pytest.raises(RuntimeError), secret_files(path, other):
         raise RuntimeError("playbook crashed")
     assert not path.exists() and not other.exists()
+
+
+def test_secret_name_rejects_path_traversal(tmp_path):
+    """Security.md R-03 / QASuite S-08: a credentials_secret is a name, never a path."""
+    settings = Settings(secrets_dir=tmp_path)
+    (tmp_path / "ok").mkdir()
+    (tmp_path / "ok" / "username").write_text("u")
+    (tmp_path / "ok" / "password").write_text("p")
+    assert resolve("ok", settings, env={})["username"] == "u"
+    for bad in ("../../etc/passwd", "..", ".", "a/b", "/etc/shadow", "", "x" * 129, "-leading"):
+        with pytest.raises(SecretNotFound):
+            resolve(bad, settings, env={})

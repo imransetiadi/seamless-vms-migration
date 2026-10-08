@@ -3,6 +3,8 @@
 #   SEAMLESS_MEMORY_URL          agentmemory REST URL reachable from this namespace (memory is disabled when unset)
 #   SEAMLESS_CORS_ORIGINS        comma-separated origins, only when the dashboard is served from another host
 #   SEAMLESS_JEV_URL             Jev MCP HTTP endpoint when SEAMLESS_JEV_MODE=http (token: seamless-ai/SEAMLESS_JEV_TOKEN)
+#   SEAMLESS_STEP_TIMEOUT_S      wall-clock ceiling of one step attempt in seconds (default 0 = unbounded)
+#   SEAMLESS_AUTH_LOCKOUT_PER_MINUTE  failed authentications per address before a 429 (default 60; 0 disables)
 # A Jev MCP or agentmemory service INSIDE the cluster additionally needs an egress rule: networkpolicy.yaml excludes
 # the pod and service networks from the external rule, so enable the commented in-cluster example in that file.
 apiVersion: v1

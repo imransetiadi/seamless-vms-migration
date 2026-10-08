@@ -41,20 +41,19 @@ field of the tool is authoritative for pass counting; the tables below show the 
 p95 the largest.
 
 **Configuration and calibration (SDD §9.1, PRD G2).** Every `EstimatorParams` field can be overridden per plan
-with `Plan.estimator_overrides` (unknown keys are rejected with 400; `Plan.link_bps` keeps precedence for
+with `Plan.estimator_overrides` (unknown, non-positive and plan-owned keys are rejected with 400; `Plan.link_bps` keeps precedence for
 `link_bps`). After every completed warm pass the orchestrator calibrates the migration and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` for delta passes, and the
 observed per-stream scan rate `bytes_scanned / duration_s / min(P, V)` replaces `scan_bps` for that migration
 (`Migration.observed_scan_bps`). The estimate an approver sees therefore converges on reality after the first
 delta pass.
 
-> **Implementation check (Track B).** A *full* first pass is usually bound by moving the used data (`U/L`), not by
+> **Why delta passes only.** A *full* first pass is usually bound by moving the used data (`U/L`), not by
 > scanning, so `bytes_scanned / duration_s` of that pass underestimates `S`: for the 200 GiB worked example of
-> §4.2 it gives 202 MiB/s instead of 500, and the estimate shown before the first delta pass would be 21.4 min
-> instead of 11.3. A migration that converges after a single full pass never gets a delta pass and would keep the
-> inflated number. SDD §9.1 states "delta passes only" for the change rate, not explicitly for the scan rate —
-> the scan calibration should skip link-bound full passes (or take the maximum of the observed and the
-> configured rate). PERF-E2E-G2 reports calibrated and uncalibrated migrations separately for this reason.
+> §4.2 it gives 202 MiB/s instead of 500, and an estimate calibrated on it would show 21.4 min instead of 11.3.
+> SDD §9.1 therefore takes the scan rate from delta/final passes only (`test_first_pass_alone_does_not_calibrate`);
+> a migration that converges after a single full pass keeps the planning defaults. PERF-E2E-G2 reports
+> calibrated and uncalibrated migrations separately for this reason.
 
 ---
 
@@ -487,8 +486,8 @@ is left to the operator is the plan-level starting point, so that the very first
 | Stalls after the SSH handshake, small packets fine | MTU black hole (Geneve 1442 vs 1500/9000 paths) | Align `os_migrate_*_conversion_net_mtu`, enable `net.ipv4.tcp_mtu_probing=1` |
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
-| `meets_slo` is false for the warm estimate of every disk above ≈ 15 GiB | The default `downtime_slo_s` of 300 s is below `F + scan` (270 s + 205 s for 100 GiB) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | Python-side filtering of all documents (§9) | Narrow queries, SSE-driven refresh, upgrade path in §9.3 |
+| `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
+| API slow with many migrations | `/stats` and `/metrics` validate every migration when the change stamp moved; plans and migrations are read fully by the overview | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -517,9 +516,9 @@ is left to the operator is the plan-level starting point, so that the very first
 |---|---|---|
 | `convergence_threshold_bytes` | 1 GiB | ≥ `1.2·c·(snapshot + scan)`; e.g. 10 MiB/s on 200 GiB: ≥ 5.2 GiB; **a single 500 GiB disk at 2 MiB/s: ≥ 2.5 GiB (use 3 GiB)**, which turns the five passes of the defaults (88 min at 10 Gbit/s, 112 min at 1 Gbit/s, each a full scan) into one or two with the same downtime |
 | `max_sync_passes` | 5 | `2` when pass 2 already runs at the scan floor (every later pass costs a full scan and gains nothing); `3` for VMs with a bursty writer |
-| `downtime_slo_s` | 300 | Below `F + scan` warm can never meet it (270 s + 205 s for 100 GiB) — pick the strategy (handover, cold on fast links) instead of adding passes, or state the real budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
+| `downtime_slo_s` | 600 | Below `F + scan` warm can never meet it (270 s + 205 s for 100 GiB fits; 270 s + 410 s for 200 GiB does not) — pick the strategy (handover, cold on fast links) instead of adding passes, or state the real budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
 | `link_bps` | 125 MiB/s | Per-migration share of the link (§6.4) |
-| `estimator_overrides` | `{}` | Measured `scan_bps`, `parallel_disks` and fixed costs (§6.4); the estimator's own name for the pass limit is `max_passes`, but use the plan fields above for threshold and pass count |
+| `estimator_overrides` | `{}` | Measured `scan_bps`, `parallel_disks` and fixed costs (§6.4); the plan-owned keys `convergence_threshold_bytes` and `max_passes` are rejected with 400 — use the plan fields above |
 | `keep_warm_interval_s` | 900 | Each keep-warm pass is a full device scan plus a snapshot and a temporary volume. The final delta grows only by `c × interval`, which at 2 MiB/s adds ≈ 14 GiB over two hours — and overlaps the scan — so the interval can be relaxed (≥ 4 × the pass time) for large disks; keep-warm mainly proves the path still works |
 | `selection_policy` | `min_downtime` | `simplest_meeting_slo` for predictable operations when several strategies meet the SLO |
 
@@ -571,9 +570,9 @@ Two fleets of 40 single-disk VMs, `c` = 2 MiB/s, waves: pilot of 3 + four waves 
 
 ### 8.3 Scale-out limits in 0.1.0
 
-One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialized attach/detach, Python-side
-list filtering (§9). Beyond ≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances
-with separate databases until 0.2.0.
+One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialized attach/detach. Beyond
+≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances with separate databases until
+0.2.0.
 
 ---
 
@@ -589,7 +588,7 @@ with separate databases until 0.2.0.
   `GET /metrics` need every migration: they keep the last loaded list and reload it only when the store's
   `change_stamp` (count + sum of versions, one aggregate query) moved — measured on SQLite with 1,000
   migrations: a full load + validation 19 ms, the stamp 0.2 ms, so a 15 s Prometheus scrape or an idle
-  overview costs one aggregate query. `GET /plans` still loads every plan (plans are few). Prefer SSE-triggered
+  overview costs one aggregate query. `GET /plans` filters by `status` and pages like `/migrations`. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling.
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
@@ -605,7 +604,7 @@ with separate databases until 0.2.0.
 |---|---|
 | Size | 1 vCPU / 1–2 GiB, 20 GiB volume is generous (manifests: request 250 m / 512 Mi, limit 2 CPU / 1 GiB, 20 Gi PVC) |
 | Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process plus CLI/psql) |
-| Indexes in place | `documents(kind, id)` primary key; `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
+| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
 | Bloat | frequently updated documents: `ALTER TABLE documents SET (fillfactor = 70)` and an aggressive autovacuum (`autovacuum_vacuum_scale_factor = 0.05`) |
 | Retention | archive `events` older than 13 months ([MEMORY.md](MEMORY.md) §3.4); `VACUUM (ANALYZE)` after bulk deletes |
 | Backups | `pg_dump` nightly (encrypted) plus a restore drill each release; the dump of 1,000 migrations is tens of MiB |
@@ -614,7 +613,7 @@ with separate databases until 0.2.0.
 
 | Limit | Cause | Upgrade |
 |---|---|---|
-| List endpoints scale with the **total** number of documents of a kind | filters evaluated in Python (SDD §11) | 0.2.0: filter in SQL on JSONB (`data->>'plan_id'`) with an expression index `ON documents ((data->>'plan_id')) WHERE kind = 'migration'`, keyset pagination |
+| `/stats` and `/metrics` validate every migration document when the change stamp moved | one load per change; a busy fleet with thousands of migrations re-validates often | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
 | Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
 | Event table growth | append-only, no purge | partition by month, archive |
 
@@ -631,6 +630,7 @@ with separate databases until 0.2.0.
 | `seamless_downtime_seconds_sum`, `_count`, `_max` | counters / gauge | mean and worst downtime (percentiles come from `/stats`, populations from §6.4) |
 | `seamless_step_duration_seconds_sum`, `_count{step}` | counters | mean duration per step (`prestage`, `precopy`, `sync`, `cutover`, `rollback`, `finalize`) |
 | `seamless_advisor_calls_total{tool,outcome}` | counter | Jev usage and failures (label values are defined by the implementation) |
+| `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. Queries:
@@ -707,12 +707,12 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 |---|---|---|
 | Hash-scan floor (SDD §20 D1): every warm pass reads and hashes the devices on both sides | downtime ≥ `F + scan`; a single disk above ≈ 160 GiB exceeds 10 min, a single 500 GiB disk needs `S` ≥ 416 MiB/s for the 25 min p95 | **0.2.0** changed-extent tracking (FR-26): Ceph-direct `rbd diff` between pass snapshots (opt-in, needs Ceph credentials) and hypervisor-assisted libvirt checkpoints; target ≤ 5 min median independent of disk size (PRD §8) |
 | Aggregate read ceiling of a conversion host (≈ 1,190 MiB/s on 10 GbE; 2–3 full-rate streams on 4 vCPU) | `P × S` overstates the scan rate of multi-disk VMs; G1a can be missed by VMs above ≈ 380 GiB in total | calibration measures the real rate per migration; `parallel_disks`/`scan_bps` via `Plan.estimator_overrides`; conversion-host pools (below) |
-| Calibration needs a completed pass, and a delta pass for a trustworthy scan rate | the first estimate uses defaults and plan overrides; single-pass migrations are never calibrated (§1) | scan calibration from delta passes only; persist observed rates per provider pair as the next default (proposed; not in SDD §9.1) |
+| Calibration needs a completed delta pass | the first estimate uses defaults and plan overrides; single-pass migrations are never calibrated (§1; SDD §9.1 calibrates from delta/final passes only) | persist observed rates per provider pair as the next default (proposed; not in SDD §9.1) |
 | Single stream per disk and per SSH channel | WAN throughput bounded by `window/RTT` | multi-stream sync (several SSH channels per disk, chunk-range sharding); HPN-SSH |
 | Delta unit is the chunk | random-write workloads amplify the delta (§5.4) | adaptive chunk size per VM from the first pass |
 | One conversion-host pair per provider; attach/detach serialized | many small VMs are attach-bound | multiple host pairs / host pool |
 | Single replica orchestrator (D2) | no HA | **0.2.0** leader election |
-| Python-side list filtering (§9) | API cost grows with total documents | **0.2.0** SQL filters and pagination |
+| Whole-kind reads for `/stats` and `/metrics` (cached on the change stamp, §9.1) | one full load per change | **0.2.0** store-side aggregates |
 | Image-booted VMs with `boot_disk_copy: true` re-image each pass | slow passes | use `false` when the image exists on the destination |
 | No LVM-thick detection finding | surprise slow passes | add a finding from `volume_backends` |
 | Page-cache pollution on conversion hosts from full-device reads | cache churn, no correctness issue | `posix_fadvise` sequential/don't-need hints |

@@ -67,6 +67,7 @@ After `--force`, recreate the stack so the control plane reloads the files: `mak
 | `seamless-ps` / `seamless-logs` | status / follow logs (`SEAMLESS_SERVICE=seamless` to filter) |
 | `seamless-reset` | **deletes** containers and volumes; needs `CONFIRM=yes` |
 | `seamless-test` | `cd seamless && .venv/bin/pytest -q` (export `SEAMLESS_TEST_PG_URL` to include PostgreSQL) |
+| `seamless-check` | the full local gate: control-plane tests + ruff, collection tests + lint, dashboard typecheck/lint/tests/build |
 | `dashboard-build` | `cd dashboard && npm ci && npm run build` |
 
 Variables: `SEAMLESS_COLIMA_PROFILE` (default `seamless`), `SEAMLESS_COLIMA_CPU/MEMORY/DISK`,
@@ -77,13 +78,13 @@ Variables: `SEAMLESS_COLIMA_PROFILE` (default `seamless`), `SEAMLESS_COLIMA_CPU/
 
 `.env` (generated; edit only the toggles) holds `POSTGRES_PASSWORD`, `JEV_MCP_AUTH_TOKEN`, optionally
 `TYPESAFE_API_KEY`, `COMPOSE_PROFILES`, `SEAMLESS_JEV_MODE`, `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`.
-Any variable of [SDD §15.1](../../docs/SDD.md) can be overridden from `.env` or the shell; the ones the
+Only the variables the Compose file wires under `environment:` reach the container (there is no `env_file`); every one of them can be overridden from `.env` or the shell. The
 Compose file wires explicitly:
 
 | Variable | Default here | Meaning |
 |---|---|---|
 | `SEAMLESS_DEMO`, `_DEMO_SPEED`, `_DEMO_SEED`, `_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES`, `SEAMLESS_STEP_TIMEOUT_S` | `10`, `3`, `1.0`, `2`, `0` (no step ceiling) | orchestrator |
+| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES`, `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `10`, `3`, `1.0`, `2`, `0` (no step ceiling), `60` | orchestrator / auth lockout |
 | `SEAMLESS_JEV_MODE` | `http` (`off` when no key at init) | Jev advisor (SDD §14.1); URL `http://jev:8080/mcp` is fixed |
 | `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `20`, `0.6` | advisor bounds |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET` | host agentmemory, none | passed through only when defined; delete the line to disable memory |
