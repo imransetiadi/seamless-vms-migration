@@ -401,6 +401,7 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`) — and the warm state file (kept while a source snapshot is pending). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
 (`_create_destination_volumes`), so mapped types would be ignored. A new variable
@@ -446,11 +447,13 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 
 ### 6.6 Hardening of existing code (required)
 
-`roles/import_from_hypervisor/tasks/process_disk.yml` currently exports hypervisor disks with
-`qemu-nbd` **writable** and bound to all interfaces. It must pass `--read-only` when
-`os_migrate_nbdkit_readonly` is true (default), bind with `--bind` to
-`os_migrate_nbdkit_bind_address` (new default `127.0.0.1`; set the hypervisor's migration-network
-IP for TCP mode), use `--shared=1`, and quote paths. See Security.md §6.
+`roles/import_from_hypervisor/tasks/process_disk.yml` exports hypervisor disks with `qemu-nbd`
+`--read-only` when `os_migrate_nbdkit_readonly` is true (default), bound with `--bind` to
+`os_migrate_nbdkit_bind_address` (default `127.0.0.1`; set the hypervisor's migration-network IP for
+TCP mode — the role refuses the loopback default there), with `--shared=1` and quoted paths. Log and
+PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`) and a previous
+export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
+source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
 ---
 
@@ -534,8 +537,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
   (from `credentials_secret`), `vms_list: [vm.name]`, `dst_cloud` (auth dict), `network_map`
   (from mappings), `use_fixed_ips: true`, `cinder_volume_type` (from mappings when unique),
-  `os_migrate_vmw_data_dir` = run dir, `already_deploy_conversion_host: true`; inventory group
-  `conversion_host` points at the RHOSO conversion host.
+  `os_migrate_vmw_data_dir` = run dir, `already_deploy_conversion_host: true`,
+  `copy_openstack_credentials_to_conv_host: false`, `os_migrate_tear_down: false`,
+  `vmware_insecure`/`openstack_insecure` from the providers' `verify_tls`, `used_mapped_networks`
+  when the plan maps networks, `cbt_sync` for `vmware_warm`, `cutover` for the cutover step; inventory
+  group `conversion_host` points at the RHOSO conversion host.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host).
@@ -820,7 +826,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for 5 × `tick_s`); probes use it |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
@@ -903,7 +909,10 @@ OpenStack credentials come from `clouds.yaml` (`SEAMLESS_CLOUDS_YAML`, mounted f
 Secret) referenced by `Provider.cloud`. VMware credentials come from `credentials_secret`, resolved
 by `security.secrets.resolve(name) -> dict` from files `{SEAMLESS_SECRETS_DIR}/{name}/{username,
 password}` or environment variables `SEAMLESS_SECRET_{NAME}_USERNAME/_PASSWORD` (name upper-cased,
-`-`→`_`). Secret material is passed to Ansible only via 0600 files deleted after each run.
+`-`→`_`). The SSH private key of an existing conversion host (`ConversionHostConfig.ssh_key_secret`)
+is resolved the same way by `security.secrets.resolve_private_key(name) -> str` from
+`{SEAMLESS_SECRETS_DIR}/{name}/private_key` or `SEAMLESS_SECRET_{NAME}_PRIVATE_KEY`, and written as a
+0600 file for the run. Secret material is passed to Ansible only via 0600 files deleted after each run.
 
 ### 13.4 AI data minimization
 
@@ -1035,7 +1044,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
-| `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§7.2) |
+| `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
@@ -1107,8 +1116,10 @@ read from the developer's environment (`TYPESAFE_API_KEY`) at init time and neve
 bind mount; `.env` is 0600.
 `Makefile` targets: `seamless-colima-up` (`colima start seamless --activate=false --cpu 4 --memory 6
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
-`seamless-up` / `seamless-down` / `seamless-logs` (all with `DOCKER_CONTEXT=colima-seamless`),
-`seamless-demo` (control plane started with `--demo` against PostgreSQL).
+`seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
+(all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `--demo`
+against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
+collection, dashboard).
 
 ---
 
@@ -1128,13 +1139,16 @@ over half of `tick_s`; QASuite PERF-CP-02).
 ```text
 plugins/module_utils/blocksync.py            plugins/module_utils/warm_migration.py
 plugins/modules/import_workload_warm_snapshot.py
-plugins/modules/import_workload_warm_sync.py roles/import_workloads_warm/
+plugins/modules/import_workload_warm_sync.py  plugins/modules/import_workload_rollback.py
+roles/import_workloads_warm/                  docs/src/user/warm-migration.rst
 playbooks/import_workloads_precopy.yml        playbooks/import_workloads_cutover.yml
 playbooks/rollback_workloads.yml              tests/unit/test_blocksync.py
-tests/unit/test_warm_migration.py             tests/perf/bench_blocksync.py
+tests/unit/test_warm_migration.py             tests/unit/test_warm_destination.py
+tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
-dashboard/ (package.json, src/…, design-system/…)
-deploy/openshift/                             docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
+dashboard/ (package.json, src/…, design-system/…, e2e/…)
+deploy/openshift/   deploy/compose/   scripts/compose-init.sh   tests/e2e/
+docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
 ```
