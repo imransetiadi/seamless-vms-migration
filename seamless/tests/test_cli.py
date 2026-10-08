@@ -189,6 +189,28 @@ def test_serve_refuses_auth_disabled_on_public_bind(env, capsys, monkeypatch):
     assert calls[-1].auth_disabled is False and calls[-1].port == 8080
 
 
+def test_json_logging_covers_uvicorn_loggers(env, capsys, monkeypatch):
+    import json as _json
+    import logging
+    import logging.config
+
+    from seamless_migrate.config import Settings
+
+    settings = Settings(data_dir=env / "data", log_json=True, log_level="INFO")
+    cli.configure_logging(settings)
+    logging.config.dictConfig(cli.uvicorn_log_config())
+    try:
+        logging.getLogger("uvicorn.access").info('127.0.0.1 - "GET /api/v1/health" 200')
+        logging.getLogger("seamless_migrate.orchestrator").warning("tick slow")
+    finally:
+        logging.getLogger().handlers[:] = []
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if ln.strip()]
+    records = [_json.loads(ln) for ln in lines]
+    assert [r["logger"] for r in records] == ["uvicorn.access", "seamless_migrate.orchestrator"]
+    assert records[0]["level"] == "INFO" and "/api/v1/health" in records[0]["message"]
+    assert not logging.getLogger("uvicorn.access").handlers  # routed through the root handler
+
+
 def test_events_export_and_prune(env, capsys, tmp_path):
     import json
     from datetime import UTC, datetime, timedelta

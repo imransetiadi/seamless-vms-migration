@@ -72,6 +72,20 @@ def configure_logging(settings: Settings) -> None:
     root.setLevel(settings.log_level.upper())
 
 
+#: uvicorn installs its own plain-text handlers; ``uvicorn_log_config`` routes them through the
+#: root handler of :func:`configure_logging` so JSON logging covers access and error lines too.
+def uvicorn_log_config() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "loggers": {
+            "uvicorn": {"handlers": [], "propagate": True},
+            "uvicorn.error": {"handlers": [], "propagate": True},
+            "uvicorn.access": {"handlers": [], "propagate": True},
+        },
+    }
+
+
 # -- store-backed helpers ---------------------------------------------------------------------
 #: Stores opened by the running command; ``main()`` disposes them (no leaked connections).
 _OPEN_STORES: list[Any] = []
@@ -130,6 +144,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
             port=settings.port,
             reload=True,
             log_level=settings.log_level.lower(),
+            log_config=uvicorn_log_config(),
         )
         return
     uvicorn.run(
@@ -137,6 +152,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
+        log_config=uvicorn_log_config(),
         proxy_headers=True,
     )
 
