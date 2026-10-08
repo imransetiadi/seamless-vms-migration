@@ -95,6 +95,10 @@ export interface ConversionHostConfig {
   image: string | null;
   ssh_user: string;
   address: string | null;
+  /** CIDR allowed to SSH to the conversion host (Security.md SEC-03). */
+  ssh_allowed_cidr: string | null;
+  /** Secret holding the private key of an existing conversion host (VMware sources). */
+  ssh_key_secret: string | null;
 }
 
 export interface Provider {
@@ -219,6 +223,8 @@ export interface Plan {
   convergence_threshold_bytes: number;
   max_sync_passes: number;
   link_bps: number;
+  /** Overrides of the estimator parameters for this plan (SDD §9.1), e.g. `{scan_bps, parallel_disks}`. */
+  estimator_overrides: Record<string, number>;
   handover: HandoverConfig;
   verification: VerificationConfig;
   prestage_resources: string[];
@@ -299,6 +305,10 @@ export interface Migration {
   sync_passes: SyncPass[];
   estimate: Estimate | null;
   estimates: Estimate[];
+  /** Per-stream scan throughput measured by the last delta pass (SDD §9.1 calibration), null before it. */
+  observed_scan_bps: number | null;
+  /** Mappings matched automatically by pre-flight, e.g. the smallest fitting flavor (`MAP_FLAVOR_AUTO`). */
+  resolved_mappings: Mappings;
   findings: Finding[];
   checkpoint: string | null;
   downtime_started_at: Timestamp | null;

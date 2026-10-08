@@ -585,7 +585,11 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   `max_step_retries`; then `failed`. If downtime had started and
   `plan.verification.auto_rollback` is true → `rolling_back` automatically. On every failure the
   knowledge service looks up similar incidents (§14.3) and attaches them as an `AdvisorNote`.
-* Locks: one `asyncio.Lock` per migration id serializes API actions with the driver.
+* Locks: one `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
+  plan id serializes validations. Plan documents are written by several drivers and the tick loop
+  (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
+  use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
+  retry on conflict), so no concurrent update is lost.
 
 ---
 

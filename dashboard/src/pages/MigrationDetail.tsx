@@ -8,6 +8,7 @@ import { useRole } from '../api/session';
 import type { Event, Migration, Phase, Plan, Role, Strategy } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
+import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
 import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -120,6 +121,11 @@ function ProgressPanel({ m }: { m: Migration }) {
       </div>
     </Panel>
   );
+}
+
+function hasResolvedMappings(m: Migration): boolean {
+  const rm = m.resolved_mappings;
+  return [rm.flavors, rm.networks, rm.volume_types, rm.projects].some((t) => Object.keys(t).length > 0);
 }
 
 function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
@@ -400,6 +406,17 @@ export default function MigrationDetail() {
           <Panel title="Advisor notes" description="Jev, rules and agentmemory">
             <AdvisorNotes notes={m.advisor_notes} />
           </Panel>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Panel title="Estimate inputs" description="What the downtime estimate rests on; delta passes calibrate it (SDD §9.1)">
+            <CalibrationPanel migration={m} plan={p} />
+          </Panel>
+          {hasResolvedMappings(m) && (
+            <Panel title="Resolved mappings" description="Matched automatically by pre-flight; add a plan mapping to override (SDD §9.3)">
+              <ResolvedMappings migration={m} />
+            </Panel>
+          )}
         </div>
 
         <Panel title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">

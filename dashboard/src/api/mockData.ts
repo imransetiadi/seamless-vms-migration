@@ -162,7 +162,7 @@ const LAB_VMS: VmSpec[] = [
 // -------------------------------------------------------------------------------------------
 
 function conversionHost(name: string, address: string) {
-  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address };
+  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null };
 }
 
 export function buildProviders(now: number): Provider[] {
@@ -484,6 +484,7 @@ export function defaultPlanFields(now: number) {
     keep_warm_interval_s: 900,
     convergence_threshold_bytes: 1073741824,
     max_sync_passes: 5,
+    estimator_overrides: {},
     link_bps: 131072000,
     handover: { enabled: false, backend_map: {} },
     verification: {
@@ -943,6 +944,9 @@ export function buildFixtures(now: number): Fixtures {
         sync_passes: syncPasses,
         estimate: chosen,
         estimates,
+        // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not
+        observed_scan_bps: syncPasses.filter((p) => p.kind !== 'full' && p.ended_at !== null).length > 0 ? 545 * MiB : null,
+        resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings,
         checkpoint: m.checkpoint ?? null,
         downtime_started_at: downtimeStartedAt === null ? null : iso(downtimeStartedAt),

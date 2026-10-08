@@ -114,6 +114,16 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
       <Setting label="Link bandwidth">
         <span className="num">{formatRate(plan.link_bps)}</span>
       </Setting>
+      {Object.keys(plan.estimator_overrides).length > 0 && (
+        <Setting label="Estimator overrides">
+          <span className="font-mono text-xs">
+            {Object.entries(plan.estimator_overrides)
+              .map(([k, v]) => `${k}=${v}`)
+              .join(' · ')}
+          </span>
+          <span className="block text-xs text-muted-foreground">Replace the planning defaults for this plan (SDD §9.1)</span>
+        </Setting>
+      )}
       <Setting label="Storage handover">
         {plan.handover.enabled ? `Enabled · ${Object.keys(plan.handover.backend_map).length} backend mapping(s)` : 'Disabled'}
       </Setting>

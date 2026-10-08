@@ -674,6 +674,8 @@ export class MockServer {
         sync_passes: [],
         estimate: null,
         estimates: [],
+        observed_scan_bps: null,
+        resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings: [],
         checkpoint: null,
         downtime_started_at: null,
