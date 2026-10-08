@@ -796,8 +796,12 @@ callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` re
 
 ## 12. REST API (`/api/v1`)
 
-JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP 400 (validation),
-401 (no/invalid token), 403 (role), 404, 409 (invalid transition / conflict), 422 (schema).
+JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP 400 (validation,
+`bad_request`), 401 (no/invalid token), 403 (role), 404, 405 (`method_not_allowed`), 409 (invalid
+transition / conflict), 422 (schema), 429 (`too_many_requests`, the auth lockout of §15.1), 500
+(`internal_error`, message never carries internals), 502 (`provider_error`, the redacted provider
+message), 503 (`/ready` while degraded). Every response, including error responses written by the
+server-error handler, carries the security headers of Security.md R-05.
 Authentication: `Authorization: Bearer <token>` (§13).
 
 | Method | Path | Min role | Request | Response |
@@ -814,7 +818,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | GET | `/plans` | viewer | — | `Plan[]` |
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
-| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`) | `Plan` |
+| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}` | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (409 when any migration is `blocked`) |
@@ -916,13 +920,15 @@ returns the parsed payload dict of the corresponding tool (`jev_decide`, `jev_cl
 `mcp.client.stdio.stdio_client(StdioServerParameters(command, args, env))`,
 `mcp.client.streamable_http.streamable_http_client(url, …)`, `ClientSession(read, write)`,
 `await session.initialize()`, `await session.call_tool(name, arguments, read_timeout_seconds=…)`.
-The client keeps **one long-lived session** per `JevClient` (lazily opened on first use, guarded by
-an `asyncio.Lock`, reopened once on transport failure, closed after `SEAMLESS_JEV_IDLE_CLOSE_S`
-(default 300) without calls and on shutdown) — spawning `npx` per call costs seconds and would make
-validating a large plan with many tie sets slow.
+The client opens **one session per call** (session open + call inside one `asyncio.wait_for` of
+`SEAMLESS_JEV_TIMEOUT_S`, no retries, circuit breaker 3 failures → 300 s). The `http` sidecar
+(the deployment default, §17) makes this cheap; in `stdio` mode every call spawns `npx`, so
+`stdio` is for contributors and small plans — validating a plan calls Jev once per tie set or
+batch of 25 VMs, sequentially, inside the API request.
 The stdio child receives only `PATH`, `HOME` and the Jev provider variables (`TYPESAFE_API_KEY`,
-`OPENROUTER_API_KEY`, `JEV_PROVIDER`, `JEV_API_KEY`, `JEV_API_BASE_URL`, `JEV_MCP_MODEL`) — never
-the rest of the control-plane environment.
+`OPENROUTER_API_KEY`, `JEV_PROVIDER`, `JEV_API_KEY`, `JEV_API_BASE_URL`, `JEV_MCP_MODEL`,
+`JEV_VERCEL_ZERO_DATA_RETENTION`, `JEV_MCP_MAX_CONCURRENCY`) — never the rest of the control-plane
+environment.
 
 Response fields relied upon (verified live against jev-mcp 0.14.1 / model `jev-1.13.0`; recorded
 fixtures live in `seamless/tests/fixtures/jev_*_response.json`):
