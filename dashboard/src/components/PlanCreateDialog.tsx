@@ -34,11 +34,14 @@ interface FormState {
   linkMiBps: string;
   thresholdGiB: string;
   maxPasses: string;
+  /** Optional estimator overrides (SDD §9.1): empty = planning default. */
+  scanMiBps: string;
+  parallelDisks: string;
   tcpPorts: string;
   autoRollback: boolean;
 }
 
-type FieldKey = 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'ports';
+type FieldKey = 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -50,7 +53,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     vmIds: new Set(vmIds),
     defaultStrategy: 'auto',
     policy: 'min_downtime',
-    sloMinutes: '5',
+    sloMinutes: '10',
     requireApproval: true,
     autoCutover: false,
     windowStart: '',
@@ -61,6 +64,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     linkMiBps: '125',
     thresholdGiB: '1',
     maxPasses: '5',
+    scanMiBps: '',
+    parallelDisks: '',
     tcpPorts: '22',
     autoRollback: true,
   };
@@ -150,6 +155,17 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     if (!(threshold > 0)) e.threshold = 'Enter the convergence threshold in GiB (more than 0).';
     const passes = Number(form.maxPasses);
     if (!Number.isInteger(passes) || passes < 1 || passes > 50) e.passes = 'Enter a whole number of passes from 1 to 50.';
+    const overrides: Record<string, number> = {};
+    if (form.scanMiBps.trim()) {
+      const scan = Number(form.scanMiBps);
+      if (!(scan > 0)) e.scan = 'Enter the scan rate in MiB/s (more than 0), or leave it empty.';
+      else overrides.scan_bps = scan * MiB;
+    }
+    if (form.parallelDisks.trim()) {
+      const parallel = Number(form.parallelDisks);
+      if (!Number.isInteger(parallel) || parallel < 1 || parallel > 64) e.parallel = 'Enter a whole number of disks from 1 to 64, or leave it empty.';
+      else overrides.parallel_disks = parallel;
+    }
     const ports = form.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
     if (Object.keys(e).length) return { errors: e, body: null };
@@ -171,6 +187,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
+        estimator_overrides: overrides,
         verification: {
           tcp_ports: ports,
           probe_address: 'fixed',
@@ -213,6 +230,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     link: id('link'),
     threshold: id('threshold'),
     passes: id('passes'),
+    scan: id('scan'),
+    parallel: id('parallel'),
     ports: id('ports'),
   };
   const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'ports'].some((k) => k in errors);
@@ -368,6 +387,33 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
                 <TextField id={id('link')} label="Link bandwidth (MiB/s)" type="number" inputMode="decimal" min={0} step="any" value={form.linkMiBps} onChange={(e) => set('linkMiBps', e.target.value)} error={errors.link} />
                 <TextField id={id('threshold')} label="Convergence threshold (GiB)" type="number" inputMode="decimal" min={0} step="any" value={form.thresholdGiB} onChange={(e) => set('thresholdGiB', e.target.value)} error={errors.threshold} />
                 <TextField id={id('passes')} label="Max sync passes" type="number" inputMode="numeric" min={1} max={50} value={form.maxPasses} onChange={(e) => set('maxPasses', e.target.value)} error={errors.passes} />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField
+                  id={id('scan')}
+                  label="Scan rate per disk stream (MiB/s, optional)"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="any"
+                  placeholder="500 (planning default)"
+                  value={form.scanMiBps}
+                  onChange={(e) => set('scanMiBps', e.target.value)}
+                  error={errors.scan}
+                  hint="Measured with bench_blocksync on the conversion host flavor; delta passes recalibrate it per VM"
+                />
+                <TextField
+                  id={id('parallel')}
+                  label="Disks scanned in parallel (optional)"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={64}
+                  placeholder="4 (planning default)"
+                  value={form.parallelDisks}
+                  onChange={(e) => set('parallelDisks', e.target.value)}
+                  error={errors.parallel}
+                />
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Comma separated, e.g. 22, 443." />

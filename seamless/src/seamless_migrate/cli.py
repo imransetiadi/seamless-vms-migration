@@ -19,7 +19,7 @@ from . import __version__
 from .config import Settings
 from .domain.enums import ProviderKind, Role, Strategy, strategies_for
 from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
-from .planning.estimator import EstimatorParams, estimate
+from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
 from .security.auth import TokenStore, auth_disabled_allowed, generate_token, is_loopback
 
 log = logging.getLogger("seamless_migrate")
@@ -301,9 +301,24 @@ def _vms_from(document: Any) -> list[VMRef]:
 
 def cmd_estimate(args: argparse.Namespace, settings: Settings) -> int:
     vms = _vms_from(_load_yaml(args.file))
-    params = EstimatorParams()
+    overrides: dict[str, float] = {}
     if args.link_mbps is not None:
-        params = EstimatorParams(link_bps=args.link_mbps * 1_000_000 / 8)
+        overrides["link_bps"] = args.link_mbps * 1_000_000 / 8
+    if args.scan_mibps is not None:
+        overrides["scan_bps"] = args.scan_mibps * 2**20
+    if args.change_mibps is not None:
+        overrides["change_rate_bps"] = args.change_mibps * 2**20
+    if args.parallel_disks is not None:
+        overrides["parallel_disks"] = args.parallel_disks
+    if args.max_passes is not None:
+        overrides["max_passes"] = args.max_passes
+    problems = invalid_estimator_overrides(
+        {k: v for k, v in overrides.items() if k != "max_passes"}
+    )
+    if problems:
+        print("error: " + "; ".join(problems), file=sys.stderr)
+        return 2
+    params = EstimatorParams(**overrides)  # type: ignore[arg-type]
     rows = []
     for vm in vms:
         vmware = vm.cbt_enabled is not None or any(d.kind == "vmdk" for d in vm.disks)
@@ -403,8 +418,24 @@ def parser() -> argparse.ArgumentParser:
     est = sub.add_parser("estimate", help="estimate downtime for VMs described in YAML")
     est.add_argument("-f", "--file", required=True)
     est.add_argument("--strategy", choices=[s.value for s in Strategy])
-    est.add_argument("--slo", type=float, default=300.0, help="downtime SLO in seconds")
+    est.add_argument("--slo", type=float, default=600.0, help="downtime SLO in seconds")
     est.add_argument("--link-mbps", type=float, default=None, help="link speed in Mbit/s")
+    est.add_argument(
+        "--scan-mibps",
+        type=float,
+        default=None,
+        help="per-disk-stream scan rate in MiB/s (SDD §9.1 S; e.g. the bench_blocksync result)",
+    )
+    est.add_argument(
+        "--change-mibps",
+        type=float,
+        default=None,
+        help="guest write rate in MiB/s for VMs without change_rate_bps",
+    )
+    est.add_argument(
+        "--parallel-disks", type=int, default=None, help="disks of one VM scanned in parallel"
+    )
+    est.add_argument("--max-passes", type=int, default=None, help="pre-copy pass cap")
     est.set_defaults(func=cmd_estimate)
 
     status = sub.add_parser("status", help="migration status")

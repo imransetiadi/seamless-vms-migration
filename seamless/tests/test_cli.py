@@ -152,6 +152,24 @@ def test_estimate_table(env, capsys):
     out = capsys.readouterr().out
     assert all(s in out for s in ("cold", "warm", "storage_handover"))
 
+    # calibration knobs mirror Plan.estimator_overrides (SDD §9.1): a faster scan shrinks the
+    # warm downtime floor, which is 60+30+scan+60+120 with scan = 200 GiB / S
+    assert cli.main(["estimate", "-f", str(path), "--strategy", "warm", "--slo", "600"]) == 0
+    default = capsys.readouterr().out
+    assert "680" in default  # scan = 200 GiB / 500 MiB/s = 409.6 s
+    assert (
+        cli.main(["estimate", "-f", str(path), "--strategy", "warm", "--scan-mibps", "1000"]) == 0
+    )
+    faster = capsys.readouterr().out
+    assert "475" in faster  # scan = 204.8 s
+    lines = [ln for ln in faster.splitlines() if "db-01" in ln]
+    assert len(lines) == 1 and "yes" in lines[0].split(), "meets the default 600 s SLO"
+    assert cli.main(["estimate", "-f", str(path), "--scan-mibps", "0"]) == 2
+    assert "scan_bps" in capsys.readouterr().err
+    assert (
+        cli.main(["estimate", "-f", str(path), "--parallel-disks", "1", "--max-passes", "2"]) == 0
+    )
+
 
 def test_serve_refuses_auth_disabled_on_public_bind(env, capsys, monkeypatch):
     calls = []

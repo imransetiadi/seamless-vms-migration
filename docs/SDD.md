@@ -965,7 +965,8 @@ seamless token create --name NAME --role {viewer,operator,approver,admin}
 seamless plan apply -f plan.yaml            # create/update plan in the local store
 seamless plan validate PLAN_ID              # prints findings + estimates table
 seamless plan start PLAN_ID
-seamless estimate -f vms.yaml [--strategy S] [--slo 300] [--link-mbps 1000]
+seamless estimate -f vms.yaml [--strategy S] [--slo 600] [--link-mbps 1000] [--scan-mibps 500]
+                  [--change-mibps 2] [--parallel-disks 4] [--max-passes 5]   # the §9.1 knobs
 seamless status [--plan PLAN_ID]
 seamless version
 ```

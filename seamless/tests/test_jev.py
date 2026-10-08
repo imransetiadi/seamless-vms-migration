@@ -194,3 +194,19 @@ async def test_http_mode_unreachable_server_is_unavailable():
     with pytest.raises(JevUnavailable):
         await client.screen(text="x", purpose="y")
     assert client.calls[("jev_screen", "error")] == 1
+
+
+def test_parse_result_rejects_camel_case_errors_and_non_objects():
+    from types import SimpleNamespace as NS
+
+    from seamless_migrate.ai.jev import JevUnavailable, parse_result
+
+    with pytest.raises(JevUnavailable, match="tool error"):
+        parse_result(NS(isError=True, content=[NS(text="Input validation error: password=x")]))
+    with pytest.raises(JevUnavailable, match="not a JSON object"):
+        parse_result(NS(content=[NS(text="[1, 2, 3]")]))
+    with pytest.raises(JevUnavailable, match="no text content"):
+        parse_result(NS(content=[NS(text=None)]))
+    with pytest.raises(JevUnavailable, match="no text content"):
+        parse_result(NS(content=[]))
+    assert parse_result(NS(content=[NS(text='{"status": "ok"}')])) == {"status": "ok"}

@@ -43,7 +43,8 @@ describe('Plans page', () => {
     await waitFor(() => expect(server.plans.some((p) => p.name === 'Wave test')).toBe(true));
     const created = server.plans.find((p) => p.name === 'Wave test');
     expect(created?.vm_ids).toEqual(['os-0a11', 'os-0a12']);
-    expect(created?.downtime_slo_s).toBe(300);
+    expect(created?.downtime_slo_s).toBe(600);
+    expect(created?.estimator_overrides).toEqual({});
     expect(created?.status).toBe('draft');
   });
 });
