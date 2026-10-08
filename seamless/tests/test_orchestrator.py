@@ -133,11 +133,17 @@ async def test_retry_after_rollback_counts_an_attempt(tmp_path, store):
     await h.orch.validate_plan(plan.id, "alice")
     m = await h.by_vm(plan.id, "vm-1")
     m.phase = P.rolled_back
+    m.downtime_started_at = h.orch.now() - timedelta(seconds=600)
+    m.downtime_ended_at = h.orch.now()
+    m.actual_downtime_s = 600.0
     store.put("migration", m)
     again = await h.orch.retry(m.id, "alice")
     assert again.phase == P.ready and again.attempts == 1
     stored = store.get("migration", m.id, Migration)
     assert stored.attempts == 1
+    # the previous attempt's downtime clock is not inherited by the next cutover
+    assert stored.downtime_started_at is None and stored.downtime_ended_at is None
+    assert stored.actual_downtime_s is None
 
 
 async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, store):

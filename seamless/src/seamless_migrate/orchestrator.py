@@ -639,6 +639,11 @@ class Orchestrator:
             m.progress_pct = 0
             m.review_required = False
             m.review_reason = None
+            # the downtime clock belongs to the attempt: the source runs again after a
+            # rollback, so the next cutover starts a fresh clock
+            m.downtime_started_at = None
+            m.downtime_ended_at = None
+            m.actual_downtime_s = None
             await self._save(m, v)
         self._force_window.discard(mid)
         await self._emit(
