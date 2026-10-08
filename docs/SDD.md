@@ -785,8 +785,11 @@ events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, mes
 `ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
 top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
 pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
-other values are evaluated in Python), `delete(kind, id)`, `append_event(event) -> Event`,
-`events(since_seq=0, plan_id=None, migration_id=None, limit=500)`. Kinds: `provider`, `plan`,
+other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
+aggregate over the kind; moves on every insert, update or delete — `GET /stats` and `GET /metrics`
+reload their full document lists only when it moved), `delete(kind, id)`,
+`append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`.
+Kinds: `provider`, `plan`,
 `migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
 callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
