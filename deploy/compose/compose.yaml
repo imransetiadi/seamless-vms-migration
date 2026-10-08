@@ -161,7 +161,7 @@ services:
       SEAMLESS_MEMORY_REDACT_NAMES: ${SEAMLESS_MEMORY_REDACT_NAMES:-false}
       # observability (SDD 18)
       SEAMLESS_LOG_LEVEL: ${SEAMLESS_LOG_LEVEL:-INFO}
-      SEAMLESS_LOG_JSON: ${SEAMLESS_LOG_JSON:-false}
+      SEAMLESS_LOG_JSON: ${SEAMLESS_LOG_JSON:-true}
     ports:
       - "127.0.0.1:${SEAMLESS_HOST_PORT:-8080}:8080"
     volumes:

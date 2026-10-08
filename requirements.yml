@@ -1,3 +1,9 @@
 ---
-collections: []
-roles: []
+# Collections the Seamless Migrate control-plane image installs next to os_migrate.os_migrate
+# (seamless/Containerfile). The VMware migration kit is pinned: the Ansible executor
+# (seamless/src/seamless_migrate/executors/ansible.py, build_vars) hard-codes its variables
+# (vms_list, cbt_sync, cutover, already_deploy_conversion_host, …) and the name of its power-off
+# task; bump the version together with that contract (Security.md §9.2).
+collections:
+  - name: os_migrate.vmware_migration_kit
+    version: 2.2.7

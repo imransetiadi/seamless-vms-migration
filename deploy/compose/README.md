@@ -88,7 +88,7 @@ Compose file wires explicitly:
 | `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `20`, `0.6` | advisor bounds |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET` | host agentmemory, none | passed through only when defined; delete the line to disable memory |
 | `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | `seamless-migrate`, `false` | memory project id / privacy ([MEMORY.md](../../docs/MEMORY.md) §3) |
-| `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `false` | misc |
+| `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `true` | misc (JSON logs for forwarders, SDD §15.1) |
 | `SEAMLESS_HOST_PORT`, `SEAMLESS_VERSION` | `8080`, `0.1.0` | published loopback port, image tag |
 
 Authentication is always on (`SEAMLESS_AUTH_DISABLED=false`): the process listens on `0.0.0.0` inside the
@@ -167,7 +167,7 @@ application credentials ([Security.md](../../docs/Security.md) §7).
 | `POSTGRES_PASSWORD is not set` | run `scripts/compose-init.sh` (or `make seamless-init`) |
 | `bind source path does not exist: …/tokens.yaml` | `.env`/`tokens.yaml` missing: run the init script (Compose never creates a directory in its place) |
 | `password authentication failed for user "seamless"` | `.env` password differs from the one the `pgdata` volume was initialized with (or a stray `POSTGRES_PASSWORD` in your shell when you ran `docker compose` yourself — see Precedence). Restore the old `.env`, or `make seamless-reset CONFIRM=yes` and init again |
-| `Permission denied: '/data/...'` | the image must own `/data` for its non-root user (Containerfile); one-off fix: `docker --context colima-seamless run --rm -v seamless_seamless-data:/data busybox chown -R <uid>:0 /data` |
+| `Permission denied: '/data/...'` | the image creates `/data` owned by its non-root user (UID 1001, Containerfile), so a volume created by a current image is writable; a volume first mounted by an older image keeps root ownership — one-off fix: `docker --context colima-seamless run --rm -v seamless_seamless-data:/data busybox chown -R 1001:0 /data` |
 | `jev` unhealthy for ~1 min after first start | `npx` downloads the pinned package; wait for `start_period` (90 s) and check `make seamless-logs SEAMLESS_SERVICE=jev` |
 | Memory calls fail from the container | `docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.internal:3111/agentmemory/livez`; start the host agentmemory, or delete `SEAMLESS_MEMORY_URL` from `.env` |
 | Port 8080 already in use | set `SEAMLESS_HOST_PORT=8081` in `.env` |

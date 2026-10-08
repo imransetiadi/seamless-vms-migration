@@ -1,4 +1,5 @@
 import copy
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,12 +54,18 @@ MAPPINGS = Mappings(
 
 
 class FakeImpl:
-    def __init__(self, calls):
-        self.calls = calls
+    """Destination/source provider double: a server named like the VM exists when the test
+    declared it (``registry.existing``) or once a fake import/cutover playbook created it."""
+
+    def __init__(self, registry):
+        self.calls = registry.calls
+        self.registry = registry
 
     async def find_server(self, name):
         self.calls.append(("find_server", name))
-        return f"dst-{name}"
+        if name in self.registry.existing:
+            return f"dst-{name}"
+        return f"dst-{name}" if name in self.registry.created() else None
 
     async def delete_server(self, server_id):
         self.calls.append(("delete_server", server_id))
@@ -68,11 +75,21 @@ class FakeImpl:
 
 
 class FakeRegistry:
-    def __init__(self):
+    def __init__(self, existing=()):
         self.calls = []
+        self.existing = set(existing)
 
     def get(self, provider):
-        return FakeImpl(self.calls)
+        return FakeImpl(self)
+
+    @staticmethod
+    def created() -> list[str]:
+        """Names the fake playbooks created (see ``ANSIBLE_FAKE_CREATED`` in fake_ansible)."""
+        marker = os.environ.get("ANSIBLE_FAKE_CREATED")
+        if not marker or not os.path.exists(marker):
+            return []
+        with open(marker, encoding="utf-8") as fh:
+            return fh.read().split()
 
 
 @pytest.fixture
@@ -80,6 +97,7 @@ def env(tmp_path, monkeypatch):
     fake = install(tmp_path / "bin")
     log = tmp_path / "ansible.log"
     monkeypatch.setenv("ANSIBLE_FAKE_LOG", str(log))
+    monkeypatch.setenv("ANSIBLE_FAKE_CREATED", str(tmp_path / "created.txt"))
     monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.05")
     monkeypatch.setenv("SEAMLESS_JEV_TOKEN", "must-not-leak")
     clouds = tmp_path / "clouds.yaml"
@@ -269,7 +287,15 @@ async def test_cutover_cold_sets_stop_before_migration(env):
 
     rb, _ = ctx_for(env, strategy=Strategy.cold)
     await env.executor.run(StepName.ROLLBACK, rb)
-    assert read_log(env.log)[-1]["playbook"] == "rollback_workloads.yml"
+    last = read_log(env.log)[-1]
+    assert last["playbook"] == "rollback_workloads.yml"
+    assert "os_migrate_rollback_delete_dest_volumes" not in last["vars"]
+    # the cleanup after a cancel also drops the destination volumes of the abandoned pass
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(plan_id=plan.id, vm=make_vm(source_id="srv-1"), strategy=Strategy.warm)
+    cleanup, _ = make_ctx(plan, mig, SRC, DST, env.settings, delete_dest_volumes=True)
+    await env.executor.run(StepName.ROLLBACK, cleanup)
+    assert read_log(env.log)[-1]["vars"]["os_migrate_rollback_delete_dest_volumes"] is True
     assert not env.executor.supports(Strategy.storage_handover)
 
 
@@ -308,7 +334,10 @@ async def test_vmware_warm_flags(env):
     assert (cut["cbt_sync"], cut["cutover"]) == (True, True)
     assert rec.downtime_marks == 1
 
-    cold_ctx, _ = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER)
+    # the warm cutover above created the server: a cold cutover of the same VM is a resume
+    cold_ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
     await env.executor.run(StepName.CUTOVER, cold_ctx)
     cold = read_log(env.log)[-1]["vars"]
     assert (cold["cbt_sync"], cold["cutover"]) == (False, True)
@@ -644,6 +673,87 @@ async def test_finalize_variants(env):
         await failing.run(StepName.FINALIZE, ctx)
 
 
+async def test_cutover_refuses_a_pre_existing_destination_server(env):
+    """A same-named server the migration did not create blocks the cutover before any stop."""
+    executor = AnsibleExecutor(
+        env.settings, providers=FakeRegistry(existing={"web-01"}), poll_s=0.02
+    )
+    for strategy, source in ((Strategy.cold, SRC), (Strategy.vmware_cold, VCENTER)):
+        ctx, rec = ctx_for(env, strategy=strategy, source=source)
+        with pytest.raises(PermanentStepError, match="already exists in the destination"):
+            await executor.run(StepName.CUTOVER, ctx)
+        assert rec.downtime_marks == 0
+    assert read_log(env.log) == []  # no playbook ran
+    # a retry after the stop (a resume) or with a recorded server is not a collision
+    ctx, rec = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    result = await executor.run(StepName.CUTOVER, ctx)
+    assert result.destination_server_id == "dst-web-01"
+
+
+async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
+    """Without a recorded destination server, only a cutover that powered the VM off can have
+    created a same-named server; an earlier failure leaves any such server alone."""
+    registry = FakeRegistry(existing={"web-01"})
+    executor = AnsibleExecutor(env.settings, providers=registry, poll_s=0.02)
+    ctx, _ = ctx_for(env, strategy=Strategy.vmware_cold, source=VCENTER)
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert registry.calls == [("power_on", "srv-1")]
+    assert result.details["deleted_server"] is None
+    registry.calls.clear()
+    ctx, _ = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+    )
+    result = await executor.run(StepName.ROLLBACK, ctx)
+    assert registry.calls == [
+        ("find_server", "web-01"),
+        ("delete_server", "dst-web-01"),
+        ("power_on", "srv-1"),
+    ]
+    assert result.details["deleted_server"] == "dst-web-01"
+
+
+async def test_warm_pass_without_a_new_state_entry_is_a_permanent_failure(env, monkeypatch):
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    assert first.sync_pass is not None and first.sync_pass.number == 1
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")  # the role skipped the workload
+    ctx, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
+    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+        await env.executor.run(StepName.SYNC, ctx)
+    cut, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
+    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+        await env.executor.run(StepName.CUTOVER, cut)
+
+
+async def test_a_huge_output_line_does_not_fail_the_step(env, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_FAKE_LONG_LINE", str(5 * 2**22))  # 20 MiB on one line
+    ctx, rec = ctx_for(env, strategy=Strategy.warm)
+    result = await env.executor.run(StepName.PRECOPY, ctx)
+    assert result.sync_pass is not None
+    assert any(line.startswith("ok: [localhost] => xxx") for line in rec.logs)
+
+
+async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkeypatch):
+    for key in (
+        "ANSIBLE_VERBOSITY",
+        "ANSIBLE_LOG_PATH",
+        "ANSIBLE_STDOUT_CALLBACK",
+        "ANSIBLE_CONFIG",
+    ):
+        monkeypatch.setenv(key, "x")
+    monkeypatch.setenv("ANSIBLE_SSH_ARGS", "-o ServerAliveInterval=30")
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    keys = set(read_log(env.log)[-1]["env_keys"])
+    assert {
+        "ANSIBLE_VERBOSITY",
+        "ANSIBLE_LOG_PATH",
+        "ANSIBLE_STDOUT_CALLBACK",
+        "ANSIBLE_CONFIG",
+    }.isdisjoint(keys)
+    assert {"ANSIBLE_SSH_ARGS", "ANSIBLE_DISPLAY_SKIPPED_HOSTS", "ANSIBLE_NOCOLOR"} <= keys
+
+
 async def test_vmware_rollback_and_lookup_failures(env):
     failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
@@ -735,7 +845,10 @@ def test_lazy_provider_registry(env):
 async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
     monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
-    await env.executor.run(StepName.CUTOVER, ctx)
+    # the cold role skips everything when the destination already has the server: nothing was
+    # migrated, so the step fails instead of returning the same-named server as the result
+    with pytest.raises(PermanentStepError, match="nothing was migrated"):
+        await env.executor.run(StepName.CUTOVER, ctx)
     assert rec.downtime_marks == 0, "a skipped stop task does not stop the source"
     monkeypatch.delenv("ANSIBLE_FAKE_STOP_SKIPPED")
     ctx2, rec2 = ctx_for(env, strategy=Strategy.cold)

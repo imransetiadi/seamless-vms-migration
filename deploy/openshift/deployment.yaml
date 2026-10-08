@@ -180,6 +180,8 @@ spec:
             #     path: dc2/username
             #   - key: dc2-password
             #     path: dc2/password
+            #   - key: conv-key-private-key        # ConversionHostConfig.ssh_key_secret "conv-key":
+            #     path: conv-key/private_key       # security.secrets.resolve_private_key reads <name>/private_key
             #
             # Alternative without edits to this file: put SEAMLESS_SECRET_DC2_USERNAME / SEAMLESS_SECRET_DC2_PASSWORD
             # (name upper-cased, "-" -> "_") into a Secret and add it under `envFrom` (environment variables are the

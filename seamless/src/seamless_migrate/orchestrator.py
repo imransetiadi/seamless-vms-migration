@@ -165,6 +165,8 @@ class Orchestrator:
         self._force_window: set[str] = set()
         self._prestage_done: set[str] = set()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
+        #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
+        self._cleanups: dict[str, asyncio.Task[None]] = {}
         self._wave_events_seen: dict[str, set[tuple[str, str]]] = {}
         self._progress_at: dict[str, float] = {}
         self._tick_task: asyncio.Task[None] | None = None
@@ -707,6 +709,7 @@ class Orchestrator:
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.cancelled):
                 raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
+            previous = m.phase
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
@@ -721,8 +724,48 @@ class Orchestrator:
             actor=actor,
             data={"action": "cancel", "reason": reason},
         )
+        if step is not None and previous in (P.precopy, P.syncing) and not self._stopping:
+            # the killed pass left snapshots, temporary and destination volumes behind: the
+            # rollback step removes them (the source keeps running throughout a pass)
+            self._cleanups[mid] = asyncio.create_task(
+                self._cleanup_after_cancel(m, step, actor), name=f"cleanup:{mid}"
+            )
         self.wake()
         return m
+
+    async def _cleanup_after_cancel(
+        self, m: Migration, step: asyncio.Task[Any], actor: str
+    ) -> None:
+        with contextlib.suppress(BaseException):
+            await step  # the executor kills the playbook and removes its secret files
+        try:
+            plan = await self._plan(m.plan_id)
+            source = await self.db.get("provider", plan.source_provider_id, Provider)
+            destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+            ctx = self._context(
+                m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
+            )
+            await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit(
+                "migration.error",
+                f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
+                "rollback_workloads.yml for the workload to remove its temporary resources",
+                migration=m,
+                data={"step": "cleanup", "error_class": type(exc).__name__},
+            )
+            return
+        finally:
+            self._cleanups.pop(m.id, None)
+        await self._emit(
+            "migration.action",
+            f"{m.vm.name}: temporary resources of the cancelled pass removed",
+            migration=m,
+            actor=actor,
+            data={"action": "cleanup"},
+        )
 
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""
@@ -822,6 +865,7 @@ class Orchestrator:
                 *self._drivers.values(),
                 *self._prestage_tasks.values(),
                 *self._steps.values(),
+                *self._cleanups.values(),
             )
             if t
         ]
@@ -833,6 +877,7 @@ class Orchestrator:
         self._drivers.clear()
         self._steps.clear()
         self._prestage_tasks.clear()
+        self._cleanups.clear()
 
     async def _loop(self) -> None:
         assert self._wake is not None

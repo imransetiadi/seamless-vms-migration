@@ -336,6 +336,58 @@ def blocking_cutover(gates: dict[str, asyncio.Event], started: list[str]):
     return hook
 
 
+async def test_cancel_during_a_pass_rolls_the_data_path_back(tmp_path, store):
+    """A cancel in precopy/syncing kills the pass and then runs the rollback step so the
+    snapshots, temporary and destination volumes of the abandoned pass are removed."""
+    settings = make_settings(tmp_path)
+    started = asyncio.Event()
+    seen_options: list[dict] = []
+
+    async def blocking_pass(ctx):
+        started.set()
+        await asyncio.sleep(60)
+        return StepResult()
+
+    async def rollback(ctx):
+        seen_options.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: blocking_pass, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await asyncio.wait_for(started.wait(), 5)
+    cancelled = await h.orch.cancel(m.id, "rina", "window closed")
+    assert cancelled.phase == P.cancelled
+    for _ in range(300):
+        if (m.id, StepName.ROLLBACK) in executor.calls:
+            break
+        await asyncio.sleep(0.01)
+    assert (m.id, StepName.ROLLBACK) in executor.calls
+    assert seen_options == [{"delete_dest_volumes": True}]
+    for _ in range(300):
+        if m.id not in h.orch._cleanups:
+            break
+        await asyncio.sleep(0.01)
+    actions = [
+        e.data.get("action")
+        for e in h.store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.migration_id == m.id
+    ]
+    assert actions == ["cancel", "cleanup"]
+    assert (await h.migration(m.id)).phase == P.cancelled
+    await h.orch.stop()
+
+
 async def test_wave_dependencies_respected(tmp_path, store):
     vms = [vm(1), vm(2)]
     waves = [

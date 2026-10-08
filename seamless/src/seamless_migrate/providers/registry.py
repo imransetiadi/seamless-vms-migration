@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -35,8 +36,18 @@ class ProviderRegistry:
         self._cache: dict[str, tuple[str, Any]] = {}
         self._lock = threading.Lock()
 
+    def _credentials_stamp(self) -> str:
+        """Change marker of the mounted credential files (a rotated clouds.yaml reconnects)."""
+        try:
+            st = os.stat(self.settings.clouds_yaml)
+        except OSError:
+            return "-"
+        return f"{st.st_mtime_ns}:{st.st_size}"
+
     def get(self, provider: Provider) -> Any:
         fingerprint = provider.model_dump_json(exclude=_STATE_FIELDS)
+        if not self.settings.demo:
+            fingerprint += "|" + self._credentials_stamp()
         with self._lock:
             cached = self._cache.get(provider.id)
             if cached is not None and cached[0] == fingerprint:

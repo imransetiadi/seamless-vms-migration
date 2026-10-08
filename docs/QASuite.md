@@ -683,6 +683,17 @@ Twenty-three further iterations after the integration run, each verified with th
   device are warned about; docs name the SHUTOFF state after a failed cutover and the stop-at-first-failure
   loop; SDD §6.5 lists every warm variable. 100 collection tests, syntax checks and ansible-lint green.
   Deferred with rationale: helper script in `/tmp` (R-02) and host-key policy (R-11) wait for the lab.
+* Executor and deployment review wave (independent reviewer): a cutover refuses a pre-existing same-named
+  destination server before stopping anything, a skipped cold stop task fails the step, a warm pass without
+  a new state entry fails instead of re-reporting the previous pass, the VMware rollback deletes by name
+  only after a stop (Security.md R-12/R-13); a cancel in precopy/syncing runs the rollback step once the
+  killed playbook is gone (snapshots, temporary and destination volumes removed, `migration.action`
+  `cleanup` event); `ANSIBLE_*` output/config variables no longer reach playbooks (R-14); over-long output
+  lines are read in pieces; prestage failures keep their output tail in the service log; the provider
+  registry reconnects after a rotated `clouds.yaml`. Deploy: the image owns `/data` (Compose volume),
+  JSON logs are the image default, the VMware kit is pinned through `requirements.yml` (2.2.7), the
+  OpenShift secret example shows the conversion-host `private_key` item. Deferred: a wall-clock bound per
+  playbook (needs an SDD setting) and a contract test against the real kit (needs the kit in the build).
 
 ### 13.2 Exit criteria — release 0.1.0
 
