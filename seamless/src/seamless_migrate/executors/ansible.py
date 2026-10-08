@@ -543,6 +543,8 @@ class AnsibleExecutor:
                 "ANSIBLE_LOCAL_TEMP": str(home / "tmp"),
                 "ANSIBLE_RETRY_FILES_ENABLED": "0",
                 "ANSIBLE_NOCOLOR": "1",
+                # the downtime clock reads the stop task's result line: never hide skipped hosts
+                "ANSIBLE_DISPLAY_SKIPPED_HOSTS": "True",
                 "ANSIBLE_HOST_KEY_CHECKING": env.get("ANSIBLE_HOST_KEY_CHECKING", "False"),
                 "PYTHONUNBUFFERED": "1",
             }
@@ -662,12 +664,18 @@ class AnsibleExecutor:
                     # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
                     stop_seen_at = utcnow()
+                elif stop_seen_at is not None and line.startswith("TASK ["):
+                    # …the next task began without a result that ran: the stop was skipped
+                    stop_seen_at = None
                 elif stop_seen_at is not None and _RESULT_LINE.match(line):
                     # …but only once its result line shows it ran (a skipped task, e.g. with
-                    # data_copy: false, prints the TASK header too and stops nothing)
+                    # data_copy: false, prints the TASK header too and stops nothing); with a
+                    # loop, keep waiting while items are skipped
                     if not line.startswith("skipping:"):
                         await ctx.mark_downtime_start(at=stop_seen_at)  # type: ignore[union-attr]
-                    stop_seen_at = None
+                        stop_seen_at = None
+                    elif "(item=" not in line:
+                        stop_seen_at = None
             returncode = await proc.wait()
             if stop_seen_at is not None and ctx is not None:
                 # the playbook ended without a result line for the task: assume it ran

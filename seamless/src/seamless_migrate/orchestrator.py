@@ -181,6 +181,7 @@ class Orchestrator:
             "slow": 0,
         }
         self._last_tick_at: float | None = None
+        self._tick_errors = 0
         self._started = False
 
     # ------------------------------------------------------------------------------------------
@@ -398,9 +399,11 @@ class Orchestrator:
         for vm_id, stale in existing.items():
             if vm_id not in selected and stale.phase in REVALIDATABLE:
                 await self.cancel(stale.id, actor, "removed from the plan")
-        plan = await self._plan(plan_id)
-        plan.status = PlanStatus.validated
-        await self._save_plan(plan)
+
+        def mark_validated(fresh: Plan) -> None:
+            fresh.status = PlanStatus.validated
+
+        plan = await self._update_plan(plan_id, mark_validated)
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
         await self._emit(
@@ -518,9 +521,13 @@ class Orchestrator:
                 summary=f"Classified {len(vms)} VM(s) with the heuristic",
                 data={"tiers": dict(tiers)},
             )
-        plan.waves = plan_waves(vms, tiers, max_wave_size)
-        plan.status = PlanStatus.draft
-        await self._save_plan(plan)
+        waves = plan_waves(vms, tiers, max_wave_size)
+
+        def set_waves(fresh: Plan) -> None:
+            fresh.waves = waves
+            fresh.status = PlanStatus.draft
+
+        plan = await self._update_plan(plan.id, set_waves)
         await self._emit(
             "advisor.classification",
             note.summary,
@@ -549,8 +556,11 @@ class Orchestrator:
         blocked = [m.vm.name for m in migrations if m.phase == P.blocked]
         if blocked:
             raise NotAllowed(f"{len(blocked)} migration(s) are blocked: {', '.join(blocked[:10])}")
-        plan.status = PlanStatus.running
-        await self._save_plan(plan)
+
+        def start(fresh: Plan) -> None:
+            fresh.status = PlanStatus.running
+
+        plan = await self._update_plan(plan.id, start)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan
@@ -561,8 +571,14 @@ class Orchestrator:
             return plan
         if plan.status != PlanStatus.running:
             raise NotAllowed(f"only running plans can be paused (plan is {plan.status})")
-        plan.status = PlanStatus.paused
-        await self._save_plan(plan)
+
+        def pause(fresh: Plan) -> bool:
+            if fresh.status != PlanStatus.running:
+                return False
+            fresh.status = PlanStatus.paused
+            return True
+
+        plan = await self._update_plan(plan.id, pause)
         await self._emit("plan.paused", f"{plan.name} paused", plan_id=plan.id, actor=actor)
         return plan
 
@@ -822,11 +838,14 @@ class Orchestrator:
         assert self._wake is not None
         while not self._stopping:
             started = time.monotonic()
+            self._last_tick_at = started  # heartbeat: the loop is alive even during a long tick
             try:
                 await self.tick()
+                self._tick_errors = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._tick_errors += 1
                 log.exception("orchestrator tick failed")
             self._record_tick(time.monotonic() - started)
             with contextlib.suppress(TimeoutError):
@@ -843,12 +862,15 @@ class Orchestrator:
         task = self._tick_task
         running = task is not None and not task.done()
         age = None if self._last_tick_at is None else time.monotonic() - self._last_tick_at
-        stale = age is not None and age > 5 * max(self.settings.tick_s, 0.05)
+        # a tick heartbeats when it starts and when it ends: a long tick is not a dead loop
+        stale = age is not None and age > max(5 * self.settings.tick_s, 30.0)
+        failing = self._tick_errors >= 3  # the loop runs but every tick raises
         return {
             "running": running,
             "last_tick_age_s": None if age is None else round(age, 3),
             "ticks": int(self.tick_stats["count"]),
-            "healthy": (running and not stale) or (not self._started and not running),
+            "healthy": (running and not stale and not failing)
+            or (not self._started and not running),
         }
 
     def _record_tick(self, seconds: float) -> None:
@@ -869,9 +891,10 @@ class Orchestrator:
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
             return
-        # only the migrations of plans that can still have work: running ones, and paused ones
-        # whose in-flight steps still count against the concurrency limits
-        active = [p.id for p in all_plans if p.status in (PlanStatus.running, PlanStatus.paused)]
+        # only the migrations of plans that can still have work: running ones, plus paused and
+        # re-validated ones whose in-flight steps still count against the concurrency limits
+        live = (PlanStatus.running, PlanStatus.paused, PlanStatus.validated)
+        active = [p.id for p in all_plans if p.status in live]
         migrations = await self.db.list("migration", Migration, plan_id=active)
         by_plan: dict[str, list[Migration]] = defaultdict(list)
         for m in migrations:
@@ -975,10 +998,10 @@ class Orchestrator:
 
             def finish(fresh: Plan) -> bool:
                 nonlocal completed
-                if fresh.status != PlanStatus.running:
+                completed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                if not completed:
                     return False
                 fresh.status = PlanStatus.completed
-                completed = True
                 return True
 
             await self._update_plan(plan.id, finish)

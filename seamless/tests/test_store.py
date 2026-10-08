@@ -207,3 +207,11 @@ def test_delete_events_before(any_store: Store):
     assert [e.message for e in left] == ["e2", "e3", "e4"]
     assert any_store.max_seq() == left[-1].seq, "sequence numbers are not reused"
     assert any_store.delete_events_before(datetime(2020, 1, 1)) == 0  # naive = UTC
+    # an aware cutoff in another zone is normalised to UTC (SQLite stores UTC wall time)
+    from datetime import timezone
+
+    plus7 = timezone(timedelta(hours=7))
+    # 06:59+07:00 is Oct 3 23:59 UTC: it removes e2 (Oct 3 00:00) but not e3 (Oct 4 00:00)
+    assert any_store.delete_events_before(datetime(2026, 10, 4, 6, 59, tzinfo=plus7)) == 1
+    assert [e.message for e in any_store.events(since_seq=0, limit=100)] == ["e3", "e4"]
+    assert any_store.delete_events_before(datetime(2026, 10, 4, 7, 1, tzinfo=plus7)) == 1

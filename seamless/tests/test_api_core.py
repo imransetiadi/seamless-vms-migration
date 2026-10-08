@@ -331,12 +331,15 @@ def test_auth_lockout_after_repeated_failures(tmp_path):
             assert client.get("/api/v1/me", headers=bad).status_code == 401
         locked = client.get("/api/v1/me", headers=bad)
         assert locked.status_code == 429 and locked.json()["error"]["code"] == "too_many_requests"
-        # the lockout covers the address, valid tokens included, until the window drains
+        # valid tokens from the same address keep working (an ingress or NAT shares one
+        # address between everyone): only failed authentications are answered with 429
         good = {"Authorization": f"Bearer {tokens[Role.admin]}"}
-        assert client.get("/api/v1/me", headers=good).status_code == 429
+        assert client.get("/api/v1/me", headers=good).status_code == 200
+        assert client.get("/api/v1/me", headers=bad).status_code == 429
         assert client.get("/api/v1/health").status_code == 200, "public routes stay open"
         client.app.state.services._auth_failures.clear()
-        assert client.get("/api/v1/me", headers=good).status_code == 200
+        assert client.get("/api/v1/me", headers=bad).status_code == 401
+        assert "testclient" in client.app.state.services._auth_failures
         kinds = [e.kind for e in store.events(since_seq=0, limit=100)]
         assert kinds.count("auth.denied") >= 4
     store.dispose()

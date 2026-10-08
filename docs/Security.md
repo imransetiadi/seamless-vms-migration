@@ -206,7 +206,7 @@ QASuite case that exercises the control.
 | Category | Position in 0.1.0 |
 |---|---|
 | API1 Broken object-level authorization | Single-tenant control plane: every authenticated principal sees every plan; separation is by **role**, not by object ownership. Per-team scoping is not in 0.1.0 |
-| API2 Broken authentication | Hashed static tokens, constant-time comparison, `auth.denied` audit. No expiry. Lockout: after `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` (default 60) failed bearer authentications from one client address within a minute every request from that address gets `429` until the window drains (in-process, per replica); rate limiting beyond that — add at the ingress |
+| API2 Broken authentication | Hashed static tokens, constant-time comparison, `auth.denied` audit. No expiry. Lockout: after `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` (default 60) failed bearer authentications from one client address within a minute, further *failed* authentications from that address get `429` until the window drains (in-process, per replica; valid tokens are never blocked, so a shared ingress/NAT address cannot be used to lock operators out — set uvicorn's `FORWARDED_ALLOW_IPS` to the ingress address so the real client address is used); rate limiting beyond that — add at the ingress |
 | API3 Broken object property-level authorization | No credential material in any response model; status fields of `Provider` are ignored on create |
 | API4 Unrestricted resource consumption | Orchestrator concurrency caps; ingress limits recommended (C1-09) |
 | API5 Broken function-level authorization | Minimum role per route (§5.2) with the exhaustive `test_role_matrix` |

@@ -360,6 +360,7 @@ class Store:
         """
         if before.tzinfo is None:
             before = before.replace(tzinfo=UTC)
+        before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
         with self.engine.begin() as conn:
             result = conn.execute(events.delete().where(events.c.ts < before))
         return int(result.rowcount or 0)

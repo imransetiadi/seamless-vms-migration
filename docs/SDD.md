@@ -993,7 +993,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_DB_URL` | `sqlite:///{data_dir}/seamless.db` | database |
 | `SEAMLESS_HOST` / `SEAMLESS_PORT` | `127.0.0.1` / `8080` | bind |
 | `SEAMLESS_DEMO`, `SEAMLESS_DEMO_SPEED`, `SEAMLESS_DEMO_SEED`, `SEAMLESS_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before `429` (`0` disables) |
+| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (valid tokens always pass; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |

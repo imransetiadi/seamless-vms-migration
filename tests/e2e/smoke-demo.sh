@@ -28,6 +28,7 @@ me=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/me" || echo '{}')
 check "/me is admin"                '[[ "$me" == *\"role\":\"admin\"* ]]'
 index=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$BASE/")
 check "dashboard served at /"       '[ "$index" = 200 ] && curl -fsS -m 10 "$BASE/" | grep -qi "<div id=\"root\""'
+check "security headers on / and the API" 'curl -sSI -m 10 "$BASE/" | grep -qi "^content-security-policy:" && curl -sSI -m 10 "$BASE/api/v1/health" | grep -qi "^x-content-type-options: nosniff"'
 check "SPA fallback for /plans"     '[ "$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$BASE/plans")" = 200 ]'
 check "metrics endpoint"            'curl -fsS -m 10 -H "$H" "$BASE/api/v1/metrics" | grep -q "^seamless_"'
 

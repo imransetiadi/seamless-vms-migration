@@ -961,6 +961,14 @@ async def test_orchestrator_health_reports_loop_state(tmp_path, store):
     h.orch._started = True
     assert h.orch.health()["healthy"] is False
     h.orch._started = False
+    # a loop whose ticks keep raising is unhealthy even though it runs
+    await h.orch.start()
+    await asyncio.sleep(0.02)
+    h.orch._tick_errors = 3
+    assert h.orch.health()["healthy"] is False
+    h.orch._tick_errors = 0
+    assert h.orch.health()["healthy"] is True
+    await h.orch.stop()
 
 
 async def test_executor_supplied_downtime_start_is_kept(tmp_path, store):
