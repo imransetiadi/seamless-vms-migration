@@ -39,6 +39,7 @@ STUBBED = (
     "import_workload_rollback",
     "os_conversion_host_info",
     "server_action",
+    "server_info",
 )
 
 STUB = r'''#!/usr/bin/python
@@ -157,6 +158,10 @@ elif NAME == "import_workload_rollback":
             save(path, state)
 elif NAME == "server_action":
     result = {"changed": True}
+elif NAME == "server_info":
+    status = world.get("server_status", {}).get(args["server"], "ACTIVE")
+    result = {"changed": False, "servers": [] if status == "MISSING" else [
+        {"id": args["server"], "name": args["server"], "status": status}]}
 print(json.dumps(result))
 '''
 
@@ -404,6 +409,47 @@ def test_failed_precopy_removes_the_snapshot_and_reports(env):
     assert env.state("srv-1")["pending_snapshot"] is None
     assert "Warm pre-copy of vm1 failed: injected import_workload_warm_sync failure" in out
     assert modules_for(calls, "vm2", "srv-2") == []  # the play stops on failure
+
+
+def test_cutover_rerun_refuses_a_failed_destination_server(env):
+    """A recorded destination server in ERROR is not 'already cut over'."""
+    rc, out, _ = env.run("import_workloads_cutover")
+    assert rc == 0, out
+    env.world["server_status"] = {"dst-vm1": "ERROR"}
+
+    rc, out, calls = env.run("import_workloads_cutover")
+
+    assert rc != 0
+    assert "destination server dst-vm1 is in ERROR" in out
+    assert "rollback_workloads.yml" in out
+    # nothing stopped, synchronised or created again (the rescue's snapshot cleanup is a no-op)
+    sequence = modules_for(calls, "vm1", "srv-1")
+    assert not {"server_action:stop", "import_workload_warm_sync", "import_workload_create_instance"} & set(sequence)
+    looked_up = [c["args"]["server"] for c in calls if c["module"] == "server_info"]
+    assert looked_up == ["dst-vm1"]
+
+
+def test_cutover_rerun_is_a_noop_for_a_healthy_destination_server(env):
+    rc, out, _ = env.run("import_workloads_cutover")
+    assert rc == 0, out
+
+    rc, out, calls = env.run("import_workloads_cutover")
+
+    assert rc == 0, out
+    assert "destination server dst-vm1 was already created" in out
+    assert modules_for(calls, "vm1", "srv-1") == []
+    assert [c["args"]["server"] for c in calls if c["module"] == "server_info"] == ["dst-vm1", "dst-vm2"]
+
+
+def test_rollback_passes_the_destination_conversion_host(env):
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_delete_dest_volumes=True)
+
+    assert rc == 0, out
+    rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
+    assert {r["conversion_host"] for r in rollback} == {"os_migrate_conv_dst"}
 
 
 def test_rollback_keeps_destination_volumes_by_default(env):

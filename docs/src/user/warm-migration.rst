@@ -23,7 +23,9 @@ How a pass works
    changed chunks from ``blocksync send`` on the source host, over the same
    SSH link the cold migration uses. All-zero chunks are recognised without
    hashing; a manifest digest over every chunk digest is verified at the end
-   of each pass.
+   of each pass (``os_migrate_warm_assume_zero`` skips reading never-written
+   destination chunks of the first pre-copy pass, so their digests are
+   assumed; the final pass always reads everything).
 #. The temporary snapshots and volumes are removed, and the pass is appended
    to the *warm state file*.
 
@@ -47,14 +49,19 @@ Run ``export_workloads.yml`` first, exactly as for the cold path, then:
     stop the source server (wait for ``SHUTOFF``) → snapshot → sync
     (``final``) → remove the snapshot → create the destination server with
     ``import_workload_create_instance`` and record its id in the warm state. A
-    cutover whose destination server already exists is a no-op, and the
-    cutover refuses to stop a source whose name is already used by a
-    destination server it did not create.
+    cutover whose destination server already exists is a no-op (it fails
+    instead when that server is in ``ERROR`` or gone: roll the workload back
+    and cut over again), and the cutover refuses to stop a source whose name
+    is already used by a destination server it did not create. A cutover that
+    fails after the source was stopped leaves it ``SHUTOFF`` and keeps the
+    destination volumes: retry the cutover or roll back.
 
 ``rollback_workloads.yml``
     delete the recorded destination server (and, with
     ``os_migrate_rollback_delete_dest_volumes: true``, the destination volumes
-    and the warm state) → start the source server again. For workloads without
+    and the warm state; a volume still attached to a server other than the
+    destination conversion host is kept and reported) → start the source
+    server again. The playbooks stop at the first failing workload. For workloads without
     a warm state (for example a cold migration) set
     ``os_migrate_rollback_match_by_name: true`` to delete the only destination
     server named exactly like the workload.
@@ -102,8 +109,9 @@ Variables
      - disks of a workload synchronised at the same time
    * - ``os_migrate_warm_assume_zero``
      - ``false``
-     - skip reading destination volumes created by the first pass; only for
-       backends that return zeros for never-written blocks (Ceph RBD, thin LVM)
+     - skip reading destination volumes created by the first pre-copy pass;
+       only for backends that return zeros for never-written blocks (Ceph
+       RBD, thin LVM); never applied to a final pass
    * - ``os_migrate_workloads_preserve_volume_type``
      - ``false``
      - create destination volumes with the serialized ``volume_type``
@@ -111,7 +119,13 @@ Variables
        of the destination default; also honoured by ``import_workloads``
    * - ``os_migrate_rollback_delete_dest_volumes``
      - ``false``
-     - the rollback also deletes the destination volumes and the warm state
+     - the rollback also deletes the destination volumes and the warm state;
+       a volume still attached to a server other than the destination
+       conversion host is kept and reported
+   * - ``os_migrate_dst_conversion_host_name``
+     - ``os_migrate_conv_dst``
+     - destination conversion host; the only server a rollback detaches
+       destination volumes from
    * - ``os_migrate_rollback_match_by_name``
      - ``false``
      - rollback of a workload without a warm state: delete the only

@@ -29,9 +29,12 @@ description:
     clears the record, so a later cutover can create it again."
   - "With I(delete_dest_volumes) the destination volumes are deleted too (the
     ones recorded in the warm state and every volume attached to the deleted
-    server), and so is the warm state file. The file is kept while a source
-    snapshot is still pending, so its temporary resources can be cleaned up
-    with M(os_migrate.os_migrate.import_workload_warm_snapshot)."
+    server), and so is the warm state file. A volume that is still attached to
+    another server is detached only when that server is the destination
+    conversion host (I(conversion_host)); otherwise it is kept and listed in
+    C(kept_volume_ids). The file is kept while a source snapshot is still
+    pending, so its temporary resources can be cleaned up with
+    M(os_migrate.os_migrate.import_workload_warm_snapshot)."
   - "Starting the source server again is left to the caller."
 
 options:
@@ -71,6 +74,13 @@ options:
     required: false
     default: 1800
     type: int
+  conversion_host:
+    description:
+      - Name or ID of the destination conversion host. Volumes left attached
+        to it by an interrupted pass are detached before deletion; volumes
+        attached to any other server are kept.
+    required: false
+    type: str
 """
 
 EXAMPLES = r"""
@@ -94,6 +104,12 @@ deleted_volume_ids:
   type: list
   elements: str
   sample: [3b7a57d7-8210-47f9-b592-a6627ae52d13]
+kept_volume_ids:
+  description: Destination volumes kept because another server than the conversion host uses them.
+  returned: success
+  type: list
+  elements: str
+  sample: []
 state_deleted:
   description: Whether the warm state file was removed.
   returned: success
@@ -122,6 +138,7 @@ def run_module():
         match_by_name=dict(type="bool", default=False),
         dst_filters=dict(type="dict", default={}),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
+        conversion_host=dict(type="str", default=None),
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
@@ -143,6 +160,7 @@ def run_module():
             match_by_name=params["match_by_name"],
             dst_filters=params["dst_filters"],
             timeout=params["timeout"],
+            conversion_host=params["conversion_host"],
         ).run(delete_volumes=params["delete_dest_volumes"])
     except Exception as err:  # pylint: disable=broad-except
         module.fail_json(msg="Rollback of server %s failed: %s" % (server_id, err))

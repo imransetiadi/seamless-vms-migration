@@ -4,6 +4,7 @@ __metaclass__ = type
 
 import copy
 import json
+import logging
 import os
 import shlex
 import stat
@@ -623,6 +624,34 @@ def test_sync_assume_zero_only_for_new_volumes(tmp_path):
 
     assert all("--assume-zero" in argv[:argv.index("--")] for argv in first)
     assert not any("--assume-zero" in argv for argv in second)
+
+
+def test_sync_final_pass_never_assumes_zero(tmp_path, caplog):
+    """A cutover without a preceding pre-copy creates the destination volumes
+    in the final pass; that pass must read them in full (no later pass
+    would catch a backend that does not return zeros)."""
+    scenario = Scenario(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        sync_pass = scenario.run_pass("uuid-1", pass_kind="final", assume_zero=True)
+
+    assert sync_pass["kind"] == "final"
+    assert not any("--assume-zero" in argv for argv in receive_commands(scenario))
+    assert "assume_zero ignored for the final pass" in caplog.text
+
+
+def test_sync_warns_about_recorded_volumes_without_a_source_device(tmp_path, caplog):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    state = scenario.state()
+    state.dest_volumes["/dev/vdz"] = dict(state.dest_volumes["/dev/vdb"], name="stale")
+    state.save()
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        scenario.run_pass("uuid-2")
+
+    assert "/dev/vdz" in caplog.text and "no source device" in caplog.text
+    assert "/dev/vdz" in scenario.state().dest_volumes  # kept for the rollback
 
 
 def test_sync_failure_detaches_and_raises(tmp_path):

@@ -675,6 +675,14 @@ Twenty-three further iterations after the integration run, each verified with th
   is marked as ignored; the mock honours `limit`/`offset`, keeps `/health` and `/ready` outside the
   simulated lockout and uses the backend's 600 s SLO default; the browser smoke selects the sidebar theme
   toggle by its visible name.
+* Collection review wave (independent reviewer, warm path): `assume_zero` is never applied to a final
+  pass (a cutover without pre-copy reads new volumes in full); a rollback with
+  `delete_dest_volumes` keeps a volume held by any server other than the destination conversion host
+  (`kept_volume_ids`, Security.md R-10); a cutover re-run fails on a recorded destination server in
+  `ERROR` or gone instead of reporting "already created"; recorded destination volumes without a source
+  device are warned about; docs name the SHUTOFF state after a failed cutover and the stop-at-first-failure
+  loop; SDD §6.5 lists every warm variable. 100 collection tests, syntax checks and ansible-lint green.
+  Deferred with rationale: helper script in `/tmp` (R-02) and host-key policy (R-11) wait for the lab.
 
 ### 13.2 Exit criteria — release 0.1.0
 

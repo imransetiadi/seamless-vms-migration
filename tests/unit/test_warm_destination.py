@@ -169,6 +169,7 @@ def test_rollback_deletes_recorded_server_and_keeps_volumes(tmp_path):
         "changed": True,
         "deleted_server_id": "dst-srv",
         "deleted_volume_ids": [],
+        "kept_volume_ids": [],
         "state_deleted": False,
     }
     assert "dst-srv" not in dst.servers and "other" in dst.servers
@@ -218,10 +219,46 @@ def test_rollback_detaches_volumes_left_on_the_conversion_host(tmp_path):
         {"server_id": "dst-conv", "device": "/dev/vdb", "volume_id": "dvol-data"}
     )
 
-    WarmRollback(dst, WarmState.load(state_dir, "srv-1"), timeout=5).run(delete_volumes=True)
+    WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), timeout=5, conversion_host="dst-conv"
+    ).run(delete_volumes=True)
 
     assert "dvol-data" not in dst.volumes
     assert ("detach_volume", {"server": "dst-conv", "volume": "dvol-data"}) in dst.calls
+
+
+def test_rollback_keeps_volumes_held_by_another_server(tmp_path):
+    """A shared volume attached to a server outside the migration is never
+    detached from it or deleted (the role names only the conversion host)."""
+    dst, state_dir = migrated(tmp_path)
+    dst.volumes["dvol-data"].attachments.append(
+        {"server_id": "other", "device": "/dev/vdb", "volume_id": "dvol-data"}
+    )
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), timeout=5, conversion_host="dst-conv"
+    ).run(delete_volumes=True)
+
+    assert result["deleted_volume_ids"] == ["dvol-boot"]
+    assert result["kept_volume_ids"] == ["dvol-data"]
+    assert "dvol-data" in dst.volumes
+    assert not [c for c in dst.calls_to("detach_volume") if c[1]["volume"] == "dvol-data"]
+    assert result["state_deleted"] is True  # the kept volume is no longer recorded
+    assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
+
+
+def test_rollback_without_a_conversion_host_keeps_every_attached_volume(tmp_path):
+    dst, state_dir = migrated(tmp_path)
+    dst.volumes["dvol-data"].attachments.append(
+        {"server_id": "dst-conv", "device": "/dev/vdb", "volume_id": "dvol-data"}
+    )
+
+    result = WarmRollback(dst, WarmState.load(state_dir, "srv-1"), timeout=5).run(
+        delete_volumes=True
+    )
+
+    assert result["kept_volume_ids"] == ["dvol-data"]
+    assert "dvol-data" in dst.volumes
 
 
 def test_rollback_without_a_record_does_nothing(tmp_path):
