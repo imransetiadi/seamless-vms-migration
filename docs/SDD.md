@@ -302,8 +302,16 @@ active enters `cutover` when all hold:
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
 
 `POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`.
-While waiting, a warm migration runs a keep-warm delta pass whenever the last pass ended more than
-`plan.keep_warm_interval_s` ago (`awaiting_cutover → syncing → awaiting_cutover`).
+While waiting — for the gate or for a free cutover slot (rule 4) — a warm migration runs a keep-warm
+delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ago
+(`awaiting_cutover → syncing → awaiting_cutover`; the interval is at least 60 s).
+Approvals, `cutover_requested` and a pending `force_window` belong to the assessment they were given
+for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
+or estimate is approved again by a human. A VM whose migration is `cancelled` (terminal) cannot be
+re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
+plan them anew).
+`vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
+them; the SLO estimate and `max_sync_passes` decide.
 
 ---
 
@@ -631,7 +639,7 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
 ```
 
 Let `D = vm.disk_bytes`, `Dmax` = size of the largest disk, `U = vm.used_bytes`,
-`c = vm.change_rate_bps or params.change_rate_bps`, `L = link_bps`, `S = scan_bps` (per disk
+`c = vm.change_rate_bps if it is not None else params.change_rate_bps` (a calibrated 0 B/s stays 0), `L = link_bps`, `S = scan_bps` (per disk
 stream), `P = params.parallel_disks` (default 4 — the collection's `DEFAULT_PARALLEL_DISKS`; disks
 of one VM are synced concurrently), `A = params.max_aggregate_scan_bps` (default `null` = `S·P`; set
 it to the conversion host's storage-path ceiling, e.g. ≈ 1190 MiB/s behind 10 GbE), `V` = number of
@@ -701,14 +709,14 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
-| `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is, emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name) |
-| `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` — info — names it) |
-| `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
+| `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
+| `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
+| `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty, and when a mapping's *target* type does not exist in the destination | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
-| `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present |
-| `VM_VGPU` | blocker | extra spec `resources:VGPU` present |
+| `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
+| `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
 | `GUEST_OS_LEGACY` | warning | `os_type` matches `rhel[3-6]`, `centos[3-6]`, `windows200[038]` |
 | `VMW_CBT_DISABLED` | warning (vmware_warm) | VMware VM with `cbt_enabled` false |
@@ -728,6 +736,9 @@ disks first). Remaining VMs are ordered by tier (the order above) then disk size
 chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
 `max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
 VMs go to a final wave named `Manual review`.
+`start_plan` refuses a plan with waves while a non-terminal migration belongs to no wave (a VM added
+to `vm_ids` after the waves were planned): re-run the planner or add the VM to a wave, otherwise it
+would start at once outside every wave's order and `max_parallel`.
 
 ---
 
