@@ -92,6 +92,35 @@ function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
   );
 }
 
+/** Shown above every page while GET /health is degraded or unreachable (SDD §12). */
+function HealthNotice() {
+  const health = useHealth();
+  if (health.isError) {
+    return (
+      <p role="status" className="mb-4 rounded-md border border-status-warning/50 bg-status-warning/10 px-3 py-2 text-sm text-foreground">
+        The control plane is not answering health checks; the data below may be stale.
+      </p>
+    );
+  }
+  const h = health.data;
+  if (!h || h.status !== 'degraded') return null;
+  const reasons: string[] = [];
+  if (h.db !== 'ok') reasons.push('the database is unreachable');
+  if (h.orchestrator && !h.orchestrator.healthy) {
+    reasons.push(
+      h.orchestrator.running
+        ? `the orchestrator has not ticked for ${Math.round(h.orchestrator.last_tick_age_s ?? 0)} s`
+        : 'the orchestrator loop is not running',
+    );
+  }
+  return (
+    <p role="status" className="mb-4 rounded-md border border-status-danger/50 bg-status-danger/10 px-3 py-2 text-sm text-foreground">
+      Control plane degraded: {reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is
+      resolved.
+    </p>
+  );
+}
+
 function SessionFooter() {
   const me = useMe();
   const health = useHealth();
@@ -203,6 +232,7 @@ export function Layout() {
           tabIndex={-1}
           className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
         >
+          <HealthNotice />
           <Outlet />
         </main>
       </div>

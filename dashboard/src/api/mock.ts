@@ -23,6 +23,7 @@ import {
   prng,
 } from './mockData';
 import type {
+  Health,
   AdvisorStatus,
   DestinationInventory,
   Estimate,
@@ -90,6 +91,14 @@ export interface MockServerOptions {
 }
 
 export class MockServer {
+  /** What GET /health answers; tests flip it to a degraded state. */
+  health: Health = {
+    status: 'ok',
+    version: '0.1.0-mock',
+    demo: true,
+    db: 'ok',
+    orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
+  };
   readonly providers: Provider[];
   readonly inventories: Record<string, VMRef[] | DestinationInventory>;
   readonly plans: Plan[];
@@ -474,7 +483,7 @@ export class MockServer {
     const [root, id, sub, subsub] = seg;
     const input = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
 
-    if (method === 'GET' && root === 'health') return ok({ status: 'ok', version: '0.1.0-mock', demo: true, db: 'ok', orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true } });
+    if (method === 'GET' && root === 'health') return ok(this.health);
 
     if (root === 'me' && method === 'GET') return ok(this.require(token, 'viewer', path));
 
