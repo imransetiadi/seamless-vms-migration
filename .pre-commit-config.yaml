@@ -1,0 +1,46 @@
+# Local guard rails mirroring the CI jobs (QASuite §13, Security.md §12).
+#   pipx install pre-commit   (or: uv tool install pre-commit)
+#   pre-commit install
+# gitleaks runs on every commit (S-17); ruff, shellcheck and actionlint keep the rest honest.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ^(roles|playbooks|tests/unit)/  # Ansible YAML with Jinja is validated by ansible-lint
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: end-of-file-fixer
+        exclude: ^dashboard/design-system/
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        args: [--config=.gitleaks.toml, --redact]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        files: ^seamless/
+        args: [--fix]
+      - id: ruff-format
+        files: ^seamless/
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        files: ^(scripts|tests/e2e)/.*\.sh$
+        args: [-S, warning]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.4
+    hooks:
+      - id: actionlint

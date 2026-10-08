@@ -422,7 +422,7 @@ SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused 
 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
         seamless-up seamless-demo seamless-down seamless-ps seamless-logs seamless-reset \
-        seamless-test dashboard-build
+        seamless-test seamless-check dashboard-build
 
 seamless-help:
 	@echo "Seamless Migrate stack (Docker Compose on Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
@@ -436,6 +436,7 @@ seamless-help:
 	@echo "  seamless-reset      - DELETE containers and volumes (requires CONFIRM=yes)"
 	@echo "  seamless-test       - run the control-plane test suite (cd seamless && .venv/bin/pytest -q)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
+	@echo "  seamless-check      - every CI check that runs locally: tests, ruff, collection tests, scans, dashboard"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
 # starts by default (--activate, default true), which would switch the developer's current Docker context:
@@ -493,6 +494,20 @@ seamless-reset: seamless-check-context
 seamless-test:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -q
+
+# Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go.
+seamless-check: seamless-test
+	cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
+	@mkdir -p .cache/colltree/ansible_collections/os_migrate \
+	 && ln -sfn "$(CURDIR)" .cache/colltree/ansible_collections/os_migrate/os_migrate
+	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
+	  PYTHONPATH="$(CURDIR)/.cache/colltree" ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" \
+	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q tests/unit/test_blocksync.py \
+	    tests/unit/test_warm_migration.py tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py
+	@command -v gitleaks >/dev/null && gitleaks dir --redact --no-banner . || echo "gitleaks not installed: skipped (S-17)"
+	@command -v actionlint >/dev/null && actionlint || echo "actionlint not installed: skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning scripts/*.sh tests/e2e/*.sh || echo "shellcheck not installed: skipped"
+	cd dashboard && npm run typecheck && npm run lint && npm test && npm run build
 
 dashboard-build:
 	@command -v npm >/dev/null 2>&1 || { echo "npm (Node 22) is required"; exit 1; }

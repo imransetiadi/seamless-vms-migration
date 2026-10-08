@@ -324,3 +324,91 @@ async def test_handover_rollback_reverses_order(tmp_path):
     assert new_vm["source_id"] == "src-new-1"
     assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
     assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists(), "journal archived"
+
+
+async def test_handover_rollback_with_empty_journal_is_a_noop(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="stop_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and result.details == {
+        "source_running": True,
+        "note": "nothing to roll back",
+    }
+
+
+async def test_handover_rollback_before_unmanage_reattaches_and_starts(tmp_path):
+    """Crash after the first detach: the rollback reattaches that volume and starts the source."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    attached = []
+    clouds["src"].compute.create_volume_attachment = lambda server_id, volume_id, device: (
+        attached.append((server_id, volume_id, device))
+    )
+    rb_ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.ROLLBACK, rb_ctx)
+    assert attached == [("srv-1", "vol-data", "/dev/vdb")]
+    assert ops(calls) == [("src", "start_server", "srv-1")]
+    assert result.details == {"source_running": True}, "same ids: nothing to report"
+    assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists()
+
+
+async def test_handover_rollback_after_unmanage_deletes_stale_source_and_recreates(tmp_path):
+    """Crash before the source server was deleted: both volumes are already unmanaged at the
+    source, so the rollback manages them back, removes the stale server and recreates it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    rb_ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.ROLLBACK, rb_ctx)
+    assert ops(calls) == [
+        ("src", "manage", "volume-vol-root"),
+        ("src", "manage", "volume-vol-data"),
+        ("src", "delete_server", "srv-1"),
+        ("src", "create_server", "web-01"),
+    ]
+    new_vm = result.details["vm"]
+    assert new_vm["source_id"] == "src-new-1"
+    assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
+    # a second rollback finds the archived journal gone and does nothing
+    calls.clear()
+    again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and again.details["note"] == "nothing to roll back"
+
+
+def test_existing_server_and_write_json_helpers(tmp_path):
+    from seamless_migrate.executors.handover import _existing_server, _write_json
+
+    class ResourceNotFound(Exception):
+        pass
+
+    class Gone(Exception):
+        status_code = 404
+
+    class Boom(Exception):
+        status_code = 500
+
+    def compute(exc):
+        return NS(compute=NS(get_server=lambda sid: (_ for _ in ()).throw(exc)))
+
+    assert _existing_server(compute(ResourceNotFound("x")), "srv") is None
+    assert _existing_server(compute(Gone("x")), "srv") is None
+    with pytest.raises(Boom):
+        _existing_server(compute(Boom("x")), "srv")
+    assert _existing_server(NS(compute=NS(get_server=lambda sid: "server")), "srv") == "server"
+
+    target = tmp_path / "nested" / "journal.json"
+    _write_json(target, {"b": 1, "a": [1, 2]})
+    assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(TypeError):
+        _write_json(target, {"bad": object()})
+    assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}, "atomic: old content kept"
+    assert [p.name for p in target.parent.iterdir()] == ["journal.json"], "temp file removed"

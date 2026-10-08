@@ -1,0 +1,50 @@
+# Dependency updates (Security.md §12 "dependency and image scans run monthly and before releases").
+# Grouped, weekly, so a single PR per ecosystem carries the routine bumps; security updates are
+# opened immediately regardless of the schedule.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /seamless
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      control-plane:
+        patterns: ["*"]
+    labels: [dependencies, control-plane]
+
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      dashboard:
+        patterns: ["*"]
+        # tailwind 4 is a migration, not a bump (Security.md R-09): keep it out of the group
+        exclude-patterns: ["tailwindcss"]
+    labels: [dependencies, dashboard]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [dependencies, ci]
+
+  - package-ecosystem: docker
+    directory: /seamless
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, image]
+
+  - package-ecosystem: docker
+    directory: /deploy/compose
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, image]

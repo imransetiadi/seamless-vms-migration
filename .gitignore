@@ -53,3 +53,6 @@ deploy/compose/compose.local.yaml
 # OpenShift: real secrets rendered from deploy/openshift/secret-example.yaml
 deploy/openshift/secret.yaml
 deploy/openshift/secrets/
+
+# local check scratch (make seamless-check)
+.cache/
