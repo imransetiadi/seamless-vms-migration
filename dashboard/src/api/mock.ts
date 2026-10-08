@@ -546,7 +546,11 @@ export class MockServer {
       if (!id) {
         if (method === 'GET') {
           this.require(token, 'viewer', path);
-          return ok(this.plans);
+          // SDD §12: status filter and limit/offset paging, like the migrations list
+          const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
+          const offset = Number(query.get('offset') ?? 0);
+          const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+          return ok(rows.slice(offset, offset + limit));
         }
         if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);
       } else {

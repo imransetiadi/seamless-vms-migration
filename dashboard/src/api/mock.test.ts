@@ -12,6 +12,7 @@ import {
   STRATEGIES,
   type Event,
   type Migration,
+  type Plan,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -84,6 +85,17 @@ describe('mock API', () => {
     expect(all).toHaveLength(server.migrations.length);
     const page = await client.get<Migration[]>('/migrations', { query: { limit: 2, offset: 1 } });
     expect(page.map((m) => m.id)).toEqual(all.slice(1, 3).map((m) => m.id));
+  });
+
+  it('filters and pages the plans list', async () => {
+    const { server, client } = setup();
+    const all = await client.get<Plan[]>('/plans');
+    expect(all).toHaveLength(server.plans.length);
+    const running = await client.get<Plan[]>('/plans', { query: { status: 'running' } });
+    expect(running.length).toBeGreaterThan(0);
+    expect(running.every((p) => p.status === 'running')).toBe(true);
+    const page = await client.get<Plan[]>('/plans', { query: { limit: 1, offset: 1 } });
+    expect(page.map((p) => p.id)).toEqual(all.slice(1, 2).map((p) => p.id));
   });
 
   it('enforces route roles (SDD §12)', async () => {
