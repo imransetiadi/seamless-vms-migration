@@ -44,7 +44,7 @@ function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 break-words text-sm text-foreground">{children}</dd>
+      <dd className="mt-0.5 wrap-break-word text-sm text-foreground">{children}</dd>
     </div>
   );
 }
@@ -307,7 +307,7 @@ export default function PlanDetail() {
           {migrations.data && <MigrationsTable migrations={list} plan={p} caption={`Migrations in ${p.name}`} />}
         </Panel>
 
-        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-none">
+        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-hidden">
           <Panel
             title="Findings"
             description={`${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`}

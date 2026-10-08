@@ -103,7 +103,7 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {inventory.volume_types.map((t) => (
-              <li key={t} className="rounded border border-border px-2 py-0.5 font-mono text-xs">
+              <li key={t} className="rounded-sm border border-border px-2 py-0.5 font-mono text-xs">
                 {t}
               </li>
             ))}

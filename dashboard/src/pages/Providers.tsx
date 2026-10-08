@@ -40,7 +40,7 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
         if (typeof value === 'boolean') {
           const Icon = value ? Check : Minus;
           return (
-            <li key={key} className={cn('inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-xs', value ? 'text-foreground' : 'text-muted-foreground')}>
+            <li key={key} className={cn('inline-flex items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs', value ? 'text-foreground' : 'text-muted-foreground')}>
               <Icon aria-hidden className={cn('size-3.5', value ? 'text-status-success' : 'text-muted-foreground')} />
               {label}
               <span className="sr-only">: {value ? 'yes' : 'no'}</span>
@@ -49,7 +49,7 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
         }
         const text = Array.isArray(value) ? value.join(', ') : String(value);
         return (
-          <li key={key} className="inline-flex max-w-full items-center gap-1 rounded border border-border px-1.5 py-0.5 text-xs text-foreground">
+          <li key={key} className="inline-flex max-w-full items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
             <span className="num truncate">{text}</span>
           </li>
@@ -102,7 +102,7 @@ function ProviderCard({
         <dt className="text-muted-foreground">Region</dt>
         <dd>{provider.region ?? '—'}</dd>
         <dt className="text-muted-foreground">Credentials</dt>
-        <dd className="min-w-0 break-words">
+        <dd className="min-w-0 wrap-break-word">
           {provider.cloud ? (
             <>
               clouds.yaml <code className="text-xs">{provider.cloud}</code>
@@ -130,7 +130,7 @@ function ProviderCard({
           )}
         </dd>
         <dt className="text-muted-foreground">Conversion host</dt>
-        <dd className="min-w-0 break-words">
+        <dd className="min-w-0 wrap-break-word">
           {ch ? (
             <>
               {ch.name ?? 'managed'} <span className="num text-muted-foreground">{ch.address ?? ''}</span>

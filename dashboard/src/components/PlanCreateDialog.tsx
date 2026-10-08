@@ -248,7 +248,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
 
         <div className="flex flex-col gap-6 px-5 py-4">
           {errorEntries.length > 0 && (
-            <div ref={summaryRef} tabIndex={-1} role="alert" aria-labelledby={id('summary')} className="rounded-md border border-status-danger/40 bg-status-danger/10 p-3 outline-none">
+            <div ref={summaryRef} tabIndex={-1} role="alert" aria-labelledby={id('summary')} className="rounded-md border border-status-danger/40 bg-status-danger/10 p-3 outline-hidden">
               <p id={id('summary')} className="flex items-center gap-2 font-medium text-foreground">
                 <CircleAlert aria-hidden className="size-4 text-status-danger" />
                 Fix {errorEntries.length} problem{errorEntries.length === 1 ? '' : 's'} to create the plan
@@ -308,7 +308,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
           </Fieldset>
 
           <fieldset className="flex min-w-0 flex-col gap-2" aria-describedby={errors.vms ? id('vms-error') : undefined}>
-            <legend id={id('vms')} tabIndex={-1} className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground outline-none">
+            <legend id={id('vms')} tabIndex={-1} className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground outline-hidden">
               VMs <span aria-hidden className="text-status-danger">*</span>
             </legend>
             {errors.vms && (

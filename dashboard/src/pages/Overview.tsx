@@ -115,7 +115,7 @@ function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans:
                       </Link>
                       <PhaseBadge phase={item.migration.phase} />
                     </div>
-                    <p className="mt-0.5 break-words text-sm text-foreground">{item.reason}</p>
+                    <p className="mt-0.5 wrap-break-word text-sm text-foreground">{item.reason}</p>
                     <p className="text-xs text-muted-foreground">Next: {item.nextAction}</p>
                   </div>
                 </li>

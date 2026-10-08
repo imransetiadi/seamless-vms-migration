@@ -1,6 +1,143 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --breakpoint-*: initial;
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+  --breakpoint-xl: 1280px;
+  --breakpoint-2xl: 1440px;
+
+  --color-background: rgb(var(--background));
+  --color-foreground: rgb(var(--foreground));
+
+  --color-card: rgb(var(--card));
+  --color-card-foreground: rgb(var(--card-foreground));
+
+  --color-muted: rgb(var(--muted));
+  --color-muted-foreground: rgb(var(--muted-foreground));
+
+  --color-border: rgb(var(--border));
+  --color-input: rgb(var(--input));
+
+  --color-primary: rgb(var(--primary));
+  --color-primary-foreground: rgb(var(--primary-foreground));
+
+  --color-accent: rgb(var(--accent));
+  --color-accent-foreground: rgb(var(--accent-foreground));
+
+  --color-destructive: rgb(var(--destructive));
+  --color-destructive-foreground: rgb(var(--destructive-foreground));
+
+  --color-ring: rgb(var(--ring));
+
+  --color-status-neutral: rgb(var(--status-neutral));
+  --color-status-info: rgb(var(--status-info));
+  --color-status-progress: rgb(var(--status-progress));
+  --color-status-warning: rgb(var(--status-warning));
+  --color-status-success: rgb(var(--status-success));
+  --color-status-danger: rgb(var(--status-danger));
+
+  --color-chart-1: rgb(var(--chart-1));
+  --color-chart-2: rgb(var(--chart-2));
+  --color-chart-reference: rgb(var(--chart-reference));
+  --color-chart-grid: rgb(var(--chart-grid));
+
+  --font-sans:
+    'Fira Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  --font-mono:
+    'Fira Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+
+  --default-transition-duration: 200ms;
+
+  --z-index-nav: 20;
+  --z-index-overlay: 40;
+  --z-index-modal: 50;
+  --z-index-toast: 60;
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility card {
+  @apply rounded-lg border border-border bg-card text-card-foreground;
+}
+
+@utility num {
+  @apply font-mono tabular-nums;
+}
+
+@utility field-label {
+  @apply mb-1 block text-sm font-medium text-foreground;
+}
+
+@utility field-hint {
+  @apply mt-1 text-xs text-muted-foreground;
+}
+
+@utility field-error {
+  @apply mt-1 flex items-center gap-1 text-sm text-status-danger;
+}
+
+@utility input {
+  @apply block min-h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-base text-foreground placeholder:text-muted-foreground transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-status-danger sm:text-sm;
+}
+
+@utility skip-link {
+  @apply sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-toast focus:rounded-md focus:bg-accent focus:px-4 focus:py-2 focus:font-medium focus:text-accent-foreground;
+}
+
+@utility table-wrap {
+  @apply w-full overflow-x-auto;
+}
+
+@utility data-table {
+  @apply w-full border-collapse text-left text-sm;
+
+  & thead th {
+    @apply whitespace-nowrap border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground;
+  }
+
+  & tbody th {
+    @apply border-b border-border/60 px-3 py-2 align-middle;
+  }
+
+  & td {
+    @apply border-b border-border/60 px-3 py-2 align-middle;
+  }
+
+  & tbody th {
+    @apply text-left font-medium text-foreground;
+  }
+
+  & tbody tr {
+    @apply transition-colors duration-150 hover:bg-muted/40;
+  }
+}
+
+@utility animate-dialog-in {
+  /* Modal entrance: short fade + lift (motion 3/10). Removed under prefers-reduced-motion. */
+  animation: dialog-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
 
 /*
  * Design tokens.
@@ -137,64 +274,6 @@
 }
 
 @layer components {
-  .card {
-    @apply rounded-lg border border-border bg-card text-card-foreground;
-  }
-
-  .num {
-    @apply font-mono tabular-nums;
-  }
-
-  .field-label {
-    @apply mb-1 block text-sm font-medium text-foreground;
-  }
-
-  .field-hint {
-    @apply mt-1 text-xs text-muted-foreground;
-  }
-
-  .field-error {
-    @apply mt-1 flex items-center gap-1 text-sm text-status-danger;
-  }
-
-  .input {
-    @apply block min-h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-base text-foreground placeholder:text-muted-foreground transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50 aria-[invalid=true]:border-status-danger sm:text-sm;
-  }
-
-  .skip-link {
-    @apply sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-toast focus:rounded-md focus:bg-accent focus:px-4 focus:py-2 focus:font-medium focus:text-accent-foreground;
-  }
-
-  .table-wrap {
-    @apply w-full overflow-x-auto;
-  }
-
-  .data-table {
-    @apply w-full border-collapse text-left text-sm;
-  }
-
-  .data-table thead th {
-    @apply whitespace-nowrap border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground;
-  }
-
-  .data-table tbody th,
-  .data-table td {
-    @apply border-b border-border/60 px-3 py-2 align-middle;
-  }
-
-  .data-table tbody th {
-    @apply text-left font-medium text-foreground;
-  }
-
-  .data-table tbody tr {
-    @apply transition-colors duration-150 hover:bg-muted/40;
-  }
-
-  /* Modal entrance: short fade + lift (motion 3/10). Removed under prefers-reduced-motion. */
-  .animate-dialog-in {
-    animation: dialog-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
-  }
-
   @keyframes dialog-in {
     from {
       opacity: 0;

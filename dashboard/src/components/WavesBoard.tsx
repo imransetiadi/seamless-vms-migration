@@ -52,7 +52,7 @@ export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migr
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">
                   Wave {wave.order} · <code>{wave.id}</code>
                 </p>
-                <h3 className="break-words text-sm font-semibold text-foreground">{wave.name}</h3>
+                <h3 className="wrap-break-word text-sm font-semibold text-foreground">{wave.name}</h3>
               </div>
               <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} />
             </div>

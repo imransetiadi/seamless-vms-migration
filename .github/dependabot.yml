@@ -21,8 +21,6 @@ updates:
     groups:
       dashboard:
         patterns: ["*"]
-        # tailwind 4 is a migration, not a bump (Security.md R-09): keep it out of the group
-        exclude-patterns: ["tailwindcss"]
     labels: [dependencies, dashboard]
 
   - package-ecosystem: github-actions

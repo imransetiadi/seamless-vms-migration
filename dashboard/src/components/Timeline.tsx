@@ -69,8 +69,8 @@ export function Timeline({ history, events }: { history: PhaseChange[]; events: 
             <entry.icon className="size-3.5" />
           </span>
           <div className="min-w-0 flex-1">
-            <p className="break-words text-sm font-medium text-foreground">{entry.title}</p>
-            {entry.detail && <p className="break-words text-xs text-muted-foreground">{entry.detail}</p>}
+            <p className="wrap-break-word text-sm font-medium text-foreground">{entry.title}</p>
+            {entry.detail && <p className="wrap-break-word text-xs text-muted-foreground">{entry.detail}</p>}
             <p className="text-xs text-muted-foreground">
               <time dateTime={entry.at} title={formatDateTime(entry.at)} className="num">
                 {formatTime(entry.at)}

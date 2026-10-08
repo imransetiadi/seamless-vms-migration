@@ -98,7 +98,7 @@ export function Modal({
         tabIndex={-1}
         onKeyDown={onKeyDown}
         className={cn(
-          'card animate-dialog-in relative max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto shadow-xl outline-none',
+          'card animate-dialog-in relative max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto shadow-xl outline-hidden',
           size === 'md' ? 'max-w-lg' : 'max-w-3xl',
         )}
       >

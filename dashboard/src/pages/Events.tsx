@@ -244,7 +244,7 @@ export default function Events() {
                   <code className="break-all text-foreground">{event.kind}</code>
                 </span>
                 <div className="min-w-0">
-                  <p className="break-words text-sm text-foreground">{event.message || '—'}</p>
+                  <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
                   <p className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
                     <span>by {event.actor}</span>
                     {event.plan_id && (

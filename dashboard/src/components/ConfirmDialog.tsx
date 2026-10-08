@@ -84,7 +84,7 @@ export function ConfirmDialog({
         {requireText !== undefined && (
           <div>
             <label htmlFor={inputId} className="field-label">
-              Type <code className="rounded bg-muted px-1 py-0.5 text-foreground">{requireText}</code> to confirm
+              Type <code className="rounded-sm bg-muted px-1 py-0.5 text-foreground">{requireText}</code> to confirm
             </label>
             <input
               ref={inputRef}

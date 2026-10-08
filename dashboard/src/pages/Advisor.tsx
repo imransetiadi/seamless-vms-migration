@@ -54,7 +54,7 @@ function ServiceCard({
         ))}
       </dl>
       {lastError && (
-        <p className="break-words rounded-md border border-status-warning/40 bg-status-warning/10 px-2.5 py-1.5 text-xs text-foreground">
+        <p className="wrap-break-word rounded-md border border-status-warning/40 bg-status-warning/10 px-2.5 py-1.5 text-xs text-foreground">
           Last error: {lastError}
         </p>
       )}
@@ -205,7 +205,7 @@ export default function Advisor() {
                       <span className="font-medium text-foreground">{hit.title}</span>
                       {typeof hit.score === 'number' && <span className="num text-xs text-muted-foreground">match {formatPct(hit.score * 100, 0)}</span>}
                     </p>
-                    <p className="mt-1 break-words text-muted-foreground">{hit.content}</p>
+                    <p className="mt-1 wrap-break-word text-muted-foreground">{hit.content}</p>
                   </li>
                 ))}
               </ol>

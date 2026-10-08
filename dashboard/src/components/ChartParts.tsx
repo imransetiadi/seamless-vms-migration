@@ -37,7 +37,7 @@ export interface ChartDataTableProps {
 export function ChartDataTable({ caption, columns, rows }: ChartDataTableProps) {
   return (
     <details className="group mt-2 text-sm">
-      <summary className="inline-flex min-h-8 cursor-pointer select-none items-center gap-1.5 rounded text-muted-foreground transition-colors duration-200 hover:text-foreground">
+      <summary className="inline-flex min-h-8 cursor-pointer select-none items-center gap-1.5 rounded-sm text-muted-foreground transition-colors duration-200 hover:text-foreground">
         <Table2 aria-hidden className="size-3.5" />
         <span className="group-open:hidden">Show data table</span>
         <span className="hidden group-open:inline">Hide data table</span>

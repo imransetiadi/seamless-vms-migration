@@ -71,7 +71,7 @@ function Alerts({ m }: { m: Migration }) {
       {m.error && (
         <div className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <CircleX aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
-          <p className="break-words text-foreground">
+          <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Last error:</strong> {m.error}
           </p>
         </div>
@@ -79,7 +79,7 @@ function Alerts({ m }: { m: Migration }) {
       {m.review_required && (
         <div className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
           <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
-          <p className="break-words text-foreground">
+          <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Review required.</strong> {m.review_reason ?? 'The advisor flagged this migration for a human check.'}
           </p>
         </div>
@@ -256,7 +256,7 @@ function VmDetails({ m }: { m: Migration }) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Disks</h3>
         <ul className="flex flex-col gap-1">
           {vm.disks.map((d) => (
-            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded border border-border px-2 py-1">
+            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded-sm border border-border px-2 py-1">
               <span className="font-mono text-xs">
                 {d.device ?? d.name ?? d.id} {d.bootable && <span className="text-muted-foreground">(boot)</span>}
               </span>
@@ -274,7 +274,7 @@ function VmDetails({ m }: { m: Migration }) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Networks</h3>
         <ul className="flex flex-col gap-1">
           {vm.nics.map((n, i) => (
-            <li key={`${n.network}-${i}`} className="flex flex-wrap justify-between gap-x-2 rounded border border-border px-2 py-1 text-xs">
+            <li key={`${n.network}-${i}`} className="flex flex-wrap justify-between gap-x-2 rounded-sm border border-border px-2 py-1 text-xs">
               <span className="font-mono">{n.network}</span>
               <span className="num text-muted-foreground">
                 {n.fixed_ips.join(', ') || 'no fixed IP'} · MTU {n.mtu ?? '—'} · {n.vnic_type}
@@ -299,7 +299,7 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
           <time dateTime={a.at} title={formatDateTime(a.at)} className="text-muted-foreground">
             {formatRelative(a.at)}
           </time>
-          {a.comment && <p className="break-words text-muted-foreground">“{a.comment}”</p>}
+          {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
         </li>
       ))}
       {m.cutover_requested && <li className="text-xs text-status-success">Cutover requested</li>}

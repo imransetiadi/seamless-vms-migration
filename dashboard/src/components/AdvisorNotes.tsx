@@ -35,7 +35,7 @@ function NoteDetails({ note }: { note: AdvisorNote }) {
                 {text(hit.title)}
                 {typeof hit.score === 'number' && <span className="num ml-2 font-normal text-muted-foreground">match {formatPct(hit.score * 100, 0)}</span>}
               </p>
-              <p className="break-words text-muted-foreground">{text(hit.content)}</p>
+              <p className="wrap-break-word text-muted-foreground">{text(hit.content)}</p>
             </li>
           ))}
         </ul>
@@ -82,7 +82,7 @@ export function AdvisorNotes({ notes, emptyText = 'No advisor notes.' }: { notes
             <li key={`${note.created_at}-${index}`} className="py-2.5">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                 <span className="font-semibold text-foreground">{ADVISOR_KIND_LABELS[note.kind] ?? note.kind}</span>
-                <span className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-muted-foreground">
+                <span className="inline-flex items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-muted-foreground">
                   <SourceIcon aria-hidden className="size-3.5" />
                   {ADVISOR_SOURCE_LABELS[note.source] ?? note.source}
                 </span>
@@ -99,7 +99,7 @@ export function AdvisorNotes({ notes, emptyText = 'No advisor notes.' }: { notes
                   {formatRelative(note.created_at)}
                 </time>
               </div>
-              <p className="mt-1 break-words text-sm text-foreground">{note.summary}</p>
+              <p className="mt-1 wrap-break-word text-sm text-foreground">{note.summary}</p>
               <NoteDetails note={note} />
             </li>
           );

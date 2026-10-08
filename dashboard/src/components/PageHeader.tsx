@@ -25,7 +25,7 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta }: P
               <li key={`${crumb.label}-${index}`} className="flex min-w-0 items-center gap-1">
                 {index > 0 && <ChevronRight aria-hidden className="size-3.5 shrink-0" />}
                 {crumb.to ? (
-                  <Link to={crumb.to} className="truncate rounded underline-offset-4 hover:text-foreground hover:underline">
+                  <Link to={crumb.to} className="truncate rounded-sm underline-offset-4 hover:text-foreground hover:underline">
                     {crumb.label}
                   </Link>
                 ) : (
@@ -40,7 +40,7 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta }: P
       )}
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
-          <h1 className="break-words text-xl font-semibold text-foreground md:text-2xl">{title}</h1>
+          <h1 className="wrap-break-word text-xl font-semibold text-foreground md:text-2xl">{title}</h1>
           {description && <div className="mt-1 max-w-3xl text-sm text-muted-foreground">{description}</div>}
           {meta && <div className="mt-2 flex flex-wrap items-center gap-2">{meta}</div>}
         </div>

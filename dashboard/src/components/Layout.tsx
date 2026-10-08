@@ -102,7 +102,7 @@ function SessionFooter() {
       <div className="flex items-center justify-between gap-2 px-1">
         <LiveIndicator />
         {health.data?.demo && (
-          <span className="rounded border border-status-info/40 px-1.5 py-0.5 text-xs text-status-info">Demo</span>
+          <span className="rounded-sm border border-status-info/40 px-1.5 py-0.5 text-xs text-status-info">Demo</span>
         )}
       </div>
       {me.data && (
@@ -169,7 +169,7 @@ export function Layout() {
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur lg:hidden">
+        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm lg:hidden">
           <button
             type="button"
             onClick={() => setMenuOpen((open) => !open)}
@@ -201,7 +201,7 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-none md:px-6 md:py-6"
+          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
         >
           <Outlet />
         </main>
