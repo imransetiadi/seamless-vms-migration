@@ -1024,6 +1024,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
+| `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§7.2) |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
