@@ -54,8 +54,21 @@ class ProviderRegistry:
                 return cached[1]
             impl = build(provider, self.settings)
             self._cache[provider.id] = (fingerprint, impl)
-            return impl
+        if cached is not None:
+            _close(cached[1])  # the replaced implementation must not keep its session
+        return impl
 
     def forget(self, provider_id: str) -> None:
         with self._lock:
-            self._cache.pop(provider_id, None)
+            cached = self._cache.pop(provider_id, None)
+        if cached is not None:
+            _close(cached[1])
+
+
+def _close(impl: Any) -> None:
+    close = getattr(impl, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # best effort
+            pass

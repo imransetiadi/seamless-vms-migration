@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import math
 import threading
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
@@ -16,6 +18,10 @@ from ..security.secrets import SecretNotFound, load_cloud_auth
 from .base import ProviderError, missing_dependency
 
 log = logging.getLogger(__name__)
+
+#: openstacksdk per-request timeout and the ceiling of one provider call from the control plane
+PROVIDER_API_TIMEOUT_S = 60
+PROVIDER_CALL_TIMEOUT_S = 300.0
 T = TypeVar("T")
 
 _POWER = {
@@ -56,8 +62,12 @@ def connect(provider: Provider, settings: Settings) -> Any:
     if provider.region:
         kwargs["region_name"] = provider.region
     kwargs["verify"] = provider.verify_tls
+    if not provider.verify_tls:
+        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", provider.id)
     if provider.ca_cert_path:
         kwargs["cacert"] = provider.ca_cert_path
+    # a black-holed endpoint must not pin a worker thread forever (SDD §7)
+    kwargs["api_timeout"] = PROVIDER_API_TIMEOUT_S
     return openstack.connect(**kwargs)
 
 
@@ -108,12 +118,24 @@ class OpenStackProvider:
 
     async def _run(self, fn: Callable[..., T], *args: Any) -> T:
         try:
-            return await asyncio.to_thread(fn, *args)
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args), PROVIDER_CALL_TIMEOUT_S)
         except ProviderError:
             raise
+        except TimeoutError:
+            raise ProviderError(
+                f"{self.provider.id}: call timed out after {PROVIDER_CALL_TIMEOUT_S:g} s"
+            ) from None
         except Exception as exc:
             message = str(exc).strip() or type(exc).__name__
             raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+
+    def close(self) -> None:
+        """Close the cached connection (a replaced provider must not keep its session)."""
+        with self._lock:
+            conn, self._conn = self._conn, None
+        if conn is not None and callable(getattr(conn, "close", None)):
+            with contextlib.suppress(Exception):
+                conn.close()
 
     # -- protocol ----------------------------------------------------------------------------
     async def check(self) -> dict[str, Any]:
@@ -324,11 +346,12 @@ class _MapContext:
         image = _attr(server, "image", default={}) or {}
         image_booted = bool(_attr(image, "id"))
         root_device = _attr(server, "root_device_name", default="/dev/vda")
+        server_id = str(_attr(server, "id"))
         disks: list[Disk] = []
         if image_booted:
             disks.append(
                 Disk(
-                    id=f"{_attr(server, 'id')}-root",
+                    id=f"{server_id}-root",
                     name="root",
                     size_gb=int(disk_gb or 0),
                     bootable=True,
@@ -336,22 +359,55 @@ class _MapContext:
                     kind="image_root",
                 )
             )
+        # flavor ephemeral (GiB) and swap (MiB) disks live on the hypervisor: they are copied
+        # like the root disk and count towards capacity and the estimate (SDD §4.2)
+        ephemeral_gb = int(_attr(flavor, "ephemeral", default=0) or 0)
+        swap_mb = int(_attr(flavor, "swap", default=0) or 0)
+        if ephemeral_gb > 0:
+            disks.append(
+                Disk(
+                    id=f"{server_id}-ephemeral",
+                    name="ephemeral",
+                    size_gb=ephemeral_gb,
+                    kind="ephemeral",
+                )
+            )
+        if swap_mb > 0:
+            disks.append(
+                Disk(
+                    id=f"{server_id}-swap",
+                    name="swap",
+                    size_gb=math.ceil(swap_mb / 1024),
+                    kind="ephemeral",
+                )
+            )
+        volume_disks: list[tuple[Disk, bool]] = []
         for attachment in conn.compute.volume_attachments(server):
             volume = conn.block_storage.get_volume(_attr(attachment, "volume_id"))
             device = _attr(attachment, "device")
-            disks.append(
-                Disk(
-                    id=str(_attr(volume, "id")),
-                    name=_attr(volume, "name"),
-                    size_gb=int(_attr(volume, "size", default=0)),
-                    bootable=not image_booted and device == root_device,
-                    volume_type=_attr(volume, "volume_type"),
-                    device=device,
-                    kind="volume",
-                    multiattach=_truthy(_attr(volume, "is_multiattach", "multiattach")),
-                    encrypted=_truthy(_attr(volume, "is_encrypted", "encrypted")),
-                )
+            disk = Disk(
+                id=str(_attr(volume, "id")),
+                name=_attr(volume, "name"),
+                size_gb=int(_attr(volume, "size", default=0)),
+                bootable=not image_booted and device == root_device,
+                volume_type=_attr(volume, "volume_type"),
+                device=device,
+                kind="volume",
+                multiattach=_truthy(_attr(volume, "is_multiattach", "multiattach")),
+                encrypted=_truthy(_attr(volume, "is_encrypted", "encrypted")),
             )
+            volume_disks.append((disk, _truthy(_attr(volume, "is_bootable", "bootable"))))
+        if not image_booted and volume_disks and not any(d.bootable for d, _ in volume_disks):
+            # Nova reports no root_device_name (or a device the attachment does not carry, e.g.
+            # virtio-scsi /dev/sda): fall back to Cinder's bootable flag, lowest device first
+            flagged = sorted((d for d, b in volume_disks if b), key=lambda d: d.device or "")
+            if flagged:
+                boot = flagged[0]
+                volume_disks = [
+                    (d.model_copy(update={"bootable": True}) if d is boot else d, b)
+                    for d, b in volume_disks
+                ]
+        disks.extend(d for d, _ in volume_disks)
         disks.sort(key=lambda d: (not d.bootable, d.device or ""))
 
         nics = []

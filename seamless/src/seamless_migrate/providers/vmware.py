@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import ssl
 import time
@@ -15,6 +16,9 @@ from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
 from ..security.secrets import SecretNotFound, resolve
 from .base import ProviderError, missing_dependency
+from .openstack import PROVIDER_CALL_TIMEOUT_S
+
+log = logging.getLogger(__name__)
 
 GIB = 2**30
 _POWER = {"poweredOn": "running", "poweredOff": "stopped", "suspended": "paused"}
@@ -35,6 +39,8 @@ def default_connector(
     host: str, port: int, user: str, pwd: str, verify: bool, ca_cert: str | None
 ) -> Any:
     smart_connect, _, _ = _import_pyvmomi()
+    if not verify:
+        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", host)
     if verify:
         context = ssl.create_default_context(cafile=ca_cert) if ca_cert else None
         if context is not None:
@@ -193,12 +199,28 @@ class VMwareProvider:
                 self._disconnect(si)
 
         try:
-            return await asyncio.to_thread(work)
+            return await asyncio.wait_for(asyncio.to_thread(work), PROVIDER_CALL_TIMEOUT_S)
         except ProviderError:
             raise
+        except TimeoutError:
+            raise ProviderError(
+                f"{self.provider.id}: call timed out after {PROVIDER_CALL_TIMEOUT_S:g} s"
+            ) from None
         except Exception as exc:
             message = str(getattr(exc, "msg", "") or exc).strip() or type(exc).__name__
             raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+
+    @staticmethod
+    def _find_by_uuid(content: Any, source_id: str) -> Any:
+        """One SOAP call instead of a walk over every VM (``instanceUuid`` lookup)."""
+        index = getattr(content, "searchIndex", None)
+        find = getattr(index, "FindByUuid", None)
+        if not callable(find):
+            return None
+        try:
+            return find(None, source_id, True, True)
+        except Exception:
+            return None
 
     @staticmethod
     def _objects(content: Any, vim: Any, type_name: str) -> list[Any]:
@@ -211,7 +233,8 @@ class VMwareProvider:
         finally:
             view.Destroy()
 
-    def _vms(self, content: Any, vim: Any) -> list[VMRef]:
+    def _context(self, content: Any, vim: Any) -> tuple[dict[str, str], dict[Any, str]]:
+        """Custom-field names and DVS portgroup names used while mapping VMs."""
         fields = {
             f.key: f.name
             for f in (getattr(getattr(content, "customFieldsManager", None), "field", None) or [])
@@ -226,6 +249,10 @@ class VMwareProvider:
                 portgroups = {pg.key: pg.name for pg in view.view if hasattr(pg, "key")}
             finally:
                 view.Destroy()
+        return fields, portgroups
+
+    def _vms(self, content: Any, vim: Any) -> list[VMRef]:
+        fields, portgroups = self._context(content, vim)
         out = []
         for vm in self._objects(content, vim, "VirtualMachine"):
             config = getattr(vm, "config", None)
@@ -257,7 +284,17 @@ class VMwareProvider:
         return await self._run(self._vms)
 
     async def get_vm(self, source_id: str) -> VMRef:
-        for vm in await self.list_vms():
+        def work(content: Any, vim: Any) -> VMRef | None:
+            vm = self._find_by_uuid(content, source_id)
+            if vm is None or getattr(vm, "config", None) is None:
+                return None
+            fields, portgroups = self._context(content, vim)
+            return map_vm(vm, vim, portgroups, fields)
+
+        found = await self._run(work)
+        if found is not None:
+            return found
+        for vm in await self.list_vms():  # moId-addressed or index-less setups
             if vm.source_id == source_id:
                 return vm
         raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
@@ -266,7 +303,11 @@ class VMwareProvider:
         """Power the source VM on again (rollback of VMware strategies)."""
 
         def work(content: Any, vim: Any) -> None:
-            for vm in self._objects(content, vim, "VirtualMachine"):
+            direct = self._find_by_uuid(content, source_id)
+            candidates = (
+                [direct] if direct is not None else self._objects(content, vim, "VirtualMachine")
+            )
+            for vm in candidates:
                 config = getattr(vm, "config", None)
                 uuid = getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)
                 if uuid != source_id:

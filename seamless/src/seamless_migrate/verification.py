@@ -21,6 +21,8 @@ from .config import Settings
 from .providers.base import ProviderError
 
 log = logging.getLogger(__name__)
+#: Nova states no amount of polling leaves (SDD §7.5): the verification fails at once.
+TERMINAL_STATES = frozenset({"ERROR", "DELETED", "SOFT_DELETED"})
 TCP_TIMEOUT_S = 5.0
 CONSOLE_LINES = 200
 CONSOLE_WARNING = "console log unavailable; console check skipped"
@@ -102,7 +104,7 @@ class Verifier:
             attempt += 1
             result = await self._attempt(ctx)
             result.evidence["attempts"] = attempt
-            if result.passed or self._clock() >= deadline:
+            if result.passed or result.evidence.get("terminal") or self._clock() >= deadline:
                 return result
             await self._sleep(min(self.poll_s, max(0.0, deadline - self._clock())))
 
@@ -122,10 +124,17 @@ class Verifier:
         checks = []
         status = str(server.get("status") or "UNKNOWN")
         checks.append(_check("server_active", status == "ACTIVE", f"status {status}"))
+        if status.upper() in TERMINAL_STATES:
+            # polling cannot turn an ERROR/DELETED server ACTIVE: fail fast, inside the window
+            evidence["terminal"] = True
         ports = list(server.get("ports") or [])
         up = [p for p in ports if p.get("status") == "ACTIVE"]
         checks.append(
-            _check("ports_up", len(up) == len(ports), f"{len(up)}/{len(ports)} ports ACTIVE")
+            _check(
+                "ports_up",
+                len(up) == len(ports),
+                f"{len(up)}/{len(ports)} ports ACTIVE" if ports else "no ports on the server",
+            )
         )
 
         key = "floating_ips" if cfg.probe_address == "floating" else "fixed_ips"

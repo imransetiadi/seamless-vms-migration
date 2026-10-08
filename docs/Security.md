@@ -143,7 +143,7 @@ QASuite case that exercises the control.
 | ID | STRIDE | Threat | Controls | Status | Res. |
 |---|---|---|---|---|---|
 | C4-01 | Info disclosure | Credential theft from the mounted Secret or run directory | Secret volumes `defaultMode 0440`, read-only mounts, non-root container, run-dir temp files 0600 and deleted; credentials **never** in DB/API (SDD §13.3); Keystone **application credentials** (project-scoped, revocable, no password) recommended | Impl + Cfg | M |
-| C4-02 | Spoofing | Spoofed Keystone/vCenter endpoint when TLS verification is off | `verify_tls` defaults to `true`; CA bundle per provider; **recommended**: surface a warning finding/UI badge for `verify_tls=false` | Impl + **Rec** | L |
+| C4-02 | Spoofing | Spoofed Keystone/vCenter endpoint when TLS verification is off | `verify_tls` defaults to `true`; CA bundle per provider; both connectors log a warning on every connection opened with `verify_tls=false` (`test_openstack_tls_off_is_logged_and_calls_are_bounded`); **recommended**: a finding/UI badge as well | Impl + Rec (badge) | L |
 | C4-03 | Elevation | Over-privileged credentials | Tenant (`member`) credentials for tenant workloads; admin only where SDD §9.2 requires it (handover, some pre-staging); separate application credentials per cloud | Cfg | M |
 | C4-04 | Repudiation | Cloud-side actions cannot be attributed to Seamless | Dedicated service identity per cloud so Keystone/Nova audit logs show Seamless | Cfg | L |
 | C4-05 | Denial of service | API throttling or outage | Transient error classification and backoff; per-provider status in `Provider.status` | Impl | L |

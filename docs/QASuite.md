@@ -710,6 +710,16 @@ Twenty-three further iterations after the integration run, each verified with th
   the local `seamless-pg-test` container); `SEAMLESS_STEP_TIMEOUT_S` bounds one step attempt (a hung
   cutover is cancelled and rolled back, `test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop`).
   Deferred: a `limit` on `GET /plans` (SDD amendment).
+* Provider / verification / CLI review wave (independent reviewer, no HIGH findings): `verify_tls: false` is
+  logged by both connectors (Security.md C4-02 implemented); flavor ephemeral and swap disks enter the
+  OpenStack inventory as `ephemeral` disks (capacity and estimate were undercounted); the boot volume falls
+  back to Cinder's bootable flag when Nova reports no usable `root_device_name` (virtio-scsi); every provider
+  call is bounded (openstacksdk `api_timeout` 60 s, 300 s per call, VMware too); VMware `get_vm`/`power_on`
+  use `FindByUuid` instead of walking the inventory; a replaced provider closes its session; verification
+  fails fast on `ERROR`/`DELETED`; `events export -o` writes 0600 and never overwrites; `plan apply` checks
+  the id shape. Deferred (lab or SDD): `used_gb` from real providers (estimates use the 60 % fallback),
+  transitional Nova states and a forbidden quota read as findings (§9.3 catalog), `all_projects` listing,
+  bulk volume/port listing, re-encrypting the Route.
 
 ### 13.2 Exit criteria — release 0.1.0
 

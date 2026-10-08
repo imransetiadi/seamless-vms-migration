@@ -327,6 +327,65 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
     assert inv.networks == {"app-net": 1442}
 
 
+async def test_openstack_flavor_ephemeral_and_swap_become_disks(stub_openstack):
+    """Flavor ephemeral (GiB) and swap (MiB) disks count towards capacity and the estimate."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.flavor = {**server.flavor, "ephemeral": 200, "swap": 2048}
+    stub_openstack(conn)
+    provider = OpenStackProvider(make_provider(), settings())
+    [vm] = await provider.list_vms()
+    by_name = {d.name: d for d in vm.disks}
+    assert by_name["ephemeral"].kind == "ephemeral" and by_name["ephemeral"].size_gb == 200
+    assert by_name["swap"].kind == "ephemeral" and by_name["swap"].size_gb == 2
+    assert vm.disk_bytes == (20 + 100 + 200 + 2) * 2**30
+    assert vm.root_disk() is not None and vm.root_disk().id == "vol-root"
+
+
+async def test_openstack_boot_volume_falls_back_to_cinder_bootable_flag(stub_openstack):
+    """Nova may report no root_device_name, or one the attachment does not carry (virtio-scsi
+    /dev/sda): the volume flagged bootable by Cinder is the boot disk then."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.root_device_name = None
+    server.attachments = [
+        NS(volume_id="vol-data", device="/dev/sda"),
+        NS(volume_id="vol-root", device="/dev/sdb"),
+    ]
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [d.bootable for d in vm.disks] == [True, False]
+    assert vm.root_disk().id == "vol-root"
+
+
+async def test_openstack_tls_off_is_logged_and_calls_are_bounded(
+    stub_openstack, monkeypatch, caplog
+):
+    import logging
+    import time
+
+    from seamless_migrate.providers import openstack as osp
+
+    calls = stub_openstack(fake_conn())
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.providers.openstack"):
+        provider = OpenStackProvider(make_provider(verify_tls=False), settings())
+        await provider.list_vms()
+    assert "TLS certificate verification is disabled" in caplog.text
+    assert calls["api_timeout"] == osp.PROVIDER_API_TIMEOUT_S
+
+    monkeypatch.setattr(osp, "PROVIDER_CALL_TIMEOUT_S", 0.05)
+    slow = OpenStackProvider(
+        make_provider(), settings(), connect_fn=lambda p, s: time.sleep(0.3) or fake_conn()
+    )
+    with pytest.raises(ProviderError, match="timed out after 0.05 s"):
+        await slow.check()
+
+    closed = []
+    provider._conn = NS(close=lambda: closed.append(True))
+    provider.close()
+    assert closed == [True] and provider._conn is None
+
+
 async def test_openstack_image_booted_server_gets_image_root_disk(stub_openstack):
     conn = fake_conn()
     srv = conn.compute.get_server("srv-1")
@@ -573,6 +632,51 @@ async def test_vmware_power_on_and_inventory(tmp_path):
         await provider_for([vm]).get_vm("missing")
     inv = await provider_for([vm]).inventory()
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
+
+
+async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
+    """One FindByUuid call instead of a walk over every VM in the vCenter."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM()
+    lookups: list[tuple] = []
+    walked: list[str] = []
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        content = si.RetrieveContent()
+        real_view = content.viewManager.CreateContainerView
+
+        def counted_view(folder, types, recursive):
+            walked.append(str(types))
+            return real_view(folder, types, recursive)
+
+        content.viewManager = NS(CreateContainerView=counted_view)
+        content.searchIndex = NS(
+            FindByUuid=lambda dc, uuid, is_vm, instance: (
+                lookups.append((uuid, is_vm, instance)) or (vm if uuid == "5012-abcd" else None)
+            )
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+    found = await provider.get_vm("5012-abcd")
+    assert found.source_id == "5012-abcd" and lookups == [("5012-abcd", True, True)]
+    assert not any("VirtualMachine" in t for t in walked), "no inventory walk for a lookup"
+    await provider.power_on("5012-abcd")
+    assert len(vm.tasks) == 1 and len(lookups) == 2
+    assert not any("VirtualMachine" in t for t in walked)
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.get_vm("missing")  # falls back to the walk, then fails
 
 
 async def test_vmware_requires_credentials_secret():

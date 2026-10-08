@@ -88,6 +88,11 @@ def test_plan_apply_from_yaml(env, capsys):
     bad.write_text(yaml.safe_dump({**doc, "source_provider_id": "nope"}))
     assert cli.main(["plan", "apply", "-f", str(bad)]) == 1
     assert "nope" in capsys.readouterr().err
+    # an explicit id must have the SDD §4.2 shape (it is part of every route)
+    bad_id = env / "bad-id.yaml"
+    bad_id.write_text(yaml.safe_dump({**doc, "id": "finance plan"}))
+    assert cli.main(["plan", "apply", "-f", str(bad_id)]) == 1
+    assert "invalid plan id" in capsys.readouterr().err
 
 
 def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):
@@ -227,6 +232,9 @@ def test_events_export_and_prune(env, capsys, tmp_path):
         )  # fmt: skip
     out = tmp_path / "events.jsonl"
     assert cli.main(["events", "export", "-o", str(out)]) == 0
+    assert oct(out.stat().st_mode & 0o777) == "0o600"  # the audit export is owner-only
+    assert cli.main(["events", "export", "-o", str(out)]) == 1  # never silently overwritten
+    assert "exists" in capsys.readouterr().err
     lines = out.read_text().splitlines()
     assert len(lines) == 3 and all(json.loads(ln)["kind"] == "plan.updated" for ln in lines)
     assert cli.main(["events", "export", "--plan", "plan-00000001"]) == 0

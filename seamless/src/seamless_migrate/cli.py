@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,6 +24,9 @@ from .planning.estimator import EstimatorParams, estimate, invalid_estimator_ove
 from .security.auth import TokenStore, auth_disabled_allowed, generate_token, is_loopback
 
 log = logging.getLogger("seamless_migrate")
+
+
+_PLAN_ID = re.compile(r"^plan-[0-9a-f]{8}$")
 
 
 class CliError(Exception):
@@ -227,6 +231,8 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
     if not isinstance(document, dict):
         raise CliError("the plan file must contain a mapping (PlanCreate)")
     plan_id = document.pop("id", None)
+    if plan_id is not None and not _PLAN_ID.match(str(plan_id)):
+        raise CliError(f"invalid plan id {plan_id!r}: expected plan-<8 hex digits> (SDD §4.2)")
     try:
         spec = PlanCreate.model_validate(document)
     except ValidationError as exc:
@@ -412,7 +418,15 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
 def cmd_events_export(args: argparse.Namespace, settings: Settings) -> int:
     """Write events as JSON lines (one ``Event`` per line), in sequence order, paged."""
     store = _store(settings)
-    out = sys.stdout if args.output in (None, "-") else open(args.output, "w", encoding="utf-8")
+    if args.output in (None, "-"):
+        out = sys.stdout
+    else:
+        # the audit export: owner-only, never silently overwritten
+        try:
+            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise CliError(f"{args.output} exists; remove it or choose another path") from None
+        out = os.fdopen(fd, "w", encoding="utf-8")
     written = 0
     try:
         since = int(args.since_seq)

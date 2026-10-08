@@ -26,8 +26,12 @@ def test_registry_reuses_until_the_provider_or_clouds_yaml_changes(tmp_path):
     assert rotated is not first
     assert registry.get(provider) is rotated
 
+    # the replaced implementation is closed (its session must not linger)
+    closed: list[str] = []
+    rotated.close = lambda: closed.append("rotated")  # type: ignore[attr-defined]
     # a changed endpoint rebuilds; forget() drops the cache
     changed = provider.model_copy(update={"endpoint": "https://other.example:5000/v3"})
     assert registry.get(changed) is not rotated
+    assert closed == ["rotated"]
     registry.forget(provider.id)
     assert registry.get(changed) is not registry.get(provider)

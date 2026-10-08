@@ -85,6 +85,15 @@ async def test_verification_checks(listener):
         assert [c["name"] for c in res.checks if not c["ok"]] == [bad]
 
 
+async def test_verification_fails_fast_on_a_terminal_server_state():
+    """ERROR never becomes ACTIVE: no polling until the timeout, inside the downtime window."""
+    dest = Dest(status="ERROR")
+    result = await Verifier(dest, Settings(), poll_s=0.01).verify(ctx(timeout_s=600))
+    assert result.passed is False and result.evidence["attempts"] == 1
+    assert result.evidence["terminal"] is True
+    assert [c["name"] for c in result.checks if not c["ok"]] == ["server_active"]
+
+
 async def test_verification_polls_until_timeout_then_passes():
     dest = Dest(status="BUILD")
     verifier = Verifier(dest, Settings(), poll_s=0.01)
