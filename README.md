@@ -29,8 +29,11 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 * **Assisted, never autonomous:** Jev may break ties between eligible strategies, classify workloads into
   risk tiers and review post-cutover evidence — always inside deterministic bounds, and everything works
   with Jev off ([SDD §14](docs/SDD.md)). agentmemory recalls similar past incidents on failures.
-* **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics, structured logs, PostgreSQL 16 as the
-  system of record ([SDD §11, §16, §18](docs/SDD.md)).
+* **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
+  structured logs, `/health` and a `/ready` probe that answers 503 while the database or the
+  orchestrator loop is down, audit log export and retention (`seamless events export|prune`),
+  per-address lockout after repeated failed authentications, PostgreSQL 16 as the system of record
+  ([SDD §11, §12, §16, §18](docs/SDD.md)).
 
 ```
  Operators ─HTTPS─►  seamless control plane (FastAPI REST+SSE · orchestrator FSM · planner · advisor)
