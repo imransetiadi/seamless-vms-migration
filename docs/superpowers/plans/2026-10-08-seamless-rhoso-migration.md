@@ -6,7 +6,7 @@
 
 **Architecture:** The Ansible collection remains the data mover and gains a warm path (snapshot pre-copy + BLAKE2b chunk delta sync). A Python control plane (`seamless/`) owns plans, waves, validation, estimation, strategy selection, an FSM-driven asyncio orchestrator, REST/SSE API and RBAC, and calls the collection through `ansible-playbook`. A React dashboard consumes the API. Jev (MCP) advises within deterministic bounds; agentmemory stores lessons.
 
-**Tech Stack:** Python 3.11+ (FastAPI, Pydantic v2, SQLAlchemy 2 Core, psycopg 3, httpx, mcp 2.x, openstacksdk, pyVmomi), Ansible core 2.16+, stdlib-only Python for conversion-host code, React 18 + Vite 5 + TypeScript 5 + Tailwind 3.4 + TanStack Query 5 + Recharts 2, PostgreSQL 16, Docker Compose on Colima, OpenShift (kustomize).
+**Tech Stack:** Python 3.11+ (FastAPI, Pydantic v2, SQLAlchemy 2 Core, psycopg 3, httpx, mcp 2.x, openstacksdk, pyVmomi), Ansible core 2.16+, stdlib-only Python for conversion-host code, React 18 + Vite 8 + TypeScript 5 + Tailwind 4.3 + TanStack Query 5 + Recharts 2 (started on Vite 5 / Tailwind 3.4; upgraded 2026-10-08), PostgreSQL 16, Docker Compose on Colima, OpenShift (kustomize).
 
 **Spec:** `docs/SDD.md` (binding; section numbers referenced as `SDD §n`) and `docs/PRD.md`.
 

@@ -64,6 +64,8 @@ make seamless-demo               # build + start postgres, jev (if enabled) and 
 open http://127.0.0.1:8080/      # sign in at /login with the admin token
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
+make seamless-check              # every CI check that runs locally (tests, ruff, collection, scans, dashboard)
+pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
 
 The control plane is published on `127.0.0.1:8080` only; PostgreSQL is never published; Jev (profile `ai`)
