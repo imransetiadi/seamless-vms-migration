@@ -620,7 +620,16 @@ npx @axe-core/cli http://127.0.0.1:8080/ --exit
 | DEMO-04, DEMO-06 | `tests/e2e/demo-restart.sh` after `make seamless-reset CONFIRM=yes && make seamless-demo`: `by_phase` showed `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `completed`, `failed`, `rolling_back`, `rolled_back`; `compose restart seamless` at t = 41 s with 7 migrations in an active step — all 36 migrations reached a terminal phase (34 `completed`, 1 `rolled_back` after its one scripted retry, 1 `cancelled` = the vGPU blocker); 675 events, seq 1…675 without gaps, 0 FSM-invalid `migration.phase` orderings |
 | DEMO-05 (four tokens) | `tests/e2e/rbac-live.sh` with viewer / operator / approver / admin tokens created by `seamless token create` and appended to `tokens.yaml`: "RBAC matrix OK" (every route × role, policy fields 403 for the operator before any 400/404) |
 | Playwright | not run (optional) |
+| Coverage gate (§13.2 item 2, NFR-11) | `pytest --cov=seamless_migrate --cov-fail-under=85`: **92.37 %** line coverage; lowest core modules `executors/handover.py` 85 %, `orchestrator.py` 89 %, `ai/jev.py` 90 %, `executors/ansible.py` 90 % |
+| S-17 secret scan | `gitleaks dir` and `gitleaks git --redact` (with `.gitleaks.toml`: git-ignored `.env`/`tokens.yaml`, bytecode caches and the redaction fixtures of `test_memory.py` allow-listed): no leaks |
+| S-18 dependency audit | `pip-audit` in `seamless/.venv`: no known vulnerabilities; `npm audit --omit=dev`: 0 after `react-router-dom` 7.18.4; dev toolchain moved to vite 8.3.3 / vitest 5.0.3; remaining dev-only `braces` (High) and `postcss-selector-parser` (Moderate) through tailwindcss 3 accepted as Security.md R-09 |
+| S-19 image scan and SBOM | `seamless-migrate:0.1.0` rebuilt with `dnf update`, setuptools/urllib3/msgpack upgraded and pip removed from the runtime layer: `trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1` → **0** (was 94 OS + 6 Python fixable); 323 HIGH remain **without a vendor fix** in the UBI 9.8 layer (accepted until Red Hat ships errata; re-scan nightly); CycloneDX 1.6 SBOM with 575 components generated (`trivy image --format cyclonedx`) |
+| S-20 configuration scan | `trivy config deploy/ --severity HIGH,CRITICAL --exit-code 1` → 0 after moving the credential-file paths from the ConfigMap to Deployment env values (AVD-KSV-0109) and running PostgreSQL with `readOnlyRootFilesystem` plus emptyDir scratch mounts (AVD-KSV-0014); Compose: only `seamless` publishes, on `127.0.0.1:8080` |
 | Lab (E3), PERF-E2E, D-01…D-10 on real storage | not run: no RHOSP/RHOSO lab in this environment; Performance.md §6.3 stays open |
+
+§13.2 status after this run: items 1, 2, 3 and 7 are met on the developer host (item 7 with the R-09 waiver and the
+unfixed UBI findings noted above; the signed checklist of Security.md §12 is the release manager's); items 4, 5 and 6
+need the reference lab.
 
 Fixes that came out of this run: Jev is skipped with fewer than two candidates; a retry after an automatic
 rollback counts as a new attempt and starts a fresh downtime clock; an unmapped volume type blocks when the

@@ -51,6 +51,14 @@ RUN ansible-galaxy collection build /opt/seamless/collection --output-path /tmp/
  && ansible-galaxy collection install "${VMWARE_KIT}" -p /usr/share/ansible/collections \
  && rm -rf /tmp/collection /root/.ansible
 
+# pip is a build-time tool only: its vendored urllib3/msgpack/setuptools copies lag their
+# advisories (image scan, QASuite S-19), so it leaves the runtime image.
+# hadolint ignore=DL3013
+RUN python3 -m pip uninstall -y pip \
+ && rm -rf /opt/app-root/lib/python3.11/site-packages/pip* \
+           /opt/app-root/lib64/python3.11/site-packages/pip* \
+           /opt/app-root/bin/pip /opt/app-root/bin/pip3 /opt/app-root/bin/pip3.11
+
 # Dashboard build, only when it exists in the build context.
 RUN --mount=type=bind,source=.,target=/ctx \
     mkdir -p /opt/seamless/dashboard \
