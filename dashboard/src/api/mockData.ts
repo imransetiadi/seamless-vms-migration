@@ -955,6 +955,7 @@ export function buildFixtures(now: number): Fixtures {
         actual_downtime_s: m.downtimeS ?? null,
         approvals: (m.approvals ?? []).map((a) => ({ actor: a.actor, at: iso(now - a.ago * 1000), comment: a.comment ?? null })),
         cutover_requested: m.cutoverRequested ?? false,
+        force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,

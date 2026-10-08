@@ -6,6 +6,7 @@ from seamless_migrate.planning.preflight import (
     SourceInventory,
     fitting_flavor,
     resolve_mappings,
+    resource_demand,
     run_preflight,
 )
 from tests.factories import make_disk, make_plan, make_provider, make_vm
@@ -76,6 +77,7 @@ def test_catalog_is_complete():
         "MAP_FLAVOR_AUTO",
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
+        "DST_PROJECT_MISSING",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "VM_PCI_PASSTHROUGH",
@@ -139,6 +141,44 @@ def test_finding_src_vm_transitional_state():
     assert f.severity == Severity.blocker and "task in flight" in f.message
     assert all(x.code != "SRC_VM_ERROR_STATE" for x in check(vm))
     assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
+
+
+def test_finding_dst_project_missing_and_image_root_quota():
+    dst = dst_inv(
+        quotas={
+            "finance-rhoso": {
+                "cores": 100,
+                "ram_mb": 10**6,
+                "instances": 10,
+                "volumes": 10,
+                "gigabytes": 10**4,
+            },
+            "shop-rhoso": {
+                "cores": 100,
+                "ram_mb": 10**6,
+                "instances": 10,
+                "volumes": 10,
+                "gigabytes": 10**4,
+            },
+        }
+    )
+    vm = make_vm(project="finance")
+    # mapped to a project the destination does not list
+    bad = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    f = only(check(vm, plan=bad, dst=dst), "DST_PROJECT_MISSING")
+    assert f.severity == Severity.blocker and "fin-rhoso" in f.message
+    # unmapped, no same-named project, several destination projects: nothing to charge
+    f = only(check(vm, dst=dst), "DST_PROJECT_MISSING")
+    assert "2 projects" in f.message
+    # a mapping to an existing project, or a single destination project, is fine
+    good = make_plan(mappings=Mappings(projects={"finance": "finance-rhoso"}))
+    assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm, plan=good, dst=dst))
+    assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm))
+    # an image_root disk counts as a destination volume unless the plan is cold-only
+    image = make_vm(disks=[make_disk(kind="image_root", size_gb=30, volume_type=None)])
+    assert resource_demand(image, make_plan())["volumes"] == 1
+    assert resource_demand(image, make_plan(default_strategy=Strategy.warm))["gigabytes"] == 30
+    assert resource_demand(image, make_plan(default_strategy=Strategy.cold))["volumes"] == 0
 
 
 def test_finding_map_network_missing():

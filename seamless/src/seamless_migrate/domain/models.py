@@ -352,6 +352,8 @@ class Migration(_Model):
     actual_downtime_s: float | None = None
     approvals: list[Approval] = Field(default_factory=list)
     cutover_requested: bool = False
+    #: cutover window bypass granted with the request (SDD §5.4 rule 2); persisted
+    force_window: bool = False
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
     review_required: bool = False
     review_reason: str | None = None

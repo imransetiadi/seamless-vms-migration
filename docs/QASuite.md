@@ -737,9 +737,11 @@ Twenty-three further iterations after the integration run, each verified with th
   Follow-ups the same day: `SRC_VM_TRANSITIONAL_STATE` (blocker; Nova RESIZE/VERIFY_RESIZE/MIGRATING/
   RESCUE/REBUILD/REBOOT/BUILD map to `power_state: transitioning`, SDD §4.2/§9.3, dashboard label "Task
   in flight") and VMware per-disk `used_gb` from `vm.layoutEx` (extent files behind the disk chain, so thin
-  disks are estimated on their real usage instead of the 60 % rule). Deferred: OpenStack `used_gb` (Cinder
-  reports no usage), quota demand for `image_root` under warm, missing destination project as a finding
-  (catalog), gate-time delta ageing in the shown estimate, `force_window` persistence.
+  disks are estimated on their real usage instead of the 60 % rule); `Migration.force_window` is persisted
+  (a restart keeps the window bypass); `DST_PROJECT_MISSING` blocks a VM whose destination project is unknown
+  (mapped to an absent project, or unmapped in a multi-project destination); an `image_root` disk counts
+  towards the volume quota unless the plan is cold-only. Deferred: OpenStack `used_gb` (Cinder reports no
+  usage), gate-time delta ageing in the shown estimate.
 
 ### 13.2 Exit criteria — release 0.1.0
 

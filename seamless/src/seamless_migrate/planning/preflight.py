@@ -99,6 +99,11 @@ CATALOG: dict[str, CatalogEntry] = {
     "DST_QUOTA_INSUFFICIENT": CatalogEntry(
         Severity.blocker, (), "Raise the destination project quotas or split the plan."
     ),
+    "DST_PROJECT_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Map the VM's project to an existing destination project (plan.mappings.projects).",
+    ),
     "NET_MTU_SHRINK": CatalogEntry(
         Severity.warning,
         (),
@@ -200,8 +205,13 @@ def destination_project(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) ->
     return vm.project
 
 
-def resource_demand(vm: VMRef) -> dict[str, int]:
-    volumes = [d for d in vm.disks if d.kind in ("volume", "vmdk")]
+def resource_demand(vm: VMRef, plan: Plan | None = None) -> dict[str, int]:
+    """Quota the VM needs at the destination. An ``image_root`` disk becomes a destination volume
+    on the warm path (``boot_disk_copy``), so it counts unless the plan is cold-only."""
+    kinds = {"volume", "vmdk"}
+    if plan is None or plan.default_strategy != Strategy.cold:
+        kinds.add("image_root")
+    volumes = [d for d in vm.disks if d.kind in kinds]
     return {
         "cores": vm.vcpus,
         "ram_mb": vm.ram_mb,
@@ -220,7 +230,7 @@ def _quota_shortfall(
     totals = dict.fromkeys(_QUOTA_KEYS, 0)
     for other in all_vms:
         if destination_project(other, plan, dst_inv) == project:
-            for key, value in resource_demand(other).items():
+            for key, value in resource_demand(other, plan).items():
                 totals[key] += value
     free = dst_inv.quotas[project]
     short = []
@@ -501,6 +511,29 @@ def run_preflight(
             )
         )
 
+    if dst_inv.quotas:
+        mapped_project = maps.projects.get(vm.project or "")
+        if mapped_project is not None and mapped_project not in dst_inv.quotas:
+            out.append(
+                finding(
+                    "DST_PROJECT_MISSING",
+                    f"Project {vm.project!r} is mapped to {mapped_project!r}, which the "
+                    "destination does not list.",
+                )
+            )
+        elif (
+            vm.project  # VMware VMs report none: the kit charges the credential's project
+            and mapped_project is None
+            and vm.project not in dst_inv.quotas
+            and len(dst_inv.quotas) != 1
+        ):
+            out.append(
+                finding(
+                    "DST_PROJECT_MISSING",
+                    f"No destination project for {vm.project!r}: no mapping, no same-named "
+                    f"project, and the destination has {len(dst_inv.quotas)} projects.",
+                )
+            )
     shortfall = _quota_shortfall(vm, plan, dst_inv, selected)
     if shortfall is not None:
         project, short = shortfall

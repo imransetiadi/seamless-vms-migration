@@ -284,7 +284,9 @@ async def test_cutover_window_respected_and_force_window(tmp_path, store):
     await run_plan(h2, plan2)
     m2 = await h2.wait_phase((await h2.by_vm(plan2.id, "vm-5")).id, P.awaiting_cutover)
     out = await h2.orch.request_cutover(m2.id, "sari", force_window=True, comment="emergency")
-    assert out.cutover_requested and out.approvals[-1].comment == "emergency"
+    assert out.cutover_requested and out.force_window and out.approvals[-1].comment == "emergency"
+    # persisted: a restarted orchestrator still bypasses the window
+    assert (await h2.migration(m2.id)).force_window is True
     await h2.wait_phase(m2.id, P.completed)
     await h2.orch.stop()
 
@@ -355,11 +357,11 @@ async def test_revalidation_and_strategy_change_clear_approvals(tmp_path, store)
     await h.orch.request_cutover(m.id, "sari", force_window=True)
     m = await h.migration(m.id)
     assert len(m.approvals) == 2 and m.cutover_requested is True
-    assert m.id in h.orch._force_window
+    assert m.force_window is True
     await h.orch.validate_plan(plan.id, "alice")
     m = await h.migration(m.id)
     assert m.approvals == [] and m.cutover_requested is False
-    assert m.id not in h.orch._force_window
+    assert m.force_window is False
     await h.orch.approve(m.id, "sari", "again")
     await h.orch.set_strategy(m.id, Strategy.warm, "rina")
     assert (await h.migration(m.id)).approvals == []

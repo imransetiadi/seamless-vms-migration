@@ -706,6 +706,7 @@ export class MockServer {
         actual_downtime_s: null,
         approvals: [],
         cutover_requested: false,
+        force_window: false,
         advisor_notes: [],
         review_required: false,
         review_reason: null,
@@ -827,6 +828,7 @@ export class MockServer {
         if (!allowed) throw new HttpError(409, 'invalid_transition', `Cannot request cutover for ${m.vm.name} while ${m.phase}.`);
         approve();
         m.cutover_requested = true;
+        m.force_window = m.force_window || Boolean(input.force_window);
         record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window) });
         if (plan.status === 'running' && this.gateOpen(m, plan)) this.beginCutover(m, plan);
         break;
@@ -851,6 +853,7 @@ export class MockServer {
         m.attempts += 1;
         m.error = null;
         m.cutover_requested = false;
+        m.force_window = false;
         m.progress_pct = 0;
         m.bytes_transferred = 0;
         record('retry requested');

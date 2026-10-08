@@ -316,6 +316,7 @@ export interface Migration {
   actual_downtime_s: number | null;
   approvals: Approval[];
   cutover_requested: boolean;
+  force_window: boolean;
   advisor_notes: AdvisorNote[];
   review_required: boolean;
   review_reason: string | null;

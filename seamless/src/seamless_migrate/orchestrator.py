@@ -162,7 +162,6 @@ class Orchestrator:
         self._locks: dict[str, asyncio.Lock] = {}
         self._drivers: dict[str, asyncio.Task[None]] = {}
         self._steps: dict[str, asyncio.Task[Any]] = {}
-        self._force_window: set[str] = set()
         self._prestage_done: set[str] = set()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
@@ -497,7 +496,7 @@ class Orchestrator:
             # this validation carries over to the new strategy, findings and estimate
             m.approvals = []
             m.cutover_requested = False
-            self._force_window.discard(mid)
+            m.force_window = False
             if no_eligible:
                 details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
                 m.error = f"no eligible strategy ({details})"[:1000]
@@ -642,9 +641,8 @@ class Orchestrator:
                 raise NotAllowed(f"cutover cannot be requested in {m.phase}")
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
             m.cutover_requested = True
+            m.force_window = m.force_window or force_window
             await self._save(m, v)
-            if force_window:
-                self._force_window.add(mid)
         await self._emit(
             "migration.approved",
             f"{m.vm.name} approved by {actor}",
@@ -723,7 +721,6 @@ class Orchestrator:
             m.downtime_ended_at = None
             m.actual_downtime_s = None
             await self._save(m, v)
-        self._force_window.discard(mid)
         await self._emit(
             "migration.action",
             f"retry of {m.vm.name}",
@@ -746,7 +743,6 @@ class Orchestrator:
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-        self._force_window.discard(mid)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -850,7 +846,6 @@ class Orchestrator:
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
             m.cutover_requested = False
-            self._force_window.discard(mid)
             await self._save(m, v)
         source_id = m.vm.source_id
 
@@ -989,7 +984,7 @@ class Orchestrator:
         if plan.require_approval and not m.approvals:
             return False
         window = plan.cutover_window
-        if window is not None and m.id not in self._force_window and not window.contains(now):
+        if window is not None and not m.force_window and not window.contains(now):
             return False
         return plan.auto_cutover or m.cutover_requested
 
