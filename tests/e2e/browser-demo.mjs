@@ -64,6 +64,17 @@ const expectCharts = async (name, min) => {
   const warmPanel = page.getByRole('heading', { name: /sync-pass convergence/i });
   if ((await warmPanel.count()) > 0 && (await page.getByText(/no sync passes yet/i).count()) === 0) await expectCharts('migration', 1);
 
+  // Swagger UI (public in demo mode) must boot under its nonce-based CSP: the operations list
+  // renders only when the inline bootstrap script was allowed (SDD §12)
+  await page.goto(`${base}/api/docs`, { waitUntil: 'load' });
+  try {
+    await page.locator('#swagger-ui .opblock-tag-section, #swagger-ui .opblock').first().waitFor({ timeout: 15_000 });
+  } catch {
+    problems.push('api docs: Swagger UI did not render (CSP blocked its bootstrap script?)');
+  }
+
+  await page.goBack({ waitUntil: 'load' });
+  await page.getByRole('heading', { name: /estimate inputs/i }).waitFor({ timeout: 10_000 });
   const font = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
   const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
   if (!/Fira Sans/.test(font)) problems.push(`font stack not applied: ${font}`);
