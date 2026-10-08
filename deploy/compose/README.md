@@ -37,7 +37,8 @@ Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token,
 
 ```bash
 export TOKEN='smg_...'                                   # the token printed by compose-init.sh
-curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok","version":...,"demo":...,"db":"ok"}
+curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
+curl -fsS http://127.0.0.1:8080/api/v1/ready             # same body; HTTP 503 while the DB or the orchestrator loop is down
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me
 curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
 ```
