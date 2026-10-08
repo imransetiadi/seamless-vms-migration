@@ -187,3 +187,32 @@ def test_serve_refuses_auth_disabled_on_public_bind(env, capsys, monkeypatch):
     assert calls[-1].demo is True and calls[-1].auth_disabled is True
     assert cli.main(["serve", "--demo", "--host", "0.0.0.0"]) == 0
     assert calls[-1].auth_disabled is False and calls[-1].port == 8080
+
+
+def test_events_export_and_prune(env, capsys, tmp_path):
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from seamless_migrate.domain.models import Event
+
+    store = store_for(env)
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(3):
+        store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}",
+                  plan_id="plan-00000001" if i else None)
+        )  # fmt: skip
+    out = tmp_path / "events.jsonl"
+    assert cli.main(["events", "export", "-o", str(out)]) == 0
+    lines = out.read_text().splitlines()
+    assert len(lines) == 3 and all(json.loads(ln)["kind"] == "plan.updated" for ln in lines)
+    assert cli.main(["events", "export", "--plan", "plan-00000001"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 2
+    # prune refuses without --confirm and without a bound
+    assert cli.main(["events", "prune", "--before", "2026-10-02T00:00:00Z"]) == 2
+    assert cli.main(["events", "prune", "--confirm"]) == 2
+    assert cli.main(["events", "prune", "--before", "2026-10-02T00:00:00Z", "--confirm"]) == 0
+    assert "deleted 1 event(s)" in capsys.readouterr().out
+    assert cli.main(["events", "prune", "--older-than-days", "0", "--confirm"]) == 0
+    assert "deleted 2 event(s)" in capsys.readouterr().out
+    assert store.events(since_seq=0, limit=10) == []

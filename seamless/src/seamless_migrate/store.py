@@ -352,6 +352,18 @@ class Store:
             for row in rows
         ]
 
+    def delete_events_before(self, before: datetime) -> int:
+        """Delete events with ``ts < before`` (audit retention, Security.md §12); returns the count.
+
+        Export them first (``seamless events export``): the sequence numbers are never reused,
+        so SSE clients resuming with ``since`` keep working after a prune.
+        """
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)
+        with self.engine.begin() as conn:
+            result = conn.execute(events.delete().where(events.c.ts < before))
+        return int(result.rowcount or 0)
+
     def max_seq(self) -> int:
         with self.engine.connect() as conn:
             value = conn.execute(sa.select(sa.func.max(events.c.seq))).scalar()
@@ -394,6 +406,9 @@ class AsyncStore:
 
     async def events(self, **kwargs: Any) -> list[Event]:
         return await asyncio.to_thread(lambda: self.sync.events(**kwargs))
+
+    async def delete_events_before(self, before: datetime) -> int:
+        return await asyncio.to_thread(self.sync.delete_events_before, before)
 
     async def max_seq(self) -> int:
         return await asyncio.to_thread(self.sync.max_seq)

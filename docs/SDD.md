@@ -971,6 +971,8 @@ seamless plan start PLAN_ID
 seamless estimate -f vms.yaml [--strategy S] [--slo 600] [--link-mbps 1000] [--scan-mibps 500]
                   [--change-mibps 2] [--parallel-disks 4] [--max-passes 5]   # the §9.1 knobs
 seamless status [--plan PLAN_ID]
+seamless events export [-o events.jsonl] [--since-seq N] [--plan PLAN_ID]   # JSON lines, paged
+seamless events prune (--before ISO | --older-than-days N) --confirm        # audit retention
 seamless version
 ```
 

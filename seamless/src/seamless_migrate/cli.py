@@ -382,6 +382,54 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_events_export(args: argparse.Namespace, settings: Settings) -> int:
+    """Write events as JSON lines (one ``Event`` per line), in sequence order, paged."""
+    store = _store(settings)
+    out = sys.stdout if args.output in (None, "-") else open(args.output, "w", encoding="utf-8")
+    written = 0
+    try:
+        since = int(args.since_seq)
+        while True:
+            page = store.events(since_seq=since, plan_id=args.plan, limit=1000)
+            if not page:
+                break
+            for event in page:
+                out.write(event.model_dump_json() + "\n")
+            written += len(page)
+            since = page[-1].seq
+    finally:
+        if out is not sys.stdout:
+            out.close()
+    print(f"exported {written} event(s)" + (f" to {args.output}" if out is not sys.stdout else ""),
+          file=sys.stderr)  # fmt: skip
+    return 0
+
+
+def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
+    """Delete events older than a date or an age; refuses without ``--confirm``."""
+    from datetime import datetime, timedelta
+
+    from .domain.models import utcnow
+
+    if args.before:
+        before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+    elif args.older_than_days is not None:
+        before = utcnow() - timedelta(days=float(args.older_than_days))
+    else:
+        print("error: give --before <ISO datetime> or --older-than-days N", file=sys.stderr)
+        return 2
+    if not args.confirm:
+        print(
+            f"would delete events before {before.isoformat()}; export them first "
+            "(seamless events export) and re-run with --confirm",
+            file=sys.stderr,
+        )
+        return 2
+    deleted = _store(settings).delete_events_before(before)
+    print(f"deleted {deleted} event(s) before {before.isoformat()}")
+    return 0
+
+
 def cmd_version(args: argparse.Namespace, settings: Settings) -> int:
     print(__version__)
     return 0
@@ -397,6 +445,19 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--demo", action="store_true", help="simulated providers and executor")
     serve.add_argument("--reload", action="store_true", help="auto-reload (development)")
     serve.set_defaults(func=cmd_serve)
+
+    ev = sub.add_parser("events", help="export or prune the audit event log")
+    ev_sub = ev.add_subparsers(dest="events_command", required=True)
+    export = ev_sub.add_parser("export", help="write events as JSON lines (stdout or a file)")
+    export.add_argument("-o", "--output", default=None, help="file path (default: stdout)")
+    export.add_argument("--since-seq", type=int, default=0, help="start after this sequence")
+    export.add_argument("--plan", default=None, help="only events of this plan id")
+    export.set_defaults(func=cmd_events_export)
+    prune = ev_sub.add_parser("prune", help="delete events older than a date or an age")
+    prune.add_argument("--before", default=None, help="ISO 8601 datetime (UTC when naive)")
+    prune.add_argument("--older-than-days", type=float, default=None, help="age in days")
+    prune.add_argument("--confirm", action="store_true", help="actually delete")
+    prune.set_defaults(func=cmd_events_prune)
 
     token = sub.add_parser("token", help="API tokens").add_subparsers(dest="action", required=True)
     create = token.add_parser("create", help="print a new token and its tokens.yaml entry")

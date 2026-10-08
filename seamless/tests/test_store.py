@@ -190,3 +190,20 @@ def test_list_limit_and_offset_in_sql_and_python(any_store: Store):
     assert len(odd) == 3
     assert [m.id for m in any_store.list("migration", Migration, attempts=1, limit=2)] == odd[:2]
     assert [m.id for m in any_store.list("migration", Migration, attempts=1, offset=2)] == odd[2:]
+
+
+def test_delete_events_before(any_store: Store):
+    from datetime import UTC, datetime, timedelta
+
+    from seamless_migrate.domain.models import Event
+
+    t0 = datetime(2026, 10, 1, tzinfo=UTC)
+    for i in range(5):
+        any_store.append_event(
+            Event(ts=t0 + timedelta(days=i), kind="plan.updated", actor="t", message=f"e{i}")
+        )
+    assert any_store.delete_events_before(t0 + timedelta(days=2)) == 2
+    left = any_store.events(since_seq=0, limit=100)
+    assert [e.message for e in left] == ["e2", "e3", "e4"]
+    assert any_store.max_seq() == left[-1].seq, "sequence numbers are not reused"
+    assert any_store.delete_events_before(datetime(2020, 1, 1)) == 0  # naive = UTC
