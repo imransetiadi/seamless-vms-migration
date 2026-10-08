@@ -172,6 +172,14 @@ class Orchestrator:
         self._stopping = False
         #: step -> [sum_seconds, count] for seamless_step_duration_seconds
         self.step_stats: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
+        #: tick timing (seconds): count, sum, last, max, slow (over half of tick_s)
+        self.tick_stats: dict[str, float] = {
+            "count": 0,
+            "sum": 0.0,
+            "last": 0.0,
+            "max": 0.0,
+            "slow": 0,
+        }
 
     # ------------------------------------------------------------------------------------------
     # plumbing
@@ -809,21 +817,39 @@ class Orchestrator:
     async def _loop(self) -> None:
         assert self._wake is not None
         while not self._stopping:
+            started = time.monotonic()
             try:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("orchestrator tick failed")
+            self._record_tick(time.monotonic() - started)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self.settings.tick_s)
             self._wake.clear()
 
+    def _record_tick(self, seconds: float) -> None:
+        """Tick timing for ``GET /metrics`` (QASuite PERF-CP-02: p95 below half of tick_s)."""
+        stats = self.tick_stats
+        stats["count"] += 1
+        stats["sum"] += seconds
+        stats["last"] = seconds
+        stats["max"] = max(stats["max"], seconds)
+        budget = self.settings.tick_s / 2
+        if seconds > budget:
+            stats["slow"] += 1
+            log.warning("orchestrator tick took %.3f s (budget %.3f s)", seconds, budget)
+
     async def tick(self) -> None:
-        plans = [p for p in await self.db.list("plan", Plan) if p.status == PlanStatus.running]
+        all_plans = await self.db.list("plan", Plan)
+        plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
             return
-        migrations = await self.db.list("migration", Migration)
+        # only the migrations of plans that can still have work: running ones, and paused ones
+        # whose in-flight steps still count against the concurrency limits
+        active = [p.id for p in all_plans if p.status in (PlanStatus.running, PlanStatus.paused)]
+        migrations = await self.db.list("migration", Migration, plan_id=active)
         by_plan: dict[str, list[Migration]] = defaultdict(list)
         for m in migrations:
             by_plan[m.plan_id].append(m)

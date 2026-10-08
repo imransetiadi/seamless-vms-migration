@@ -171,6 +171,9 @@ def test_metrics_format(api, tmp_path):
         "seamless_downtime_seconds_sum 0",
         "seamless_downtime_seconds_count 0",
         "seamless_downtime_seconds_max 0",
+        "# TYPE seamless_tick_seconds summary",
+        "seamless_tick_seconds_count",
+        "# TYPE seamless_tick_slow_total counter",
         "# TYPE seamless_step_duration_seconds summary",
         "# TYPE seamless_advisor_calls_total counter",
     ):

@@ -98,5 +98,10 @@ async def similar_incidents(
 async def metrics(request: Request, _: Principal | None = Depends(metrics_access)) -> str:
     svc = services(request)
     migrations = await svc.db.list("migration", Migration)
-    text = render_metrics(migrations, svc.orchestrator.step_stats, advisor_calls(svc.jev))
+    text = render_metrics(
+        migrations,
+        svc.orchestrator.step_stats,
+        advisor_calls(svc.jev),
+        svc.orchestrator.tick_stats,
+    )
     return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")

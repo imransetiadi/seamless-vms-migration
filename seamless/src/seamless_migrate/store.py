@@ -48,9 +48,7 @@ documents = sa.Table(
 #: index on ``(kind, field)`` so a plan's migrations or a phase are found without a full scan.
 INDEXED_FIELDS = ("plan_id", "phase", "wave_id", "status", "role")
 for _field in INDEXED_FIELDS:
-    sa.Index(
-        f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string()
-    )
+    sa.Index(f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string())
 
 events = sa.Table(
     "events",

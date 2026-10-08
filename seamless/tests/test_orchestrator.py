@@ -921,3 +921,25 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
     assert updated.strategy_overrides == {"vm-1-recreated": Strategy.cold}
     assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
     assert updated.status == PlanStatus.completed
+
+
+async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await run_plan(h, plan)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    stats = h.orch.tick_stats
+    assert stats["count"] >= 1 and stats["max"] >= stats["last"] >= 0 and stats["sum"] >= 0
+    # a stale active-step migration left in the completed plan must not consume the global
+    # cutover budget of a new running plan: the tick only loads running/paused plans
+    stale = await h.by_vm(plan.id, "vm-1")
+    stale.phase = P.cutover
+    store.put("migration", stale)
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    h2 = build_harness(tmp_path, store, [vm(2)], settings=settings)
+    plan2 = plan_for([vm(2)], default_strategy=Strategy.cold)
+    store.put("plan", plan2)
+    await run_plan(h2, plan2)
+    done = await h2.wait_phase((await h2.by_vm(plan2.id, "vm-2")).id, P.completed)
+    await h2.orch.stop()
+    assert done.phase == P.completed

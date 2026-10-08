@@ -1071,7 +1071,9 @@ bind mount; `.env` is 0600.
 Structured logs (JSON when `SEAMLESS_LOG_JSON=true`), audit events in the DB, `/metrics` with:
 `seamless_migrations{phase}` gauge, `seamless_bytes_transferred_total` counter,
 `seamless_downtime_seconds_sum/_count` and `seamless_downtime_seconds_max`,
-`seamless_step_duration_seconds_sum/_count{step}`, `seamless_advisor_calls_total{tool,outcome}`.
+`seamless_step_duration_seconds_sum/_count{step}`, `seamless_advisor_calls_total{tool,outcome}`,
+`seamless_tick_seconds_sum/_count`, `seamless_tick_seconds_max` and `seamless_tick_slow_total` (ticks
+over half of `tick_s`; QASuite PERF-CP-02).
 
 ---
 
