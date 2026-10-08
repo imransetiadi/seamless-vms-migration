@@ -106,8 +106,8 @@ spec:
             limits:
               cpu: "4"
               memory: 4Gi
-          # SDD 17: liveness on /api/v1/health. The endpoint is public and reports "degraded" when the
-          # database is unreachable, so the generous failureThreshold avoids restart storms during a DB blip.
+          # SDD 17: liveness on /api/v1/health (always 200 while the process answers; the body reports
+          # what is degraded); the generous failureThreshold avoids restart storms during a DB blip.
           startupProbe:
             httpGet:
               path: /api/v1/health
@@ -121,9 +121,11 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6
+          # readiness on /api/v1/ready: 503 while the database or the orchestrator loop is
+          # unavailable, so the Service stops routing here until it recovers
           readinessProbe:
             httpGet:
-              path: /api/v1/health
+              path: /api/v1/ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 5

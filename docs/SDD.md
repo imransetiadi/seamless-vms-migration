@@ -771,8 +771,8 @@ other values are evaluated in Python), `delete(kind, id)`, `append_event(event) 
 `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`. Kinds: `provider`, `plan`,
 `migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
-callers. `Store.ping() -> bool` backs the readiness probe (`GET /api/v1/health` reports
-`"db": "ok"|"error"`).
+callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
+`"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
 
 ---
 
@@ -785,6 +785,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
 | GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for 5 × `tick_s`); probes use it |
+| GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider` |
@@ -1038,7 +1039,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
   Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, liveness
-  `/api/v1/health`), Service, Route (TLS re-encrypt/edge), NetworkPolicy (ingress from router only;
+  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS re-encrypt/edge), NetworkPolicy (ingress from router only;
   egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory).
 * Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
   a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an

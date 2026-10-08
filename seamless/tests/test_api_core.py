@@ -39,6 +39,12 @@ def test_health_public_reports_db(api, monkeypatch):
     )
     degraded = api.client.get("/api/v1/health").json()
     assert degraded["status"] == "degraded" and degraded["orchestrator"]["running"] is False
+    # readiness answers 503 with the same body while degraded, 200 otherwise
+    ready = api.client.get("/api/v1/ready")
+    assert ready.status_code == 503 and ready.json()["status"] == "degraded"
+    monkeypatch.undo()
+    assert api.client.get("/api/v1/ready").status_code == 200
+    assert api.client.get("/api/v1/ready").json()["status"] == "ok"
 
 
 def test_unauthenticated_401_and_audit_event(api):

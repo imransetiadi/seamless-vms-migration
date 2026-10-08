@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from .. import __version__
@@ -30,6 +30,21 @@ router = APIRouter(tags=["misc"])
 
 @router.get("/health", response_model=Health)
 async def health(request: Request) -> Health:
+    """Liveness: always 200 while the process answers; the body says what is degraded."""
+    return await _health(request)
+
+
+@router.get("/ready", response_model=Health)
+async def ready(request: Request, response: Response) -> Health:
+    """Readiness: the same body as ``/health`` with HTTP 503 while degraded, so Kubernetes
+    stops routing to a replica whose database or orchestrator loop is unavailable."""
+    body = await _health(request)
+    if body.status != "ok":
+        response.status_code = 503
+    return body
+
+
+async def _health(request: Request) -> Health:
     svc = services(request)
     db_ok = await asyncio.to_thread(svc.store.ping)
     orchestrator = svc.orchestrator.health()
