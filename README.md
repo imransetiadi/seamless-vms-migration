@@ -30,9 +30,11 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
   risk tiers and review post-cutover evidence — always inside deterministic bounds, and everything works
   with Jev off ([SDD §14](docs/SDD.md)). agentmemory recalls similar past incidents on failures.
 * **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
-  structured logs, `/health` and a `/ready` probe that answers 503 while the database or the
-  orchestrator loop is down, audit log export and retention (`seamless events export|prune`),
-  per-address lockout after repeated failed authentications, PostgreSQL 16 as the system of record
+  structured JSON logs (uvicorn's access lines included), `/health` and a `/ready` probe that answers
+  503 while the database or the orchestrator loop is down, audit log export and retention
+  (`seamless events export|prune`), per-address lockout after repeated failed authentications, a
+  per-step wall-clock ceiling (`SEAMLESS_STEP_TIMEOUT_S`) so a hung playbook never holds a stopped
+  source, cleanup of the data path when a pass is cancelled, PostgreSQL 16 as the system of record
   ([SDD §11, §12, §16, §18](docs/SDD.md)).
 
 ```
