@@ -104,6 +104,58 @@ def _install_error_handlers(app: FastAPI) -> None:
         return _error(502, "provider_error", str(exc))
 
 
+#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts) and the
+#: Fira fonts from Google Fonts (dashboard/index.html); Swagger UI loads from jsdelivr.
+_CSP_APP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
+    "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' "
+    "data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
+_CSP_DOCS = (
+    "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' "
+    "'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; "
+    "connect-src 'self'; frame-ancestors 'none'"
+)
+
+
+def _install_security_headers(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        headers = response.headers
+        headers.setdefault("X-Content-Type-Options", "nosniff")
+        headers.setdefault("X-Frame-Options", "DENY")
+        headers.setdefault("Referrer-Policy", "same-origin")
+        headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        headers.setdefault(
+            "Content-Security-Policy",
+            _CSP_DOCS if request.url.path == "/api/docs" else _CSP_APP,
+        )
+        return response
+
+
+def _install_api_docs(app: FastAPI, settings: Settings) -> None:
+    """``/api/openapi.json`` and ``/api/docs``: public in demo mode, viewer role otherwise."""
+    from fastapi.openapi.docs import get_swagger_ui_html
+
+    from ..domain.enums import Role
+    from .deps import require_role
+
+    async def docs_access(request: Request) -> None:
+        if not settings.demo:
+            await require_role(Role.viewer)(request)
+
+    @app.get("/api/openapi.json", include_in_schema=False)
+    async def openapi_json(request: Request) -> Any:
+        await docs_access(request)
+        return JSONResponse(app.openapi())
+
+    @app.get("/api/docs", include_in_schema=False)
+    async def swagger_ui(request: Request) -> Any:
+        await docs_access(request)
+        return get_swagger_ui_html(openapi_url="/api/openapi.json", title="Seamless Migrate API")
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -192,12 +244,16 @@ def create_app(
         title="Seamless Migrate",
         version=__version__,
         lifespan=lifespan,
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
+        # the OpenAPI document and Swagger UI are served by _install_api_docs: public in demo
+        # mode, viewer-authenticated otherwise (Security.md R-04)
+        docs_url=None,
+        openapi_url=None,
         redoc_url=None,
     )
     app.state.services = svc
     _install_error_handlers(app)
+    _install_security_headers(app)
+    _install_api_docs(app, settings)
     if settings.cors_origins:
         app.add_middleware(
             CORSMiddleware,

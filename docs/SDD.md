@@ -819,6 +819,10 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | POST | `/advisor/similar-incidents` | operator | `{"query": str, "limit": int = 5}` | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
+Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
+and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
+disabled (Security.md R-04). Every response carries the security headers of Security.md R-05.
+
 ```text
 ValidationReport { plan_id: str, ok: bool,
                    migrations: [{ migration_id, vm_name, strategy, phase, findings: Finding[],

@@ -348,3 +348,40 @@ def test_auth_lockout_after_repeated_failures(tmp_path):
         for _ in range(5):
             assert client.get("/api/v1/me", headers=bad).status_code == 401
     store2.dispose()
+
+
+def test_security_headers_and_api_docs_exposure(tmp_path):
+    # demo: docs are public; headers on API and SPA responses alike
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    settings, tokens = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'hdr.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/", "/api/v1/health", "/api/v1/does-not-exist"):
+            res = client.get(path)
+            assert res.headers["x-content-type-options"] == "nosniff", path
+            assert res.headers["x-frame-options"] == "DENY"
+            assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
+            assert "fonts.gstatic.com" in res.headers["content-security-policy"]
+        docs = client.get("/api/docs")
+        assert docs.status_code == 200 and "swagger" in docs.text.lower()
+        assert "cdn.jsdelivr.net" in docs.headers["content-security-policy"]
+        spec = client.get("/api/openapi.json").json()
+        assert "/api/v1/plans" in spec["paths"]
+        assert "/api/openapi.json" not in spec["paths"], "docs routes stay out of the schema"
+    store.dispose()
+
+    # outside demo mode the docs need a viewer token (Security.md R-04, QASuite S-07)
+    prod, tokens = api_settings(tmp_path / "prod", demo=False)
+    store2 = Store(f"sqlite:///{tmp_path / 'prod.db'}")
+    store2.create_schema()
+    with TestClient(create_app(prod, store2)) as client:
+        assert client.get("/api/docs").status_code == 401
+        assert client.get("/api/openapi.json").status_code == 401
+        viewer = {"Authorization": f"Bearer {tokens[Role.viewer]}"}
+        assert client.get("/api/openapi.json", headers=viewer).status_code == 200
+        assert client.get("/api/docs", headers=viewer).status_code == 200
+        assert client.get("/docs").status_code == 404 and client.get("/redoc").status_code == 404
+    store2.dispose()
