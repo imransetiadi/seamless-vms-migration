@@ -215,6 +215,10 @@ def test_plan_create_validate_start_flow(api):
     wait_for(lambda: api.get(f"/api/v1/plans/{plan['id']}").json()["status"] == "completed")
     phase_filter = api.get(f"/api/v1/migrations?plan_id={plan['id']}&phase=completed").json()
     assert len(phase_filter) == 3
+    page = api.get(f"/api/v1/migrations?plan_id={plan['id']}&limit=2&offset=1").json()
+    assert [m["id"] for m in page] == [m["id"] for m in migs[1:3]]
+    assert api.get(f"/api/v1/migrations?plan_id={plan['id']}&offset=3").json() == []
+    assert api.get("/api/v1/migrations?limit=0").status_code == 422
     assert api.get("/api/v1/migrations?phase=failed").json() == []
     stats = api.get(f"/api/v1/stats?plan_id={plan['id']}").json()
     assert stats["total"] == 3 and stats["completed"] == 3 and stats["avg_downtime_s"] is not None

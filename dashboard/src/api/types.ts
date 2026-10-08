@@ -466,6 +466,9 @@ export interface MigrationListQuery {
   plan_id?: string;
   phase?: Phase;
   wave_id?: string;
+  /** Page large plans: 1…5000 (default: every migration), creation order. */
+  limit?: number;
+  offset?: number;
 }
 
 export interface ApproveRequest {

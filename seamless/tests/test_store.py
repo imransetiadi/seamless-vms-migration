@@ -168,3 +168,25 @@ def test_sql_pushed_filters_match_python_semantics(any_store: Store):
     any_store.create_schema()
     any_store.create_schema()
     assert ids(any_store.list("migration", Migration, plan_id="plan-a")) == {a.id, b.id}
+
+
+def test_list_limit_and_offset_in_sql_and_python(any_store: Store):
+    ms = [make_migration(plan_id="plan-p", phase=Phase.ready, attempts=i % 2) for i in range(7)]
+    for m in ms:
+        any_store.put("migration", m)
+    order = [m.id for m in any_store.list("migration", Migration, plan_id="plan-p")]
+    assert len(order) == 7
+    # pushed-down filters page in SQL
+    assert [
+        m.id for m in any_store.list("migration", Migration, plan_id="plan-p", limit=3)
+    ] == order[:3]
+    assert [
+        m.id for m in any_store.list("migration", Migration, plan_id="plan-p", limit=2, offset=5)
+    ] == order[5:7]
+    assert any_store.list("migration", Migration, plan_id="plan-p", offset=7) == []
+    assert any_store.list("migration", Migration, limit=0) == []
+    # a Python-side filter pages after filtering, with the same semantics
+    odd = [m.id for m in any_store.list("migration", Migration, attempts=1)]
+    assert len(odd) == 3
+    assert [m.id for m in any_store.list("migration", Migration, attempts=1, limit=2)] == odd[:2]
+    assert [m.id for m in any_store.list("migration", Migration, attempts=1, offset=2)] == odd[2:]

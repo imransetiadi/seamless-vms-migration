@@ -248,20 +248,39 @@ class Store:
     def get(self, kind: str, id_: str, model_cls: type[M]) -> M:
         return self.get_versioned(kind, id_, model_cls)[0]
 
-    def list(self, kind: str, model_cls: type[M], **filters: Any) -> list[M]:
-        """Documents of ``kind``; ``filters`` compare top-level JSON fields (in Python).
+    def list(
+        self,
+        kind: str,
+        model_cls: type[M],
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        **filters: Any,
+    ) -> list[M]:
+        """Documents of ``kind`` in creation order; ``filters`` compare top-level JSON fields.
 
-        A filter value that is a list/tuple/set matches any of its members.
+        String filters are evaluated in SQL (see ``INDEXED_FIELDS``), the others in Python;
+        a filter value that is a list/tuple/set matches any of its members. ``limit`` and
+        ``offset`` page the result; they are applied in SQL when every filter could be pushed
+        down, otherwise after the Python filtering.
         """
         query = (
             sa.select(documents.c.data)
             .where(documents.c.kind == kind)
             .order_by(documents.c.created_at, documents.c.id)
         )
+        all_pushed = True
         for name, wanted in filters.items():
             clause = _sql_filter(name, wanted)
-            if clause is not None:
+            if clause is None:
+                all_pushed = False
+            else:
                 query = query.where(clause)
+        page_in_sql = all_pushed and (limit is not None or offset)
+        if page_in_sql:
+            query = query.offset(max(0, int(offset)))
+            if limit is not None:
+                query = query.limit(max(0, int(limit)))
         with self.engine.connect() as conn:
             rows = conn.execute(query).all()
         out: list[M] = []
@@ -270,6 +289,9 @@ class Store:
             # the Python check stays authoritative (non-string values, dialect quirks)
             if all(_matches(data.get(name), wanted) for name, wanted in filters.items()):
                 out.append(model_cls.model_validate(data))
+        if not page_in_sql and (limit is not None or offset):
+            start = max(0, int(offset))
+            out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
         return out
 
     def delete(self, kind: str, id_: str) -> None:
@@ -351,8 +373,18 @@ class AsyncStore:
     async def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
         return await asyncio.to_thread(self.sync.get_versioned, kind, id_, model_cls)
 
-    async def list(self, kind: str, model_cls: type[M], **filters: Any) -> list[M]:
-        return await asyncio.to_thread(lambda: self.sync.list(kind, model_cls, **filters))
+    async def list(
+        self,
+        kind: str,
+        model_cls: type[M],
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        **filters: Any,
+    ) -> list[M]:
+        return await asyncio.to_thread(
+            lambda: self.sync.list(kind, model_cls, limit=limit, offset=offset, **filters)
+        )
 
     async def delete(self, kind: str, id_: str) -> None:
         await asyncio.to_thread(self.sync.delete, kind, id_)
