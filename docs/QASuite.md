@@ -661,6 +661,13 @@ Twenty-three further iterations after the integration run, each verified with th
   dashboard, finding catalog vs §9.3 (the first run found `SEAMLESS_LOG_JSON` missing from §15.1).
 * Dev workflow: Dependabot, pre-commit, `make seamless-check`, Playwright browser smoke (`dashboard-e2e`
   CI job). Coverage 95 % (`providers/openstack.py` 100 %).
+* Review wave on the series (independent reviewer): the auth lockout is consulted only after a failed
+  authentication (a shared ingress address can no longer lock operators out), every plan writer uses the
+  optimistic `_update_plan`, the tick heartbeats at start and reports unhealthy after three failing ticks,
+  the Ansible executor forces `ANSIBLE_DISPLAY_SKIPPED_HOSTS` and drops a pending stop when the next task
+  starts, prune cutoffs are normalised to UTC. Security headers (CSP, nosniff, DENY framing) on every
+  response and viewer-gated OpenAPI docs outside demo mode closed Security.md R-04/R-05; verified in a
+  real Chromium session against the rebuilt stack (no console errors or CSP violations).
 
 ### 13.2 Exit criteria — release 0.1.0
 
