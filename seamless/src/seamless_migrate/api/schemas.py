@@ -60,11 +60,19 @@ class SimilarIncidentsResponse(BaseModel):
     hits: list[Hit]
 
 
+class OrchestratorHealth(BaseModel):
+    running: bool
+    last_tick_age_s: float | None
+    ticks: int
+    healthy: bool
+
+
 class Health(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
     demo: bool
     db: Literal["ok", "error"]
+    orchestrator: OrchestratorHealth
 
 
 class Me(BaseModel):

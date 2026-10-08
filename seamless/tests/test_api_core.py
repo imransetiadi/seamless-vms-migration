@@ -21,10 +21,24 @@ def api(tmp_path):
 def test_health_public_reports_db(api, monkeypatch):
     res = api.client.get("/api/v1/health")
     assert res.status_code == 200
-    assert res.json() == {"status": "ok", "version": "0.1.0", "demo": True, "db": "ok"}
+    body = res.json()
+    orchestrator = body.pop("orchestrator")
+    assert body == {"status": "ok", "version": "0.1.0", "demo": True, "db": "ok"}
+    assert orchestrator["running"] is True and orchestrator["healthy"] is True
+    assert orchestrator["ticks"] >= 0
+    assert orchestrator["last_tick_age_s"] is None or orchestrator["last_tick_age_s"] >= 0
     monkeypatch.setattr(api.store, "ping", lambda: False)
     assert api.client.get("/api/v1/health").json()["db"] == "error"
     assert api.client.get("/api/v1/health").json()["status"] == "degraded"
+    monkeypatch.setattr(api.store, "ping", lambda: True)
+    # a dead or stale tick loop degrades the service even with a healthy database
+    monkeypatch.setattr(
+        api.client.app.state.services.orchestrator,
+        "health",
+        lambda: {"running": False, "last_tick_age_s": 99.0, "ticks": 5, "healthy": False},
+    )
+    degraded = api.client.get("/api/v1/health").json()
+    assert degraded["status"] == "degraded" and degraded["orchestrator"]["running"] is False
 
 
 def test_unauthenticated_401_and_audit_event(api):

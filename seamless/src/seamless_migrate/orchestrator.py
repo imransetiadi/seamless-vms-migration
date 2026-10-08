@@ -180,6 +180,8 @@ class Orchestrator:
             "max": 0.0,
             "slow": 0,
         }
+        self._last_tick_at: float | None = None
+        self._started = False
 
     # ------------------------------------------------------------------------------------------
     # plumbing
@@ -793,6 +795,7 @@ class Orchestrator:
             if any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history):
                 self._prestage_done.add(m.plan_id)  # work started: resources were pre-staged
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
+        self._started = True
 
     async def stop(self) -> None:
         self._stopping = True
@@ -810,6 +813,7 @@ class Orchestrator:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tick_task = None
+        self._started = False
         self._drivers.clear()
         self._steps.clear()
         self._prestage_tasks.clear()
@@ -829,9 +833,28 @@ class Orchestrator:
                 await asyncio.wait_for(self._wake.wait(), timeout=self.settings.tick_s)
             self._wake.clear()
 
+    def health(self) -> dict[str, Any]:
+        """Liveness of the tick loop for ``GET /health`` (readiness probes, SDD §12).
+
+        ``running`` is true while the loop task is alive; ``last_tick_age_s`` is the time since
+        the last completed tick (None before the first one); ``healthy`` is false when the loop
+        is dead after ``start()`` or has not ticked for five tick intervals.
+        """
+        task = self._tick_task
+        running = task is not None and not task.done()
+        age = None if self._last_tick_at is None else time.monotonic() - self._last_tick_at
+        stale = age is not None and age > 5 * max(self.settings.tick_s, 0.05)
+        return {
+            "running": running,
+            "last_tick_age_s": None if age is None else round(age, 3),
+            "ticks": int(self.tick_stats["count"]),
+            "healthy": (running and not stale) or (not self._started and not running),
+        }
+
     def _record_tick(self, seconds: float) -> None:
         """Tick timing for ``GET /metrics`` (QASuite PERF-CP-02: p95 below half of tick_s)."""
         stats = self.tick_stats
+        self._last_tick_at = time.monotonic()
         stats["count"] += 1
         stats["sum"] += seconds
         stats["last"] = seconds

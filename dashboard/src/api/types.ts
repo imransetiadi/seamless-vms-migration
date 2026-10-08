@@ -418,11 +418,20 @@ export interface ApiErrorEnvelope {
   error: { code: string; message: string };
 }
 
+export interface OrchestratorHealth {
+  running: boolean;
+  /** Seconds since the last completed tick; null before the first one. */
+  last_tick_age_s: number | null;
+  ticks: number;
+  healthy: boolean;
+}
+
 export interface Health {
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
   db: 'ok' | 'error';
+  orchestrator: OrchestratorHealth;
 }
 
 export interface Me {

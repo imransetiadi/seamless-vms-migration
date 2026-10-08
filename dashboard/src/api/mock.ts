@@ -474,7 +474,7 @@ export class MockServer {
     const [root, id, sub, subsub] = seg;
     const input = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
 
-    if (method === 'GET' && root === 'health') return ok({ status: 'ok', version: '0.1.0-mock', demo: true, db: 'ok' });
+    if (method === 'GET' && root === 'health') return ok({ status: 'ok', version: '0.1.0-mock', demo: true, db: 'ok', orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true } });
 
     if (root === 'me' && method === 'GET') return ok(this.require(token, 'viewer', path));
 

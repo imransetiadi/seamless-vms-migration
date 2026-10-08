@@ -784,7 +784,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error"}` |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for 5 × `tick_s`); probes use it |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider` |

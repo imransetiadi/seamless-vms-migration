@@ -943,3 +943,21 @@ async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_
     done = await h2.wait_phase((await h2.by_vm(plan2.id, "vm-2")).id, P.completed)
     await h2.orch.stop()
     assert done.phase == P.completed
+
+
+async def test_orchestrator_health_reports_loop_state(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    before = h.orch.health()
+    assert before == {"running": False, "last_tick_age_s": None, "ticks": 0, "healthy": True}
+    await h.orch.start()
+    await asyncio.sleep(0.05)
+    live = h.orch.health()
+    assert live["running"] is True and live["healthy"] is True and live["ticks"] >= 1
+    assert live["last_tick_age_s"] is not None and live["last_tick_age_s"] >= 0
+    await h.orch.stop()
+    stopped = h.orch.health()
+    assert stopped["running"] is False and stopped["healthy"] is True, "stopped on purpose"
+    # a loop that died after start() is unhealthy
+    h.orch._started = True
+    assert h.orch.health()["healthy"] is False
+    h.orch._started = False
