@@ -50,6 +50,11 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Repair or reset the source VM (running or stopped), then re-validate.",
     ),
+    "SRC_VM_TRANSITIONAL_STATE": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Wait until the Nova task finishes and the VM is ACTIVE or SHUTOFF, then re-validate.",
+    ),
     "SRC_VM_DUPLICATE_NAME": CatalogEntry(
         Severity.blocker,
         (),
@@ -331,6 +336,14 @@ def run_preflight(
 
     if vm.power_state == "error":
         out.append(finding("SRC_VM_ERROR_STATE", f"Source VM {vm.name} is in error state."))
+    elif vm.power_state == "transitioning":
+        out.append(
+            finding(
+                "SRC_VM_TRANSITIONAL_STATE",
+                f"Source VM {vm.name} has a Nova task in flight (resize, migration, rescue, "
+                "rebuild or reboot); a stop or snapshot would fail.",
+            )
+        )
 
     twins = [v for v in selected if v.source_id != vm.source_id and v.name == vm.name]
     if twins:

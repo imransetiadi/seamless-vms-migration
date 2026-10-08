@@ -386,6 +386,15 @@ async def test_openstack_tls_off_is_logged_and_calls_are_bounded(
     assert closed == [True] and provider._conn is None
 
 
+async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.status = "VERIFY_RESIZE"
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.power_state == "transitioning"
+
+
 async def test_openstack_image_booted_server_gets_image_root_disk(stub_openstack):
     conn = fake_conn()
     srv = conn.compute.get_server("srv-1")
@@ -677,6 +686,53 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     assert not any("VirtualMachine" in t for t in walked)
     with pytest.raises(ProviderError, match="not found"):
         await provider.get_vm("missing")  # falls back to the walk, then fails
+
+
+async def test_vmware_used_bytes_come_from_the_disk_layout(tmp_path):
+    """Thin disks: the extent files behind a disk's chain are its used space (no 60 % rule)."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = fake_vcenter_vm()
+    vm.layoutEx = NS(
+        file=[
+            NS(key=0, size=700),  # descriptor
+            NS(key=1, size=12 * GIB),  # Hard disk 1 extent
+            NS(key=2, size=3 * GIB),  # Hard disk 1 snapshot delta
+            NS(key=3, size=100 * GIB),  # Hard disk 2 extent
+        ],
+        disk=[
+            NS(key=2000, chain=[NS(fileKey=[0, 1]), NS(fileKey=[2])]),
+            NS(key=2001, chain=[NS(fileKey=[3])]),
+        ],
+    )
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+    [mapped] = await provider.list_vms()
+    by_name = {d.name: d for d in mapped.disks}
+    assert by_name["Hard disk 1"].used_gb == 15.0 and by_name["Hard disk 2"].used_gb == 100.0
+    assert mapped.used_bytes == 115 * GIB
+    # without a layout the used size stays unknown (estimator fallback)
+    plain = (await provider_for_plain(tmp_path, fake_vcenter_vm()).list_vms())[0]
+    assert all(d.used_gb is None for d in plain.disks)
+
+
+def provider_for_plain(tmp_path, vm):
+    return VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
 
 
 async def test_vmware_pci_and_vgpu_devices_become_blocking_extra_specs(tmp_path):

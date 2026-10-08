@@ -43,11 +43,11 @@ def eligibility(
     kind = ProviderKind(source_kind)
     out: dict[Strategy, list[str]] = {s: [] for s in strategies_for(kind)}
     multiattach = [d for d in vm.disks if d.multiattach]
-    in_error = vm.power_state == "error"
+    in_error = vm.power_state in ("error", "transitioning")
 
     if kind == ProviderKind.vmware:
         if in_error:
-            out[Strategy.vmware_cold].append("source VM is in error state")
+            out[Strategy.vmware_cold].append(f"source VM is in {vm.power_state} state")
         if vm.cbt_enabled is not True:
             out[Strategy.vmware_warm].append("Changed Block Tracking (CBT) is not enabled")
         independent = [d for d in vm.disks if d.independent]
@@ -56,7 +56,7 @@ def eligibility(
     else:
         copy_reasons: list[str] = []
         if in_error:
-            copy_reasons.append("source VM is in error state")
+            copy_reasons.append(f"source VM is in {vm.power_state} state")
         if not src_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):

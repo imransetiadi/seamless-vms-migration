@@ -21,6 +21,7 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
   const add = (code: string, label: string, severity: Severity, detail: string) => flags.push({ code, label, severity, detail });
 
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'Error state', 'blocker', 'The source VM is in ERROR state.');
+  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'Task in flight', 'blocker', 'A Nova task (resize, migration, rescue, rebuild, reboot) is in flight.');
   if ('resources:VGPU' in vm.flavor_extra_specs) add('VM_VGPU', 'vGPU', 'blocker', 'The flavor requests a vGPU.');
   if ('pci_passthrough:alias' in vm.flavor_extra_specs) add('VM_PCI_PASSTHROUGH', 'PCI passthrough', 'blocker', 'The flavor requests PCI passthrough.');
   if (vm.disks.some((d) => d.multiattach)) add('SRC_VM_MULTIATTACH', 'Multi-attach', 'warning', 'A multi-attach volume rules out warm and storage handover.');

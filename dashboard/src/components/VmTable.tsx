@@ -1,13 +1,4 @@
-import {
-  CircleCheck,
-  CircleHelp,
-  CircleX,
-  Pause,
-  Power,
-  PowerOff,
-  SearchX,
-  type LucideIcon,
-} from 'lucide-react';
+import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { POWER_STATES, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
@@ -27,6 +18,7 @@ const POWER_META: Record<PowerState, { label: string; tone: Tone; icon: LucideIc
   stopped: { label: 'Stopped', tone: 'neutral', icon: PowerOff },
   paused: { label: 'Paused', tone: 'warning', icon: Pause },
   error: { label: 'Error', tone: 'danger', icon: CircleX },
+  transitioning: { label: 'Task in flight', tone: 'warning', icon: RefreshCw },
   unknown: { label: 'Unknown', tone: 'neutral', icon: CircleHelp },
 };
 

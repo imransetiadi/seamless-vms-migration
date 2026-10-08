@@ -60,7 +60,7 @@ export type ProviderStatus = (typeof PROVIDER_STATUSES)[number];
 export const DISK_KINDS = ['volume', 'ephemeral', 'image_root', 'vmdk'] as const;
 export type DiskKind = (typeof DISK_KINDS)[number];
 
-export const POWER_STATES = ['running', 'stopped', 'paused', 'error', 'unknown'] as const;
+export const POWER_STATES = ['running', 'stopped', 'paused', 'error', 'transitioning', 'unknown'] as const;
 export type PowerState = (typeof POWER_STATES)[number];
 
 export const SELECTION_POLICIES = ['min_downtime', 'simplest_meeting_slo'] as const;

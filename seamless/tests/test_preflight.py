@@ -66,6 +66,7 @@ def only(findings, code):
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
+        "SRC_VM_TRANSITIONAL_STATE",
         "SRC_VM_DUPLICATE_NAME",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
@@ -130,6 +131,14 @@ def test_finding_src_vm_ephemeral_root():
     # a data-only ephemeral disk is not the root disk
     data_eph = make_vm(disks=[make_disk(), make_disk(id="e", kind="ephemeral", bootable=False)])
     assert all(x.code != "SRC_VM_EPHEMERAL_ROOT" for x in check(data_eph))
+
+
+def test_finding_src_vm_transitional_state():
+    vm = make_vm(power_state="transitioning")
+    f = only(check(vm), "SRC_VM_TRANSITIONAL_STATE")
+    assert f.severity == Severity.blocker and "task in flight" in f.message
+    assert all(x.code != "SRC_VM_ERROR_STATE" for x in check(vm))
+    assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
 
 
 def test_finding_map_network_missing():

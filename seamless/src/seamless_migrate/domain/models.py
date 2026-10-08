@@ -104,7 +104,7 @@ class Nic(_Model):
     mtu: int | None = None
 
 
-PowerState = Literal["running", "stopped", "paused", "error", "unknown"]
+PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]
 
 
 class VMRef(_Model):

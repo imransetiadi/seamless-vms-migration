@@ -32,6 +32,17 @@ _POWER = {
     "SHELVED": "stopped",
     "SHELVED_OFFLOADED": "stopped",
     "ERROR": "error",
+    # a Nova task in flight: a stop or snapshot would fail (SDD §4.2, §9.3)
+    "BUILD": "transitioning",
+    "REBUILD": "transitioning",
+    "REBOOT": "transitioning",
+    "HARD_REBOOT": "transitioning",
+    "RESIZE": "transitioning",
+    "VERIFY_RESIZE": "transitioning",
+    "REVERT_RESIZE": "transitioning",
+    "MIGRATING": "transitioning",
+    "RESCUE": "transitioning",
+    "PASSWORD": "transitioning",
 }
 
 

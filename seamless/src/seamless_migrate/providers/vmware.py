@@ -63,6 +63,27 @@ def _count_snapshots(nodes: Iterable[Any] | None) -> int:
     return total
 
 
+def _disk_usage(vm: Any) -> dict[int, int]:
+    """Bytes each virtual disk really occupies on its datastore (``vm.layoutEx``): the sum of
+    the extent files behind the disk's chain, which is the used space of a thin disk. Without
+    the layout the estimator falls back to its 60 % rule (SDD §4.2)."""
+    layout = getattr(vm, "layoutEx", None)
+    files = {
+        int(getattr(f, "key", -1)): int(getattr(f, "size", 0) or 0)
+        for f in (getattr(layout, "file", None) or [])
+    }
+    out: dict[int, int] = {}
+    for disk in getattr(layout, "disk", None) or []:
+        keys = [
+            int(k)
+            for chain in (getattr(disk, "chain", None) or [])
+            for k in (getattr(chain, "fileKey", None) or [])
+        ]
+        if keys:
+            out[int(getattr(disk, "key", -1))] = sum(files.get(k, 0) for k in keys)
+    return out
+
+
 def map_vm(
     vm: Any,
     vim: Any,
@@ -78,16 +99,19 @@ def map_vm(
     disk_cls = vim.vm.device.VirtualDisk
     nic_cls = vim.vm.device.VirtualEthernetCard
 
+    used_by_key = _disk_usage(vm)
     disks: list[Disk] = []
     for dev in sorted((d for d in devices if isinstance(d, disk_cls)), key=lambda d: d.key):
         size_bytes = getattr(dev, "capacityInBytes", None) or int(dev.capacityInKB) * 1024
         backing = getattr(dev, "backing", None)
         mode = str(getattr(backing, "diskMode", "") or "")
+        used = used_by_key.get(int(dev.key))
         disks.append(
             Disk(
                 id=str(getattr(backing, "uuid", None) or f"{source_id}:{dev.key}"),
                 name=getattr(getattr(dev, "deviceInfo", None), "label", None),
                 size_gb=math.ceil(size_bytes / GIB),
+                used_gb=None if used is None else round(min(used, size_bytes) / GIB, 3),
                 bootable=not disks,
                 device=getattr(getattr(dev, "deviceInfo", None), "label", None),
                 kind="vmdk",

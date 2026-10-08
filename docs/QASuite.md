@@ -734,8 +734,12 @@ Twenty-three further iterations after the integration run, each verified with th
   `vmware_warm` convergence no longer "converges" on missing byte counts; `start_plan` refuses VMs outside
   every wave; `validate_plan` refuses VMs with a cancelled migration; `keep_warm_interval_s ≥ 60`,
   `downtime_slo_s ≥ 1`. SDD §5.4, §9.1, §9.3, §9.4 amended (own commit). 650 control-plane tests.
-  Deferred: `used_gb` from real providers, quota demand for `image_root` under warm, missing destination
-  project as a finding (catalog), gate-time delta ageing in the shown estimate, `force_window` persistence.
+  Follow-ups the same day: `SRC_VM_TRANSITIONAL_STATE` (blocker; Nova RESIZE/VERIFY_RESIZE/MIGRATING/
+  RESCUE/REBUILD/REBOOT/BUILD map to `power_state: transitioning`, SDD §4.2/§9.3, dashboard label "Task
+  in flight") and VMware per-disk `used_gb` from `vm.layoutEx` (extent files behind the disk chain, so thin
+  disks are estimated on their real usage instead of the 60 % rule). Deferred: OpenStack `used_gb` (Cinder
+  reports no usage), quota demand for `image_root` under warm, missing destination project as a finding
+  (catalog), gate-time delta ageing in the shown estimate, `force_window` persistence.
 
 ### 13.2 Exit criteria — release 0.1.0
 

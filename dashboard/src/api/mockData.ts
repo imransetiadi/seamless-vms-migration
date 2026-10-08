@@ -427,6 +427,7 @@ export function preflight(
     findings.push({ code, severity, message, remediation, strategies });
 
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'blocker', `${vm.name} is in ERROR state at the source.`, 'Repair or reset the source instance, then re-validate.');
+  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'blocker', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`, 'Wait until the VM is ACTIVE or SHUTOFF, then re-validate.');
   if (selectedNames.filter((n) => n === vm.name).length > 1)
     add('SRC_VM_DUPLICATE_NAME', 'blocker', `Another selected VM is also named ${vm.name}; os-migrate filters workloads by name.`, 'Rename one of the instances or split them into separate plans.');
   if (vm.disks.some((d) => d.multiattach))
