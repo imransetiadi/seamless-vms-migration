@@ -168,6 +168,28 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
 
+  manifests:
+    name: OpenShift manifests (kustomize build + kubeconform)
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFORM_VERSION: v0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeconform (checksum-pinned release)
+        run: |
+          curl -sSLf -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar xzf kubeconform.tar.gz -C "$HOME/.local/bin" kubeconform
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Render the kustomization and validate against the Kubernetes 1.30 schemas
+        # Route (route.openshift.io) has no public JSON schema: kustomize parses it, kubeconform skips it
+        run: |
+          kubectl kustomize deploy/openshift > /tmp/manifests.yaml
+          kubeconform -strict -summary -skip Route -kubernetes-version 1.30.0 \
+            -schema-location default /tmp/manifests.yaml
+
   image:
     name: container image (build, trivy, SBOM)
     # heavy: the UBI errata and the Galaxy downloads take minutes — main, nightly and manual runs only
