@@ -9,6 +9,7 @@ from seamless_migrate.planning.estimator import (
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    invalid_estimator_overrides,
     observed_scan_rate,
     params_for_plan,
     scan_seconds,
@@ -188,6 +189,26 @@ def test_estimator_overrides_with_plan_precedence():
         "bogus",
     ]
     assert unknown_estimator_overrides({}) == []
+
+
+def test_invalid_estimator_overrides():
+    assert invalid_estimator_overrides({}) == []
+    assert invalid_estimator_overrides({"scan_bps": 1e9, "parallel_disks": 2, "link_bps": 1}) == []
+    problems = invalid_estimator_overrides(
+        {"bogus": 1, "scan_bps": 0, "boot_s": -5, "max_passes": 9,
+         "convergence_threshold_bytes": 1, "snapshot_s": "30", "parallel_disks": True}
+    )  # fmt: skip
+    assert [p.split(":")[0] for p in problems] == sorted(
+        ["bogus", "scan_bps", "boot_s", "max_passes", "convergence_threshold_bytes",
+         "snapshot_s", "parallel_disks"]
+    )  # fmt: skip
+    assert any("unknown" in p for p in problems if p.startswith("bogus"))
+    assert any("max_sync_passes" in p for p in problems if p.startswith("max_passes"))
+    assert any("positive" in p for p in problems if p.startswith("scan_bps"))
+    with pytest.raises(ValueError):
+        make_plan(link_bps=0)
+    with pytest.raises(ValueError):
+        make_plan(max_sync_passes=0)
 
 
 def test_estimate_final_downtime_uses_scan_term():

@@ -217,9 +217,9 @@ class PlanSpec(_Model):
     auto_cutover: bool = False
     cutover_window: CutoverWindow | None = None
     keep_warm_interval_s: int = 900
-    convergence_threshold_bytes: int = 1073741824
-    max_sync_passes: int = 5
-    link_bps: float = 131072000.0
+    convergence_threshold_bytes: int = Field(default=1073741824, ge=0)
+    max_sync_passes: int = Field(default=5, ge=1)
+    link_bps: float = Field(default=131072000.0, gt=0)
     #: overrides of ``EstimatorParams`` fields for this plan (SDD §9.1)
     estimator_overrides: dict[str, float] = Field(default_factory=dict)
     handover: HandoverConfig = Field(default_factory=HandoverConfig)

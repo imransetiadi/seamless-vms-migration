@@ -140,6 +140,9 @@ def destination_volume_sdk_params(
             )
             sdk_params.update(boot_volume_params_defined)
     if preserve_volume_type:
+        if sdk_params.get("volume_type") is None and ser_server is not None:
+            # boot copies: the serialized (already mapped) type of the volume at ``path``
+            sdk_params["volume_type"] = serialized_volume_type(ser_server, device=path)
         if sdk_params.get("volume_type") is None and mapping.get("volume_type"):
             sdk_params["volume_type"] = mapping["volume_type"]
         if sdk_params.get("volume_type") is None:
@@ -147,6 +150,22 @@ def destination_volume_sdk_params(
     else:
         sdk_params.pop("volume_type", None)
     return sdk_params
+
+
+def serialized_volume_type(ser_server, device=None, volume_id=None):
+    """``volume_type`` of the serialized workload volume attached at ``device`` or with
+    ``volume_id`` (the value the user may have mapped in workloads.yml); ``None`` if unknown.
+    """
+    for data in ser_server.params().get("volumes") or []:
+        vol = ServerVolume.from_data(data)
+        info = vol.info()
+        if volume_id is not None and info.get("id") == volume_id:
+            return vol.params().get("volume_type")
+        if device is not None and any(
+            a.get("device") == device for a in info.get("attachments") or []
+        ):
+            return vol.params().get("volume_type")
+    return None
 
 
 class OpenStackVolumeBase:

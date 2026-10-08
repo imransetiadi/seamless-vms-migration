@@ -118,6 +118,15 @@ async def test_recommend_never_returns_ineligible():
     assert "warm" not in [c["id"] for c in session.calls[0][1]["candidates"]]
 
 
+async def test_recommend_needs_two_candidates():
+    """jev_decide rejects fewer than two candidates: a single eligible strategy is final."""
+    plan = make_plan(downtime_slo_s=10)  # nothing meets the SLO -> Jev would be consulted
+    advisor, session = advisor_for({"decide": decide_with("warm", 0.9)})
+    one = [est(Strategy.warm, 950), est(Strategy.cold, 1000, eligible=False)]
+    assert await advisor.recommend_strategy(make_vm(), one, plan) is None
+    assert session.calls == []
+
+
 async def test_recommend_without_jev_is_none_or_rules_note():
     off = Advisor(None, Settings())
     assert await off.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200)) is None

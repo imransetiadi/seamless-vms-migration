@@ -8,9 +8,16 @@ from fastapi import APIRouter, Body, Depends, Request
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderRole, Role
-from ..domain.models import PLAN_EDITABLE_FIELDS, Plan, PlanCreate, Provider, ValidationReport
+from ..domain.models import (
+    PLAN_EDITABLE_FIELDS,
+    Plan,
+    PlanCreate,
+    PlanSpec,
+    Provider,
+    ValidationReport,
+)
 from ..events import emit
-from ..planning.estimator import unknown_estimator_overrides
+from ..planning.estimator import invalid_estimator_overrides
 from ..security.auth import Principal
 from ..store import NotFound
 from .deps import ApiError, _audit_denied, require_role, services
@@ -31,11 +38,18 @@ async def _check_policy_fields(request: Request, fields: set[str], principal: Pr
 
 
 def _check_estimator_overrides(spec: PlanCreate) -> None:
-    unknown = unknown_estimator_overrides(spec.estimator_overrides)
-    if unknown:
-        raise ApiError(
-            400, "bad_request", f"unknown estimator_overrides field(s): {', '.join(unknown)}"
-        )
+    problems = invalid_estimator_overrides(spec.estimator_overrides)
+    if problems:
+        raise ApiError(400, "bad_request", f"invalid estimator_overrides: {'; '.join(problems)}")
+
+
+def _non_default_policy_fields(body: PlanCreate) -> set[str]:
+    """Policy fields the request sets to something other than the default."""
+    return {
+        name
+        for name in body.model_fields_set & POLICY_FIELDS
+        if getattr(body, name) != PlanSpec.model_fields[name].default
+    }
 
 
 async def _check_providers(request: Request, spec: PlanCreate) -> None:
@@ -66,7 +80,7 @@ async def create_plan(
     body: PlanCreate, request: Request, principal: Principal = Depends(require_role(Role.operator))
 ) -> Plan:
     svc = services(request)
-    await _check_policy_fields(request, set(body.model_fields_set), principal)
+    await _check_policy_fields(request, _non_default_policy_fields(body), principal)
     _check_estimator_overrides(body)
     await _check_providers(request, body)
     plan = Plan(**body.model_dump())

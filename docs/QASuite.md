@@ -358,7 +358,7 @@ Every run records the environment descriptor ([Performance.md](Performance.md) �
 | LAB-N07 | RHEL 6 / Windows 2008 guest | `GUEST_OS_LEGACY` warning | FR-04 |
 | LAB-N08 | an unmapped network with `networks` removed from `plan.prestage_resources`, and a flavor larger than every destination flavor | `MAP_NETWORK_MISSING` / `MAP_FLAVOR_MISSING` blockers; adding the mappings and re-validating clears them. With the default `prestage_resources` the same unmapped network yields `MAP_NETWORK_PRESTAGED` (info), and a flavor that fits an existing destination flavor yields `MAP_FLAVOR_AUTO` (info) and is recorded in `Migration.resolved_mappings`, which `apply_mappings` then uses (SDD §7.2, §9.3) | FR-04 |
 | LAB-N09 | provider without conversion host | `CONV_HOST_MISSING` warning; strategy eligibility reflects it | FR-04 |
-| LAB-N10 | volume type without mapping or same-named destination type | `MAP_VOLUME_TYPE_MISSING` warning | FR-04 |
+| LAB-N10 | volume type without mapping or same-named destination type | `MAP_VOLUME_TYPE_MISSING` warning; with any `plan.mappings.volume_types` entry the same finding is a blocker (SDD §6.4/§9.3) | FR-04 |
 | **Control, rollback, finalize** | | | |
 | LAB-R01 | verification fails after cutover | automatic rollback; source runs again; destination volumes kept (AC-4) | FR-14, FR-15 |
 | LAB-R02 | manual `rollback` of a `completed` migration before finalize | destination server removed, source restarted | FR-15 |

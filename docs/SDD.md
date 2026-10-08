@@ -628,7 +628,9 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
-(unknown keys are rejected with 400); `Plan.link_bps` keeps precedence for `link_bps`. After every
+(unknown keys, non-positive values and the plan-owned keys `convergence_threshold_bytes` /
+`max_passes` are rejected with 400 — set `Plan.convergence_threshold_bytes` / `Plan.max_sync_passes`
+instead); `Plan.link_bps` keeps precedence for `link_bps`. After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
@@ -679,7 +681,7 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is, emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name) |
 | `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` — info — names it) |
-| `MAP_VOLUME_TYPE_MISSING` | warning | a disk volume type has no mapping and no same-named destination type |
+| `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |

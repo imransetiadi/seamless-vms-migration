@@ -43,6 +43,32 @@ def unknown_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
     return sorted(k for k in overrides if k not in _FIELD_TYPES)
 
 
+#: Override keys that belong to plan fields (rejected: set the plan field instead).
+_PLAN_FIELD_FOR = {"convergence_threshold_bytes": "convergence_threshold_bytes",
+                   "max_passes": "max_sync_passes"}  # fmt: skip
+
+
+def invalid_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
+    """Problems with ``Plan.estimator_overrides`` (empty = valid), one message per key.
+
+    Unknown keys, keys owned by plan fields (``link_bps`` is accepted but the plan's value
+    keeps precedence, SDD §9.1) and non-positive values are rejected; ``parallel_disks``
+    must be at least 1.
+    """
+    problems = []
+    for key in sorted(overrides):
+        value = overrides[key]
+        if key not in _FIELD_TYPES:
+            problems.append(f"{key}: unknown field")
+        elif key in _PLAN_FIELD_FOR:
+            problems.append(f"{key}: set the plan field {_PLAN_FIELD_FOR[key]} instead")
+        elif not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
+            problems.append(f"{key}: must be a positive number")
+        elif key == "parallel_disks" and int(value) < 1:
+            problems.append(f"{key}: must be at least 1")
+    return problems
+
+
 def params_for_plan(plan: Plan, base: EstimatorParams | None = None) -> EstimatorParams:
     """Estimator parameters for ``plan``.
 

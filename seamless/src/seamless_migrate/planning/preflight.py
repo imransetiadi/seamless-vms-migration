@@ -168,13 +168,18 @@ def is_legacy_os(os_type: str | None) -> bool:
     return any(_LEGACY_OS.search(v) for v in variants)
 
 
-def finding(code: str, message: str) -> Finding:
+def finding(
+    code: str,
+    message: str,
+    severity: Severity | None = None,
+    remediation: str | None = None,
+) -> Finding:
     entry = CATALOG[code]
     return Finding(
         code=code,
-        severity=entry.severity,
+        severity=severity or entry.severity,
         message=message,
-        remediation=entry.remediation,
+        remediation=remediation or entry.remediation,
         strategies=list(entry.strategies),
     )
 
@@ -371,7 +376,19 @@ def run_preflight(
         and d.volume_type not in maps.volume_types
         and d.volume_type not in dst_inv.volume_types
     ]
-    if missing_types:
+    if missing_types and maps.volume_types:
+        # SDD §6.4: with mapped volume types the executor preserves them, so an
+        # unmapped type would fail volume creation after the source was stopped.
+        out.append(
+            finding(
+                "MAP_VOLUME_TYPE_MISSING",
+                f"No mapping or same-named RHOSO volume type for: {_names(missing_types)}; "
+                "the plan maps volume types, so the destination default cannot be used.",
+                severity=Severity.blocker,
+                remediation="Add a volume type mapping for it (the plan preserves volume types).",
+            )
+        )
+    elif missing_types:
         out.append(
             finding(
                 "MAP_VOLUME_TYPE_MISSING",

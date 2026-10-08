@@ -504,13 +504,41 @@ def test_sync_destination_volumes_match_cold_path_params(tmp_path):
 
 def test_sync_preserves_volume_type_when_asked(tmp_path):
     scenario = Scenario(tmp_path)
+    # the user (or the control plane's apply_mappings) rewrote the serialized
+    # types to destination types; the source cloud still reports ssd / ceph
+    scenario.data["params"]["volumes"][0]["params"]["volume_type"] = "rhoso-ssd"
+    scenario.data["params"]["volumes"][1]["params"]["volume_type"] = "rhoso-hdd"
     scenario.run_pass("uuid-1", preserve_volume_type=True)
 
     boot, data = scenario.dst.calls_to("create_volume")
-    # Both destination volumes keep the serialized (already mapped) type of
-    # their source volume instead of the destination default.
-    assert boot[1]["volume_type"] == "ssd"
-    assert data[1]["volume_type"] == "ceph"
+    # Both destination volumes get the serialized (mapped) type, never the raw
+    # source-cloud type recorded by the snapshot and never the destination default.
+    assert boot[1]["volume_type"] == "rhoso-ssd"
+    assert data[1]["volume_type"] == "rhoso-hdd"
+    # boot_volume_params.volume_type (also mapped) wins for the boot copy when set
+    typed = Scenario(tmp_path / "typed")
+    typed.data["_migration_params"]["boot_volume_params"]["volume_type"] = "rhoso-boot"
+    typed.run_pass("uuid-1", preserve_volume_type=True)
+    boot, _ = typed.dst.calls_to("create_volume")
+    assert boot[1]["volume_type"] == "rhoso-boot"
+
+
+def test_cold_boot_copy_preserves_serialized_volume_type(tmp_path):
+    """The cold path's /dev/vda mapping points at the temporary copy: the type comes from
+    the serialized volume attached at /dev/vda."""
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common
+
+    scenario = Scenario(tmp_path)
+    scenario.data["params"]["volumes"][0]["params"]["volume_type"] = "rhoso-ssd"
+    boot_mapping = {"name": "os-migrate-vm1", "bootable": True, "size": 20, "source_id": "tmp-1"}
+    kept = volume_common.destination_volume_sdk_params(
+        None, scenario.ser_server(), "/dev/vda", boot_mapping, 10, preserve_volume_type=True
+    )
+    assert kept["volume_type"] == "rhoso-ssd"
+    default = volume_common.destination_volume_sdk_params(
+        None, scenario.ser_server(), "/dev/vda", boot_mapping, 10
+    )
+    assert "volume_type" not in default
 
 
 def test_destination_volume_sdk_params_volume_type_switch():

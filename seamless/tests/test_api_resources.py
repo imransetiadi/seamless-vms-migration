@@ -132,6 +132,33 @@ def test_plan_create_validate_start_flow(api):
         },
     )
     assert bogus.status_code == 400 and "nope" in bogus.json()["error"]["message"]
+    zero = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "zero scan",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+            "estimator_overrides": {"scan_bps": 0},
+        },
+    )
+    assert zero.status_code == 400 and "scan_bps" in zero.json()["error"]["message"]
+    # an operator may spell out the policy defaults: only non-default values need an approver
+    defaults = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "defaults spelled out",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+            "require_approval": True,
+            "auto_cutover": False,
+            "cutover_window": None,
+        },
+    )
+    assert defaults.status_code == 201, defaults.text
 
     patched = api.client.patch(
         f"/api/v1/plans/{plan['id']}",

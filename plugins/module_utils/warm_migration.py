@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import blocksync
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
+    serialized_volume_type,
     ATTACH_LOCK_FILE_DESTINATION,
     ATTACH_LOCK_FILE_SOURCE,
     DEFAULT_TIMEOUT,
@@ -772,7 +773,11 @@ class OpenstackWarmSync(_WarmVolumeBase):
             "size": source["size"],
             "bootable": source["bootable"],
             "source_id": source["tmp_volume_id"] if dev == BOOT_DEVICE else source["source_id"],
-            "volume_type": source.get("volume_type"),
+            # the serialized type (mapped by the user in workloads.yml), never the raw
+            # source-cloud type recorded by the snapshot
+            "volume_type": serialized_volume_type(self.ser_server, volume_id=source["source_id"])
+            if source.get("source_id")
+            else None,
         }
         params = destination_volume_sdk_params(
             self.conn,

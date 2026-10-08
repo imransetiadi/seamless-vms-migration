@@ -160,6 +160,8 @@ class Advisor:
             {"id": e.strategy.value, "description": STRATEGY_DESCRIPTIONS[e.strategy]}
             for e in eligible
         ]
+        if len(candidates) < 2:
+            return None  # nothing to decide: jev_decide needs at least two candidates
         base_data: dict[str, Any] = {
             "deterministic": deterministic.value,
             "deterministic_reason": reason,

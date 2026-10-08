@@ -298,6 +298,11 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # planning actions
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
+        # one validation per plan at a time: concurrent runs would create duplicate migrations
+        async with self._lock(f"plan:{plan_id}"):
+            return await self._validate_plan(plan_id, actor)
+
+    async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")

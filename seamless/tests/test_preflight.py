@@ -210,6 +210,12 @@ def test_finding_map_volume_type_missing():
     assert f.severity == Severity.warning and "ceph-hdd" in f.message
     mapped = make_plan(mappings=Mappings(volume_types={"ceph-hdd": "ceph-ssd"}))
     assert all(x.code != "MAP_VOLUME_TYPE_MISSING" for x in check(vm, plan=mapped))
+    # when the plan maps volume types the executor preserves them (SDD §6.4): an unmapped
+    # type would fail volume creation after the source was stopped, so it blocks
+    other = make_vm(disks=[make_disk(volume_type="ceph-nvme")])
+    blocker = only(check(other, plan=mapped), "MAP_VOLUME_TYPE_MISSING")
+    assert blocker.severity == Severity.blocker and "ceph-nvme" in blocker.message
+    assert "mapping" in (blocker.remediation or "")
 
 
 def test_finding_dst_quota_insufficient():

@@ -124,6 +124,15 @@ async def test_validation_records_resolved_flavor_mapping(tmp_path, store):
     assert (await h.by_vm(plan.id, "vm-1")).resolved_mappings.flavors == {}
 
 
+async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2), vm(3)])
+    reports = await asyncio.gather(
+        h.orch.validate_plan(plan.id, "alice"), h.orch.validate_plan(plan.id, "bob")
+    )
+    assert all(len(r.migrations) == 3 for r in reports)
+    assert len(await h.migrations(plan.id)) == 3
+
+
 async def test_start_rejects_blocked_plan(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     h, plan = await setup(tmp_path, store, [vm(1), gpu])
