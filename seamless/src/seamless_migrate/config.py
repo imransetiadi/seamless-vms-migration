@@ -59,6 +59,8 @@ class Settings(BaseModel):
     max_concurrent_cutovers: int = 3
     tick_s: float = 1.0
     max_step_retries: int = 2
+    #: failed bearer authentications per client address per minute before 429 (0 = off)
+    auth_lockout_per_minute: int = 60
     jev_mode: JevMode = "off"
     jev_command: str = "npx -y @jkudish/jev-mcp@0.14.1"
     jev_url: str | None = None
@@ -118,6 +120,7 @@ class Settings(BaseModel):
             "MAX_CONCURRENT_CUTOVERS": ("max_concurrent_cutovers", int),
             "TICK_S": ("tick_s", float),
             "MAX_STEP_RETRIES": ("max_step_retries", int),
+            "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),
             "JEV_TIMEOUT_S": ("jev_timeout_s", float),
             "JEV_MIN_CONFIDENCE": ("jev_min_confidence", float),
         }

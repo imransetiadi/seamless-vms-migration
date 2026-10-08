@@ -35,6 +35,7 @@ class Services:
     memory: Any = None
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
+    _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
 
     @property
     def db(self) -> AsyncStore:
@@ -43,6 +44,22 @@ class Services:
     @property
     def providers(self) -> Any:
         return self.orchestrator.providers
+
+    def auth_locked(self, client: str) -> bool:
+        """True while ``client`` exceeded ``auth_lockout_per_minute`` failed authentications
+        in the last minute (Security.md API2: in-process lockout, ingress limits on top)."""
+        limit = self.settings.auth_lockout_per_minute
+        if limit <= 0:
+            return False
+        now = time.monotonic()
+        window = self._auth_failures[client]
+        while window and now - window[0] > 60:
+            window.popleft()
+        return len(window) >= limit
+
+    def record_auth_failure(self, client: str) -> None:
+        if self.settings.auth_lockout_per_minute > 0:
+            self._auth_failures[client].append(time.monotonic())
 
     def allow_audit(self, client: str) -> bool:
         now = time.monotonic()
@@ -105,8 +122,18 @@ def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:
     """FastAPI dependency: the caller's principal, which must hold at least ``role``."""
 
     async def dependency(request: Request) -> Principal:
+        svc = services(request)
+        client = request.client.host if request.client else "unknown"
+        if svc.auth_locked(client):
+            await _audit_denied(request, "too many failed authentication attempts", role)
+            raise ApiError(
+                429,
+                "too_many_requests",
+                "too many failed authentication attempts from this address; retry in a minute",
+            )
         principal = authenticate(request)
         if principal is None:
+            svc.record_auth_failure(client)
             await _audit_denied(request, "missing or invalid bearer token", role)
             raise ApiError(401, "unauthorized", "missing or invalid bearer token")
         if not principal.role.at_least(role):

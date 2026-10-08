@@ -115,7 +115,8 @@ ROUTES = [
 @pytest.fixture(scope="module")
 def matrix_api(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("matrix")
-    settings, tokens = api_settings(tmp_path)
+    # the matrix fires >100 unauthenticated requests from one client: no lockout here
+    settings, tokens = api_settings(tmp_path, auth_lockout_per_minute=0)
     store = Store(f"sqlite:///{tmp_path / 'matrix.db'}")
     store.create_schema()
     with TestClient(create_app(settings, store)) as client:
@@ -318,3 +319,32 @@ def test_every_route_is_documented_in_sdd_12(api):
     assert served - documented == set(), "served but missing from SDD §12"
     assert documented - served == set(), "in SDD §12 but not served"
     assert len(served) >= 30
+
+
+def test_auth_lockout_after_repeated_failures(tmp_path):
+    settings, tokens = api_settings(tmp_path, auth_lockout_per_minute=3)
+    store = Store(f"sqlite:///{tmp_path / 'lock.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        bad = {"Authorization": "Bearer smg_not_a_real_token"}
+        for _ in range(3):
+            assert client.get("/api/v1/me", headers=bad).status_code == 401
+        locked = client.get("/api/v1/me", headers=bad)
+        assert locked.status_code == 429 and locked.json()["error"]["code"] == "too_many_requests"
+        # the lockout covers the address, valid tokens included, until the window drains
+        good = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+        assert client.get("/api/v1/me", headers=good).status_code == 429
+        assert client.get("/api/v1/health").status_code == 200, "public routes stay open"
+        client.app.state.services._auth_failures.clear()
+        assert client.get("/api/v1/me", headers=good).status_code == 200
+        kinds = [e.kind for e in store.events(since_seq=0, limit=100)]
+        assert kinds.count("auth.denied") >= 4
+    store.dispose()
+
+    off, _ = api_settings(tmp_path / "off", auth_lockout_per_minute=0)
+    store2 = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store2.create_schema()
+    with TestClient(create_app(off, store2)) as client:
+        for _ in range(5):
+            assert client.get("/api/v1/me", headers=bad).status_code == 401
+    store2.dispose()
