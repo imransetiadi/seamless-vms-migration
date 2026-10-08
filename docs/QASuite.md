@@ -616,8 +616,10 @@ npx @axe-core/cli http://127.0.0.1:8080/ --exit
 | Live integrations (`-m live` with `SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1`) | `test_live_jev_decide` (stdio, `TYPESAFE_API_KEY`) and `test_live_memory_roundtrip` (agentmemory 0.9.30 on `:3111`): 2 passed |
 | Dashboard | `npm run typecheck`, `npm run lint`, `vitest run` (386 tests), `vite build`: OK |
 | Deployment (§14.5) | `.mcp.json` / `.claude/settings.json` valid JSON; `docker compose … config` OK; 21 OpenShift manifest documents parse (`kubectl kustomize` not run: no binary on the host) |
-| DEMO-01, DEMO-02, DEMO-03 (natural failures at the default 10 % rate), DEMO-05 (admin + anonymous only), §14.6 | `tests/e2e/smoke-demo.sh`: 21 passed, 0 failed against the image built from the checkout (`make seamless-demo`); both seeded plans completed, 3 injected cutover failures rolled back automatically and completed on retry; Jev decided the strategy of a fresh plan through the HTTP sidecar; agentmemory reachable from the container |
-| DEMO-04, DEMO-06, four-token RBAC, Playwright | not run |
+| DEMO-01, DEMO-02, DEMO-03 (natural failures at the default 10 % rate), §14.6 | `tests/e2e/smoke-demo.sh`: 21 passed, 0 failed against the image built from the checkout (`make seamless-demo`); both seeded plans completed, 3 injected cutover failures rolled back automatically and completed on retry; Jev decided the strategy of a fresh plan through the HTTP sidecar; agentmemory reachable from the container |
+| DEMO-04, DEMO-06 | `tests/e2e/demo-restart.sh` after `make seamless-reset CONFIRM=yes && make seamless-demo`: `by_phase` showed `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `completed`, `failed`, `rolling_back`, `rolled_back`; `compose restart seamless` at t = 41 s with 7 migrations in an active step — all 36 migrations reached a terminal phase (34 `completed`, 1 `rolled_back` after its one scripted retry, 1 `cancelled` = the vGPU blocker); 675 events, seq 1…675 without gaps, 0 FSM-invalid `migration.phase` orderings |
+| DEMO-05 (four tokens) | `tests/e2e/rbac-live.sh` with viewer / operator / approver / admin tokens created by `seamless token create` and appended to `tokens.yaml`: "RBAC matrix OK" (every route × role, policy fields 403 for the operator before any 400/404) |
+| Playwright | not run (optional) |
 | Lab (E3), PERF-E2E, D-01…D-10 on real storage | not run: no RHOSP/RHOSO lab in this environment; Performance.md §6.3 stays open |
 
 Fixes that came out of this run: Jev is skipped with fewer than two candidates; a retry after an automatic
@@ -795,10 +797,11 @@ make seamless-down                                   # keeps data;  make seamles
 
 ### 14.7 Journey and RBAC scripts (E2)
 
-The committed smoke script [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh) (`export TOKEN=…` then run it)
+Committed scripts (`export TOKEN=…` then run them): [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh)
 covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
-decision on a fresh plan; it exits with the number of failed checks. The journey and RBAC scripts below remain
-proposed.
+decision on a fresh plan (exit code = failed checks); [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
+is the RBAC matrix below (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
+runs DEMO-04 and DEMO-06. The journey script below remains proposed.
 
 *Proposed* files (`tests/e2e/demo-journey.sh`, `tests/e2e/rbac-live.sh`; not part of the plan). Both were verified
 against an SDD-shaped stub server and pass `shellcheck`.
