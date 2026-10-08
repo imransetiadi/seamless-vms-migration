@@ -1057,7 +1057,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
   Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, liveness
-  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS re-encrypt/edge), NetworkPolicy (ingress from router only;
+  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS), NetworkPolicy (ingress from router only;
   egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory).
 * Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
   a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
