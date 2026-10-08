@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "jev": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@jkudish/jev-mcp@0.14.1"],
+      "env": {
+        "TYPESAFE_API_KEY": "${TYPESAFE_API_KEY:-}"
+      }
+    },
+    "agentmemory": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@agentmemory/mcp@0.9.30"],
+      "env": {
+        "AGENTMEMORY_URL": "${AGENTMEMORY_URL:-http://localhost:3111}",
+        "AGENTMEMORY_SECRET": "${AGENTMEMORY_SECRET:-}"
+      }
+    }
+  }
+}

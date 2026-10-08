@@ -1,0 +1,54 @@
+# Seamless Migrate on OpenShift 4.16+ (SDD 17). Single-replica control plane, PostgreSQL 16 StatefulSet,
+# edge-TLS Route, default-deny NetworkPolicies.
+#
+# Deploy:
+#   1. Build and push the image from the repository root:
+#        podman build -f seamless/Containerfile -t <registry>/seamless-migrate:0.1.0 .
+#        (run `make dashboard-build` first so the UI is baked into the image)
+#   2. Set newName/newTag (or digest) in the images: section below.
+#   3. Create the Secrets seamless-db, seamless-tokens (required) and seamless-clouds, seamless-vmware,
+#      seamless-ai (optional) in the namespace - see secret-example.yaml. They are deliberately NOT
+#      part of this kustomization.
+#   4. oc apply -k deploy/openshift
+#      oc -n seamless-migrate rollout status deploy/seamless
+#      oc -n seamless-migrate get route seamless
+#
+# Using an existing PostgreSQL instead: remove postgres-statefulset.yaml and postgres-service.yaml from
+# the resources and set SEAMLESS_DB_URL in the seamless-db Secret (SDD 17).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: seamless-migrate
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - postgres-service.yaml
+  - postgres-statefulset.yaml
+  - deployment.yaml
+  - service.yaml
+  - route.yaml
+  - networkpolicy.yaml
+
+# metadata labels only: selectors are immutable, so they must not be rewritten
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: seamless-migrate
+      app.kubernetes.io/version: 0.1.0
+    includeSelectors: false
+
+images:
+  - name: seamless-migrate
+    # default: the OpenShift internal registry of this namespace
+    newName: image-registry.openshift-image-registry.svc:5000/seamless-migrate/seamless-migrate
+    newTag: 0.1.0
+    # production: pin by digest instead of a tag
+    # digest: sha256:<digest-of-the-pushed-image>
+  - name: registry.redhat.io/rhel9/postgresql-16
+    # The PostgreSQL major version (16) is part of the repository name; the repository has no "16" tag. "1" is its
+    # stream tag (the same image as :latest today, but a deliberate choice instead of a floating "latest").
+    newTag: "1"
+    # production: pin by digest (skopeo inspect docker://registry.redhat.io/rhel9/postgresql-16:1 | jq -r .Digest)
+    # digest: sha256:<digest-of-the-postgresql-16-image>

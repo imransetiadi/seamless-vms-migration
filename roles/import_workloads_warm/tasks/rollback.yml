@@ -1,0 +1,91 @@
+---
+# Rollback of a workload: delete the destination server recorded in the
+# warm state (and, with os_migrate_rollback_delete_dest_volumes, the
+# destination volumes and the warm state), then start the source server.
+- name: Read the warm state of the workload
+  ansible.builtin.slurp:
+    src: "{{ os_migrate_warm_state_dir }}/{{ item['_info']['id'] }}.json"
+  register: import_workloads_warm_state_file
+  failed_when: false
+
+- name: Parse the warm state
+  ansible.builtin.set_fact:
+    import_workloads_warm_state: >-
+      {{ (import_workloads_warm_state_file.content | b64decode | from_json)
+         if 'content' in import_workloads_warm_state_file else {} }}
+
+# Left behind only when a pass was interrupted without its own cleanup.
+# Removing it needs the source conversion host; a failure is reported but
+# does not stop the rollback (the warm state keeps the record).
+- name: Remove a temporary snapshot left by an interrupted pass
+  when: import_workloads_warm_state.pending_snapshot | default(none) is not none
+  block:
+    - name: Get the source conversion host
+      os_migrate.os_migrate.os_conversion_host_info:
+        cloud: src
+        server: "{{ os_migrate_src_conversion_host_name }}"
+        filters: "{{ os_migrate_src_filters }}"
+        validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+        ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+        client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+        client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+      register: import_workloads_warm_src_conversion_host
+
+    - name: Remove the temporary snapshot
+      os_migrate.os_migrate.import_workload_warm_snapshot:
+        cloud: src
+        validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+        ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+        client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+        client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+        data: "{{ item }}"
+        conversion_host: "{{ import_workloads_warm_src_conversion_host.openstack_conversion_host }}"
+        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        state_dir: "{{ os_migrate_warm_state_dir }}"
+        timeout: "{{ os_migrate_timeout }}"
+        state: absent
+
+  rescue:
+    - name: Report the temporary snapshot that is left behind
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item['params']['name'] }}: the temporary snapshot of transfer
+          {{ import_workloads_warm_state.pending_snapshot.transfer_uuid }} could not be
+          removed ({{ ansible_failed_result.msg | default('unknown error') }}). It stays
+          recorded in the warm state; the next pass or rollback removes it.
+
+- name: Delete the destination server
+  os_migrate.os_migrate.import_workload_rollback:
+    cloud: dst
+    validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+    data: "{{ item }}"
+    state_dir: "{{ os_migrate_warm_state_dir }}"
+    delete_dest_volumes: "{{ os_migrate_rollback_delete_dest_volumes | bool }}"
+    match_by_name: "{{ os_migrate_rollback_match_by_name | bool }}"
+    dst_filters: "{{ os_migrate_dst_filters }}"
+    timeout: "{{ os_migrate_timeout }}"
+  register: import_workloads_warm_rollback
+
+- name: Start the source server
+  os_migrate.os_migrate.server_action:
+    cloud: src
+    server: "{{ item['_info']['id'] }}"
+    action: start
+    wait: true
+    timeout: "{{ os_migrate_timeout }}"
+    validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+
+- name: Report the rollback
+  ansible.builtin.debug:
+    msg: >-
+      {{ item['params']['name'] }}: destination server
+      {{ import_workloads_warm_rollback.deleted_server_id | default('none', true) }} deleted,
+      {{ import_workloads_warm_rollback.deleted_volume_ids | default([]) | length }}
+      destination volume(s) deleted, source server started.

@@ -1,0 +1,26 @@
+os_migrate_conversion_host_content_install: true
+# The following two variables must be
+# configured to set up properly the RHSM
+# os_migrate_conversion_rhsm_username: username
+# os_migrate_conversion_rhsm_password: password
+# or
+# os_migrate_conversion_rhsm_org_id: org_id
+# os_migrate_conversion_rhsm_activationkey: activation_key
+
+# For the repositories you must declare:
+# os_migrate_conversion_rhsm_repositories:
+#  - {name: "rhel-9-for-x86_64-appstream-rpms", state: enabled}
+#  - {name: "rhel-9-for-x86_64-baseos-rpms", state: enabled}
+os_migrate_conversion_rhsm_retries: 5
+os_migrate_conversion_rhsm_delay: 10
+
+os_migrate_conversion_host_pre_content_hook: false
+os_migrate_conversion_host_post_content_hook: false
+
+os_migrate_conversion_rhsm_manage: true
+
+
+os_migrate_conversion_link_keypair_private_path: "{{ os_migrate_data_dir }}/conversion/link-ssh.key"
+os_migrate_conversion_host_ssh_user: cloud-user
+os_migrate_conversion_host_ssh_user_enable_password_access: false
+os_migrate_conversion_host_ssh_user_password: weak_password_disabled_by_default

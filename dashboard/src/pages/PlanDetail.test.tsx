@@ -1,0 +1,78 @@
+import { screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it } from 'vitest';
+import { renderWithApp } from '../test/utils';
+import PlanDetail from './PlanDetail';
+
+function renderPlan(planId: string, token = 'operator') {
+  return renderWithApp(<PlanDetail />, { route: `/plans/${planId}`, path: '/plans/:planId', token });
+}
+
+async function actionButton(name: RegExp) {
+  const actions = await screen.findByRole('group', { name: /plan actions/i });
+  return within(actions).getByRole('button', { name });
+}
+
+describe('PlanDetail', () => {
+  it('shows the settings summary, waves board and migrations table', async () => {
+    renderPlan('plan-4f2a9c1e');
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'DC1 → RHOSO production rollout' })).toBeInTheDocument();
+    const settings = screen.getByRole('region', { name: /settings/i });
+    expect(settings).toHaveTextContent('5m 00s');
+    expect(settings).toHaveTextContent(/require approval/i);
+    const waves = screen.getByRole('region', { name: /waves/i });
+    expect(within(waves).getByText('Pilot — stateless web')).toBeInTheDocument();
+    expect(within(waves).getByText('Middleware')).toBeInTheDocument();
+    const table = await screen.findByRole('table', { name: /migrations/i });
+    expect(within(table).getAllByRole('row')).toHaveLength(11);
+  });
+
+  it('enables only Pause for a running plan', async () => {
+    renderPlan('plan-4f2a9c1e');
+
+    const pause = await actionButton(/pause/i);
+    expect(pause).not.toHaveAttribute('aria-disabled');
+    expect(await actionButton(/^start|resume/i)).toHaveAttribute('aria-disabled', 'true');
+    expect(await actionButton(/validate/i)).toHaveAttribute('aria-disabled', 'true');
+    expect(await actionButton(/auto-plan waves/i)).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('validates a draft plan and then allows starting it', async () => {
+    const user = userEvent.setup();
+    renderPlan('plan-0e9f6a17');
+
+    const start = await actionButton(/^start/i);
+    expect(start).toHaveAttribute('aria-disabled', 'true');
+    expect(start).toHaveAccessibleDescription(/validate the plan first/i);
+
+    await user.click(await actionButton(/validate/i));
+    expect(await screen.findByText(/validation finished/i)).toBeInTheDocument();
+    expect(await actionButton(/^start/i)).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('keeps every plan action disabled for viewers, with the reason', async () => {
+    renderPlan('plan-c81d44a0', 'viewer');
+
+    for (const name of [/validate/i, /auto-plan waves/i, /^start/i, /pause/i]) {
+      const button = await actionButton(name);
+      expect(button).toHaveAttribute('aria-disabled', 'true');
+      expect(button).toHaveAccessibleDescription(/operator role/i);
+    }
+  });
+
+  it('pauses a running plan after confirmation', async () => {
+    const user = userEvent.setup();
+    renderPlan('plan-4f2a9c1e');
+
+    await user.click(await actionButton(/pause/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /pause/i });
+    await user.click(within(dialog).getByRole('button', { name: /pause plan/i }));
+    expect(await screen.findAllByText('Paused')).not.toHaveLength(0);
+    // gpu-render-01 is blocked, and POST /start answers 409 while any migration is blocked (SDD §12).
+    const resume = await actionButton(/resume/i);
+    expect(resume).toHaveAttribute('aria-disabled', 'true');
+    expect(resume).toHaveAccessibleDescription(/1 migration is blocked/i);
+    expect(await actionButton(/pause/i)).toHaveAttribute('aria-disabled', 'true');
+  });
+});

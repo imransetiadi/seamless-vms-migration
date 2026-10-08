@@ -1,0 +1,28 @@
+# Edge TLS termination at the OpenShift router with a redirect from HTTP (SDD 17).
+# The router talks plain HTTP to the pod over the cluster network; the NetworkPolicy allows only the
+# ingress controller to reach port 8080. Re-encrypt would need TLS on the pod itself (not in 0.1.0).
+# Custom certificate: set spec.tls.externalCertificate (or certificate/key) - never commit private keys.
+# Source-IP allow-list: add the router IP allow-list annotation (ip_whitelist on older OpenShift,
+# ip_allowlist on newer releases - check your release notes).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: seamless
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+  annotations:
+    # /api/v1/events/stream sends a heartbeat every 15 s (SDD 12); 2m tolerates short stalls
+    haproxy.router.openshift.io/timeout: 2m
+spec:
+  # host: seamless.apps.<cluster-domain>   # omit to let the router generate one
+  to:
+    kind: Service
+    name: seamless
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

@@ -1,0 +1,57 @@
+{
+  "tool": "jev_decide",
+  "model": "jev-1.13.0",
+  "provider": "typesafe",
+  "recommendation": {
+    "selected": "storage_handover",
+    "escaped": false,
+    "confidence": 0.68,
+    "probabilities": {
+      "cold": 0,
+      "warm": 0.12,
+      "storage_handover": 0.73,
+      "ask_user": 0.03,
+      "investigate": 0.02,
+      "none": 0.1
+    },
+    "contradicted_requirements": []
+  },
+  "requirements_checked": 2,
+  "checks": [
+    {
+      "candidate": "cold",
+      "requirement": 0,
+      "answer": "contradicted"
+    },
+    {
+      "candidate": "cold",
+      "requirement": 1,
+      "answer": "contradicted"
+    },
+    {
+      "candidate": "warm",
+      "requirement": 0,
+      "answer": "contradicted"
+    },
+    {
+      "candidate": "warm",
+      "requirement": 1,
+      "answer": "supported"
+    },
+    {
+      "candidate": "storage_handover",
+      "requirement": 0,
+      "answer": "supported"
+    },
+    {
+      "candidate": "storage_handover",
+      "requirement": 1,
+      "answer": "supported"
+    }
+  ],
+  "warnings": [],
+  "usage": {
+    "input_tokens": 1669,
+    "output_tokens": 335
+  }
+}

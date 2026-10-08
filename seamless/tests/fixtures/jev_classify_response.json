@@ -1,0 +1,108 @@
+{
+  "tool": "jev_classify",
+  "model": "jev-1.13.0",
+  "provider": "typesafe",
+  "summary": {
+    "items": 5,
+    "auto": 5,
+    "review": 0,
+    "invalid_response": 0,
+    "by_class": {
+      "stateless_web": 1,
+      "stateful_database": 1,
+      "infrastructure_service": 1,
+      "legacy_os": 1,
+      "middleware_queue": 1
+    }
+  },
+  "thresholds": {
+    "auto_accept": 0.85,
+    "minimum_margin": 0.5
+  },
+  "results": [
+    {
+      "id": "vm-web-01",
+      "classification": "stateless_web",
+      "probabilities": {
+        "stateless_web": 1,
+        "middleware_queue": 0,
+        "infrastructure_service": 0,
+        "stateful_database": 0,
+        "legacy_os": 0,
+        "manual_review": 0
+      },
+      "confidence": 1,
+      "margin": 1,
+      "top_probability": 1,
+      "decision": "auto"
+    },
+    {
+      "id": "vm-db-02",
+      "classification": "stateful_database",
+      "probabilities": {
+        "stateless_web": 0,
+        "middleware_queue": 0,
+        "infrastructure_service": 0,
+        "stateful_database": 1,
+        "legacy_os": 0,
+        "manual_review": 0
+      },
+      "confidence": 1,
+      "margin": 1,
+      "top_probability": 1,
+      "decision": "auto"
+    },
+    {
+      "id": "vm-ad-01",
+      "classification": "infrastructure_service",
+      "probabilities": {
+        "stateless_web": 0,
+        "middleware_queue": 0,
+        "infrastructure_service": 1,
+        "stateful_database": 0,
+        "legacy_os": 0,
+        "manual_review": 0
+      },
+      "confidence": 1,
+      "margin": 1,
+      "top_probability": 1,
+      "decision": "auto"
+    },
+    {
+      "id": "vm-legacy-01",
+      "classification": "legacy_os",
+      "probabilities": {
+        "stateless_web": 0,
+        "middleware_queue": 0,
+        "infrastructure_service": 0,
+        "stateful_database": 0,
+        "legacy_os": 1,
+        "manual_review": 0
+      },
+      "confidence": 1,
+      "margin": 1,
+      "top_probability": 1,
+      "decision": "auto"
+    },
+    {
+      "id": "vm-mq-01",
+      "classification": "middleware_queue",
+      "probabilities": {
+        "stateless_web": 0,
+        "middleware_queue": 1,
+        "infrastructure_service": 0,
+        "stateful_database": 0,
+        "legacy_os": 0,
+        "manual_review": 0
+      },
+      "confidence": 1,
+      "margin": 1,
+      "top_probability": 1,
+      "decision": "auto"
+    }
+  ],
+  "usage": {
+    "input_tokens": 1178,
+    "output_tokens": 323
+  }
+}

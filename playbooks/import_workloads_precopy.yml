@@ -1,0 +1,11 @@
+# Warm migration, step 1 (repeat as needed): copy the disks of the selected
+# workloads while they keep running. The first pass creates the destination
+# volumes, later passes transfer only the chunks that changed since.
+- name: Warm pre-copy of workloads
+  hosts: migrator
+  environment:
+    OS_CLIENT_CONFIG_FILE: "{{ os_migrate_clouds_path | default(os_migrate_data_dir ~ '/clouds.yaml') }}"
+  roles:
+    - role: os_migrate.os_migrate.import_workloads_warm
+      vars:
+        import_workloads_warm_action: precopy

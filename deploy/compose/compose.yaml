@@ -1,0 +1,200 @@
+# Seamless Migrate - local stack for the dedicated Colima profile "seamless" (SDD 17.1).
+#
+#   make seamless-colima-up      # once: Colima profile "seamless" (Docker context colima-seamless)
+#   scripts/compose-init.sh      # once: writes .env + tokens.yaml, prints the admin token ONCE
+#   make seamless-up             # postgres + seamless (+ jev when COMPOSE_PROFILES=ai in .env)
+#   make seamless-demo           # same, with simulated clouds (SEAMLESS_DEMO=true)
+#
+# Exposure: only `seamless` is published, and only on 127.0.0.1:${SEAMLESS_HOST_PORT:-8080}.
+# PostgreSQL is reachable from `seamless` only (internal network, no route out, not published); Jev is
+# never published and only `seamless` shares its network (it sits on `frontend` because it needs npm and
+# the Jev provider API). No secret is stored in this file: .env and tokens.yaml are generated and git-ignored.
+#
+# Always address this stack through the Docker context colima-seamless (the Make targets do):
+#   docker --context colima-seamless compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env ps
+#
+# Precedence: Compose lets a variable exported in your shell win over --env-file. The Make targets unset the
+# variables that .env owns (POSTGRES_PASSWORD, JEV_MCP_AUTH_TOKEN, TYPESAFE_API_KEY, COMPOSE_PROFILES,
+# SEAMLESS_JEV_MODE, SEAMLESS_MEMORY_URL, SEAMLESS_MEMORY_SECRET); when you call `docker compose` yourself,
+# prefix it with `env -u POSTGRES_PASSWORD -u TYPESAFE_API_KEY ...` or unset them first.
+
+name: seamless
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------------------------
+  # System of record (SDD 11): PostgreSQL 16. Never published to the host.
+  # ---------------------------------------------------------------------------------------------
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: seamless
+      POSTGRES_USER: seamless
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - run scripts/compose-init.sh}
+      # initdb defaults to "trust" for the unix socket and loopback inside the container; require a password
+      # everywhere (the entrypoint exports PGPASSWORD for its own init-time psql calls when local auth needs one).
+      # The application user is the bootstrap superuser of this throw-away local database.
+      POSTGRES_INITDB_ARGS: "--data-checksums --auth-local=scram-sha-256 --auth-host=scram-sha-256"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      # TCP on 127.0.0.1 so the temporary init-time server (unix socket only) never counts as ready
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U seamless -d seamless"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ---------------------------------------------------------------------------------------------
+  # Jev MCP over HTTP (SDD 14.1): advisory judgments. Compose profile "ai" - enabled through
+  # COMPOSE_PROFILES=ai in .env, which compose-init.sh sets only when TYPESAFE_API_KEY was present.
+  # Non-loopback HOST requires the bearer token JEV_MCP_AUTH_TOKEN (random, generated).
+  # ---------------------------------------------------------------------------------------------
+  jev:
+    <<: *service-defaults
+    profiles: ["ai"]
+    image: node:22-alpine
+    init: true
+    user: node
+    cap_drop:
+      - ALL
+    command: ["npx", "-y", "@jkudish/jev-mcp@0.14.1", "--http"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      JEV_MCP_AUTH_TOKEN: ${JEV_MCP_AUTH_TOKEN:?JEV_MCP_AUTH_TOKEN is not set - run scripts/compose-init.sh}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      npm_config_update_notifier: "false"
+      npm_config_fund: "false"
+      npm_config_audit: "false"
+    expose:
+      - "8080"
+    networks:
+      - frontend          # needs outbound access: npm registry on first start, the Jev provider API
+    healthcheck:
+      # /health is unauthenticated (200 "ok"); /mcp requires the bearer token. Node's fetch avoids depending on busybox wget.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ---------------------------------------------------------------------------------------------
+  # Control plane + dashboard (SDD 2, 12, 16). Built from the repository root.
+  # ---------------------------------------------------------------------------------------------
+  seamless:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: seamless/Containerfile
+    image: seamless-migrate:${SEAMLESS_VERSION:-0.1.0}
+    init: true
+    cap_drop:
+      - ALL
+    # To rehearse the OpenShift security context (SDD 17) uncomment the next two lines:
+    # read_only: true
+    # tmpfs: ["/tmp"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jev:
+        condition: service_healthy
+        required: false   # the jev service only exists when the "ai" profile is enabled
+    environment:
+      # bind / storage
+      SEAMLESS_HOST: 0.0.0.0              # inside the container; the host side is loopback-only (ports below)
+      SEAMLESS_PORT: "8080"
+      SEAMLESS_DATA_DIR: /data
+      SEAMLESS_DB_URL: postgresql+psycopg://seamless:${POSTGRES_PASSWORD:?run scripts/compose-init.sh}@postgres:5432/seamless
+      # demo mode (SimulatedExecutor + fake providers); `make seamless-demo` sets SEAMLESS_DEMO=true
+      SEAMLESS_DEMO: ${SEAMLESS_DEMO:-false}
+      SEAMLESS_DEMO_SPEED: ${SEAMLESS_DEMO_SPEED:-60}
+      SEAMLESS_DEMO_SEED: ${SEAMLESS_DEMO_SEED:-42}
+      SEAMLESS_DEMO_FAILURE_RATE: ${SEAMLESS_DEMO_FAILURE_RATE:-0.1}
+      # authentication (SDD 13.1): bearer tokens, SHA-256 only. Never disabled in this stack:
+      # the process listens on 0.0.0.0, so the CLI would refuse SEAMLESS_AUTH_DISABLED=true anyway.
+      SEAMLESS_AUTH_DISABLED: "false"
+      SEAMLESS_TOKENS_FILE: /etc/seamless/tokens/tokens.yaml
+      SEAMLESS_CORS_ORIGINS: ${SEAMLESS_CORS_ORIGINS:-}
+      SEAMLESS_METRICS_PUBLIC: ${SEAMLESS_METRICS_PUBLIC:-false}
+      # orchestrator (SDD 8)
+      SEAMLESS_MAX_CONCURRENT_MIGRATIONS: ${SEAMLESS_MAX_CONCURRENT_MIGRATIONS:-10}
+      SEAMLESS_MAX_CONCURRENT_CUTOVERS: ${SEAMLESS_MAX_CONCURRENT_CUTOVERS:-3}
+      SEAMLESS_TICK_S: ${SEAMLESS_TICK_S:-1.0}
+      SEAMLESS_MAX_STEP_RETRIES: ${SEAMLESS_MAX_STEP_RETRIES:-2}
+      # Jev advisor over HTTP to the sidecar (SDD 14.1); "off" when the ai profile is disabled
+      SEAMLESS_JEV_MODE: ${SEAMLESS_JEV_MODE:-http}
+      SEAMLESS_JEV_URL: http://jev:8080/mcp
+      SEAMLESS_JEV_TOKEN: ${JEV_MCP_AUTH_TOKEN:-}
+      SEAMLESS_JEV_TIMEOUT_S: ${SEAMLESS_JEV_TIMEOUT_S:-20}
+      SEAMLESS_JEV_MIN_CONFIDENCE: ${SEAMLESS_JEV_MIN_CONFIDENCE:-0.6}
+      # agentmemory on the developer's host (SDD 14.3). Pass-through semantics: the variable reaches the
+      # container only when it is defined in .env or the shell; delete it from .env to run without memory.
+      SEAMLESS_MEMORY_URL:
+      SEAMLESS_MEMORY_SECRET:
+      SEAMLESS_MEMORY_PROJECT: ${SEAMLESS_MEMORY_PROJECT:-seamless-migrate}
+      SEAMLESS_MEMORY_REDACT_NAMES: ${SEAMLESS_MEMORY_REDACT_NAMES:-false}
+      # observability (SDD 18)
+      SEAMLESS_LOG_LEVEL: ${SEAMLESS_LOG_LEVEL:-INFO}
+      SEAMLESS_LOG_JSON: ${SEAMLESS_LOG_JSON:-false}
+    ports:
+      - "127.0.0.1:${SEAMLESS_HOST_PORT:-8080}:8080"
+    volumes:
+      - seamless-data:/data
+      # API tokens (hashes only), read-only. Fail instead of creating a directory if the file is missing.
+      - type: bind
+        source: ./tokens.yaml
+        target: /etc/seamless/tokens/tokens.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - backend
+      - frontend          # outbound: cloud APIs, vCenter, conversion hosts (SSH), Jev provider, host agentmemory
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+networks:
+  backend:
+    internal: true        # postgres <-> seamless only: no route to the outside, nothing published
+  frontend: {}            # seamless <-> jev, and the way out to clouds / host agentmemory
+
+volumes:
+  pgdata: {}
+  seamless-data: {}

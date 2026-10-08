@@ -1,0 +1,72 @@
+---
+- name: Check the requested warm action
+  ansible.builtin.assert:
+    that:
+      - import_workloads_warm_action in ['precopy', 'cutover', 'rollback']
+    fail_msg: >-
+      import_workloads_warm_action must be precopy, cutover or rollback,
+      not {{ import_workloads_warm_action }}
+    quiet: true
+
+- name: Read workloads resource file
+  os_migrate.os_migrate.read_resources:
+    path: "{{ os_migrate_data_dir }}/workloads.yml"
+  register: import_workloads_warm_read
+
+- name: Filter workloads
+  ansible.builtin.set_fact:
+    import_workloads_warm_workloads: "{{ (import_workloads_warm_read.resources
+      | from_yaml
+      | os_migrate.os_migrate.stringfilter(os_migrate_workloads_filter,
+       attribute='params.name')) }}"
+
+- name: Create the warm state and workload log directories
+  ansible.builtin.file:
+    path: "{{ import_workloads_warm_dir.path }}"
+    state: directory
+    mode: "{{ import_workloads_warm_dir.mode }}"
+  loop:
+    - path: "{{ os_migrate_warm_state_dir }}"
+      mode: "0700"
+    - path: "{{ os_migrate_data_dir }}/workload_logs"
+      mode: "0750"
+  loop_control:
+    loop_var: import_workloads_warm_dir
+    label: "{{ import_workloads_warm_dir.path }}"
+
+- name: Check that the workloads can be migrated warm
+  ansible.builtin.assert:
+    that:
+      - item['_migration_params']['data_copy'] | default(true)
+      - not item['_migration_params']['use_nbdkit_direct'] | default(false)
+    fail_msg: >-
+      {{ item['params']['name'] }}: a warm migration copies the disks through
+      conversion hosts in both clouds; it needs data_copy and does not
+      support use_nbdkit_direct.
+    quiet: true
+  loop: "{{ import_workloads_warm_workloads }}"
+  loop_control:
+    label: "{{ item['params']['name'] }}"
+  when: import_workloads_warm_action != 'rollback'
+
+- name: Include the conversion hosts inventory
+  ansible.builtin.include_role:
+    name: os_migrate.os_migrate.conversion_host
+    tasks_from: conv_hosts_inventory.yml
+  when:
+    - import_workloads_warm_action != 'rollback'
+    - import_workloads_warm_workloads | length > 0
+
+- name: Look up the conversion hosts
+  ansible.builtin.include_role:
+    name: os_migrate.os_migrate.conversion_host
+    tasks_from: conv_host_details.yml
+  when:
+    - import_workloads_warm_action != 'rollback'
+    - import_workloads_warm_workloads | length > 0
+
+- name: Run the warm action for each workload
+  ansible.builtin.include_tasks: "{{ import_workloads_warm_action }}.yml"
+  loop: "{{ import_workloads_warm_workloads }}"
+  loop_control:
+    label: "{{ item['params']['name'] }}"

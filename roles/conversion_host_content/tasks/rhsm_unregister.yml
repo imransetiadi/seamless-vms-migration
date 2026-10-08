@@ -1,0 +1,10 @@
+- name: Unregister RHEL hosts from RHSM
+  vars:
+    ansible_become: true
+    ansible_become_user: root
+    rhc_state: absent
+  ansible.builtin.include_role:
+    name: redhat.rhel_system_roles.rhc
+  when:
+    - ansible_distribution is defined
+    - ansible_distribution in ['RedHat']

@@ -1,0 +1,28 @@
+---
+# Defaults for import_from_hypervisor role.
+# The os_migrate_* names are the role's public interface, shared with the
+# rest of the collection, hence the var-naming exceptions.
+
+# NBD export configuration. Disk N of a workload is exported on port + N.
+os_migrate_nbdkit_port: 10809  # noqa: var-naming[no-role-prefix]
+# 'tcp': the conversion host connects to nbd://<address>:<port>, so qemu-nbd
+# must listen on an address it can reach (see os_migrate_nbdkit_bind_address).
+# 'ssh': the conversion host reaches the export through SSH to the
+# hypervisor, so qemu-nbd only listens on the loopback address.
+os_migrate_nbdkit_protocol: tcp  # noqa: var-naming[no-role-prefix]
+os_migrate_nbdkit_ssh_user: stack  # noqa: var-naming[no-role-prefix]
+# Export the disks read-only.
+os_migrate_nbdkit_readonly: true  # noqa: var-naming[no-role-prefix]
+# Address qemu-nbd listens on. The loopback default suits the ssh protocol;
+# for tcp set the hypervisor's migration-network IP (globally or as a host
+# variable of each hypervisor). 0.0.0.0 listens on every interface.
+os_migrate_nbdkit_bind_address: 127.0.0.1  # noqa: var-naming[no-role-prefix]
+# Private (0700) directory on the hypervisor for qemu-nbd logs and PID files.
+os_migrate_nbdkit_log_dir: /var/log/os-migrate-nbd  # noqa: var-naming[no-role-prefix]
+os_migrate_nbdkit_timeout: 300  # noqa: var-naming[no-role-prefix]
+
+# IP restriction (optional) - set to destination conversion host IP
+os_migrate_nbdkit_ip_allow: null  # noqa: var-naming[no-role-prefix]
+
+# Nova directories on hypervisor
+os_migrate_nbdkit_nova_instances_dir: /var/lib/nova/instances  # noqa: var-naming[no-role-prefix]

@@ -1,0 +1,212 @@
+---
+# Cutover of a pre-copied workload: stop the source, snapshot it (now
+# consistent), run the final delta pass, remove the snapshot and boot the
+# destination server from the synchronised volumes. Downtime starts at
+# "Stop the source server".
+- name: Warm cutover of a workload
+  block:
+    - name: Read the warm state of the workload
+      ansible.builtin.slurp:
+        src: "{{ os_migrate_warm_state_dir }}/{{ item['_info']['id'] }}.json"
+      register: import_workloads_warm_state_file
+      failed_when: false
+
+    - name: Parse the warm state
+      ansible.builtin.set_fact:
+        import_workloads_warm_state: >-
+          {{ (import_workloads_warm_state_file.content | b64decode | from_json)
+             if 'content' in import_workloads_warm_state_file else {} }}
+
+    - name: Report a workload that was already cut over
+      ansible.builtin.debug:
+        msg: >-
+          {{ item['params']['name'] }}: destination server
+          {{ import_workloads_warm_state.destination_server_id }} was already created.
+      when: import_workloads_warm_state.destination_server_id | default(none) is not none
+
+    - name: Cut over the workload
+      when: import_workloads_warm_state.destination_server_id | default(none) is none
+      block:
+        - name: Preliminary setup for the warm cutover
+          os_migrate.os_migrate.import_workload_prelim:
+            cloud: dst
+            validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+            ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+            client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+            client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+            dst_filters: "{{ os_migrate_dst_filters }}"
+            src_conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+            log_dir: "{{ os_migrate_data_dir }}/workload_logs"
+            data: "{{ item }}"
+          register: import_workloads_warm_prelim
+
+        # prelim reports no change for the source conversion host itself and
+        # when a server with the workload's name exists in the destination.
+        - name: Decide whether the workload is cut over
+          ansible.builtin.set_fact:
+            import_workloads_warm_proceed: "{{ import_workloads_warm_prelim.changed }}"
+
+        # A same-named server that the warm state does not know about may be
+        # an unrelated workload: never stop the source on that assumption.
+        - name: Refuse to cut over next to an unrecorded destination server
+          ansible.builtin.fail:
+            msg: >-
+              A server named {{ item['params']['name'] }} already exists in the
+              destination but is not recorded in the warm state; refusing to stop
+              the source. Delete or rename it, or roll the workload back.
+          when:
+            - not import_workloads_warm_proceed | bool
+            - not import_workloads_warm_prelim.skipped | default(false)
+
+        - name: Stop the source and create the destination server
+          when: import_workloads_warm_proceed | bool
+          block:
+            - name: Check that the destination cloud is ready for the workload
+              os_migrate.os_migrate.import_workload_dst_check:
+                cloud: dst
+                validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+                data: "{{ item }}"
+                dst_filters: "{{ os_migrate_dst_filters }}"
+
+            - name: Stop the source server
+              os_migrate.os_migrate.server_action:
+                cloud: src
+                server: "{{ item['_info']['id'] }}"
+                action: stop
+                wait: true
+                timeout: "{{ os_migrate_timeout }}"
+                validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+
+            - name: Check that the source server is shut off
+              os_migrate.os_migrate.import_workload_src_check:
+                cloud: src
+                validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+                name: "{{ item['_info']['id'] }}"
+
+            - name: Snapshot the stopped workload
+              os_migrate.os_migrate.import_workload_warm_snapshot:
+                cloud: src
+                validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+                data: "{{ item }}"
+                conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+                ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                state_dir: "{{ os_migrate_warm_state_dir }}"
+                boot_volume_prefix: "{{ os_migrate_workload_boot_volume_prefix }}"
+                log_file: "{{ import_workloads_warm_prelim.log_file }}"
+                state_file: "{{ import_workloads_warm_prelim.state_file }}"
+                timeout: "{{ os_migrate_timeout }}"
+                state: present
+              register: import_workloads_warm_snapshot
+
+            - name: Run the final synchronisation pass
+              os_migrate.os_migrate.import_workload_warm_sync:
+                cloud: dst
+                validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+                data: "{{ item }}"
+                conversion_host: "{{ os_dst_conversion_host_info.openstack_conversion_host }}"
+                src_conversion_host_address: "{{ os_src_conversion_host_info.openstack_conversion_host.address }}"
+                ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                state_dir: "{{ os_migrate_warm_state_dir }}"
+                transfer_uuid: "{{ import_workloads_warm_snapshot.transfer_uuid }}"
+                pass_kind: final
+                chunk_size: "{{ os_migrate_warm_chunk_size }}"
+                workers: "{{ os_migrate_warm_workers }}"
+                parallel_disks: "{{ os_migrate_warm_parallel_disks }}"
+                assume_zero: "{{ os_migrate_warm_assume_zero }}"
+                python_interpreter: "{{ os_migrate_warm_python_interpreter }}"
+                log_file: "{{ import_workloads_warm_prelim.log_file }}"
+                state_file: "{{ import_workloads_warm_prelim.state_file }}"
+                timeout: "{{ os_migrate_timeout }}"
+              register: import_workloads_warm_sync
+
+            - name: Remove the temporary snapshot
+              os_migrate.os_migrate.import_workload_warm_snapshot:
+                cloud: src
+                validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+                data: "{{ item }}"
+                conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+                ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+                ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+                state_dir: "{{ os_migrate_warm_state_dir }}"
+                log_file: "{{ import_workloads_warm_prelim.log_file }}"
+                timeout: "{{ os_migrate_timeout }}"
+                state: absent
+
+            # Records destination_server_id in the warm state.
+            - name: Create the destination server from the synchronised volumes
+              os_migrate.os_migrate.import_workload_create_instance:
+                cloud: dst
+                validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+                ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+                client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+                client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+                data: "{{ item }}"
+                block_device_mapping: "{{ import_workloads_warm_sync.block_device_mapping }}"
+                warm_state_dir: "{{ os_migrate_warm_state_dir }}"
+              register: import_workloads_warm_instance
+
+            - name: Report the cutover
+              ansible.builtin.debug:
+                msg: >-
+                  {{ item['params']['name'] }}: final pass transferred
+                  {{ import_workloads_warm_sync.sync_pass.bytes_transferred }} bytes in
+                  {{ import_workloads_warm_sync.sync_pass.duration_s }} s; destination
+                  server {{ import_workloads_warm_instance.server_id }}
+
+  rescue:
+    - name: Remember why the cutover failed
+      ansible.builtin.set_fact:
+        import_workloads_warm_error: "{{ ansible_failed_result.msg | default('unknown error') }}"
+
+    # The destination volumes are kept: a retried cutover reuses them and
+    # rollback_workloads.yml decides whether to delete them. The source
+    # server is left as it is; rolling back starts it again.
+    - name: Remove the temporary snapshot after the failure
+      os_migrate.os_migrate.import_workload_warm_snapshot:
+        cloud: src
+        validate_certs: "{{ os_migrate_src_validate_certs | default(omit) }}"
+        ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
+        client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
+        client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+        data: "{{ item }}"
+        conversion_host: "{{ os_src_conversion_host_info.openstack_conversion_host }}"
+        ssh_key_path: "{{ os_migrate_conversion_keypair_private_path }}"
+        ssh_user: "{{ os_migrate_conversion_host_ssh_user }}"
+        state_dir: "{{ os_migrate_warm_state_dir }}"
+        timeout: "{{ os_migrate_timeout }}"
+        state: absent
+      register: import_workloads_warm_cleanup
+      ignore_errors: true
+      when: os_migrate_workload_cleanup_on_failure | bool
+
+    - name: Fail the cutover
+      ansible.builtin.fail:
+        msg: >-
+          Warm cutover of {{ item['params']['name'] }} failed:
+          {{ import_workloads_warm_error }}{{ import_workloads_warm_cleanup_note }}
+      vars:
+        import_workloads_warm_cleanup_note: >-
+          {{ ('; the temporary snapshot could not be removed ('
+              ~ (import_workloads_warm_cleanup.msg | default('unknown error'))
+              ~ ') and stays recorded in the warm state for the next pass or rollback')
+             if import_workloads_warm_cleanup is failed else '' }}

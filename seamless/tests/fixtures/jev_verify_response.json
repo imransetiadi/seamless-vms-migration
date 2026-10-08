@@ -1,0 +1,47 @@
+{
+  "tool": "jev_verify",
+  "model": "jev-1.13.0",
+  "provider": "typesafe",
+  "auto_accept": 0.8,
+  "subject_at": 0.5,
+  "summary": {
+    "verified": 2,
+    "contradicted": 0,
+    "unsupported": 0,
+    "needs_review": 0
+  },
+  "results": [
+    {
+      "id": "claim0",
+      "claim": "The guest operating system finished booting",
+      "verdict": "verified",
+      "probabilities": {
+        "supports": 1,
+        "contradicts": 0,
+        "says_nothing": 0
+      },
+      "confidence": 1,
+      "action": "auto",
+      "supporting_evidence": "console",
+      "same_subject": 0.84
+    },
+    {
+      "id": "claim1",
+      "claim": "No kernel panic or filesystem errors are reported",
+      "verdict": "verified",
+      "probabilities": {
+        "supports": 0.89,
+        "contradicts": 0,
+        "says_nothing": 0.11
+      },
+      "confidence": 0.83,
+      "action": "auto",
+      "supporting_evidence": "console",
+      "same_subject": 0.54
+    }
+  ],
+  "usage": {
+    "input_tokens": 1147,
+    "output_tokens": 199
+  }
+}

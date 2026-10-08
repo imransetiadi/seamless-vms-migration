@@ -1,0 +1,172 @@
+# Seamless Migrate control plane + dashboard (SDD 17).
+#
+# * One replica, strategy Recreate: the orchestrator is a singleton (SDD 17, open decision D2); a rolling
+#   update would briefly run two orchestrators against one database and one PVC.
+# * Security context follows SDD 17: non-root (UID assigned by the restricted SCC), readOnlyRootFilesystem,
+#   all capabilities dropped, seccomp RuntimeDefault, no service-account token.
+# * Writable paths are explicit: /data (PVC) and /tmp (emptyDir). HOME points at /tmp so that Ansible, SSH
+#   and npx (Jev stdio mode) can write their caches without a writable root filesystem.
+# * Secrets (create them from secret-example.yaml or an external secret store):
+#     seamless-db      SEAMLESS_DB_URL (+ POSTGRES_* for the StatefulSet)         required
+#     seamless-tokens  tokens.yaml (SHA-256 hashes of API tokens, SDD 13.1)        required
+#     seamless-clouds  clouds.yaml (+ CA bundles), referenced by Provider.cloud    optional until a provider is added
+#     seamless-vmware  <name>-username / <name>-password for vCenter (SDD 13.3)    optional
+#     seamless-ai      TYPESAFE_API_KEY, SEAMLESS_MEMORY_SECRET, SEAMLESS_JEV_TOKEN optional
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seamless
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seamless
+        app.kubernetes.io/component: control-plane
+        app.kubernetes.io/part-of: seamless-migrate
+    spec:
+      serviceAccountName: seamless
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        # fsGroup is injected by the restricted SCC on OpenShift; set it yourself on vanilla Kubernetes
+      containers:
+        - name: seamless
+          # placeholder name, replaced by the images: section of kustomization.yaml
+          image: seamless-migrate
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: seamless-config
+          env:
+            - name: SEAMLESS_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: SEAMLESS_DB_URL
+            - name: TYPESAFE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-ai
+                  key: TYPESAFE_API_KEY
+                  optional: true
+            - name: SEAMLESS_MEMORY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-ai
+                  key: SEAMLESS_MEMORY_SECRET
+                  optional: true
+            - name: SEAMLESS_JEV_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-ai
+                  key: SEAMLESS_JEV_TOKEN
+                  optional: true
+            # identity and caches for a read-only root filesystem with an arbitrary UID
+            - name: HOME
+              value: /tmp
+            - name: USER
+              value: seamless
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            # sized for SEAMLESS_MAX_CONCURRENT_MIGRATIONS=10: every running migration spawns an
+            # ansible-playbook process (planning estimate ~250 MiB each, see Performance.md 8)
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          # SDD 17: liveness on /api/v1/health. The endpoint is public and reports "degraded" when the
+          # database is unreachable, so the generous failureThreshold avoids restart storms during a DB blip.
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: tokens
+              mountPath: /etc/seamless/tokens
+              readOnly: true
+            - name: clouds
+              mountPath: /etc/seamless/clouds
+              readOnly: true
+            - name: vmware
+              mountPath: /var/run/secrets/seamless
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: seamless-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tokens
+          secret:
+            secretName: seamless-tokens
+            defaultMode: 0440
+        - name: clouds
+          secret:
+            secretName: seamless-clouds
+            optional: true
+            defaultMode: 0440
+        - name: vmware
+          secret:
+            secretName: seamless-vmware
+            optional: true
+            defaultMode: 0440
+            # vCenter credentials: security.secrets.resolve (SDD 13.3) reads <SECRETS_DIR>/<name>/{username,password}.
+            # Secret keys cannot contain "/", so each credentials_secret needs an items mapping. Add one pair per
+            # credential when you create the seamless-vmware Secret (example for credentials_secret "dc2" with the
+            # keys dc2-username and dc2-password; see secret-example.yaml):
+            #
+            # items:
+            #   - key: dc2-username
+            #     path: dc2/username
+            #   - key: dc2-password
+            #     path: dc2/password
+            #
+            # Alternative without edits to this file: put SEAMLESS_SECRET_DC2_USERNAME / SEAMLESS_SECRET_DC2_PASSWORD
+            # (name upper-cased, "-" -> "_") into a Secret and add it under `envFrom` (environment variables are the
+            # fallback of the resolver; files are preferred because the environment is inherited by child processes).

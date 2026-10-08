@@ -1,0 +1,39 @@
+---
+# Inputs of the warm playbooks (SDD 6.5). The variable names are part of
+# the contract with the Seamless control plane and keep the os_migrate_
+# prefix of the collection, hence the var-naming exceptions.
+
+# blocksync chunk size in bytes and read-ahead hashing threads per host.
+os_migrate_warm_chunk_size: 4194304  # noqa: var-naming[no-role-prefix]
+os_migrate_warm_workers: 4  # noqa: var-naming[no-role-prefix]
+# Rollback: also delete the destination volumes and the warm state.
+os_migrate_rollback_delete_dest_volumes: false  # noqa: var-naming[no-role-prefix]
+
+# Optional tuning.
+# Disks of one workload synchronised at the same time.
+os_migrate_warm_parallel_disks: 4  # noqa: var-naming[no-role-prefix]
+# Do not read destination volumes created by the first pass (assume they
+# are zero-filled). Only safe on backends that return zeros for blocks
+# never written (Ceph RBD, thin LVM, sparse files).
+os_migrate_warm_assume_zero: false  # noqa: var-naming[no-role-prefix]
+# Python 3.6+ on the conversion hosts (e.g. /usr/libexec/platform-python on RHEL 8).
+os_migrate_warm_python_interpreter: python3  # noqa: var-naming[no-role-prefix]
+# Warm state files: {{ os_migrate_warm_state_dir }}/{source_server_id}.json
+os_migrate_warm_state_dir: "{{ os_migrate_data_dir }}/workload_warm"  # noqa: var-naming[no-role-prefix]
+# Rollback of workloads without a warm state (e.g. cold): delete the only
+# destination server named exactly like the workload.
+os_migrate_rollback_match_by_name: false  # noqa: var-naming[no-role-prefix]
+
+# Standard os-migrate variables, with the defaults of import_workloads
+# and conversion_host.
+os_migrate_conversion_keypair_private_path: "{{ os_migrate_data_dir }}/conversion/ssh.key"  # noqa: var-naming[no-role-prefix]
+os_migrate_conversion_host_ssh_user: cloud-user  # noqa: var-naming[no-role-prefix]
+os_migrate_src_conversion_host_name: os_migrate_conv_src  # noqa: var-naming[no-role-prefix]
+os_migrate_timeout: 1800  # noqa: var-naming[no-role-prefix]
+os_migrate_workload_cleanup_on_failure: true  # noqa: var-naming[no-role-prefix]
+os_migrate_workload_boot_volume_prefix: os-migrate-  # noqa: var-naming[no-role-prefix]
+os_migrate_workloads_filter:  # noqa: var-naming[no-role-prefix]
+  - regex: .*
+
+# Set by the playbooks: precopy, cutover or rollback.
+import_workloads_warm_action: precopy

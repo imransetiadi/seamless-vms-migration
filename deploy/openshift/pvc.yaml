@@ -1,0 +1,16 @@
+# Run directories ({data_dir}/plans/<plan>/migrations/<migration>/, SDD 7.2) and logs.
+# Credentials never land here: secrets.yml/clouds.yaml are 0600 temp files deleted after each run.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seamless-data
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: <your RWO class>   # omit to use the cluster default

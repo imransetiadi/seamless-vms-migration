@@ -1,0 +1,208 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens.
+ *   - Base palette: SDD §16 (binding) — identical to design-system/seamless-migrate/MASTER.md
+ *     (ui-ux-pro-max "Minimalism & Swiss Style", density 8, motion 3).
+ *   - Status / chart / input tokens are additions that SDD §16 leaves open; their values were
+ *     chosen so text meets WCAG 2.2 AA (>= 4.5:1) on background, card, muted and tinted badges,
+ *     and non-text boundaries meet 3:1 (verified by src/theme/contrast.test.ts). The chart
+ *     series pair passes the dataviz palette validator (lightness band, chroma, CVD separation)
+ *     in both themes; reference lines (SLO, convergence threshold) are neutral and labelled.
+ * Values are "R G B" channel triplets so Tailwind opacity modifiers work (`bg-accent/10`).
+ * contrast.test.ts parses this file: keep exactly one `--token: R G B;` declaration per line.
+ */
+@layer base {
+  :root,
+  :root.dark {
+    color-scheme: dark;
+    --background: 15 23 42; /* #0F172A */
+    --foreground: 248 250 252; /* #F8FAFC */
+    --card: 27 35 54; /* #1B2336 */
+    --card-foreground: 248 250 252; /* #F8FAFC */
+    --muted: 39 47 66; /* #272F42 */
+    --muted-foreground: 148 163 184; /* #94A3B8 */
+    --border: 71 85 105; /* #475569 */
+    --input: 116 132 153; /* #748499 */
+    --primary: 30 41 59; /* #1E293B */
+    --primary-foreground: 255 255 255; /* #FFFFFF */
+    --accent: 34 197 94; /* #22C55E */
+    --accent-foreground: 15 23 42; /* #0F172A */
+    --destructive: 239 68 68; /* #EF4444 */
+    --destructive-foreground: 0 0 0; /* #000000 */
+    --ring: 255 255 255; /* #FFFFFF */
+    --status-neutral: 148 163 184; /* #94A3B8 */
+    --status-info: 96 165 250; /* #60A5FA */
+    --status-progress: 34 211 238; /* #22D3EE */
+    --status-warning: 251 191 36; /* #FBBF24 */
+    --status-success: 34 197 94; /* #22C55E */
+    --status-danger: 248 113 113; /* #F87171 */
+    --chart-1: 59 130 246; /* #3B82F6 */
+    --chart-2: 217 119 6; /* #D97706 */
+    --chart-reference: 148 163 184; /* #94A3B8 */
+    --chart-grid: 51 65 85; /* #334155 */
+  }
+
+  :root.light {
+    color-scheme: light;
+    --background: 248 250 252; /* #F8FAFC */
+    --foreground: 30 41 59; /* #1E293B */
+    --card: 255 255 255; /* #FFFFFF */
+    --card-foreground: 30 41 59; /* #1E293B */
+    --muted: 233 239 248; /* #E9EFF8 */
+    --muted-foreground: 71 85 105; /* #475569 */
+    --border: 226 232 240; /* #E2E8F0 */
+    --input: 100 116 139; /* #64748B */
+    --primary: 37 99 235; /* #2563EB */
+    --primary-foreground: 255 255 255; /* #FFFFFF */
+    --accent: 234 88 12; /* #EA580C */
+    --accent-foreground: 15 23 42; /* #0F172A (white on #EA580C is only 3.56:1) */
+    --destructive: 220 38 38; /* #DC2626 */
+    --destructive-foreground: 255 255 255; /* #FFFFFF */
+    --ring: 37 99 235; /* #2563EB */
+    --status-neutral: 71 85 105; /* #475569 */
+    --status-info: 29 78 216; /* #1D4ED8 */
+    --status-progress: 21 94 117; /* #155E75 */
+    --status-warning: 146 64 14; /* #92400E */
+    --status-success: 22 101 52; /* #166534 */
+    --status-danger: 185 28 28; /* #B91C1C */
+    --chart-1: 37 99 235; /* #2563EB */
+    --chart-2: 180 83 9; /* #B45309 */
+    --chart-reference: 71 85 105; /* #475569 */
+    --chart-grid: 226 232 240; /* #E2E8F0 */
+  }
+
+  html {
+    @apply bg-background font-sans text-foreground antialiased;
+    -webkit-text-size-adjust: 100%;
+    /* Keep keyboard focus clear of the sticky mobile header (WCAG 2.2 focus-not-obscured). */
+    scroll-padding-top: 4.5rem;
+  }
+
+  @media (min-width: 1024px) {
+    html {
+      scroll-padding-top: 1rem;
+    }
+  }
+
+  body {
+    @apply min-h-dvh bg-background leading-normal text-foreground;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-mono tracking-tight;
+    text-wrap: balance;
+  }
+
+  /* Clickable things look clickable (pre-delivery checklist); disabled ones say not-allowed via utilities. */
+  button:not(:disabled):not([aria-disabled='true']),
+  summary,
+  select:not(:disabled),
+  [role='button'],
+  input[type='checkbox']:not(:disabled),
+  input[type='radio']:not(:disabled),
+  label:has(> input[type='checkbox']) {
+    cursor: pointer;
+  }
+
+  /* Visible keyboard focus everywhere (ring token: white in dark, #2563EB in light). */
+  :focus-visible {
+    outline: 2px solid rgb(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Long ids / names wrap instead of overflowing narrow screens. */
+  code,
+  kbd,
+  samp {
+    @apply font-mono;
+    overflow-wrap: anywhere;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-lg border border-border bg-card text-card-foreground;
+  }
+
+  .num {
+    @apply font-mono tabular-nums;
+  }
+
+  .field-label {
+    @apply mb-1 block text-sm font-medium text-foreground;
+  }
+
+  .field-hint {
+    @apply mt-1 text-xs text-muted-foreground;
+  }
+
+  .field-error {
+    @apply mt-1 flex items-center gap-1 text-sm text-status-danger;
+  }
+
+  .input {
+    @apply block min-h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-base text-foreground placeholder:text-muted-foreground transition-colors duration-200 disabled:cursor-not-allowed disabled:opacity-50 aria-[invalid=true]:border-status-danger sm:text-sm;
+  }
+
+  .skip-link {
+    @apply sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-toast focus:rounded-md focus:bg-accent focus:px-4 focus:py-2 focus:font-medium focus:text-accent-foreground;
+  }
+
+  .table-wrap {
+    @apply w-full overflow-x-auto;
+  }
+
+  .data-table {
+    @apply w-full border-collapse text-left text-sm;
+  }
+
+  .data-table thead th {
+    @apply whitespace-nowrap border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground;
+  }
+
+  .data-table tbody th,
+  .data-table td {
+    @apply border-b border-border/60 px-3 py-2 align-middle;
+  }
+
+  .data-table tbody th {
+    @apply text-left font-medium text-foreground;
+  }
+
+  .data-table tbody tr {
+    @apply transition-colors duration-150 hover:bg-muted/40;
+  }
+
+  /* Modal entrance: short fade + lift (motion 3/10). Removed under prefers-reduced-motion. */
+  .animate-dialog-in {
+    animation: dialog-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes dialog-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}

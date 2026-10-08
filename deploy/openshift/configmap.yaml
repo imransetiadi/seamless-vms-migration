@@ -1,0 +1,42 @@
+# Non-secret settings (SDD 15.1). Secrets are referenced from the Deployment, never stored here.
+# Optional settings not set below (add them when needed):
+#   SEAMLESS_MEMORY_URL          agentmemory REST URL reachable from this namespace (memory is disabled when unset)
+#   SEAMLESS_CORS_ORIGINS        comma-separated origins, only when the dashboard is served from another host
+#   SEAMLESS_JEV_URL             Jev MCP HTTP endpoint when SEAMLESS_JEV_MODE=http (token: seamless-ai/SEAMLESS_JEV_TOKEN)
+# A Jev MCP or agentmemory service INSIDE the cluster additionally needs an egress rule: networkpolicy.yaml excludes
+# the pod and service networks from the external rule, so enable the commented in-cluster example in that file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seamless-config
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+data:
+  # bind / storage
+  SEAMLESS_HOST: "0.0.0.0"
+  SEAMLESS_PORT: "8080"
+  SEAMLESS_DATA_DIR: /data
+  # credentials are mounted from Secrets (see deployment.yaml)
+  SEAMLESS_TOKENS_FILE: /etc/seamless/tokens/tokens.yaml
+  SEAMLESS_CLOUDS_YAML: /etc/seamless/clouds/clouds.yaml
+  SEAMLESS_SECRETS_DIR: /var/run/secrets/seamless
+  # authentication is always on in a cluster (the CLI refuses SEAMLESS_AUTH_DISABLED on a non-loopback bind)
+  SEAMLESS_AUTH_DISABLED: "false"
+  SEAMLESS_DEMO: "false"
+  SEAMLESS_METRICS_PUBLIC: "false"
+  # orchestrator (SDD 8)
+  SEAMLESS_MAX_CONCURRENT_MIGRATIONS: "10"
+  SEAMLESS_MAX_CONCURRENT_CUTOVERS: "3"
+  SEAMLESS_TICK_S: "1.0"
+  SEAMLESS_MAX_STEP_RETRIES: "2"
+  # AI assistance (SDD 14): off by default. "stdio" launches the pinned Jev MCP server inside the pod
+  # (needs TYPESAFE_API_KEY from the optional seamless-ai Secret and egress to the Jev provider).
+  SEAMLESS_JEV_MODE: "off"
+  SEAMLESS_JEV_TIMEOUT_S: "20"
+  SEAMLESS_JEV_MIN_CONFIDENCE: "0.6"
+  SEAMLESS_MEMORY_PROJECT: seamless-migrate
+  SEAMLESS_MEMORY_REDACT_NAMES: "false"
+  # observability (SDD 18)
+  SEAMLESS_LOG_LEVEL: INFO
+  SEAMLESS_LOG_JSON: "true"

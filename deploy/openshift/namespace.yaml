@@ -1,0 +1,12 @@
+# Namespace for the Seamless Migrate control plane and its PostgreSQL (SDD 17).
+# Pod Security Admission "restricted" matches the pod security contexts below
+# (non-root, no privilege escalation, all capabilities dropped, RuntimeDefault seccomp).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: seamless-migrate
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

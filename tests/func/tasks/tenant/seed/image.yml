@@ -1,0 +1,22 @@
+- name: make sure test_inputs dir exists
+  ansible.builtin.file:
+    path: "{{ os_migrate_tests_tmp_dir }}/test_inputs"
+    state: directory
+    mode: 0700
+
+- name: fetch cirros image
+  ansible.builtin.get_url:
+    url: https://download.cirros-cloud.net/0.6.3/cirros-0.6.3-x86_64-disk.img
+    dest: "{{ os_migrate_tests_tmp_dir }}/test_inputs/cirros.img"
+    mode: 0600
+
+- name: create osm_image
+  os_migrate.os_migrate.image:
+    auth: "{{ os_migrate_src_auth }}"
+    name: osm_image
+    filename: "{{ os_migrate_tests_tmp_dir }}/test_inputs/cirros.img"
+    container_format: bare
+    disk_format: qcow2
+    min_disk: 1
+    min_ram: 128
+    state: present

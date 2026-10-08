@@ -1,0 +1,35 @@
+# Build-context hygiene for `docker compose build` / `podman build` run from the repository root
+# (SDD 17: seamless/Containerfile uses the repository root as its context).
+
+# VCS, agent and worktree scratch (other tracks' worktrees live under .worktrees/)
+.git
+.worktrees
+.superpowers
+.claude
+
+# Python / Node build and cache directories
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/node_modules
+dashboard/coverage
+seamless/data
+seamless/*.db
+
+# Secrets must never enter the build context (SDD 13.3)
+deploy/compose/.env
+deploy/compose/.env.*
+deploy/compose/tokens.yaml
+deploy/compose/compose.local.yaml
+deploy/openshift/secret.yaml
+.env
+.env.*
+**/*.env
+**/clouds.yaml
+**/secure.yaml
+**/*.pem
+**/*.key

@@ -1,0 +1,37 @@
+- name: Independent tests
+  hosts: migrator
+  tasks:
+    - name: check independent
+      ansible.builtin.import_tasks: tasks/tenant/independent/all.yml
+  tags:
+    - test_independent
+
+- name: Migration tests
+  hosts: migrator
+  environment:
+    OS_CLIENT_CONFIG_FILE: "{{ os_migrate_clouds_path|default(os_migrate_data_dir ~ '/clouds.yaml') }}"
+  tasks:
+    - name: prepare
+      ansible.builtin.import_tasks: tasks/global/prep.yml
+    - name: clean
+      ansible.builtin.include_tasks: tasks/tenant/clean/all.yml
+      args:
+        apply:
+          tags: test_clean_before
+      tags: always
+    - name: seed
+      ansible.builtin.import_tasks: tasks/tenant/seed/all.yml
+    - name: run
+      ansible.builtin.import_tasks: tasks/tenant/run/all.yml
+    - name: check idempotence
+      ansible.builtin.import_tasks: tasks/tenant/idempotence/all.yml
+    - name: update
+      ansible.builtin.import_tasks: tasks/tenant/update/all.yml
+    - name: clean
+      ansible.builtin.include_tasks: tasks/tenant/clean/all.yml
+      args:
+        apply:
+          tags: test_clean_after
+      tags: always
+  tags:
+    - test_migration

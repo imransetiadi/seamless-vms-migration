@@ -1,0 +1,421 @@
+import { Ban, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import { ApiError } from '../api/client';
+import { useEventTail, useMigration, usePlan, useSetStrategy } from '../api/hooks';
+import { useLiveEvents } from '../api/live';
+import { useRole } from '../api/session';
+import type { Event, Migration, Phase, Plan, Role, Strategy } from '../api/types';
+import { AdvisorNotes } from '../components/AdvisorNotes';
+import { Button } from '../components/Button';
+import { DowntimeClock } from '../components/DowntimeClock';
+import { EmptyState } from '../components/EmptyState';
+import { ErrorBanner } from '../components/ErrorBanner';
+import { FindingsList } from '../components/FindingsList';
+import { MigrationActions } from '../components/MigrationActions';
+import { PageHeader } from '../components/PageHeader';
+import { Panel } from '../components/Panel';
+import { PhaseStepper } from '../components/PhaseStepper';
+import { ProgressBar } from '../components/ProgressBar';
+import { LoadingBlock } from '../components/Skeleton';
+import { PhaseBadge } from '../components/StatusBadge';
+import { SyncPassChart } from '../components/SyncPassChart';
+import { Timeline } from '../components/Timeline';
+import { cn } from '../lib/cn';
+import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
+import { isActivePhase, isWarmStrategy, phaseMeta } from '../lib/phase';
+import { hasRole } from '../lib/roles';
+import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
+import { usePageTitle } from '../lib/usePageTitle';
+
+/** Announces phase changes and every 10 % of progress — never every tick (aria-live polite). */
+function useProgressAnnouncement(m: Migration | undefined): string {
+  const [text, setText] = useState('');
+  const last = useRef<{ id?: string; phase?: Phase; bucket?: number }>({});
+  const id = m?.id;
+  const phase = m?.phase;
+  const pct = m?.progress_pct ?? 0;
+  const name = m?.vm.name ?? '';
+  useEffect(() => {
+    if (!id || !phase) return;
+    const bucket = Math.floor(pct / 10);
+    if (last.current.id !== id) {
+      last.current = { id, phase, bucket };
+      return;
+    }
+    if (last.current.phase !== phase) {
+      setText(`${name} is now ${phaseMeta(phase).label}.`);
+      last.current = { id, phase, bucket };
+    } else if (isActivePhase(phase) && bucket !== last.current.bucket) {
+      setText(`${name} ${phaseMeta(phase).label}: ${formatPct(pct, 0)} complete.`);
+      last.current.bucket = bucket;
+    }
+  }, [id, phase, pct, name]);
+  return text;
+}
+
+function Alerts({ m }: { m: Migration }) {
+  const sourceStopped = m.phase === 'failed' && m.downtime_started_at && !m.downtime_ended_at;
+  return (
+    <div className="flex flex-col gap-2 empty:hidden">
+      {sourceStopped && (
+        <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="text-foreground">
+            <strong className="font-semibold">The source VM is stopped</strong> since {formatDateTime(m.downtime_started_at)} and the migration failed. Roll back
+            to restart it, or fix the cause and retry.
+          </p>
+        </div>
+      )}
+      {m.error && (
+        <div className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <CircleX aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="break-words text-foreground">
+            <strong className="font-semibold">Last error:</strong> {m.error}
+          </p>
+        </div>
+      )}
+      {m.review_required && (
+        <div className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <p className="break-words text-foreground">
+            <strong className="font-semibold">Review required.</strong> {m.review_reason ?? 'The advisor flagged this migration for a human check.'}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProgressPanel({ m }: { m: Migration }) {
+  const meta = phaseMeta(m.phase);
+  const active = isActivePhase(m.phase);
+  const openPass = m.sync_passes.find((p) => p.ended_at === null);
+  return (
+    <Panel title="Progress" description={meta.description}>
+      <div className="flex flex-col gap-3">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="num text-3xl font-semibold text-foreground">{formatPct(m.progress_pct)}</span>
+          <PhaseBadge phase={m.phase} />
+        </div>
+        <ProgressBar value={m.progress_pct} label={`${m.vm.name} ${meta.label} progress`} tone={active ? 'progress' : meta.tone} />
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
+          <dt className="text-muted-foreground">Transferred</dt>
+          <dd className="num text-right">
+            {formatBytes(m.bytes_transferred)} / {formatBytes(m.bytes_total)}
+          </dd>
+          {openPass && (
+            <>
+              <dt className="text-muted-foreground">Current pass</dt>
+              <dd className="num text-right">
+                #{openPass.number} {openPass.kind}
+              </dd>
+            </>
+          )}
+          <dt className="text-muted-foreground">Checkpoint</dt>
+          <dd className="num text-right">{m.checkpoint ?? '—'}</dd>
+          <dt className="text-muted-foreground">Attempts</dt>
+          <dd className="num text-right">{m.attempts}</dd>
+        </dl>
+      </div>
+    </Panel>
+  );
+}
+
+function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
+  const setStrategy = useSetStrategy(m.id);
+  const canChangePhase = m.phase === 'pending' || m.phase === 'ready' || m.phase === 'blocked';
+  const canChangeRole = hasRole(role, 'operator');
+  const reasonFor = (strategy: Strategy, eligible: boolean): string | null => {
+    if (!canChangeRole) return 'Requires the operator role.';
+    if (!canChangePhase) return 'The strategy can change only while pending, ready or blocked.';
+    if (!eligible) return 'This strategy is not eligible for this VM.';
+    if (strategy === m.strategy) return 'Already selected.';
+    return null;
+  };
+  if (m.estimates.length === 0) return <EmptyState icon={ClipboardX} title="Not estimated yet" description="Validate the plan to estimate every strategy." />;
+  return (
+    <div className="flex flex-col gap-2">
+      {setStrategy.error && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
+      <div className="table-wrap rounded-md border border-border">
+        <table className="data-table">
+          <caption className="sr-only">Estimates per strategy</caption>
+          <thead>
+            <tr>
+              <th scope="col">Strategy</th>
+              <th scope="col">Eligible</th>
+              <th scope="col" className="text-right">
+                Downtime
+              </th>
+              <th scope="col" className="hidden text-right sm:table-cell">
+                Pre-copy
+              </th>
+              <th scope="col" className="hidden text-right md:table-cell">
+                Total
+              </th>
+              <th scope="col">SLO</th>
+              <th scope="col">
+                <span className="sr-only">Action</span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {m.estimates.map((e) => (
+              <tr key={e.strategy} className={cn(e.strategy === m.strategy && 'bg-accent/5')}>
+                <th scope="row" className="whitespace-nowrap" title={STRATEGY_DESCRIPTIONS[e.strategy]}>
+                  {strategyLabel(e.strategy)}
+                  {e.strategy === m.strategy && <span className="block text-xs font-normal text-status-success">selected</span>}
+                </th>
+                <td>
+                  {e.eligible ? (
+                    <span className="inline-flex items-center gap-1 text-status-success">
+                      <CircleCheck aria-hidden className="size-3.5" />
+                      Yes
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-start gap-1 text-status-danger" title={e.reasons.join('; ')}>
+                      <Ban aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+                      <span>
+                        No
+                        <span className="block max-w-56 text-xs text-muted-foreground">{e.reasons.join('; ')}</span>
+                      </span>
+                    </span>
+                  )}
+                </td>
+                <td className="num whitespace-nowrap text-right">{formatDuration(e.downtime_s)}</td>
+                <td className="num hidden whitespace-nowrap text-right sm:table-cell">
+                  {e.passes > 0 ? `${formatDuration(e.precopy_s)} · ${e.passes}×` : '—'}
+                </td>
+                <td className="num hidden whitespace-nowrap text-right md:table-cell">{formatDuration(e.total_s)}</td>
+                <td className="whitespace-nowrap">
+                  {e.meets_slo ? (
+                    <span className="inline-flex items-center gap-1 text-status-success">
+                      <CircleCheck aria-hidden className="size-3.5" />
+                      Meets
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-status-warning">
+                      <TriangleAlert aria-hidden className="size-3.5" />
+                      Misses
+                    </span>
+                  )}
+                </td>
+                <td>
+                  <Button
+                    size="sm"
+                    disabledReason={reasonFor(e.strategy, e.eligible)}
+                    loading={setStrategy.isPending && setStrategy.variables === e.strategy}
+                    onClick={() => setStrategy.mutate(e.strategy)}
+                    aria-label={`Use ${strategyLabel(e.strategy)}`}
+                  >
+                    Use
+                  </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function VmDetails({ m }: { m: Migration }) {
+  const vm = m.vm;
+  return (
+    <div className="flex flex-col gap-3 text-sm">
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
+        <dt className="text-muted-foreground">Source id</dt>
+        <dd className="min-w-0">
+          <code className="text-xs">{vm.source_id}</code>
+        </dd>
+        <dt className="text-muted-foreground">Project</dt>
+        <dd>{vm.project ?? '—'}</dd>
+        <dt className="text-muted-foreground">Flavor</dt>
+        <dd>
+          {vm.flavor ?? '—'} <span className="num text-muted-foreground">({vm.vcpus} vCPU, {formatBytes(vm.ram_mb * 1024 * 1024)})</span>
+        </dd>
+        <dt className="text-muted-foreground">OS</dt>
+        <dd>{vm.os_type ?? '—'}</dd>
+        <dt className="text-muted-foreground">Power</dt>
+        <dd>{vm.power_state}</dd>
+        <dt className="text-muted-foreground">Size</dt>
+        <dd className="num">
+          {formatBytes(vm.used_bytes)} used of {formatBytes(vm.disk_bytes)}
+        </dd>
+        <dt className="text-muted-foreground">Destination</dt>
+        <dd className="min-w-0">{m.destination_server_id ? <code className="text-xs">{m.destination_server_id}</code> : 'Not created yet'}</dd>
+      </dl>
+      <div>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Disks</h3>
+        <ul className="flex flex-col gap-1">
+          {vm.disks.map((d) => (
+            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded border border-border px-2 py-1">
+              <span className="font-mono text-xs">
+                {d.device ?? d.name ?? d.id} {d.bootable && <span className="text-muted-foreground">(boot)</span>}
+              </span>
+              <span className="num text-xs text-muted-foreground">
+                {d.size_gb} GiB · {d.kind}
+                {d.volume_type ? ` · ${d.volume_type}` : ''}
+                {d.multiattach ? ' · multi-attach' : ''}
+                {d.encrypted ? ' · encrypted' : ''}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div>
+        <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Networks</h3>
+        <ul className="flex flex-col gap-1">
+          {vm.nics.map((n, i) => (
+            <li key={`${n.network}-${i}`} className="flex flex-wrap justify-between gap-x-2 rounded border border-border px-2 py-1 text-xs">
+              <span className="font-mono">{n.network}</span>
+              <span className="num text-muted-foreground">
+                {n.fixed_ips.join(', ') || 'no fixed IP'} · MTU {n.mtu ?? '—'} · {n.vnic_type}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
+  if (m.approvals.length === 0) {
+    return <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>;
+  }
+  return (
+    <ul className="flex flex-col gap-2">
+      {m.approvals.map((a, i) => (
+        <li key={`${a.actor}-${a.at}-${i}`} className="text-sm">
+          <span className="font-medium text-foreground">{a.actor}</span>{' '}
+          <time dateTime={a.at} title={formatDateTime(a.at)} className="text-muted-foreground">
+            {formatRelative(a.at)}
+          </time>
+          {a.comment && <p className="break-words text-muted-foreground">“{a.comment}”</p>}
+        </li>
+      ))}
+      {m.cutover_requested && <li className="text-xs text-status-success">Cutover requested</li>}
+    </ul>
+  );
+}
+
+export default function MigrationDetail() {
+  const { migrationId = '' } = useParams();
+  const migration = useMigration(migrationId);
+  const m = migration.data;
+  const plan = usePlan(m?.plan_id);
+  const history = useEventTail({ migration_id: migrationId }, 300);
+  const role = useRole();
+  const [liveEvents, setLiveEvents] = useState<Event[]>([]);
+  usePageTitle(m ? `${m.vm.name} · ${phaseMeta(m.phase).label}` : 'Migration');
+  const announcement = useProgressAnnouncement(m);
+
+  useEffect(() => setLiveEvents([]), [migrationId]);
+  useLiveEvents((event) => {
+    if (event.migration_id === migrationId && event.seq > 0) setLiveEvents((list) => [...list, event].slice(-300));
+  });
+  const events = useMemo(() => {
+    const bySeq = new Map<number, Event>();
+    for (const e of history.data ?? []) bySeq.set(e.seq, e);
+    for (const e of liveEvents) bySeq.set(e.seq, e);
+    return [...bySeq.values()];
+  }, [history.data, liveEvents]);
+
+  if (migration.isPending) return <LoadingBlock label="Loading migration…" rows={8} />;
+  if (migration.error || !m) {
+    const missing = migration.error instanceof ApiError && migration.error.status === 404;
+    return (
+      <>
+        <PageHeader title="Migration" breadcrumbs={[{ label: 'Plans', to: '/plans' }, { label: migrationId }]} />
+        {missing ? (
+          <EmptyState icon={ClipboardX} title={`Migration ${migrationId} does not exist`} action={<Link to="/plans" className="underline">Back to plans</Link>} />
+        ) : (
+          <ErrorBanner error={migration.error} title="The migration is unavailable" onRetry={() => void migration.refetch()} />
+        )}
+      </>
+    );
+  }
+
+  const p = plan.data;
+  const warm = isWarmStrategy(m.strategy);
+  const wave = p?.waves.find((w) => w.id === m.wave_id);
+
+  return (
+    <>
+      <PageHeader
+        title={<span className="font-mono">{m.vm.name}</span>}
+        breadcrumbs={[{ label: 'Plans', to: '/plans' }, { label: p?.name ?? m.plan_id, to: `/plans/${m.plan_id}` }, { label: m.vm.name }]}
+        meta={
+          <>
+            <PhaseBadge phase={m.phase} size="md" />
+            <span className="text-sm text-foreground">{strategyLabel(m.strategy)}</span>
+            {wave && <span className="text-sm text-muted-foreground">Wave {wave.order}: {wave.name}</span>}
+            <code className="text-xs text-muted-foreground">{m.id}</code>
+          </>
+        }
+      />
+      <p aria-live="polite" className="sr-only">
+        {announcement}
+      </p>
+
+      <div className="flex flex-col gap-4">
+        <Alerts m={m} />
+
+        <Panel title="Next step">
+          <MigrationActions migration={m} plan={p} role={role} />
+        </Panel>
+
+        <section aria-label="Lifecycle" className="card p-4">
+          <PhaseStepper migration={m} />
+        </section>
+
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <ProgressPanel m={m} />
+          <Panel title="Downtime" description="From source stop to verified boot on RHOSO">
+            <DowntimeClock
+              startedAt={m.downtime_started_at}
+              endedAt={m.downtime_ended_at}
+              actualS={m.actual_downtime_s}
+              sloS={p?.downtime_slo_s ?? null}
+              estimateS={m.estimate?.downtime_s ?? null}
+            />
+          </Panel>
+          <Panel title="Approvals" description={p?.require_approval ? 'An approver must approve the cutover' : undefined}>
+            <Approvals m={m} plan={p} />
+          </Panel>
+        </div>
+
+        {warm && (
+          <Panel title="Sync-pass convergence" description="Bytes changed per pass; cutover becomes possible once a delta is below the threshold">
+            <SyncPassChart passes={m.sync_passes} thresholdBytes={p?.convergence_threshold_bytes ?? null} maxPasses={p?.max_sync_passes ?? null} />
+          </Panel>
+        )}
+
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">
+            <FindingsList findings={m.findings} />
+          </Panel>
+          <Panel title="Advisor notes" description="Jev, rules and agentmemory">
+            <AdvisorNotes notes={m.advisor_notes} />
+          </Panel>
+        </div>
+
+        <Panel title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
+          <EstimatesPanel m={m} role={role} />
+        </Panel>
+
+        <div className="grid gap-4 xl:grid-cols-2">
+          <Panel title="VM">
+            <VmDetails m={m} />
+          </Panel>
+          <Panel title="Timeline" description="Phase changes and audit events, newest first">
+            {history.error && <ErrorBanner error={history.error} title="Events are unavailable" onRetry={() => void history.refetch()} />}
+            <Timeline history={m.phase_history} events={events} />
+          </Panel>
+        </div>
+      </div>
+    </>
+  );
+}

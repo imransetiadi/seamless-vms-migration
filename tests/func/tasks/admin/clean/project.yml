@@ -1,0 +1,10 @@
+- name: remove osm_project
+  os_migrate.os_migrate.project:
+    auth: "{{ item['auth'] }}"
+    name: "{{ item['project'] }}"
+    state: absent
+  loop:
+    - auth: "{{ os_migrate_src_auth }}"
+      project: osm_project
+    - auth: "{{ os_migrate_dst_auth }}"
+      project: osmdst_project

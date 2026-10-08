@@ -1,0 +1,43 @@
+---
+# Main tasks for import_from_hypervisor role
+# Exports the disks of workloads with use_nbdkit_direct enabled with qemu-nbd
+# on their hypervisors.
+
+- name: Read workloads file
+  ansible.builtin.slurp:
+    src: "{{ os_migrate_data_dir }}/workloads.yml"
+  register: import_from_hypervisor_workloads_file
+
+- name: Parse workloads YAML
+  ansible.builtin.set_fact:
+    import_from_hypervisor_all_workloads: >-
+      {{ (import_from_hypervisor_workloads_file.content | b64decode | from_yaml).resources }}
+
+- name: Filter workloads with nbdkit direct mode enabled
+  ansible.builtin.set_fact:
+    import_from_hypervisor_workloads: >-
+      {{
+        import_from_hypervisor_all_workloads |
+        selectattr('_migration_params.use_nbdkit_direct', 'defined') |
+        selectattr('_migration_params.use_nbdkit_direct', 'equalto', true) |
+        list
+      }}
+
+- name: Check the NBD protocol
+  ansible.builtin.assert:
+    that:
+      - os_migrate_nbdkit_protocol in ['tcp', 'ssh']
+    fail_msg: "os_migrate_nbdkit_protocol must be tcp or ssh, not {{ os_migrate_nbdkit_protocol }}"
+    quiet: true
+
+- name: Display nbdkit workloads count
+  ansible.builtin.debug:
+    msg: "Found {{ import_from_hypervisor_workloads | length }} workload(s) with use_nbdkit_direct enabled"
+
+- name: Process each workload with nbdkit direct mode
+  ansible.builtin.include_tasks: workload.yml
+  loop: "{{ import_from_hypervisor_workloads }}"
+  loop_control:
+    loop_var: workload_item
+    label: "{{ workload_item.params.name }}"
+  when: import_from_hypervisor_workloads | length > 0

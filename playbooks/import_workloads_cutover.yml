@@ -1,0 +1,10 @@
+# Warm migration, step 2: stop the selected workloads, transfer the final
+# delta and create the destination servers from the synchronised volumes.
+- name: Warm cutover of workloads
+  hosts: migrator
+  environment:
+    OS_CLIENT_CONFIG_FILE: "{{ os_migrate_clouds_path | default(os_migrate_data_dir ~ '/clouds.yaml') }}"
+  roles:
+    - role: os_migrate.os_migrate.import_workloads_warm
+      vars:
+        import_workloads_warm_action: cutover

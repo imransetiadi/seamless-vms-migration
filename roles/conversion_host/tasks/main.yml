@@ -1,0 +1,81 @@
+- name: Generate os_migrate conversion keypair
+  ansible.builtin.include_tasks: generate_keypair.yml
+  when: os_migrate_conversion_keypair_generate | bool
+
+- name: Ensure conversion host keypair mode is correct
+  ansible.builtin.file:
+    path: "{{ os_migrate_conversion_keypair_private_path }}"
+    mode: "0600"
+
+- name: Create a network for the conversion host
+  ansible.builtin.include_tasks: create_network.yml
+  when: os_migrate_conversion_manage_network | bool
+
+- name: Create os_migrate conversion security group
+  os_migrate.os_migrate.security_group:
+    name: "{{ os_migrate_conversion_secgroup_name }}"
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+
+- name: Allow ssh in os_migrate conversion security group
+  os_migrate.os_migrate.security_group_rule:
+    security_group: "{{ os_migrate_conversion_secgroup_name }}"
+    remote_ip_prefix: "{{ os_migrate_conversion_secgroup_remote_ip_prefix }}"
+    protocol: tcp
+    port_range_min: 22
+    port_range_max: 22
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+
+- name: Allow icmp in os_migrate conversion security group
+  os_migrate.os_migrate.security_group_rule:
+    security_group: "{{ os_migrate_conversion_secgroup_name }}"
+    remote_ip_prefix: "{{ os_migrate_conversion_secgroup_remote_ip_prefix }}"
+    protocol: icmp
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+
+- name: Create os_migrate conversion keypair
+  os_migrate.os_migrate.keypair:
+    name: "{{ os_migrate_conversion_keypair_name }}"
+    public_key_file: "{{ os_migrate_conversion_keypair_private_path }}.pub"
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+
+- name: Create os_migrate conversion host
+  os_migrate.os_migrate.server:
+    name: "{{ os_migrate_conversion_host_name }}"
+    flavor: "{{ os_migrate_conversion_flavor_name }}"
+    image: "{{ os_migrate_conversion_image_name }}"
+    key_name: "{{ os_migrate_conversion_keypair_name }}"
+    boot_from_volume: "{{ os_migrate_conversion_host_boot_from_volume | default(omit) }}"
+    volume_size: "{{ os_migrate_conversion_host_volume_size | default(omit) }}"
+    terminate_volume: true
+    network: "{{ os_migrate_conversion_net_name }}"
+    security_groups:
+      - "{{ os_migrate_conversion_secgroup_name }}"
+    auto_ip: false
+    wait: true
+    timeout: "{{ os_migrate_conversion_host_deploy_timeout }}"
+    cloud: "{{ os_migrate_conversion_cloud }}"
+    availability_zone: "{{ os_migrate_conversion_availability_zone | default(omit) }}"
+    validate_certs: "{{ os_migrate_conversion_validate_certs | default(omit) }}"
+    ca_cert: "{{ os_migrate_conversion_ca_cert | default(omit) }}"
+    client_cert: "{{ os_migrate_conversion_client_cert | default(omit) }}"
+    client_key: "{{ os_migrate_conversion_client_key | default(omit) }}"
+
+- name: Create a floating IP for the conversion host
+  ansible.builtin.include_tasks: create_fip.yml
+  when: os_migrate_conversion_manage_fip | bool

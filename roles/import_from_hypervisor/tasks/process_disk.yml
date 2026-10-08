@@ -1,0 +1,167 @@
+---
+# Process one disk: inspect it and export it with qemu-nbd (read-only,
+# bound to os_migrate_nbdkit_bind_address, one client at a time).
+
+- name: Get disk filename
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disk_name: "{{ disk_item | basename }}"
+    import_from_hypervisor_disk_index: "{{ disk_loop_index }}"
+
+- name: Inspect disk with qemu-img info
+  ansible.builtin.raw: qemu-img info {{ disk_item | quote }}
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_qemu_img_info
+  changed_when: false
+
+- name: Display disk info
+  ansible.builtin.debug:
+    msg: "{{ import_from_hypervisor_disk_name }}: {{ import_from_hypervisor_qemu_img_info.stdout }}"
+
+- name: Parse disk format and size
+  ansible.builtin.set_fact:
+    import_from_hypervisor_format_match: >-
+      {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('file format: (\w+)', '\1') }}
+    import_from_hypervisor_size_match: >-
+      {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('virtual size: ([0-9]+) GiB', '\1') }}
+
+- name: Set disk properties
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disk_format: >-
+      {{ import_from_hypervisor_format_match | first | trim if import_from_hypervisor_format_match else 'qcow2' }}
+    import_from_hypervisor_disk_size_gb: >-
+      {{ import_from_hypervisor_size_match | first | int if import_from_hypervisor_size_match else 0 }}
+
+- name: Display disk configuration
+  ansible.builtin.debug:
+    msg:
+      - "Disk: {{ import_from_hypervisor_disk_name }}"
+      - "Path: {{ disk_item }}"
+      - "Format: {{ import_from_hypervisor_disk_format }}"
+      - "Size: {{ import_from_hypervisor_disk_size_gb }} GB"
+
+- name: Calculate NBD port for this disk
+  ansible.builtin.set_fact:
+    import_from_hypervisor_nbd_port: "{{ import_from_hypervisor_base_port | int + import_from_hypervisor_disk_index | int }}"
+
+- name: Set the log and PID files of the export
+  ansible.builtin.set_fact:
+    import_from_hypervisor_nbd_log: "{{ os_migrate_nbdkit_log_dir }}/qemu-nbd-{{ import_from_hypervisor_nbd_port }}.log"
+    import_from_hypervisor_nbd_pid_file: "{{ os_migrate_nbdkit_log_dir }}/qemu-nbd-{{ import_from_hypervisor_nbd_port }}.pid"
+
+- name: Build qemu-nbd command for this disk
+  ansible.builtin.set_fact:
+    import_from_hypervisor_qemu_nbd_cmd: >-
+      sudo qemu-nbd
+      --format={{ import_from_hypervisor_disk_format | quote }}
+      --port={{ import_from_hypervisor_nbd_port | int }}
+      --bind={{ import_from_hypervisor_bind_address | quote }}
+      --shared=1
+      {{ '--read-only' if os_migrate_nbdkit_readonly | bool else '' }}
+      --pid-file={{ import_from_hypervisor_nbd_pid_file | quote }}
+      {{ disk_item | quote }}
+
+- name: Display qemu-nbd command for this disk
+  ansible.builtin.debug:
+    msg: "qemu-nbd command for {{ import_from_hypervisor_disk_name }}: {{ import_from_hypervisor_qemu_nbd_cmd }}"
+
+# Only the qemu-nbd recorded in this port's PID file is stopped, and only
+# if that process really is a qemu-nbd started with this PID file (a stale
+# PID may belong to an unrelated process by now).
+- name: "Stop the previous export of port {{ import_from_hypervisor_nbd_port }}"
+  ansible.builtin.raw: |
+    pidfile={{ import_from_hypervisor_nbd_pid_file | quote }}
+    if sudo test -s "$pidfile"; then
+      pid=$(sudo cat "$pidfile")
+      case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          case "$(ps -ww -p "$pid" -o args= 2>/dev/null)" in
+            *qemu-nbd*"--pid-file=$pidfile"*)
+              echo "Stopping qemu-nbd $pid"
+              sudo kill "$pid"
+              n=0
+              while ps -p "$pid" > /dev/null 2>&1 && [ "$n" -lt 10 ]; do
+                sleep 1
+                n=$((n + 1))
+              done
+              if ps -p "$pid" > /dev/null 2>&1; then sudo kill -9 "$pid"; fi
+              ;;
+          esac
+          ;;
+      esac
+      sudo rm -f "$pidfile"
+    fi
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  changed_when: false
+
+- name: "Check that the export port is free: {{ import_from_hypervisor_nbd_port }}"
+  ansible.builtin.raw: |
+    if sudo netstat -tlnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
+      echo "Port {{ import_from_hypervisor_nbd_port }} is in use by another process:"
+      sudo netstat -tlnp | grep -E ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'
+      exit 1
+    fi
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  changed_when: false
+
+- name: "Start qemu-nbd: {{ import_from_hypervisor_disk_name }}"
+  ansible.builtin.raw: |
+    setsid {{ import_from_hypervisor_qemu_nbd_cmd }} > {{ import_from_hypervisor_nbd_log | quote }} 2>&1 < /dev/null &
+    QEMU_NBD_PID=$!
+    sleep 2
+    if ps -p $QEMU_NBD_PID > /dev/null 2>&1; then
+      echo "qemu-nbd started with PID $QEMU_NBD_PID"
+    else
+      echo "qemu-nbd failed to start"
+      cat {{ import_from_hypervisor_nbd_log | quote }}
+      exit 1
+    fi
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_qemu_nbd_start
+  changed_when: true
+
+- name: "Wait for qemu-nbd to be ready on port {{ import_from_hypervisor_nbd_port }}"
+  ansible.builtin.raw: |
+    i=0
+    while [ "$i" -lt 30 ]; do
+      if sudo netstat -tlnp | grep -Eq ':{{ import_from_hypervisor_nbd_port }}[[:space:]]'; then
+        echo "Port {{ import_from_hypervisor_nbd_port }} is ready"
+        exit 0
+      fi
+      sleep 1
+      i=$((i + 1))
+    done
+    echo "Timeout waiting for port {{ import_from_hypervisor_nbd_port }}"
+    exit 1
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  changed_when: false
+
+- name: Build NBD URI for this disk
+  ansible.builtin.set_fact:
+    import_from_hypervisor_nbd_uri: >-
+      {{ ('nbd+ssh://' ~ os_migrate_nbdkit_ssh_user ~ '@' ~ import_from_hypervisor_host)
+         if os_migrate_nbdkit_protocol == 'ssh'
+         else ('nbd://' ~ import_from_hypervisor_nbd_host) }}:{{ import_from_hypervisor_nbd_port }}
+
+- name: Add disk info to the disk list
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disks: >-
+      {{ import_from_hypervisor_disks | default([]) + [import_from_hypervisor_disk_info] }}
+  vars:
+    import_from_hypervisor_disk_info:
+      disk_path: "{{ disk_item }}"
+      disk_name: "{{ import_from_hypervisor_disk_name }}"
+      device: "{{ disk_device_name }}"
+      uri: "{{ import_from_hypervisor_nbd_uri }}"
+      port: "{{ import_from_hypervisor_nbd_port | int }}"
+      size: "{{ import_from_hypervisor_disk_size_gb | int }}"
+      bootable: "{{ disk_is_bootable }}"
+
+- name: Display disk qemu-nbd info
+  ansible.builtin.debug:
+    msg:
+      - "Started qemu-nbd for {{ import_from_hypervisor_disk_name }}"
+      - "Device: {{ disk_device_name }}"
+      - "URI: {{ import_from_hypervisor_nbd_uri }}"
+      - "Port: {{ import_from_hypervisor_nbd_port }}"
+      - "Size: {{ import_from_hypervisor_disk_size_gb }} GB"

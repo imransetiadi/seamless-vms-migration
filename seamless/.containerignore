@@ -1,0 +1,31 @@
+# Ignore file for builds of seamless/Containerfile (the build context is the repository root).
+.git
+.github
+.worktrees
+.superpowers
+**/.venv
+**/venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/node_modules
+dashboard/coverage
+seamless/data
+seamless/tests
+**/*.db
+**/*.sqlite3
+docs/_build
+tests/e2e
+# never send secrets to the builder
+**/.env
+**/.env.*
+**/*.env
+**/clouds.yaml
+**/secure.yaml
+**/tokens.yaml
+**/*.pem
+**/*.key
+**/secrets
+deploy/compose/.env

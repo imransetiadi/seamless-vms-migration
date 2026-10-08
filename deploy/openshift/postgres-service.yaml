@@ -1,0 +1,18 @@
+# Headless service that governs the PostgreSQL StatefulSet; the control plane connects to
+# seamless-postgres:5432 (see SEAMLESS_DB_URL in the seamless-db Secret).
+apiVersion: v1
+kind: Service
+metadata:
+  name: seamless-postgres
+  labels:
+    app.kubernetes.io/name: seamless-postgres
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: seamless-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

@@ -1,0 +1,187 @@
+# Default-deny with explicit allows (SDD 17): ingress to the control plane from the OpenShift router only;
+# egress to DNS, PostgreSQL and the external systems a migration needs (cloud APIs, vCenter, conversion
+# hosts over SSH, Jev provider, agentmemory). PostgreSQL accepts connections from the control plane only.
+#
+# TIGHTEN BEFORE PRODUCTION: seamless-allow-egress-external allows the listed ports to any address outside
+# the cluster networks. Replace 0.0.0.0/0 with the CIDRs of your source/destination clouds, vCenter,
+# conversion hosts, Jev provider and agentmemory (Security.md 8). The "except" ranges are the OpenShift
+# defaults for the pod and service networks; adjust them to your cluster.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-ingress-from-router
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-egress-postgres
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: seamless-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-egress-external
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.128.0.0/14   # default OpenShift pod network
+              - 172.30.0.0/16   # default OpenShift service network
+              - 169.254.0.0/16  # link-local, including cloud metadata endpoints
+      ports:
+        - protocol: TCP
+          port: 22      # SSH to conversion hosts (Ansible)
+        - protocol: TCP
+          port: 443     # RHOSO/OpenStack APIs, vCenter, Jev provider API, npm registry (Jev stdio)
+        - protocol: TCP
+          port: 3111    # agentmemory REST
+        - protocol: TCP
+          port: 5000    # community OpenStack Keystone
+        - protocol: TCP
+          port: 8774    # Nova
+        - protocol: TCP
+          port: 8776    # Cinder
+        - protocol: TCP
+          port: 9292    # Glance
+        - protocol: TCP
+          port: 9696    # Neutron
+        - protocol: TCP
+          port: 13000   # RHOSP 17.1 public Keystone (TLS)
+        - protocol: TCP
+          port: 13292   # RHOSP 17.1 public Glance
+        - protocol: TCP
+          port: 13696   # RHOSP 17.1 public Neutron
+        - protocol: TCP
+          port: 13774   # RHOSP 17.1 public Nova
+        - protocol: TCP
+          port: 13776   # RHOSP 17.1 public Cinder
+# IN-CLUSTER Jev MCP / agentmemory (SEAMLESS_JEV_URL or SEAMLESS_MEMORY_URL pointing at a Service in the cluster).
+# seamless-allow-egress-external excludes the pod and service networks, so such a target is blocked until it is
+# allowed explicitly and narrowly. Uncomment, replace the placeholders, and make sure the target namespace admits
+# traffic from seamless-migrate (an ingress rule there if it has a default-deny policy of its own).
+#
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: seamless-allow-egress-incluster-ai
+#   labels:
+#     app.kubernetes.io/part-of: seamless-migrate
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: seamless
+#   policyTypes:
+#     - Egress
+#   egress:
+#     - to:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: <namespace-of-jev-or-agentmemory>
+#           podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: <agentmemory-or-jev-mcp>
+#       ports:
+#         - protocol: TCP
+#           port: 3111    # agentmemory REST
+#         - protocol: TCP
+#           port: 8080    # jev-mcp --http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-postgres-allow-from-seamless
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: seamless
+      ports:
+        - protocol: TCP
+          port: 5432

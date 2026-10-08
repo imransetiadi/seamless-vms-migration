@@ -1,0 +1,32 @@
+{
+  "extraKnownMarketplaces": {
+    "superpowers-marketplace": {
+      "source": {
+        "source": "github",
+        "repo": "obra/superpowers-marketplace"
+      }
+    },
+    "ui-ux-pro-max-skill": {
+      "source": {
+        "source": "github",
+        "repo": "nextlevelbuilder/ui-ux-pro-max-skill"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "superpowers@superpowers-marketplace": true,
+    "ui-ux-pro-max@ui-ux-pro-max-skill": true
+  },
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./deploy/compose/.env)",
+      "Read(./deploy/compose/tokens.yaml)",
+      "Read(./**/clouds.yaml)",
+      "Read(./**/secure.yaml)",
+      "Read(./**/*.pem)",
+      "Read(./secrets/**)"
+    ]
+  }
+}

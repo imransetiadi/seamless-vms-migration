@@ -1,0 +1,34 @@
+- name: Add both conversion hosts to inventory
+  ansible.builtin.import_tasks: conv_hosts_inventory.yml
+
+- name: Create folder for link keypairs
+  ansible.builtin.file:
+    path: "{{ os_migrate_conversion_link_keypair_private_path | dirname }}"
+    state: directory
+    mode: '0700'
+
+- name: Generate a keypair for the conversion host
+  ansible.builtin.shell: >
+    ssh-keygen -t {{ os_migrate_conversion_host_ssh_key_type }}
+    {% if os_migrate_conversion_host_ssh_key_type != 'ed25519' %}-b {{ os_migrate_conversion_host_ssh_key_bits }}{% endif %}
+    -f "{{ os_migrate_conversion_link_keypair_private_path }}" -N ""
+  args:
+    creates: "{{ os_migrate_conversion_link_keypair_private_path }}"
+
+- name: Wait for src conversion host reachability
+  ansible.builtin.wait_for:
+    port: 22
+    host: "{{ hostvars['os_migrate_conv_src']['ansible_ssh_host'] }}"
+    search_regex: OpenSSH
+    sleep: 5
+    timeout: 600
+  retries: 10
+
+- name: Wait for dst conversion host reachability
+  ansible.builtin.wait_for:
+    port: 22
+    host: "{{ hostvars['os_migrate_conv_dst']['ansible_ssh_host'] }}"
+    search_regex: OpenSSH
+    sleep: 5
+    timeout: 600
+  retries: 10

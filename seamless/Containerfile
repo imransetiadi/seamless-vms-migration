@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1.7
+# Seamless Migrate control plane (SDD §17).
+#
+# Build context is the REPOSITORY ROOT:
+#   podman build --ignorefile seamless/.containerignore -f seamless/Containerfile -t seamless:0.1.0 .
+#   docker build -f seamless/Containerfile -t seamless:0.1.0 .   # uses Containerfile.dockerignore
+#
+# The built dashboard (dashboard/dist) is copied when present; build it first to include it, or
+# point DASHBOARD_DIST elsewhere: --build-arg DASHBOARD_DIST=path/to/dist
+
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest
+FROM ${BASE_IMAGE}
+
+ARG DASHBOARD_DIST=dashboard/dist
+ARG ANSIBLE_CORE_VERSION=">=2.16,<2.19"
+ARG VMWARE_KIT=os_migrate.vmware_migration_kit
+
+LABEL org.opencontainers.image.title="seamless-migrate" \
+      org.opencontainers.image.description="Seamless Migrate control plane: VM migration to RHOSO 18.0" \
+      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 0
+
+# Node 22 runs the npx-launched Jev MCP server; ssh is used by Ansible for conversion hosts.
+RUN dnf -y module enable nodejs:22 \
+ && dnf -y install --setopt=install_weak_deps=False nodejs npm openssh-clients rsync \
+ && dnf clean all \
+ && rm -rf /var/cache/dnf
+
+# Control plane with the OpenStack, VMware and Jev extras, plus ansible-core.
+COPY seamless/pyproject.toml seamless/README.md /opt/seamless/src/seamless/
+COPY seamless/src /opt/seamless/src/seamless/src
+# hadolint ignore=DL3013
+RUN python3 -m pip install --no-cache-dir --upgrade pip \
+ && python3 -m pip install --no-cache-dir "/opt/seamless/src/seamless[openstack,vmware,jev]" \
+        "ansible-core${ANSIBLE_CORE_VERSION}"
+
+# The os-migrate collection from this repository and the VMware migration kit.
+COPY galaxy.yml README.md LICENSE CHANGELOG.rst requirements.yml /opt/seamless/collection/
+COPY meta /opt/seamless/collection/meta
+COPY plugins /opt/seamless/collection/plugins
+COPY roles /opt/seamless/collection/roles
+COPY playbooks /opt/seamless/collection/playbooks
+RUN ansible-galaxy collection build /opt/seamless/collection --output-path /tmp/collection \
+ && ansible-galaxy collection install /tmp/collection/*.tar.gz \
+        -p /usr/share/ansible/collections --force \
+ && ansible-galaxy collection install "${VMWARE_KIT}" -p /usr/share/ansible/collections \
+ && rm -rf /tmp/collection /root/.ansible
+
+# Dashboard build, only when it exists in the build context.
+RUN --mount=type=bind,source=.,target=/ctx \
+    mkdir -p /opt/seamless/dashboard \
+ && if [ -f "/ctx/${DASHBOARD_DIST}/index.html" ]; then \
+        cp -r "/ctx/${DASHBOARD_DIST}/." /opt/seamless/dashboard/; \
+    else echo "dashboard build not found at ${DASHBOARD_DIST}; serving the API only"; fi
+
+RUN mkdir -p /var/lib/seamless \
+ && chown -R 1001:0 /var/lib/seamless /opt/seamless \
+ && chmod -R g=u /var/lib/seamless /opt/seamless
+
+ENV HOME=/var/lib/seamless \
+    SEAMLESS_DATA_DIR=/var/lib/seamless \
+    SEAMLESS_HOST=0.0.0.0 \
+    SEAMLESS_PORT=8080 \
+    SEAMLESS_COLLECTION_ROOT=/usr/share/ansible/collections/ansible_collections/os_migrate/os_migrate \
+    SEAMLESS_DASHBOARD_DIR=/opt/seamless/dashboard \
+    ANSIBLE_HOME=/var/lib/seamless/.ansible \
+    ANSIBLE_COLLECTIONS_PATH=/usr/share/ansible/collections \
+    PYTHONUNBUFFERED=1
+
+USER 1001
+WORKDIR /var/lib/seamless
+EXPOSE 8080
+VOLUME ["/var/lib/seamless"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python3", "-c", "import urllib.request,sys; r = urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health', timeout=4); sys.exit(0 if r.status == 200 else 1)"]
+
+ENTRYPOINT ["seamless"]
+CMD ["serve"]

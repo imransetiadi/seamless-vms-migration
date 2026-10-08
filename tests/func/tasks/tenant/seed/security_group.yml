@@ -1,0 +1,15 @@
+- name: Create security group
+  os_migrate.os_migrate.security_group:
+    auth: "{{ os_migrate_src_auth }}"
+    state: present
+    name: osm_security_group
+    description: OSM security group
+
+- name: Create security group rule
+  os_migrate.os_migrate.security_group_rule:
+    auth: "{{ os_migrate_src_auth }}"
+    security_group: osm_security_group
+    protocol: tcp
+    port_range_min: 80
+    port_range_max: 80
+    remote_ip_prefix: 0.0.0.0/0

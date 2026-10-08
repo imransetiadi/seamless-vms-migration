@@ -1,0 +1,73 @@
+- name: Run the rhsm tasks
+  when:
+    - >-
+      os_migrate_conversion_rhsm_manage and (
+      os_migrate_conversion_rhsm_username is defined or
+      os_migrate_conversion_rhsm_org_id is defined)
+  block:
+    - name: Execute RHC system role with retries
+      ansible.builtin.include_role:
+        name: redhat.rhel_system_roles.rhc
+      vars:
+        rhc_state: present
+        rhc_organization: "{{ os_migrate_conversion_rhsm_org_id | default(omit) }}"
+        rhc_release: "{{ os_migrate_conversion_rhsm_release | default(omit) }}"
+        rhc_baseurl: "{{ os_migrate_conversion_rhsm_rhsm_baseurl | default(omit) }}"
+        rhc_repositories: "{{ os_migrate_conversion_rhsm_repositories | default(omit) }}"
+        rhc_auth:
+          activation_keys: >-
+            {{ {'keys': [os_migrate_conversion_rhsm_activationkey]}
+               if os_migrate_conversion_rhsm_activationkey is defined
+               else omit }}
+          login: >-
+            {{ {'username': os_migrate_conversion_rhsm_username,
+                'password': os_migrate_conversion_rhsm_password | default('')}
+               if os_migrate_conversion_rhsm_username is defined
+               and os_migrate_conversion_rhsm_activationkey is not defined
+               else omit }}
+        rhc_server: >-
+          {{ omit if os_migrate_conversion_rhsm_server_hostname is not defined
+             else {'hostname': os_migrate_conversion_rhsm_server_hostname,
+                   'insecure': os_migrate_conversion_rhsm_server_insecure
+                               | default(false) | bool} }}
+        rhc_proxy: >-
+          {{ omit if os_migrate_conversion_rhsm_server_proxy_hostname is not defined
+             else {'hostname': os_migrate_conversion_rhsm_server_proxy_hostname,
+                   'port': os_migrate_conversion_rhsm_server_proxy_port
+                           | default(443) | int,
+                   'username': os_migrate_conversion_rhsm_server_proxy_user
+                               | default(omit),
+                   'password': os_migrate_conversion_rhsm_server_proxy_password
+                               | default(omit)} }}
+        # Insights configuration
+        rhc_insights:
+          state: "{{ os_migrate_conversion_insights_enable | default('absent') }}"
+      register: rhc_role_result
+      ignore_errors: true
+
+    - name: Fail if the RHC role execution failed completely
+      ansible.builtin.fail:
+        msg: "The RHC registration role failed to complete successfully."
+      when: rhc_role_result is failed
+
+- name: Update all packages
+  ansible.builtin.package:
+    name: '*'
+    state: present
+  when: do_yum_update|default(false)|bool
+
+- name: Install content
+  ansible.builtin.package:
+    name:
+      - nbdkit
+      - nbdkit-basic-plugins
+      - qemu-img
+      - libguestfs-tools
+      - libvirt
+    state: present
+
+- name: Start libvirtd
+  ansible.builtin.service:
+    name: libvirtd
+    state: started
+    enabled: true

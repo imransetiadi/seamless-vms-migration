@@ -1,0 +1,15 @@
+- name: Include project tasks
+  ansible.builtin.include_tasks: project.yml
+  args:
+    apply:
+      tags:
+        - test_project
+  tags: always
+
+- name: Include user tasks
+  ansible.builtin.include_tasks: user.yml
+  args:
+    apply:
+      tags:
+        - test_user
+  tags: always

@@ -1,0 +1,22 @@
+{
+  "tool": "jev_screen",
+  "model": "jev-1.13.0",
+  "provider": "typesafe",
+  "probabilities": {
+    "injection": 0.97,
+    "substance": 0.89,
+    "relevance": 0.82
+  },
+  "thresholds": {
+    "block_at": 0.75,
+    "review_at": 0.25
+  },
+  "recommendation": {
+    "action": "block",
+    "reason": "injection probability 0.97 >= block threshold 0.75"
+  },
+  "usage": {
+    "input_tokens": 563,
+    "output_tokens": 57
+  }
+}

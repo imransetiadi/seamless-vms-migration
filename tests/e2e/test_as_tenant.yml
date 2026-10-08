@@ -1,0 +1,283 @@
+- name: Test preparation
+  hosts: migrator
+  tasks:
+    - name: prepare the environment
+      ansible.builtin.import_tasks: tasks/common/prep.yml
+
+- name: Make sure conversion hosts are cleaned up
+  ansible.builtin.import_playbook: os_migrate.os_migrate.delete_conversion_hosts
+
+- name: Deploy conversion hosts
+  ansible.builtin.import_playbook: os_migrate.os_migrate.deploy_conversion_hosts
+
+# Immediately unregister the conversion hosts to prevent dangling
+# subscriptions from CI in case the job crashes.
+- name: Unregister conversion hosts
+  hosts: conversion_hosts
+  ignore_unreachable: true
+  tasks:
+    - name: unregister the conversion hosts
+      ansible.builtin.include_role:
+        name: os_migrate.os_migrate.conversion_host_content
+        tasks_from: rhsm_unregister.yml
+
+- name: Migration tests
+  hosts: migrator
+  environment:
+    OS_BLOCK_STORAGE_DEFAULT_MICROVERSION: 3.59
+    OS_CLIENT_CONFIG_FILE: "{{ os_migrate_clouds_path|default(os_migrate_data_dir ~ '/clouds.yaml') }}"
+  tasks:
+    - name: clean workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_before
+            - test_workload
+            - test_image_workload_boot_copy
+            - test_image_workload_boot_nocopy
+      tags: always
+
+    - name: clean pre workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_pre_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_before
+            - test_pre_workload
+      tags: always
+
+    # pre-workload seed & migrate
+    - name: seed pre workloads
+      ansible.builtin.include_tasks: tasks/tenant/seed_pre_workload.yml
+      args:
+        apply:
+          tags:
+            - test_seed
+            - test_pre_workload
+      tags: always
+
+    - name: run the pre workloads
+      ansible.builtin.include_tasks: tasks/tenant/run_pre_workload.yml
+      args:
+        apply:
+          tags: test_pre_workload
+      tags: always
+
+    # Workload migration scenario:
+    #
+    # * Attached volume
+    #
+    # * From tenant-owned image
+    #
+    # * boot_disk_copy: false
+    #
+    # * data_copy: true
+    #
+    # * floating_ip_mode: auto
+    #
+    # * port_creation_mode: neutron
+    #
+    - name: seed the workloads
+      ansible.builtin.include_tasks: tasks/tenant/seed_workload.yml
+      args:
+        apply:
+          tags:
+            - test_seed
+            - test_workload
+            - test_image_workload_boot_nocopy
+      tags: always
+      vars:
+        workload_image: osm_image
+
+    - name: run the workloads
+      ansible.builtin.include_tasks: tasks/tenant/run_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_nocopy
+      tags: always
+      vars:
+        port_creation_mode: neutron
+
+    - name: clean the workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_nocopy
+            - test_image_workload_boot_nocopy_clean
+      tags: always
+
+    # Workload migration scenario:
+    #
+    # * Attached volume
+    #
+    # * From public image
+    #
+    # * boot_disk_copy: true
+    #
+    # * data_copy: true
+    #
+    # * floating_ip_mode: auto
+    #
+    # * port_creation_mode: nova
+    #
+    - name: seed the workloads
+      ansible.builtin.include_tasks: tasks/tenant/seed_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        workload_image: "{{ os_migrate_src_osm_server_image }}"
+
+    - name: run the workloads
+      ansible.builtin.include_tasks: tasks/tenant/run_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        set_boot_disk_copy: true
+        port_creation_mode: nova
+
+    - name: clean the workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_after
+            - test_workload
+            - test_image_workload_boot_copy
+            - test_image_workload_boot_copy_clean
+      tags: always
+
+    # Workload migration scenario:
+    #
+    # * Attached volume
+    #
+    # * From public image
+    #
+    # * boot_disk_copy: true
+    #
+    # * data_copy: false
+    #
+    # * floating_ip_mode: existing
+    #
+    # * port_creation_mode: nova
+
+    - name: seed the workloads
+      ansible.builtin.include_tasks: tasks/tenant/seed_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        workload_image: "{{ os_migrate_src_osm_server_image }}"
+
+    - name: run the workloads
+      ansible.builtin.include_tasks: tasks/tenant/run_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        set_boot_disk_copy: true
+        set_no_data_copy: true
+        set_floating_ip_mode: 'existing'
+        port_creation_mode: nova
+
+    - name: clean the workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_after
+            - test_workload
+            - test_image_workload_boot_copy
+            - test_image_workload_boot_copy_clean
+      tags: always
+
+    # Workload migration scenario:
+    #
+    # * Attached two volume's
+    #
+    # * From tenant-owned image
+    #
+    # * boot_disk_copy: false
+    #
+    # * data_copy: true
+    #
+    # * floating_ip_mode: auto
+    #
+    # * port_creation_mode: nova
+    #
+    - name: seed the workloads
+      ansible.builtin.include_tasks: tasks/tenant/multi_volume_migration/seed_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload_multi_volume_migration
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        workload_image: "{{ os_migrate_src_osm_server_image }}"
+        test_detached_volumes: true
+
+    - name: assert workloads seeded properly
+      ansible.builtin.include_tasks: tasks/common/test_seeded_workloads.yml
+      args:
+        apply:
+          tags:
+            - test_workloads_seeded_properly
+      tags: always
+
+    - name: run the workloads
+      ansible.builtin.include_tasks: tasks/tenant/run_workload.yml
+      args:
+        apply:
+          tags:
+            - test_workload
+            - test_image_workload_boot_copy
+      tags: always
+      vars:
+        port_creation_mode: nova
+        test_detached_volumes: true
+
+    - name: clean the workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_after
+            - test_workload
+            - test_image_workload_boot_copy
+            - test_image_workload_boot_copy_clean
+      tags: always
+
+    # pre-workload cleanup
+    - name: clean pre workloads
+      ansible.builtin.include_tasks: tasks/tenant/clean_pre_workload.yml
+      args:
+        apply:
+          tags:
+            - test_clean_after
+            - test_pre_workload
+      tags: always
+  tags:
+    - test_migration
+
+- name: Delete conversion hosts
+  when: test_clean_conversion_hosts_after|default(true)|bool
+  ansible.builtin.import_playbook: os_migrate.os_migrate.delete_conversion_hosts

@@ -1,0 +1,108 @@
+# PostgreSQL 16, the production system of record (SDD 11, 17). Single instance with a PVC.
+#
+# Uses the Red Hat / SCL PostgreSQL image, which runs under an arbitrary UID (the official postgres image
+# does not under the restricted SCC). To use an external or managed PostgreSQL instead, delete this file and
+# postgres-service.yaml from kustomization.yaml and point SEAMLESS_DB_URL in the seamless-db Secret at it
+# (add ?sslmode=verify-full&sslrootcert=... for a TLS-enabled server, see Security.md 9).
+#
+# Credentials come from the seamless-db Secret (keys POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB).
+# POSTGRESQL_ADMIN_PASSWORD is deliberately not set: the postgres superuser is then not reachable remotely.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: seamless-postgres
+  labels:
+    app.kubernetes.io/name: seamless-postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: seamless-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: seamless-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seamless-postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: seamless-migrate
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          # pin by digest for production, e.g. via the images: section of kustomization.yaml
+          image: registry.redhat.io/rhel9/postgresql-16
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_USER
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: seamless-db
+                  key: POSTGRES_DB
+            # the control plane uses a pool of 5 connections (SDD 11); leave headroom for the CLI and psql
+            - name: POSTGRESQL_MAX_CONNECTIONS
+              value: "50"
+            - name: POSTGRESQL_SHARED_BUFFERS
+              value: 256MB
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command:
+                - /usr/libexec/check-container
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /usr/libexec/check-container
+                - --live
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: seamless-postgres
+          app.kubernetes.io/component: database
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi
+        # storageClassName: <your RWO class>   # omit to use the cluster default

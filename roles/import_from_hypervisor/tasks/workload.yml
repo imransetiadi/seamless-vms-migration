@@ -1,0 +1,130 @@
+---
+# Process individual workload - export its disks on its hypervisor
+
+- name: Get workload details
+  ansible.builtin.set_fact:
+    import_from_hypervisor_instance_id: "{{ workload_item._info.id }}"
+    import_from_hypervisor_instance_name: "{{ workload_item.params.name }}"
+    import_from_hypervisor_instance_status: "{{ workload_item._info.status }}"
+    import_from_hypervisor_host: "{{ workload_item._info.hypervisor_hostname | default('') }}"
+
+- name: Fail if instance is not SHUTOFF
+  ansible.builtin.fail:
+    msg: >-
+      Instance {{ import_from_hypervisor_instance_name }} ({{ import_from_hypervisor_instance_id }})
+      must be SHUTOFF. Current status: {{ import_from_hypervisor_instance_status }}
+  when: import_from_hypervisor_instance_status != "SHUTOFF"
+
+- name: Fail if hypervisor hostname not in workload data
+  ansible.builtin.fail:
+    msg: >-
+      Hypervisor hostname not found in workload data for
+      {{ import_from_hypervisor_instance_name }}. Run export_workloads first.
+  when: import_from_hypervisor_host == ''
+
+# A host variable of the hypervisor wins over the global setting, so each
+# hypervisor can listen on its own migration-network address.
+- name: Choose the address qemu-nbd listens on
+  ansible.builtin.set_fact:
+    import_from_hypervisor_bind_address: >-
+      {{ hostvars[import_from_hypervisor_host]['os_migrate_nbdkit_bind_address']
+         | default(os_migrate_nbdkit_bind_address) }}
+
+- name: Refuse a loopback-only export for the tcp protocol
+  ansible.builtin.fail:
+    msg: >-
+      os_migrate_nbdkit_protocol 'tcp' makes the conversion host connect to
+      {{ import_from_hypervisor_host }} directly, so qemu-nbd cannot listen on
+      {{ import_from_hypervisor_bind_address }} only. Set os_migrate_nbdkit_bind_address
+      to the hypervisor's migration-network IP, or use os_migrate_nbdkit_protocol: ssh.
+  when:
+    - os_migrate_nbdkit_protocol == 'tcp'
+    - import_from_hypervisor_bind_address in ['127.0.0.1', '::1', 'localhost']
+
+- name: Choose the address the conversion host connects to
+  ansible.builtin.set_fact:
+    import_from_hypervisor_nbd_host: >-
+      {{ import_from_hypervisor_host
+         if import_from_hypervisor_bind_address in ['0.0.0.0', '::']
+         else ('[' ~ import_from_hypervisor_bind_address ~ ']')
+         if ':' in import_from_hypervisor_bind_address
+         else import_from_hypervisor_bind_address }}
+
+- name: Display workload info
+  ansible.builtin.debug:
+    msg:
+      - "Processing: {{ import_from_hypervisor_instance_name }}"
+      - "Instance ID: {{ import_from_hypervisor_instance_id }}"
+      - "Hypervisor: {{ import_from_hypervisor_host }}"
+      - "Status: {{ import_from_hypervisor_instance_status }}"
+      - "qemu-nbd listens on: {{ import_from_hypervisor_bind_address }}"
+
+# Logs and PID files of the exports live in a directory only the SSH user
+# (and root) can read, instead of predictable names in /tmp.
+- name: Create the private qemu-nbd directory on the hypervisor
+  ansible.builtin.raw: >-
+    sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)"
+    {{ os_migrate_nbdkit_log_dir | quote }}
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  changed_when: false
+
+- name: Find all instance disks on hypervisor
+  ansible.builtin.raw: >-
+    find {{ (os_migrate_nbdkit_nova_instances_dir ~ '/' ~ import_from_hypervisor_instance_id) | quote }}
+    -name 'disk*' -type f ! -name '*.info' | sort
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_disk_paths
+  changed_when: false
+
+- name: Parse disk paths
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disks_found: >-
+      {{ import_from_hypervisor_disk_paths.stdout_lines
+         | select('match', '.*disk.*') | reject('search', 'disk.info') | list }}
+
+- name: Fail if no disks found
+  ansible.builtin.fail:
+    msg: >-
+      No disks found for instance {{ import_from_hypervisor_instance_id }} on
+      hypervisor {{ import_from_hypervisor_host }}
+  when: import_from_hypervisor_disks_found | length == 0
+
+- name: Display found disks
+  ansible.builtin.debug:
+    msg: "Found {{ import_from_hypervisor_disks_found | length }} disk(s): {{ import_from_hypervisor_disks_found }}"
+
+- name: Initialize nbdkit disk info list
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disks: []
+
+- name: Set base port for nbdkit
+  ansible.builtin.set_fact:
+    import_from_hypervisor_base_port: "{{ workload_item._migration_params.nbdkit_port | default(os_migrate_nbdkit_port) }}"
+
+- name: Process each disk
+  ansible.builtin.include_tasks: process_disk.yml
+  loop: "{{ import_from_hypervisor_disks_found }}"
+  loop_control:
+    loop_var: disk_item
+    index_var: disk_loop_index
+    label: "{{ disk_item | basename }}"
+  vars:
+    # disk -> /dev/vda; disk.ephN (listed after disk) and others keep their order.
+    disk_device_name: >-
+      {{ '/dev/vda' if (disk_item | basename) == 'disk'
+         else '/dev/vd' ~ 'bcdefghijklmnopqrstuvwxyz'[disk_loop_index - 1
+           if 'disk.eph' in (disk_item | basename) else disk_loop_index] }}
+    disk_is_bootable: "{{ (disk_item | basename) == 'disk' }}"
+
+- name: Update workload with multiple nbdkit URIs
+  os_migrate.os_migrate.update_workload_nbdkit_uris:
+    path: "{{ os_migrate_data_dir }}/workloads.yml"
+    instance_id: "{{ import_from_hypervisor_instance_id }}"
+    nbdkit_disks: "{{ import_from_hypervisor_disks }}"
+
+- name: Success message
+  ansible.builtin.debug:
+    msg:
+      - "Successfully exported {{ import_from_hypervisor_disks | length }} disk(s) of {{ import_from_hypervisor_instance_name }}"
+      - "Disks: {{ import_from_hypervisor_disks | map(attribute='disk_name') | list }}"
+      - "Ports: {{ import_from_hypervisor_disks | map(attribute='port') | list }}"
