@@ -38,6 +38,18 @@ describe('Login', () => {
     expect(window.sessionStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
   });
 
+  it('explains the lockout when the address made too many failed attempts', async () => {
+    const user = userEvent.setup();
+    renderLogin();
+
+    await user.type(await screen.findByLabelText('API token'), 'locked');
+    await user.click(screen.getByRole('button', { name: /^sign in/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/too many failed sign-in attempts .* wait a minute/i);
+    expect(window.sessionStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
+  });
+
   it('stores a valid token for this tab only and returns to the app', async () => {
     const user = userEvent.setup();
     renderLogin();

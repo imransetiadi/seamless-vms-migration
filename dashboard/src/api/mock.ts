@@ -446,6 +446,13 @@ export class MockServer {
   }
 
   handle(method: string, path: string, query: URLSearchParams, body: unknown, token: string | null): MockResponse {
+    // the token "locked" simulates the control plane's per-address lockout (SDD §15.1)
+    if (token?.trim().toLowerCase() === 'locked') {
+      return {
+        status: 429,
+        body: { error: { code: 'too_many_requests', message: 'too many failed authentication attempts from this address; retry in a minute' } },
+      };
+    }
     try {
       return this.route(method, path, query, body, token);
     } catch (error) {

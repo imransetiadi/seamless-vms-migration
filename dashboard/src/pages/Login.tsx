@@ -43,7 +43,9 @@ export default function Login() {
       setError(
         err instanceof ApiError && err.status === 401
           ? 'The token was rejected. Check that it is complete and has not been revoked.'
-          : errorMessage(err),
+          : err instanceof ApiError && err.status === 429
+            ? 'Too many failed sign-in attempts from this address. Wait a minute, then try again.'
+            : errorMessage(err),
       );
       setPending(false);
       inputRef.current?.focus();
