@@ -67,9 +67,13 @@ python3 -c 'import json,sys; ms=json.load(sys.stdin); print("downtime_s:", sorte
 # plan status after the run
 plans=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/plans" || echo '[]')
 python3 -c 'import json,sys; print("plans:", [(x["name"], x["status"]) for x in json.load(sys.stdin)])' <<<"$plans"
-# validation is refused while a plan runs (409), allowed again afterwards
-code=$(curl -s -m 60 -o /dev/null -w "%{http_code}" -X POST -H "$H" "$BASE/api/v1/plans/$pid/validate")
-check "re-validate answers 200/409"   '[ "$code" = 200 ] || [ "$code" = 409 ]'
+# validation is refused while a plan runs (409), allowed again afterwards; a plan that still
+# lists a VM whose migration was cancelled (the seeded vGPU blocker) is refused with 400 naming it
+# (SDD §5.4)
+revalidate=$(curl -s -m 60 -w "\n%{http_code}" -X POST -H "$H" "$BASE/api/v1/plans/$pid/validate")
+code=${revalidate##*$'\n'}
+check "re-validate answers 200/409, or 400 naming a cancelled VM" \
+  '[ "$code" = 200 ] || [ "$code" = 409 ] || { [ "$code" = 400 ] && [[ "$revalidate" == *"cancelled migration"* ]]; }'
 
 stats=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/stats?plan_id=$pid" || echo '{}')
 check "stats report completions"    '[[ "$stats" == *\"completed\"* ]]'
