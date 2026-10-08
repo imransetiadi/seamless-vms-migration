@@ -16,6 +16,7 @@ from seamless_migrate.domain.models import (
     Nic,
     Plan,
     Provider,
+    SyncPass,
     VerificationConfig,
     Wave,
 )
@@ -342,6 +343,106 @@ def blocking_cutover(gates: dict[str, asyncio.Event], started: list[str]):
         return StepResult(destination_server_id=f"dst-{ctx.migration.vm.source_id}")
 
     return hook
+
+
+async def test_revalidation_and_strategy_change_clear_approvals(tmp_path, store):
+    """An approval is given for one assessment (SDD §5.4): a new validation or a strategy change
+    needs a new one, and a pending cutover request does not survive either."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.approve(m.id, "sari", "ok")
+    await h.orch.request_cutover(m.id, "sari", force_window=True)
+    m = await h.migration(m.id)
+    assert len(m.approvals) == 2 and m.cutover_requested is True
+    assert m.id in h.orch._force_window
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.migration(m.id)
+    assert m.approvals == [] and m.cutover_requested is False
+    assert m.id not in h.orch._force_window
+    await h.orch.approve(m.id, "sari", "again")
+    await h.orch.set_strategy(m.id, Strategy.warm, "rina")
+    assert (await h.migration(m.id)).approvals == []
+
+
+async def test_validation_refuses_a_cancelled_vm_still_listed(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.cancel((await h.by_vm(plan.id, "vm-2")).id, "alice", "descoped")
+    with pytest.raises(BadRequest, match="cancelled migration: web-02"):
+        await h.orch.validate_plan(plan.id, "alice")
+
+
+async def test_start_plan_refuses_a_vm_outside_every_wave(tmp_path, store):
+    waves = [Wave(id="wave-1", name="Pilot", order=1, vm_ids=["vm-1"])]
+    h, plan = await setup(
+        tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold, "waves": waves}
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    with pytest.raises(NotAllowed, match="belong to no wave: web-02"):
+        await h.orch.start_plan(plan.id, "alice")
+
+
+async def test_keep_warm_runs_while_waiting_for_a_cutover_slot(tmp_path, store):
+    """A warm migration whose gate is open but which waits for max_concurrent_cutovers keeps
+    its delta small meanwhile (SDD §5.4 rule 4)."""
+    settings = make_settings(tmp_path, max_concurrent_cutovers=1)
+    gates: dict[str, asyncio.Event] = {}
+    started: list[str] = []
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: blocking_cutover(gates, started)}
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {
+            "default_strategy": Strategy.warm,
+            "require_approval": False,
+            "auto_cutover": True,
+            "keep_warm_interval_s": 900,
+        },
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    deadline = asyncio.get_running_loop().time() + 5
+    while len(started) < 1:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    waiting = next(m for m in await h.migrations(plan.id) if m.phase != P.cutover)
+    waiting = await h.wait_phase(waiting.id, P.awaiting_cutover)
+    passes = len(waiting.sync_passes)
+    h.clock.advance(901)
+    deadline = asyncio.get_running_loop().time() + 5
+    while len((await h.migration(waiting.id)).sync_passes) == passes:
+        assert asyncio.get_running_loop().time() < deadline, "no keep-warm pass while queued"
+        await asyncio.sleep(0.01)
+    assert len(started) == 1, "the slot limit still holds"
+    for gate in gates.values():
+        gate.set()
+    gates.setdefault(waiting.vm.source_id, asyncio.Event()).set()
+    await h.wait_plan(plan.id, PlanStatus.completed, timeout=20)
+    await h.orch.stop()
+
+
+async def test_vmware_warm_convergence_ignores_missing_byte_counts(tmp_path, store):
+    from seamless_migrate.domain.models import utcnow
+
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    cbt = m.model_copy(
+        update={
+            "strategy": Strategy.vmware_warm,
+            "sync_passes": [SyncPass(number=1, kind="full", started_at=utcnow(), duration_s=300.0)],
+        }
+    )
+    converged, reason = h.orch._converged(cbt, plan)
+    assert not reason.startswith("converged: last pass changed"), reason
+    assert "CBT" in reason or "SLO" in reason or "max_sync_passes" in reason
+    warm = cbt.model_copy(update={"strategy": Strategy.warm})
+    assert h.orch._converged(warm, plan) == (True, "converged: last pass changed 0 B")
 
 
 async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_path, store):

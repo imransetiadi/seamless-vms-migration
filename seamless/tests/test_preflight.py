@@ -204,6 +204,106 @@ def test_finding_map_flavor_auto_records_resolved_mapping():
     assert resolve_mappings(vm, mapped, dst) == Mappings()
 
 
+def test_mapping_targets_must_exist_in_the_destination():
+    """A mapping to a flavor, network or volume type that is not in RHOSO blocks (SDD §9.3)."""
+    vm = make_vm(
+        flavor="m1.huge",
+        vcpus=64,
+        ram_mb=262144,
+        nics=[Nic(network="db-net", mtu=9000)],
+        disks=[make_disk(volume_type="ceph-hdd")],
+    )
+    plan = make_plan(
+        mappings=Mappings(
+            flavors={"m1.huge": "m1.larg"},  # typo
+            networks={"db-net": "gone-net"},
+            volume_types={"ceph-hdd": "ceph-nvme"},
+        )
+    )
+    findings = {f.code: f for f in check(vm, plan=plan)}
+    assert "m1.larg" in findings["MAP_FLAVOR_MISSING"].message
+    assert findings["MAP_FLAVOR_MISSING"].severity == Severity.blocker
+    assert "db-net -> gone-net" in findings["MAP_NETWORK_MISSING"].message
+    assert findings["MAP_NETWORK_MISSING"].severity == Severity.blocker
+    assert "ceph-hdd -> ceph-nvme" in findings["MAP_VOLUME_TYPE_MISSING"].message
+    assert findings["MAP_VOLUME_TYPE_MISSING"].severity == Severity.blocker
+    # mappings to existing objects raise nothing
+    good = make_plan(
+        mappings=Mappings(
+            flavors={"m1.huge": "m1.large"},
+            networks={"db-net": "app-net"},
+            volume_types={"ceph-hdd": "ceph-ssd"},
+        )
+    )
+    assert all(not x.code.startswith("MAP_") for x in check(vm, plan=good))
+
+
+def test_vmware_sources_are_never_prestaged():
+    """The kit has no pre-stage step: an unmapped port group blocks instead of informing."""
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    vm = make_vm(nics=[Nic(network="VM Network")])
+    f = only(check(vm, source=vmware), "MAP_NETWORK_MISSING")
+    assert f.severity == Severity.blocker and "VMware sources are not pre-staged" in f.message
+    assert all(x.code != "MAP_NETWORK_PRESTAGED" for x in check(vm, source=vmware))
+    mapped = make_plan(mappings=Mappings(networks={"VM Network": "app-net"}))
+    assert all(not x.code.startswith("MAP_NETWORK") for x in check(vm, plan=mapped, source=vmware))
+
+
+def test_flavor_auto_match_skips_constrained_flavors_and_warns_about_hw_specs():
+    dst = dst_inv(
+        flavors=[
+            {
+                "name": "gpu.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"resources:VGPU": "1"},
+            },
+            {
+                "name": "pinned.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"aggregate_instance_extra_specs:pinned": "true"},
+            },
+            {
+                "name": "pci.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"pci_passthrough:alias": "a1:1"},
+            },
+            {"name": "m2.medium", "vcpus": 4, "ram_mb": 8192, "disk_gb": 40, "extra_specs": {}},
+        ]
+    )
+    vm = make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192)
+    assert fitting_flavor(vm, dst)["name"] == "m2.medium"
+    f = only(check(vm, dst=dst), "MAP_FLAVOR_AUTO")
+    assert f.severity == Severity.info and "'m2.medium'" in f.message
+    # a source flavor with hw:* specs: the match drops them, so the finding is a warning
+    pinned = make_vm(
+        flavor="custom.4x8",
+        vcpus=4,
+        ram_mb=8192,
+        flavor_extra_specs={"hw:cpu_policy": "dedicated", "hw:mem_page_size": "large"},
+    )
+    f = only(check(pinned, dst=dst), "MAP_FLAVOR_AUTO")
+    assert f.severity == Severity.warning and "hw:cpu_policy, hw:mem_page_size" in f.message
+    # only constrained flavors fit: nothing is matched automatically
+    constrained_only = dst_inv(flavors=[dst.flavors[0], dst.flavors[2]])
+    assert fitting_flavor(vm, constrained_only) is None
+    assert only(check(vm, dst=constrained_only), "MAP_FLAVOR_MISSING")
+
+
+def test_vmware_vms_get_no_flavor_auto_finding():
+    """A VMware VM has no flavor; the kit sizes the server, so only the blocker applies."""
+    vm = make_vm(flavor=None, vcpus=4, ram_mb=8192)
+    assert all(x.code != "MAP_FLAVOR_AUTO" for x in check(vm))
+    assert resolve_mappings(vm, make_plan(), dst_inv()) == Mappings()
+    huge = make_vm(flavor=None, vcpus=64, ram_mb=262144)
+    assert only(check(huge), "MAP_FLAVOR_MISSING")
+
+
 def test_finding_map_volume_type_missing():
     vm = make_vm(disks=[make_disk(volume_type="ceph-hdd")])
     f = only(check(vm), "MAP_VOLUME_TYPE_MISSING")

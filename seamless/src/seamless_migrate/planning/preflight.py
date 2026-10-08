@@ -253,14 +253,39 @@ def _flavor_size(flavor: dict[str, Any]) -> tuple[int, int, int, str]:
     )
 
 
+#: Extra-spec prefixes that make a destination flavor unsuitable for automatic matching: it
+#: would pin the server to special hardware or hosts (SDD §9.3 ``MAP_FLAVOR_AUTO``).
+_CONSTRAINED_SPEC_PREFIXES = (
+    "pci_passthrough:",
+    "resources:",
+    "trait:",
+    "aggregate_instance_extra_specs:",
+)
+
+
+def _constrained(flavor: dict[str, Any]) -> bool:
+    specs = flavor.get("extra_specs") or {}
+    return any(str(k).startswith(_CONSTRAINED_SPEC_PREFIXES) for k in specs)
+
+
+def _hw_specs(vm: VMRef) -> list[str]:
+    """Source ``hw:*`` extra specs (CPU pinning, huge pages, NUMA) an auto-matched flavor drops."""
+    return sorted(k for k in vm.flavor_extra_specs if str(k).startswith("hw:"))
+
+
 def fitting_flavor(vm: VMRef, dst_inv: DestinationInventory) -> dict[str, Any] | None:
     """The destination flavor to use when the plan maps none (SDD §9.3 ``MAP_FLAVOR_*``).
 
     A same-named flavor that fits wins; otherwise the smallest fitting flavor (by vCPUs, RAM,
-    root disk, name). ``None`` when nothing fits.
+    root disk, name) among those without scheduler/PCI/vGPU/aggregate/trait extra specs.
+    ``None`` when nothing fits.
     """
     root_gb = _local_root_gb(vm)
-    fits = [f for f in dst_inv.flavors if f.get("name") and _flavor_fits(f, vm, root_gb)]
+    fits = [
+        f
+        for f in dst_inv.flavors
+        if f.get("name") and _flavor_fits(f, vm, root_gb) and not _constrained(f)
+    ]
     if not fits:
         return None
     same = next((f for f in fits if f["name"] == vm.flavor), None)
@@ -333,7 +358,18 @@ def run_preflight(
         for nic in vm.nics
         if nic.network not in maps.networks and nic.network not in dst_inv.networks
     ]
-    if missing_nets and "networks" in plan.prestage_resources:
+    # a mapped target must exist: nothing creates a network under the *mapped* name
+    bad_net_targets = [
+        f"{nic.network} -> {maps.networks[nic.network]}"
+        for nic in vm.nics
+        if nic.network in maps.networks and maps.networks[nic.network] not in dst_inv.networks
+    ]
+    # pre-staging creates same-named networks for OpenStack sources only: the VMware kit has
+    # no prestage step (SDD §4.2 / §7.2)
+    prestaged = "networks" in plan.prestage_resources and (
+        source is None or source.kind != ProviderKind.vmware
+    )
+    if missing_nets and prestaged:
         out.append(
             finding(
                 "MAP_NETWORK_PRESTAGED",
@@ -344,11 +380,36 @@ def run_preflight(
         out.append(
             finding(
                 "MAP_NETWORK_MISSING",
-                f"No mapping or same-named RHOSO network for: {_names(missing_nets)}.",
+                f"No mapping or same-named RHOSO network for: {_names(missing_nets)}."
+                + ("" if prestaged or "networks" not in plan.prestage_resources else "")
+                + (
+                    " VMware sources are not pre-staged: map every port group."
+                    if source is not None and source.kind == ProviderKind.vmware
+                    else ""
+                ),
+            )
+        )
+    if bad_net_targets:
+        out.append(
+            finding(
+                "MAP_NETWORK_MISSING",
+                f"Network mapping target(s) do not exist in RHOSO: {_names(bad_net_targets)}.",
+                remediation="Fix the mapping: the destination network must exist.",
             )
         )
 
-    if not (vm.flavor and vm.flavor in maps.flavors):
+    dst_flavor_names = {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
+    if vm.flavor and vm.flavor in maps.flavors:
+        target = maps.flavors[vm.flavor]
+        if target not in dst_flavor_names:
+            out.append(
+                finding(
+                    "MAP_FLAVOR_MISSING",
+                    f"Flavor {vm.flavor!r} is mapped to {target!r}, which does not exist in RHOSO.",
+                    remediation="Fix the mapping: the destination flavor must exist.",
+                )
+            )
+    else:
         root_gb = _local_root_gb(vm)
         chosen = fitting_flavor(vm, dst_inv)
         if chosen is None:
@@ -356,16 +417,31 @@ def run_preflight(
                 finding(
                     "MAP_FLAVOR_MISSING",
                     f"No mapping for flavor {vm.flavor!r} and no RHOSO flavor with >= {vm.vcpus} "
-                    f"vCPUs, >= {vm.ram_mb} MB RAM and >= {root_gb} GB root disk.",
+                    f"vCPUs, >= {vm.ram_mb} MB RAM and >= {root_gb} GB root disk (flavors with "
+                    "PCI, vGPU, trait or aggregate extra specs are never matched automatically).",
                 )
             )
-        elif chosen["name"] != vm.flavor:
+        elif vm.flavor is not None and chosen["name"] != vm.flavor:
+            # VMware VMs carry no flavor: the migration kit sizes the server itself, so an
+            # auto-match finding would name a flavor nothing uses (only the blocker applies)
             vcpus, ram_mb, disk_gb, name = _flavor_size(chosen)
+            dropped = _hw_specs(vm)
             out.append(
                 finding(
                     "MAP_FLAVOR_AUTO",
                     f"No mapping for flavor {vm.flavor!r}: the smallest fitting RHOSO flavor "
-                    f"{name!r} ({vcpus} vCPUs, {ram_mb} MB RAM, {disk_gb} GB disk) will be used.",
+                    f"{name!r} ({vcpus} vCPUs, {ram_mb} MB RAM, {disk_gb} GB disk) will be used"
+                    + (
+                        f"; the source flavor's {', '.join(dropped)} are not carried over."
+                        if dropped
+                        else "."
+                    ),
+                    severity=Severity.warning if dropped else None,
+                    remediation=(
+                        "Map the flavor to a RHOSO flavor with the same hw:* extra specs."
+                        if dropped
+                        else None
+                    ),
                 )
             )
 
@@ -376,6 +452,22 @@ def run_preflight(
         and d.volume_type not in maps.volume_types
         and d.volume_type not in dst_inv.volume_types
     ]
+    bad_type_targets = [
+        f"{d.volume_type} -> {maps.volume_types[d.volume_type]}"
+        for d in vm.disks
+        if d.volume_type
+        and d.volume_type in maps.volume_types
+        and maps.volume_types[d.volume_type] not in dst_inv.volume_types
+    ]
+    if bad_type_targets:
+        out.append(
+            finding(
+                "MAP_VOLUME_TYPE_MISSING",
+                f"Volume type mapping target(s) do not exist in RHOSO: {_names(bad_type_targets)}.",
+                severity=Severity.blocker,
+                remediation="Fix the mapping: the destination volume type must exist.",
+            )
+        )
     if missing_types and maps.volume_types:
         # SDD §6.4: with mapped volume types the executor preserves them, so an
         # unmapped type would fail volume creation after the source was stopped.

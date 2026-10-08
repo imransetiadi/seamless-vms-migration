@@ -116,6 +116,21 @@ def map_vm(
             Nic(network=str(network), mac=mac or None, fixed_ips=guest_ips.get(mac.lower(), []))
         )
 
+    # PCI passthrough and vGPU (shared PCI) devices: expressed as the flavor extra specs the
+    # pre-flight catalog keys off (SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU)
+    extra_specs: dict[str, str] = {}
+    pci_cls = getattr(getattr(vim, "vm", None), "device", None)
+    pci_cls = getattr(pci_cls, "VirtualPCIPassthrough", None)
+    for dev in devices if pci_cls is not None else []:
+        if not isinstance(dev, pci_cls):
+            continue
+        backing = getattr(dev, "backing", None)
+        label = str(getattr(getattr(dev, "deviceInfo", None), "label", "") or "PCI device")
+        if getattr(backing, "vgpu", None):
+            extra_specs["resources:VGPU"] = "1"
+        else:
+            extra_specs["pci_passthrough:alias"] = label
+
     runtime = getattr(vm, "runtime", None)
     host = getattr(getattr(runtime, "host", None), "name", None)
     snapshot = getattr(vm, "snapshot", None)
@@ -137,6 +152,7 @@ def map_vm(
         os_type=getattr(config, "guestId", None),
         host=str(host) if host else None,
         tags=tags,
+        flavor_extra_specs=extra_specs,
         cbt_enabled=bool(getattr(config, "changeTrackingEnabled", False)),
         snapshot_count=_count_snapshots(getattr(snapshot, "rootSnapshotList", None)),
         tools_ok=str(getattr(guest, "toolsRunningStatus", "")) == "guestToolsRunning",

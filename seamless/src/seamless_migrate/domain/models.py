@@ -231,11 +231,12 @@ class PlanSpec(_Model):
     default_strategy: Strategy | Literal["auto"] = "auto"
     strategy_overrides: dict[str, Strategy] = Field(default_factory=dict)
     selection_policy: Literal["min_downtime", "simplest_meeting_slo"] = "min_downtime"
-    downtime_slo_s: int = 600
+    downtime_slo_s: int = Field(default=600, ge=1)
     require_approval: bool = True
     auto_cutover: bool = False
     cutover_window: CutoverWindow | None = None
-    keep_warm_interval_s: int = 900
+    #: at least a minute: a shorter interval would run delta passes back to back
+    keep_warm_interval_s: int = Field(default=900, ge=60)
     convergence_threshold_bytes: int = Field(default=1073741824, ge=0)
     max_sync_passes: int = Field(default=5, ge=1)
     link_bps: float = Field(default=131072000.0, gt=0)

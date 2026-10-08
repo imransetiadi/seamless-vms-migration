@@ -720,6 +720,18 @@ Twenty-three further iterations after the integration run, each verified with th
   the id shape. Deferred (lab or SDD): `used_gb` from real providers (estimates use the 60 % fallback),
   transitional Nova states and a forbidden quota read as findings (§9.3 catalog), `all_projects` listing,
   bulk volume/port listing, re-encrypting the Route.
+* Planning review wave (independent reviewer, two HIGH): mapping targets are verified (a flavor, network
+  or volume type mapped to something absent from RHOSO now blocks); VMware sources are never
+  pre-staged (an unmapped port group blocks instead of informing); VMware PCI passthrough and vGPU
+  devices are reported as the extra specs the catalog keys off; auto-matched flavors skip PCI/vGPU/
+  trait/aggregate-constrained destination flavors and warn when the source's `hw:*` specs are dropped;
+  VMware VMs get no `MAP_FLAVOR_AUTO`. Orchestrator: re-validation and `set_strategy` clear approvals,
+  cutover requests and `force_window`; keep-warm passes run while a migration waits for a cutover slot;
+  `vmware_warm` convergence no longer "converges" on missing byte counts; `start_plan` refuses VMs outside
+  every wave; `validate_plan` refuses VMs with a cancelled migration; `keep_warm_interval_s ≥ 60`,
+  `downtime_slo_s ≥ 1`. SDD §5.4, §9.1, §9.3, §9.4 amended (own commit). 650 control-plane tests.
+  Deferred: `used_gb` from real providers, quota demand for `image_root` under warm, missing destination
+  project as a finding (catalog), gate-time delta ageing in the shown estimate, `force_window` persistence.
 
 ### 13.2 Exit criteria — release 0.1.0
 

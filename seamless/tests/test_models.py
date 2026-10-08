@@ -151,6 +151,17 @@ def test_role_ordering():
     assert not Role.viewer.at_least(Role.operator)
 
 
+def test_plan_policy_bounds():
+    import pytest
+    from pydantic import ValidationError
+
+    assert make_plan(keep_warm_interval_s=60).keep_warm_interval_s == 60
+    with pytest.raises(ValidationError):
+        make_plan(keep_warm_interval_s=10)  # back-to-back delta passes
+    with pytest.raises(ValidationError):
+        make_plan(downtime_slo_s=0)
+
+
 def test_vmref_strips_nul_from_tenant_strings():
     """PostgreSQL JSONB rejects NUL characters; tenant-controlled strings are cleaned."""
     vm = make_vm(name="web\x00-01", os_type="lin\x00ux", tags={"ow\x00ner": "fin\x00ance"})

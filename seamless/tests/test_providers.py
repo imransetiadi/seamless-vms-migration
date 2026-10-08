@@ -679,6 +679,53 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
         await provider.get_vm("missing")  # falls back to the walk, then fails
 
 
+async def test_vmware_pci_and_vgpu_devices_become_blocking_extra_specs(tmp_path):
+    """SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU key off extra specs: the provider reports the
+    VMware device classes that way."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+
+    class VirtualPCIPassthrough:
+        def __init__(self, label, vgpu=None):
+            self.key = 13000
+            self.deviceInfo = NS(label=label)
+            self.backing = NS(vgpu=vgpu)
+
+    vim = NS(
+        VirtualMachine=VirtualMachine,
+        vm=NS(
+            device=NS(
+                VirtualDisk=VirtualDisk,
+                VirtualEthernetCard=VirtualEthernetCard,
+                VirtualPCIPassthrough=VirtualPCIPassthrough,
+            )
+        ),
+    )
+    pci = fake_vcenter_vm()
+    pci.config.hardware.device.append(VirtualPCIPassthrough("PCI device 0"))
+    vgpu = fake_vcenter_vm()
+    vgpu.config.instanceUuid = "5012-vgpu"
+    vgpu.config.hardware.device.append(VirtualPCIPassthrough("PCI device 1", vgpu="grid_t4-8q"))
+
+    def provider_for(vms):
+        return VMwareProvider(
+            make_provider(
+                id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+            ),
+            settings(secrets_dir=tmp_path / "secrets"),
+            connector=lambda **_: fake_service_instance(vms),
+            vim=vim,
+        )
+
+    listed = {v.source_id: v for v in await provider_for([pci, vgpu]).list_vms()}
+    assert listed["5012-abcd"].flavor_extra_specs == {"pci_passthrough:alias": "PCI device 0"}
+    assert listed["5012-vgpu"].flavor_extra_specs == {"resources:VGPU": "1"}
+    plain = await provider_for([fake_vcenter_vm()]).list_vms()
+    assert plain[0].flavor_extra_specs == {}
+
+
 async def test_vmware_requires_credentials_secret():
     provider = VMwareProvider(
         make_provider(id="vc", kind=ProviderKind.vmware, cloud=None),

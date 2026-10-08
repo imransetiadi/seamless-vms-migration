@@ -355,6 +355,15 @@ class Orchestrator:
         existing = {
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
+        cancelled = sorted(
+            m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
+        )
+        if cancelled:
+            # cancelled is terminal (SDD §5.1): the plan cannot carry the VM any further
+            raise BadRequest(
+                f"{len(cancelled)} VM(s) have a cancelled migration: {', '.join(cancelled[:10])}; "
+                "remove them from vm_ids or create a new plan for them"
+            )
         params = params_for_plan(plan)
         items: list[ValidationItem] = []
         for vm in vms:
@@ -484,6 +493,11 @@ class Orchestrator:
             # keep one strategy note per validation (the latest)
             m.advisor_notes = [n for n in m.advisor_notes if n.kind != "strategy"] + notes
             m.error = None
+            # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
+            # this validation carries over to the new strategy, findings and estimate
+            m.approvals = []
+            m.cutover_requested = False
+            self._force_window.discard(mid)
             if no_eligible:
                 details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
                 m.error = f"no eligible strategy ({details})"[:1000]
@@ -559,6 +573,21 @@ class Orchestrator:
         blocked = [m.vm.name for m in migrations if m.phase == P.blocked]
         if blocked:
             raise NotAllowed(f"{len(blocked)} migration(s) are blocked: {', '.join(blocked[:10])}")
+        if plan.waves:
+            wave_ids = {w.id for w in plan.waves}
+            stray = [
+                m.vm.name
+                for m in migrations
+                if m.phase not in fsm.WAVE_COMPLETE_PHASES
+                and (m.wave_id is None or m.wave_id not in wave_ids)
+            ]
+            if stray:
+                # a VM added after the waves were planned would otherwise start at once,
+                # outside every wave's order and max_parallel (SDD §9.4)
+                raise NotAllowed(
+                    f"{len(stray)} migration(s) belong to no wave: {', '.join(stray[:10])}; "
+                    "re-run the automatic wave planning or add them to a wave"
+                )
 
         def start(fresh: Plan) -> None:
             fresh.status = PlanStatus.running
@@ -819,6 +848,9 @@ class Orchestrator:
                 raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
             m.strategy = strategy
             m.estimate = est
+            m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
+            m.cutover_requested = False
+            self._force_window.discard(mid)
             await self._save(m, v)
         source_id = m.vm.source_id
 
@@ -1001,19 +1033,19 @@ class Orchestrator:
             )
             if not waiting or not self._gate(m, plan, now):
                 continue
-            gate_open.add(m.id)
             if counts["cutover"] >= self.settings.max_concurrent_cutovers:
-                continue
+                continue  # waits for a cutover slot: keep-warm passes go on meanwhile
             if counts["steps"] >= limit_steps or (m.phase == P.ready and not wave_room(m)):
                 continue
             if await self._begin(
                 m.id, {P.ready, P.awaiting_cutover}, P.cutover, "cutover gate open"
             ):
+                gate_open.add(m.id)
                 counts["cutover"] += 1
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
 
-        # 2. keep-warm delta passes while waiting for the gate
+        # 2. keep-warm delta passes while waiting for the gate (or for a cutover slot)
         for m in ordered:
             if m.phase != P.awaiting_cutover or m.id in gate_open or not m.sync_passes:
                 continue
@@ -1374,7 +1406,8 @@ class Orchestrator:
 
     def _converged(self, m: Migration, plan: Plan) -> tuple[bool, str]:
         last = m.sync_passes[-1]
-        if last.bytes_changed <= plan.convergence_threshold_bytes:
+        counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
+        if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
             return True, f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
         final = estimate_final_downtime(
             m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
@@ -1386,6 +1419,8 @@ class Orchestrator:
         return False, (
             f"another delta pass: changed {_fmt_bytes(last.bytes_changed)}, "
             f"estimated downtime {final:.0f} s"
+            if counted
+            else f"another CBT pass: estimated downtime {final:.0f} s"
         )
 
     async def _do_pass(self, m: Migration) -> None:
