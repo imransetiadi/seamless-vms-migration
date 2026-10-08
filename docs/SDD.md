@@ -412,12 +412,25 @@ environment block as `import_workloads.yml`):
 | Playbook | Behavior per filtered workload |
 |---|---|
 | `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent |
-| `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id` |
-| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and the warm state; start the source server |
+| `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run is a no-op while the recorded destination server exists and is not in `ERROR`; otherwise it fails and names the rollback as the recovery |
+| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and the warm state — a volume still attached to a server other than the destination conversion host is kept and returned as `kept_volume_ids`; start the source server |
 
 Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_src_auth`,
-`os_migrate_dst_auth`, `os_migrate_workloads_filter`, conversion host variables) plus
-`os_migrate_warm_chunk_size` (4194304) and `os_migrate_warm_workers` (4).
+`os_migrate_dst_auth`, `os_migrate_workloads_filter`, conversion host variables including
+`os_migrate_dst_conversion_host_name`) plus the warm variables, all defaulted in the role:
+
+| Variable | Default | Module parameter |
+|---|---|---|
+| `os_migrate_warm_chunk_size` | `4194304` | `chunk_size` |
+| `os_migrate_warm_workers` | `4` | `workers` |
+| `os_migrate_warm_parallel_disks` | `4` | `parallel_disks` |
+| `os_migrate_warm_assume_zero` | `false` | `assume_zero` — honoured for `full`/`delta` passes that create the destination volumes, never for `final` (§6.2) |
+| `os_migrate_warm_python_interpreter` | `python3` | `python_interpreter` |
+| `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | `state_dir` |
+| `os_migrate_workloads_preserve_volume_type` | `false` | `preserve_volume_type` |
+| `os_migrate_rollback_delete_dest_volumes` | `false` | `delete_dest_volumes` |
+| `os_migrate_rollback_match_by_name` | `false` | `match_by_name` |
+| `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
 ### 6.6 Hardening of existing code (required)
 
