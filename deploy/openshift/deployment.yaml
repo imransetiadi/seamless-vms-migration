@@ -54,6 +54,11 @@ spec:
             - configMapRef:
                 name: seamless-config
           env:
+            # Trusted proxies for X-Forwarded-For (uvicorn FORWARDED_ALLOW_IPS): the router/ingress pod
+            # addresses, so the auth lockout and the audit log see the real client address
+            # (Security.md §12). Never "*" on a network where pods can reach the Service directly.
+            # - name: FORWARDED_ALLOW_IPS
+            #   value: "10.128.0.0/14"
             # paths of the credential files mounted below (values, not secrets)
             - name: SEAMLESS_TOKENS_FILE
               value: /etc/seamless/tokens/tokens.yaml
