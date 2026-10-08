@@ -287,3 +287,28 @@ def test_render_metrics_escapes_labels_and_formats_numbers():
     assert 'seamless_advisor_calls_total{tool="tool\\"x",outcome="error"} 1' in text
     assert "seamless_tick_seconds_count 4" in text and "seamless_tick_slow_total 1" in text
     assert text.endswith("\n")
+
+
+def test_every_route_is_documented_in_sdd_12(api):
+    """The routes the app serves and the SDD §12 table agree (method + path, both ways)."""
+    import re
+
+    from seamless_migrate.config import find_repo_root
+
+    paths = api.client.app.openapi()["paths"]
+    served = set()
+    for path, operations in paths.items():
+        if not path.startswith("/api/v1/"):
+            continue
+        norm = re.sub(r"\{[^}]+\}", "{id}", path[len("/api/v1") :])
+        for method in operations:
+            if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                served.add((method.upper(), norm))
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    documented = {
+        (m, re.sub(r"\{[^}]+\}", "{id}", p))
+        for m, p in re.findall(r"^\| (GET|POST|PUT|PATCH|DELETE) \| `([^`]+)` \|", sdd, re.M)
+    }
+    assert served - documented == set(), "served but missing from SDD §12"
+    assert documented - served == set(), "in SDD §12 but not served"
+    assert len(served) >= 30
