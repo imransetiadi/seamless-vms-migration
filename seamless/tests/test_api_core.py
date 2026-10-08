@@ -269,3 +269,21 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
         created = [e for e in store.events(since_seq=0) if e.kind == "provider.created"]
         assert created[0].actor == "anonymous"
     store.dispose()
+
+
+def test_render_metrics_escapes_labels_and_formats_numbers():
+    from seamless_migrate.metrics import _escape, _num, advisor_calls, render_metrics
+
+    assert _escape('a"b\\c\nd') == 'a\\"b\\\\c\\nd'
+    assert _num(2.0) == "2" and _num(2.5) == "2.5" and _num(3) == "3"
+    assert advisor_calls(None) == {} and advisor_calls(object()) == {}
+    text = render_metrics(
+        [],
+        {"cut over": [12.5, 2]},
+        {("jev_decide", "ok"): 3, ('tool"x', "error"): 1},
+        {"count": 4, "sum": 0.5, "max": 0.25, "slow": 1},
+    )
+    assert 'seamless_step_duration_seconds_sum{step="cut over"} 12.5' in text
+    assert 'seamless_advisor_calls_total{tool="tool\\"x",outcome="error"} 1' in text
+    assert "seamless_tick_seconds_count 4" in text and "seamless_tick_slow_total 1" in text
+    assert text.endswith("\n")

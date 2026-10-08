@@ -584,3 +584,204 @@ async def test_vmware_requires_credentials_secret():
     )
     with pytest.raises(ProviderError, match="credentials_secret"):
         await provider.list_vms()
+
+
+# --------------------------------------------------------------------------------------------
+# Edge paths of the real providers (stubbed): connection setup, quota, console, lookups
+
+
+def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path):
+    from seamless_migrate.providers import openstack as osp
+
+    calls = {}
+    monkeypatch.setattr(
+        osp, "_import_openstack", lambda: NS(connect=lambda **kw: calls.update(kw) or "conn")
+    )
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n  src:\n    auth: {auth_url: 'https://src/v3', username: u, password: p}\n"
+        "    region_name: regionOne\n"
+    )
+    cfg = settings(clouds_yaml=clouds)
+    provider = make_provider(cloud="src", region="regionTwo", ca_cert_path="/etc/pki/ca.pem")
+    assert osp.connect(provider, cfg) == "conn"
+    assert calls["auth"]["username"] == "u" and calls["load_yaml_config"] is False
+    assert calls["region_name"] == "regionTwo", "Provider.region wins over clouds.yaml"
+    assert calls["cacert"] == "/etc/pki/ca.pem" and calls["verify"] is True
+    # unknown cloud in clouds.yaml -> ProviderError; no clouds.yaml -> openstacksdk's own lookup
+    with pytest.raises(ProviderError, match="clouds.yaml"):
+        osp.connect(make_provider(cloud="nope"), cfg)
+    calls.clear()
+    osp.connect(make_provider(cloud="src"), settings())
+    assert calls["cloud"] == "src" and "auth" not in calls
+    with pytest.raises(ProviderError, match="no 'cloud'"):
+        osp.connect(make_provider(cloud=None), settings())
+    assert osp._truthy("Yes") and osp._truthy(" true ") and not osp._truthy("no")
+    assert osp._truthy(1) and not osp._truthy(0)
+
+
+async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
+    from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
+
+    conn = fake_conn()
+    conn.compute.get_quota_set = lambda pid, usage=True: NS(
+        cores=20, ram=65536, instances=-1, usage={"cores": 6, "ram": 4096, "instances": 3}
+    )
+    conn.block_storage.get_quota_set = lambda pid, usage=True: NS(
+        volumes=None, gigabytes=1000, usage={"gigabytes": 1500}
+    )
+    free = OpenStackProvider._free_quota(conn)
+    assert free == {"cores": 14, "ram_mb": 61440, "instances": -1, "volumes": None, "gigabytes": 0}
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: conn)
+    inv = await provider.inventory()
+    assert inv.quotas == {"finance": free}
+
+    # console output unavailable (HTTP 409 / policy) -> None, never an error
+    def boom(server_id, length=None):
+        raise RuntimeError("HTTP 409: console log not available")
+
+    conn.compute.get_server_console_output = boom
+    assert await provider.console_log("srv-1") is None
+    conn.compute.get_server_console_output = lambda server_id, length=None: None
+    assert await provider.console_log("srv-1") is None
+
+    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited
+    waited = []
+    conn.compute.delete_server = lambda server, ignore_missing=True: conn.compute.deleted.append(
+        server.id
+    )
+    conn.compute.wait_for_delete = lambda server, wait=600: waited.append(server.id)
+    await provider.delete_server("missing")
+    assert conn.compute.deleted == []
+    await provider.delete_server("web-01")
+    assert conn.compute.deleted == ["srv-1"] and waited == ["srv-1"]
+    assert await provider.find_server("web-01") == "srv-1"
+    assert await provider.find_server("nope") is None
+
+    # project names are looked up once and tolerate identity failures
+    ctx = _MapContext(conn)
+    assert ctx.project_name(None) is None
+    assert ctx.project_name("proj-1") == "finance" and ctx.project_name("proj-1") == "finance"
+    conn.identity = NS(get_project=lambda pid: (_ for _ in ()).throw(RuntimeError("403")))
+    assert _MapContext(conn).project_name("proj-2") is None
+
+
+async def test_openstack_flavor_without_embedded_specs_is_fetched(stub_openstack):
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.flavor = {"id": "flv-1"}  # older Nova: no embedded vcpus/ram/disk
+    conn.compute.get_flavor = lambda flavor_id: NS(
+        id=flavor_id, name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={"hw:x": "1"}
+    )
+    stub_openstack(conn)
+    from seamless_migrate.providers.openstack import OpenStackProvider
+
+    vm = await OpenStackProvider(make_provider(cloud="src"), settings()).get_vm("srv-1")
+    assert (vm.flavor, vm.vcpus, vm.ram_mb) == ("m1.small", 2, 4096)
+    assert vm.flavor_extra_specs == {"hw:x": "1"}
+
+
+async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
+    from seamless_migrate.providers.vmware import VMwareProvider, parse_endpoint
+
+    assert parse_endpoint("vcenter.dc2.example") == ("vcenter.dc2.example", 443)
+    assert parse_endpoint("https://vcenter.dc2.example:8443/sdk") == ("vcenter.dc2.example", 8443)
+    with pytest.raises(ProviderError, match="invalid vCenter endpoint"):
+        parse_endpoint("https://")
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    base = make_provider(
+        id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+    )
+
+    # a NIC on a distributed portgroup resolves its name through the DVS view
+    class Portgroup:
+        def __init__(self, key, name):
+            self.key, self.name = key, name
+
+    vm = fake_vcenter_vm()
+    nic = vm.config.hardware.device[-1]
+    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7"))
+    vim = NS(
+        VirtualMachine=VirtualMachine,
+        vm=FAKE_VIM.vm,
+        dvs=NS(DistributedVirtualPortgroup=Portgroup),
+    )
+
+    def connector(**_):
+        objects = [vm, Portgroup("dvportgroup-7", "DC2-DMZ")]
+
+        def view_for(folder, types, recursive):
+            return NS(
+                view=[o for o in objects if isinstance(o, tuple(types))], Destroy=lambda: None
+            )
+
+        content = NS(
+            rootFolder=object(),
+            viewManager=NS(CreateContainerView=view_for),
+            about=NS(apiVersion="8.0.2.0", version="8.0.2"),
+            customFieldsManager=NS(field=[NS(key=1, name="app")]),
+        )
+        return NS(RetrieveContent=lambda: content)
+
+    provider = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=connector, vim=vim
+    )
+    [mapped] = await provider.list_vms()
+    assert mapped.nics[0].network == "DC2-DMZ"
+
+    # pyVmomi exceptions become ProviderError with the vSphere message
+    def failing(**_):
+        raise RuntimeError("Cannot complete login due to an incorrect user name or password.")
+
+    broken = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=failing, vim=vim
+    )
+    with pytest.raises(ProviderError, match="incorrect user name"):
+        await broken.check()
+
+    class Fault(Exception):
+        msg = "The session is not authenticated."
+
+    def faulting(**_):
+        raise Fault()
+
+    faulty = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=faulting, vim=vim
+    )
+    with pytest.raises(ProviderError, match="session is not authenticated"):
+        await faulty.list_vms()
+
+
+async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM(task_state="running")
+    clock = [0.0]
+
+    def fast_clock():  # every call advances 400 s: the 600 s deadline passes on the 2nd poll
+        clock[0] += 400.0
+        return clock[0]
+
+    # patch the provider's view of `time` only: asyncio's own clock must stay real
+    monkeypatch.setattr(vmw, "time", NS(monotonic=fast_clock, sleep=lambda s: None))
+    provider = vmw.VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError, match="timed out"):
+        await provider.power_on("5012-abcd")

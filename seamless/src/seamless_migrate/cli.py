@@ -73,12 +73,26 @@ def configure_logging(settings: Settings) -> None:
 
 
 # -- store-backed helpers ---------------------------------------------------------------------
+#: Stores opened by the running command; ``main()`` disposes them (no leaked connections).
+_OPEN_STORES: list[Any] = []
+
+
 def _store(settings: Settings) -> Any:
     from .store import Store
 
     store = Store(settings.db_url)
     store.create_schema()
+    _OPEN_STORES.append(store)
     return store
+
+
+def _dispose_stores() -> None:
+    while _OPEN_STORES:
+        store = _OPEN_STORES.pop()
+        try:
+            store.dispose()
+        except Exception:  # pragma: no cover - best effort at exit
+            pass
 
 
 def _services(settings: Settings) -> Any:
@@ -524,3 +538,5 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         raise
+    finally:
+        _dispose_stores()

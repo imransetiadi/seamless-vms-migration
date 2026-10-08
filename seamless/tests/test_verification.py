@@ -120,3 +120,48 @@ async def test_verification_without_destination_server_fails_fast():
     c.migration.destination_server_id = None
     res = await Verifier(Dest(), Settings(), poll_s=0.01).verify(c)
     assert res.passed is False and res.checks[0]["name"] == "server_active"
+
+
+async def test_verification_edge_paths(listener):
+    from seamless_migrate.providers.base import ProviderError
+    from seamless_migrate.verification import _pattern_match, _tcp_probe
+
+    # an invalid regex falls back to a plain substring match
+    assert _pattern_match(["login: ", "(unclosed"], "x (unclosed y") == "(unclosed"
+    assert _pattern_match(["(unclosed"], "nothing") is None
+    assert (
+        _pattern_match([r"Reached target .*Multi-User"], "Reached target Multi-User System")
+        is not None
+    )
+    # a closed port is reported unreachable, an open one with its connect time
+    ok, detail = await _tcp_probe("127.0.0.1", unused_port())
+    assert ok is False and "unreachable" in detail
+    ok, detail = await _tcp_probe("127.0.0.1", listener)
+    assert ok is True and "connected" in detail
+
+    # the destination provider failing to describe the server fails the verification
+    class Broken(Dest):
+        async def get_server(self, server_id):
+            raise ProviderError("HTTP 503 from nova")
+
+    settings = Settings(data_dir="/tmp/x")
+    result = await Verifier(Broken(), settings, poll_s=0.01).verify(ctx())
+    assert result.passed is False and result.failed_checks() == ["server_active"]
+    assert "HTTP 503" in result.checks[0]["detail"]
+
+    # no address of the requested kind: every TCP check fails with a clear reason
+    class NoAddress(Dest):
+        async def get_server(self, server_id):
+            return {
+                "status": "ACTIVE",
+                "ports": [{"status": "ACTIVE", "fixed_ips": [], "floating_ips": []}],
+            }
+
+    result = await Verifier(NoAddress(), settings, poll_s=0.01).verify(ctx(tcp_ports=[22]))
+    assert result.passed is False
+    tcp = next(c for c in result.checks if c["name"] == "tcp:22")
+    assert tcp["ok"] is False and "no fixed address" in tcp["detail"]
+    summary = result.summary()
+    assert summary["passed"] is False and [c["name"] for c in summary["checks"] if not c["ok"]] == [
+        "tcp:22"
+    ]
