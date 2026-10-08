@@ -140,3 +140,31 @@ def test_concurrent_writers_do_not_lose_updates(any_store: Store):
         t.join()
     assert not errors
     assert any_store.get("migration", mig.id, Migration).attempts == 40
+
+
+def test_sql_pushed_filters_match_python_semantics(any_store: Store):
+    """String filters run in SQL (indexed JSON fields); other values stay Python-side."""
+    from seamless_migrate.store import INDEXED_FIELDS, _sql_filter
+
+    a = make_migration(plan_id="plan-a", phase=Phase.ready, attempts=2)
+    b = make_migration(plan_id="plan-a", phase=Phase.failed, attempts=0)
+    for m in (a, b):
+        any_store.put("migration", m)
+    ids = lambda ms: {m.id for m in ms}  # noqa: E731
+    assert ids(any_store.list("migration", Migration, attempts=2)) == {a.id}  # int: Python
+    assert ids(any_store.list("migration", Migration, phase=Phase.failed)) == {b.id}  # enum: SQL
+    assert ids(any_store.list("migration", Migration, phase=("ready", "failed"))) == {a.id, b.id}
+    assert ids(any_store.list("migration", Migration, plan_id="plan-a", attempts=0)) == {b.id}
+    assert any_store.list("migration", Migration, plan_id="nope") == []
+    assert any_store.list("migration", Migration, plan_id=["x", "y"]) == []
+    # a field name that is not an identifier never reaches SQL; mixed/non-string values neither
+    assert _sql_filter("plan id", "x") is None
+    assert _sql_filter("attempts", 2) is None
+    assert _sql_filter("phase", ["ready", 3]) is None
+    assert _sql_filter("phase", []) is None
+    assert _sql_filter("phase", Phase.ready) is not None
+    assert all(f.isidentifier() for f in INDEXED_FIELDS)
+    # schema creation is idempotent (expression indexes use IF NOT EXISTS)
+    any_store.create_schema()
+    any_store.create_schema()
+    assert ids(any_store.list("migration", Migration, plan_id="plan-a")) == {a.id, b.id}

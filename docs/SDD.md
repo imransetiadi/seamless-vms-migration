@@ -759,12 +759,15 @@ PostgreSQL when `SEAMLESS_TEST_PG_URL` is set. Tables:
 
 ```text
 documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at, PK(kind,id))
+  + expression indexes ix_documents_{plan_id,phase,wave_id,status,role} on (kind, data->>field)
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
 ```
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
-top-level JSON fields evaluated in Python), `delete(kind, id)`, `append_event(event) -> Event`,
+top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
+pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
+other values are evaluated in Python), `delete(kind, id)`, `append_event(event) -> Event`,
 `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`. Kinds: `provider`, `plan`,
 `migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async

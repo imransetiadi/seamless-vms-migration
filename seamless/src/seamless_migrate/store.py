@@ -44,6 +44,14 @@ documents = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
 )
 
+#: Top-level JSON fields the list filters push into SQL (SDD §11); each gets an expression
+#: index on ``(kind, field)`` so a plan's migrations or a phase are found without a full scan.
+INDEXED_FIELDS = ("plan_id", "phase", "wave_id", "status", "role")
+for _field in INDEXED_FIELDS:
+    sa.Index(
+        f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string()
+    )
+
 events = sa.Table(
     "events",
     metadata,
@@ -104,6 +112,32 @@ def build_engine(url: str) -> Engine:
     return sa.create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
 
+def _as_strings(wanted: Any) -> list[str] | None:
+    """``wanted`` as a list of strings when every member is a string (or string enum)."""
+    members = (
+        list(wanted)
+        if isinstance(wanted, Collection) and not isinstance(wanted, str | bytes)
+        else [wanted]
+    )
+    out: list[str] = []
+    for member in members:
+        if isinstance(member, Enum):
+            member = member.value
+        if not isinstance(member, str):
+            return None
+        out.append(member)
+    return out
+
+
+def _sql_filter(name: str, wanted: Any) -> Any:
+    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``."""
+    values = _as_strings(wanted)
+    if not values or not name.isidentifier():
+        return None
+    column = documents.c.data[name].as_string()
+    return column == values[0] if len(values) == 1 else column.in_(values)
+
+
 def _matches(value: Any, wanted: Any) -> bool:
     if isinstance(wanted, Enum):
         wanted = wanted.value
@@ -122,6 +156,11 @@ class Store:
     # -- lifecycle ---------------------------------------------------------------------------
     def create_schema(self) -> None:
         metadata.create_all(self.engine, checkfirst=True)
+        # create_all skips the indexes of tables that already exist, and expression indexes
+        # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
+        with self.engine.begin() as conn:
+            for index in documents.indexes:
+                conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
         self.engine.dispose()
@@ -216,15 +255,21 @@ class Store:
 
         A filter value that is a list/tuple/set matches any of its members.
         """
+        query = (
+            sa.select(documents.c.data)
+            .where(documents.c.kind == kind)
+            .order_by(documents.c.created_at, documents.c.id)
+        )
+        for name, wanted in filters.items():
+            clause = _sql_filter(name, wanted)
+            if clause is not None:
+                query = query.where(clause)
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(documents.c.data)
-                .where(documents.c.kind == kind)
-                .order_by(documents.c.created_at, documents.c.id)
-            ).all()
+            rows = conn.execute(query).all()
         out: list[M] = []
         for row in rows:
             data = row.data
+            # the Python check stays authoritative (non-string values, dialect quirks)
             if all(_matches(data.get(name), wanted) for name, wanted in filters.items()):
                 out.append(model_cls.model_validate(data))
         return out
