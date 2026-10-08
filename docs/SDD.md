@@ -151,7 +151,7 @@ Nic   { network: str, mac: str|null, fixed_ips: list[str] = [], vnic_type: str =
 
 VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
         disks: list[Disk], nics: list[Nic],
-        power_state: "running"|"stopped"|"paused"|"error"|"unknown",
+        power_state: "running"|"stopped"|"paused"|"error"|"transitioning"|"unknown",  # transitioning: a Nova task in flight (RESIZE, VERIFY_RESIZE, MIGRATING, RESCUE, REBUILD, REBOOT, BUILD)
         os_type: str|null, host: str|null, tags: dict[str,str] = {},
         flavor_extra_specs: dict[str,str] = {}, cbt_enabled: bool|null = null,
         snapshot_count: int = 0, tools_ok: bool|null = null,
@@ -687,12 +687,12 @@ The scan term is the warm path's floor; removing it is the purpose of decision D
 
 * OpenStack sources consider `cold`, `warm`, `storage_handover`; VMware sources consider
   `vmware_cold`, `vmware_warm`.
-* `cold`: ineligible if `power_state == "error"` or no conversion host configured on either side.
+* `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side.
 * `warm`: as `cold`, plus any disk `multiattach`.
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, and `src_caps["admin"]` and
   `dst_caps["admin"]` truthy.
-* `vmware_cold`: ineligible if `power_state == "error"`.
+* `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
 
@@ -712,6 +712,7 @@ Finding catalog (code — severity — condition):
 | Code | Severity | Condition |
 |---|---|---|
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
+| `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
