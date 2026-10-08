@@ -69,3 +69,23 @@ def test_settings_parses_types(tmp_path):
     assert s.memory_url == "http://localhost:3111" and s.memory_redact_names
     assert s.metrics_public
     assert s.dashboard_dir == tmp_path / "dist"
+
+
+def test_every_setting_is_documented_in_sdd_15_1():
+    """Every SEAMLESS_* variable Settings.from_env reads appears in SDD §15.1, and every
+    variable the section lists is read (the dashboard-only SEAMLESS_MOCK aside)."""
+    import inspect
+    import re
+
+    from seamless_migrate.config import Settings, find_repo_root
+
+    source = inspect.getsource(Settings.from_env)
+    read = {f"SEAMLESS_{name}" for name in re.findall(r'"([A-Z0-9_]+)"\s*:', source)}
+    read |= {f"SEAMLESS_{name}" for name in re.findall(r'get\("([A-Z0-9_]+)"\)', source)}
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    start = sdd.index("### 15.1")
+    end = sdd.index("\n## 16", start)
+    documented = set(re.findall(r"SEAMLESS_[A-Z0-9_]+", sdd[start:end])) - {"SEAMLESS_MOCK"}
+    assert read - documented == set(), "read but not documented in SDD §15.1"
+    assert documented - read == set(), "documented in SDD §15.1 but never read"
+    assert len(read) >= 30
