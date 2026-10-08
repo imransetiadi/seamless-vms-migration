@@ -131,7 +131,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | FR-02 | Inventory with disks, NICs, power state, CBT, snapshots | `test_fake_openstack_inventory_has_required_traits`, `test_fake_vmware_mixed_cbt`, `test_openstack_provider_maps_server_to_vmref`, `test_vmware_provider_maps_vm`; VmTable filtering | LAB-P02 (counts and attributes equal the cloud's own listing) |
 | FR-03 | Plans with selection, mappings, SLO, approval, window; editable in draft/validated | `test_models_roundtrip_json`, `test_put_get_roundtrip`, `test_optimistic_conflict_raises`, `test_plan_create_validate_start_flow`, `test_plan_apply_from_yaml`; plan list/detail UI tests | AC-1 |
 | FR-04 | Pre-flight validation, full finding catalog | the 20 `test_finding_<code_lower>` tests, `test_quota_aggregates_across_plan`, `test_duplicate_names_blocked`, `test_validate_creates_migrations_with_findings_and_estimates`, `test_start_rejects_blocked_plan` | LAB-N01…N09 |
-| FR-05 | Downtime/duration estimate per VM and strategy (SDD §9.1: parallel-disk scan term, `Plan.estimator_overrides`, per-pass calibration) | `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`, `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`, `test_ineligible_strategies_marked`, `test_estimate_table`; **proposed, not yet named in the plan**: `test_warm_scan_uses_parallel_disk_term` (4 × 100 GiB equals 1 × 100 GiB at `P` = 4; 8 × 100 GiB does not), `test_estimator_overrides_apply`, `test_estimator_overrides_unknown_key_400`, `test_calibration_replaces_change_rate_and_scan` (after a delta pass: `vm.change_rate_bps`, `observed_scan_bps`, recomputed `estimate`), `test_calibration_ignores_link_bound_full_pass` (Performance.md §1) | Performance.md Appendix A cross-check (incl. 4 × 100 GiB and 500 GiB); LAB-W12…W14; G2 accuracy (PERF-E2E-G2, §9) |
+| FR-05 | Downtime/duration estimate per VM and strategy (SDD §9.1: parallel-disk scan term, `Plan.estimator_overrides`, per-pass calibration) | `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`, `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`, `test_ineligible_strategies_marked`, `test_estimate_table`; implemented for the §9.1 amendment: `test_warm_scan_uses_largest_disk_and_parallel_streams` (4 × 100 GiB equals 1 × 100 GiB at `P` = 4; 8 × 50 GiB and an aggregate ceiling `A`), `test_sdd_worked_example`, `test_estimate_final_downtime_uses_scan_term`, `test_estimator_overrides_with_plan_precedence`, `test_invalid_estimator_overrides` (unknown keys, plan-owned keys, non-positive values), `test_calibration_helpers`, `test_warm_passes_calibrate_change_rate_scan_rate_and_estimate` (after a delta pass: `vm.change_rate_bps`, `observed_scan_bps`, recomputed `estimate`), `test_first_pass_alone_does_not_calibrate` (Performance.md §1); the 400 on invalid overrides is asserted in `test_plan_create_validate_start_flow` | Performance.md Appendix A cross-check (incl. 4 × 100 GiB and 500 GiB); LAB-W12…W14; G2 accuracy (PERF-E2E-G2, §9) |
 | FR-06 | Automatic strategy selection; ineligible never selected; override rejected if ineligible | `test_multiattach_blocks_warm`, `test_handover_requires_backend_map_and_admin`, `test_vmware_warm_requires_cbt`, `test_override_ignored_when_ineligible`, `test_min_downtime_tie_prefers_simpler`, `test_recommend_never_returns_ineligible`, `test_migration_actions_transitions` (strategy PUT) | AC-5 |
 | FR-07 | Warm OpenStack migration: running source, final pass moves changed chunks only, checksums verified | A1 (all ten), A2 (all nine), S-COL-LINT, `test_warm_precopy_runs_export_once_then_precopy`, `test_warm_flow_reaches_completed_with_downtime` | AC-1, LAB-W01…W15, D-01…D-09 |
 | FR-08 | Cold OpenStack migration via os-migrate | `test_cutover_cold_sets_stop_before_migration`, `test_cold_flow` | LAB-C01…C03, LAB-W15 |
@@ -471,7 +471,7 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 
 | ID | Test | Method | Expected |
 |---|---|---|---|
-| S-01 | RBAC matrix | `test_role_matrix` (unit) and `rbac-live.sh` against the demo stack with four tokens | every route × role as in Security.md §5.2, including the plan policy fields: an operator that sets `require_approval`, `auto_cutover` or `cutover_window` on `POST /plans` or `PATCH /plans/{id}` gets 403 (before any 400/404/422), an approver does not (proposed unit test `test_policy_fields_need_approver`) |
+| S-01 | RBAC matrix | `test_role_matrix` (unit) and `rbac-live.sh` against the demo stack with four tokens | every route × role as in Security.md §5.2, including the plan policy fields: an operator that sets `require_approval`, `auto_cutover` or `cutover_window` on `POST /plans` or `PATCH /plans/{id}` gets 403 (before any 400/404/422), an approver does not; an operator spelling out the defaults is accepted (asserted in `test_plan_create_validate_start_flow`) |
 | S-02 | Authentication failures | missing, malformed and wrong tokens; `GET /events` afterwards | 401; one `auth.denied` event per attempt; the event data never contains the token |
 | S-03 | Hypervisor NBD bind (SEC-01) | on a hypervisor with the A4 role: `sudo ss -ltnp \| grep qemu-nbd`; from another host `nc -vz <hv> 10809` | listens on `127.0.0.1` (or the migration IP); remote connect refused |
 | S-04 | NBD read-only (SEC-01, SEC-05) | `ps -o args= -C qemu-nbd` shows `--read-only`; `qemu-io -c 'write -P 0xff 0 4096' nbd://127.0.0.1:<port>` | write fails with a read-only error; for nbdkit on conversion hosts the same (finding SEC-05 is expected to fail until fixed) |
@@ -606,6 +606,23 @@ npx @axe-core/cli http://127.0.0.1:8080/ --exit
 | Demo E2E (E2) | image builds from a clean checkout; `compose-init.sh` run; unit and integration green |
 | Lab (E3) | E2 green; lab provisioned to the reference specification; conversion hosts deployable; synthetic VMs and writers ready; release candidate tagged |
 | Security release review | all scans runnable on the candidate image; Security.md §12 checklist prepared |
+
+### 13.1a Integration run record — 2026-10-08 (developer laptop, Colima profile `seamless`)
+
+| Check | Result |
+|---|---|
+| Collection unit tests (`tests/unit/test_blocksync.py`, `test_warm_migration.py`, `test_warm_destination.py`, `test_warm_playbooks.py`) | 79 passed; `ansible-lint` on `import_workloads_warm`, `import_from_hypervisor` and the three warm playbooks: 0 failures (production profile); `ansible-playbook --syntax-check` of `import_workloads.yml`, `import_workloads_precopy.yml`, `import_workloads_cutover.yml`: OK |
+| Control plane (`cd seamless && .venv/bin/pytest -q`) | 578 passed, 9 skipped (live) on SQLite; store and event tests also green on PostgreSQL 16 (`SEAMLESS_TEST_PG_URL`); `ruff check` clean |
+| Live integrations (`-m live` with `SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1`) | `test_live_jev_decide` (stdio, `TYPESAFE_API_KEY`) and `test_live_memory_roundtrip` (agentmemory 0.9.30 on `:3111`): 2 passed |
+| Dashboard | `npm run typecheck`, `npm run lint`, `vitest run` (386 tests), `vite build`: OK |
+| Deployment (§14.5) | `.mcp.json` / `.claude/settings.json` valid JSON; `docker compose … config` OK; 21 OpenShift manifest documents parse (`kubectl kustomize` not run: no binary on the host) |
+| DEMO-01, DEMO-02, DEMO-03 (natural failures at the default 10 % rate), DEMO-05 (admin + anonymous only), §14.6 | `tests/e2e/smoke-demo.sh`: 21 passed, 0 failed against the image built from the checkout (`make seamless-demo`); both seeded plans completed, 3 injected cutover failures rolled back automatically and completed on retry; Jev decided the strategy of a fresh plan through the HTTP sidecar; agentmemory reachable from the container |
+| DEMO-04, DEMO-06, four-token RBAC, Playwright | not run |
+| Lab (E3), PERF-E2E, D-01…D-10 on real storage | not run: no RHOSP/RHOSO lab in this environment; Performance.md §6.3 stays open |
+
+Fixes that came out of this run: Jev is skipped with fewer than two candidates; a retry after an automatic
+rollback counts as a new attempt and starts a fresh downtime clock; an unmapped volume type blocks when the
+plan maps volume types; estimator overrides are validated.
 
 ### 13.2 Exit criteria — release 0.1.0
 
@@ -777,6 +794,11 @@ make seamless-down                                   # keeps data;  make seamles
 ```
 
 ### 14.7 Journey and RBAC scripts (E2)
+
+The committed smoke script [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh) (`export TOKEN=…` then run it)
+covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
+decision on a fresh plan; it exits with the number of failed checks. The journey and RBAC scripts below remain
+proposed.
 
 *Proposed* files (`tests/e2e/demo-journey.sh`, `tests/e2e/rbac-live.sh`; not part of the plan). Both were verified
 against an SDD-shaped stub server and pass `shellcheck`.
