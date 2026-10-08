@@ -124,6 +124,22 @@ async def test_validation_records_resolved_flavor_mapping(tmp_path, store):
     assert (await h.by_vm(plan.id, "vm-1")).resolved_mappings.flavors == {}
 
 
+async def test_retry_after_rollback_counts_an_attempt(tmp_path, store):
+    """A retry after the automatic rollback is a new attempt: the simulated executor seeds
+    its failure injection with ``attempts``, so the same cutover must not fail forever."""
+    from seamless_migrate.domain.models import Migration
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.rolled_back
+    store.put("migration", m)
+    again = await h.orch.retry(m.id, "alice")
+    assert again.phase == P.ready and again.attempts == 1
+    stored = store.get("migration", m.id, Migration)
+    assert stored.attempts == 1
+
+
 async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1), vm(2), vm(3)])
     reports = await asyncio.gather(

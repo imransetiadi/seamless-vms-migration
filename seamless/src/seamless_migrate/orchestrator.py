@@ -628,6 +628,10 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
+            if m.phase == P.rolled_back:
+                # the FSM counts failed -> ready only; a retry after an automatic rollback
+                # is still a new attempt of the cutover (executors key their behaviour on it)
+                m.attempts += 1
             m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
             m.error = None
             m.cutover_requested = False
