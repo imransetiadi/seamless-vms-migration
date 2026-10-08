@@ -22,6 +22,7 @@ from seamless_migrate.executors.ansible import (
     workload_filter,
 )
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
+from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
 from tests.fake_ansible import install, read_log
@@ -596,3 +597,136 @@ async def test_cancelled_step_kills_playbook_and_removes_secrets(env, monkeypatc
     assert asyncio.get_running_loop().time() - started < 15
     assert not (run_dir(env) / "secrets.yml").exists()
     assert not (run_dir(env) / "osm" / "clouds.yaml").exists()
+
+
+class FailingImpl:
+    """Provider implementation whose every call fails with ProviderError."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def find_server(self, name):
+        raise ProviderError(f"find {name}: connection refused")
+
+    async def delete_server(self, server_id):
+        raise ProviderError(f"delete {server_id}: HTTP 503")
+
+    async def power_on(self, source_id):
+        raise ProviderError(f"power on {source_id}: timeout")
+
+
+class FailingRegistry(FakeRegistry):
+    def get(self, provider):
+        return FailingImpl(self.calls)
+
+
+async def test_finalize_variants(env):
+    # nothing requested: nothing happens
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    assert (await env.executor.run(StepName.FINALIZE, ctx)).details == {"source_deleted": False}
+    # delete_source on OpenStack deletes the source server
+    plan = make_plan(id="plan-00c0ffee")
+    mig = make_migration(plan_id=plan.id, vm=make_vm(source_id="srv-1"), strategy=Strategy.warm)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings, delete_source=True)
+    assert (await env.executor.run(StepName.FINALIZE, ctx)).details == {"source_deleted": True}
+    assert ("delete_server", "srv-1") in env.registry.calls
+    # VMware sources are never deleted automatically in 0.1.0
+    vmw = make_migration(
+        plan_id=plan.id, vm=make_vm(source_id="vm-9"), strategy=Strategy.vmware_cold
+    )
+    ctx, _ = make_ctx(plan, vmw, VCENTER, DST, env.settings, delete_source=True)
+    details = (await env.executor.run(StepName.FINALIZE, ctx)).details
+    assert details["source_deleted"] is False and "not automated" in details["reason"]
+    # a provider failure is transient (retried)
+    failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings, delete_source=True)
+    with pytest.raises(TransientStepError, match="finalize"):
+        await failing.run(StepName.FINALIZE, ctx)
+
+
+async def test_vmware_rollback_and_lookup_failures(env):
+    failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
+    with pytest.raises(TransientStepError, match="rollback"):
+        await failing.run(StepName.ROLLBACK, ctx)
+    # a failed destination lookup after a cold cutover is logged, not fatal
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    result = await failing.run(StepName.CUTOVER, cold)
+    assert result.destination_server_id is None
+    assert any("could not look up the destination server" in line for line in rec.logs)
+
+
+async def test_run_rejects_unsupported_strategy_and_steps(env):
+    ctx, _ = ctx_for(env, strategy=Strategy.storage_handover)
+    with pytest.raises(PermanentStepError, match="does not handle"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="does not apply"):
+        await env.executor.run(StepName.PRECOPY, cold)
+    assert env.executor._playbooks(StepName.SYNC, Strategy.vmware_cold, run_dir(env)) == []
+
+
+async def test_missing_ansible_playbook_binary_is_permanent(env):
+    broken = Settings(
+        data_dir=env.settings.data_dir,
+        ansible_playbook=str(env.settings.data_dir / "no-such-ansible-playbook"),
+        clouds_yaml=env.settings.clouds_yaml,
+        secrets_dir=env.settings.secrets_dir,
+        collection_root=env.settings.collection_root,
+    )
+    executor = AnsibleExecutor(broken, providers=env.registry, poll_s=0.02)
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=make_vm(), strategy=Strategy.warm)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, broken)
+    with pytest.raises(PermanentStepError, match="cannot run"):
+        await executor.run(StepName.PRECOPY, ctx)
+    assert not (run_dir(env) / "secrets.yml").exists()
+
+
+def test_rewrite_workloads_and_warm_state_guards(tmp_path):
+    from seamless_migrate.executors.ansible import _read_warm_state
+
+    osm = tmp_path / "osm"
+    osm.mkdir()
+    with pytest.raises(PermanentStepError, match="did not produce"):
+        AnsibleExecutor._rewrite_workloads(osm, MAPPINGS)
+    (osm / "workloads.yml").write_text("resources:\n  - type: openstack.network.Network\n")
+    with pytest.raises(PermanentStepError, match="contains no server"):
+        AnsibleExecutor._rewrite_workloads(osm, MAPPINGS)
+    assert _read_warm_state(osm, "srv-1") is None
+    (osm / "workload_warm").mkdir()
+    (osm / "workload_warm" / "srv-1.json").write_text("{not json")
+    assert _read_warm_state(osm, "srv-1") is None
+
+
+def test_secret_vars_auth_type_region_and_missing_cloud(env, tmp_path):
+    from seamless_migrate.executors.ansible import build_secret_vars
+
+    clouds = tmp_path / "clouds2.yaml"
+    clouds.write_text(
+        "clouds:\n"
+        "  src:\n    auth_type: v3applicationcredential\n"
+        "    auth: {auth_url: 'https://src/v3', application_credential_id: id, "
+        "application_credential_secret: s}\n    region_name: regionOne\n"
+        "  dst:\n    auth: {auth_url: 'https://dst/v3', username: du, password: dpw, "
+        "project_name: finance}\n"
+    )
+    settings = Settings(data_dir=tmp_path / "data", clouds_yaml=clouds, secrets_dir=tmp_path / "s")
+    out = build_secret_vars(SRC, DST, settings)
+    assert out["os_migrate_src_auth_type"] == "v3applicationcredential"
+    assert out["os_migrate_src_region_name"] == "regionOne"
+    assert out["os_migrate_dst_region_name"] == "regionTwo", "Provider.region wins over clouds.yaml"
+    assert "os_migrate_dst_auth_type" not in out
+    missing = make_provider(cloud="nope")
+    with pytest.raises(PermanentStepError, match="credentials unavailable"):
+        build_secret_vars(missing, DST, settings)
+    with pytest.raises(PermanentStepError, match="credentials unavailable"):
+        build_secret_vars(VCENTER.model_copy(update={"credentials_secret": None}), DST, settings)
+
+
+def test_lazy_provider_registry(env):
+    from seamless_migrate.providers.registry import ProviderRegistry
+
+    executor = AnsibleExecutor(env.settings)
+    assert isinstance(executor.providers, ProviderRegistry)
+    assert executor.providers is executor.providers

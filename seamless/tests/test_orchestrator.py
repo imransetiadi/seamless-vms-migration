@@ -841,3 +841,83 @@ async def test_first_pass_alone_does_not_calibrate(tmp_path, store):
     assert len(m.sync_passes) == 1
     assert m.observed_scan_bps is None, "pass 1 is link-bound: never a scan calibration"
     assert m.vm.change_rate_bps == 2 * 2**20, "a full pass does not measure the write rate"
+
+
+async def test_prestage_failure_fails_the_plan(tmp_path, store):
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings)
+
+    async def broken_prestage(plan, source, destination):
+        raise RuntimeError("export_networks.yml failed: HTTP 503")
+
+    executor.prestage = broken_prestage
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    failed = await h.wait_plan(plan.id, PlanStatus.failed)
+    await h.orch.stop()
+    assert failed.status == PlanStatus.failed
+    assert (await h.by_vm(plan.id, "vm-1")).phase == P.ready, "no migration started"
+    assert "plan.updated" in h.kinds()
+
+
+async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, caplog):
+    from types import SimpleNamespace
+
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+
+    async def exploding_review(vm_ref, result):
+        raise RuntimeError("jev_screen: HTTP 500")
+
+    h.orch.advisor = SimpleNamespace(review_verification=exploding_review)
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert m.review_required is False and m.advisor_notes == []
+    assert any("verification review failed" in r.message for r in caplog.records)
+
+
+async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
+    """A storage-handover rollback recreates the source VM: the plan, its waves and the
+    strategy override follow the new id (SDD §7.3)."""
+    settings = make_settings(tmp_path)
+
+    async def failing_cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("manage at the destination failed")
+
+    async def recreating_rollback(ctx):
+        old = ctx.migration.vm.source_id
+        new_vm = ctx.migration.vm.model_copy(update={"source_id": f"{old}-recreated"})
+        return StepResult(details={"source_running": True, "vm": new_vm.model_dump(mode="json")})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: failing_cutover, StepName.ROLLBACK: recreating_rollback}
+    )
+    h, plan = await setup(
+        tmp_path, store, [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold}},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await h.orch.auto_waves(plan.id, 10, "alice")  # resets the plan to draft: validate after
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert m.vm.source_id == "vm-1-recreated" and m.destination_server_id is None
+    updated = await h.plan(plan.id)
+    # both VMs rolled back concurrently: neither rewrite may be lost (optimistic plan writes)
+    assert sorted(updated.vm_ids) == ["vm-1-recreated", "vm-2-recreated"]
+    assert sorted(v for w in updated.waves for v in w.vm_ids) == [
+        "vm-1-recreated",
+        "vm-2-recreated",
+    ]
+    assert updated.strategy_overrides == {"vm-1-recreated": Strategy.cold}
+    assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
+    assert updated.status == PlanStatus.completed

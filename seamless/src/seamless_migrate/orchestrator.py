@@ -74,7 +74,7 @@ from .planning.preflight import has_blocker, resolve_mappings, run_preflight
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError
-from .store import AsyncStore, NotFound, Store
+from .store import AsyncStore, ConflictError, NotFound, Store
 from .verification import VerificationResult, Verifier
 
 log = logging.getLogger(__name__)
@@ -202,6 +202,26 @@ class Orchestrator:
     async def _save_plan(self, plan: Plan) -> None:
         plan.updated_at = self._now()
         await self.db.put("plan", plan)
+
+    async def _update_plan(self, plan_id: str, mutate: Callable[[Plan], bool | None]) -> Plan:
+        """Read-modify-write ``plan`` under optimistic concurrency.
+
+        Several drivers and the tick loop touch the same plan concurrently (ids rewritten by a
+        rollback, status changes, strategy overrides): ``mutate`` runs on the freshest copy and
+        the write is retried when another writer got in between. ``mutate`` returns ``False``
+        to leave the plan untouched.
+        """
+        for _ in range(8):
+            plan, version = await self.db.get_versioned("plan", plan_id, Plan)
+            if mutate(plan) is False:
+                return plan
+            plan.updated_at = self._now()
+            try:
+                await self.db.put("plan", plan, expected_version=version)
+                return plan
+            except ConflictError:
+                continue
+        raise RuntimeError(f"plan {plan_id} changed too often to update it")
 
     async def _provider(self, provider_id: str, role: ProviderRole) -> Provider:
         try:
@@ -730,9 +750,12 @@ class Orchestrator:
             m.strategy = strategy
             m.estimate = est
             await self._save(m, v)
-        plan = await self._plan(m.plan_id)
-        plan.strategy_overrides[m.vm.source_id] = strategy
-        await self._save_plan(plan)
+        source_id = m.vm.source_id
+
+        def override(plan: Plan) -> None:
+            plan.strategy_overrides[source_id] = strategy
+
+        plan = await self._update_plan(m.plan_id, override)
         await self._emit(
             "migration.action",
             f"{m.vm.name}: strategy set to {strategy}",
@@ -899,10 +922,18 @@ class Orchestrator:
 
         # 4. plan completion
         if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
-            fresh = await self._plan(plan.id)
-            if fresh.status == PlanStatus.running:
+            completed = False
+
+            def finish(fresh: Plan) -> bool:
+                nonlocal completed
+                if fresh.status != PlanStatus.running:
+                    return False
                 fresh.status = PlanStatus.completed
-                await self._save_plan(fresh)
+                completed = True
+                return True
+
+            await self._update_plan(plan.id, finish)
+            if completed:
                 done = sum(1 for m in migs if m.phase in fsm.SUCCESS_PHASES)
                 await self._emit(
                     "plan.completed",
@@ -971,9 +1002,11 @@ class Orchestrator:
             raise
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
-            fresh = await self._plan(plan.id)
-            fresh.status = PlanStatus.failed
-            await self._save_plan(fresh)
+
+            def fail(fresh: Plan) -> None:
+                fresh.status = PlanStatus.failed
+
+            await self._update_plan(plan.id, fail)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: pre-staging failed",
@@ -1419,13 +1452,14 @@ class Orchestrator:
         self.wake()
 
     async def _replace_vm_id(self, plan_id: str, old: str, new: str) -> None:
-        plan = await self._plan(plan_id)
-        plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
-        for wave in plan.waves:
-            wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
-        if old in plan.strategy_overrides:
-            plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
-        await self._save_plan(plan)
+        def rewrite(plan: Plan) -> None:
+            plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
+            for wave in plan.waves:
+                wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
+            if old in plan.strategy_overrides:
+                plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
+
+        plan = await self._update_plan(plan_id, rewrite)
         await self._emit(
             "plan.updated",
             f"{plan.name}: source VM {old} is now {new}",
