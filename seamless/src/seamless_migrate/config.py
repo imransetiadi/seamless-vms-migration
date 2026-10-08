@@ -59,6 +59,8 @@ class Settings(BaseModel):
     max_concurrent_cutovers: int = 3
     tick_s: float = 1.0
     max_step_retries: int = 2
+    #: wall-clock ceiling of one step attempt in seconds; 0 = unbounded (SDD §15.1)
+    step_timeout_s: float = 0.0
     #: failed bearer authentications per client address per minute before 429 (0 = off)
     auth_lockout_per_minute: int = 60
     jev_mode: JevMode = "off"
@@ -120,6 +122,7 @@ class Settings(BaseModel):
             "MAX_CONCURRENT_CUTOVERS": ("max_concurrent_cutovers", int),
             "TICK_S": ("tick_s", float),
             "MAX_STEP_RETRIES": ("max_step_retries", int),
+            "STEP_TIMEOUT_S": ("step_timeout_s", float),
             "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),
             "JEV_TIMEOUT_S": ("jev_timeout_s", float),
             "JEV_MIN_CONFIDENCE": ("jev_min_confidence", float),

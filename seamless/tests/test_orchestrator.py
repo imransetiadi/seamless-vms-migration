@@ -344,6 +344,38 @@ def blocking_cutover(gates: dict[str, asyncio.Event], started: list[str]):
     return hook
 
 
+async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_path, store):
+    """A hung cutover (after the source stopped) is cut short by SEAMLESS_STEP_TIMEOUT_S and
+    handled like any permanent failure: automatic rollback (SDD §15.1, §7.2)."""
+    settings = make_settings(tmp_path, step_timeout_s=0.2)
+    cancelled = asyncio.Event()
+
+    async def hung_cutover(ctx):
+        await ctx.mark_downtime_start()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return StepResult()
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: hung_cutover})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert cancelled.is_set(), "the hung step task was cancelled"
+    assert "exceeded the step timeout of 0.2 s" in m.error
+    assert h.history(m)[-4:] == [P.cutover, P.failed, P.rolling_back, P.rolled_back]
+
+
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
     """A provider deleted while its check ran is not re-inserted by the check's write."""
     h, plan = await setup(tmp_path, store, [vm(1)])

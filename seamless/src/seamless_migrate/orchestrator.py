@@ -1274,8 +1274,17 @@ class Orchestrator:
             task = asyncio.create_task(work, name=f"{step}:{m.id}")
             self._steps[m.id] = task
             started = loop.time()
+            timeout = self.settings.step_timeout_s or None
+            timed_out = False
             try:
-                await asyncio.wait({task})
+                done, _ = await asyncio.wait({task}, timeout=timeout)
+                if not done:
+                    # SDD §15.1: the attempt exceeded its wall-clock ceiling — cancel it (the
+                    # executor kills the playbook) and fail it like any other permanent error
+                    timed_out = True
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
             except asyncio.CancelledError:
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -1287,6 +1296,10 @@ class Orchestrator:
             stats = self.step_stats[str(step)]
             stats[0] += loop.time() - started
             stats[1] += 1
+            if timed_out:
+                raise PermanentStepError(
+                    f"{step} exceeded the step timeout of {self.settings.step_timeout_s:g} s"
+                )
             if task.cancelled():
                 return None
             exc = task.exception()

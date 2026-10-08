@@ -27,6 +27,7 @@ def test_settings_defaults_match_sdd():
     assert s.metrics_public is False
     assert s.log_level == "INFO"
     assert s.log_json is False
+    assert s.step_timeout_s == 0.0
 
 
 def test_settings_pg_url_from_env(tmp_path):

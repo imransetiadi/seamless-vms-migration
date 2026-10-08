@@ -83,7 +83,7 @@ Compose file wires explicitly:
 | Variable | Default here | Meaning |
 |---|---|---|
 | `SEAMLESS_DEMO`, `_DEMO_SPEED`, `_DEMO_SEED`, `_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
+| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES`, `SEAMLESS_STEP_TIMEOUT_S` | `10`, `3`, `1.0`, `2`, `0` (no step ceiling) | orchestrator |
 | `SEAMLESS_JEV_MODE` | `http` (`off` when no key at init) | Jev advisor (SDD §14.1); URL `http://jev:8080/mcp` is fixed |
 | `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `20`, `0.6` | advisor bounds |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET` | host agentmemory, none | passed through only when defined; delete the line to disable memory |

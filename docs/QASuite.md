@@ -707,7 +707,9 @@ Twenty-three further iterations after the integration run, each verified with th
   `/stats` and `/metrics` reload their document lists only when the store's change stamp moved (SDD §11;
   1,000 migrations: 19 ms load vs 0.2 ms stamp) and `test_api_journey_on_every_store_backend` runs the
   request-path SQL (JSON-path filters, paging, replay, the stamp) on SQLite and PostgreSQL (CI's service and
-  the local `seamless-pg-test` container). Deferred: a `limit` on `GET /plans` (SDD amendment).
+  the local `seamless-pg-test` container); `SEAMLESS_STEP_TIMEOUT_S` bounds one step attempt (a hung
+  cutover is cancelled and rolled back, `test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop`).
+  Deferred: a `limit` on `GET /plans` (SDD amendment).
 
 ### 13.2 Exit criteria — release 0.1.0
 
