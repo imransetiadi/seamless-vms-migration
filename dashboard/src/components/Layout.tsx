@@ -134,6 +134,18 @@ function SessionFooter() {
           <span className="rounded-sm border border-status-info/40 px-1.5 py-0.5 text-xs text-status-info">Demo</span>
         )}
       </div>
+      {health.data?.orchestrator && (
+        <p className="px-1 text-xs text-muted-foreground" data-testid="orchestrator-status">
+          Orchestrator{' '}
+          {health.data.orchestrator.healthy
+            ? health.data.orchestrator.last_tick_age_s === null
+              ? 'starting'
+              : `running · last tick ${Math.round(health.data.orchestrator.last_tick_age_s)} s ago`
+            : health.data.orchestrator.running
+              ? 'stalled'
+              : 'stopped'}
+        </p>
+      )}
       {me.data && (
         <p className="px-1 text-sm">
           <span className="block truncate font-medium text-foreground">{me.data.name}</span>

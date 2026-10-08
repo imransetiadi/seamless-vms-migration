@@ -10,6 +10,12 @@ describe('Layout health notice', () => {
     expect(screen.queryByText(/control plane degraded/i)).not.toBeInTheDocument();
   });
 
+  it('shows the orchestrator status in the session footer', async () => {
+    renderWithApp(<Layout />, { route: '/', path: '/' });
+    const status = await screen.findByTestId('orchestrator-status');
+    expect(status).toHaveTextContent(/orchestrator running · last tick 0 s ago/i);
+  });
+
   it('names the degraded parts: database and a stalled orchestrator', async () => {
     const server = createTestServer();
     server.health = {
@@ -19,6 +25,7 @@ describe('Layout health notice', () => {
       orchestrator: { running: true, last_tick_age_s: 42.4, ticks: 10, healthy: false },
     };
     renderWithApp(<Layout />, { route: '/', path: '/', server });
+    expect(await screen.findByTestId('orchestrator-status')).toHaveTextContent(/stalled/i);
     const notice = await screen.findByRole('status', { name: '' });
     expect(notice).toHaveTextContent(/control plane degraded: the database is unreachable; the orchestrator has not ticked for 42 s/i);
   });
