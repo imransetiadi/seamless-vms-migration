@@ -15,7 +15,8 @@
 build, Compose demo smoke test 21/21, DEMO-01…06, review fix wave, release scans, push to GitHub `main`) and the
 suites run in GitHub Actions (`.github/workflows/ci.yml`, all jobs green). Reference-lab measurements
 (Performance.md §6.3, QASuite §13.2 items 4–6) need a real RHOSP/RHOSO environment and are skipped until the
-lab is ready (user decision, 2026-10-08).
+lab is ready (user decision, 2026-10-08). The continuous-improvement series that followed is summarised in
+QASuite §13.1b.
 
 ## Global Constraints
 

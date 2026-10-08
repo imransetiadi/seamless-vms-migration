@@ -637,6 +637,31 @@ Fixes that came out of this run: Jev is skipped with fewer than two candidates; 
 rollback counts as a new attempt and starts a fresh downtime clock; an unmapped volume type blocks when the
 plan maps volume types; estimator overrides are validated.
 
+### 13.1b Post-integration improvement series — 2026-10-08 (local commits)
+
+Twenty-three further iterations after the integration run, each verified with the unit suites and
+`make seamless-check`; the notable ones for test planning:
+
+* Concurrency: plan writes from drivers and the tick loop use optimistic versions (`_update_plan`),
+  found by a test that rolled two migrations back at once; a retry after an automatic rollback counts
+  an attempt and starts a fresh downtime clock.
+* Store: string filters pushed into SQL with expression indexes; `limit`/`offset` on `GET /migrations`;
+  the tick loads only running/paused plans. PERF-CP-02 measured in-process (p95 30 ms for 1,000 active
+  migrations).
+* Operability: `seamless_tick_seconds*` metrics; `/health` reports the orchestrator loop, `/ready` answers
+  503 while degraded (readiness probe); the dashboard shows a degraded notice; `seamless events
+  export|prune` for audit retention.
+* Security: per-address lockout after `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` failed authentications (429);
+  images pinned by digest; Tailwind 4 closed R-09 (npm audit 0 incl. dev); pip removed from the image.
+* Collection: zero chunks skip hashing (2.5× faster scans of never-written regions); randomized engine
+  fuzz (D-02); Sphinx user guide for the warm path.
+* Calibration surfaced: `seamless estimate` calibration knobs, plan-dialog overrides, "Estimate inputs"
+  and "Resolved mappings" panels on the migration page.
+* Guards against documentation drift: settings vs SDD §15.1, routes vs §12, event kinds vs §4.3 and the
+  dashboard, finding catalog vs §9.3 (the first run found `SEAMLESS_LOG_JSON` missing from §15.1).
+* Dev workflow: Dependabot, pre-commit, `make seamless-check`, Playwright browser smoke (`dashboard-e2e`
+  CI job). Coverage 95 % (`providers/openstack.py` 100 %).
+
 ### 13.2 Exit criteria — release 0.1.0
 
 1. All unit suites green: collection (baseline + A1/A2), control plane on **SQLite and PostgreSQL 16**, dashboard
