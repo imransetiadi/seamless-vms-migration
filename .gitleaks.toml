@@ -1,0 +1,14 @@
+# gitleaks configuration (Security.md §12): the default rules plus paths that are
+# never secrets - git-ignored generated files and Python bytecode caches.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "git-ignored local secrets files and bytecode caches"
+paths = [
+  'deploy/compose/\.env$',
+  'deploy/compose/tokens\.yaml$',
+  '__pycache__/',
+  # redaction test fixtures: fake tokens that the redactor must strip (seamless/tests/test_memory.py)
+  'seamless/tests/test_memory\.py$',
+]

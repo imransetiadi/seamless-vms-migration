@@ -4,7 +4,6 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration, Plan } from '../api/types';
-import { ROUTER_FUTURE } from '../test/utils';
 import { MigrationsTable } from './MigrationsTable';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -14,7 +13,7 @@ const migrations = fx.migrations.filter((m) => m.plan_id === plan.id);
 
 function renderTable(list: Migration[] = migrations) {
   return render(
-    <MemoryRouter future={ROUTER_FUTURE}>
+    <MemoryRouter>
       <MigrationsTable migrations={list} plan={plan} />
     </MemoryRouter>,
   );

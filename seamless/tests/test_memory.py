@@ -12,7 +12,7 @@ def test_redact_removes_secrets():
         "login failed password=hunter2 for admin; token: abc123def; "
         'json {"password": "s3cr3t", "api_key": "AKIA-xyz"} '
         "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl "
-        "curl -H 'X-Auth-Token: gAAAAABlongfernettokenvalue1234567890' "
+        "curl -H 'X-Auth-Token: gAAAAABlongfernettokenvalue1234567890' "  # gitleaks:allow
         "db postgresql+psycopg://seamless:pgpass@db.internal:5432/seamless "
         "key -----BEGIN RSA PRIVATE KEY-----\nMIIEow\nIBAAK\n-----END RSA PRIVATE KEY----- end "
         "api token smg_abcdefghijklmnopqrstuvwxyz012345"

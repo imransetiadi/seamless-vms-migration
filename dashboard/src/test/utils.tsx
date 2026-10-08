@@ -9,7 +9,6 @@ import { LiveEventsProvider } from '../api/LiveEventsProvider';
 import { createMockFetch, MockServer } from '../api/mock';
 import { ThemeProvider } from '../theme/ThemeProvider';
 
-export const ROUTER_FUTURE = { v7_startTransition: true, v7_relativeSplatPath: true } as const;
 
 /** Fixed clock for deterministic fixtures. */
 export const TEST_NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -46,7 +45,7 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): Re
     <ThemeProvider initialTheme="dark">
       <QueryClientProvider client={queryClient}>
         <ApiProvider client={client}>
-          <MemoryRouter initialEntries={[options.route ?? '/']} future={ROUTER_FUTURE}>
+          <MemoryRouter initialEntries={[options.route ?? '/']}>
             {wrap(
               <Routes>
                 <Route path={options.path ?? '*'} element={ui} />

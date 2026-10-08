@@ -77,7 +77,7 @@ export default function App({ client, queryClient }: AppProps) {
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <ApiProvider client={client}>
-          <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+          <BrowserRouter>
             <AppRoutes />
           </BrowserRouter>
         </ApiProvider>

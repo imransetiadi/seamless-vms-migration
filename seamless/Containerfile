@@ -22,8 +22,10 @@ LABEL org.opencontainers.image.title="seamless-migrate" \
 
 USER 0
 
-# Node 22 runs the npx-launched Jev MCP server; ssh is used by Ansible for conversion hosts.
-RUN dnf -y module enable nodejs:22 \
+# Security.md §12: apply the base image's pending errata at build time (the UBI tag lags
+# its errata), then Node 22 for the npx-launched Jev MCP server and ssh/rsync for Ansible.
+RUN dnf -y update --setopt=install_weak_deps=False \
+ && dnf -y module enable nodejs:22 \
  && dnf -y install --setopt=install_weak_deps=False nodejs npm openssh-clients rsync \
  && dnf clean all \
  && rm -rf /var/cache/dnf
@@ -31,10 +33,11 @@ RUN dnf -y module enable nodejs:22 \
 # Control plane with the OpenStack, VMware and Jev extras, plus ansible-core.
 COPY seamless/pyproject.toml seamless/README.md /opt/seamless/src/seamless/
 COPY seamless/src /opt/seamless/src/seamless/src
+# pip/setuptools/urllib3/msgpack are upgraded past their advisories (image scan, QASuite §10).
 # hadolint ignore=DL3013
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
+RUN python3 -m pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" \
  && python3 -m pip install --no-cache-dir "/opt/seamless/src/seamless[openstack,vmware,jev]" \
-        "ansible-core${ANSIBLE_CORE_VERSION}"
+        "ansible-core${ANSIBLE_CORE_VERSION}" "urllib3>=2.8.0" "msgpack>=1.2.1"
 
 # The os-migrate collection from this repository and the VMware migration kit.
 COPY galaxy.yml README.md LICENSE CHANGELOG.rst requirements.yml /opt/seamless/collection/
