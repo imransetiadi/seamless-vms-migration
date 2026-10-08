@@ -359,28 +359,29 @@ databases sit between the extremes. Consequences:
 | End to end | lab scenarios of [QASuite.md](QASuite.md) §7 (LAB-W*, LAB-H*) | Downtime per VM profile, estimate accuracy |
 | Control plane | demo mode with a 1,000-VM plan; API load (QASuite §9, PERF-CP-*) | Tick time, API/SSE latency, DB growth |
 
-### 6.2 Results — engine benchmark (developer host, 2026-10-08)
+### 6.2 Results — engine benchmark (developer host, 2026-10-08, after the zero-chunk fast path)
 
 MiB/s scanned, from [`tests/perf/results-darwin-arm64-apple-m5.md`](../tests/perf/results-darwin-arm64-apple-m5.md):
 Darwin 27.0.0 arm64, 10 CPUs, Python 3.13.5; a 1 GiB file in the page cache with a 64 MiB hole every
-256 MiB, random 1 MiB change extents, sender and receiver on the same host through pipes (the CPU ceiling
-of read + BLAKE2b + apply, not disk or network throughput); the host carried other load (load average
-5–10), so single runs vary by ± 30 %.
+256 MiB (25 % zero chunks), random 1 MiB change extents, sender and receiver on the same host through
+pipes (the CPU ceiling of read + BLAKE2b + apply, not disk or network throughput); load average ≈ 3
+during the run. Single runs on a laptop vary by ± 30 %.
 
 | Chunk / workers | full (`--assume-zero`) | delta 1 % | delta 5 % | delta 20 % |
 |---|---|---|---|---|
-| 1 MiB / 1 | 228 | 622 | 438 | 630 |
-| 1 MiB / 4 | 511 | 1653 | 1555 | 1214 |
-| 4 MiB / 1 | 294 | 400 | 405 | 425 |
-| 4 MiB / 4 | 515 | 1118 | 728 | 557 |
-| 16 MiB / 1 | 441 | 517 | 343 | 345 |
-| 16 MiB / 4 | 494 | 472 | 472 | 407 |
+| 1 MiB / 1 | 1047 | 1388 | 1422 | 1275 |
+| 1 MiB / 4 | 1030 | 2749 | 2676 | 2064 |
+| 4 MiB / 1 | 956 | 1381 | 1239 | 636 |
+| 4 MiB / 4 | 1142 | 2878 | 2127 | 1244 |
+| 16 MiB / 1 | 1103 | 1282 | 1065 | 593 |
+| 16 MiB / 4 | 1178 | 2625 | 1238 | 935 |
 
-Reading: the default 4 MiB / 4 workers scans at 515 MiB/s on a full pass and 557–1118 MiB/s on delta passes
-on this laptop, above the 500 MiB/s planning default `S`; 1 MiB chunks hash faster here but transfer less
-per changed extent (the 4 MiB rows move 4× the bytes for the same 1 % change). These numbers are an upper
-bound for a 4 vCPU conversion host reading from Cinder: the NFR-02a acceptance below still has to be
-measured on that flavor (§6.3).
+Reading: the default 4 MiB / 4 workers scans at ≈ 1.1 GiB/s on a full pass and 1.2–2.9 GiB/s on delta
+passes here, two to three times the first measurement of the day (515 / 557–1118 MiB/s, taken on a
+host with load average 5–10 and before all-zero chunks skipped hashing — `blocksync` now recognises
+them with a byte count, 2.5× cheaper than BLAKE2b). The 20 % rows are transfer-bound (the delta is
+sent over a pipe). These numbers are an upper bound for a 4 vCPU conversion host reading from Cinder:
+the NFR-02a acceptance below still has to be measured on that flavor (§6.3).
 
 Acceptance for NFR-02a: ≥ 400 MiB/s scanned per side on a 4 vCPU conversion-host flavor with the 4 MiB / 4
 worker configuration. The same measurement decides SM-1 p95 for a single 500 GiB disk: `S` ≥ 416 MiB/s (§3.2).
