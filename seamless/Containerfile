@@ -8,7 +8,10 @@
 # The built dashboard (dashboard/dist) is copied when present; build it first to include it, or
 # point DASHBOARD_DIST elsewhere: --build-arg DASHBOARD_DIST=path/to/dist
 
-ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest
+# Pinned by digest (Security.md §12): the manifest list of ubi9/python-311:latest as of 2026-10-08.
+# Dependabot (docker, /seamless) proposes digest bumps; `dnf update` below still applies errata
+# published after the pin at build time.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
 FROM ${BASE_IMAGE}
 
 ARG DASHBOARD_DIST=dashboard/dist
