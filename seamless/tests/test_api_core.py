@@ -255,22 +255,17 @@ def test_metrics_format(api, tmp_path):
     public_store.dispose()
 
 
-def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api, monkeypatch):
+def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     svc = api.client.app.state.services
-    loads: list[str] = []
-    original = svc.db.list
-
-    async def counting_list(kind, model_cls, **kw):
-        if not kw:  # the cache loads whole kinds; the orchestrator tick lists running plans
-            loads.append(kind)
-        return await original(kind, model_cls, **kw)
-
-    monkeypatch.setattr(svc.db, "list", counting_list)
     assert api.get("/api/v1/stats").status_code == 200
+    migrations_list = svc._doc_cache["migration"][1]
+    plans_list = svc._doc_cache["plan"][1]
     assert api.get("/api/v1/metrics").status_code == 200
     assert api.get("/api/v1/stats?plan_id=plan-x").status_code == 200
-    assert loads.count("migration") == 1 and loads.count("plan") == 1
-    # a change reloads: a new plan document moves the stamp of "plan" only
+    # nothing changed: the same list objects served every call (no reload)
+    assert svc._doc_cache["migration"][1] is migrations_list
+    assert svc._doc_cache["plan"][1] is plans_list
+    # a new plan document moves the stamp of "plan" only
     assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
     assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
     created = api.post(
@@ -285,7 +280,9 @@ def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api, monkeypa
     )
     assert created.status_code == 201, created.text
     assert api.get("/api/v1/stats").status_code == 200
-    assert loads.count("plan") == 2 and loads.count("migration") == 1
+    assert svc._doc_cache["plan"][1] is not plans_list
+    assert [p.id for p in svc._doc_cache["plan"][1]] == [created.json()["id"]]
+    assert svc._doc_cache["migration"][1] is migrations_list
 
 
 def test_stats_shape(api):
