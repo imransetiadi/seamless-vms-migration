@@ -1,5 +1,7 @@
 # Seamless Migrate
 
+[![ci](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml/badge.svg)](https://github.com/imransetiadi/seamless-vms-migration/actions/workflows/ci.yml)
+
 **Move virtual machines from Red Hat OpenStack Platform 17.1, community OpenStack or VMware vSphere into
 Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 — with minutes of downtime, predictable before it
 starts, approved by the right people, and reversible until you finalize.**

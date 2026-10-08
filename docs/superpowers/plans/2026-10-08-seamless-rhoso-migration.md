@@ -12,8 +12,10 @@
 
 **Status (2026-10-08):** all tracks and the integration steps are done; evidence per step is recorded in
 `docs/QASuite.md` §13.1a (unit suites, PostgreSQL run, live Jev/agentmemory tests, ansible-lint, dashboard
-build, Compose demo smoke test 21/21, review fix wave, push to GitHub `main`). Reference-lab measurements
-(Performance.md §6.3) need a real RHOSP/RHOSO environment and remain open.
+build, Compose demo smoke test 21/21, DEMO-01…06, review fix wave, release scans, push to GitHub `main`) and the
+suites run in GitHub Actions (`.github/workflows/ci.yml`, all jobs green). Reference-lab measurements
+(Performance.md §6.3, QASuite §13.2 items 4–6) need a real RHOSP/RHOSO environment and are skipped until the
+lab is ready (user decision, 2026-10-08).
 
 ## Global Constraints
 
