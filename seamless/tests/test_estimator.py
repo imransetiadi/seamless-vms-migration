@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -122,6 +123,13 @@ def test_sdd_worked_example():
     assert warm.downtime_s == pytest.approx(60 + 30 + 409.6 + 60 + 120)  # ~680 s
     assert cold.downtime_s == pytest.approx(270 + 120 * GIB / P.link_bps)  # ~1253 s
     assert handover.downtime_s == pytest.approx(260)
+    # Performance.md §4.2: pass 1 moves U, pass 2 carries 2,026 MiB (> 1 GiB), pass 3 carries
+    # 879 MiB and converges — three passes, 1,892 s; on 10 Gbit/s two passes, 879 s.
+    assert warm.passes == 3
+    assert warm.precopy_s == pytest.approx(1013.0 + 440.0 + 440.0, abs=1.5)
+    fast = estimate(vm, Strategy.warm, replace(P, link_bps=1250 * MIB), slo_s=600)
+    assert (fast.passes, fast.downtime_s) == (2, pytest.approx(warm.downtime_s))
+    assert fast.precopy_s == pytest.approx(2 * 440.0, abs=1.5)
 
 
 def test_handover_downtime_independent_of_size():

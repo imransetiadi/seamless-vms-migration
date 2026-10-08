@@ -33,10 +33,11 @@ measurement, tuning, capacity planning, control-plane limits and monitoring.
 | `Δf` | final delta moved during the downtime window | — |
 
 Conventions: the model treats 1 Gbit/s as 125 MiB/s (so 10 Gbit/s is 1,250 MiB/s; the raw line rate of a 10 GbE
-port is ≈ 1,190 MiB/s), and pre-copy passes follow SDD §9.1: pass *k* + 1 runs while `Δk > convergence_threshold_bytes` and
-*k* < `max_sync_passes` — the total, including pass 1, never exceeds `max_sync_passes` (the runtime rule of
-SDD §5.3 adds an SLO-based exit). The `Estimate.passes` field of the tool is authoritative for pass counting;
-the tables below show the pre-copy passes. Percentiles use the nearest-rank rule: with 10 runs p90 is the 9th smallest value and
+port is ≈ 1,190 MiB/s), and pre-copy passes follow SDD §9.1 and the runtime rule of §5.3: pass *k* + 1 runs while
+the bytes pass *k* moved exceed `convergence_threshold_bytes` (`Δ1 = U`, so a converging migration always runs at
+least one delta pass — the first delta pass is what measures the change) and *k* < `max_sync_passes` — the total,
+including pass 1, never exceeds `max_sync_passes` (the runtime adds an SLO-based exit). The `Estimate.passes`
+field of the tool is authoritative for pass counting; the tables below show the pre-copy passes. Percentiles use the nearest-rank rule: with 10 runs p90 is the 9th smallest value and
 p95 the largest.
 
 **Configuration and calibration (SDD §9.1, PRD G2).** Every `EstimatorParams` field can be overridden per plan
@@ -142,7 +143,7 @@ at 500 MiB/s)".
 | Strategy | Pre-copy | Downtime |
 |---|---|---|
 | `cold` | none | `shutdown + snapshot + U/L + create + boot` |
-| `warm` | `T1 = snapshot + max(U/L, scan)`; then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` while `Δk > threshold` and `k < max_passes` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
+| `warm` | `T1 = snapshot + max(U/L, scan)`, `Δ1 = U`; then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
 | `storage_handover` | none | `shutdown + V·handover_per_volume + create + boot` |
 | `vmware_cold` | none | `shutdown + U/L + v2v + create + boot` |
 | `vmware_warm` | `T1 = U/L`; `Tk = 10 + Δk/L` (same loop) | `shutdown + Δf/L + v2v_inplace + create + boot` |
@@ -191,7 +192,7 @@ Derived properties worth knowing:
 | | 1 Gbit/s (`L` = 125 MiB/s) | 10 Gbit/s (`L` = 1,250 MiB/s) |
 |---|---|---|
 | `cold` downtime | `270 + 983 s` = **1,253 s (20.9 min)** | `270 + 98 s` = **368 s (6.1 min)** |
-| `warm` pre-copy | `scan` = 410 s. `T1 = 30 + max(983, 410) = 1,013 s`; `Δ1 = 2 MiB/s × 1,013 s = 2,026 MiB > 1 GiB` ⇒ pass 2: `T2 = 30 + max(410, 16) = 440 s`; `Δ = 879 MiB ≤ 1 GiB` ⇒ stop. **2 passes, 1,453 s (24.2 min) while the VM runs** | `T1 = 30 + max(98, 410) = 440 s`; `Δ = 879 MiB ≤ 1 GiB` ⇒ stop. **1 pass, 440 s** |
+| `warm` pre-copy | `scan` = 410 s. `T1 = 30 + max(983, 410) = 1,013 s` moves `U` ⇒ pass 2 carries `Δ2 = 2 MiB/s × 1,013 s = 2,026 MiB`: `T2 = 30 + max(410, 16) = 440 s`; `2,026 MiB > 1 GiB` ⇒ pass 3 carries `Δ3 = 2 MiB/s × 440 s = 879 MiB`: `T3 = 440 s`; `879 MiB ≤ 1 GiB` ⇒ stop. **3 passes, 1,892 s (31.5 min) while the VM runs** | `T1 = 30 + max(98, 410) = 440 s` moves `U` ⇒ pass 2 carries `879 MiB` in `440 s`; `≤ 1 GiB` ⇒ stop. **2 passes, 879 s (14.7 min)** |
 | `warm` final delta | 879 MiB (moved in 7 s, hidden inside the 410 s scan) | 879 MiB (0.7 s) |
 | `warm` downtime | `60 + 30 + 410 + 60 + 120` = **680 s (11.3 min)** | **680 s (11.3 min)** — identical |
 | `storage_handover` downtime | `60 + 20 + 60 + 120` = **260 s (4.3 min)** | 260 s |
@@ -230,8 +231,8 @@ the aggregate ceiling is not reached; beyond it `scan = D / S_agg`. Set `paralle
 full-rate streams the host really sustains and the estimator stays honest: with `P` = 2, 4 × 100 GiB is estimated
 at 680 s (11.3 min).
 
-Warm pre-copy cost on 1 Gbit/s: 50 GiB → 1 pass (4.6 min); 100 GiB → 2 passes (12.6 min); 200 GiB → 2 passes
-(24.2 min); **300 GiB → 5 passes (68 min, final delta 1.26 GiB); 500 GiB → 5 passes (112 min, 2.1 GiB); 1 TiB →
+Warm pre-copy cost on 1 Gbit/s: 50 GiB → 2 passes (6.8 min); 100 GiB → 3 passes (16.5 min); 200 GiB → 3 passes
+(31.5 min); **300 GiB → 5 passes (68 min, final delta 1.26 GiB); 500 GiB → 5 passes (112 min, 2.1 GiB); 1 TiB →
 5 passes (226 min, 4.2 GiB)**. Every single disk above ≈ 235 GiB fails to converge below the 1 GiB threshold at
 the default change rate (property 3 of §4.1) — see §7.3.
 
@@ -239,8 +240,8 @@ the default change rate (property 3 of §4.1) — see §7.3.
 
 | `c` (MiB/s) | Pre-copy passes (s) | Final delta | Downtime | `Δf/L` |
 |---|---|---|---|---|
-| 0.5 | 1 013 | 507 MiB | 11.3 min | 4 s |
-| 2 | 1 013, 440 | 879 MiB | 11.3 min | 7 s |
+| 0.5 | 1 013, 440 | 220 MiB | 11.3 min | 2 s |
+| 2 | 1 013, 440, 440 | 879 MiB | 11.3 min | 7 s |
 | 10 | 1 013, 440 × 4 (never converges) | 4.3 GiB | 11.3 min | 35 s |
 | 50 | 1 013, 440 × 4 | 21.5 GiB | 11.3 min | 176 s |
 | 100 | 1 013, 840, 702, 592, 504 | 49.2 GiB | 11.3 min | 403 s |
@@ -742,20 +743,19 @@ def scan_time(disks, p, ceiling=None):
 
 def warm(disks, U, p, ceiling=None):
     D, scan = sum(disks), scan_time(disks, p, ceiling)
-    t = [p.snapshot + max(U / p.link, scan)]; k = 1
-    while k < p.max_passes:
-        delta = min(D, p.change * t[-1])
-        if delta <= p.threshold: break
-        k += 1; t.append(p.snapshot + max(scan, delta / p.link))
+    t = [p.snapshot + max(U / p.link, scan)]; moved = U          # pass 1 moves the used data
+    while moved > p.threshold and len(t) < p.max_passes:        # SDD 5.3: another pass while the last one moved > threshold
+        moved = min(D, p.change * t[-1]); t.append(p.snapshot + max(scan, moved / p.link))
     final = min(D, p.change * t[-1])
-    return dict(scan=scan, passes=k, pass_times=t, final=final,
+    return dict(scan=scan, passes=len(t), pass_times=t, final=final,
                 down=p.shutdown + p.snapshot + max(scan, final / p.link) + p.create + p.boot)
 
 cold = lambda U, p: p.shutdown + p.snapshot + U / p.link + p.create + p.boot
 handover = lambda V, p: p.shutdown + V * p.handover_per_volume + p.create + p.boot
 
 p = P(); D = 200 * GiB; U = int(D * 0.6)
-print(warm([D], U, p)["down"], cold(U, p), handover(1, p))                   # 679.6 1253.04 260
+w = warm([D], U, p)
+print(w["down"], cold(U, p), handover(1, p), w["passes"], round(sum(w["pass_times"])))   # 679.6 1253.04 260 3 1892
 print(warm([100 * GiB], 60 * GiB, p)["down"])                                # G1a: 474.8
 print(round(warm([100 * GiB] * 4, 240 * GiB, p)["down"], 1),
       round(warm([100 * GiB] * 4, 240 * GiB, p, ceiling=1190 * MiB)["down"], 1))   # 4 x 100 GiB: 474.8 614.2
