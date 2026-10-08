@@ -65,6 +65,7 @@ spec:
               value: 256MB
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -93,6 +94,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/pgsql/data
+            # writable scratch paths of the SCL image with a read-only root filesystem
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

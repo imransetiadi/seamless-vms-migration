@@ -17,10 +17,8 @@ data:
   SEAMLESS_HOST: "0.0.0.0"
   SEAMLESS_PORT: "8080"
   SEAMLESS_DATA_DIR: /data
-  # credentials are mounted from Secrets (see deployment.yaml)
-  SEAMLESS_TOKENS_FILE: /etc/seamless/tokens/tokens.yaml
-  SEAMLESS_CLOUDS_YAML: /etc/seamless/clouds/clouds.yaml
-  SEAMLESS_SECRETS_DIR: /var/run/secrets/seamless
+  # the paths of the mounted credential files (SEAMLESS_TOKENS_FILE, SEAMLESS_CLOUDS_YAML,
+  # SEAMLESS_SECRETS_DIR) are set next to their volume mounts in deployment.yaml
   # authentication is always on in a cluster (the CLI refuses SEAMLESS_AUTH_DISABLED on a non-loopback bind)
   SEAMLESS_AUTH_DISABLED: "false"
   SEAMLESS_DEMO: "false"

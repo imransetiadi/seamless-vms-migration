@@ -54,6 +54,13 @@ spec:
             - configMapRef:
                 name: seamless-config
           env:
+            # paths of the credential files mounted below (values, not secrets)
+            - name: SEAMLESS_TOKENS_FILE
+              value: /etc/seamless/tokens/tokens.yaml
+            - name: SEAMLESS_CLOUDS_YAML
+              value: /etc/seamless/clouds/clouds.yaml
+            - name: SEAMLESS_SECRETS_DIR
+              value: /var/run/secrets/seamless
             - name: SEAMLESS_DB_URL
               valueFrom:
                 secretKeyRef:
