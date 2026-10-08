@@ -87,7 +87,8 @@ and the conversion host variables (`os_migrate_src_conversion_host_name`,
   it only the data volumes are synchronised and the destination boots from
   the image.
 * As in the cold path, destination volumes take the source volume's
-  editable parameters (the boot volume takes `boot_volume_params`) and the
+  editable parameters (the boot volume takes `boot_volume_params`) and,
+  unless `os_migrate_workloads_preserve_volume_type` is set, the
   destination's default volume type.
 
 Multi-volume pre-copy snapshots are not atomic; this is harmless because the
