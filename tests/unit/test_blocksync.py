@@ -730,3 +730,74 @@ def test_digests_are_fips_tolerant(monkeypatch):
         assert blocksync.manifest_digest([expected_chunk] * 3) == expected_manifest
     assert any("usedforsecurity" not in kwargs for kwargs in seen)
     assert any(kwargs.get("usedforsecurity") is False for kwargs in seen)
+
+
+def _mutate(data, rng, pattern, chunk_size):
+    """Return a mutated copy of ``data``: random extents, whole chunks, or sparse zero runs."""
+    out = bytearray(data)
+    size = len(out)
+    if size == 0:
+        return bytes(out)
+    if pattern == "extents":
+        for _ in range(rng.randint(1, 8)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 4)))
+            out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
+    elif pattern == "chunks":
+        chunks = max(1, (size + chunk_size - 1) // chunk_size)
+        for index in rng.sample(range(chunks), k=max(1, chunks // 3)):
+            start = index * chunk_size
+            length = min(chunk_size, size - start)
+            out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
+    elif pattern == "zero-runs":
+        for _ in range(rng.randint(1, 4)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 3)))
+            out[start : start + length] = b"\0" * length
+    elif pattern == "tail":
+        length = min(size, rng.randint(1, 4097))
+        out[size - length :] = rand_bytes(length, 7)  # same length: the device size is unchanged
+    assert len(out) == size
+    return bytes(out)
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_randomized_engine_fuzz(tmp_path, seed):
+    """QASuite D-02: random sizes (0 and 1 byte included), chunk sizes, mutation patterns and
+    zero ratios; sender and receiver run as subprocesses; the destination must end
+    byte-identical to the source on every iteration, with a self-consistent summary."""
+    rng = random.Random(1000 + seed)
+    chunk_size = rng.choice([4096, 65536, 131072, 1 * MIB, 4 * MIB])
+    size = rng.choice([0, 1, chunk_size - 1, chunk_size, chunk_size + 1, rng.randint(0, 6 * MIB)])
+    workers = rng.choice([1, 2, 4])
+    zero_ratio = rng.choice([0.0, 0.3, 0.9])
+    # the source: random data with zero runs sprinkled in according to the zero ratio
+    source = bytearray(rand_bytes(size, seed))
+    if size and zero_ratio:
+        for _ in range(int(zero_ratio * 6)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 2)))
+            source[start : start + length] = b"\0" * length
+    source = bytes(source)
+    pattern = rng.choice(["extents", "chunks", "zero-runs", "tail", "identical"])
+    destination = source if pattern == "identical" else _mutate(source, rng, pattern, chunk_size)
+    src = write(tmp_path / "src", source)
+    dst = write(tmp_path / "dst", destination)
+
+    rc, summary, err = receive(dst, src, chunk_size=chunk_size, workers=workers)
+
+    assert rc == 0, err
+    assert read(dst) == source, "destination differs from the source (seed %d)" % seed
+    expected_chunks = (size + chunk_size - 1) // chunk_size
+    assert summary["ok"] is True and summary["chunks"] == expected_chunks
+    assert summary["bytes_scanned"] == size
+    assert 0 <= summary["chunks_changed"] <= expected_chunks
+    assert summary["bytes_transferred"] <= summary["bytes_changed"] <= size
+    if pattern == "identical":
+        assert summary["chunks_changed"] == 0 and summary["bytes_transferred"] == 0
+
+    # a second pass over now-identical devices moves nothing and leaves the data untouched
+    rc, again, err = receive(dst, src, chunk_size=chunk_size, workers=workers)
+    assert rc == 0, err
+    assert again["chunks_changed"] == 0 and again["bytes_transferred"] == 0
+    assert read(dst) == source
