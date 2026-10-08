@@ -585,10 +585,12 @@ with separate databases until 0.2.0.
   migration, so 10 active migrations produce ≤ 10 messages/s fanned out to *N* clients (500 msg/s for 50
   dashboards) — negligible. Heartbeat every 15 s keeps proxies open; resume with `?since=<seq>` replays from
   the `events` table (`limit` ≤ 1,000).
-* **Reads:** `GET /plans`, `/migrations`, `/stats` call `Store.list`, which loads **every document of the
-  kind** and filters in Python (SDD §11). At ≈ 20 KB per migration document, 1,000 migrations ≈ 20 MB per
-  request and Pydantic validation on the order of a second (planning estimate; PERF-CP-01 measures it). Prefer
-  SSE-triggered cache invalidation in the dashboard over short-interval polling.
+* **Reads:** `GET /migrations` filters and pages in SQL (expression indexes, SDD §11). `GET /stats` and
+  `GET /metrics` need every migration: they keep the last loaded list and reload it only when the store's
+  `change_stamp` (count + sum of versions, one aggregate query) moved — measured on SQLite with 1,000
+  migrations: a full load + validation 19 ms, the stamp 0.2 ms, so a 15 s Prometheus scrape or an idle
+  overview costs one aggregate query. `GET /plans` still loads every plan (plans are few). Prefer SSE-triggered
+  cache invalidation in the dashboard over short-interval polling.
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
   Re-estimation after a completed pass (calibration, §1) is one more write per pass and a pure function.

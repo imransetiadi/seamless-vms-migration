@@ -248,6 +248,17 @@ class Store:
     def get(self, kind: str, id_: str, model_cls: type[M]) -> M:
         return self.get_versioned(kind, id_, model_cls)[0]
 
+    def change_stamp(self, kind: str) -> tuple[int, int]:
+        """``(count, sum of versions)`` of the documents of ``kind``: changes whenever one is
+        inserted, updated or deleted, at the cost of one index scan instead of loading and
+        validating every document (``/stats`` and ``/metrics`` cache on it)."""
+        query = sa.select(
+            sa.func.count(documents.c.id), sa.func.coalesce(sa.func.sum(documents.c.version), 0)
+        ).where(documents.c.kind == kind)
+        with self.engine.connect() as conn:
+            count, versions = conn.execute(query).one()
+        return int(count), int(versions)
+
     def list(
         self,
         kind: str,
@@ -385,6 +396,9 @@ class AsyncStore:
 
     async def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
         return await asyncio.to_thread(self.sync.get_versioned, kind, id_, model_cls)
+
+    async def change_stamp(self, kind: str) -> tuple[int, int]:
+        return await asyncio.to_thread(self.sync.change_stamp, kind)
 
     async def list(
         self,

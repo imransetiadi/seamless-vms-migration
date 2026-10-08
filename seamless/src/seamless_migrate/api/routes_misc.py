@@ -69,9 +69,10 @@ async def stats(
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> Stats:
     svc = services(request)
-    filters = {"plan_id": plan_id} if plan_id else {}
-    migrations = await svc.db.list("migration", Migration, **filters)
-    plans = {p.id: p for p in await svc.db.list("plan", Plan)}
+    migrations = await svc.all_documents("migration", Migration)
+    if plan_id:
+        migrations = [m for m in migrations if m.plan_id == plan_id]
+    plans = {p.id: p for p in await svc.all_documents("plan", Plan)}
     return compute_stats(migrations, plans, svc.orchestrator.now())
 
 
@@ -114,7 +115,7 @@ async def similar_incidents(
 @router.get("/metrics", response_class=PlainTextResponse)
 async def metrics(request: Request, _: Principal | None = Depends(metrics_access)) -> str:
     svc = services(request)
-    migrations = await svc.db.list("migration", Migration)
+    migrations = await svc.all_documents("migration", Migration)
     text = render_metrics(
         migrations,
         svc.orchestrator.step_stats,

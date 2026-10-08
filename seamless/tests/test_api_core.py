@@ -255,6 +255,38 @@ def test_metrics_format(api, tmp_path):
     public_store.dispose()
 
 
+def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api, monkeypatch):
+    svc = api.client.app.state.services
+    loads: list[str] = []
+    original = svc.db.list
+
+    async def counting_list(kind, model_cls, **kw):
+        loads.append(kind)
+        return await original(kind, model_cls, **kw)
+
+    monkeypatch.setattr(svc.db, "list", counting_list)
+    assert api.get("/api/v1/stats").status_code == 200
+    assert api.get("/api/v1/metrics").status_code == 200
+    assert api.get("/api/v1/stats?plan_id=plan-x").status_code == 200
+    assert loads.count("migration") == 1 and loads.count("plan") == 1
+    # a change reloads: a new plan document moves the stamp of "plan" only
+    assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+    assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
+    created = api.post(
+        "/api/v1/plans",
+        Role.approver,
+        json={
+            "name": "cache",
+            "source_provider_id": SOURCE["id"],
+            "destination_provider_id": DESTINATION["id"],
+            "vm_ids": ["vm-1"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert api.get("/api/v1/stats").status_code == 200
+    assert loads.count("plan") == 2 and loads.count("migration") == 1
+
+
 def test_stats_shape(api):
     res = api.get("/api/v1/stats")
     assert res.status_code == 200

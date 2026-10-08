@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -46,6 +47,24 @@ class Services:
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
+    #: full document lists reused by /stats and /metrics while their change stamp holds
+    _doc_cache: dict[str, tuple[tuple[int, int], list[Any]]] = field(default_factory=dict)
+    _doc_cache_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def all_documents(self, kind: str, model_cls: type[Any]) -> list[Any]:
+        """Every document of ``kind``, reloaded only when the store's change stamp moved
+        (one aggregate query per call instead of loading and validating every row)."""
+        stamp = await self.db.change_stamp(kind)
+        cached = self._doc_cache.get(kind)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        async with self._doc_cache_lock:
+            cached = self._doc_cache.get(kind)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            rows = await self.db.list(kind, model_cls)
+            self._doc_cache[kind] = (stamp, rows)
+            return rows
 
     @property
     def db(self) -> AsyncStore:

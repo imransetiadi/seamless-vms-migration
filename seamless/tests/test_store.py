@@ -41,6 +41,20 @@ def test_optimistic_conflict_raises(any_store: Store):
         any_store.put("migration", make_migration(), expected_version=4)
 
 
+def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
+    assert any_store.change_stamp("migration") == (0, 0)
+    m = make_migration()
+    any_store.put("migration", m)
+    first = any_store.change_stamp("migration")
+    assert first == (1, 1)
+    any_store.put("migration", m.model_copy(update={"progress_pct": 50.0}), expected_version=1)
+    second = any_store.change_stamp("migration")
+    assert second == (1, 2) and second != first
+    any_store.delete("migration", m.id)
+    assert any_store.change_stamp("migration") == (0, 0)
+    assert any_store.change_stamp("plan") == (0, 0)  # per kind
+
+
 def test_list_filters(any_store: Store):
     a = make_migration(plan_id="plan-a", phase=Phase.ready, wave_id="wave-1")
     b = make_migration(plan_id="plan-a", phase=Phase.blocked, wave_id="wave-2")
