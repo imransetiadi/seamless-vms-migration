@@ -55,6 +55,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - The cold path's nbdkit export of source volumes is read-only.
 - The source of the conversion hosts' security group rules is configurable
   (``os_migrate_conversion_secgroup_remote_ip_prefix``).
+- ``os_migrate_workloads_preserve_volume_type`` (default ``false``) makes the
+  cold path and ``import_workload_warm_sync`` create destination volumes with
+  the serialized ``volume_type`` instead of the destination default type.
 - Progress files are replaced atomically; destination volume parameters are
   shared by the cold and warm paths.
 - Remove the unused ``sshpass`` from bindep.

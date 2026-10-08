@@ -96,15 +96,22 @@ def use_lock(lock_file):
     return _decorate_lock
 
 
-def destination_volume_sdk_params(conn, ser_server, path, mapping, timeout=DEFAULT_TIMEOUT):
+def destination_volume_sdk_params(
+    conn, ser_server, path, mapping, timeout=DEFAULT_TIMEOUT, preserve_volume_type=False
+):
     """Creation parameters for the destination copy of one source volume.
 
     Shared by the cold path (_create_destination_volumes) and the warm path
     so both create identical destination volumes. A mapping whose
     ``source_id`` is one of the workload's exported volumes takes that
     volume's user-editable params; otherwise the boot device takes the
-    non-null ``boot_volume_params`` migration params. ``volume_type`` is
-    never passed: the destination's default volume type is used.
+    non-null ``boot_volume_params`` migration params.
+
+    By default ``volume_type`` is never passed and the destination's default
+    volume type is used (os-migrate 1.0.5 behaviour). With
+    ``preserve_volume_type`` the serialized ``volume_type`` (or the mapping's
+    own ``volume_type``) is kept, so a type rewritten to a destination type
+    by the caller is honoured.
     """
     sdk_params = {
         "name": mapping["name"],
@@ -132,7 +139,13 @@ def destination_volume_sdk_params(conn, ser_server, path, mapping, timeout=DEFAU
                 )
             )
             sdk_params.update(boot_volume_params_defined)
-    sdk_params.pop("volume_type", None)
+    if preserve_volume_type:
+        if sdk_params.get("volume_type") is None and mapping.get("volume_type"):
+            sdk_params["volume_type"] = mapping["volume_type"]
+        if sdk_params.get("volume_type") is None:
+            sdk_params.pop("volume_type", None)
+    else:
+        sdk_params.pop("volume_type", None)
     return sdk_params
 
 
@@ -149,6 +162,7 @@ class OpenStackVolumeBase:
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
+        preserve_volume_type=False,
     ):
         # Required common parameters:
         # openstack_connection: OpenStack connection object
@@ -166,10 +180,13 @@ class OpenStackVolumeBase:
         # conversion_host_address: Optional address used to override 'access_ipv4'
         # state_file: File to hold current disk transfer state
         # log_file: Debug log path for volume migration
+        # preserve_volume_type: keep the serialized volume_type of destination
+        #                       volumes instead of the destination default
         self.conversion_host_address = conversion_host_address
         self.state_file = state_file
         self.log_file = log_file
         self.timeout = timeout
+        self.preserve_volume_type = bool(preserve_volume_type)
         # Configure logging
         self.log = logging.getLogger("osp-osp")
         log_format = logging.Formatter(
@@ -1035,7 +1052,12 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         ser_server = getattr(self, "ser_server", None)
         for path, mapping in self.volume_map.items():
             sdk_params = destination_volume_sdk_params(
-                self.conn, ser_server, path, mapping, self.timeout
+                self.conn,
+                ser_server,
+                path,
+                mapping,
+                self.timeout,
+                preserve_volume_type=self.preserve_volume_type,
             )
             new_volume = self.conn.create_volume(**sdk_params)
             self.volume_map[path]["dest_id"] = new_volume.id

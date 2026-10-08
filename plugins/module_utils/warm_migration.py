@@ -635,6 +635,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
         log_file=None,
         timeout=DEFAULT_TIMEOUT,
         shell_factory=None,
+        preserve_volume_type=False,
     ):
         super(OpenstackWarmSync, self).__init__(
             openstack_connection,
@@ -647,6 +648,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
             log_file=log_file,
             timeout=timeout,
             shell_factory=shell_factory,
+            preserve_volume_type=preserve_volume_type,
         )
         self.ser_server = ser_server
         self.state = state
@@ -770,9 +772,15 @@ class OpenstackWarmSync(_WarmVolumeBase):
             "size": source["size"],
             "bootable": source["bootable"],
             "source_id": source["tmp_volume_id"] if dev == BOOT_DEVICE else source["source_id"],
+            "volume_type": source.get("volume_type"),
         }
         params = destination_volume_sdk_params(
-            self.conn, self.ser_server, dev, cold_mapping, self.timeout
+            self.conn,
+            self.ser_server,
+            dev,
+            cold_mapping,
+            self.timeout,
+            preserve_volume_type=self.preserve_volume_type,
         )
         params.pop("wait", None)
         params.pop("timeout", None)

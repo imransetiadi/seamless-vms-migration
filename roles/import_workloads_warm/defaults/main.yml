@@ -16,6 +16,9 @@ os_migrate_warm_parallel_disks: 4  # noqa: var-naming[no-role-prefix]
 # are zero-filled). Only safe on backends that return zeros for blocks
 # never written (Ceph RBD, thin LVM, sparse files).
 os_migrate_warm_assume_zero: false  # noqa: var-naming[no-role-prefix]
+# Keep the serialized volume_type of destination volumes (after mapping it to
+# a destination type in the workload data) instead of the destination default.
+os_migrate_workloads_preserve_volume_type: false  # noqa: var-naming[no-role-prefix]
 # Python 3.6+ on the conversion hosts (e.g. /usr/libexec/platform-python on RHEL 8).
 os_migrate_warm_python_interpreter: python3  # noqa: var-naming[no-role-prefix]
 # Warm state files: {{ os_migrate_warm_state_dir }}/{source_server_id}.json

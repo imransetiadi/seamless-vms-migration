@@ -270,6 +270,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         use_nbdkit_direct=False,
         nbdkit_socket_uri=None,
         nbdkit_export_name=None,
+        preserve_volume_type=False,
     ):
 
         super().__init__(
@@ -282,6 +283,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             state_file=state_file,
             log_file=log_file,
             timeout=timeout,
+            preserve_volume_type=preserve_volume_type,
         )
 
         # Required unique parameters:
@@ -397,6 +399,7 @@ def run_module():
         use_nbdkit_direct=dict(type="bool", default=False),
         nbdkit_socket_uri=dict(type="str", default=None),
         nbdkit_export_name=dict(type="str", default=None),
+        preserve_volume_type=dict(type="bool", default=False),
     )
 
     result = dict(
@@ -455,6 +458,7 @@ def run_module():
         use_nbdkit_direct=use_nbdkit_direct,
         nbdkit_socket_uri=nbdkit_socket_uri,
         nbdkit_export_name=nbdkit_export_name,
+        preserve_volume_type=module.params["preserve_volume_type"],
     )
     destination_host.transfer_exports()
 

@@ -106,6 +106,14 @@ options:
     required: false
     default: 4
     type: int
+  preserve_volume_type:
+    description:
+      - Create the destination volumes with the serialized C(volume_type) instead
+        of the destination's default type. Set it when the volume types in the
+        workload data were already rewritten to destination types.
+    required: false
+    default: false
+    type: bool
   assume_zero:
     description:
       - Skip reading destination volumes created by this pass and treat them as
@@ -233,6 +241,7 @@ def run_module():
         chunk_size=dict(type="int", default=blocksync.DEFAULT_CHUNK_SIZE),
         workers=dict(type="int", default=blocksync.DEFAULT_WORKERS),
         parallel_disks=dict(type="int", default=DEFAULT_PARALLEL_DISKS),
+        preserve_volume_type=dict(type="bool", default=False),
         assume_zero=dict(type="bool", default=False),
         python_interpreter=dict(type="str", default="python3"),
         log_file=dict(type="str", default=None),
@@ -281,6 +290,7 @@ def run_module():
             chunk_size=params["chunk_size"],
             workers=params["workers"],
             parallel_disks=params["parallel_disks"],
+            preserve_volume_type=params["preserve_volume_type"],
             assume_zero=params["assume_zero"],
             python_interpreter=params["python_interpreter"],
             state_file=params["state_file"],

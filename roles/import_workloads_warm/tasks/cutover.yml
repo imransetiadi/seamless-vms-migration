@@ -129,6 +129,7 @@
                 chunk_size: "{{ os_migrate_warm_chunk_size }}"
                 workers: "{{ os_migrate_warm_workers }}"
                 parallel_disks: "{{ os_migrate_warm_parallel_disks }}"
+                preserve_volume_type: "{{ os_migrate_workloads_preserve_volume_type }}"
                 assume_zero: "{{ os_migrate_warm_assume_zero }}"
                 python_interpreter: "{{ os_migrate_warm_python_interpreter }}"
                 log_file: "{{ import_workloads_warm_prelim.log_file }}"

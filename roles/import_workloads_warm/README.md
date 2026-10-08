@@ -60,6 +60,7 @@ and the module log to `workload_logs/{name}.log`.
 | `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and the warm state |
 | `os_migrate_warm_parallel_disks` | `4` | disks of a workload synchronised at the same time |
 | `os_migrate_warm_assume_zero` | `false` | skip reading destination volumes created by the first pass; only for backends that return zeros for never-written blocks (Ceph RBD, thin LVM) |
+| `os_migrate_workloads_preserve_volume_type` | `false` | create destination volumes with the serialized `volume_type` (rewrite it to a destination type in the workload data first) instead of the destination default; also honoured by `import_workloads` |
 | `os_migrate_warm_python_interpreter` | `python3` | Python 3.6+ on the conversion hosts (`/usr/libexec/platform-python` on RHEL 8) |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | warm state files |
 | `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. migrated cold): delete the only destination server named exactly like the workload |

@@ -4,5 +4,8 @@ os_migrate_workload_cleanup_on_failure: true
 os_migrate_workload_boot_volume_prefix: os-migrate-
 os_migrate_workload_stop_before_migration: false
 os_migrate_workloads_data_copy: true
+# Keep the serialized volume_type of destination volumes (after mapping it to
+# a destination type in the workload data) instead of the destination default.
+os_migrate_workloads_preserve_volume_type: false
 os_migrate_workloads_filter:
   - regex: .*

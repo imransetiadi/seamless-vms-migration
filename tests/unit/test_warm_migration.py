@@ -502,6 +502,33 @@ def test_sync_destination_volumes_match_cold_path_params(tmp_path):
     assert "volume_type" not in boot[1] and "volume_type" not in data[1]
 
 
+def test_sync_preserves_volume_type_when_asked(tmp_path):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1", preserve_volume_type=True)
+
+    boot, data = scenario.dst.calls_to("create_volume")
+    # Both destination volumes keep the serialized (already mapped) type of
+    # their source volume instead of the destination default.
+    assert boot[1]["volume_type"] == "ssd"
+    assert data[1]["volume_type"] == "ceph"
+
+
+def test_destination_volume_sdk_params_volume_type_switch():
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common
+
+    mapping = {"name": "n", "bootable": False, "size": 5, "source_id": "x", "volume_type": "hdd"}
+    default = volume_common.destination_volume_sdk_params(None, None, "/dev/vdb", mapping, 10)
+    assert "volume_type" not in default
+    kept = volume_common.destination_volume_sdk_params(
+        None, None, "/dev/vdb", mapping, 10, preserve_volume_type=True
+    )
+    assert kept["volume_type"] == "hdd"
+    untyped = dict(mapping, volume_type=None)
+    assert "volume_type" not in volume_common.destination_volume_sdk_params(
+        None, None, "/dev/vdb", untyped, 10, preserve_volume_type=True
+    )
+
+
 def test_sync_records_pass_in_state(tmp_path):
     scenario = Scenario(
         tmp_path,
