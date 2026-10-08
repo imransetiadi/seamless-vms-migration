@@ -54,7 +54,8 @@ test('a viewer cannot reach approver actions', async ({ page }) => {
 
 test('light theme switches the token values', async ({ page }) => {
   await signIn(page);
-  await page.getByRole('button', { name: /theme|light|dark/i }).first().click();
+  // the sidebar toggle is labelled by its visible text (the header one by aria-label)
+  await page.locator('aside').getByRole('button', { name: /^(light|dark) theme$/i }).click();
   await expect
     .poll(async () => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
     .toBe('rgb(248, 250, 252)');

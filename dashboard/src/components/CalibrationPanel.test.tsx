@@ -40,6 +40,25 @@ describe('CalibrationPanel', () => {
     expect(screen.getByText('Disks scanned in parallel')).toBeInTheDocument();
   });
 
+  it('shows no scan term for VMware CBT and calls it calibrated once a delta pass carried bytes', () => {
+    const { warm, plan } = fixtures();
+    const m: Migration = { ...warm, strategy: 'vmware_warm', observed_scan_bps: null, vm: { ...warm.vm, change_rate_bps: 3 * MiB } };
+    render(<CalibrationPanel migration={m} plan={plan} />);
+    expect(screen.getByText(/calibrated: the estimate uses rates measured/i)).toBeInTheDocument();
+    expect(screen.getByText('not needed')).toBeInTheDocument();
+    expect(screen.getByText(/changed-block tracking knows the delta/)).toBeInTheDocument();
+    expect(screen.queryByText(/measured by the last delta pass/)).not.toBeInTheDocument();
+  });
+
+  it('does not call a delta pass without byte counts a measurement', () => {
+    const { warm, plan } = fixtures();
+    const passes = warm.sync_passes.map((p) => ({ ...p, bytes_changed: 0, bytes_scanned: 0, bytes_transferred: 0 }));
+    const m: Migration = { ...warm, sync_passes: passes, observed_scan_bps: null, vm: { ...warm.vm, change_rate_bps: 3 * MiB } };
+    render(<CalibrationPanel migration={m} plan={plan} />);
+    expect(screen.getByText(/not calibrated yet/i)).toBeInTheDocument();
+    expect(screen.getByText('from the inventory')).toBeInTheDocument();
+  });
+
   it('explains that single-shot strategies are never calibrated', () => {
     const { warm, plan } = fixtures();
     const m: Migration = { ...warm, strategy: 'cold', sync_passes: [], observed_scan_bps: null };

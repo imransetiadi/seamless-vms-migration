@@ -32,6 +32,11 @@ function Row({ label, value, source }: { label: string; value: string; source: s
  */
 export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) {
   const overrides = plan?.estimator_overrides ?? {};
+  // a delta pass with byte counts calibrated the write rate (the VMware kit reports none)
+  const measuredDelta = m.sync_passes.some(
+    (p) => p.kind !== 'full' && p.ended_at !== null && (p.bytes_changed > 0 || p.bytes_scanned > 0),
+  );
+  const cbt = m.strategy === 'vmware_warm';
   const scanSource =
     m.observed_scan_bps !== null
       ? 'measured by the last delta pass'
@@ -41,14 +46,15 @@ export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) 
   const scan = m.observed_scan_bps ?? overrides.scan_bps ?? DEFAULT_SCAN_BPS;
   const changeSource =
     m.vm.change_rate_bps !== null
-      ? m.sync_passes.some((p) => p.kind !== 'full' && p.ended_at !== null)
+      ? measuredDelta
         ? 'measured between snapshots'
         : 'from the inventory'
       : 'change_rate_bps' in overrides
         ? 'plan override'
         : 'planning default';
   const changeRate = m.vm.change_rate_bps ?? overrides.change_rate_bps ?? DEFAULT_CHANGE_RATE_BPS;
-  const calibrated = m.observed_scan_bps !== null;
+  // the scan rate is calibrated for the OpenStack warm path only; CBT passes have no scan term
+  const calibrated = m.observed_scan_bps !== null || (cbt && measuredDelta);
   const warm = isWarmStrategy(m.strategy);
 
   return (
@@ -63,7 +69,11 @@ export function CalibrationPanel({ migration: m, plan }: CalibrationPanelProps) 
       </p>
       <dl className="mt-2 divide-y divide-border">
         <Row label="Guest write rate" value={formatRate(changeRate)} source={changeSource} />
-        <Row label="Scan rate per disk stream" value={formatRate(scan)} source={scanSource} />
+        {cbt ? (
+          <Row label="Scan rate per disk stream" value="not needed" source="changed-block tracking knows the delta" />
+        ) : (
+          <Row label="Scan rate per disk stream" value={formatRate(scan)} source={scanSource} />
+        )}
         {plan && <Row label="Link speed" value={formatRate(plan.link_bps)} source="plan" />}
         {'parallel_disks' in overrides && (
           <Row label="Disks scanned in parallel" value={String(overrides.parallel_disks)} source="plan override" />

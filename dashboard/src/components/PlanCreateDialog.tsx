@@ -234,7 +234,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     parallel: id('parallel'),
     ports: id('ports'),
   };
-  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'ports'].some((k) => k in errors);
+  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!create.isPending} initialFocusRef={nameRef}>

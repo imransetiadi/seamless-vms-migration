@@ -17,6 +17,8 @@ export default defineConfig({
   webServer: {
     command: 'VITE_SEAMLESS_MOCK=1 npx vite build --outDir dist-mock && npx vite preview --outDir dist-mock --host 127.0.0.1 --port 4173 --strictPort',
     url: 'http://127.0.0.1:4173/login',
+    // locally a preview left running serves whatever dist-mock it was started with: stop it
+    // (or run with CI=1) after changing CSS or components to test a fresh build
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },

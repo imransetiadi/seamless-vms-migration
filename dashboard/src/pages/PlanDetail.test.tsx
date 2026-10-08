@@ -1,7 +1,7 @@
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
 function renderPlan(planId: string, token = 'operator') {
@@ -26,6 +26,18 @@ describe('PlanDetail', () => {
     expect(within(waves).getByText('Middleware')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: /migrations/i });
     expect(within(table).getAllByRole('row')).toHaveLength(11);
+  });
+
+  it('formats the estimator overrides and marks link_bps as ignored', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e');
+    if (!plan) throw new Error('fixture plan missing');
+    plan.estimator_overrides = { scan_bps: 400 * 2 ** 20, parallel_disks: 2, link_bps: 10 * 2 ** 20 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    await within(settings).findByText(/scan_bps=400 MiB\/s/);
+    expect(settings).toHaveTextContent(/parallel_disks=2/);
+    expect(settings).toHaveTextContent(/link_bps=10.0 MiB\/s \(ignored: the plan link bandwidth applies\)/);
   });
 
   it('enables only Pause for a running plan', async () => {

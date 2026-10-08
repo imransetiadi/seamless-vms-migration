@@ -75,6 +75,14 @@ function providerLabel(provider: Provider | undefined, id: string) {
   );
 }
 
+/** Human value of an estimator override (SDD §9.1): rates, durations, counts; link_bps is ignored. */
+function formatOverride(key: string, value: number): string {
+  if (key === 'link_bps') return `${formatRate(value)} (ignored: the plan link bandwidth applies)`;
+  if (key.endsWith('_bps')) return formatRate(value);
+  if (key.endsWith('_s')) return formatDuration(value);
+  return String(value);
+}
+
 function windowText(plan: Plan): string {
   const w = plan.cutover_window;
   if (!w) return 'Any time';
@@ -118,7 +126,7 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         <Setting label="Estimator overrides">
           <span className="font-mono text-xs">
             {Object.entries(plan.estimator_overrides)
-              .map(([k, v]) => `${k}=${v}`)
+              .map(([k, v]) => `${k}=${formatOverride(k, v)}`)
               .join(' · ')}
           </span>
           <span className="block text-xs text-muted-foreground">Replace the planning defaults for this plan (SDD §9.1)</span>

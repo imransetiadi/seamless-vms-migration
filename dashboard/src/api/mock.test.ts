@@ -72,6 +72,20 @@ describe('mock API', () => {
     await expect(setup('nonsense').client.get('/me')).rejects.toMatchObject({ status: 401 });
   });
 
+  it('simulates the auth lockout for API routes but keeps the health routes public', async () => {
+    const { client } = setup('locked');
+    await expect(client.get('/me')).rejects.toMatchObject({ status: 429, code: 'too_many_requests' });
+    await expect(client.get('/health')).resolves.toMatchObject({ status: expect.any(String) });
+  });
+
+  it('honours limit and offset on the migrations list', async () => {
+    const { server, client } = setup();
+    const all = await client.get<Migration[]>('/migrations');
+    expect(all).toHaveLength(server.migrations.length);
+    const page = await client.get<Migration[]>('/migrations', { query: { limit: 2, offset: 1 } });
+    expect(page.map((m) => m.id)).toEqual(all.slice(1, 3).map((m) => m.id));
+  });
+
   it('enforces route roles (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const waiting = byPhase(server, 'awaiting_cutover');

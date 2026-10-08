@@ -92,31 +92,46 @@ function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
   );
 }
 
-/** Shown above every page while GET /health is degraded or unreachable (SDD §12). */
+/**
+ * Shown above every page while GET /health is degraded or unreachable (SDD §12). The live
+ * region is always mounted so screen readers announce the text when it appears.
+ */
 function HealthNotice() {
   const health = useHealth();
+  let tone: 'danger' | 'warning' | null = null;
+  let text = '';
   if (health.isError) {
-    return (
-      <p role="status" className="mb-4 rounded-md border border-status-warning/50 bg-status-warning/10 px-3 py-2 text-sm text-foreground">
-        The control plane is not answering health checks; the data below may be stale.
-      </p>
-    );
-  }
-  const h = health.data;
-  if (!h || h.status !== 'degraded') return null;
-  const reasons: string[] = [];
-  if (h.db !== 'ok') reasons.push('the database is unreachable');
-  if (h.orchestrator && !h.orchestrator.healthy) {
-    reasons.push(
-      h.orchestrator.running
-        ? `the orchestrator has not ticked for ${Math.round(h.orchestrator.last_tick_age_s ?? 0)} s`
-        : 'the orchestrator loop is not running',
-    );
+    tone = 'warning';
+    text = 'The control plane is not answering health checks; the data below may be stale.';
+  } else if (health.data && health.data.status === 'degraded') {
+    const h = health.data;
+    const reasons: string[] = [];
+    if (h.db !== 'ok') reasons.push('the database is unreachable');
+    if (h.orchestrator && !h.orchestrator.healthy) {
+      const age = h.orchestrator.last_tick_age_s;
+      reasons.push(
+        !h.orchestrator.running
+          ? 'the orchestrator loop is not running'
+          : age === null
+            ? 'the orchestrator loop is unhealthy before its first tick'
+            : `the orchestrator loop is unhealthy (last tick ${Math.round(age)} s ago)`,
+      );
+    }
+    tone = 'danger';
+    text = `Control plane degraded: ${reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is resolved.`;
   }
   return (
-    <p role="status" className="mb-4 rounded-md border border-status-danger/50 bg-status-danger/10 px-3 py-2 text-sm text-foreground">
-      Control plane degraded: {reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is
-      resolved.
+    <p
+      role="status"
+      aria-live="polite"
+      data-testid="health-notice"
+      className={cn(
+        tone === null && 'sr-only',
+        tone === 'danger' && 'mb-4 rounded-md border border-status-danger/50 bg-status-danger/10 px-3 py-2 text-sm text-foreground',
+        tone === 'warning' && 'mb-4 rounded-md border border-status-warning/50 bg-status-warning/10 px-3 py-2 text-sm text-foreground',
+      )}
+    >
+      {text}
     </p>
   );
 }

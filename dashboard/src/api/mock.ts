@@ -446,8 +446,10 @@ export class MockServer {
   }
 
   handle(method: string, path: string, query: URLSearchParams, body: unknown, token: string | null): MockResponse {
-    // the token "locked" simulates the control plane's per-address lockout (SDD §15.1)
-    if (token?.trim().toLowerCase() === 'locked') {
+    // the token "locked" simulates the control plane's per-address lockout (SDD §15.1);
+    // like the real one it never affects the public health routes
+    const publicRoute = /^\/?(health|ready)$/.test(path);
+    if (token?.trim().toLowerCase() === 'locked' && !publicRoute) {
       return {
         status: 429,
         body: { error: { code: 'too_many_requests', message: 'too many failed authentication attempts from this address; retry in a minute' } },
@@ -563,14 +565,15 @@ export class MockServer {
     if (root === 'migrations') {
       if (!id && method === 'GET') {
         this.require(token, 'viewer', path);
-        return ok(
-          this.migrations.filter(
-            (m) =>
-              (!query.get('plan_id') || m.plan_id === query.get('plan_id')) &&
-              (!query.get('phase') || m.phase === query.get('phase')) &&
-              (!query.get('wave_id') || m.wave_id === query.get('wave_id')),
-          ),
+        const rows = this.migrations.filter(
+          (m) =>
+            (!query.get('plan_id') || m.plan_id === query.get('plan_id')) &&
+            (!query.get('phase') || m.phase === query.get('phase')) &&
+            (!query.get('wave_id') || m.wave_id === query.get('wave_id')),
         );
+        const offset = Number(query.get('offset') ?? 0);
+        const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+        return ok(rows.slice(offset, offset + limit));
       }
       if (id && !sub && method === 'GET') {
         this.require(token, 'viewer', path);
@@ -896,7 +899,7 @@ export class MockServer {
     for (const m of mine) byPhase[m.phase] = (byPhase[m.phase] ?? 0) + 1;
     const downtimes = mine.filter((m) => m.actual_downtime_s !== null && m.downtime_ended_at !== null);
     const values = downtimes.map((m) => m.actual_downtime_s ?? 0).sort((a, b) => a - b);
-    const sloOf = (m: Migration) => this.plans.find((p) => p.id === m.plan_id)?.downtime_slo_s ?? 300;
+    const sloOf = (m: Migration) => this.plans.find((p) => p.id === m.plan_id)?.downtime_slo_s ?? 600;
     const byStrategy: Partial<Record<Strategy, number>> = {};
     for (const s of STRATEGIES) {
       const list = downtimes.filter((m) => m.strategy === s).map((m) => m.actual_downtime_s ?? 0);

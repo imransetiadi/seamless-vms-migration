@@ -27,7 +27,18 @@ describe('Layout health notice', () => {
     renderWithApp(<Layout />, { route: '/', path: '/', server });
     expect(await screen.findByTestId('orchestrator-status')).toHaveTextContent(/stalled/i);
     const notice = await screen.findByRole('status', { name: '' });
-    expect(notice).toHaveTextContent(/control plane degraded: the database is unreachable; the orchestrator has not ticked for 42 s/i);
+    expect(notice).toHaveTextContent(
+      /control plane degraded: the database is unreachable; the orchestrator loop is unhealthy \(last tick 42 s ago\)/i,
+    );
+  });
+
+  it('keeps the live region mounted while healthy so a later notice is announced', async () => {
+    renderWithApp(<Layout />, { route: '/', path: '/' });
+    await screen.findByRole('navigation', { name: /primary/i });
+    const region = screen.getByTestId('health-notice');
+    expect(region).toHaveAttribute('role', 'status');
+    expect(region).toHaveAttribute('aria-live', 'polite');
+    expect(region).toBeEmptyDOMElement();
   });
 
   it('reports a dead orchestrator loop', async () => {

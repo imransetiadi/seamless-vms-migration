@@ -668,6 +668,13 @@ Twenty-three further iterations after the integration run, each verified with th
   starts, prune cutoffs are normalised to UTC. Security headers (CSP, nosniff, DENY framing) on every
   response and viewer-gated OpenAPI docs outside demo mode closed Security.md R-04/R-05; verified in a
   real Chromium session against the rebuilt stack (no console errors or CSP violations).
+* Dashboard review wave: the plan dialog opens its advanced section for scan/parallel errors as it does
+  for the other fields; the health notice is a persistent polite live region and names an unhealthy
+  running loop by its last tick; the calibration panel treats the VMware CBT path correctly (no scan term,
+  calibrated once a delta pass carried byte counts); estimator overrides are shown as rates and `link_bps`
+  is marked as ignored; the mock honours `limit`/`offset`, keeps `/health` and `/ready` outside the
+  simulated lockout and uses the backend's 600 s SLO default; the browser smoke selects the sidebar theme
+  toggle by its visible name.
 
 ### 13.2 Exit criteria — release 0.1.0
 

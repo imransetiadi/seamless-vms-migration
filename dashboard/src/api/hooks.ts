@@ -144,7 +144,13 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
     queryFn: ({ signal }) =>
       api.get<Migration[]>('/migrations', {
         signal,
-        query: { plan_id: query.plan_id, phase: query.phase, wave_id: query.wave_id },
+        query: {
+          plan_id: query.plan_id,
+          phase: query.phase,
+          wave_id: query.wave_id,
+          limit: query.limit,
+          offset: query.offset,
+        },
       }),
     enabled: options.enabled ?? true,
     placeholderData: options.keepPrevious ? keepPreviousData : undefined,

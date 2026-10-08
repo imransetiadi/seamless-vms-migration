@@ -477,7 +477,7 @@ export function defaultPlanFields(now: number) {
     default_strategy: 'auto' as const,
     strategy_overrides: {},
     selection_policy: 'min_downtime' as const,
-    downtime_slo_s: 300,
+    downtime_slo_s: 600,
     require_approval: true,
     auto_cutover: false,
     cutover_window: null,
@@ -643,7 +643,7 @@ const PLAN_SPECS: PlanSpec[] = [
     overrides: {
       handover: { enabled: true, backend_map: { 'ceph-ssd': 'hostgroup@ceph-ssd#volumes-ssd' } },
       cutover_window: null,
-      downtime_slo_s: 300,
+      downtime_slo_s: 600,
     },
     waves: [{ id: 'wave-1', name: 'Spark cluster', vms: ['os-0f71', 'os-0f72', 'os-0f73', 'os-0f74'], max_parallel: 4 }],
     migrations: [
