@@ -42,6 +42,12 @@ def test_api_journey_on_every_store_backend(any_store, tmp_path):
             assert subset and all(m["phase"] == phase for m in subset)
         assert api.get("/api/v1/migrations?plan_id=plan-nope").json() == []
 
+        # the plan list filters by status and pages in SQL too
+        assert [p["id"] for p in api.get("/api/v1/plans?status=validated").json()] == [plan_id]
+        assert api.get("/api/v1/plans?status=running").json() == []
+        assert api.get("/api/v1/plans?limit=1&offset=1").json() == []
+        assert api.get("/api/v1/plans?status=nope").status_code == 422
+
         # change-stamp cache, stats and metrics
         stats = api.get(f"/api/v1/stats?plan_id={plan_id}").json()
         assert stats["total"] == len(vm_ids)

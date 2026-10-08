@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderRole, Role
@@ -77,9 +77,15 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
 
 @router.get("/plans", response_model=list[Plan])
 async def list_plans(
-    request: Request, _: Principal = Depends(require_role(Role.viewer))
+    request: Request,
+    status: PlanStatus | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Plan]:
-    return await services(request).db.list("plan", Plan)
+    """Plans in creation order; ``status``, ``limit`` and ``offset`` run in SQL (SDD §12)."""
+    filters = {"status": status} if status is not None else {}
+    return await services(request).db.list("plan", Plan, limit=limit, offset=offset, **filters)
 
 
 @router.post("/plans", response_model=Plan, status_code=201)
