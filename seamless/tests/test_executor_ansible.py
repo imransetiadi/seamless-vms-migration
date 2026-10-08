@@ -8,7 +8,7 @@ import yaml
 
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
-from seamless_migrate.domain.models import ConversionHostConfig, Mappings
+from seamless_migrate.domain.models import ConversionHostConfig, Mappings, utcnow
 from seamless_migrate.executors.ansible import (
     CONVERSION_KEY_FILE,
     KIT_PLAYBOOK,
@@ -503,8 +503,8 @@ async def test_downtime_clock_starts_at_the_stop_task(env, monkeypatch):
 
     ctx, rec = ctx_for(env, strategy=Strategy.warm)
 
-    async def mark():
-        marks.append(time.time())
+    async def mark(at=None):
+        marks.append(at.timestamp() if at is not None else time.time())
         rec.downtime_marks += 1
 
     ctx.mark_downtime_start = mark
@@ -730,3 +730,15 @@ def test_lazy_provider_registry(env):
     executor = AnsibleExecutor(env.settings)
     assert isinstance(executor.providers, ProviderRegistry)
     assert executor.providers is executor.providers
+
+
+async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")
+    ctx, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert rec.downtime_marks == 0, "a skipped stop task does not stop the source"
+    monkeypatch.delenv("ANSIBLE_FAKE_STOP_SKIPPED")
+    ctx2, rec2 = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, ctx2)
+    assert rec2.downtime_marks == 1 and rec2.downtime_at[0] is not None
+    assert (utcnow() - rec2.downtime_at[0]).total_seconds() < 60

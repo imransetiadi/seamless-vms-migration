@@ -477,8 +477,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   warm state file. Non-zero exit → `TransientStepError` when the output matches a transient pattern
   (`Timeout`, `HTTP 503`, `Connection reset`), otherwise `PermanentStepError`.
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
-* Downtime clock for Ansible-driven cutovers: the executor calls `mark_downtime_start()` when the
-  playbook output shows the source-stop task starting (`TASK [... : Stop the source server]` for the
+* Downtime clock for Ansible-driven cutovers: the executor calls `mark_downtime_start(at=…)` with the
+  time the playbook output showed the source-stop task starting, once the task's result line confirms
+  it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
   for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts.
 * Cold rollback passes `os_migrate_rollback_match_by_name: true` (the cold path does not record the

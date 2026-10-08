@@ -1115,9 +1115,9 @@ class Orchestrator:
         async def report_progress(pct: float, done: int, total: int) -> None:
             await self._on_progress(mid, phase, pct, done, total, persist=not locked)
 
-        async def mark_downtime_start() -> None:
+        async def mark_downtime_start(at: datetime | None = None) -> None:
             if not locked:
-                await self._mark_downtime(mid)
+                await self._mark_downtime(mid, at)
 
         async def log_line(line: str) -> None:
             await self._emit(
@@ -1171,12 +1171,12 @@ class Orchestrator:
             },
         )
 
-    async def _mark_downtime(self, mid: str) -> None:
+    async def _mark_downtime(self, mid: str, at: datetime | None = None) -> None:
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.downtime_started_at is not None:
                 return
-            m.downtime_started_at = self._now()
+            m.downtime_started_at = at or self._now()
             await self._save(m, v)
         await self._emit(
             "migration.downtime_started",

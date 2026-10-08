@@ -1,5 +1,5 @@
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -961,3 +961,24 @@ async def test_orchestrator_health_reports_loop_state(tmp_path, store):
     h.orch._started = True
     assert h.orch.health()["healthy"] is False
     h.orch._started = False
+
+
+async def test_executor_supplied_downtime_start_is_kept(tmp_path, store):
+    settings = make_settings(tmp_path)
+    stopped_at = datetime.now(UTC) - timedelta(seconds=90)
+
+    async def precise_cutover(ctx):
+        await ctx.mark_downtime_start(at=stopped_at)
+        await ctx.mark_downtime_start()  # later calls never move the clock
+        return StepResult(destination_server_id="dst-1")
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: precise_cutover})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert m.downtime_started_at == stopped_at
+    assert m.actual_downtime_s is not None and m.actual_downtime_s >= 90

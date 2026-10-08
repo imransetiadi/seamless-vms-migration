@@ -54,6 +54,8 @@ TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
 STOP_TASK = re.compile(
     r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down)"
 )
+#: Result lines of an Ansible task (default stdout callback).
+_RESULT_LINE = re.compile(r"^(ok|changed|failed|fatal|skipping|unreachable):")
 #: Private key for an existing conversion host (``ssh_key_secret``), written per run.
 CONVERSION_KEY_FILE = "conversion-ssh.key"
 _RESOURCE = re.compile(r"^[a-z_]+$")
@@ -621,6 +623,7 @@ class AnsibleExecutor:
     ) -> None:
         name = playbook.name
         watch_stop = playbook.stops_source and ctx is not None
+        stop_seen_at: Any = None  # the stop task started; its result line confirms it ran
         cmd = [
             self.settings.ansible_playbook,
             "-i", str(inventory),
@@ -656,10 +659,19 @@ class AnsibleExecutor:
                 if ctx is not None and line.strip():
                     await ctx.log(line[:2000])
                 if watch_stop and STOP_TASK.match(line):
-                    # SDD §7.2: the downtime clock starts when the source-stop task starts
+                    # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
-                    await ctx.mark_downtime_start()  # type: ignore[union-attr]
+                    stop_seen_at = utcnow()
+                elif stop_seen_at is not None and _RESULT_LINE.match(line):
+                    # …but only once its result line shows it ran (a skipped task, e.g. with
+                    # data_copy: false, prints the TASK header too and stops nothing)
+                    if not line.startswith("skipping:"):
+                        await ctx.mark_downtime_start(at=stop_seen_at)  # type: ignore[union-attr]
+                    stop_seen_at = None
             returncode = await proc.wait()
+            if stop_seen_at is not None and ctx is not None:
+                # the playbook ended without a result line for the task: assume it ran
+                await ctx.mark_downtime_start(at=stop_seen_at)
         finally:
             if tail is not None:
                 tail.cancel()
