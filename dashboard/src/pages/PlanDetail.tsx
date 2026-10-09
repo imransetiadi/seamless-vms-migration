@@ -430,6 +430,7 @@ export default function PlanDetail() {
         description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together."
         confirmLabel="Plan waves"
         canConfirm={waveSizeValid}
+        confirmReason="Enter a whole number from 1 to 100."
         pending={pending('waves')}
         error={confirm === 'waves' ? action.error : null}
         onConfirm={() => run({ action: 'waves', body: { max_wave_size: waveSizeNumber } })}

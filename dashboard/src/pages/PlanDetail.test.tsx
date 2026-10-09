@@ -246,6 +246,24 @@ describe('PlanDetail', () => {
     await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-95a7e3f1')?.status).toBe('running'));
   });
 
+  it('says why Plan waves is unavailable while the wave size is not a whole number from 1 to 100 (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-0e9f6a17');
+    await user.click(await actionButton(/auto-plan waves/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves|replace the waves/i });
+    const size = within(dialog).getByLabelText(/maximum vms per wave/i);
+    const confirm = within(dialog).getByRole('button', { name: /^plan waves$/i });
+    await user.clear(size);
+    await user.type(size, '0');
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a whole number from 1 to 100.');
+    await user.clear(size);
+    await user.type(size, '4');
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.click(confirm);
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length).toBeGreaterThan(0));
+  });
+
   it('keeps every plan action disabled for viewers, with the reason', async () => {
     renderPlan('plan-c81d44a0', 'viewer');
 

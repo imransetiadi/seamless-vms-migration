@@ -16,6 +16,8 @@ export interface ConfirmDialogProps {
   children?: ReactNode;
   /** Additional validation owned by `children`. */
   canConfirm?: boolean;
+  /** Why Confirm is unavailable while `canConfirm` is false: the button stays focusable and says so (SDD §16). */
+  confirmReason?: string;
   pending?: boolean;
   error?: unknown;
   onConfirm: () => void;
@@ -33,6 +35,7 @@ export function ConfirmDialog({
   requireText,
   children,
   canConfirm = true,
+  confirmReason,
   pending = false,
   error,
   onConfirm,
@@ -41,6 +44,7 @@ export function ConfirmDialog({
   const titleId = useId();
   const descriptionId = useId();
   const inputId = useId();
+  const mismatchId = useId();
   const [typed, setTyped] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -52,6 +56,15 @@ export function ConfirmDialog({
 
   const typedOk = requireText === undefined || typed === requireText;
   const ready = typedOk && canConfirm && !pending;
+  const mismatch = typed.length > 0 && !typedOk;
+  // an unavailable Confirm stays in the Tab order and says why (SDD §16); while pending it is busy instead
+  const blockedReason = pending
+    ? null
+    : !typedOk
+      ? `Type ${requireText} to confirm.`
+      : !canConfirm
+        ? (confirmReason ?? 'Complete the fields above first.')
+        : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -95,9 +108,14 @@ export function ConfirmDialog({
               autoComplete="off"
               autoCapitalize="off"
               spellCheck={false}
-              aria-invalid={typed.length > 0 && !typedOk ? true : undefined}
+              aria-invalid={mismatch ? true : undefined}
+              aria-describedby={mismatch ? mismatchId : undefined}
             />
-            {typed.length > 0 && !typedOk && <p className="field-error">The text does not match yet.</p>}
+            {mismatch && (
+              <p id={mismatchId} className="field-error">
+                The text does not match yet.
+              </p>
+            )}
           </div>
         )}
         {error !== undefined && error !== null && <ErrorBanner error={error} title={`${confirmLabel} failed`} />}
@@ -111,7 +129,7 @@ export function ConfirmDialog({
             size="lg"
             variant={tone === 'danger' ? 'danger' : 'primary'}
             loading={pending}
-            disabled={!ready && !pending}
+            disabledReason={blockedReason}
           >
             {confirmLabel}
           </Button>

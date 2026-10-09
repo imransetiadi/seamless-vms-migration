@@ -38,13 +38,15 @@ describe('MigrationActions', () => {
     await user.click(button(/finalize/i));
     const dialog = await screen.findByRole('alertdialog', { name: /finalize web-01/i });
     const confirm = within(dialog).getByRole('button', { name: /^finalize$/i });
-    expect(confirm).toBeDisabled();
+    // unavailable until the name matches, but focusable and saying why (SDD §16)
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Type web-01 to confirm.');
 
     const input = within(dialog).getByLabelText(/type web-01 to confirm/i);
     await user.type(input, 'web-0');
-    expect(confirm).toBeDisabled();
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
     await user.type(input, '1');
-    expect(confirm).toBeEnabled();
+    expect(confirm).not.toHaveAttribute('aria-disabled');
 
     await user.click(confirm);
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('finalized'));
@@ -93,7 +95,8 @@ describe('MigrationActions', () => {
     await user.click(button(/roll back/i));
     const dialog = await screen.findByRole('alertdialog', { name: /roll back legacy-rhel6-app/i });
     const confirm = within(dialog).getByRole('button', { name: /^roll back$/i });
-    expect(confirm).toBeDisabled();
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a reason first.');
     await user.type(within(dialog).getByLabelText(/reason/i), 'kernel panic on RHOSO');
     await user.click(confirm);
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('rolling_back'));

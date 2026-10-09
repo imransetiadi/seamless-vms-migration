@@ -225,6 +225,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         description="Deletes the RHOSO instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
         confirmLabel="Roll back"
         canConfirm={reason.trim().length > 0}
+        confirmReason="Enter a reason first."
         onConfirm={() => submit({ action: 'rollback', body: { reason: reason.trim() } })}
       >
         <TextAreaField label="Reason" required rows={2} maxLength={ACTION_TEXT_MAX} value={reason} onChange={(e) => setReason(e.target.value)} hint="Required; recorded in the audit trail." />
