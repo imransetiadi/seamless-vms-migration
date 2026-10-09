@@ -80,6 +80,22 @@ describe('Plans page', () => {
     expect(within(dialog).getByLabelText(/cutover window start/i)).toBeDisabled();
   });
 
+  it('names a selected VM that another plan holds, as validation would refuse it (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
+
+    const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+  });
+
   it('turns on storage handover with a RHOSO backend per volume type (Ceph and NetApp)', async () => {
     const user = userEvent.setup();
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

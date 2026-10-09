@@ -182,6 +182,8 @@ describe('PlanDetail', () => {
     expect(within(dialog).getByText(/saving returns the plan to draft/i)).toBeInTheDocument();
     expect(within(dialog).getByRole('checkbox', { name: /hand volumes over without copying/i })).toBeChecked();
     expect(within(dialog).getByLabelText(/^source provider/i)).toBeDisabled();
+    // the plan's own migrations hold its VMs for this plan, not against it (SDD §5.4)
+    expect(within(dialog).queryByRole('status', { name: /another plan holds/i })).not.toBeInTheDocument();
 
     const slo = within(dialog).getByLabelText(/downtime slo/i);
     await user.clear(slo);

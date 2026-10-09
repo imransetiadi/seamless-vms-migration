@@ -1,10 +1,11 @@
-import { CircleAlert } from 'lucide-react';
+import { CircleAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useCreatePlan, useInventory, usePatchPlan, useProviders } from '../api/hooks';
+import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { cn } from '../lib/cn';
+import { heldElsewhere } from '../lib/holds';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
@@ -208,6 +209,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const inventory = useInventory(form.sourceId || undefined);
+  // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing
+  const plans = usePlans();
+  const migrations = useMigrations();
 
   useEffect(() => {
     if (!open) return;
@@ -228,6 +232,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // storage handover (SDD §7.3, §7.3.1): one RHOSO backend per volume type of the selected VMs
   const destination = destinations.find((p) => p.id === form.destinationId);
   const selectedVms = vms.filter((vm) => form.vmIds.has(vm.source_id));
+  const held = heldElsewhere(form.vmIds, form.sourceId, plan?.id, plans.data ?? [], migrations.data ?? []);
   const sourceStorage = source ? storageBackends(source.capabilities) : [];
   const destinationStorage = destination ? storageBackends(destination.capabilities) : [];
   const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
@@ -485,6 +490,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 caption={`VMs on ${source.name}`}
                 pageSize={25}
               />
+            )}
+            {held.size > 0 && (
+              <div role="status" aria-labelledby={id('held')} className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+                <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+                <div className="min-w-0">
+                  <p id={id('held')} className="font-medium text-foreground">
+                    Another plan holds {held.size === 1 ? 'a selected VM' : `${held.size} selected VMs`}: validation refuses {held.size === 1 ? 'it' : 'them'}
+                  </p>
+                  <ul className="mt-1 text-muted-foreground">
+                    {[...held.values()].flat().map((holder) => (
+                      <li key={holder}>{holder}</li>
+                    ))}
+                  </ul>
+                  <p className="mt-1 text-muted-foreground">Finish, roll back or cancel the migration in that plan, or leave the VM out.</p>
+                </div>
+              </div>
             )}
           </fieldset>
 
