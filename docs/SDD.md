@@ -1221,7 +1221,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans`, `/plans/:id` (settings summary, waves board, migrations table with
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
-  changed fields as `PATCH`, in `draft`/`validated` only), `/migrations/:id` (phase
+  changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
+  Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
+  operator's change), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name), `/providers` (status cards + Check, each card summarizing the storage backends by driver family —
