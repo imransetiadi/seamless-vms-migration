@@ -15,6 +15,9 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
+
+/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
+const GIB = 1024 ** 3;
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -85,7 +88,7 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                     </th>
                     <td className="num text-right">{f.vcpus}</td>
                     <td className="num text-right">{formatBytes(f.ram_mb * 1024 * 1024)}</td>
-                    <td className="num text-right">{f.disk_gb} GB</td>
+                    <td className="num text-right">{formatBytes(f.disk_gb * GIB)}</td>
                     <td className="text-xs text-muted-foreground">
                       {Object.entries(f.extra_specs)
                         .map(([k, v]) => `${k}=${v}`)
@@ -159,7 +162,7 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                     <td className="num text-right">{formatBytes(q.ram_mb * 1024 * 1024)}</td>
                     <td className="num text-right">{formatNumber(q.instances)}</td>
                     <td className="num text-right">{formatNumber(q.volumes)}</td>
-                    <td className="num text-right">{formatNumber(q.gigabytes)} GB</td>
+                    <td className="num text-right">{formatBytes(q.gigabytes * GIB)}</td>
                   </tr>
                 ))}
               </tbody>

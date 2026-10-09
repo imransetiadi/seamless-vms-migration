@@ -50,6 +50,17 @@ describe('Inventory', () => {
     expect(listed).toEqual([...inventory.projects].sort((a, b) => a.localeCompare(b)));
   });
 
+  it('shows flavor disks and Cinder quotas in GiB-based IEC units, never GB (SDD §16)', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer' });
+    const flavors = await screen.findByRole('region', { name: 'Flavors' });
+    // m1.small: a 40 GiB disk; shop: 8000 GiB of Cinder quota
+    const small = within(flavors).getByRole('row', { name: /m1\.small/ });
+    expect(small).toHaveTextContent('40.0 GiB');
+    const quotas = screen.getByRole('region', { name: 'Free quota per project' });
+    expect(within(quotas).getByRole('row', { name: /^shop/ })).toHaveTextContent('7.8 TiB');
+    expect(screen.queryByText(/\bGB\b/)).not.toBeInTheDocument();
+  });
+
   it('says when a destination reports no projects', async () => {
     renderWithApp(<Inventory />, { route: '/inventory/rhoso-staging', path: '/inventory/:providerId', token: 'viewer' });
     const projects = await screen.findByRole('region', { name: 'Projects' });
