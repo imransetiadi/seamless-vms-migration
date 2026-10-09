@@ -227,7 +227,8 @@ PhaseChange { from_phase: Phase|null, to_phase: Phase, at: datetime, reason: str
 Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef,
             strategy: Strategy, phase: Phase = "pending", phase_history: list[PhaseChange] = [],
             progress_pct: float = 0, bytes_total: int = 0, bytes_transferred: int = 0,
-            sync_passes: list[SyncPass] = [], estimate: Estimate|null, estimates: list[Estimate] = [],
+            sync_passes: list[SyncPass] = [], sync_bytes_dropped: int = 0,
+            estimate: Estimate|null, estimates: list[Estimate] = [],
             observed_scan_bps: float|null, resolved_mappings: Mappings = {},
             findings: list[Finding] = [], checkpoint: str|null,
             downtime_started_at: datetime|null, downtime_ended_at: datetime|null,
@@ -330,6 +331,10 @@ requested cutover that waits for a closed window — but never clears one.
 While waiting — for the gate or for a free cutover slot (rule 4) — a warm migration runs a keep-warm
 delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ago
 (`awaiting_cutover → syncing → awaiting_cutover`; the interval is at least 60 s).
+`sync_passes` keeps the first `plan.max_sync_passes` passes and the latest 20, so a long wait does not
+grow the migration without bound: when a pass takes the list past that, the oldest pass in between is
+dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transferred` stays the total
+(`sync_bytes_dropped` plus the listed passes), and pass numbers keep counting from the last one.
 Approvals, `cutover_requested` and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A VM whose migration is `cancelled` (terminal) cannot be
