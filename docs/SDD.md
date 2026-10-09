@@ -293,7 +293,9 @@ else, appends a `PhaseChange`, and updates `updated_at`. `failed → cancelled` 
 while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at` null): the source
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
 it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
-an open clock and resets a closed one (§5.2). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
+an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
+granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
+bypass never carries over to it — while approvals stay (the assessment did not change). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) and then runs the `rollback` step once with `delete_dest_volumes` as a best-effort cleanup
 of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
