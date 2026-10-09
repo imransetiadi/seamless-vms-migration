@@ -26,6 +26,8 @@ TERMINAL_STATES = frozenset({"ERROR", "DELETED", "SOFT_DELETED"})
 TCP_TIMEOUT_S = 5.0
 CONSOLE_LINES = 200
 CONSOLE_WARNING = "console log unavailable; console check skipped"
+WINDOWS_CONSOLE = "Windows writes no boot messages to the serial console; console check skipped"
+WINDOWS_NO_PORTS = "no TCP port probed for this Windows guest: set windows_tcp_ports (e.g. 3389)"
 
 
 @dataclass
@@ -137,23 +139,37 @@ class Verifier:
             )
         )
 
+        # the guest family picks the profile (SDD §7.5)
+        vm = getattr(ctx.migration, "vm", None)
+        windows = vm is not None and vm.guest_os.family == "windows"
+        probe_ports = list(cfg.windows_tcp_ports if windows else cfg.tcp_ports)
+        warnings: list[str] = []
+        if windows and not probe_ports:
+            warnings.append(WINDOWS_NO_PORTS)
+
         key = "floating_ips" if cfg.probe_address == "floating" else "fixed_ips"
         address = next((ip for p in ports for ip in (p.get(key) or []) if ip), None)
-        for port in cfg.tcp_ports:
+        for port in probe_ports:
             if address is None:
                 checks.append(_check(f"tcp:{port}", False, f"no {cfg.probe_address} address"))
                 continue
             ok, detail = await self._probe(address, int(port))
             checks.append(_check(f"tcp:{port}", ok, detail))
 
-        try:
-            console = await self.dst.console_log(server_id, CONSOLE_LINES)
-        except ProviderError:
-            console = None
-        if console is None:
-            checks.append(_check("console", True, CONSOLE_WARNING, skipped=True))
-            evidence["warnings"] = [CONSOLE_WARNING]
+        console: Any = None
+        if windows:
+            checks.append(_check("console", True, WINDOWS_CONSOLE, skipped=True))
         else:
+            try:
+                console = await self.dst.console_log(server_id, CONSOLE_LINES)
+            except ProviderError:
+                console = None
+            if console is None:
+                checks.append(_check("console", True, CONSOLE_WARNING, skipped=True))
+                warnings.append(CONSOLE_WARNING)
+        if warnings:
+            evidence["warnings"] = warnings
+        if console is not None:
             excerpt = "\n".join(str(console).splitlines()[-CONSOLE_LINES:])
             evidence["console"] = excerpt
             matched = _pattern_match(list(cfg.console_success_patterns), excerpt)

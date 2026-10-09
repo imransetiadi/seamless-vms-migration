@@ -174,3 +174,38 @@ async def test_verification_edge_paths(listener):
     assert summary["passed"] is False and [c["name"] for c in summary["checks"] if not c["ok"]] == [
         "tcp:22"
     ]
+
+
+def windows_ctx(tcp_ports=(), windows_tcp_ports=(), timeout_s=0):
+    from tests.factories import make_vm
+
+    plan = make_plan(
+        verification=VerificationConfig(
+            tcp_ports=list(tcp_ports),
+            windows_tcp_ports=list(windows_tcp_ports),
+            timeout_s=timeout_s,
+        )
+    )
+    vm = make_vm(os_type="windows2019srvNext_64Guest")
+    return SimpleNamespace(
+        plan=plan, migration=make_migration(destination_server_id="srv-9", vm=vm)
+    )
+
+
+async def test_verification_windows_guest_skips_console_and_probes_windows_ports(listener):
+    """SDD §7.5: Windows writes nothing to the serial console; RDP/WinRM ports replace SSH."""
+    closed = unused_port()
+    dest = Dest(console="")  # an empty serial console, as Windows leaves it
+    result = await Verifier(dest, Settings(), poll_s=0).verify(
+        windows_ctx(tcp_ports=[closed], windows_tcp_ports=[listener])
+    )
+    assert result.passed, result.checks
+    names = {c["name"]: c for c in result.checks}
+    assert f"tcp:{listener}" in names and f"tcp:{closed}" not in names
+    assert names["console"]["skipped"] is True and "Windows" in names["console"]["detail"]
+
+
+async def test_verification_windows_guest_without_ports_passes_with_a_warning():
+    result = await Verifier(Dest(console=""), Settings(), poll_s=0).verify(windows_ctx())
+    assert result.passed
+    assert any("no TCP port" in w for w in result.evidence["warnings"])
