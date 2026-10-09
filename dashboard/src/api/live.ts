@@ -77,6 +77,20 @@ function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/**
+ * A stream status listener that refetches every query when the stream opens again after a drop
+ * (SDD §16): a connection that dropped before its first persisted event resumes live-only, so the
+ * gap is never replayed, and ephemeral progress never is. The first open refetches nothing.
+ */
+export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveStatus) => void {
+  let opened = false;
+  return (status) => {
+    if (status !== 'open') return;
+    if (opened) void queryClient.invalidateQueries();
+    opened = true;
+  };
+}
+
 /** Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. */
 export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400) {
   const pending = new Map<string, QueryKey>();

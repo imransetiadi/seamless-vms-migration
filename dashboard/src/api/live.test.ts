@@ -1,6 +1,6 @@
 import { QueryClient } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
-import { applyEventToCache, createBatchedInvalidator } from './live';
+import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
 import type { Event, Migration } from './types';
 
@@ -140,5 +140,24 @@ describe('createBatchedInvalidator', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+
+describe('refetchAfterReconnect', () => {
+  it('refetches what the dashboard shows when the stream opens again, not on the first open (SDD §16)', () => {
+    const queryClient = new QueryClient();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue();
+    const onStatus = refetchAfterReconnect(queryClient);
+
+    for (const status of ['connecting', 'open'] as const) onStatus(status);
+    expect(invalidate).not.toHaveBeenCalled();
+    // a drop: the gap may hold persisted events a live-only resume never replays
+    for (const status of ['reconnecting', 'reconnecting', 'open'] as const) onStatus(status);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(invalidate).toHaveBeenCalledWith();
+    onStatus('reconnecting');
+    onStatus('open');
+    expect(invalidate).toHaveBeenCalledTimes(2);
   });
 });
