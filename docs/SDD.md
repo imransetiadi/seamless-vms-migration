@@ -164,8 +164,13 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
         flavor_extra_specs: dict[str,str] = {}, cbt_enabled: bool|null = null,
         snapshot_count: int = 0, tools_ok: bool|null = null,
         change_rate_bps: float|null = null }
-   derived (properties, also serialized): disk_bytes: int, used_bytes: int
-   (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋)
+   derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
+   (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
+    guest_os = identify(os_type), §9.5)
+
+GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|null, label: str,
+          lifecycle: "current"|"legacy"|"unknown",
+          v2v: "supported"|"tech_preview"|"unverified"|"unsupported"|"unknown" }
 
 Mappings { networks: dict[str,str] = {}, flavors: dict[str,str] = {},
            volume_types: dict[str,str] = {}, projects: dict[str,str] = {} }
@@ -176,7 +181,8 @@ HandoverConfig { enabled: bool = false, backend_map: dict[str,str] = {} }
 
 CutoverWindow { start: datetime, end: datetime }
 
-VerificationConfig { tcp_ports: list[int] = [], probe_address: "fixed"|"floating" = "fixed",
+VerificationConfig { tcp_ports: list[int] = [], windows_tcp_ports: list[int] = [],
+                     probe_address: "fixed"|"floating" = "fixed",
                      console_success_patterns: list[str] =
                         ["login:", "Cloud-init v\\. .* finished", "Reached target .*Multi-User"],
                      timeout_s: int = 600, auto_rollback: bool = true, use_advisor: bool = true }
@@ -583,12 +589,18 @@ volumes with their server, so the order is:
    "volume-<source_volume_id>">, "name": …, "volume_type": mapped, "bootable": …}}`; wait
    `available`. Every supported driver renames the object to `volume-<new_id>` — journal the new
    id/name, it is the reference for a reverse manage.
-7. Create the destination server from the managed volumes (BDM in journaled device order,
+7. Restore each volume's boot properties: Cinder `manage` creates a new volume record without
+   `volume_image_metadata`, so the journaled image metadata of every volume (keys `hw_*`, `os_*`,
+   `img_*` and `architecture` — firmware type, machine type, disk bus, NIC model, `os_type`) is set
+   on the managed volume with `POST /volumes/{id}/action {"os-set_image_metadata": {"metadata":
+   …}}` (journaled per volume). Without it a UEFI or Windows guest would boot with defaults.
+8. Create the destination server from the managed volumes (BDM in journaled device order,
    `delete_on_termination: false`).
 
 Rollback walks the journal backwards: delete the destination server; unmanage at RHOSO; manage at the
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
-journaled source host/type (a definition journaled without `storage` is RBD); recreate
+journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
+metadata set back (step 7); recreate
 the source ports with their journaled MAC and fixed IPs (admin is already required); recreate the
 source server from the journaled definition with the volumes in device order; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
@@ -629,7 +641,10 @@ Not an executor step: the orchestrator calls `Verifier.verify(ctx) -> Verificati
 `server_active` (destination server status `ACTIVE`), `ports_up` (all ports `ACTIVE`),
 `tcp:<port>` for each configured port (connect with 5 s timeout from the control plane),
 `console` (any `console_success_patterns` regex matches the last 200 console lines; skipped with a
-warning if the console log is unavailable). Polls until `timeout_s`. Deterministic pass = all
+warning if the console log is unavailable). The guest's family (`vm.guest_os.family`, §9.5) picks the
+profile: **Windows** guests probe `windows_tcp_ports` instead of `tcp_ports` and skip the `console`
+check (Windows writes no boot messages to the serial console), with a warning in the evidence when
+no TCP port is probed; Linux and unknown guests use `tcp_ports` and the console patterns. Polls until `timeout_s`. Deterministic pass = all
 non-skipped checks ok. The advisor (§14.2) may then set `review_required`, never flip the result.
 
 ---
@@ -764,13 +779,38 @@ Finding catalog (code — severity — condition):
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
-| `GUEST_OS_LEGACY` | warning | `os_type` matches `rhel[3-6]`, `centos[3-6]`, `windows200[038]` |
+| `GUEST_OS_LEGACY` | warning | `guest_os.lifecycle == "legacy"` (§9.5: out of the vendor's standard support; it still migrates — test the application on RHOSO) |
+| `GUEST_OS_UNKNOWN` | info | `guest_os.family == "unknown"`: no OS identified — set the `os_distro`/`os_version` image properties (OpenStack) or run VMware Tools; verification uses the Linux profile |
+| `GUEST_CONVERSION_UNVERIFIED` | warning (vmware_cold, vmware_warm) | VMware VM with `guest_os.v2v` in {`tech_preview`, `unverified`}: virt-v2v converts it but Red Hat does not support the conversion — run a test conversion first |
+| `GUEST_CONVERSION_UNSUPPORTED` | warning (vmware_cold, vmware_warm) | VMware VM with `guest_os.v2v == "unsupported"`: the RHEL 9 conversion host has no drivers for it (e.g. Windows Server 2003–2012 R2, RHEL ≤ 5) — install the virtio storage and network drivers from an older virtio-win release in the guest and test the conversion, or migrate it another way |
 | `VMW_CBT_DISABLED` | warning (vmware_warm) | VMware VM with `cbt_enabled` false |
 | `VMW_INDEPENDENT_DISK` | warning (vmware_warm) | any independent disk |
 | `VMW_SNAPSHOTS_PRESENT` | warning | `snapshot_count > 0` |
 | `VMW_TOOLS_MISSING` | info | `tools_ok is False` |
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
+
+### 9.5 Guest OS catalog (`seamless_migrate/guest_os.py`)
+
+`identify(os_type) -> GuestOS` parses what the providers report (§10): OpenStack server metadata or
+image properties (`os_distro`/`os_version`/`os_type`, e.g. `ubuntu 22.04`, `rhel9`, `windows`),
+libosinfo short ids (`win2k19`, `debian12`), VMware guest ids (`rhel9_64Guest`,
+`windows2019srvNext_64Guest`, `ubuntu64Guest`) and VMware Tools names (`Ubuntu 22.04.4 LTS`,
+`Microsoft Windows Server 2019 Standard`). Distributions: RHEL, CentOS (Linux and Stream), Rocky,
+AlmaLinux, Oracle Linux, Ubuntu (versions and code names), Debian (versions and code names), SLES,
+openSUSE, Fedora, Windows Server 2003–2025 and Windows client 7–11. The case table shared by both test
+suites is `seamless/tests/fixtures/guest_os_cases.json`.
+
+Lifecycle as of 2026-10 (`legacy` = out of standard vendor support): RHEL/Oracle ≤ 7, CentOS Linux
+and Stream 8, Ubuntu before 22.04 and interim releases before 26.04, Debian ≤ 11, SLES ≤ 12, Windows
+Server ≤ 2012 R2, Windows client ≤ 10. Fedora and unknown versions are `unknown`.
+
+`v2v` (VMware sources, virt-v2v on the RHEL 9 conversion host): `supported` — RHEL 7–10, Windows
+Server 2016–2025, Windows 10/11; `tech_preview` — Ubuntu, Debian; `unverified` — RHEL/CentOS 6,
+Rocky, AlmaLinux, Oracle Linux, CentOS 7+, SLES/openSUSE (btrfs roots are not convertible), Fedora;
+`unsupported` — RHEL/CentOS ≤ 5, Windows Server 2003–2012 R2, Windows client 7–8.1 (current
+virtio-win ships no drivers for them). OpenStack sources need no conversion (KVM to KVM): their
+guests boot unchanged when the boot properties travel with the volumes (§6, §7.3 step 7).
 
 ### 9.4 Wave planner (`planning/waves.py`)
 
@@ -814,9 +854,12 @@ Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking ca
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
 "compute_microversion": str, "ovn": bool, "volume_backends": [pool names], "storage_backends":
 [{"pool": str, "vendor": str|null, "protocol": str|null, "family": "rbd"|"netapp_nfs"|
-"netapp_block"|"other"}]}`, both lists empty without admin; volume disks carry their Cinder `pool`),
+"netapp_block"|"other"}]}`, both lists empty without admin; volume disks carry their Cinder `pool`;
+`os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
+`volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
-lazy; reports CBT, snapshots, independent disks, tools state), `FakeSourceProvider`/
+lazy; reports CBT, snapshots, independent disks, tools state; `os_type` is the VMware Tools pretty
+name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
 12 VMware VMs with mixed CBT/snapshot/independent-disk states; a RHOSO destination with networks,
