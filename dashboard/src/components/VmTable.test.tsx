@@ -30,7 +30,7 @@ describe('VmTable', () => {
   });
 
   it('filters by free text across name, project, OS and tags', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'db-');
@@ -43,7 +43,7 @@ describe('VmTable', () => {
   });
 
   it('filters by power state, project and readiness', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.selectOptions(screen.getByLabelText('Power state'), 'stopped');
@@ -59,7 +59,7 @@ describe('VmTable', () => {
   });
 
   it('shows an empty state with a way back when nothing matches', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'web');
@@ -82,7 +82,7 @@ describe('VmTable', () => {
   });
 
   it('sorts by disk size with aria-sort', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
     const diskHeader = screen.getByRole('columnheader', { name: /disks/i });
 
@@ -94,7 +94,7 @@ describe('VmTable', () => {
   });
 
   it('supports selecting VMs for a plan', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const onSelectedChange = vi.fn();
     render(
       <VmTable vms={openstackVms} providerKind="openstack" selected={new Set(['os-0a11'])} onSelectedChange={onSelectedChange} />,
@@ -110,7 +110,7 @@ describe('VmTable', () => {
   });
 
   it('names each guest OS, flags legacy releases and filters by OS', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
     const row = (name: string) => bodyRows().find((r) => within(r).getAllByRole('rowheader')[0]?.textContent === name)!;
     expect(row('web-02')).toHaveTextContent('Ubuntu 22.04');
@@ -126,7 +126,7 @@ describe('VmTable', () => {
   });
 
   it('clears the guest OS filter with the other filters', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     // the OS filter alone is an active filter: the way back is offered and resets it

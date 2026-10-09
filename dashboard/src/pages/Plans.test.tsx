@@ -31,7 +31,7 @@ describe('Plans page', () => {
   }, 15_000); // the 5xx retries take about 3 s
 
   it('summarises validation errors and moves focus to the summary', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -45,7 +45,7 @@ describe('Plans page', () => {
   });
 
   it('creates a draft plan with the selected VMs', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -66,7 +66,7 @@ describe('Plans page', () => {
   });
 
   it('gives an operator the default approval policy, read-only (SDD §12, §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -84,7 +84,7 @@ describe('Plans page', () => {
     const server = createTestServer();
     const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
     const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -97,7 +97,7 @@ describe('Plans page', () => {
   });
 
   it('sets project mappings and every verification setting from the form (dashboard-first, SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -130,7 +130,7 @@ describe('Plans page', () => {
   });
 
   it('sets the keep-warm interval and the pre-staged resources of a new plan (dashboard-first, SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -157,7 +157,7 @@ describe('Plans page', () => {
   });
 
   it('sets a per-VM strategy override; a VM taken out of the plan loses its override (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
@@ -186,7 +186,7 @@ describe('Plans page', () => {
   });
 
   it('changes an override in place, and another source clears every override (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
@@ -209,7 +209,7 @@ describe('Plans page', () => {
   });
 
   it('refuses a keep-warm interval under a minute (SDD §5.4)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
@@ -225,7 +225,7 @@ describe('Plans page', () => {
   });
 
   it('says a VMware source pre-stages nothing (SDD §7.2)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
@@ -237,7 +237,7 @@ describe('Plans page', () => {
   });
 
   it('refuses a negative verification timeout and a malformed project mapping, and opens the advanced section', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
@@ -255,7 +255,7 @@ describe('Plans page', () => {
   });
 
   it('turns on storage handover with a RHOSO backend per volume type (Ceph and NetApp)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
 
     await user.click(await screen.findByRole('button', { name: /new plan/i }));

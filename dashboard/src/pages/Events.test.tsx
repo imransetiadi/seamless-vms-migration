@@ -46,7 +46,7 @@ describe('Events page', () => {
   });
 
   it('holds new events while paused and shows them on resume', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
     await within(list).findByText(/paused: vCenter degraded/i);
@@ -84,7 +84,7 @@ describe('Events page', () => {
   });
 
   it('filters by category and text', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
     await within(list).findByText(/paused: vCenter degraded/i);
@@ -100,7 +100,7 @@ describe('Events page', () => {
   });
 
   it('downloads the shown events as JSON lines, oldest first, like `seamless events export`', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const blobs: Blob[] = [];
     const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
       blobs.push(b as Blob);

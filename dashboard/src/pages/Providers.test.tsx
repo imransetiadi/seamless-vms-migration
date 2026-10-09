@@ -50,7 +50,7 @@ describe('Providers page', () => {
   });
 
   it('checks every provider at once for an operator', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPage('operator');
     const before = server.events.filter((e) => e.kind === 'provider.checked').length;
     await user.click(await screen.findByRole('button', { name: /check all/i }));
@@ -59,7 +59,7 @@ describe('Providers page', () => {
   });
 
   it('summarises what is missing and focuses the summary', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPage();
     const dialog = await openAdd(user);
     await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
@@ -72,7 +72,7 @@ describe('Providers page', () => {
   });
 
   it('connects a Kolla-Ansible source: the preset fills the form, credentials stay write-only', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
     const dialog = await openAdd(user);
     await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
@@ -100,7 +100,7 @@ describe('Providers page', () => {
   });
 
   it('connects vCenter with an existing conversion host and a key file that is never displayed', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
     const dialog = await openAdd(user);
     await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
@@ -129,7 +129,7 @@ describe('Providers page', () => {
   });
 
   it('edits a provider: credentials stay empty, only changed fields are sent, the platform type is locked', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
     await user.click(within(card).getByRole('button', { name: /^edit$/i }));
@@ -150,7 +150,7 @@ describe('Providers page', () => {
   });
 
   it('keeps the dialog open with the reason when a running plan locks the provider', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const running = server.plans.find((p) => p.status === 'running');
     if (!running) throw new Error('fixture without a running plan');
@@ -166,7 +166,7 @@ describe('Providers page', () => {
   });
 
   it('keeps a provider whose credentials failed and saves them on the next try, without adding it again (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     // the credentials step fails once (e.g. the secret store is down)
     const target = server as unknown as { setCredentials: (...args: unknown[]) => unknown };
@@ -203,7 +203,7 @@ describe('Providers page', () => {
   });
 
   it('after a connection test that did not pass, Edit again fixes the added provider instead of adding it again (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
     const dialog = await openAdd(user);
     await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));

@@ -43,7 +43,7 @@ describe('MigrationsTable', () => {
   });
 
   it('sorts by phase in lifecycle order', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
     const header = screen.getByRole('columnheader', { name: /^phase/i });
     await user.click(within(header).getByRole('button'));
@@ -63,7 +63,7 @@ describe('MigrationsTable', () => {
   });
 
   it('sorts by estimated downtime in both directions', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
     const expected = [...migrations]
       .sort((a, b) => (a.estimate?.downtime_s ?? Infinity) - (b.estimate?.downtime_s ?? Infinity))
@@ -78,7 +78,7 @@ describe('MigrationsTable', () => {
   });
 
   it('filters by text, phase, strategy and wave', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
 
     await user.type(screen.getByRole('searchbox', { name: /search migrations/i }), 'web');

@@ -104,7 +104,7 @@ describe('Overview page (mock data)', () => {
   });
 
   it('offers table views of the charts', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Overview />);
 
     const throughput = await screen.findByRole('region', { name: /throughput/i });
@@ -119,7 +119,7 @@ describe('Overview page (mock data)', () => {
   });
 
   it('scopes the dashboard to one plan', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<Overview />);
 
     const select = await screen.findByLabelText('Plan');

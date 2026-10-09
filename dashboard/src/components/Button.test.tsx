@@ -7,7 +7,7 @@ describe('Button', () => {
   afterEach(() => vi.useRealTimers());
 
   it('says why a soft-disabled action is unavailable when it is tapped or clicked, not only on hover', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const onClick = vi.fn();
     render(
       <Button disabledReason="Requires the approver role." onClick={onClick}>
@@ -54,7 +54,7 @@ describe('Button', () => {
   });
 
   it('runs an enabled action and shows no note', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const onClick = vi.fn();
     render(<Button onClick={onClick}>Validate</Button>);
     await user.click(screen.getByRole('button', { name: 'Validate' }));

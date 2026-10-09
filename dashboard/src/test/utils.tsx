@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ApiProvider } from '../api/ApiProvider';
 import { getStoredToken } from '../api/auth';
 import { ApiClient } from '../api/client';
+import { queryKeys } from '../api/hooks';
 import { LiveEventsProvider } from '../api/LiveEventsProvider';
 import { createMockFetch, MockServer } from '../api/mock';
 import { ThemeProvider } from '../theme/ThemeProvider';
@@ -39,6 +40,13 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): Re
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false } },
   });
+  // The app renders pages only after RequireAuth has loaded GET /me, so a page never sees an unknown
+  // role. Pages rendered here skip RequireAuth: seed the session like it, or a test that clicks a
+  // role-gated action races the /me request (the action stays soft-disabled until it returns).
+  if (!options.storedToken) {
+    const me = server.handle('GET', '/me', new URLSearchParams(), undefined, options.token === undefined ? 'admin' : options.token);
+    if (me.status === 200) queryClient.setQueryData(queryKeys.me, me.body);
+  }
   const wrap = (node: ReactNode) =>
     options.live ? <LiveEventsProvider enabled>{node}</LiveEventsProvider> : node;
   const result = render(

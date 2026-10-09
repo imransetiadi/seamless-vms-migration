@@ -26,7 +26,7 @@ describe('Login', () => {
   });
 
   it('keeps the user on the page with a clear error when the token is rejected', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
 
     await user.type(await screen.findByLabelText('API token'), 'not-a-valid-token');
@@ -39,7 +39,7 @@ describe('Login', () => {
   });
 
   it('explains the lockout when the address made too many failed attempts', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
 
     await user.type(await screen.findByLabelText('API token'), 'locked');
@@ -51,7 +51,7 @@ describe('Login', () => {
   });
 
   it('stores a valid token for this tab only and returns to the app', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
 
     await user.type(await screen.findByLabelText('API token'), 'approver');
@@ -62,7 +62,7 @@ describe('Login', () => {
   });
 
   it('asks for a token before calling the server', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
     await user.click(await screen.findByRole('button', { name: /^sign in/i }));
     expect(within(await screen.findByRole('alert')).getByText(/paste your api token/i)).toBeInTheDocument();

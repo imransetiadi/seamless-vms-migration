@@ -55,7 +55,7 @@ describe('MigrationDetail', () => {
     m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
     m.cutover_requested = true;
     const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
 
     await user.click(await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` }));
@@ -74,7 +74,7 @@ describe('MigrationDetail', () => {
     m.approvals = [];
     m.cutover_requested = false;
     const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
     const use = await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` });
     // the page shows the migration without approvals; then an approver approves elsewhere
@@ -94,7 +94,7 @@ describe('MigrationDetail', () => {
     m.approvals = [];
     m.cutover_requested = false;
     const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
 
     await user.click(await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` }));

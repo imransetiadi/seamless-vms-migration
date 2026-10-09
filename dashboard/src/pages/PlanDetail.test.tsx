@@ -52,7 +52,7 @@ describe('PlanDetail', () => {
   });
 
   it('validates a draft plan and then allows starting it', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPlan('plan-0e9f6a17');
 
     const start = await actionButton(/^start/i);
@@ -75,7 +75,7 @@ describe('PlanDetail', () => {
       destination_provider_id: 'rhoso-prod',
       vm_ids: free,
     });
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
 
     const panel = await screen.findByRole('region', { name: /^migrations$/i });
@@ -138,7 +138,7 @@ describe('PlanDetail', () => {
       destination_provider_id: first.destination_provider_id,
       vm_ids: [held.vm.source_id],
     });
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<PlanDetail />, { route: `/plans/${second.id}`, path: '/plans/:planId', token: 'operator', server });
 
     await user.click(await actionButton(/validate/i));
@@ -157,7 +157,7 @@ describe('PlanDetail', () => {
       m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
     }
     first.cutover_requested = true;
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     await screen.findByRole('table', { name: /migrations/i });
 
@@ -180,7 +180,7 @@ describe('PlanDetail', () => {
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
     const m = server.migrations.find((x) => x.plan_id === plan.id)!;
     m.phase = 'ready';
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     await screen.findByRole('table', { name: /migrations/i });
     // an approver approves meanwhile (another tab or person): the list on screen does not show it yet
@@ -201,7 +201,7 @@ describe('PlanDetail', () => {
       failing && method === 'GET' && path === '/migrations'
         ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
         : handle(method, path, query, body, token);
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     await screen.findByRole('table', { name: /migrations/i });
     failing = true;
@@ -213,7 +213,7 @@ describe('PlanDetail', () => {
   }, 15_000);
 
   it('starts a failed plan again, saying that pre-staging failed and is retried (SDD §8, §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-95a7e3f1');
     const start = await actionButton(/^start again$/i);
     expect(start).not.toHaveAttribute('aria-disabled');
@@ -237,7 +237,7 @@ describe('PlanDetail', () => {
   });
 
   it('pauses a running plan after confirmation', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPlan('plan-4f2a9c1e');
 
     await user.click(await actionButton(/pause/i));
@@ -252,7 +252,7 @@ describe('PlanDetail', () => {
   });
 
   it('edits a validated plan: prefilled, only the changed field is sent, the plan returns to draft', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-c81d44a0');
     await user.click(await actionButton(/^edit plan$/i));
     const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
@@ -276,7 +276,7 @@ describe('PlanDetail', () => {
   });
 
   it('shows an operator the approval policy read-only, with the reason (SDD §12, §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPlan('plan-c81d44a0', 'operator');
     await user.click(await actionButton(/^edit plan$/i));
     const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
@@ -293,7 +293,7 @@ describe('PlanDetail', () => {
   });
 
   it('lets an approver change the approval policy; only that field is sent', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-c81d44a0', 'approver');
     const before = server.plans.find((p) => p.id === 'plan-c81d44a0')?.auto_cutover;
     await user.click(await actionButton(/^edit plan$/i));
@@ -312,7 +312,7 @@ describe('PlanDetail', () => {
   });
 
   it('edits keep-warm and pre-staging, prefilled; a resource the form does not show is kept (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
     plan.keep_warm_interval_s = 600;
@@ -348,7 +348,7 @@ describe('PlanDetail', () => {
   });
 
   it('shows and removes a per-VM strategy override when editing; only the overrides are sent (SDD §16)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
     const vmId = plan.vm_ids[0]!;
@@ -370,7 +370,7 @@ describe('PlanDetail', () => {
   });
 
   it('edits the verification settings, prefilled from the plan; only verification is sent', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
     // a pattern is a regular expression: its spaces are part of it and survive an unrelated edit

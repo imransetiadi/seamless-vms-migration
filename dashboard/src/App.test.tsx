@@ -1,5 +1,5 @@
 import { QueryClient } from '@tanstack/react-query';
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -40,7 +40,7 @@ describe('App shell', () => {
   });
 
   it('navigates between pages and marks the current one', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderApp('operator');
     await screen.findByRole('heading', { level: 1, name: 'Overview' }, PAGE_TIMEOUT);
     const nav = screen.getAllByRole('navigation', { name: 'Primary' })[0] as HTMLElement;
@@ -48,11 +48,12 @@ describe('App shell', () => {
     await user.click(within(nav).getByRole('link', { name: 'Events' }));
     expect(await screen.findByRole('heading', { level: 1, name: 'Events' }, PAGE_TIMEOUT)).toBeInTheDocument();
     expect(within(nav).getByRole('link', { name: 'Events' })).toHaveAttribute('aria-current', 'page');
-    expect(document.title).toBe('Events · Seamless Migrate');
+    // the page sets its title in an effect, which may run after the heading is in the DOM
+    await waitFor(() => expect(document.title).toBe('Events · Seamless Migrate'));
   });
 
   it('leaves focus alone on first load (even in StrictMode) and moves it to main after navigating', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderApp('operator', true);
     await screen.findByRole('heading', { level: 1, name: 'Overview' }, PAGE_TIMEOUT);
     // The first Tab must reach the skip link, so nothing may steal focus on load.
@@ -61,7 +62,8 @@ describe('App shell', () => {
     const nav = screen.getAllByRole('navigation', { name: 'Primary' })[0] as HTMLElement;
     await user.click(within(nav).getByRole('link', { name: 'Providers' }));
     await screen.findByRole('heading', { level: 1, name: 'Providers' }, PAGE_TIMEOUT);
-    expect(document.activeElement).toBe(screen.getByRole('main'));
+    // focus moves in the layout's effect after the navigation commits
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('main')));
   });
 
   it('sends an unauthenticated user to the sign-in page', async () => {

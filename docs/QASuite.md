@@ -945,6 +945,13 @@ every API route with the 429 auth lockout of SDD §15.1 (the health routes stay 
 whose endpoint host starts with `unreachable` fails its connection test (status `error`), so the
 provider dialog's "Edit again" path can be shown without a real cloud.
 
+Test conventions that keep the suite deterministic: `renderWithApp` seeds `GET /me` for its token, as
+`RequireAuth` does in the app, so a role-gated action is enabled at the first render (a click used to race the
+`/me` request and land on a soft-disabled button); an assertion on what an effect sets — `document.title`,
+focus — waits for it; and user-event runs without a timer turn per keystroke (`userEvent.setup({ delay: null })`):
+an idle run is no faster, but under six parallel full runs it cut the failures from 10-13 to 6-9 per run (what
+is left there are 15 s timeouts of a starved CPU).
+
 ### 14.5 Deployment artifacts (Track D)
 
 ```bash

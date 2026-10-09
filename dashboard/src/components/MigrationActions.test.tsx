@@ -32,7 +32,7 @@ describe('MigrationActions', () => {
   });
 
   it('requires typing the VM name before finalizing', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('web-01', 'approver');
 
     await user.click(button(/finalize/i));
@@ -52,7 +52,7 @@ describe('MigrationActions', () => {
   });
 
   it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');
 
     await user.click(button(/retry/i));
@@ -64,7 +64,7 @@ describe('MigrationActions', () => {
   });
 
   it('caps a rollback reason at the API limit of 2000 characters (SDD §12)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');
 
     await user.click(button(/roll back/i));
@@ -73,7 +73,7 @@ describe('MigrationActions', () => {
   });
 
   it('caps an approval comment and a cancel reason at 2000 characters (SDD §12)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button } = setup('app-billing-01', 'approver');
 
     await user.click(button(/approve/i));
@@ -86,7 +86,7 @@ describe('MigrationActions', () => {
   });
 
   it('asks for a reason before rolling back', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('legacy-rhel6-app', 'operator');
 
     expect(button(/cancel/i)).toHaveAttribute('aria-disabled', 'true');
@@ -100,7 +100,7 @@ describe('MigrationActions', () => {
   });
 
   it('lets an approver request the cutover of a converged warm migration', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('app-billing-01', 'approver');
 
     expect(screen.getByText(/next:/i)).toHaveTextContent(/cut over|approve/i);
@@ -112,7 +112,7 @@ describe('MigrationActions', () => {
   });
 
   it('offers to ignore a closed window with the first cutover request (SDD §5.4)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
     const plan = server.plans.find((p) => p.id === migration.plan_id)!;
@@ -134,7 +134,7 @@ describe('MigrationActions', () => {
   });
 
   it('lets an approver let a requested cutover start outside a closed window (SDD §5.4)', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
     const plan = server.plans.find((p) => p.id === migration.plan_id)!;

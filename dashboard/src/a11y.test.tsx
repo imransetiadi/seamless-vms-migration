@@ -73,7 +73,7 @@ describe('axe-core: no WCAG violations', () => {
   }, 30_000);
 
   it('the finalize confirmation dialog', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderAt('/migrations/mig-3c1a0f9e21', 'approver');
     await screen.findByRole('heading', { level: 1, name: 'web-01' }, { timeout: 8_000 });
     await settled();
@@ -84,7 +84,7 @@ describe('axe-core: no WCAG violations', () => {
   }, 30_000);
 
   it('the new-plan dialog with validation errors', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderAt('/plans', 'operator');
     await screen.findByRole('heading', { level: 1, name: 'Plans' }, { timeout: 8_000 });
     await settled();
@@ -96,7 +96,7 @@ describe('axe-core: no WCAG violations', () => {
   }, 30_000);
 
   it('the provider dialog: platform tiles, sign-in methods, conversion host and errors', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderAt('/providers', 'admin');
     await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
     await settled();
