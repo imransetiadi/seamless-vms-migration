@@ -201,6 +201,62 @@ async def test_retry_clears_the_cutover_request_and_its_window_bypass(tmp_path, 
     assert [a.actor for a in stored.approvals] == ["ana"]
 
 
+def _park_vms(h, monkeypatch):
+    """Make the orchestrator's next source inventory reads wait until released."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.orch._vms
+
+    async def parked(plan, impl):
+        entered.set()
+        await release.wait()
+        return await original(plan, impl)
+
+    monkeypatch.setattr(h.orch, "_vms", parked)
+    return entered, release
+
+
+async def test_start_waits_for_auto_waves_instead_of_being_overwritten(
+    tmp_path, store, monkeypatch
+):
+    """SDD §8: status changes run under the plan's lock and re-check the fresh copy. A start
+    issued while auto-waves reads the inventory waits for it and then sees the plan back in
+    draft; it never runs a plan that auto-waves then turns into a draft."""
+    from seamless_migrate.domain.models import Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    entered, release = _park_vms(h, monkeypatch)
+    waves = asyncio.create_task(h.orch.auto_waves(plan.id, 5, "alice"))
+    await entered.wait()
+    start = asyncio.create_task(h.orch.start_plan(plan.id, "bayu"))
+    for _ in range(10):
+        await asyncio.sleep(0)  # the start runs as far as it can meanwhile
+    release.set()
+    await waves
+    with pytest.raises(NotAllowed, match="validate it first"):
+        await start
+    assert store.get("plan", plan.id, Plan).status == PlanStatus.draft
+
+
+async def test_start_waits_for_a_running_validation(tmp_path, store, monkeypatch):
+    """SDD §8: a start issued while the plan is validated again waits for the validation, so the
+    validation never marks the started plan validated."""
+    from seamless_migrate.domain.models import Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    entered, release = _park_vms(h, monkeypatch)
+    validating = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+    await entered.wait()
+    start = asyncio.create_task(h.orch.start_plan(plan.id, "bayu"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    release.set()
+    await validating
+    assert (await start).status == PlanStatus.running
+    assert store.get("plan", plan.id, Plan).status == PlanStatus.running
+
+
 async def test_validate_cancels_a_removed_vms_failed_migration(tmp_path, store):
     """SDD §5.4: validation cancels the migrations of VMs removed from vm_ids, a failed one too
     (its source never stopped): left failed it would hold the VM and keep the plan from

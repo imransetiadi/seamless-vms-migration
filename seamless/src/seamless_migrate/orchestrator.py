@@ -614,6 +614,12 @@ class Orchestrator:
         )
 
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
+        # status changes serialize on the plan's lock (SDD §8): a start waits instead of being
+        # turned back into a draft
+        async with self._lock(f"plan:{plan_id}"):
+            return await self._auto_waves(plan_id, max_wave_size, actor)
+
+    async def _auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):
             raise NotAllowed(f"waves cannot change while the plan is {plan.status}")
@@ -640,6 +646,8 @@ class Orchestrator:
         waves = plan_waves(vms, tiers, max_wave_size)
 
         def set_waves(fresh: Plan) -> None:
+            if fresh.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):
+                raise NotAllowed(f"waves cannot change while the plan is {fresh.status}")
             fresh.waves = waves
             fresh.status = PlanStatus.draft
 
@@ -661,6 +669,10 @@ class Orchestrator:
         return plan
 
     async def start_plan(self, plan_id: str, actor: str) -> Plan:
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: after a validation or auto-waves
+            return await self._start_plan(plan_id, actor)
+
+    async def _start_plan(self, plan_id: str, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.running:
             return plan
@@ -689,6 +701,8 @@ class Orchestrator:
                 )
 
         def start(fresh: Plan) -> None:
+            if fresh.status not in (PlanStatus.validated, PlanStatus.paused, PlanStatus.failed):
+                raise NotAllowed(f"a {fresh.status} plan cannot be started; validate it first")
             fresh.status = PlanStatus.running
 
         plan = await self._update_plan(plan.id, start)
@@ -697,6 +711,10 @@ class Orchestrator:
         return plan
 
     async def pause_plan(self, plan_id: str, actor: str) -> Plan:
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: status changes serialize
+            return await self._pause_plan(plan_id, actor)
+
+    async def _pause_plan(self, plan_id: str, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.paused:
             return plan
