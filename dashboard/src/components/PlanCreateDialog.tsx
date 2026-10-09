@@ -289,6 +289,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const destination = destinations.find((p) => p.id === form.destinationId);
   const selectedVms = vms.filter((vm) => form.vmIds.has(vm.source_id));
   const held = heldElsewhere(form.vmIds, form.sourceId, plan?.id, plans.data ?? [], migrations.data ?? []);
+  // the check needs every plan and migration: without them it is unknown, not "none held" (SDD §16)
+  const plansUnknown = Boolean(plans.error) && !plans.data;
+  const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
   const sourceStorage = source ? storageBackends(source.capabilities) : [];
   const destinationStorage = destination ? storageBackends(destination.capabilities) : [];
   const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
@@ -516,6 +519,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </Fieldset>
 
           <Fieldset legend="Clouds">
+            {providers.error && <ErrorBanner error={providers.error} title="Providers are unavailable" onRetry={() => void providers.refetch()} />}
             <div className="grid gap-3 sm:grid-cols-2">
               <SelectField
                 id={id('source')}
@@ -567,6 +571,16 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 onSelectedChange={(next) => set('vmIds', next)}
                 caption={`VMs on ${source.name}`}
                 pageSize={25}
+              />
+            )}
+            {form.vmIds.size > 0 && (plansUnknown || migrationsUnknown) && (
+              <ErrorBanner
+                error={plansUnknown ? plans.error : migrations.error}
+                title="Cannot check whether another plan holds the selected VMs"
+                onRetry={() => {
+                  if (plansUnknown) void plans.refetch();
+                  if (migrationsUnknown) void migrations.refetch();
+                }}
               />
             )}
             {held.size > 0 && (

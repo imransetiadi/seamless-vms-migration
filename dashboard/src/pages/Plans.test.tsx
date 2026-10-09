@@ -96,6 +96,64 @@ describe('Plans page', () => {
     expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
   });
 
+  it('says in the form that the providers are unavailable, with Retry, instead of empty cloud lists (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    // a 4xx is not retried: the error shows at once
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/providers'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toHaveTextContent(/providers are unavailable/i);
+    // Retry fills the cloud lists once the providers load
+    server.handle = handle;
+    await user.click(within(alert).getByRole('button', { name: /retry/i }));
+    const sources = server.providers.filter((p) => p.role === 'source');
+    await waitFor(() => expect(within(within(dialog).getByLabelText(/source provider/i)).getAllByRole('option')).toHaveLength(sources.length + 1));
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['/migrations', /migration progress is unavailable/i],
+    ['/plans', /plans are unavailable/i],
+  ])('says it cannot check whether another plan holds a selected VM when %s cannot be loaded (SDD §5.4, §16)', async (failing, pageBanner) => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === failing
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    // the load has failed (the page behind names it), but with no VM selected there is nothing to check
+    await screen.findByText(pageBanner);
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
+
+    // no silent all clear: the form says the check could not be made
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert).toHaveTextContent(/cannot check whether another plan holds the selected vms/i);
+    expect(within(dialog).queryByRole('status', { name: /another plan holds/i })).not.toBeInTheDocument();
+    // Retry runs the check: the holder is named again
+    server.handle = handle;
+    await user.click(within(alert).getByRole('button', { name: /retry/i }));
+    const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('sets project mappings and every verification setting from the form (dashboard-first, SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
