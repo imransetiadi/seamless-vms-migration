@@ -496,6 +496,7 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
     handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
     result.storage_handover = handover;
