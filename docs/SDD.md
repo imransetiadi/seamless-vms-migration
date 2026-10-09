@@ -643,8 +643,12 @@ the source ports with their journaled MAC and fixed IPs (admin is already requir
 source server from the journaled definition with the volumes in device order and their journaled
 `delete_on_termination`; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
-(`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. QASuite marks
-handover as **lab-verification required** before production use.
+(`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. An unmanage and a
+manage are journaled as *sent* as soon as Cinder accepts them — a manage with the new volume id — and
+again when their wait ends: a crash during the wait resumes by waiting for that call instead of
+repeating it (a volume Cinder no longer knows has been unmanaged; a second manage would find the
+object renamed), and the rollback unmanages a sent manage's volume at RHOSO and names the source's
+manage after it. QASuite marks handover as **lab-verification required** before production use.
 
 #### 7.3.1 Storage references per driver family
 
