@@ -296,8 +296,9 @@ it stopped with nothing left to restart it. `failed → ready` (retry) increment
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
 granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
-playbook) and then runs the `rollback` step once with `delete_dest_volumes` as a best-effort cleanup
-of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
+playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
+no further attempt starts — and then runs the `rollback` step once with `delete_dest_volumes` as a
+best-effort cleanup of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run.
 
@@ -738,7 +739,9 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s). A migration whose
   step task is still running is not relaunched.
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
-  `max_step_retries`; then `failed`. If downtime had started and
+  `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
+  migration is still in the step's phase, so an action under that lock (a cancel) either finds the
+  attempt running or ends the retries (§5.1). If downtime had started and
   `plan.verification.auto_rollback` is true → `rolling_back` automatically. On every failure the
   knowledge service looks up similar incidents (§14.3) and attaches them as an `AdvisorNote`.
 * Locks: one `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
