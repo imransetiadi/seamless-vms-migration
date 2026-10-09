@@ -108,3 +108,25 @@ async def test_demo_clouds_report_netapp_and_ceph_storage_backends():
     )
     reasons = eligibility(vms["app-01"], ProviderKind.openstack, plan, src_caps, dst_caps)
     assert reasons[Strategy.storage_handover] == []
+
+
+async def test_demo_estate_covers_the_guest_os_range():
+    """The demo shows every guest family and support level of SDD §9.5."""
+    from seamless_migrate.domain.enums import ProviderKind
+    from seamless_migrate.providers.fake import FakeSourceProvider
+
+    openstack = await FakeSourceProvider(ProviderKind.openstack, seed=42).list_vms()
+    vmware = await FakeSourceProvider(ProviderKind.vmware, seed=42).list_vms()
+    distros = {vm.guest_os.distro for vm in openstack + vmware}
+    assert {
+        "rhel",
+        "ubuntu",
+        "debian",
+        "rocky",
+        "almalinux",
+        "centos",
+        "windows-server",
+    } <= distros
+    assert {vm.guest_os.lifecycle for vm in openstack} >= {"current", "legacy"}
+    assert {vm.guest_os.v2v for vm in vmware} >= {"supported", "tech_preview", "unsupported"}
+    assert all(vm.guest_os.family != "unknown" for vm in openstack + vmware)

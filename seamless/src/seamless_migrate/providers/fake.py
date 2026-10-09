@@ -67,20 +67,26 @@ _FLAVORS = {
 # 24 OpenStack VMs of the "Finance apps" estate (RHOSP 17.1).
 _OPENSTACK: tuple[_Spec, ...] = (
     _Spec("web-01", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
-    _Spec("web-02", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
+    _Spec("web-02", "m1.small", (20,), "ubuntu 24.04", rate_mib=0.5, tags=(("app", "portal"),)),
     _Spec("web-03", "m1.small", (40,), "rhel9", rate_mib=0.8, image_root=True),
-    _Spec("api-gw-01", "m1.medium", (30,), "rhel9", rate_mib=1.0),
-    _Spec("portal-01", "m1.small", (25,), "rhel8", rate_mib=0.6, netapp=True),
+    _Spec("api-gw-01", "m1.medium", (30,), "rocky 9.4", rate_mib=1.0),
+    _Spec("portal-01", "m1.small", (25,), "debian 12", rate_mib=0.6, netapp=True),
     _Spec(
         "app-01", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),), netapp=True
     ),
     _Spec(
-        "app-02", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),), netapp=True
+        "app-02",
+        "m1.large",
+        (60,),
+        "almalinux 8",
+        rate_mib=2.0,
+        tags=(("role", "tomcat"),),
+        netapp=True,
     ),
-    _Spec("mq-01", "m1.medium", (50,), "rhel9", rate_mib=4.0, tags=(("role", "rabbitmq"),)),
-    _Spec("mq-02", "m1.medium", (80,), "rhel9", rate_mib=6.0, tags=(("role", "kafka"),)),
+    _Spec("mq-01", "m1.medium", (50,), "ubuntu 22.04", rate_mib=4.0, tags=(("role", "rabbitmq"),)),
+    _Spec("mq-02", "m1.medium", (80,), "debian 11", rate_mib=6.0, tags=(("role", "kafka"),)),
     _Spec("cache-01", "m1.medium", (30,), "rhel9", rate_mib=3.0, tags=(("role", "redis"),)),
-    _Spec("dns-01", "m1.small", (20,), "rhel9", rate_mib=0.2),
+    _Spec("dns-01", "m1.small", (20,), "ubuntu 20.04", rate_mib=0.2),
     _Spec(
         "win-ad-01",
         "m1.large",
@@ -90,7 +96,7 @@ _OPENSTACK: tuple[_Spec, ...] = (
         tags=(("role", "domain-controller"),),
     ),
     _Spec("monitor-01", "m1.large", (100,), "rhel9", rate_mib=3.0, tags=(("role", "prometheus"),)),
-    _Spec("bastion-01", "m1.small", (20,), "rhel9", rate_mib=0.1),
+    _Spec("bastion-01", "m1.small", (20,), "centos 7", rate_mib=0.1),
     _Spec(
         "ledger-db-01",
         "m1.xlarge",
@@ -177,16 +183,16 @@ class _VSpec:
 _VMWARE: tuple[_VSpec, ...] = (
     _VSpec("dc2-web-01", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", rate_mib=0.5),
     _VSpec("dc2-web-02", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", cbt=False),
-    _VSpec("dc2-proxy-01", 2, 4096, (30,), "rhel8_64Guest", network="DC2-DMZ"),
+    _VSpec("dc2-proxy-01", 2, 4096, (30,), "Ubuntu 22.04.4 LTS", network="DC2-DMZ"),
     _VSpec("dc2-app-01", 4, 8192, (80,), "rhel8_64Guest", rate_mib=2.0),
     _VSpec("dc2-mq-01", 4, 8192, (60,), "rhel8_64Guest", snapshots=2, rate_mib=3.0),
-    _VSpec("dc2-dc-01", 4, 8192, (80,), "windows2019srv_64Guest"),
-    _VSpec("dc2-mon-01", 4, 16384, (200,), "rhel9_64Guest", rate_mib=2.5),
+    _VSpec("dc2-dc-01", 4, 8192, (80,), "windows2019srvNext_64Guest"),
+    _VSpec("dc2-mon-01", 4, 16384, (200,), "debian12_64Guest", rate_mib=2.5),
     _VSpec("dc2-db-01", 8, 32768, (100, 400), "rhel8_64Guest", rate_mib=6.0),
     _VSpec("dc2-db-02", 8, 32768, (100, 600), "rhel8_64Guest", cbt=False, rate_mib=5.0),
-    _VSpec("dc2-file-01", 4, 8192, (60, 500), "windows2019srv_64Guest", independent=True),
+    _VSpec("dc2-file-01", 4, 8192, (60, 500), "windows8Server64Guest", independent=True),
     _VSpec("dc2-legacy-01", 2, 4096, (40,), "windows2008_64Guest", tools_ok=False, snapshots=1),
-    _VSpec("dc2-ci-01", 4, 8192, (120,), "rhel9_64Guest", cbt=False, rate_mib=4.0),
+    _VSpec("dc2-ci-01", 4, 8192, (120,), "rockylinux_64Guest", cbt=False, rate_mib=4.0),
 )
 
 
