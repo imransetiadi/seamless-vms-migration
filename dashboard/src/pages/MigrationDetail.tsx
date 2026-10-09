@@ -1,4 +1,4 @@
-import { Ban, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
@@ -368,8 +368,28 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
 }
 
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
+  // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
+  const request = m.cutover_requested ? (
+    <div className="flex flex-col gap-0.5 text-xs">
+      <p className="inline-flex items-center gap-1 text-status-success">
+        <CircleCheck aria-hidden className="size-3.5 shrink-0" />
+        Cutover requested
+      </p>
+      {m.force_window && (
+        <p className="inline-flex items-center gap-1 text-status-warning">
+          <CalendarClock aria-hidden className="size-3.5 shrink-0" />
+          An approver allowed it to start outside the cutover window.
+        </p>
+      )}
+    </div>
+  ) : null;
   if (m.approvals.length === 0) {
-    return <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>;
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
+        {request}
+      </div>
+    );
   }
   return (
     <ul className="flex flex-col gap-2">
@@ -382,7 +402,7 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
           {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
         </li>
       ))}
-      {m.cutover_requested && <li className="text-xs text-status-success">Cutover requested</li>}
+      {request && <li>{request}</li>}
     </ul>
   );
 }

@@ -10,6 +10,32 @@ function renderMigration(id: string) {
 }
 
 describe('MigrationDetail', () => {
+  it('says when a requested cutover may start outside the cutover window (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    // an approval too, so the request shows in the list of approvals
+    m.approvals = [{ actor: 'approver-1', at: '2026-10-08T11:50:00Z', comment: 'go after the backup' }];
+    m.cutover_requested = true;
+    m.force_window = true;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByText('Cutover requested')).toBeInTheDocument();
+    expect(screen.getByText('An approver allowed it to start outside the cutover window.')).toBeInTheDocument();
+    expect(screen.getByText('approver-1')).toBeInTheDocument();
+  });
+
+  it('shows a cutover request in a plan that needs no approval (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    server.plans.find((p) => p.id === m.plan_id)!.require_approval = false;
+    m.approvals = [];
+    m.cutover_requested = true;
+    m.force_window = false;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByText('This plan does not require approval.')).toBeInTheDocument();
+    expect(screen.getByText('Cutover requested')).toBeInTheDocument();
+    expect(screen.queryByText(/outside the cutover window/i)).not.toBeInTheDocument();
+  });
+
   it('names the guest OS and the verification profile a Windows guest gets (SDD §7.5, §9.5)', async () => {
     renderMigration('mig-5d7e2b4a13');
     const vm = await screen.findByRole('region', { name: /^vm$/i });
