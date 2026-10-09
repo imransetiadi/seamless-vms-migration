@@ -1296,6 +1296,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   items, and the announcement counts them ("Checked 2 of 3 providers: 2 healthy; 1 could not be
   checked"). A provider whose check ran but could not reach its cloud is a result (status `error`,
   §4.2), not a failed request.
+* Sizes: IEC units everywhere (B, KiB, MiB, GiB, TiB, one formatter); OpenStack's "GB" — a flavor's disk,
+  a Cinder quota's gigabytes — is GiB and is shown as such.
 * Downtime against the SLO: Overview's Downtime now and the migration page's clock use one rule — calm
   below 80 % of the plan's downtime SLO, a warning (amber, hourglass icon) from 80 %, a breach (red,
   warning icon) past 100 % — so a VM never reads differently on the two pages, and the warning is never
