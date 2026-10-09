@@ -32,6 +32,7 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { PlanStatusBadge } from '../components/StatusBadge';
+import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
 import { cn } from '../lib/cn';
 import { groupFindings } from '../lib/findings';
@@ -275,6 +276,9 @@ export default function PlanDetail() {
   // the API's bound (SDD §12)
   const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 1000;
   const s = stats.data;
+  // what is built from the migrations reads as unknown when they could not be loaded, never as empty (SDD §16)
+  const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
+  const migrationCount = migrations.data?.length ?? s?.total;
 
   return (
     <>
@@ -344,7 +348,7 @@ export default function PlanDetail() {
         <Panel title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">
           <WavesBoard
             plan={p}
-            migrations={list}
+            migrations={migrationsUnknown ? null : list}
             emptyAction={
               <Button icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
                 Auto-plan waves
@@ -374,12 +378,20 @@ export default function PlanDetail() {
         <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-hidden">
           <Panel
             title="Findings"
-            description={`${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`}
+            description={
+              migrationsUnknown
+                ? undefined
+                : `${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`
+            }
           >
-            <FindingGroupsList
-              groups={groupFindings(findings)}
-              emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
-            />
+            {migrationsUnknown ? (
+              <Unavailable what="findings" />
+            ) : (
+              <FindingGroupsList
+                groups={groupFindings(findings)}
+                emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
+              />
+            )}
           </Panel>
         </section>
       </div>
@@ -391,7 +403,7 @@ export default function PlanDetail() {
           <>
             {p.status === 'failed' &&
               'Pre-staging failed (the events say why): starting again retries it before any migration starts. Failed migrations stay failed until you retry or roll them back. '}
-            {list.length} migrations in {p.waves.length || 1} wave{(p.waves.length || 1) === 1 ? '' : 's'}. Warm migrations begin pre-copy while their
+            {migrationCount ?? 'An unknown number of'} migrations in {p.waves.length || 1} wave{(p.waves.length || 1) === 1 ? '' : 's'}. Warm migrations begin pre-copy while their
             source VMs keep running. {p.require_approval ? 'Every cutover still needs an approver.' : 'Cutovers do not need approval in this plan.'}
           </>
         }

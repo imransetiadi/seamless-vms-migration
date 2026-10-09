@@ -230,7 +230,67 @@ describe('PlanDetail', () => {
     // a 5xx is retried twice with backoff before the refetch reports the error
     const dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i }, { timeout: 8000 });
     expect(dialog).toHaveTextContent(/clears any approvals and cutover requests/i);
+    // the list loaded before the failed refetch still stands: the waves and findings keep showing it (SDD §16)
+    expect(within(screen.getByRole('region', { name: /waves/i })).queryByText('Progress unknown')).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Findings' })).toHaveTextContent(/\d+ blockers/);
   }, 15_000);
+
+  it('shows wave progress and findings as unknown, not empty or zero, when the migrations cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    expect(plan.waves).toHaveLength(3);
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/migrations'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    expect(await screen.findByText(/migrations are unavailable/i)).toBeInTheDocument();
+
+    // each wave keeps what the plan says about it; its state and progress come from the migrations
+    const waves = within(screen.getByRole('region', { name: /waves/i })).getAllByRole('listitem');
+    expect(waves).toHaveLength(3);
+    for (const [i, wave] of waves.entries()) {
+      expect(wave).toHaveTextContent(plan.waves.find((w) => w.order === i + 1)!.name);
+      expect(within(wave).getByText('Unknown')).toBeInTheDocument();
+      expect(within(wave).getByText('Progress unknown')).toBeInTheDocument();
+      expect(within(wave).queryByRole('progressbar')).not.toBeInTheDocument();
+      expect(wave).not.toHaveTextContent(/Active|Waiting|Complete|0\/0/);
+    }
+    const findings = screen.getByRole('region', { name: 'Findings' });
+    expect(findings).toHaveTextContent('Unknown: the findings could not be loaded.');
+    expect(findings).not.toHaveTextContent(/0 blockers|no findings yet/i);
+  });
+
+  it('counts the migrations to start from the statistics when the list cannot be loaded, else says unknown (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const count = server.migrations.filter((m) => m.plan_id === plan.id).length;
+    expect(count).toBe(4);
+    const refused = new Set(['/migrations']);
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && refused.has(path)
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByText(/migrations are unavailable/i);
+    await waitFor(() => expect(within(screen.getByRole('region', { name: /plan metrics/i })).getByRole('group', { name: 'Migrations' })).toHaveTextContent('Migrations4'));
+
+    await user.click(await actionButton(/^start$/i));
+    expect(await screen.findByRole('alertdialog', { name: /start this plan/i })).toHaveTextContent(/\b4 migrations in 1 wave\./);
+    view.unmount();
+
+    refused.add('/stats');
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByText(/statistics are unavailable/i);
+    await screen.findByText(/migrations are unavailable/i);
+    await user.click(await actionButton(/^start$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /start this plan/i });
+    expect(dialog).toHaveTextContent(/An unknown number of migrations in 1 wave\./);
+    expect(dialog).not.toHaveTextContent(/\b0 migrations/);
+  });
 
   it('starts a failed plan again, saying that pre-staging failed and is retried (SDD §8, §16)', async () => {
     const user = userEvent.setup({ delay: null });
