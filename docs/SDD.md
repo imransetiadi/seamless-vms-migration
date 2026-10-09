@@ -773,9 +773,10 @@ disks, and the **scan time** `scan = max(Dmax / S, D / min(S·P, A))`.
 
 **Configuration and calibration (PRD G2).** `EstimatorParams` gains `parallel_disks: int = 4`.
 `Plan.estimator_overrides: dict[str, float] = {}` overrides any `EstimatorParams` field for that plan
-(unknown keys, non-positive values and the plan-owned keys `convergence_threshold_bytes` /
-`max_passes` are rejected with 400 — set `Plan.convergence_threshold_bytes` / `Plan.max_sync_passes`
-instead); `Plan.link_bps` keeps precedence for `link_bps`. After every
+(unknown keys, values that are not finite positive numbers — NaN and infinity included — and the
+plan-owned keys `convergence_threshold_bytes` / `max_passes` are rejected with 400 — set
+`Plan.convergence_threshold_bytes` / `Plan.max_sync_passes` instead); `Plan.link_bps` keeps precedence
+for `link_bps` and must be a finite positive number (422 otherwise). After every
 completed warm pass the orchestrator calibrates the migration in place and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` (delta passes
 only; the interval is the time between the two snapshots), and the observed per-stream scan rate
@@ -1010,6 +1011,9 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str, "limit": int = 5}` | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
+
+The free-text fields of the migration actions — `comment` (approve, cutover), `reason` (rollback,
+cancel) and `confirm` (finalize) — hold at most 2000 characters; a longer value is refused with 422.
 
 `GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
 continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
