@@ -709,7 +709,11 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   `plan.verification.auto_rollback` is true → `rolling_back` automatically. On every failure the
   knowledge service looks up similar incidents (§14.3) and attaches them as an `AdvisorNote`.
 * Locks: one `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
-  plan id serializes validations. Plan documents are written by several drivers and the tick loop
+  plan id serializes validations; one shared lock serializes the cross-plan claim of validations and
+  retries (§5.4); one lock per provider id serializes provider checks, so a validation and a manual
+  `POST /providers/{id}/check` do not collide on the provider's versioned write (a provider edited or
+  deleted during a check still refuses it). Order: plan, claim, migration; the provider lock is
+  innermost and takes no other. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost.
