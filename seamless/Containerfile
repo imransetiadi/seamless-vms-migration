@@ -84,9 +84,10 @@ RUN --mount=type=bind,source=.,target=/ctx \
 
 # /var/lib/seamless is the default data dir; /data is the mount point the Compose stack uses
 # (a fresh named volume takes the ownership of its mount point, so the non-root user owns it).
-RUN mkdir -p /var/lib/seamless /data \
- && chown -R 1001:0 /var/lib/seamless /data /opt/seamless \
- && chmod -R g=u /var/lib/seamless /data /opt/seamless
+RUN mkdir -p /var/lib/seamless /data /var/run/secrets/seamless \
+ && chown -R 1001:0 /var/lib/seamless /data /opt/seamless /var/run/secrets/seamless \
+ && chmod -R g=u /var/lib/seamless /data /opt/seamless \
+ && chmod 0700 /var/run/secrets/seamless
 
 ENV HOME=/var/lib/seamless \
     SEAMLESS_DATA_DIR=/var/lib/seamless \

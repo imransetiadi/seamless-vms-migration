@@ -130,6 +130,9 @@ services:
       SEAMLESS_HOST: 0.0.0.0              # inside the container; the host side is loopback-only (ports below)
       SEAMLESS_PORT: "8080"
       SEAMLESS_DATA_DIR: /data
+      # credentials entered in the dashboard (SDD 13.3): 0600 files in the seamless-secrets volume
+      SEAMLESS_SECRET_STORE: files
+      SEAMLESS_SECRETS_DIR: /var/run/secrets/seamless
       SEAMLESS_DB_URL: postgresql+psycopg://seamless:${POSTGRES_PASSWORD:?run scripts/compose-init.sh}@postgres:5432/seamless
       # demo mode (SimulatedExecutor + fake providers); `make seamless-demo` sets SEAMLESS_DEMO=true
       SEAMLESS_DEMO: ${SEAMLESS_DEMO:-false}
@@ -168,6 +171,7 @@ services:
       - "127.0.0.1:${SEAMLESS_HOST_PORT:-8080}:8080"
     volumes:
       - seamless-data:/data
+      - seamless-secrets:/var/run/secrets/seamless
       # API tokens (hashes only), read-only. Fail instead of creating a directory if the file is missing.
       - type: bind
         source: ./tokens.yaml
@@ -201,3 +205,4 @@ networks:
 volumes:
   pgdata: {}
   seamless-data: {}
+  seamless-secrets: {}    # dashboard-entered provider credentials (0600 files); back it up like a secret

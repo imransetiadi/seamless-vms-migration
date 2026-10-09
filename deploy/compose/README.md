@@ -89,6 +89,7 @@ Compose file wires explicitly:
 | `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `20`, `0.6` | advisor bounds |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET` | host agentmemory, none | passed through only when defined; delete the line to disable memory |
 | `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | `seamless-migrate`, `false` | memory project id / privacy ([MEMORY.md](../../docs/MEMORY.md) §3) |
+| `SEAMLESS_SECRET_STORE`, `SEAMLESS_SECRETS_DIR` | `files`, `/var/run/secrets/seamless` | provider credentials and conversion-host keys entered in the dashboard (Providers → Add or Edit): 0600 files in the `seamless-secrets` volume — back it up like a secret; `make seamless-reset` deletes it |
 | `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `true` | misc (JSON logs for forwarders, SDD §15.1) |
 | `SEAMLESS_HOST_PORT`, `SEAMLESS_VERSION` | `8080`, `0.1.0` | published loopback port, image tag |
 

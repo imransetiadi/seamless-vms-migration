@@ -133,6 +133,37 @@ spec:
           port: 13774   # RHOSP 17.1 public Nova
         - protocol: TCP
           port: 13776   # RHOSP 17.1 public Cinder
+---
+# Kubernetes API for the dashboard's secret store (SEAMLESS_SECRET_STORE=kubernetes, SDD 13.3/17).
+# kubernetes.default.svc is DNATed to the API server endpoints (control-plane node IPs, port 6443) before
+# OVN-Kubernetes evaluates egress, so allow 6443; 443 to the Service IP covers plugins that match before
+# DNAT. TIGHTEN BEFORE PRODUCTION: replace 0.0.0.0/0 with the machine network of the control-plane nodes
+# (oc get endpoints kubernetes -n default).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: seamless-allow-egress-kube-api
+  labels:
+    app.kubernetes.io/part-of: seamless-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: seamless
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: 172.30.0.1/32   # default kubernetes Service IP
+      ports:
+        - protocol: TCP
+          port: 443
 # IN-CLUSTER Jev MCP / agentmemory (SEAMLESS_JEV_URL or SEAMLESS_MEMORY_URL pointing at a Service in the cluster).
 # seamless-allow-egress-external excludes the pod and service networks, so such a target is blocked until it is
 # allowed explicitly and narrowly. Uncomment, replace the placeholders, and make sure the target namespace admits

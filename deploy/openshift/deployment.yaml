@@ -34,7 +34,9 @@ spec:
         app.kubernetes.io/part-of: seamless-migrate
     spec:
       serviceAccountName: seamless
-      automountServiceAccountToken: false
+      # the token lets the dashboard store provider credentials as Secrets (secret-store-rbac.yaml);
+      # set false (and SEAMLESS_SECRET_STORE=files or remove it) to manage credentials outside the UI
+      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -66,6 +68,9 @@ spec:
               value: /etc/seamless/clouds/clouds.yaml
             - name: SEAMLESS_SECRETS_DIR
               value: /var/run/secrets/seamless
+            # credentials entered in the dashboard are written as Secrets in this namespace (SDD 13.3)
+            - name: SEAMLESS_SECRET_STORE
+              value: kubernetes
             - name: SEAMLESS_DB_URL
               valueFrom:
                 secretKeyRef:
