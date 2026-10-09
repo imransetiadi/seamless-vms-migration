@@ -967,11 +967,16 @@ env -u TYPESAFE_API_KEY docker --context colima-seamless compose -f deploy/compo
   --env-file "$DUMMY" --profile '*' config -q                                          # never print `config` output
 python3 -c 'import yaml,sys; [list(yaml.safe_load_all(open(f))) for f in sys.argv[1:]]' deploy/openshift/*.yaml
 
-pip install kubernetes-validate yamllint
-kubernetes-validate --strict -k 1.29 deploy/openshift/{namespace,serviceaccount,configmap,pvc,postgres-service,postgres-statefulset,deployment,service,networkpolicy}.yaml
-yamllint -d '{extends: relaxed, rules: {line-length: {max: 160}}}' deploy/
-kubectl kustomize deploy/openshift >/dev/null                  # or: kustomize build deploy/openshift (v5.8.2 renders 15 objects)
-trivy config deploy/                                           # misconfiguration scan (S-20)
+# as CI's `manifests` job: render both kustomizations, validate them against the Kubernetes 1.30 schemas
+kubectl kustomize deploy/openshift > /tmp/manifests.yaml        # 18 objects
+kubeconform -strict -summary -skip Route -kubernetes-version 1.30.0 -schema-location default /tmp/manifests.yaml
+kubectl kustomize deploy/kubernetes > /tmp/k8s.yaml             # the vanilla Kubernetes overlay: 18 objects, no Route
+kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default /tmp/k8s.yaml
+# without the tools: docker --context colima-seamless run --rm -v "$PWD/deploy":/deploy:ro registry.k8s.io/kubectl:v1.30.4 \
+#   kustomize /deploy/openshift > /tmp/manifests.yaml, and docker --context colima-seamless run --rm -i \
+#   ghcr.io/yannh/kubeconform:v0.7.0 <the flags above> - < /tmp/manifests.yaml (CI pins kubeconform v0.7.0)
+pip install yamllint && yamllint -d '{extends: relaxed, rules: {line-length: {max: 160}}}' deploy/
+trivy config deploy/                                            # misconfiguration scan (S-20)
 ```
 
 (`route.yaml` is an OpenShift API object with no upstream schema; it is covered by the structure checks only.)
