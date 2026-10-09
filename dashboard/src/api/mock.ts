@@ -97,6 +97,12 @@ export interface MockServerOptions {
  * either — in the API it does not exist before the plan is validated.
  */
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['pending', 'cancelled', 'finalized', 'rolled_back']);
+/** At most `limit` holders from `heldElsewhere`, and how many are left out (the API's wording). */
+function holdersText(held: Map<string, string[]>, limit = 10): string {
+  const entries = [...held.values()].flat().sort();
+  const rest = entries.length - limit;
+  return entries.slice(0, limit).join(', ') + (rest > 0 ? ` and ${rest} more` : '');
+}
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
 const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
@@ -880,23 +886,30 @@ export class MockServer {
     return ok(plan);
   }
 
-  /** `name (plan "…", phase)` for each VM a migration of another plan with the same source holds (SDD §5.4). */
-  private heldElsewhere(plan: Plan, vmIds: readonly string[]): string[] {
+  /**
+   * The VMs of `vmIds` that migrations of other plans with the same source hold (SDD §5.4), by source
+   * id: `name (plan "…", phase)` once per holder — plans validated before the rule may hold a VM twice.
+   */
+  private heldElsewhere(plan: Plan, vmIds: readonly string[]): Map<string, string[]> {
     const others = new Map(this.plans.filter((p) => p.id !== plan.id && p.source_provider_id === plan.source_provider_id).map((p) => [p.id, p]));
-    return this.migrations
-      .filter((m) => others.has(m.plan_id) && vmIds.includes(m.vm.source_id) && !RELEASES_VM.has(m.phase))
-      .map((m) => `${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.phase})`)
-      .sort();
+    const held = new Map<string, Set<string>>();
+    for (const m of this.migrations) {
+      if (!others.has(m.plan_id) || !vmIds.includes(m.vm.source_id) || RELEASES_VM.has(m.phase)) continue;
+      const holders = held.get(m.vm.source_id) ?? new Set<string>();
+      holders.add(`${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.phase})`);
+      held.set(m.vm.source_id, holders);
+    }
+    return new Map([...held].map(([id, holders]) => [id, [...holders].sort()]));
   }
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
     if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
     const held = this.heldElsewhere(plan, plan.vm_ids);
-    if (held.length) {
+    if (held.size) {
       throw new HttpError(
         409,
         'conflict',
-        `${held.length} VM(s) already have a migration in another plan: ${held.slice(0, 10).join(', ')}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
+        `${held.size} VM(s) already have a migration in another plan: ${holdersText(held)}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
       );
     }
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
@@ -993,8 +1006,8 @@ export class MockServer {
       }
       case 'retry': {
         if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
-        const [holder] = this.heldElsewhere(this.plan(m.plan_id), [m.vm.source_id]);
-        if (holder) throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: a migration in another plan holds the VM: ${holder}; finish, roll back or cancel it there first`);
+        const held = this.heldElsewhere(this.plan(m.plan_id), [m.vm.source_id]);
+        if (held.size) throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: a migration in another plan holds the VM: ${holdersText(held)}; finish, roll back or cancel it there first`);
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
         if (!m.downtime_started_at || m.downtime_ended_at) {

@@ -264,6 +264,28 @@ describe('mock API', () => {
     expect(m).toMatchObject({ strategy: other, approvals: [], cutover_requested: false, force_window: false });
   });
 
+  it('counts VMs, not migrations, and names each holder once in the cross-plan refusal (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const first = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === first.id).slice(0, 2);
+    for (const m of mine) m.phase = 'ready';
+    // a plan from before the rule, with the same name, holds the same VMs again
+    const legacy: Plan = { ...first, id: 'plan-legacy00' };
+    server.plans.push(legacy);
+    for (const m of mine) server.migrations.push({ ...m, id: `${m.id}-legacy`, plan_id: legacy.id });
+    const third = await client.post<Plan>('/plans', {
+      name: 'Third wave',
+      source_provider_id: first.source_provider_id,
+      destination_provider_id: first.destination_provider_id,
+      vm_ids: mine.map((m) => m.vm.source_id),
+    });
+    const [a, b] = mine.map((m) => m.vm.name).sort();
+    await expect(client.post(`/plans/${third.id}/validate`)).rejects.toMatchObject({
+      status: 409,
+      message: `2 VM(s) already have a migration in another plan: ${a} (plan "${first.name}", ready), ${b} (plan "${first.name}", ready); finish, roll back or cancel it there, or remove the VM from vm_ids`,
+    });
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');
