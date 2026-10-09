@@ -39,13 +39,14 @@ interface FormState {
   scanMiBps: string;
   parallelDisks: string;
   tcpPorts: string;
+  windowsTcpPorts: string;
   autoRollback: boolean;
   /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
   handoverEnabled: boolean;
   handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
+type FieldKey = 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -71,6 +72,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     scanMiBps: '',
     parallelDisks: '',
     tcpPorts: '22',
+    windowsTcpPorts: '3389',
     autoRollback: true,
     handoverEnabled: false,
     handoverMap: {},
@@ -204,6 +206,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     }
     const ports = form.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
+    const windowsPorts = form.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
+    if (windowsPorts.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.windowsPorts = 'Use port numbers from 1 to 65535, separated by commas.';
     const backendMap: Record<string, string> = {};
     if (form.handoverEnabled && source?.kind !== 'vmware') {
       const missing = handoverTypes.filter((t) => !chosenTarget(t));
@@ -235,6 +239,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
         estimator_overrides: overrides,
         verification: {
           tcp_ports: ports,
+          windows_tcp_ports: windowsPorts,
           probe_address: 'fixed',
           console_success_patterns: ['login:', 'Cloud-init v\\. .* finished', 'Reached target .*Multi-User'],
           timeout_s: 600,
@@ -278,9 +283,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     scan: id('scan'),
     parallel: id('parallel'),
     ports: id('ports'),
+    windowsPorts: id('windows-ports'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!create.isPending} initialFocusRef={nameRef}>
@@ -462,7 +468,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
                 />
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Comma separated, e.g. 22, 443." />
+                <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Linux and other guests. Comma separated, e.g. 22, 443." />
+                <TextField
+                  id={id('windows-ports')}
+                  label="Windows verification TCP ports"
+                  value={form.windowsTcpPorts}
+                  onChange={(e) => set('windowsTcpPorts', e.target.value)}
+                  error={errors.windowsPorts}
+                  hint="RDP 3389 or WinRM 5985. Windows guests skip the console check."
+                />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
               </div>
               {source?.kind !== 'vmware' && (

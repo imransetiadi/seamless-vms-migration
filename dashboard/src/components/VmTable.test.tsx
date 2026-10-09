@@ -108,4 +108,29 @@ describe('VmTable', () => {
     await user.click(screen.getByRole('checkbox', { name: /select all 3 shown/i }));
     expect(onSelectedChange).toHaveBeenLastCalledWith(new Set(['os-0a11', 'os-0d51', 'os-0d52', 'os-0d53']));
   });
+
+  it('names each guest OS, flags legacy releases and filters by OS', async () => {
+    const user = userEvent.setup();
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+    const row = (name: string) => bodyRows().find((r) => within(r).getAllByRole('rowheader')[0]?.textContent === name)!;
+    expect(row('web-02')).toHaveTextContent('Ubuntu 22.04');
+    expect(row('report-gen-01')).toHaveTextContent('Windows Server 2022');
+    // legacy releases carry the readiness hint from the catalog (SDD §9.5)
+    expect(within(row('jump-host-01')).getByTitle(/GUEST_OS_LEGACY: Ubuntu 18\.04/)).toBeInTheDocument();
+    expect(within(row('legacy-rhel6-app')).getByTitle(/GUEST_OS_LEGACY: RHEL 6/)).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    expect(rowNames().sort()).toEqual(['ad-dc-01', 'report-gen-01']);
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'legacy');
+    expect(rowNames().sort()).toEqual(['jump-host-01', 'legacy-rhel6-app']);
+  });
+
+  it('warns about guests virt-v2v does not support on VMware sources', () => {
+    render(<VmTable vms={vmwareVms} providerKind="vmware" />);
+    const legacy = bodyRows().find((r) => r.textContent?.includes('vm-legacy-win2008'))!;
+    expect(within(legacy).getByTitle(/GUEST_CONVERSION_UNSUPPORTED/)).toBeInTheDocument();
+    const ubuntu = bodyRows().find((r) => r.textContent?.includes('vm-hr-portal'))!;
+    expect(ubuntu).toHaveTextContent('Ubuntu 24.04');
+    expect(within(ubuntu).getByTitle(/GUEST_CONVERSION_UNVERIFIED/)).toBeInTheDocument();
+  });
 });

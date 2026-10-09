@@ -164,6 +164,16 @@ export interface Disk {
   pool?: string | null;
 }
 
+/** Derived by the control plane from `os_type` (SDD §9.5). */
+export interface GuestOS {
+  family: 'linux' | 'windows' | 'unknown';
+  distro: string | null;
+  version: string | null;
+  label: string;
+  lifecycle: 'current' | 'legacy' | 'unknown';
+  v2v: 'supported' | 'tech_preview' | 'unverified' | 'unsupported' | 'unknown';
+}
+
 export interface Nic {
   network: string;
   mac: string | null;
@@ -194,6 +204,8 @@ export interface VMRef {
   disk_bytes: number;
   /** Derived and serialized: Σ used_gb · 2^30 when every disk has used_gb, else ⌊disk_bytes · 0.6⌋. */
   used_bytes: number;
+  /** Derived and serialized from `os_type` (SDD §9.5); absent in responses of older control planes. */
+  guest_os?: GuestOS;
 }
 
 export interface Mappings {
@@ -216,6 +228,8 @@ export interface CutoverWindow {
 
 export interface VerificationConfig {
   tcp_ports: number[];
+  /** Probed instead of `tcp_ports` for Windows guests, whose console check is skipped (SDD §7.5). */
+  windows_tcp_ports: number[];
   probe_address: 'fixed' | 'floating';
   console_success_patterns: string[];
   timeout_s: number;

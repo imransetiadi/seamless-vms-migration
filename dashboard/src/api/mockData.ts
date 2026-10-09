@@ -22,6 +22,7 @@ import type {
   SyncPass,
   VMRef,
 } from './types';
+import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 
 export const GiB = 1024 ** 3;
@@ -151,16 +152,17 @@ export function makeVm(spec: VmSpec): VMRef {
     change_rate_bps: spec.change_rate_mibps === undefined ? null : spec.change_rate_mibps * MiB,
     disk_bytes: diskBytes,
     used_bytes: usedBytes,
+    guest_os: identifyGuestOs(spec.os_type ?? 'rhel9'),
   };
 }
 
 const OS_VMS: VmSpec[] = [
   { id: 'os-0a11', name: 'web-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 12 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-01' },
-  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
+  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'ubuntu 22.04', disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
   { id: 'os-0a13', name: 'web-03', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 13 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-03' },
   { id: 'os-0a14', name: 'web-cache-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 30, used_gb: 9 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'cache' } },
-  { id: 'os-0b21', name: 'api-gw-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 60, used_gb: 21 }], tags: { app: 'gateway' } },
-  { id: 'os-0b22', name: 'api-gw-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 60, used_gb: 20 }], tags: { app: 'gateway' } },
+  { id: 'os-0b21', name: 'api-gw-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'rocky 9.4', disks: [{ size_gb: 60, used_gb: 21 }], tags: { app: 'gateway' } },
+  { id: 'os-0b22', name: 'api-gw-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'debian 12', disks: [{ size_gb: 60, used_gb: 20 }], tags: { app: 'gateway' } },
   { id: 'os-0b31', name: 'mq-broker-01', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 46, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0b32', name: 'mq-broker-02', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 51, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0c41', name: 'ad-dc-01', project: 'platform', flavor: 'm1.large', vcpus: 4, ram_mb: 16384, os_type: 'windows2019', disks: [{ size_gb: 80, used_gb: 38 }], nics: [{ network: 'tenant-infra', mtu: 1500 }], tags: { app: 'active-directory' } },
@@ -172,13 +174,13 @@ const OS_VMS: VmSpec[] = [
   { id: 'os-0e63', name: 'shared-disk-node-a', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 12 }, { size_gb: 300, used_gb: 140, multiattach: true }], tags: { app: 'gfs-cluster' } },
   { id: 'os-0e64', name: 'app-billing-01', project: 'finance', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 50, used_gb: 22 }, { size_gb: 150, used_gb: 88 }], tags: { app: 'billing' }, change_rate_mibps: 3 },
   { id: 'os-0e65', name: 'static-cdn-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 20, used_gb: 6, kind: 'image_root', volume_type: null }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'static' } },
-  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', disks: [{ size_gb: 60, used_gb: 25, volume_type: 'netapp-nfs' }], tags: { app: 'reporting' } },
+  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', os_type: 'windows 2022', disks: [{ size_gb: 60, used_gb: 25, volume_type: 'netapp-nfs' }], tags: { app: 'reporting' } },
   { id: 'os-0e67', name: 'old-ftp-01', project: 'platform', flavor: 'm1.small', power_state: 'stopped', disks: [{ size_gb: 30, used_gb: 4, volume_type: 'netapp-nfs' }], tags: { app: 'ftp' } },
   { id: 'os-0f71', name: 'analytics-node-1', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 380, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f72', name: 'analytics-node-2', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 362, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f73', name: 'analytics-node-3', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 15, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 371, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f74', name: 'analytics-db', project: 'analytics', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 17, volume_type: 'ceph-ssd' }, { size_gb: 400, used_gb: 260, volume_type: 'ceph-hdd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark', tier: 'database' }, change_rate_mibps: 6 },
-  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500 }], tags: { app: 'bastion' } },
+  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', os_type: 'ubuntu 18.04', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500 }], tags: { app: 'bastion' } },
   { id: 'os-1a02', name: 'build-runner-07', project: 'platform', flavor: 'm1.large', power_state: 'error', disks: [{ size_gb: 100 }], tags: { app: 'ci' } },
 ];
 
@@ -187,7 +189,7 @@ const VMW_VMS: VmSpec[] = [
   { id: 'vm-5002', name: 'vm-erp-db-01', project: 'erp', vcpus: 16, ram_mb: 131072, os_type: 'rhel8', cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 100, used_gb: 30, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 800, used_gb: 590, kind: 'vmdk', volume_type: null, device: 'scsi0:1' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'erp', tier: 'database' }, change_rate_mibps: 10 },
   { id: 'vm-5003', name: 'vm-fileserver-01', project: 'erp', vcpus: 4, ram_mb: 16384, os_type: 'windows2019', cbt_enabled: false, tools_ok: true, disks: [{ size_gb: 100, used_gb: 40, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 1500, used_gb: 1100, kind: 'vmdk', volume_type: null, device: 'scsi0:1' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'files' } },
   { id: 'vm-5004', name: 'vm-print-01', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2016', cbt_enabled: true, tools_ok: false, disks: [{ size_gb: 60, used_gb: 22, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 20, used_gb: 3, kind: 'vmdk', volume_type: null, device: 'scsi0:1', independent: true }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'print' } },
-  { id: 'vm-5005', name: 'vm-hr-portal', project: 'erp', vcpus: 4, ram_mb: 8192, os_type: 'rhel9', cbt_enabled: true, tools_ok: true, snapshot_count: 2, disks: [{ size_gb: 80, used_gb: 31, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'hr' } },
+  { id: 'vm-5005', name: 'vm-hr-portal', project: 'erp', vcpus: 4, ram_mb: 8192, os_type: 'Ubuntu 24.04.1 LTS', cbt_enabled: true, tools_ok: true, snapshot_count: 2, disks: [{ size_gb: 80, used_gb: 31, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'hr' } },
   { id: 'vm-5006', name: 'vm-legacy-win2008', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2008', cbt_enabled: false, tools_ok: false, disks: [{ size_gb: 60, used_gb: 41, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'legacy-crm' } },
 ];
 
@@ -543,8 +545,15 @@ export function preflight(
     add('VM_VGPU', 'blocker', 'Flavor requests a vGPU (resources:VGPU).', 'Configure mediated devices on RHOSO and map the flavor.');
   if (vm.disks.some((d) => d.encrypted))
     add('VOL_ENCRYPTED', 'warning', 'An encrypted volume is attached; its Barbican key must be re-created at RHOSO.', 'Export the secret and register it in the RHOSO Key Manager before cutover.');
-  if (vm.os_type && /^(rhel[3-6]|centos[3-6]|windows200[038])/.test(vm.os_type))
-    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${vm.os_type} is end-of-life; drivers may be missing.`, 'Verify virtio drivers in the initramfs before cutover.');
+  const guest = guestOsOf(vm);
+  if (guest.lifecycle === 'legacy')
+    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${guest.label} is out of standard vendor support.`, 'It still migrates: test the application on RHOSO, check the virtio drivers and plan a longer verification.');
+  if (guest.family === 'unknown')
+    add('GUEST_OS_UNKNOWN', 'info', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`, 'Set the os_distro and os_version image properties or run VMware Tools; verification uses the Linux profile meanwhile.');
+  if (sourceKind === 'vmware' && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
+    add('GUEST_CONVERSION_UNVERIFIED', 'warning', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`, 'Run a test conversion of a copy first.', ['vmware_cold', 'vmware_warm']);
+  if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
+    add('GUEST_CONVERSION_UNSUPPORTED', 'warning', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`, 'Install the virtio storage and network drivers from an older virtio-win release inside the guest and test the conversion, or migrate the VM another way.', ['vmware_cold', 'vmware_warm']);
   if (sourceKind === 'vmware') {
     if (vm.cbt_enabled === false)
       add('VMW_CBT_DISABLED', 'warning', 'Changed Block Tracking is disabled; only cold migration is possible.', 'Enable CBT (requires a power cycle) or accept a cold window.', ['vmware_warm']);
@@ -583,6 +592,7 @@ export function defaultPlanFields(now: number) {
     handover: { enabled: false, backend_map: {} },
     verification: {
       tcp_ports: [22],
+      windows_tcp_ports: [3389],
       probe_address: 'fixed' as const,
       console_success_patterns: ['login:', 'Cloud-init v\\. .* finished', 'Reached target .*Multi-User'],
       timeout_s: 600,
@@ -795,7 +805,7 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'failed',
     createdAgo: 2 * D,
-    overrides: { verification: { tcp_ports: [22, 8080], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
+    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
     waves: [{ id: 'wave-1', name: 'Legacy', vms: ['os-0e61', 'os-0e63', 'os-0e66', 'os-0e67'], max_parallel: 2 }],
     migrations: [
       {

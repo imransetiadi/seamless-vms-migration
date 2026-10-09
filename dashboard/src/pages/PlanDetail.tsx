@@ -133,10 +133,15 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         </Setting>
       )}
       <Setting label="Storage handover">
-        {plan.handover.enabled ? `Enabled · ${Object.keys(plan.handover.backend_map).length} backend mapping(s)` : 'Disabled'}
+        {plan.handover.enabled
+          ? Object.entries(plan.handover.backend_map)
+              .map(([type, target]) => `${type} to ${target}`)
+              .join(', ') || 'Enabled, no backend mapped'
+          : 'Disabled'}
       </Setting>
       <Setting label="Verification">
-        {v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')}` : 'No TCP probes'} · {v.probe_address} IP · timeout {formatDuration(v.timeout_s)} ·
+        {v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')}` : 'No TCP probes'} ·{' '}
+        {v.windows_tcp_ports?.length ? `Windows TCP ${v.windows_tcp_ports.join(', ')}` : 'no Windows TCP probes'} · {v.probe_address} IP · timeout {formatDuration(v.timeout_s)} ·
         auto-rollback {v.auto_rollback ? 'on' : 'off'} · advisor {v.use_advisor ? 'on' : 'off'}
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>

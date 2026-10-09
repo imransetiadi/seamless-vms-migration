@@ -1,11 +1,11 @@
 import { Ban, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { useEventTail, useMigration, usePlan, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
-import type { Event, Migration, Phase, Plan, Role, Strategy } from '../api/types';
+import type { Event, GuestOS, Migration, Phase, Plan, Role, Strategy, VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
@@ -24,6 +24,7 @@ import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
+import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { isActivePhase, isWarmStrategy, phaseMeta } from '../lib/phase';
 import { hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
@@ -226,8 +227,23 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   );
 }
 
-function VmDetails({ m }: { m: Migration }) {
+/** How verification will judge this guest (SDD §7.5): the Windows profile or the Linux one. */
+function verificationProfile(family: GuestOS['family'], v: VerificationConfig | undefined): string {
+  if (!v) return '';
+  if (family === 'windows') {
+    return v.windows_tcp_ports?.length
+      ? `Verified on TCP ${v.windows_tcp_ports.join(', ')}, without the console check`
+      : 'Verified without a TCP probe or console check: set Windows ports in the plan';
+  }
+  const tcp = v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')} and ` : '';
+  return `Verified on ${tcp}the console log`;
+}
+
+function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const vm = m.vm;
+  const osId = useId();
+  const guest = guestOsOf(vm);
+  const vmware = m.strategy === 'vmware_cold' || m.strategy === 'vmware_warm';
   return (
     <div className="flex flex-col gap-3 text-sm">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
@@ -241,8 +257,13 @@ function VmDetails({ m }: { m: Migration }) {
         <dd>
           {vm.flavor ?? '—'} <span className="num text-muted-foreground">({vm.vcpus} vCPU, {formatBytes(vm.ram_mb * 1024 * 1024)})</span>
         </dd>
-        <dt className="text-muted-foreground">OS</dt>
-        <dd>{vm.os_type ?? '—'}</dd>
+        <dt id={osId} className="text-muted-foreground">Guest OS</dt>
+        <dd aria-labelledby={osId} title={vm.os_type ?? undefined}>
+          {guest.label}
+          {guest.lifecycle === 'legacy' && <span className="text-status-warning">, out of vendor support</span>}
+          <span className="block text-xs text-muted-foreground">{verificationProfile(guest.family, plan?.verification)}</span>
+          {vmware && guest.v2v !== 'supported' && <span className="block text-xs text-status-warning">{V2V_LABELS[guest.v2v]}</span>}
+        </dd>
         <dt className="text-muted-foreground">Power</dt>
         <dd>{vm.power_state}</dd>
         <dt className="text-muted-foreground">Size</dt>
@@ -424,7 +445,7 @@ export default function MigrationDetail() {
               </Panel>
             )}
             <Panel title="VM">
-              <VmDetails m={m} />
+              <VmDetails m={m} plan={p} />
             </Panel>
           </div>
           <Panel title="Timeline" description="Phase changes and audit events, newest first">

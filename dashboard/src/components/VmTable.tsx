@@ -1,6 +1,6 @@
 import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { POWER_STATES, type PowerState, type ProviderKind, type VMRef } from '../api/types';
+import { POWER_STATES, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatBytes, formatNumber } from '../lib/format';
 import type { Tone } from '../lib/phase';
@@ -12,6 +12,7 @@ import { EmptyState } from './EmptyState';
 import { SelectField } from './Field';
 import { SortableHeader } from './SortableHeader';
 import { StatusBadge } from './StatusBadge';
+import { guestOsOf } from '../lib/guestOs';
 
 const POWER_META: Record<PowerState, { label: string; tone: Tone; icon: LucideIcon }> = {
   running: { label: 'Running', tone: 'success', icon: Power },
@@ -27,11 +28,14 @@ const READINESS_ORDER: Record<ReadinessLevel, number> = { blocker: 0, attention:
 type SortKey = 'name' | 'project' | 'power' | 'cpu' | 'disk' | 'used' | 'readiness';
 type ReadinessFilter = 'all' | ReadinessLevel;
 
+type OsFilter = 'all' | 'linux' | 'windows' | 'legacy' | 'unknown';
+
 interface Row {
   vm: VMRef;
   flags: ReadinessFlag[];
   level: ReadinessLevel;
   haystack: string;
+  guest: GuestOS;
 }
 
 export interface VmTableProps {
@@ -74,6 +78,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [power, setPower] = useState<PowerState | 'all'>('all');
   const [readiness, setReadiness] = useState<ReadinessFilter>('all');
   const [project, setProject] = useState('all');
+  const [os, setOs] = useState<OsFilter>('all');
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -83,11 +88,12 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     () =>
       vms.map((vm) => {
         const flags = readinessFlags(vm, providerKind);
-        const haystack = [vm.name, vm.project, vm.os_type, vm.flavor, vm.host, ...Object.entries(vm.tags).flat()]
+        const guest = guestOsOf(vm);
+        const haystack = [vm.name, vm.project, vm.os_type, guest.label, vm.flavor, vm.host, ...Object.entries(vm.tags).flat()]
           .filter(Boolean)
           .join(' ')
           .toLowerCase();
-        return { vm, flags, level: readinessLevel(flags), haystack };
+        return { vm, flags, level: readinessLevel(flags), haystack, guest };
       }),
     [vms, providerKind],
   );
@@ -99,15 +105,16 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return rows.filter(({ vm, level, haystack }) => {
+    return rows.filter(({ vm, level, haystack, guest }) => {
       if (power !== 'all' && vm.power_state !== power) return false;
+      if (os === 'legacy' ? guest.lifecycle !== 'legacy' : os !== 'all' && guest.family !== os) return false;
       if (project !== 'all' && vm.project !== project) return false;
       if (readiness === 'ready' && level !== 'ready') return false;
       if (readiness === 'attention' && level === 'ready') return false;
       if (readiness === 'blocker' && level !== 'blocker') return false;
       return !q || haystack.includes(q);
     });
-  }, [rows, query, power, project, readiness]);
+  }, [rows, query, power, project, readiness, os]);
 
   const sorted = useMemo(
     () =>
@@ -202,6 +209,19 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             { value: 'ready', label: 'Ready' },
             { value: 'attention', label: 'Needs attention' },
             { value: 'blocker', label: 'Blocked' },
+          ]}
+        />
+        <SelectField
+          label="Guest OS"
+          className="md:w-40"
+          value={os}
+          onChange={(e) => setOs(e.target.value as OsFilter)}
+          options={[
+            { value: 'all', label: 'All' },
+            { value: 'linux', label: 'Linux' },
+            { value: 'windows', label: 'Windows' },
+            { value: 'legacy', label: 'Legacy releases' },
+            { value: 'unknown', label: 'Not identified' },
           ]}
         />
         {projects.length > 1 && (
@@ -309,7 +329,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                       {formatBytes(vm.disk_bytes)}
                     </td>
                     <td className="num hidden whitespace-nowrap text-right md:table-cell">{formatBytes(vm.used_bytes)}</td>
-                    <td className="hidden text-muted-foreground lg:table-cell">{vm.os_type ?? '—'}</td>
+                    <td className="hidden text-muted-foreground lg:table-cell" title={vm.os_type ?? undefined}>
+                      {guestOsOf(vm).label}
+                    </td>
                   </tr>
                 );
               })}
