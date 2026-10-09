@@ -254,7 +254,11 @@ export interface ProviderDialogProps {
  */
 export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDialogProps) {
   const titleId = useId();
-  const editing = Boolean(provider);
+  // a provider this dialog added before a later step failed (credentials, key, a connection test
+  // that did not pass): the dialog goes on editing it, so Save never adds it twice (SDD §16)
+  const [added, setAdded] = useState<Provider | null>(null);
+  const current = provider ?? added ?? undefined;
+  const editing = Boolean(current);
   const nameRef = useRef<HTMLInputElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
   const [form, setForm] = useState<FormState>(() => initialState(provider));
@@ -273,6 +277,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   useEffect(() => {
     if (!open) return;
     setForm(initialState(provider));
+    setAdded(null);
     setErrors({});
     setOutcome(null);
     setFailure(null);
@@ -310,7 +315,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     if (!form.name.trim()) e.name = 'Enter a name operators will recognise.';
     if (!editing && !ID_PATTERN.test(form.id)) e.id = 'Use 2–63 lowercase letters, digits and dashes, starting with a letter or digit.';
     if (!/^https?:\/\/\S+$/.test(form.endpoint.trim())) e.endpoint = `Enter the full URL, e.g. ${preset.endpointExample}.`;
-    const stored = editing && Boolean(provider?.credentials_updated_at);
+    const stored = editing && Boolean(current?.credentials_updated_at);
     const required = !editing || !stored || wantsCredentials();
     if (form.mode === 'clouds_yaml') {
       if (!form.cloud.trim()) e.cloud = 'Enter the cloud name of the entry in the mounted clouds.yaml.';
@@ -324,7 +329,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     }
     if (!form.hostManaged) {
       if (!form.hostName.trim() && !form.hostAddress.trim()) e.hostAddress = 'Enter the address (or name) of the existing conversion host.';
-      const keyStored = editing && Boolean(provider?.conversion_key_updated_at);
+      const keyStored = editing && Boolean(current?.conversion_key_updated_at);
       if (!keyStored && !form.privateKey) e.privateKey = 'Add the SSH private key Seamless uses to reach the conversion host.';
     }
     if (form.privateKey && !/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(form.privateKey.trim())) {
@@ -335,7 +340,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
 
   const conversionHost = (): ConversionHostConfig | null => {
     const blank = (v: string) => (v.trim() ? v.trim() : null);
-    const existing = provider?.conversion_host;
+    const existing = current?.conversion_host;
     const host: ConversionHostConfig = {
       manage: form.hostManaged,
       name: blank(form.hostName),
@@ -389,22 +394,27 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         distribution: form.distribution,
         conversion_host: conversionHost(),
       };
+      // every step that succeeded is kept: a later failure never makes Save add the provider again
+      const keep = (step: Provider): Provider => {
+        if (!provider) setAdded(step);
+        return step;
+      };
       let saved: Provider;
-      if (provider) {
+      if (current) {
         const patch: ProviderPatch = {};
         for (const [key, value] of Object.entries(fields) as Array<[keyof ProviderPatch, unknown]>) {
-          if (JSON.stringify(value) !== JSON.stringify(provider[key])) (patch as Record<string, unknown>)[key] = value;
+          if (JSON.stringify(value) !== JSON.stringify(current[key])) (patch as Record<string, unknown>)[key] = value;
         }
-        if (form.mode === 'clouds_yaml' && provider.credentials_secret) patch.credentials_secret = null;
-        saved = Object.keys(patch).length ? await update.mutateAsync({ id: provider.id, patch }) : provider;
+        if (form.mode === 'clouds_yaml' && current.credentials_secret) patch.credentials_secret = null;
+        saved = Object.keys(patch).length ? keep(await update.mutateAsync({ id: current.id, patch })) : current;
       } else {
-        saved = await create.mutateAsync({ ...fields, id: form.id, kind: preset.kind, role: form.role, credentials_secret: null });
+        saved = keep(await create.mutateAsync({ ...fields, id: form.id, kind: preset.kind, role: form.role, credentials_secret: null }));
       }
       const creds = credentials();
-      if (creds) saved = await setCredentials.mutateAsync({ id: saved.id, credentials: creds });
-      if (form.privateKey) saved = await setKey.mutateAsync({ id: saved.id, privateKey: form.privateKey });
+      if (creds) saved = keep(await setCredentials.mutateAsync({ id: saved.id, credentials: creds }));
+      if (form.privateKey) saved = keep(await setKey.mutateAsync({ id: saved.id, privateKey: form.privateKey }));
       if (test) {
-        saved = await check.mutateAsync(saved.id);
+        saved = keep(await check.mutateAsync(saved.id));
         setOutcome({ provider: saved, checked: true });
       } else {
         onSaved?.(saved, `${saved.name} ${provider ? 'saved' : 'added'}.`);
@@ -435,7 +445,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   };
 
   const errorEntries = Object.entries(errors) as Array<[FieldKey, string]>;
-  const credsStored = editing && provider?.credentials_updated_at;
+  const credsStored = editing && current?.credentials_updated_at;
   const failureText = failure instanceof ApiError ? failure.message : failure ? String(failure) : null;
 
   if (outcome) {
@@ -486,7 +496,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       <form noValidate onSubmit={submit} className="flex max-h-[85vh] flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
-            {editing ? `Edit ${provider?.name}` : 'Connect a cloud'}
+            {editing ? `Edit ${current?.name}` : 'Connect a cloud'}
           </h2>
           <p className="text-sm text-muted-foreground">
             {editing
@@ -515,7 +525,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           )}
 
           <Section title="Platform" description="Choosing a platform fills in sensible defaults; you can change every value below.">
-            <PlatformPicker value={form.distribution} lockedKind={editing ? (provider?.kind ?? null) : null} onChange={choosePreset} />
+            <PlatformPicker value={form.distribution} lockedKind={editing ? (current?.kind ?? null) : null} onChange={choosePreset} />
           </Section>
 
           <Section title="Connection">
@@ -621,7 +631,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 options={preset.credentialModes.map((m) => ({ value: m, label: MODE_LABELS[m] }))}
               />
             )}
-            {form.mode !== 'clouds_yaml' && <StoredNote at={credsStored ? provider?.credentials_updated_at : null} what="Credentials" />}
+            {form.mode !== 'clouds_yaml' && <StoredNote at={credsStored ? current?.credentials_updated_at : null} what="Credentials" />}
             {form.mode === 'clouds_yaml' && (
               <TextField
                 id={id('cloud')}
@@ -800,7 +810,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 {!form.hostManaged && (
                   <div className="flex flex-col gap-2" id={id('privateKey')} tabIndex={-1}>
                     <span className="field-label">SSH private key</span>
-                    <StoredNote at={provider?.conversion_key_updated_at} what="A key" />
+                    <StoredNote at={current?.conversion_key_updated_at} what="A key" />
                     <div className="flex flex-wrap items-center gap-2">
                       <label className="inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border border-border px-3 text-sm text-foreground hover:bg-muted/60 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-ring">
                         <FileKey2 aria-hidden className="size-4" />

@@ -568,9 +568,15 @@ export class MockServer {
           const me = this.require(token, 'operator', path);
           provider.last_checked_at = new Date(this.now()).toISOString();
           if (provider.status === 'unknown') {
-            provider.status = 'ok';
-            provider.status_message = 'All services reachable.';
-            provider.capabilities = { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+            // a mock convention: an endpoint whose host starts with "unreachable" fails the test
+            if (/^https?:\/\/unreachable[.-]/i.test(provider.endpoint)) {
+              provider.status = 'error';
+              provider.status_message = 'The endpoint did not answer (connection timed out).';
+            } else {
+              provider.status = 'ok';
+              provider.status_message = 'All services reachable.';
+              provider.capabilities = { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+            }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
           return ok(provider);

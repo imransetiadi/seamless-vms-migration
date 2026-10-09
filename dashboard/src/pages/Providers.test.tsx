@@ -164,4 +164,68 @@ describe('Providers page', () => {
     expect(await within(dialog).findByText(/not all changes were saved/i)).toBeInTheDocument();
     expect(dialog).toHaveTextContent(/running or paused plan/i);
   });
+
+  it('keeps a provider whose credentials failed and saves them on the next try, without adding it again (SDD §16)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    // the credentials step fails once (e.g. the secret store is down)
+    const target = server as unknown as { setCredentials: (...args: unknown[]) => unknown };
+    const setCredentials = target.setCredentials.bind(server);
+    let failures = 1;
+    target.setCredentials = (...args: unknown[]) => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new Error('secret store unavailable');
+      }
+      return setCredentials(...args);
+    };
+    renderPage('admin', server);
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab C');
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-c.example.com:5000/v3');
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+
+    // the provider was added; its credentials were not
+    expect(await within(dialog).findByText(/internal error/i)).toBeInTheDocument();
+    const added = () => server.providers.filter((p) => p.id === 'kolla-lab-c');
+    expect(added()).toHaveLength(1);
+    expect(added()[0]?.credentials_updated_at).toBeNull();
+    // the dialog goes on editing it: the ID is fixed now, and Save sends what is missing
+    expect(within(dialog).getByLabelText(/^id/i)).toBeDisabled();
+    await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
+    await waitFor(() => expect(added()[0]?.credentials_updated_at).not.toBeNull());
+    expect(added()).toHaveLength(1);
+    expect(JSON.stringify(server.providers)).not.toContain('Hunter2-secret');
+  });
+
+  it('after a connection test that did not pass, Edit again fixes the added provider instead of adding it again (SDD §16)', async () => {
+    const user = userEvent.setup();
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab D');
+    // the mock fails the connection test of an endpoint whose host starts with "unreachable"
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://unreachable.example.com:5000/v3');
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+
+    const failed = await screen.findByRole('dialog', { name: /kolla lab d was saved, but the connection test did not pass/i });
+    await user.click(within(failed).getByRole('button', { name: /^edit again$/i }));
+    const form = await screen.findByRole('dialog', { name: /edit kolla lab d/i });
+    const url = within(form).getByLabelText(/keystone url/i);
+    await user.clear(url);
+    await user.type(url, 'https://kolla-d.example.com:5000/v3');
+    await user.click(within(form).getByRole('button', { name: /save and test connection/i }));
+
+    expect(await screen.findByRole('dialog', { name: /kolla lab d is connected/i })).toBeInTheDocument();
+    const added = server.providers.filter((p) => p.id === 'kolla-lab-d');
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ endpoint: 'https://kolla-d.example.com:5000/v3', status: 'ok' });
+  });
 });
