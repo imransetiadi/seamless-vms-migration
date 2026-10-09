@@ -72,6 +72,28 @@ def _deployment() -> dict:
     return next(m for m in manifests if m and m["kind"] == "Deployment")
 
 
+def test_postgres_gets_a_writable_home_under_its_read_only_root():
+    """The SCL image's start script writes ``$HOME/passwd`` and its generated config under
+    ``HOME=/var/lib/pgsql`` for every UID (OpenShift's arbitrary one and the overlay's 26): with
+    ``readOnlyRootFilesystem`` that path must be an emptyDir, or the database exits 1 on start
+    ("/var/lib/pgsql/passwd: Read-only file system"). The data PVC stays nested at
+    ``/var/lib/pgsql/data`` (QASuite §14.5 reproduces both with the pinned image)."""
+    docs = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "postgres-statefulset.yaml").read_text()
+    )
+    (sts,) = [d for d in docs if d and d.get("kind") == "StatefulSet"]
+    pod = sts["spec"]["template"]["spec"]
+    (container,) = [c for c in pod["containers"] if c["name"] == "postgres"]
+    assert container["securityContext"]["readOnlyRootFilesystem"] is True
+    mounts = {m["mountPath"]: m["name"] for m in container["volumeMounts"]}
+    empty = {v["name"] for v in pod["volumes"] if "emptyDir" in v}
+    claims = {t["metadata"]["name"] for t in sts["spec"]["volumeClaimTemplates"]}
+    assert mounts.get("/var/lib/pgsql") in empty
+    assert mounts.get("/var/lib/pgsql/data") in claims
+    for scratch in ("/var/run/postgresql", "/tmp"):
+        assert mounts.get(scratch) in empty
+
+
 def test_security_md_describes_the_api_token_the_deployment_mounts():
     """Security.md's secrets rules and hardening table say what deployment.yaml does with the
     control plane's Kubernetes API token: mounted for the dashboard's Secret store (R-15)."""

@@ -451,7 +451,7 @@ CIDRs of your clouds, vCenter, conversion hosts, Jev provider and agentmemory be
 | Non-root | `jev`: `user: node`; `seamless`: image user (Containerfile, SDD §17) | `runAsNonRoot: true`; UID from the restricted SCC |
 | Capabilities | `cap_drop: ALL` on `seamless` and `jev` | `capabilities.drop: [ALL]` on every container |
 | Privilege escalation | `security_opt: no-new-privileges:true` on every service | `allowPrivilegeEscalation: false` |
-| Root filesystem | writable by default; `read_only: true` + `tmpfs: [/tmp]` is provided as a commented opt-in to rehearse the cluster profile | `readOnlyRootFilesystem: true` on `seamless`; writable only `/data` (PVC) and `/tmp` (`emptyDir`) |
+| Root filesystem | writable by default; `read_only: true` + `tmpfs: [/tmp]` is provided as a commented opt-in to rehearse the cluster profile | `readOnlyRootFilesystem: true` on `seamless`; writable only `/data` (PVC) and `/tmp` (`emptyDir`). On PostgreSQL too: writable only its data PVC and the `emptyDir`s `/var/lib/pgsql` (the image's HOME, where the start script writes `passwd` and its generated config — without it the database exits 1), `/var/run/postgresql` and `/tmp` (QASuite §14.5) |
 | Seccomp | Docker default profile | `seccompProfile: RuntimeDefault` (pod level) |
 | Kubernetes API token | n/a | `automountServiceAccountToken: true` on the control plane only, for the dashboard's Secret store, with a namespaced Role on Secrets (R-15); `false` on the ServiceAccount and on PostgreSQL, and on the control plane when credentials are managed outside the dashboard |
 | Network exposure | only `seamless` on `127.0.0.1:8080`; `postgres` on an `internal: true` network; `jev` only on the app network | Route (edge TLS) → Service; default-deny NetworkPolicies (§8) |
