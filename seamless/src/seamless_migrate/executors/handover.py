@@ -39,6 +39,20 @@ T = TypeVar("T")
 JOURNAL_FILE = "handover-journal.json"
 DEFINITION_FILE = "source-server.json"
 ROOT_DEVICES = ("/dev/vda", "/dev/sda", "/dev/xvda")
+# volume_image_metadata keys that decide how the guest boots (SDD §7.3 step 7)
+BOOT_PROPERTY_PREFIXES = ("hw_", "os_", "img_")
+BOOT_PROPERTY_KEYS = frozenset({"architecture"})
+
+
+def boot_properties(metadata: Any) -> dict[str, str]:
+    """Firmware, machine type, buses, NIC model and OS hints of a volume's image metadata."""
+    if not isinstance(metadata, dict):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in metadata.items()
+        if str(k).startswith(BOOT_PROPERTY_PREFIXES) or str(k) in BOOT_PROPERTY_KEYS
+    }
 
 
 def _attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -185,6 +199,7 @@ class HandoverExecutor:
                     "size": _attr(volume, "size"),
                     "volume_type": _attr(volume, "volume_type"),
                     "host": _attr(volume, "host"),
+                    "image_metadata": boot_properties(_attr(volume, "volume_image_metadata")),
                 }
             )
         attachments.sort(key=lambda a: (a["boot"], a["device"] or ""))  # data first, boot last
@@ -249,6 +264,13 @@ class HandoverExecutor:
                 raise PermanentStepError(f"volume {vid}: {exc}") from None
             storage[vid] = {"family": family, "src_pool": src_pool, "dst_host": dst_host}
         return storage
+
+    @staticmethod
+    def _set_boot_properties(conn: Any, volume_id: str, metadata: dict[str, str]) -> None:
+        conn.block_storage.post(
+            f"/volumes/{volume_id}/action",
+            json={"os-set_image_metadata": {"metadata": metadata}},
+        )
 
     def _unmanage(self, conn: Any, volume_id: str) -> None:
         volume = conn.block_storage.get_volume(volume_id)
@@ -432,6 +454,18 @@ class HandoverExecutor:
                 await asyncio.to_thread(journal.mark, key, dest_id=dest_id)
             dest_ids[att["volume_id"]] = journal.get(key)["dest_id"]
 
+        for att in attachments:
+            metadata = att.get("image_metadata") or {}
+            key = f"meta_dst:{att['volume_id']}"
+            if metadata and not journal.done(key):
+                await self._call(
+                    f"restore the boot properties of {att['volume_id']} in RHOSO",
+                    lambda v=dest_ids[att["volume_id"]], m=metadata: self._set_boot_properties(
+                        dst, v, m
+                    ),
+                )
+                await asyncio.to_thread(journal.mark, key)
+
         if not journal.done("create_server"):
 
             def create() -> str:
@@ -527,6 +561,14 @@ class HandoverExecutor:
                 )
                 await asyncio.to_thread(journal.mark, key, volume_id=new_id)
             new_ids[vid] = journal.get(key)["volume_id"]
+            metadata = att.get("image_metadata") or {}
+            meta_key = f"rb:meta_src:{vid}"
+            if metadata and not journal.done(meta_key):
+                await self._call(
+                    f"restore the boot properties of {new_ids[vid]} at the source",
+                    lambda v=new_ids[vid], m=metadata: self._set_boot_properties(src, v, m),
+                )
+                await asyncio.to_thread(journal.mark, meta_key)
 
         any_unmanaged = any(journal.done(f"unmanage_src:{a['volume_id']}") for a in attachments)
         new_server_id = server_id

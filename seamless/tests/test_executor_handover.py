@@ -92,6 +92,11 @@ class FakeBlockStorage:
         return [NS(name=name, capabilities=caps) for name, caps in self.c.pools]
 
     def post(self, url, json=None, **kw):
+        if url.endswith("/action") and "os-set_image_metadata" in json:
+            vid = url.split("/")[2]
+            self.c.record("set_image_metadata", vid)
+            self.c.image_metadata[vid] = dict(json["os-set_image_metadata"]["metadata"])
+            return FakeResponse({"metadata": json["os-set_image_metadata"]["metadata"]}, 200)
         if url.endswith("/action") and "os-unmanage" in json:
             vid = url.split("/")[2]
             self.c.record("unmanage", vid)
@@ -143,6 +148,7 @@ class FakeCloud:
         self.crash_on = crash_on
         self.created = []
         self.managed = []
+        self.image_metadata = {}
         self.compute = FakeCompute(self)
         self.block_storage = FakeBlockStorage(self)
         self.network = FakeNetwork(self)
@@ -524,6 +530,41 @@ async def test_handover_resume_of_a_definition_without_storage_stays_rbd(tmp_pat
         "hostgroup@ceph-hdd#hdd",
         "hostgroup@ceph-ssd#ssd",
     ]
+
+
+UEFI_WINDOWS = {
+    "hw_firmware_type": "uefi",
+    "hw_machine_type": "q35",
+    "os_type": "windows",
+    "os_distro": "windows",
+    "img_hide_hypervisor_id": "true",
+    "architecture": "x86_64",
+    # Glance bookkeeping that must not be copied
+    "image_id": "0f1e2d3c",
+    "checksum": "abc",
+    "size": "21474836480",
+}
+BOOT_PROPS = {k: v for k, v in UEFI_WINDOWS.items() if k not in ("image_id", "checksum", "size")}
+
+
+async def test_handover_restores_boot_properties_on_managed_volumes(tmp_path):
+    """SDD §7.3 step 7: manage drops volume_image_metadata; a UEFI Windows guest needs it back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].volumes["vol-root"].volume_image_metadata = dict(UEFI_WINDOWS)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    assert ops(calls)[-2:] == [
+        ("dst", "set_image_metadata", "dst-vol-2"),  # the boot volume, before the server boots
+        ("dst", "create_server", "web-01"),
+    ]
+    assert clouds["dst"].image_metadata == {"dst-vol-2": BOOT_PROPS}
+
+    calls.clear()
+    mig.destination_server_id = "dst-new-1"
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # the re-managed source volume boots the same way again
+    assert ("src", "set_image_metadata", "src-vol-1") in ops(calls)
+    assert clouds["src"].image_metadata == {"src-vol-1": BOOT_PROPS}
 
 
 def test_existing_server_and_write_json_helpers(tmp_path):
