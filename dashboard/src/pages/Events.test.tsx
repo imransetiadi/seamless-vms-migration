@@ -115,6 +115,68 @@ describe('Events page', () => {
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
   });
 
+  it('downloads only the events shown, not the older ones behind Show older events (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 250; i++) {
+      server.emit({ kind: 'plan.updated', plan_id: 'plan-4f2a9c1e', migration_id: null, actor: 'rina', message: `bulk change ${i}`, data: {} });
+    }
+    const blobs: Blob[] = [];
+    const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      blobs.push(b as Blob);
+      return 'blob:events';
+    });
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    const lineCount = async (blob: Blob) =>
+      (await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsText(blob);
+      }))
+        .trim()
+        .split('\n').length;
+    try {
+      renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+      const list = await screen.findByRole('list', { name: /events, newest first/i });
+      await within(list).findByText('bulk change 249');
+      const more = screen.getByRole('button', { name: /show \d+ older events/i });
+      const shown = within(list).getAllByRole('listitem').length;
+
+      await user.click(screen.getByRole('button', { name: /download shown events/i }));
+      expect(await lineCount(blobs[0]!)).toBe(shown);
+
+      // showing older events adds them to the download
+      await user.click(more);
+      const shownNow = within(list).getAllByRole('listitem').length;
+      expect(shownNow).toBeGreaterThan(shown);
+      await user.click(screen.getByRole('button', { name: /download shown events/i }));
+      expect(await lineCount(blobs[1]!)).toBe(shownNow);
+    } finally {
+      create.mockRestore();
+      revoke.mockRestore();
+      click.mockRestore();
+    }
+  });
+
+  it('says why there is nothing to download when only progress updates are shown (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await streamReady(server);
+    // the page keeps progress updates only while they are shown
+    await user.click(screen.getByRole('checkbox', { name: /show progress updates/i }));
+    act(() => {
+      // progress updates are streamed, never persisted (seq 0)
+      server.emit({ kind: 'migration.progress', plan_id: 'plan-4f2a9c1e', migration_id: 'mig-3c1a0f9e23', actor: 'orchestrator', message: 'zz-probe 42%', data: {} }, false);
+    });
+    await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'zz-probe');
+    await within(list).findByText('zz-probe 42%');
+    const download = screen.getByRole('button', { name: /download shown events/i });
+    expect(download).toHaveAttribute('aria-disabled', 'true');
+    expect(download).toHaveAccessibleDescription('Only progress updates are shown; they are not part of the audit trail.');
+  });
+
   it('downloads the shown events as JSON lines, oldest first, like `seamless events export`', async () => {
     const user = userEvent.setup({ delay: null });
     const blobs: Blob[] = [];

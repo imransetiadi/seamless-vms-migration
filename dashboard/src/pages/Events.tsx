@@ -155,13 +155,19 @@ export default function Events() {
   }, [items, category, query, showProgress]);
   // a failed history load with nothing cached: the trail is unknown, not empty (SDD §16)
   const historyUnknown = Boolean(history.error) && !history.data;
+  // the shown audit events (SDD §16): the page as shown, without progress updates (never persisted)
+  const shownAudit = useMemo(() => filtered.slice(0, limit).filter(({ event }) => event.seq > 0), [filtered, limit]);
+  const downloadReason = shownAudit.length
+    ? null
+    : historyUnknown
+      ? 'The audit trail could not be loaded.'
+      : filtered.length
+        ? 'Only progress updates are shown; they are not part of the audit trail.'
+        : 'No events match the filters.';
 
-  /** The filtered audit events as JSON lines, oldest first — the format of `seamless events export`. */
+  /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
-    const events = filtered
-      .map(({ event }) => event)
-      .filter((event) => event.seq > 0)
-      .sort((a, b) => a.seq - b.seq);
+    const events = shownAudit.map(({ event }) => event).sort((a, b) => a.seq - b.seq);
     const blob = new Blob(events.map((event) => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -194,7 +200,7 @@ export default function Events() {
               size="lg"
               icon={Download}
               onClick={download}
-              disabledReason={filtered.length ? null : historyUnknown ? 'The audit trail could not be loaded.' : 'No events match the filters.'}
+              disabledReason={downloadReason}
             >
               Download shown events
             </Button>
