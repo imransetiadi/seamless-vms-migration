@@ -4,7 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Providers from './Providers';
 
-const KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n-----END OPENSSH PRIVATE KEY-----\n';
+// a key-shaped string without key material (write-only upload fixture)
+const KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\n-----END OPENSSH PRIVATE KEY-----\n'; // gitleaks:allow
 
 function renderPage(token = 'admin', server = createTestServer()) {
   return renderWithApp(<Providers />, { route: '/providers', path: '/providers', token, server });

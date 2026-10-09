@@ -396,8 +396,9 @@ malicious, corruption).
    long-lived keys exported in shells where agents run commands; hand one to the single process that needs it from
    a subshell that prompts for it: `( read -rs TYPESAFE_API_KEY && export TYPESAFE_API_KEY && scripts/compose-init.sh )`.
    `docker compose config` and `env` print resolved values.
-5. **Detect:** run `gitleaks dir --redact --no-banner .` (working tree) and
-   `gitleaks git --redact --no-banner .` (history) before every push and in CI; enable the hosting
+5. **Detect:** run `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` (working tree; it skips the
+   git-ignored local secret files) and `gitleaks git --redact --no-banner .` (history; `.gitleaks.toml` allowlists
+   no path where a secret can live, so a force-added `.env` is reported) before every push and in CI; enable the hosting
    provider's secret scanning and push protection.
 6. **If a secret leaks:** rotate **first**, then purge ([§13](#13-incident-response) playbook H).
 
@@ -661,7 +662,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 ## 12. Secure configuration checklist
 
 **Before first use (all environments)**
-- [ ] `gitleaks dir` and `gitleaks git` (`--redact --no-banner .`) are clean; `.env`, `tokens.yaml`, `clouds.yaml` are not tracked.
+- [ ] `gitleaks dir -c .gitleaks-tree.toml` and `gitleaks git` (`--redact --no-banner .`) are clean; `.env`, `tokens.yaml`, `clouds.yaml` are not tracked.
 - [ ] `SEAMLESS_AUTH_DISABLED` is `false`; the admin token was stored once in a password manager.
 - [ ] Separate tokens per person/automation; `viewer` for application owners; `admin` only for provider setup.
 - [ ] `verify_tls: true` for every provider; CA bundles configured; no `verify: false` in `clouds.yaml`.

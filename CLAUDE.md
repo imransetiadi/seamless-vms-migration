@@ -128,7 +128,9 @@ placeholders already in `deploy/openshift/secret-example.yaml`. These files are 
 so: `deploy/compose/.env`, `deploy/compose/tokens.yaml`, `clouds.yaml`, `secure.yaml`, `*.pem`, `*.key`.
 Test fixtures are synthetic. `.claude/settings.json` denies *reading* those files from the agent; do not
 work around it with shell tricks. If a secret reaches a commit: **rotate it first**, then purge history,
-then tell the user. Run `gitleaks dir --redact --no-banner .` (working tree) and `gitleaks git --redact --no-banner .` (history) before pushing.
+then tell the user. Run `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` (working tree: the tree config skips the
+git-ignored local secret files a checkout holds) and `gitleaks git --redact --no-banner .` (history: `.gitleaks.toml`, which
+allowlists no secret path, plus `.gitleaksignore`) before pushing.
 
 ## 8. Definition of done
 

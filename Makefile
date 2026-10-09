@@ -543,7 +543,9 @@ seamless-check: seamless-test
 	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q tests/unit/test_blocksync.py \
 	    tests/unit/test_warm_migration.py tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py \
 	    tests/unit/test_role_modules_resolve.py
-	@command -v gitleaks >/dev/null && gitleaks dir --redact --no-banner . || echo "gitleaks not installed: skipped (S-17)"
+	@if command -v gitleaks >/dev/null; then \
+	  gitleaks dir -c .gitleaks-tree.toml --redact --no-banner . && gitleaks git --redact --no-banner .; \
+	else echo "gitleaks not installed: skipped (S-17)"; fi
 	@command -v actionlint >/dev/null && actionlint || echo "actionlint not installed: skipped"
 	@command -v shellcheck >/dev/null && shellcheck -S warning scripts/*.sh tests/e2e/*.sh || echo "shellcheck not installed: skipped"
 	cd dashboard && npm run typecheck && npm run lint && npm test && npm run build

@@ -130,7 +130,7 @@ ROUTES = [
         "/api/v1/providers/src-osp/conversion-key",
         Role.admin,
         {
-            "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n"  # gitleaks:allow (fake)
             + "A" * 64
             + "\n-----END OPENSSH PRIVATE KEY-----"
         },

@@ -1,0 +1,6 @@
+# Commits that introduced synthetic test fixtures (no key material, fake tokens) before they carried an
+# inline `gitleaks:allow`. Format: <commit>:<file>:<rule>:<line> (gitleaks git fingerprints).
+741f2dfd8a746c9317ae773882c87b0ba85c3d56:seamless/tests/test_memory.py:curl-auth-header:15
+4d70a4197c174dd341c2a8ad1666879f8416ab09:seamless/tests/test_api_core.py:private-key:133
+4d70a4197c174dd341c2a8ad1666879f8416ab09:seamless/tests/test_provider_management.py:private-key:35
+d8b1f1eaf310d0547328a9a8ac7a34ac11642357:dashboard/src/pages/Providers.test.tsx:private-key:7

@@ -1,0 +1,24 @@
+# Working-tree scans: `gitleaks dir -c .gitleaks-tree.toml --redact --no-banner .` reports everything
+# .gitleaks.toml does, except the git-ignored secret files a checkout legitimately holds —
+# scripts/compose-init.sh writes deploy/compose/.env and tokens.yaml, operators keep clouds.yaml, keys
+# and credentials files. git never stages them (seamless/tests/test_build_context.py checks .gitignore)
+# and a force-added one is still reported by the git, pre-commit and CI scans, which use .gitleaks.toml.
+[extend]
+path = ".gitleaks.toml"
+
+[allowlist]
+description = "git-ignored local secret files (the secret section of .gitignore)"
+paths = [
+  '__pycache__/',
+  '(^|/)[^/]*\.env(\.[^/]*)?$',
+  '(^|/)tokens\.yaml$',
+  '(^|/)clouds\.ya?ml$',
+  '(^|/)secure\.yaml$',
+  '\.(pem|key)$',
+  '(^|/)secrets/',
+  '(^|/)deploy/compose/compose\.local\.yaml$',
+  '(^|/)deploy/openshift/secret\.yaml$',
+  '(^|/)tests/(.*/)?auth_[^/]*\.yml$',
+  '(^|/)\.claude/settings\.local\.json$',
+  '(^|/)seamless/data/',
+]

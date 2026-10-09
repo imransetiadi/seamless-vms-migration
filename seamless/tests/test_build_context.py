@@ -10,6 +10,7 @@ reaches local, remote and CI builders.
 import re
 import shutil
 import subprocess
+import tomllib
 
 import pytest
 
@@ -125,3 +126,59 @@ def test_auth_file_generation_never_prints_credentials():
     for line in recipe:
         assert "tee" not in line, line
         assert "umask 077" in line and "> " in line, line
+
+
+def test_strict_gitleaks_config_never_allowlists_a_secret_path():
+    """``.gitleaks.toml`` drives CI, pre-commit and history scans: a force-added ``.env`` or token
+    file must be reported, so none of its allowlisted paths may cover a secret file (Security.md
+    S-17). Working-tree scans add the git-ignored local secrets through ``.gitleaks-tree.toml``."""
+    config = tomllib.loads((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+    paths = [re.compile(p) for p in config.get("allowlist", {}).get("paths", [])]
+    for block in config.get("allowlists", []):
+        paths += [re.compile(p) for p in block.get("paths", [])]
+    covered = [path for path in SECRET_PATHS if any(rx.search(path) for rx in paths)]
+    assert covered == [], f".gitleaks.toml allowlists secret files: {covered}"
+
+
+def test_tree_gitleaks_config_skips_only_the_git_ignored_secret_files():
+    """``.gitleaks-tree.toml`` (working-tree scans) skips the local secret files a checkout holds
+    and nothing broader: each of its patterns stands for one kind of git-ignored secret file."""
+    config = tomllib.loads((ROOT / ".gitleaks-tree.toml").read_text(encoding="utf-8"))
+    assert config["extend"]["path"] == ".gitleaks.toml"
+    paths = [re.compile(p) for p in config["allowlist"]["paths"]]
+    reported = [path for path in SECRET_PATHS if not any(rx.search(path) for rx in paths)]
+    assert reported == [], f"working-tree scans would report local secret files: {reported}"
+    samples = [*SECRET_PATHS, "seamless/tests/__pycache__/test_memory.cpython-313.pyc"]
+    stray = [rx.pattern for rx in paths if not any(rx.search(path) for path in samples)]
+    assert stray == [], f"patterns that match no kind of secret file: {stray}"
+    for code in (
+        "seamless/src/seamless_migrate/app.py",
+        "deploy/compose/compose.yaml",
+        "README.md",
+    ):
+        assert not any(rx.search(code) for rx in paths), code
+
+
+@pytest.mark.skipif(shutil.which("gitleaks") is None, reason="gitleaks is not installed")
+def test_gitleaks_reports_a_force_added_env_file(tmp_path):
+    """The scan CI and pre-commit run catches a committed compose ``.env`` (synthetic key)."""
+    repo = tmp_path / "repo"
+    (repo / "deploy" / "compose").mkdir(parents=True)
+    (repo / ".gitleaks.toml").write_text((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+    synthetic = "TYPESAFE_API_KEY=" + "tsk_" + "9fQ2xLmA7vR4tB8nZ1cK6dJ3wE5yH0pU"
+    (repo / "deploy" / "compose" / ".env").write_text(synthetic + "\n")
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "add", "-f", ".")
+    git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "leak")
+    scan = subprocess.run(
+        ["gitleaks", "git", "--no-banner", "--redact", "-c", ".gitleaks.toml", "."],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert scan.returncode == 1, scan.stdout + scan.stderr

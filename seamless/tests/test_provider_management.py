@@ -32,7 +32,7 @@ from tests.api_support import DESTINATION, SOURCE, Api, api_settings
 from tests.factories import make_plan, make_provider
 
 KEY = (
-    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"  # gitleaks:allow (header only, no key material)
     + "b3BlbnNzaC1rZXktdjEAAAAA" * 4
     + "\n-----END OPENSSH PRIVATE KEY-----"
 )
