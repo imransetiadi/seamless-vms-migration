@@ -256,7 +256,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `auth.denied`. `provider.credentials_updated` carries the provider id and the key *names* written,
-never a value.
+never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.progress` carries the running step's
@@ -1300,8 +1300,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   stepper, progress (the running step's percentage, and the bytes transferred over all passes and the disk's used
   bytes as two figures, never one over the other — a warm migration transfers more than its disk holds; a
   `migration.progress` event updates them by the API's rule: `pct`, and `sync_bytes_dropped` plus the listed passes
-  plus `bytes_done`), sync-pass convergence chart (once a long wait dropped passes from `sync_passes`, it says how
-  many earlier passes are no longer listed and that the bytes they transferred stay counted, §5.4), downtime clock,
+  plus `bytes_done`; a `migration.sync_pass` event adds the pass that ended to the page's passes, so the figure does
+  not drop while the page fetches the migration again), sync-pass convergence chart (once a long wait dropped passes
+  from `sync_passes`, it says how many earlier passes are no longer listed and that the bytes they transferred stay
+  counted, §5.4), downtime clock,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; while a requested cutover waits for a closed window, an approver can let it cut over
