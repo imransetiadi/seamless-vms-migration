@@ -49,6 +49,9 @@ interface FormState {
   /** Optional estimator overrides (SDD §9.1): empty = planning default. */
   scanMiBps: string;
   parallelDisks: string;
+  /** Guest write rate and aggregate scan cap, MiB/s (SDD §9.1 change_rate_bps, max_aggregate_scan_bps). */
+  changeMiBps: string;
+  aggregateScanMiBps: string;
   tcpPorts: string;
   windowsTcpPorts: string;
   autoRollback: boolean;
@@ -64,7 +67,7 @@ interface FormState {
   handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
+type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -92,6 +95,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     prestage: [...DEFAULT_PRESTAGE],
     scanMiBps: '',
     parallelDisks: '',
+    changeMiBps: '',
+    aggregateScanMiBps: '',
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
@@ -131,9 +136,9 @@ const PRESTAGE_LABEL: Record<string, string> = {
 };
 const isDefaultPrestage = (resource: string): boolean => DEFAULT_PRESTAGE.includes(resource);
 
-/** Estimator overrides the form does not edit (it edits scan_bps and parallel_disks). */
+/** Estimator overrides the form does not edit (it edits the four of SDD §16); they are kept. */
 function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
-  const { scan_bps: _scan, parallel_disks: _parallel, ...rest } = overrides ?? {};
+  const { scan_bps: _scan, parallel_disks: _parallel, change_rate_bps: _change, max_aggregate_scan_bps: _cap, ...rest } = overrides ?? {};
   return rest;
 }
 
@@ -163,6 +168,8 @@ function formFromPlan(plan: Plan): FormState {
     prestage: plan.prestage_resources.filter(isDefaultPrestage),
     scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
+    changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
+    aggregateScanMiBps: plan.estimator_overrides.max_aggregate_scan_bps ? plain(plan.estimator_overrides.max_aggregate_scan_bps / MiB) : '',
     tcpPorts: v.tcp_ports.join(', '),
     windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
     autoRollback: v.auto_rollback,
@@ -363,6 +370,17 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
       if (!Number.isInteger(parallel) || parallel < 1 || parallel > 64) e.parallel = 'Enter a whole number of disks from 1 to 64, or leave it empty.';
       else overrides.parallel_disks = parallel;
     }
+    // like the API (SDD §9.1): every override is a finite number above 0
+    if (f.changeMiBps.trim()) {
+      const change = Number(f.changeMiBps);
+      if (!(change > 0) || !Number.isFinite(change)) e.changeRate = 'Enter the guest write rate in MiB/s (more than 0), or leave it empty.';
+      else overrides.change_rate_bps = change * MiB;
+    }
+    if (f.aggregateScanMiBps.trim()) {
+      const cap = Number(f.aggregateScanMiBps);
+      if (!(cap > 0) || !Number.isFinite(cap)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (more than 0), or leave it empty.';
+      else overrides.max_aggregate_scan_bps = cap * MiB;
+    }
     const ports = f.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
     const windowsPorts = f.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
@@ -464,11 +482,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     keepWarm: id('keep-warm'),
     scan: id('scan'),
     parallel: id('parallel'),
+    changeRate: id('changeRate'),
+    aggregateScan: id('aggregateScan'),
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -801,6 +821,34 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   value={form.parallelDisks}
                   onChange={(e) => set('parallelDisks', e.target.value)}
                   error={errors.parallel}
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField
+                  id={id('changeRate')}
+                  label="Guest write rate (MiB/s, optional)"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="any"
+                  placeholder="2 (planning default)"
+                  value={form.changeMiBps}
+                  onChange={(e) => set('changeMiBps', e.target.value)}
+                  error={errors.changeRate}
+                  hint="How fast the guests change their disks: it decides how many warm passes an estimate needs"
+                />
+                <TextField
+                  id={id('aggregateScan')}
+                  label="Aggregate scan cap (MiB/s, optional)"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="any"
+                  placeholder="Scan rate × disks (planning default)"
+                  value={form.aggregateScanMiBps}
+                  onChange={(e) => set('aggregateScanMiBps', e.target.value)}
+                  error={errors.aggregateScan}
+                  hint="The conversion host's storage ceiling for all disk streams together, e.g. about 1190 behind 10 GbE"
                 />
               </div>
               <Fieldset legend="Pre-staged at the destination">

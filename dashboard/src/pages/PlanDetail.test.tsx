@@ -375,6 +375,28 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['auto_cutover'] });
   });
 
+  it('edits the guest write rate, prefilled; overrides the form does not show are kept (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.estimator_overrides = { change_rate_bps: 4 * 2 ** 20, max_aggregate_scan_bps: 800 * 2 ** 20, boot_s: 90 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const rate = within(dialog).getByLabelText(/guest write rate/i);
+    expect(rate).toHaveValue(4);
+    expect(within(dialog).getByLabelText(/aggregate scan cap/i)).toHaveValue(800);
+    await user.clear(rate);
+    await user.type(rate, '6');
+    // a cleared field goes back to the planning default: its override is removed
+    await user.clear(within(dialog).getByLabelText(/aggregate scan cap/i));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.estimator_overrides).toEqual({ change_rate_bps: 6 * 2 ** 20, boot_s: 90 });
+  });
+
   it('edits keep-warm and pre-staging, prefilled; a resource the form does not show is kept (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

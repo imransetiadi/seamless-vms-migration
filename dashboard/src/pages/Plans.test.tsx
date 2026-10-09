@@ -65,6 +65,46 @@ describe('Plans page', () => {
     expect(created?.status).toBe('draft');
   });
 
+  it('sets the guest write rate and the aggregate scan cap of a new plan (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Write rate test');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.type(within(dialog).getByLabelText(/guest write rate/i), '8');
+    await user.type(within(dialog).getByLabelText(/aggregate scan cap/i), '1000');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Write rate test')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Write rate test')?.estimator_overrides).toEqual({
+      change_rate_bps: 8 * 2 ** 20,
+      max_aggregate_scan_bps: 1000 * 2 ** 20,
+    });
+  });
+
+  it('refuses a guest write rate or aggregate scan cap that is not more than 0, like the API (SDD §9.1)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const before = server.plans.length;
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Bad rates');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.type(within(dialog).getByLabelText(/guest write rate/i), '0');
+    await user.type(within(dialog).getByLabelText(/aggregate scan cap/i), '-5');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent('Enter the guest write rate in MiB/s (more than 0), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the aggregate scan cap in MiB/s (more than 0), or leave it empty.');
+    expect(server.plans).toHaveLength(before);
+  });
+
   it('gives an operator the default approval policy, read-only (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
