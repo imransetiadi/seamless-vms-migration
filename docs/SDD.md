@@ -1229,7 +1229,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
   changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
-  operator's change; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  operator's change, and the form names each selected VM that a migration of another plan with the same source holds
+  (§5.4: that plan and the phase), as validation refuses it; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
