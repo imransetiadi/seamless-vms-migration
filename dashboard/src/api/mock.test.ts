@@ -643,4 +643,18 @@ describe('mock API', () => {
     expect(stats.throughput_series).toHaveLength(60);
     expect(stats.total).toBeGreaterThan(20);
   });
+
+  it('plans waves with any size from 1 to 1000 and refuses others like the API (SDD §12)', () => {
+    const { server } = setup('operator');
+    const path = '/plans/plan-0e9f6a17/waves/auto';
+    for (const [size, bound] of [
+      [0, 'greater than or equal to 1'],
+      [1001, 'less than or equal to 1000'],
+    ] as const) {
+      const refused = server.handle('POST', path, new URLSearchParams(), { max_wave_size: size }, 'operator');
+      expect(refused.status).toBe(422);
+      expect(refused.body).toEqual({ error: { code: 'validation_error', message: `max_wave_size: Input should be ${bound}` } });
+    }
+    expect(server.handle('POST', path, new URLSearchParams(), { max_wave_size: 1000 }, 'operator').status).toBe(200);
+  });
 });

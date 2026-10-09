@@ -272,7 +272,8 @@ export default function PlanDetail() {
   const checked = new Set(list.filter(preflightRan).map((m) => m.vm.source_id));
   const preflightDone = p.status !== 'draft' && p.vm_ids.length > 0 && p.vm_ids.every((vmId) => checked.has(vmId));
   const waveSizeNumber = Number(waveSize);
-  const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 100;
+  // the API's bound (SDD §12)
+  const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 1000;
   const s = stats.data;
 
   return (
@@ -439,7 +440,7 @@ export default function PlanDetail() {
         description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together."
         confirmLabel="Plan waves"
         canConfirm={waveSizeValid}
-        confirmReason="Enter a whole number from 1 to 100."
+        confirmReason="Enter a whole number from 1 to 1000."
         pending={pending('waves')}
         error={confirm === 'waves' ? action.error : null}
         onConfirm={() =>
@@ -459,10 +460,10 @@ export default function PlanDetail() {
           type="number"
           inputMode="numeric"
           min={1}
-          max={100}
+          max={1000}
           value={waveSize}
           onChange={(e) => setWaveSize(e.target.value)}
-          error={waveSizeValid ? null : 'Enter a whole number from 1 to 100.'}
+          error={waveSizeValid ? null : 'Enter a whole number from 1 to 1000.'}
           hint="A wave may exceed this to keep an application together."
         />
       </ConfirmDialog>

@@ -592,3 +592,24 @@ def test_events_tail_returns_the_newest_limit_events_ascending(api):
     assert api.get(f"/api/v1/events?tail=true&since={every[-1]['seq']}").json() == []
     # without tail the first page is unchanged: the oldest events after since
     assert api.get("/api/v1/events?limit=2").json() == every[:2]
+
+
+def test_auto_waves_takes_a_wave_size_from_1_to_1000(api):
+    """SDD §12: max_wave_size is 1-1000; outside it the API answers 422 validation_error, the
+    shape the dashboard mock copies."""
+    body = {
+        "name": "Wave sizes",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api),
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    url = f"/api/v1/plans/{plan['id']}/waves/auto"
+    for size, bound in ((0, "greater than or equal to 1"), (1001, "less than or equal to 1000")):
+        refused = api.post(url, Role.operator, json={"max_wave_size": size})
+        assert refused.status_code == 422, refused.text
+        error = refused.json()["error"]
+        assert error["code"] == "validation_error"
+        assert error["message"] == f"max_wave_size: Input should be {bound}"
+    planned = api.post(url, Role.operator, json={"max_wave_size": 1000})
+    assert planned.status_code == 200, planned.text

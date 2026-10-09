@@ -935,9 +935,13 @@ export class MockServer {
   }
 
   private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    // like the API (SDD §12): the body is checked first, an integer from 1 to 1000, never clamped
+    const size = input.max_wave_size ?? 10;
+    if (typeof size !== 'number' || !Number.isInteger(size)) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be a valid integer');
+    if (size < 1) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be greater than or equal to 1');
+    if (size > 1000) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be less than or equal to 1000');
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Waves can only be planned in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 're-planning the waves');
-    const size = Math.max(1, Math.min(100, Number(input.max_wave_size ?? 10) || 10));
     const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
     const pilot = mine.slice(0, Math.min(3, mine.length));
     const rest = mine.slice(pilot.length);
