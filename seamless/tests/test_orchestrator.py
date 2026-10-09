@@ -13,6 +13,7 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import Phase, PlanStatus, Strategy
 from seamless_migrate.domain.models import (
     CutoverWindow,
+    Migration,
     Nic,
     Plan,
     Provider,
@@ -952,6 +953,149 @@ async def test_cancel_during_a_pass_rolls_the_data_path_back(tmp_path, store):
         if e.kind == "migration.action" and e.migration_id == m.id
     ]
     assert actions == ["cancel", "cleanup"]
+    assert (await h.migration(m.id)).phase == P.cancelled
+    await h.orch.stop()
+
+
+def _backoff_harness(tmp_path, store):
+    """A warm migration whose pre-copy attempts all fail transiently; every attempt records the
+    phase it started in, and the rollback step records its options."""
+    settings = make_settings(tmp_path)
+    started_in: list[Phase] = []
+    rollbacks: list[dict] = []
+
+    async def failing_pass(ctx):
+        started_in.append(store.get("migration", ctx.migration.id, Migration).phase)
+        raise TransientStepError("HTTP 503 from cinder")
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: failing_pass, StepName.ROLLBACK: rollback}
+    )
+    return settings, executor, started_in, rollbacks
+
+
+def _hold_after_failure(h, at: str) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the driver after a transient failure — while it reports the failure ("report") or
+    during the backoff ("backoff") — until the test sets the returned release event."""
+    held, release = asyncio.Event(), asyncio.Event()
+    if at == "backoff":
+
+        async def held_sleep(seconds: float) -> None:
+            held.set()
+            await release.wait()
+
+        h.orch._sleep = held_sleep
+    else:
+        emit = h.orch._emit
+
+        async def held_emit(kind, message, **kw):
+            if kind == "migration.log" and "transient failure" in message and not release.is_set():
+                held.set()
+                await release.wait()
+            return await emit(kind, message, **kw)
+
+        h.orch._emit = held_emit
+    return held, release
+
+
+async def _settled(h, mid: str) -> list[str]:
+    for _ in range(300):
+        if mid not in h.orch._cleanups and mid not in h.orch._drivers:
+            break
+        await asyncio.sleep(0.01)
+    return [
+        e.data.get("action")
+        for e in h.store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.action" and e.migration_id == mid
+    ]
+
+
+@pytest.mark.parametrize("held_at", ["report", "backoff"])
+async def test_cancel_after_a_transient_failure_cleans_up_and_starts_no_further_attempt(
+    tmp_path, store, held_at
+):
+    """SDD §5.1/§8: from a transient failure of a pre-copy attempt until the next attempt starts —
+    while the failure is reported and during the backoff, when no step task runs — a cancel ends
+    the retries and runs the rollback step once with delete_dest_volumes, like a cancel of a
+    running pass: the failed attempt may have left snapshots and volumes behind."""
+    settings, executor, started_in, rollbacks = _backoff_harness(tmp_path, store)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    held, release = _hold_after_failure(h, held_at)
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await asyncio.wait_for(held.wait(), 5)
+    assert m.id not in h.orch._steps, "between attempts no step task runs"
+
+    cancelled = await h.orch.cancel(m.id, "rina", "window closed")
+    assert cancelled.phase == P.cancelled
+    for _ in range(300):
+        if rollbacks:
+            break
+        await asyncio.sleep(0.01)
+    assert rollbacks == [{"delete_dest_volumes": True}], "the failed attempt is cleaned up"
+    release.set()
+    assert await _settled(h, m.id) == ["cancel", "cleanup"]
+    assert started_in == [P.precopy], "no attempt after the cancel"
+    assert (await h.migration(m.id)).phase == P.cancelled
+    await h.orch.stop()
+
+
+async def test_an_attempt_never_starts_for_a_migration_cancelled_after_its_backoff(tmp_path, store):
+    """SDD §8: the next attempt starts under the migration's lock and only while the migration is
+    still in its phase. A cancel that lands after the backoff, while the driver reads the phase,
+    either finds the attempt running (and kills and cleans it up) or ends the retries: an attempt
+    never starts for a cancelled migration, and the last attempt is always cleaned up."""
+    settings, executor, started_in, rollbacks = _backoff_harness(tmp_path, store)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    in_backoff, release = _hold_after_failure(h, "backoff")
+    load = h.orch._load
+    armed, paused, resume = False, asyncio.Event(), asyncio.Event()
+
+    async def pausing_load(mid):
+        # the driver's first read after the backoff waits until the test let the cancel run
+        nonlocal armed
+        loaded = await load(mid)
+        task = asyncio.current_task()
+        if armed and task is not None and task.get_name() == f"migration:{mid}":
+            armed = False
+            paused.set()
+            await resume.wait()
+        return loaded
+
+    h.orch._load = pausing_load
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await asyncio.wait_for(in_backoff.wait(), 5)
+    armed = True
+    release.set()
+    await asyncio.wait_for(paused.wait(), 5)
+    cancel = asyncio.create_task(h.orch.cancel(m.id, "rina", "window closed"))
+    await asyncio.sleep(0.05)  # as far as the cancel gets while the driver reads the phase
+    resume.set()
+    assert (await cancel).phase == P.cancelled
+
+    actions = await _settled(h, m.id)
+    assert P.cancelled not in started_in, "an attempt started for a cancelled migration"
+    assert actions == ["cancel", "cleanup"]
+    assert rollbacks == [{"delete_dest_volumes": True}]
     assert (await h.migration(m.id)).phase == P.cancelled
     await h.orch.stop()
 
