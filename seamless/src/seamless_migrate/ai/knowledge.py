@@ -112,7 +112,8 @@ class KnowledgeService:
 
     async def on_completed(self, migration: Migration) -> None:
         est = migration.estimate
-        passes = len(migration.sync_passes)
+        # the last number counts every pass, also those dropped from the list (SDD §5.4)
+        passes = migration.sync_passes[-1].number if migration.sync_passes else 0
         final_delta = migration.sync_passes[-1].bytes_changed if migration.sync_passes else 0
         estimated = f"{est.downtime_s:.0f} s" if est is not None else "unknown"
         actual = (

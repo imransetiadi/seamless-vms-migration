@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 
 from ..config import Settings
 from ..domain.enums import Strategy, SyncPassKind
-from ..domain.models import Plan, Provider, SyncPass, utcnow
+from ..domain.models import Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..planning.estimator import VMWARE_PASS_OVERHEAD_S, params_for_plan
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
@@ -85,7 +85,7 @@ class SimulatedExecutor:
 
     async def _pass(self, step: StepName, ctx: StepContext) -> StepResult:
         vm = ctx.migration.vm
-        number = len(ctx.migration.sync_passes) + 1
+        number = next_pass_number(ctx.migration)
         rng = self._rng(ctx, step, number)
         first = number == 1
         if first:
@@ -130,7 +130,7 @@ class SimulatedExecutor:
                 copy_s = p.snapshot_s + max(vm.disk_bytes / p.scan_bps, changed / p.link_bps)
             else:
                 copy_s = changed / p.link_bps + p.v2v_inplace_s
-            kind, number = SyncPassKind.final, len(m.sync_passes) + 1
+            kind, number = SyncPassKind.final, next_pass_number(m)
         elif m.strategy == Strategy.storage_handover:
             changed, copy_s = 0.0, len(vm.disks) * p.handover_per_volume_s
             kind, number = None, 0
@@ -139,7 +139,7 @@ class SimulatedExecutor:
             copy_s = p.snapshot_s + changed / p.link_bps
             if m.strategy == Strategy.vmware_cold:
                 copy_s = changed / p.link_bps + p.v2v_s
-            kind, number = SyncPassKind.full, len(m.sync_passes) + 1
+            kind, number = SyncPassKind.full, next_pass_number(m)
 
         # A failure, if drawn, happens part-way through the copy (the source is already down).
         fails = rng.random() < self.settings.demo_failure_rate

@@ -684,6 +684,32 @@ async def test_vmware_warm_convergence_ignores_missing_byte_counts(tmp_path, sto
     assert h.orch._converged(warm, plan) == (True, "converged: last pass changed 0 B")
 
 
+async def test_keep_warm_history_is_bounded_and_bytes_stay_counted(tmp_path, store):
+    """SDD §5.4: a long wait keeps the first max_sync_passes passes and the latest 20; the bytes of
+    the dropped passes stay in bytes_transferred, and pass numbers keep counting."""
+    from seamless_migrate.domain.models import utcnow
+
+    plan_kw = {"default_strategy": Strategy.warm, "max_sync_passes": 3}
+    h, plan = await setup(tmp_path, store, [vm(1)], plan_kw)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    cur, v = await h.orch._load(m.id)
+    for _ in range(30):
+        done = SyncPass(
+            number=1,  # the orchestrator numbers the pass
+            kind="delta",
+            started_at=utcnow(),
+            ended_at=utcnow(),
+            duration_s=1.0,
+            bytes_transferred=1000,
+        )
+        cur, v = await h.orch._record_pass(cur, v, done, plan)
+    stored, _ = await h.orch._load(m.id)
+    assert [p.number for p in stored.sync_passes] == [1, 2, 3, *range(11, 31)]
+    assert stored.sync_bytes_dropped == 7 * 1000
+    assert stored.bytes_transferred == 30 * 1000
+
+
 async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_path, store):
     """A hung cutover (after the source stopped) is cut short by SEAMLESS_STEP_TIMEOUT_S and
     handled like any permanent failure: automatic rollback (SDD §15.1, §7.2)."""

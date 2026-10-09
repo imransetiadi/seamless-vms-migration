@@ -27,7 +27,7 @@ import yaml
 
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
-from ..domain.models import Mappings, Plan, Provider, SyncPass, utcnow
+from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
@@ -560,7 +560,7 @@ class AnsibleExecutor:
                 )
             last = state["passes"][-1]
             sync_pass = SyncPass(
-                number=int(last.get("number") or len(m.sync_passes) + 1),
+                number=int(last.get("number") or next_pass_number(m)),
                 kind=SyncPassKind(last.get("kind") or "delta"),
                 started_at=last.get("started_at") or started,
                 ended_at=last.get("ended_at") or utcnow(),
@@ -577,7 +577,7 @@ class AnsibleExecutor:
             return StepResult(destination_server_id=await self._lookup_server(ctx))
         # vmware_warm CBT passes: the kit does not report byte counts to the control plane
         ended = utcnow()
-        number = len(m.sync_passes) + 1
+        number = next_pass_number(m)
         return StepResult(
             sync_pass=SyncPass(
                 number=number,

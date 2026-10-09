@@ -417,6 +417,8 @@ class Migration(_Model):
     bytes_total: int = 0
     bytes_transferred: int = 0
     sync_passes: list[SyncPass] = Field(default_factory=list)
+    #: bytes of the passes dropped from sync_passes (SDD §5.4); bytes_transferred still counts them
+    sync_bytes_dropped: int = 0
     estimate: Estimate | None = None
     estimates: list[Estimate] = Field(default_factory=list)
     #: per-stream scan throughput measured by the last warm pass (SDD §9.1 calibration)
@@ -446,6 +448,27 @@ class Migration(_Model):
             if est.strategy == strategy:
                 return est
         return None
+
+
+#: SDD §5.4: the latest passes sync_passes keeps after the first plan.max_sync_passes
+SYNC_PASSES_LATEST = 20
+
+
+def next_pass_number(m: Migration) -> int:
+    """The number of the migration's next pass; it keeps counting after passes are dropped."""
+    return m.sync_passes[-1].number + 1 if m.sync_passes else 1
+
+
+def keep_sync_history(m: Migration, keep_first: int, keep_latest: int = SYNC_PASSES_LATEST) -> None:
+    """Drop the oldest passes between the first ``keep_first`` and the latest ``keep_latest``
+    (SDD §5.4): a long wait for the cutover runs a keep-warm pass every interval, which must not
+    grow the migration without bound. The dropped passes' bytes move to ``sync_bytes_dropped``."""
+    excess = len(m.sync_passes) - keep_first - keep_latest
+    if excess <= 0:
+        return
+    dropped = m.sync_passes[keep_first : keep_first + excess]
+    m.sync_bytes_dropped += sum(p.bytes_transferred for p in dropped)
+    del m.sync_passes[keep_first : keep_first + excess]
 
 
 class Event(_Model):

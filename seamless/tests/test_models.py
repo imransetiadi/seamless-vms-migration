@@ -168,3 +168,23 @@ def test_vmref_strips_nul_from_tenant_strings():
     assert vm.name == "web-01" and vm.os_type == "linux"
     assert vm.tags == {"owner": "finance"}
     assert "\x00" not in vm.model_dump_json()
+
+
+def test_keep_sync_history_drops_the_oldest_passes_between_the_first_and_the_latest():
+    """SDD §5.4: the first max_sync_passes passes and the latest 20 are kept; the bytes of a
+    dropped pass move to sync_bytes_dropped and pass numbers keep counting."""
+    from seamless_migrate.domain.models import SyncPass, keep_sync_history, next_pass_number, utcnow
+
+    m = make_migration()
+    assert next_pass_number(m) == 1
+    for n in range(1, 31):
+        kind = "full" if n == 1 else "delta"
+        m.sync_passes.append(
+            SyncPass(number=n, kind=kind, started_at=utcnow(), bytes_transferred=n)
+        )
+    keep_sync_history(m, keep_first=5)
+    assert [p.number for p in m.sync_passes] == [1, 2, 3, 4, 5, *range(11, 31)]
+    assert m.sync_bytes_dropped == sum(range(6, 11))
+    assert next_pass_number(m) == 31
+    keep_sync_history(m, keep_first=5)  # at the bound nothing more is dropped
+    assert len(m.sync_passes) == 25 and m.sync_bytes_dropped == sum(range(6, 11))

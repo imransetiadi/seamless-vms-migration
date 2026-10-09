@@ -53,6 +53,8 @@ from .domain.models import (
     ValidationReport,
     VMRef,
     invalid_plan_settings,
+    keep_sync_history,
+    next_pass_number,
     repeated_vm_ids,
     utcnow,
 )
@@ -1388,8 +1390,10 @@ class Orchestrator:
                 if cur.phase != phase:
                     return
                 cur.progress_pct = round(float(pct), 2)
-                cur.bytes_transferred = sum(p.bytes_transferred for p in cur.sync_passes) + int(
-                    done
+                cur.bytes_transferred = (
+                    cur.sync_bytes_dropped
+                    + sum(p.bytes_transferred for p in cur.sync_passes)
+                    + int(done)
                 )
                 await self._save(cur, v)
                 m = cur
@@ -1526,9 +1530,14 @@ class Orchestrator:
     async def _record_pass(
         self, cur: Migration, v: int, sync_pass: SyncPass, plan: Plan | None = None
     ) -> tuple[Migration, int]:
-        numbered = sync_pass.model_copy(update={"number": len(cur.sync_passes) + 1})
+        numbered = sync_pass.model_copy(update={"number": next_pass_number(cur)})
         cur.sync_passes.append(numbered)
-        cur.bytes_transferred = sum(p.bytes_transferred for p in cur.sync_passes)
+        if plan is not None:
+            # SDD §5.4: a long wait's keep-warm passes must not grow the migration without bound
+            keep_sync_history(cur, plan.max_sync_passes)
+        cur.bytes_transferred = cur.sync_bytes_dropped + sum(
+            p.bytes_transferred for p in cur.sync_passes
+        )
         if plan is not None:
             self._calibrate(cur, plan, numbered)
         v = await self._save(cur, v)
@@ -1578,14 +1587,14 @@ class Orchestrator:
                 return
             now = self._now()
             sync_pass = result.sync_pass or SyncPass(
-                number=len(cur.sync_passes) + 1,
+                number=next_pass_number(cur),
                 kind=SyncPassKind.full if not cur.sync_passes else SyncPassKind.delta,
                 started_at=now,
                 ended_at=now,
                 duration_s=0.0,
             )
             cur.progress_pct = 100.0
-            cur.checkpoint = f"{step}:{len(cur.sync_passes) + 1}"
+            cur.checkpoint = f"{step}:{next_pass_number(cur)}"
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
             converged, why = self._converged(cur, plan)
             if converged:
