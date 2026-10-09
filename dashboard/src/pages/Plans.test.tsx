@@ -208,6 +208,15 @@ describe('Plans page', () => {
     expect(within(within(overrides).getByLabelText(/^override strategy$/i)).getAllByRole('option').map((o) => o.getAttribute('value'))).toEqual(['', 'vmware_cold', 'vmware_warm']);
   });
 
+  it('caps the plan name at 200 characters and the description at 2000, like the API (SDD §12)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    expect(within(dialog).getByLabelText(/^name/i)).toHaveAttribute('maxlength', '200');
+    expect(within(dialog).getByLabelText(/^description/i)).toHaveAttribute('maxlength', '2000');
+  });
+
   it('refuses a keep-warm interval under a minute (SDD §5.4)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

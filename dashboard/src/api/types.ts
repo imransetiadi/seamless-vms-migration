@@ -526,6 +526,9 @@ export interface MigrationListQuery {
 
 /** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
 export const ACTION_TEXT_MAX = 2000;
+/** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
+export const PLAN_NAME_MAX = 200;
+export const PLAN_DESCRIPTION_MAX = 2000;
 
 export interface ApproveRequest {
   comment?: string;

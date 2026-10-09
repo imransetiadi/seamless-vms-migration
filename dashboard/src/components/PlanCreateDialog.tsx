@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } fr
 import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import { isDestinationInventory, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
+import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { cn } from '../lib/cn';
 import { heldElsewhere } from '../lib/holds';
 import { formatMappings, parseMappings } from '../lib/mappings';
@@ -511,8 +511,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           )}
 
           <Fieldset legend="Plan">
-            <TextField ref={nameRef} id={id('name')} label="Name" required value={form.name} onChange={(e) => set('name', e.target.value)} error={errors.name} autoComplete="off" />
-            <TextAreaField id={id('description')} label="Description" value={form.description} onChange={(e) => set('description', e.target.value)} rows={2} />
+            <TextField ref={nameRef} id={id('name')} label="Name" required maxLength={PLAN_NAME_MAX} value={form.name} onChange={(e) => set('name', e.target.value)} error={errors.name} autoComplete="off" />
+            <TextAreaField id={id('description')} label="Description" maxLength={PLAN_DESCRIPTION_MAX} value={form.description} onChange={(e) => set('description', e.target.value)} rows={2} />
           </Fieldset>
 
           <Fieldset legend="Clouds">

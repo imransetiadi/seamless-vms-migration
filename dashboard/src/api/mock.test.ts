@@ -78,6 +78,15 @@ describe('mock fixtures', () => {
 });
 
 describe('mock API', () => {
+  it('refuses a plan name over 200 characters and a description over 2000 with 422, like the API (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const base = { source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [freeVms(server, 'rhosp17-dc1', 1)[0]!.source_id] };
+    await expect(client.post('/plans', { ...base, name: 'x'.repeat(201) })).rejects.toMatchObject({ status: 422, message: expect.stringContaining('name') });
+    await expect(client.post('/plans', { ...base, name: 'Fine', description: 'd'.repeat(2001) })).rejects.toMatchObject({ status: 422, message: expect.stringContaining('description') });
+    const plan = await client.post<Plan>('/plans', { ...base, name: 'x'.repeat(200), description: 'd'.repeat(2000) });
+    await expect(client.patch(`/plans/${plan.id}`, { name: 'x'.repeat(201) })).rejects.toMatchObject({ status: 422 });
+  });
+
   it('refuses action texts over 2000 characters with 422, like the API (SDD §12)', async () => {
     const { server, client } = setup('approver');
     const m = byPhase(server, 'awaiting_cutover');

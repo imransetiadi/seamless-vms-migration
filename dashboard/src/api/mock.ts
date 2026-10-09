@@ -43,7 +43,7 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { ACTION_TEXT_MAX, PHASES, STRATEGIES } from './types';
+import { ACTION_TEXT_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES } from './types';
 
 interface MockResponse {
   status: number;
@@ -778,8 +778,19 @@ export class MockServer {
     if (touched.length) throw new HttpError(403, 'forbidden', `setting ${[...touched].sort().join(', ')} requires the approver role`);
   }
 
+  /** Plan name and description bounds, like the API's create and patch (SDD §12). */
+  private refuseLongPlanTexts(input: Record<string, unknown>): void {
+    const problems: string[] = [];
+    if (typeof input.name === 'string' && input.name.length > PLAN_NAME_MAX) problems.push(`name: at most ${PLAN_NAME_MAX} characters (got ${input.name.length})`);
+    if (typeof input.description === 'string' && input.description.length > PLAN_DESCRIPTION_MAX) {
+      problems.push(`description: at most ${PLAN_DESCRIPTION_MAX} characters (got ${input.description.length})`);
+    }
+    if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+  }
+
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
+    this.refuseLongPlanTexts(input);
     const body = input as unknown as PlanCreate;
     if (!body.name || !String(body.name).trim()) throw new HttpError(422, 'validation_error', 'name is required.');
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
@@ -816,6 +827,7 @@ export class MockServer {
 
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
+    this.refuseLongPlanTexts(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
     for (const key of Object.keys(input)) {
