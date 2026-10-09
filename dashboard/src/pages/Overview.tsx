@@ -130,7 +130,7 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                       aria-valuemin={0}
                       aria-valuemax={slo}
                       aria-valuenow={Math.min(elapsed, slo)}
-                      aria-valuetext={`${formatDuration(elapsed)} of ${formatDuration(slo)}`}
+                      aria-valuetext={`${formatClock(elapsed)} of ${formatClock(slo)}`}
                       className="relative h-2 overflow-hidden rounded-full bg-muted"
                     >
                       <div
@@ -143,9 +143,10 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                     </div>
                     <p className={cn('flex items-center gap-1 text-xs', tone === 'success' ? 'text-muted-foreground' : TONE_CLASSES[tone].text)}>
                       {tone !== 'success' && <ToneIcon aria-hidden className="size-3.5" />}
+                      {/* the countdown reads as a clock, the SLO as a duration, like the migration page (SDD §16) */}
                       {left !== null && left >= 0
-                        ? `${formatDuration(left)} left in the ${formatDuration(slo)} SLO`
-                        : `Over the SLO by ${formatDuration(-(left ?? 0))}`}
+                        ? `${formatClock(left)} left in the ${formatDuration(slo)} SLO`
+                        : `Over the SLO by ${formatClock(-(left ?? 0))}`}
                     </p>
                   </div>
                 )}

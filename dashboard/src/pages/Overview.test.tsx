@@ -45,6 +45,8 @@ describe('Overview page (mock data)', () => {
     const down = await screen.findByRole('region', { name: /downtime now/i });
     const item = (await within(down).findByRole('link', { name: 'web-03' })).closest('li')!;
     const line = within(item).getByText(/left in the .* slo/i);
+    // the time left reads as a clock like the migration page's (SDD §16)
+    expect(line).toHaveTextContent(/^\d+:\d{2} left in the /);
     if (expected === 'warning') {
       expect(line).toHaveClass(TONE_CLASSES.warning.text);
       expect(line.querySelector('.lucide-hourglass')).not.toBeNull();
@@ -66,7 +68,9 @@ describe('Overview page (mock data)', () => {
     const down = await screen.findByRole('region', { name: /downtime now/i });
     const meter = await within(down).findByRole('meter', { name: /web-03 downtime against the slo/i });
     expect(meter).toHaveAttribute('aria-valuenow', String(slo));
-    expect(down).toHaveTextContent(/over the slo by 2m 0[5-9]s/i);
+    expect(meter.getAttribute('aria-valuetext')).toMatch(/^\d+:\d{2} of \d+:\d{2}$/);
+    // a clock like the migration page's, not a duration (SDD §16)
+    expect(down).toHaveTextContent(/over the slo by 2:0[5-9]/i);
   });
 
   it('lists a failed cutover and a running rollback while their source is still stopped', async () => {
