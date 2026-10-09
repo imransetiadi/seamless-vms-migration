@@ -543,3 +543,66 @@ def test_dashboard_mock_error_codes_are_api_codes():
     }
     assert used, "no error responses found in mock.ts"
     assert used <= api, f"mock-only error responses: {sorted(used - api)}"
+
+
+_APPROVE = "/api/v1/migrations/mig-0000000000/approve"
+_MIB = 1024 * 1024
+
+
+def test_request_body_over_1_mib_is_refused_with_413_before_auth(api):
+    """SDD §12, Security.md R-17: FastAPI parses a body before the token is checked, so an
+    oversized body is refused first; exactly 1 MiB still reaches the route (here: 401)."""
+    head, tail = b'{"comment": "', b'"}'
+    exact = head + b"x" * (_MIB - len(head) - len(tail)) + tail
+    assert len(exact) == _MIB
+    json_headers = {"Content-Type": "application/json"}
+    assert api.client.post(_APPROVE, headers=json_headers, content=exact).status_code == 401
+    res = api.client.post(_APPROVE, headers=json_headers, content=exact + b" ")
+    assert res.status_code == 413, res.text
+    assert res.json()["error"]["code"] == "payload_too_large"
+    assert res.headers["X-Content-Type-Options"] == "nosniff"  # R-05 holds for the 413 too
+
+
+def test_chunked_request_body_over_1_mib_is_refused_with_413(api):
+    """A chunked body has no Content-Length: the bytes are counted as they arrive (SDD §12)."""
+
+    def chunks():
+        for _ in range(17):  # 17 x 64 KiB = 1,114,112 bytes
+            yield b"x" * 65536
+
+    res = api.client.post(_APPROVE, headers={"Content-Type": "application/json"}, content=chunks())
+    assert res.status_code == 413, res.text
+    assert res.json()["error"]["code"] == "payload_too_large"
+
+
+async def test_body_limit_counts_streamed_chunks():
+    """The inner app never receives more than the limit across several body messages."""
+    from starlette.exceptions import HTTPException
+
+    from seamless_migrate.api.app import BodyLimitMiddleware
+
+    seen: list[int] = []
+
+    async def inner(scope, receive, send):
+        while True:
+            message = await receive()
+            seen.append(len(message.get("body", b"")))
+            if not message.get("more_body"):
+                return
+
+    messages = iter(
+        [{"type": "http.request", "body": b"abcd", "more_body": True}] * 3
+        + [{"type": "http.request", "body": b"", "more_body": False}]
+    )
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        raise AssertionError("the middleware must not answer a body without Content-Length itself")
+
+    scope = {"type": "http", "method": "POST", "path": "/api/v1/plans", "headers": []}
+    with pytest.raises(HTTPException) as refused:
+        await BodyLimitMiddleware(inner, max_bytes=10)(scope, receive, send)
+    assert refused.value.status_code == 413
+    assert seen == [4, 4]  # the third chunk (12 > 10 bytes) never reached the app

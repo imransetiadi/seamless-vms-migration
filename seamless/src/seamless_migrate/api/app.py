@@ -45,6 +45,7 @@ _STATUS_CODES = {
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
+    413: "payload_too_large",
     422: "validation_error",
     502: "provider_error",
 }
@@ -136,6 +137,51 @@ def _apply_security_headers(headers: Any, path: str) -> None:
     headers.setdefault("Referrer-Policy", "same-origin")
     headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     headers.setdefault("Content-Security-Policy", _CSP_APP)
+
+
+#: SDD §12: the largest request body. A 5,000-VM plan with an override per VM is about 0.5 MB.
+MAX_BODY_BYTES = 1024 * 1024
+
+
+class BodyLimitMiddleware:
+    """Refuse a request body over ``max_bytes`` with 413 (SDD §12, Security.md R-17).
+
+    FastAPI parses a route's body before its auth dependency runs, so without a limit an
+    unauthenticated client could make the server buffer any amount of data. A larger
+    ``Content-Length`` is answered before anything reads the body; a body without one (chunked)
+    is counted as it arrives, and the message that passes the limit never reaches the app.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[None]], max_bytes: int = MAX_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope.get("headers") or ()).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            response = _error(413, "payload_too_large", self._message())
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def counted() -> Any:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    # FastAPI re-raises an HTTPException met while reading the body: the error
+                    # handlers answer it as 413 payload_too_large
+                    raise StarletteHTTPException(413, self._message())
+            return message
+
+        await self.app(scope, counted, send)
+
+    def _message(self) -> str:
+        return f"request body larger than {self.max_bytes} bytes"
 
 
 def _install_security_headers(app: FastAPI) -> None:
@@ -275,6 +321,9 @@ def create_app(
     )
     app.state.services = svc
     _install_error_handlers(app)
+    # added before the security headers middleware, which therefore wraps it: a 413 carries the
+    # R-05 headers too
+    app.add_middleware(BodyLimitMiddleware)
     _install_security_headers(app)
     _install_api_docs(app, settings)
     if settings.cors_origins:
