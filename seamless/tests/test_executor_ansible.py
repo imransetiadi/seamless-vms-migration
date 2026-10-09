@@ -918,11 +918,25 @@ async def test_vmware_rollback_and_lookup_failures(env):
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
     with pytest.raises(TransientStepError, match="rollback"):
         await failing.run(StepName.ROLLBACK, ctx)
-    # a failed destination lookup after a cold cutover is logged, not fatal
-    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    # a failed destination lookup after a cold cutover is logged, not fatal (a resumed cutover —
+    # the source was already stopped — skips the collision check that a first attempt runs)
+    cold, rec = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
     result = await failing.run(StepName.CUTOVER, cold)
     assert result.destination_server_id is None
     assert any("could not look up the destination server" in line for line in rec.logs)
+
+
+async def test_cutover_refused_when_destination_lookup_fails(env):
+    """The name-collision check fails closed: when the destination lookup errors, a first cutover
+    attempt stops before any playbook runs — the VMware kit would power the source off first and
+    then fail on a same-named server (Security.md R-12)."""
+    failing = AnsibleExecutor(env.settings, providers=FailingRegistry(), poll_s=0.02)
+    for strategy, source in ((Strategy.vmware_cold, VCENTER), (Strategy.cold, SRC)):
+        ctx, rec = ctx_for(env, strategy=strategy, source=source)
+        with pytest.raises(TransientStepError, match="could not check the destination"):
+            await failing.run(StepName.CUTOVER, ctx)
+        assert rec.downtime_marks == 0
+    assert read_log(env.log) == []  # no playbook ran
 
 
 async def test_run_rejects_unsupported_strategy_and_steps(env):

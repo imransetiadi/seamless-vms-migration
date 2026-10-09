@@ -521,7 +521,14 @@ class AnsibleExecutor:
         m = ctx.migration
         if m.destination_server_id or m.downtime_started_at is not None:
             return
-        existing = await self._lookup_server(ctx)
+        try:
+            existing = await self.providers.get(ctx.destination).find_server(m.vm.name)
+        except ProviderError as exc:
+            # an unanswered lookup is not "no such server": refuse before anything is stopped
+            # (a duplicate name is a lookup error too)
+            raise TransientStepError(
+                f"could not check the destination for a server named {m.vm.name}: {exc}"
+            ) from exc
         if existing:
             raise PermanentStepError(
                 f"a server named {m.vm.name} already exists in the destination ({existing}) and "
