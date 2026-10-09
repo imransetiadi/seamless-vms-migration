@@ -1026,7 +1026,7 @@ such lists again on persisted migration events.
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
-| POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside) (409 while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
+| POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
@@ -1327,7 +1327,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
   pre-flight checks, with Validate there too; the findings say pre-flight passed only once every VM of `vm_ids`
   has a migration whose pre-flight ran and the plan is not a draft again (an edited plan is validated again),
-  and until then that it runs at validation — Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan
+  and until then that it runs at validation — Validate/Start/Pause/Auto-waves/Edit actions — Auto-waves (on a
+  paused plan too) says before it runs that the plan returns to draft and must be validated again, which clears
+  approvals and cutover requests — Edit reopens the plan
   form prefilled and sends only the changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or
   edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
