@@ -244,49 +244,66 @@ function ProviderCard({
 
 const SUMMARY_ORDER: Array<Provider['status']> = ['ok', 'degraded', 'error', 'unknown'];
 
+/** "A, B and C", or "A, B, C and 2 more" past `limit` names. */
+function namesText(names: string[], limit = 3): string {
+  if (names.length > limit) return `${names.slice(0, limit).join(', ')} and ${names.length - limit} more`;
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
+}
+
 /** One line an operator reads first: how many clouds are healthy, and a way to re-check all. */
 function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider[]; canCheck: boolean; onAnnounce: (message: string) => void }) {
   const checkAll = useCheckAllProviders();
   const counts = SUMMARY_ORDER.map((status) => ({ status, count: providers.filter((p) => p.status === status).length })).filter((c) => c.count > 0);
   const missing = providers.filter((p) => !p.credentials_secret && !p.cloud).length;
+  // a check request that failed is named and counted, never left out (SDD §16)
+  const failed = checkAll.data?.failed ?? [];
+  const check = (ids: string[]) =>
+    checkAll.mutate(ids, {
+      onSuccess: ({ checked, failed: notChecked }) => {
+        const healthy = checked.filter((p) => p.status === 'ok').length;
+        const count = notChecked.length ? `${checked.length} of ${ids.length}` : `${checked.length}`;
+        onAnnounce(
+          `Checked ${count} provider${ids.length === 1 ? '' : 's'}: ${healthy} healthy${notChecked.length ? `; ${notChecked.length} could not be checked` : ''}.`,
+        );
+      },
+    });
   return (
-    <div className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border px-4 py-3">
-      <p className="text-sm text-foreground">
-        <span className="font-semibold">{providers.length}</span> {providers.length === 1 ? 'provider' : 'providers'}
-      </p>
-      <ul aria-label="Providers by status" className="flex flex-wrap items-center gap-2">
-        {counts.map(({ status, count }) => (
-          <li key={status} className="inline-flex items-center gap-1.5 text-sm">
-            <ProviderStatusBadge status={status} />
-            <span className="num">{count}</span>
-          </li>
-        ))}
-      </ul>
-      {missing > 0 && (
-        <p className="inline-flex items-center gap-1.5 text-sm text-status-warning">
-          <KeyRound aria-hidden className="size-4" />
-          {missing} without sign-in details
+    <div className="mb-5 flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border px-4 py-3">
+        <p className="text-sm text-foreground">
+          <span className="font-semibold">{providers.length}</span> {providers.length === 1 ? 'provider' : 'providers'}
         </p>
+        <ul aria-label="Providers by status" className="flex flex-wrap items-center gap-2">
+          {counts.map(({ status, count }) => (
+            <li key={status} className="inline-flex items-center gap-1.5 text-sm">
+              <ProviderStatusBadge status={status} />
+              <span className="num">{count}</span>
+            </li>
+          ))}
+        </ul>
+        {missing > 0 && (
+          <p className="inline-flex items-center gap-1.5 text-sm text-status-warning">
+            <KeyRound aria-hidden className="size-4" />
+            {missing} without sign-in details
+          </p>
+        )}
+        <Button
+          className="ml-auto"
+          icon={RefreshCw}
+          loading={checkAll.isPending}
+          disabledReason={canCheck ? null : 'Checking providers requires the operator role.'}
+          onClick={() => check(providers.map((p) => p.id))}
+        >
+          Check all
+        </Button>
+      </div>
+      {failed.length > 0 && (
+        <ErrorBanner
+          error={failed[0]!.error}
+          title={`Could not check ${namesText(failed.map((f) => providers.find((p) => p.id === f.id)?.name ?? f.id))}`}
+          onRetry={() => check(failed.map((f) => f.id))}
+        />
       )}
-      <Button
-        className="ml-auto"
-        icon={RefreshCw}
-        loading={checkAll.isPending}
-        disabledReason={canCheck ? null : 'Checking providers requires the operator role.'}
-        onClick={() =>
-          checkAll.mutate(
-            providers.map((p) => p.id),
-            {
-              onSuccess: (checked) => {
-                const healthy = checked.filter((p) => p.status === 'ok').length;
-                onAnnounce(`Checked ${checked.length} providers: ${healthy} healthy.`);
-              },
-            },
-          )
-        }
-      >
-        Check all
-      </Button>
     </div>
   );
 }

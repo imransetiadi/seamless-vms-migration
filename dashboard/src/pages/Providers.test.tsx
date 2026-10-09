@@ -58,6 +58,56 @@ describe('Providers page', () => {
     expect(server.events.filter((e) => e.kind === 'provider.checked')).toHaveLength(before + 6);
   });
 
+  it('names a provider whose check request failed, counts it, and retries only that one (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const failing = server.providers[0]!;
+    const total = server.providers.length;
+    const handle = server.handle.bind(server);
+    let refuse = true;
+    // the request fails (not the cloud): the provider's own status does not change
+    server.handle = (method, path, query, body, token) =>
+      refuse && method === 'POST' && path === `/providers/${failing.id}/check`
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    renderPage('operator', server);
+    await user.click(await screen.findByRole('button', { name: /check all/i }));
+
+    // not left out as if it had not been asked: named, with the reason and Retry
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(failing.name);
+    expect(alert).toHaveTextContent(/database unavailable/i);
+    const healthy = server.providers.filter((p) => p.id !== failing.id && p.status === 'ok').length;
+    expect(screen.getByText(`Checked ${total - 1} of ${total} providers: ${healthy} healthy; 1 could not be checked.`)).toBeInTheDocument();
+
+    // Retry checks that provider only
+    refuse = false;
+    const before = server.events.filter((e) => e.kind === 'provider.checked').length;
+    await user.click(within(alert).getByRole('button', { name: /retry/i }));
+    await waitFor(() => expect(screen.getByText(/^Checked 1 provider: /)).toBeInTheDocument());
+    expect(server.events.filter((e) => e.kind === 'provider.checked')).toHaveLength(before + 1);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it.each([2, 6])('names %i providers whose check requests failed, at most three by name (SDD §16)', async (count) => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const total = server.providers.length;
+    const failing = server.providers.slice(0, count);
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'POST' && failing.some((p) => path === `/providers/${p.id}/check`)
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    renderPage('operator', server);
+    await user.click(await screen.findByRole('button', { name: /check all/i }));
+    const names = failing.map((p) => p.name);
+    const expected = count > 3 ? `${names.slice(0, 3).join(', ')} and ${count - 3} more` : `${names.slice(0, -1).join(', ')} and ${names[count - 1]}`;
+    expect(await screen.findByRole('alert')).toHaveTextContent(`Could not check ${expected}`);
+    const healthy = server.providers.filter((p) => !failing.includes(p) && p.status === 'ok').length;
+    expect(screen.getByText(`Checked ${total - count} of ${total} providers: ${healthy} healthy; ${count} could not be checked.`)).toBeInTheDocument();
+  });
+
   it('summarises what is missing and focuses the summary', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage();

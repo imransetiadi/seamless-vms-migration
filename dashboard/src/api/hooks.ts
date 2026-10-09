@@ -281,21 +281,29 @@ export function useSetConversionKey() {
   );
 }
 
+/** The outcome of Check all: the providers checked, and every check request that failed. */
+export interface CheckAllResult {
+  checked: Provider[];
+  /** Requests that failed (5xx, 401/403, 404, 429, network): the provider's own status is unchanged. */
+  failed: { id: string; error: unknown }[];
+}
+
 /** POST /providers/{id}/check for every provider (operator), one after another. */
 export function useCheckAllProviders() {
   const api = useApi();
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (ids: string[]) => {
-      const out: Provider[] = [];
+    mutationFn: async (ids: string[]): Promise<CheckAllResult> => {
+      const result: CheckAllResult = { checked: [], failed: [] };
       for (const id of ids) {
         try {
-          out.push(await api.post<Provider>(`/providers/${enc(id)}/check`));
-        } catch {
-          // one unreachable provider must not stop the others; its card shows the error
+          result.checked.push(await api.post<Provider>(`/providers/${enc(id)}/check`));
+        } catch (error) {
+          // one failed request must not stop the others, and is reported, never dropped (SDD §16)
+          result.failed.push({ id, error });
         }
       }
-      return out;
+      return result;
     },
     onSettled: () => invalidateAll(queryClient, [queryKeys.providers]),
   });
