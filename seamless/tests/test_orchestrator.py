@@ -1199,6 +1199,54 @@ async def test_cancel_without_a_data_path_runs_no_cleanup(tmp_path, store):
     assert executor.calls == []
 
 
+def _strategy_changed_before(h, to: Phase, strategy: Strategy) -> asyncio.Event:
+    """Run set_strategy (under the migration's lock, as the API does) right after the tick chose the
+    migration for ``to`` on its snapshot and before it starts that step."""
+    begin = h.orch._begin
+    changed = asyncio.Event()
+
+    async def racing_begin(mid, allowed, target, reason):
+        if target == to and not changed.is_set():
+            changed.set()
+            await h.orch.set_strategy(mid, strategy, "rina")
+        return await begin(mid, allowed, target, reason)
+
+    h.orch._begin = racing_begin
+    return changed
+
+
+async def test_a_migration_turned_cold_before_its_precopy_starts_does_not_precopy(tmp_path, store):
+    """SDD §8: the tick chose a warm migration for pre-copy on its snapshot; a set_strategy to cold
+    meanwhile wins: a pre-copy starts only for a warm strategy, so the cold migration cuts over
+    without one instead of failing in a pre-copy its executor cannot run."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    changed = _strategy_changed_before(h, P.precopy, Strategy.cold)
+    await run_plan(h, plan)
+    await asyncio.wait_for(changed.wait(), 5)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert m.strategy == Strategy.cold
+    assert P.precopy not in h.history(m)
+    assert [s for _, s in h.executor.calls] == [StepName.CUTOVER]
+
+
+async def test_a_migration_turned_warm_before_its_cutover_starts_precopies_first(tmp_path, store):
+    """SDD §8: the tick chose a single-shot migration for a cutover from ready on its snapshot; a
+    set_strategy to warm meanwhile wins: a cutover from ready starts only for a single-shot
+    strategy, so the warm migration pre-copies first instead of cutting over with no pass."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    changed = _strategy_changed_before(h, P.cutover, Strategy.warm)
+    await run_plan(h, plan)
+    await asyncio.wait_for(changed.wait(), 5)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert m.strategy == Strategy.warm
+    history = h.history(m)
+    assert P.precopy in history and history.index(P.precopy) < history.index(P.cutover)
+    steps = [s for _, s in h.executor.calls]
+    assert steps[0] == StepName.PRECOPY and StepName.CUTOVER in steps
+
+
 async def test_wave_dependencies_respected(tmp_path, store):
     vms = [vm(1), vm(2)]
     waves = [

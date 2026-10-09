@@ -1233,6 +1233,13 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in allowed:
                 return False
+            # the tick chose it for its strategy on its snapshot; set_strategy under this lock may
+            # have changed it since: a pre-copy is a warm migration's, a cutover from ready a
+            # single-shot one's (SDD §8)
+            if to == P.precopy and m.strategy not in WARM_STRATEGIES:
+                return False
+            if to == P.cutover and m.phase == P.ready and m.strategy not in SINGLE_SHOT_STRATEGIES:
+                return False
             if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
                 # the tick saw the gate open on its snapshot; an action under this lock (e.g.
                 # set_strategy clearing the approvals) may have closed it since (SDD §5.4)
