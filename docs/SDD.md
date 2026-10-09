@@ -1016,7 +1016,7 @@ such lists again on persisted migration events.
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a non-terminal plan); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
