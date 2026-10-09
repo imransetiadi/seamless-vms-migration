@@ -32,7 +32,7 @@ deploy/openshift/secret.yaml
 **/*.env
 **/clouds.yaml
 **/clouds.yml
-tests/auth_*.yml
+tests/**/auth_*.yml
 **/secrets
 **/secure.yaml
 **/*.pem

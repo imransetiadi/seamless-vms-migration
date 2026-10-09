@@ -32,7 +32,10 @@ seamless/data/
 
 # Secrets never committed
 clouds.yaml
+clouds.yml
 secure.yaml
+# cloud credentials for the e2e and functional playbooks (make generate-auth-files, tests/func)
+tests/**/auth_*.yml
 *.pem
 *.key
 .env

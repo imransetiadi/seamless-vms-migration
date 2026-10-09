@@ -1,4 +1,4 @@
-"""The image build context never carries a secret (SDD §17, Security.md C9-04).
+"""Secret files stay out of the image build context and out of git (SDD §17, Security.md C9-04).
 
 ``docker build -f seamless/Containerfile .`` reads ``seamless/Containerfile.dockerignore`` (a link
 to ``seamless/.containerignore``) instead of the root ``.dockerignore``; Podman builds pass the file
@@ -8,6 +8,8 @@ reaches local, remote and CI builders.
 """
 
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -28,6 +30,8 @@ SECRET_PATHS = [
     "tests/clouds.yml",  # make generate-auth-files input
     "tests/auth_tenant.yml",  # make generate-auth-files output: cloud passwords
     "tests/auth_admin.yml",
+    "tests/func/auth_tenant.yml",  # functional tests (docs/src/devel/dev-env-setup.rst)
+    "tests/func/auth_admin.yml",
     "deploy/tls/server.key",
     "deploy/tls/server.pem",
     "seamless/secrets/vcenter-dc2/password",  # SEAMLESS_SECRETS_DIR in a checkout
@@ -94,3 +98,30 @@ def test_docker_reads_the_seamless_ignore_file():
     link = ROOT / "seamless" / "Containerfile.dockerignore"
     assert link.is_symlink()
     assert link.resolve() == (ROOT / "seamless" / ".containerignore").resolve()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_every_secret_path_is_git_ignored():
+    """A ``git add -A`` never stages a secret file (CLAUDE.md §7)."""
+    tracked = [
+        path
+        for path in SECRET_PATHS
+        if subprocess.run(
+            ["git", "-C", str(ROOT), "check-ignore", "-q", "--no-index", path], check=False
+        ).returncode
+        != 0
+    ]
+    assert tracked == [], f"git would track: {tracked}"
+
+
+def test_auth_file_generation_never_prints_credentials():
+    """``make generate-auth-files`` writes cloud credentials to a 0600 file, never to the log."""
+    recipe = [
+        line
+        for line in (ROOT / "Makefile").read_text().splitlines()
+        if "auth-from-clouds.sh" in line
+    ]
+    assert recipe, "the generate-auth-files recipe moved"
+    for line in recipe:
+        assert "tee" not in line, line
+        assert "umask 077" in line and "> " in line, line

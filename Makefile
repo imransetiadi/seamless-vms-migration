@@ -338,7 +338,8 @@ generate-auth-files: install-deps install
 		source "$(VENV_DIR)/bin/activate" && \
 		pip install --root-user-action ignore -q shyaml && \
 		dnf -y install util-linux openssh-clients && \
-		./scripts/auth-from-clouds.sh --config "$(CONTAINER_COLLECTION_ROOT)/tests/clouds.yml" --src "$(SRC_CLOUD)" --dst "$(DST_CLOUD)" | tee "$(CONTAINER_COLLECTION_ROOT)/tests/auth_tenant.yml"'
+		umask 077 && ./scripts/auth-from-clouds.sh --config "$(CONTAINER_COLLECTION_ROOT)/tests/clouds.yml" --src "$(SRC_CLOUD)" --dst "$(DST_CLOUD)" > "$(CONTAINER_COLLECTION_ROOT)/tests/auth_tenant.yml" && \
+		echo "wrote tests/auth_tenant.yml (mode 0600, git-ignored; it holds cloud credentials, so it is not printed)"'
 
 
 test-e2e-tenant: install-deps install generate-auth-files

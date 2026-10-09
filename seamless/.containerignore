@@ -24,7 +24,7 @@ tests/e2e
 deploy/compose/compose.local.yaml
 deploy/openshift/secret.yaml
 **/clouds.yml
-tests/auth_*.yml
+tests/**/auth_*.yml
 **/.env
 **/.env.*
 **/*.env
