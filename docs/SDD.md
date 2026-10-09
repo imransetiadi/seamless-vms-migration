@@ -1067,8 +1067,12 @@ hashes are stored; comparison uses `hmac.compare_digest`. `seamless token create
 prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
-Demo mode on loopback disables auth by default. Failed authentications emit `auth.denied` (never
-the token).
+Demo mode on loopback disables auth by default. Every request refused for its role emits
+`auth.denied` — a missing or invalid token (401), the per-address lockout (429), a role below the
+route's minimum or an approver-only plan field set below the approver role (403, §12) — with `actor`
+the principal's name (`unauthenticated` without one), `message` `METHOD path: reason` and `data`
+`{path, method, reason, required_role, client}`, never the token; at most 30 per client address and
+minute are recorded.
 
 ### 13.2 Authorization
 
