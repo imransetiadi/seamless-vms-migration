@@ -146,6 +146,42 @@ def test_plan_rejects_out_of_range_tcp_port(api):
     assert patched.status_code == 422 and "65536" in patched.json()["error"]["message"]
 
 
+def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
+    """SDD §12: a pre-copied migration waiting for its cutover (here after pause and re-validation)
+    would cut over to a changed destination or mappings — PATCH and auto-waves answer 409, naming
+    the VM; once nothing is in flight the plan can be edited again."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "in flight",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    migrations = api.store.list("migration", Migration, plan_id=plan["id"])
+    waiting = migrations[0]
+    waiting.phase = Phase.awaiting_cutover
+    api.store.put("migration", waiting)
+    patch = {"description": "move to another cloud"}
+    refused = api.client.patch(
+        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json=patch
+    )
+    assert refused.status_code == 409, refused.text
+    assert waiting.vm.name in refused.json()["error"]["message"]
+    waves = api.post(
+        f"/api/v1/plans/{plan['id']}/waves/auto", Role.operator, json={"max_wave_size": 5}
+    )
+    assert waves.status_code == 409 and waiting.vm.name in waves.json()["error"]["message"]
+    # a failed migration whose source runs stays editable: fix the cause, then retry
+    waiting.phase = Phase.failed
+    api.store.put("migration", waiting)
+    allowed = api.client.patch(
+        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json=patch
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
 def test_plan_create_validate_start_flow(api):
     vm_ids = first_clean_vms(api)
     body = {

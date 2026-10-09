@@ -151,6 +151,14 @@ async def update_plan(
     await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
     if plan.status not in (PlanStatus.draft, PlanStatus.validated):
         raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
+    busy = await svc.orchestrator.in_flight(plan_id)
+    if busy:
+        raise ApiError(
+            409,
+            "conflict",
+            f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
+            "before editing the plan",
+        )
     try:
         merged = PlanCreate.model_validate(
             {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}

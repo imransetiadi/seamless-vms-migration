@@ -98,6 +98,11 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: a migration in one of these depends on the plan's providers, mappings and strategy as they were
+#: when it started: the plan is not edited or re-waved meanwhile (SDD §12)
+IN_FLIGHT_PHASES = frozenset(
+    {P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.rolling_back, P.completed}
+)
 
 
 class OrchestratorError(Exception):
@@ -544,10 +549,24 @@ class Orchestrator:
             )
         return m
 
+    async def in_flight(self, plan_id: str) -> list[str]:
+        """VM names of the plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
+        return sorted(
+            m.vm.name
+            for m in await self.db.list("migration", Migration, plan_id=plan_id)
+            if m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+        )
+
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):
             raise NotAllowed(f"waves cannot change while the plan is {plan.status}")
+        busy = await self.in_flight(plan.id)
+        if busy:
+            raise NotAllowed(
+                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
+                "before re-planning the waves"
+            )
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
