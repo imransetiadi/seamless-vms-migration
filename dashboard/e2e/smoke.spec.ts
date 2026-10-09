@@ -95,3 +95,26 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await expect(card).toContainText(/stored just now/i);
   await expect(page.locator('body')).not.toContainText('browser-secret');
 });
+
+test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 800 });
+  // a viewer sees the most soft-disabled controls, each with a visually hidden reason
+  await signIn(page, 'viewer');
+  const pages: Array<[string, () => ReturnType<Page['locator']>]> = [
+    ['/', () => page.getByRole('heading', { level: 1 })],
+    ['/plans', () => page.locator('a[href^="/plans/plan-"]').first()],
+    ['/plans/plan-4f2a9c1e', () => page.locator('a[href^="/migrations/mig-"]').first()],
+    ['/migrations/mig-5d7e2b4a12', () => page.getByRole('button', { name: /^use /i }).first()],
+    ['/providers', () => page.getByRole('heading', { name: 'Migrate from' })],
+    ['/inventory', () => page.getByRole('heading', { name: 'Inventory', level: 1 })],
+    ['/events', () => page.getByRole('heading', { level: 1 })],
+    ['/advisor', () => page.getByRole('heading', { level: 1 })],
+  ];
+  for (const [path, ready] of pages) {
+    await page.goto(path);
+    await expect(ready()).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, `${path} is ${overflow} px wider than the screen`).toBe(0);
+  }
+});

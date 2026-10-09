@@ -112,8 +112,10 @@
   @apply fixed z-toast max-w-72 rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
 }
 
+/* relative: visually hidden text inside a wide table (sr-only is position: absolute) stays inside the
+   scroller instead of widening the page on a phone (NFR-08, WCAG 2.2 reflow) */
 @utility table-wrap {
-  @apply w-full overflow-x-auto;
+  @apply relative w-full overflow-x-auto;
 }
 
 @utility data-table {

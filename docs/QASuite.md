@@ -164,7 +164,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | NFR-05 integrity | A1 manifest tests, `test_corrupted_frame_detected_exits_3`, §8 |
 | NFR-06 security | §10, [Security.md](Security.md) §15 |
 | NFR-07 AI safety | B5 tests, S-14…S-16, R-03 |
-| NFR-08 usability | S-UI, `contrast.test.ts`, §12; SSE latency ≤ 2 s measured in PERF-CP-03 |
+| NFR-08 usability | S-UI, `contrast.test.ts`, §12 (UI-15: no sideways scroll at 320 px); SSE latency ≤ 2 s measured in PERF-CP-03 |
 | NFR-09 observability | `test_metrics_format`, `test_events_since`; timeline completeness check in `tests/e2e/smoke-demo.sh` |
 | NFR-10 portability | environment matrix (§3), compose and kustomize checks |
 | NFR-11 maintainability | coverage gate ≥ 85 % (§13), `ruff check`, ansible-lint |
@@ -618,7 +618,9 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 
 Two layers exist: `dashboard/e2e/` (`npm run test:e2e`, Chromium against the mock-mode build, CI job
 `dashboard-e2e`) — `smoke.spec.ts` (design tokens and themes, the main journey, viewer soft-disabled actions, adding
-a provider) and `journeys.spec.ts` (UI-11 editing a validated plan saves the change and returns it to draft; UI-12
+a provider; UI-15 no page scrolls sideways on a 320 px wide screen — NFR-08, WCAG 2.2 reflow — it failed on the
+migration page while visually hidden text in the strategy table escaped its scroller) and `journeys.spec.ts`
+(UI-11 editing a validated plan saves the change and returns it to draft; UI-12
 the shown audit events download as JSON lines in sequence order; UI-13 the guest OS filter and Clear filters;
 UI-14 a NetApp NFS handover names the RHOSO pool per volume type; each was checked to fail when the behaviour it
 guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
