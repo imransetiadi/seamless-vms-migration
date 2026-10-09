@@ -245,7 +245,8 @@ Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|
 
 `progress_pct` is the running step's percentage. `bytes_total` is the VM's used bytes — what one full
 copy moves; `bytes_transferred` counts every pass (`sync_bytes_dropped` plus the listed passes, §5.4)
-and the running step's bytes, so a warm migration's grows past `bytes_total`.
+and the running step's bytes, so a warm migration's grows past `bytes_total`. `sync_passes` lists the
+passes that ended: a pass is recorded when it ends, and the running step is named from the phase (§16).
 
 ### 4.3 Event kinds
 
@@ -1299,13 +1300,15 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
-  stepper, progress (the running step's percentage, and the bytes transferred over all passes and the disk's used
+  stepper, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
+  pass 1; in `syncing` the next delta pass; in `cutover` the final pass of a warm migration, the full copy of a cold
+  one or the volume handover — and its percentage, and the bytes transferred over all passes and the disk's used
   bytes as two figures, never one over the other — a warm migration transfers more than its disk holds; a
   `migration.progress` event updates them by the API's rule: `pct`, and `sync_bytes_dropped` plus the listed passes
   plus `bytes_done`; a `migration.sync_pass` event adds the pass that ended to the page's passes, so the figure does
-  not drop while the page fetches the migration again), sync-pass convergence chart (once a long wait dropped passes
-  from `sync_passes`, it says how many earlier passes are no longer listed and that the bytes they transferred stay
-  counted, §5.4), downtime clock,
+  not drop while the page fetches the migration again), sync-pass convergence chart (it names the running pass the
+  same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
+  and that the bytes they transferred stay counted, §5.4), downtime clock,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; while a requested cutover waits for a closed window, an approver can let it cut over
