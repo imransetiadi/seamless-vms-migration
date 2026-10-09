@@ -212,9 +212,9 @@ LAB-W12); network, flavor and volume-type mappings are defined; the plan has `re
 9. every action in `GET /events` carries the actor; the disk checksum procedure of §8 D-04 matches for every
    migrated disk; Dimas (viewer) can see progress but every mutating call returns 403.
 
-### 6.2 AC-2 — Shared Ceph handover (journey 2) · FR-09 · Lab
+### 6.2 AC-2 — Shared storage handover (journey 2) · FR-09 · Lab
 
-**Given** both clouds use the same Ceph cluster; both providers have admin capability; `plan.handover.enabled` is
+**Given** both clouds use the same Ceph cluster (the NetApp ONTAP variants are LAB-H07…H10); both providers have admin capability; `plan.handover.enabled` is
 true with a `backend_map` for every volume type; the VM has 1–3 Cinder volumes, none multi-attach.
 **When** the plan is validated and the migration's cutover is approved;
 **Then** `storage_handover` is eligible and, with `min_downtime`, selected; in the order of SDD §7.3 the source
