@@ -1,8 +1,12 @@
+import pytest
+
 from seamless_migrate.api.app import build_services
 from seamless_migrate.config import Settings
 from seamless_migrate.demo import DEMO_PLAN_NAMES, seed_demo
-from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderRole
-from seamless_migrate.domain.models import Migration, Plan, Provider
+from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole
+from seamless_migrate.domain.models import Mappings, Migration, Plan, Provider
+from seamless_migrate.orchestrator import NotAllowed
+from seamless_migrate.providers.fake import FakeSourceProvider
 
 
 async def test_demo_seed_idempotent(tmp_path, store):
@@ -32,7 +36,12 @@ async def test_demo_seed_idempotent(tmp_path, store):
     assert DEMO_PLAN_NAMES == ("Finance apps (RHOSP 17.1 → RHOSO)", "DC2 VMware exit")
     assert all(p.status == PlanStatus.running and p.waves for p in plans)
     migrations = store.list("migration", Migration)
-    assert len(migrations) == 24 + 12
+    # report-01 and batch-01 stay unplanned, so a new plan can take them (SDD §10, §5.4)
+    assert len(migrations) == 22 + 12
+    planned = {m.vm.name for m in migrations}
+    assert not planned & {"report-01", "batch-01"}
+    finance = next(p for p in plans if p.source_provider_id == "rhosp17-finance")
+    assert len(finance.vm_ids) == 22
     assert not [m for m in migrations if m.phase == Phase.blocked]
     cancelled = [m for m in migrations if m.phase == Phase.cancelled]
     assert [m.vm.name for m in cancelled] == ["gpu-ml-01"]
@@ -44,7 +53,7 @@ async def test_demo_seed_idempotent(tmp_path, store):
     await seed_demo(store, settings, services.orchestrator)
     assert len(store.list("provider", Provider)) == 3
     assert len(store.list("plan", Plan)) == 2
-    assert len(store.list("migration", Migration)) == 36
+    assert len(store.list("migration", Migration)) == 34
     assert store.max_seq() == events_before, "a second seed changes nothing"
 
 
@@ -130,3 +139,37 @@ async def test_demo_estate_covers_the_guest_os_range():
     assert {vm.guest_os.lifecycle for vm in openstack} >= {"current", "legacy"}
     assert {vm.guest_os.v2v for vm in vmware} >= {"supported", "tech_preview", "unsupported"}
     assert all(vm.guest_os.family != "unknown" for vm in openstack + vmware)
+
+
+async def test_demo_leaves_finance_vms_a_new_plan_can_take(tmp_path, store):
+    """SDD §10: the finance plan holds its VMs for good once it completes (§5.4), so the seed leaves
+    report-01 and batch-01 unplanned: a new plan validates with them, and is refused with a VM the
+    finance plan holds."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    vms = await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed).list_vms()
+    ids = {vm.name: vm.source_id for vm in vms}
+    mappings = Mappings(
+        networks={"finance-app": "finance-app", "finance-db": "finance-db"},
+        volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
+    )
+
+    def new_plan(*names: str) -> Plan:
+        plan = Plan(
+            name="new",
+            source_provider_id="rhosp17-finance",
+            destination_provider_id="rhoso18",
+            vm_ids=[ids[name] for name in names],
+            mappings=mappings,
+        )
+        store.put("plan", plan)
+        return plan
+
+    free = new_plan("report-01", "batch-01")
+    report = await services.orchestrator.validate_plan(free.id, "tester")
+    assert sorted(item.vm_name for item in report.migrations) == ["batch-01", "report-01"]
+    with pytest.raises(NotAllowed, match="another plan"):
+        await services.orchestrator.validate_plan(new_plan("web-01").id, "tester")

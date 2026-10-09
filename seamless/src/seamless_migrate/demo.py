@@ -27,6 +27,9 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 FINANCE_PLAN = "Finance apps (RHOSP 17.1 → RHOSO)"
+#: Finance VMs the demo leaves unplanned, so a new plan can take them (SDD §10): one VM has one
+#: migration across plans (§5.4), and the finance plan holds the rest for good once it completes.
+UNPLANNED_FINANCE_VMS = frozenset({"report-01", "batch-01"})
 VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
@@ -80,7 +83,7 @@ async def _plans(settings: Settings) -> list[Plan]:
             description="Side-by-side migration of the finance estate; cuts over automatically.",
             source_provider_id="rhosp17-finance",
             destination_provider_id="rhoso18",
-            vm_ids=[vm.source_id for vm in finance_vms],
+            vm_ids=[vm.source_id for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS],
             mappings=Mappings(
                 networks={"finance-app": "finance-app", "finance-db": "finance-db"},
                 volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
