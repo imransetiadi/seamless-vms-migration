@@ -52,6 +52,7 @@ from .domain.models import (
     ValidationItem,
     ValidationReport,
     VMRef,
+    repeated_vm_ids,
     utcnow,
 )
 from .events import EventBus, emit
@@ -339,6 +340,10 @@ class Orchestrator:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
+        repeated = repeated_vm_ids(plan.vm_ids)
+        if repeated:
+            # SDD §5.4: two migrations of one VM would both cut it over
+            raise BadRequest(f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
         src_impl = self.providers.get(source)

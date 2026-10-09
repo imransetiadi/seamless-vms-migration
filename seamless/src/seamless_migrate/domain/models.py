@@ -7,6 +7,8 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 from __future__ import annotations
 
 import secrets
+from collections import Counter
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
@@ -291,6 +293,13 @@ class PlanSpec(_Model):
 
 
 PlanCreate = PlanSpec
+
+
+def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
+    """VM ids a plan lists more than once: one VM, one migration (SDD §12)."""
+    return sorted(vm_id for vm_id, count in Counter(vm_ids).items() if count > 1)
+
+
 #: Fields a client may send in ``PlanCreate`` / ``PATCH /plans/{id}``.
 PLAN_EDITABLE_FIELDS = frozenset(PlanSpec.model_fields)
 

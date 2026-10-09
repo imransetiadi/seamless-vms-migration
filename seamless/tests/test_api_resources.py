@@ -91,6 +91,29 @@ def first_clean_vms(api, n=3):
     return [vm["source_id"] for vm in inventory if vm["name"] in names][:n]
 
 
+def test_plan_rejects_duplicate_vm_ids(api):
+    """SDD §12: one VM, one migration — a repeated VM id would make two migrations cut it over."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "twice",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [vm_ids[0], vm_ids[1], vm_ids[0]],
+    }
+    twice = api.post("/api/v1/plans", Role.operator, json=body)
+    assert twice.status_code == 422, twice.text
+    assert vm_ids[0] in twice.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.operator, json={**body, "vm_ids": vm_ids})
+    assert created.status_code == 201, created.text
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"vm_ids": [vm_ids[1], vm_ids[1]]},
+    )
+    assert patched.status_code == 422, patched.text
+    assert vm_ids[1] in patched.json()["error"]["message"]
+
+
 def test_plan_create_validate_start_flow(api):
     vm_ids = first_clean_vms(api)
     body = {
