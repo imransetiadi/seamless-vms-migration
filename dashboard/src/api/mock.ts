@@ -91,12 +91,10 @@ export interface MockServerOptions {
   seed?: number;
 }
 
-/**
- * Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4). The mock
- * creates a plan's migrations with the plan, so a never-validated one (`pending`) holds nothing
- * either — in the API it does not exist before the plan is validated.
- */
-const RELEASES_VM: ReadonlySet<Phase> = new Set(['pending', 'cancelled', 'finalized', 'rolled_back']);
+/** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
+const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
+/** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
+const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
 /** At most `limit` holders from `heldElsewhere`, and how many are left out (the API's wording). */
 function holdersText(held: Map<string, string[]>, limit = 10): string {
   const entries = [...held.values()].flat().sort();
@@ -789,7 +787,6 @@ export class MockServer {
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
-    const inventory = (this.inventories[source.id] ?? []) as VMRef[];
     const now = this.now();
     const plan: Plan = {
       ...defaultPlanFields(now),
@@ -804,47 +801,6 @@ export class MockServer {
     } as Plan;
     this.plans.unshift(plan);
     this.emit({ kind: 'plan.created', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" created with ${plan.vm_ids.length} VMs`, data: { status: 'draft' } });
-    for (const vmId of plan.vm_ids) {
-      const vm = inventory.find((v) => v.source_id === vmId);
-      if (!vm) continue;
-      const created = new Date(now).toISOString();
-      const m: Migration = {
-        id: `mig-${hex(this.rand, 10)}`,
-        plan_id: plan.id,
-        wave_id: null,
-        vm,
-        strategy: source.kind === 'vmware' ? 'vmware_cold' : 'cold',
-        phase: 'pending',
-        phase_history: [{ from_phase: null, to_phase: 'pending', at: created, reason: 'migration created', actor: me.name }],
-        progress_pct: 0,
-        bytes_total: vm.used_bytes,
-        bytes_transferred: 0,
-        sync_passes: [],
-        estimate: null,
-        estimates: [],
-        observed_scan_bps: null,
-        resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
-        findings: [],
-        checkpoint: null,
-        downtime_started_at: null,
-        downtime_ended_at: null,
-        actual_downtime_s: null,
-        approvals: [],
-        cutover_requested: false,
-        force_window: false,
-        advisor_notes: [],
-        review_required: false,
-        review_reason: null,
-        destination_server_id: null,
-        error: null,
-        attempts: 0,
-        created_at: created,
-        updated_at: created,
-      };
-      this.evaluate(m, plan);
-      this.migrations.push(m);
-      this.emit({ kind: 'migration.created', plan_id: plan.id, migration_id: m.id, actor: me.name, message: `${vm.name}: migration created`, data: { strategy: m.strategy } });
-    }
     return ok(plan, 201);
   }
 
@@ -908,8 +864,66 @@ export class MockServer {
     return new Map([...held].map(([id, holders]) => [id, [...holders].sort()]));
   }
 
+  /** A new migration of `vm` in `plan`, created by validation as in the API (SDD §8). */
+  private createMigration(plan: Plan, vm: VMRef, actor: string): Migration {
+    const now = this.now();
+    const source = this.sourceFor(plan);
+    const created = new Date(now).toISOString();
+    const m: Migration = {
+      id: `mig-${hex(this.rand, 10)}`,
+      plan_id: plan.id,
+      wave_id: null,
+      vm,
+      strategy: source.kind === 'vmware' ? 'vmware_cold' : 'cold',
+      phase: 'pending',
+      phase_history: [{ from_phase: null, to_phase: 'pending', at: created, reason: 'migration created', actor }],
+      progress_pct: 0,
+      bytes_total: vm.used_bytes,
+      bytes_transferred: 0,
+      sync_passes: [],
+      estimate: null,
+      estimates: [],
+      observed_scan_bps: null,
+      resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
+      findings: [],
+      checkpoint: null,
+      downtime_started_at: null,
+      downtime_ended_at: null,
+      actual_downtime_s: null,
+      approvals: [],
+      cutover_requested: false,
+      force_window: false,
+      advisor_notes: [],
+      review_required: false,
+      review_reason: null,
+      destination_server_id: null,
+      error: null,
+      attempts: 0,
+      created_at: created,
+      updated_at: created,
+    };
+    this.migrations.push(m);
+    this.emit({ kind: 'migration.created', plan_id: plan.id, migration_id: m.id, actor, message: `${vm.name}: migration created`, data: { strategy: m.strategy } });
+    return m;
+  }
+
   private validatePlan(me: Me, plan: Plan): MockResponse {
     if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    const mine = this.migrations.filter((m) => m.plan_id === plan.id);
+    const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
+    const selected = new Set(plan.vm_ids);
+    // the API's order of checks (orchestrator.validate_plan, SDD §5.4): nothing changes before they pass
+    const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
+    if (cancelled.length) {
+      throw new HttpError(400, 'bad_request', `${cancelled.length} VM(s) have a cancelled migration: ${cancelled.slice(0, 10).join(', ')}; remove them from vm_ids or create a new plan for them`);
+    }
+    const stopped = mine
+      .filter((m) => !selected.has(m.vm.source_id) && REVALIDATABLE.has(m.phase) && Boolean(m.downtime_started_at) && !m.downtime_ended_at)
+      .map((m) => m.vm.name)
+      .sort();
+    if (stopped.length) {
+      throw new HttpError(409, 'conflict', `${stopped.slice(0, 10).join(', ')}: the source VM is stopped after a failed cutover; keep the VM in the plan until it is cut over or rolled back`);
+    }
     const held = this.heldElsewhere(plan, plan.vm_ids);
     if (held.size) {
       throw new HttpError(
@@ -918,19 +932,27 @@ export class MockServer {
         `${held.size} VM(s) already have a migration in another plan: ${holdersText(held)}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
       );
     }
-    const mine = this.migrations.filter((m) => m.plan_id === plan.id);
-    for (const m of mine) {
-      if (m.phase === 'pending' || m.phase === 'blocked' || m.phase === 'ready') {
+    const inventory = (this.inventories[plan.source_provider_id] ?? []) as VMRef[];
+    const validated: Migration[] = [];
+    for (const vmId of plan.vm_ids) {
+      const vm = inventory.find((v) => v.source_id === vmId);
+      const m = byVm.get(vmId) ?? (vm ? this.createMigration(plan, vm, me.name) : undefined);
+      if (!m) continue;
+      if (REVALIDATABLE.has(m.phase)) {
         this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
       }
+      validated.push(m);
+    }
+    for (const m of mine) {
+      if (!selected.has(m.vm.source_id) && REVALIDATABLE.has(m.phase)) this.transition(m, 'cancelled', 'removed from the plan', me.name);
     }
     plan.status = 'validated';
     plan.updated_at = new Date(this.now()).toISOString();
     const report: ValidationReport = {
       plan_id: plan.id,
-      ok: !mine.some((m) => m.phase === 'blocked'),
-      migrations: mine.map((m) => ({ migration_id: m.id, vm_name: m.vm.name, strategy: m.strategy, phase: m.phase, findings: m.findings, estimates: m.estimates })),
+      ok: !validated.some((m) => m.phase === 'blocked'),
+      migrations: validated.map((m) => ({ migration_id: m.id, vm_name: m.vm.name, strategy: m.strategy, phase: m.phase, findings: m.findings, estimates: m.estimates })),
     };
     this.emit({ kind: 'plan.validated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" validated (${report.ok ? 'no blockers' : 'blockers found'})`, data: { ok: report.ok } });
     return ok(report);

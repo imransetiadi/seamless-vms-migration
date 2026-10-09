@@ -14,6 +14,7 @@ import {
   type Migration,
   type Plan,
   type Provider,
+  type VMRef,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -22,6 +23,15 @@ function setup(token: string | null = 'admin') {
   const server = new MockServer({ now: () => NOW, seed: 1 });
   const client = new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   return { server, client };
+}
+
+/** Inventory VMs of `providerId` that no migration of the fixtures uses: free for a new plan. */
+function freeVms(server: MockServer, providerId: string, count: number): VMRef[] {
+  const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
+  const taken = new Set(server.migrations.map((m) => m.vm.source_id));
+  const free = inventory.filter((v) => !taken.has(v.source_id)).slice(0, count);
+  if (free.length < count) throw new Error(`fixtures have fewer than ${count} free VMs on ${providerId}`);
+  return free;
 }
 
 function byPhase(server: MockServer, phase: Migration['phase']): Migration {
@@ -229,6 +239,57 @@ describe('mock API', () => {
     expect(changed).toMatchObject({ require_approval: false, cutover_window: window });
   });
 
+  it('creates a plan\'s migrations at validation, not at creation, like the API (SDD §8)', async () => {
+    const { server, client } = setup('operator');
+    const free = freeVms(server, 'rhosp17-dc1', 2);
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Fresh',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: free.map((v) => v.source_id),
+    });
+    expect(server.migrations.filter((m) => m.plan_id === plan.id)).toEqual([]);
+
+    const report = await client.post<{ migrations: { vm_name: string; phase: string }[] }>(`/plans/${plan.id}/validate`);
+    expect(report.migrations.map((m) => m.vm_name).sort()).toEqual(free.map((v) => v.name).sort());
+    expect(report.migrations.every((m) => m.phase === 'ready' || m.phase === 'blocked')).toBe(true);
+    const ids = server.migrations.filter((m) => m.plan_id === plan.id).map((m) => m.id).sort();
+    expect(ids).toHaveLength(2);
+    // validating again keeps the same migrations
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.migrations.filter((m) => m.plan_id === plan.id).map((m) => m.id).sort()).toEqual(ids);
+  });
+
+  it('cancels the migration of a VM taken out of a plan at the next validation, and refuses it back (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const [keep, drop] = freeVms(server, 'rhosp17-dc1', 2);
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Shrinking',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: [keep!.source_id, drop!.source_id],
+    });
+    await client.post(`/plans/${plan.id}/validate`);
+    const dropped = server.migrations.find((m) => m.plan_id === plan.id && m.vm.source_id === drop!.source_id)!;
+
+    // a VM whose source is stopped cannot leave the plan (SDD §5.1): the API refuses that PATCH, so
+    // the plan is changed the way `seamless plan apply` writes it, and validation refuses it
+    dropped.downtime_started_at = '2026-10-08T11:00:00Z';
+    server.plans.find((p) => p.id === plan.id)!.vm_ids = [keep!.source_id];
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining('the source VM is stopped') });
+    expect(dropped.phase).not.toBe('cancelled');
+
+    dropped.downtime_started_at = null;
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(dropped.phase).toBe('cancelled');
+    // cancelled is terminal: the VM cannot come back into this plan
+    await client.patch(`/plans/${plan.id}`, { vm_ids: [keep!.source_id, drop!.source_id] });
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining(`1 VM(s) have a cancelled migration: ${drop!.name}`),
+    });
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
@@ -262,7 +323,7 @@ describe('mock API', () => {
       destination_provider_id: first.destination_provider_id,
       vm_ids: [mine.vm.source_id],
     });
-    // the second plan has not been validated: its migration (created with the plan) holds nothing
+    // the second plan has not been validated: like in the API it has no migration yet, so it holds nothing
     await client.post(`/plans/${first.id}/validate`);
     await expect(client.post(`/plans/${second.id}/validate`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining(first.name) });
 
