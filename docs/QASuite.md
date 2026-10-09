@@ -529,6 +529,7 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 | S-22 | TLS | `nmap --script ssl-enum-ciphers -p 443 <route-host>`; `curl -sI https://<route-host>/` | TLS 1.2+ only; HTTP redirects to HTTPS; HSTS and security headers present once added |
 | S-23 | DAST baseline | OWASP ZAP API scan in safe (passive) mode — command below | no High alerts; Medium alerts triaged |
 | S-24 | PostgreSQL posture | `docker --context colima-seamless ps --format '{{.Names}}\t{{.Ports}}'` shows no host binding for 5432; the `psql` queries below inside the container (`pg_hba_file_rules`, `password_encryption`); a connection **without** a password over the unix socket and over loopback | `scram-sha-256` for every line of `pg_hba.conf` (the Compose stack passes `--auth-local=scram-sha-256 --auth-host=scram-sha-256` to `initdb`, only effective for a **new** `pgdata` volume); no `trust`; both password-less connections fail (`no password supplied`); no published port. The application role `seamless` is the bootstrap **superuser** of this throw-away local database — the hardened role model (non-superuser owner, restricted `pg_hba`) applies to shared and OpenShift databases ([Security.md](Security.md) §9.4) |
+| S-25 | Request body limit (Security.md R-17) | without a token, `curl --data-binary @2MiB.json` to `POST /api/v1/migrations/<id>/approve`, once with `Content-Length` and once with `-H 'Transfer-Encoding: chunked'`; then a 1 KiB body | both 2 MiB requests: 413 `payload_too_large` with `X-Content-Type-Options: nosniff`, before the token is checked; the small body: 401. Unit: `test_request_body_over_1_mib_is_refused_with_413_before_auth` (exactly 1 MiB still reaches the route), `test_chunked_request_body_over_1_mib_is_refused_with_413`, `test_body_limit_counts_streamed_chunks` |
 
 ZAP (S-23) — run only against the **demo** stack, never against one connected to real clouds:
 
@@ -818,7 +819,7 @@ Twenty-three further iterations after the integration run, each verified with th
    below 416 MiB/s, or a G1a p90 above 600 s for P-MULTI-L behind a saturated storage path — blocks the release
    unless it carries an accepted, documented waiver as in item 4 (a changed target or population, or a recorded lab
    deviation, each with the measured numbers and the reason); PERF-CP thresholds met.
-7. Security: S-01…S-24 executed; no open High finding ([Security.md](Security.md) §11); no secret-scan findings;
+7. Security: S-01…S-25 executed; no open High finding ([Security.md](Security.md) §11); no secret-scan findings;
    no unaccepted High/Critical dependency or image vulnerability; checklist §12 signed.
 8. Resilience: R-01…R-13 executed with all invariants holding.
 9. No open **S1** or **S2** defects; S3 defects triaged with owners.
@@ -1129,5 +1130,5 @@ VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh        # S-01 o
 | 4 Image | build, S-19, S-20 | no unaccepted High/Critical |
 | 5 Demo E2E | §14.6, `smoke-demo.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs`, DEMO-01…06, UI manual checklist | pass |
 | 6 Lab | §7 matrix, §8 integrity, §9 performance | exit criteria §13.2 |
-| 7 Security and resilience | S-03…S-16, S-21…S-24, R-01…R-13 | no S1/S2 |
+| 7 Security and resilience | S-03…S-16, S-21…S-25, R-01…R-13 | no S1/S2 |
 | 8 Sign-off | report (§13.5), Security.md §12 checklist, docs reconciled | release |
