@@ -992,6 +992,11 @@ that grows past it, is refused with 413 before the body is parsed: the framework
 body before the token is checked, so an unauthenticated client could otherwise make the server buffer
 any amount of data (Security.md R-17). A plan of 5,000 VMs (the PRD's scale test; NFR-03 is 1,000)
 with a strategy override for each and 1,000 mapping entries is about 0.5 MB.
+A response of 1 KiB or more is gzip-compressed (level 6, `Content-Encoding: gzip`, `Vary:
+Accept-Encoding`) when the request's `Accept-Encoding` allows gzip; the event stream
+(`text/event-stream`) never is, so live events are not held back. A migration document is ~4.5 KB of
+JSON, so a list of 1,000 (NFR-03) is ~4.3 MiB raw and ~12× less compressed — the dashboard fetches
+such lists again on persisted migration events.
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
