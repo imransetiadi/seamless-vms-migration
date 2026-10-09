@@ -29,7 +29,7 @@ VENV_DIR                  := $(CONTAINER_COLLECTION_ROOT)/.venv
 # --- Core Logic for Container Creation ---
 
 # Check if the container already exists and strip any whitespace/newlines
-CONTAINER_EXISTS = $(strip $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME)))
+CONTAINER_EXISTS = $(strip $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME) 2>/dev/null))
 
 
 # --- Dynamic Variable Setup ---
@@ -62,7 +62,7 @@ COLLECTION_INSTALL_DIR := $(COLLECTIONS_PATH)/ansible_collections/$(COLLECTION_N
 # --- Core Logic for Container Creation ---
 
 # Check if the container already exists
-CONTAINER_EXISTS = $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME))
+CONTAINER_EXISTS = $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME) 2>/dev/null)
 
 # Determine if we need to create a container based on cache settings and existence.
 # Default to 0 (don't create).
@@ -439,7 +439,7 @@ SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused 
 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
         seamless-up seamless-demo seamless-down seamless-ps seamless-logs seamless-reset \
-        seamless-test seamless-check dashboard-build
+        seamless-test seamless-check dashboard-build lab-handover
 
 seamless-help:
 	@echo "Seamless Migrate stack (engine '$(SEAMLESS_ENGINE)'; Docker: Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
@@ -453,6 +453,7 @@ seamless-help:
 	@echo "  seamless-logs       - follow logs (SEAMLESS_SERVICE=seamless|postgres|jev to filter)"
 	@echo "  seamless-reset      - DELETE containers and volumes (requires CONFIRM=yes)"
 	@echo "  seamless-test       - run the control-plane test suite (cd seamless && .venv/bin/pytest -q)"
+	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
 	@echo "  seamless-check      - every CI check that runs locally: tests, ruff, collection tests, scans, dashboard"
 
@@ -516,6 +517,13 @@ seamless-reset: seamless-check-context
 	else \
 		$(SEAMLESS_COMPOSE_NOENV) --profile '*' down --volumes --remove-orphans; \
 	fi
+
+# Storage handover against the real lab clouds (QASuite LAB-H07…H10, SDD §7.3): lists the Cinder pools by
+# driver family and prints the readiness report of SEAMLESS_LAB_HANDOVER_SERVER; with SEAMLESS_LAB_DESTRUCTIVE=1
+# it also hands that disposable server over to RHOSO and rolls it back. Variables: seamless/tests/lab/.
+lab-handover:
+	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,openstack]'"; exit 1; }
+	cd seamless && .venv/bin/pytest -m lab tests/lab/test_lab_storage_handover.py -v -s -rs
 
 # Control-plane tests (SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is exported).
 seamless-test:
