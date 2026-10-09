@@ -28,6 +28,21 @@ def test_volume_attributes_used_for_pools_boot_properties_and_unmanage_checks():
         assert hasattr(Volume, name), name
 
 
+def test_port_and_server_attributes_used_to_restore_the_source_nics():
+    """SDD §7.3 step 2 and rollback: a port's id, MAC, fixed IPs and binding; Nova's root device;
+    a missing port answers NotFoundException (HTTP 404), which the rollback reads as deleted."""
+    from openstack import exceptions
+    from openstack.compute.v2.server import Server
+    from openstack.network.v2.port import Port
+
+    for name in ("id", "network_id", "mac_address", "fixed_ips", "device_id"):
+        assert hasattr(Port, name), name
+    assert hasattr(Server, "root_device_name")
+    assert issubclass(exceptions.NotFoundException, exceptions.HttpException)
+    # handover._not_found matches a 404 status code or this class name
+    assert "NotFound" in exceptions.NotFoundException.__name__
+
+
 def test_backend_pools_read_the_detailed_scheduler_stats():
     from openstack.block_storage.v3 import _proxy
     from openstack.block_storage.v3.stats import Pools
@@ -94,7 +109,10 @@ def test_proxy_methods_the_executor_and_provider_call():
                 "wait_for_delete",
             ),
         ),
-        (Network, ("ports", "get_network", "find_network", "networks", "ips")),
+        (
+            Network,
+            ("ports", "get_network", "find_network", "networks", "ips", "get_port", "create_port"),
+        ),
     ):
         for name in names:
             assert callable(getattr(proxy, name, None)), f"{proxy.__module__}.{name}"

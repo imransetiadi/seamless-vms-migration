@@ -113,12 +113,26 @@ def _mark_boot(attachments: list[dict[str, Any]], root_device: str) -> None:
                 return
 
 
+def _not_found(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 404 or "NotFound" in type(exc).__name__
+
+
 def _existing_server(conn: Any, server_id: str) -> Any:
     """The server, or ``None`` when it is already gone (HTTP 404)."""
     try:
         return conn.compute.get_server(server_id)
     except Exception as exc:
-        if getattr(exc, "status_code", None) == 404 or "NotFound" in type(exc).__name__:
+        if _not_found(exc):
+            return None
+        raise
+
+
+def _existing_port(conn: Any, port_id: str) -> Any:
+    """The port, or ``None`` when it is gone (HTTP 404): Nova deletes the ports it created."""
+    try:
+        return conn.network.get_port(port_id)
+    except Exception as exc:
+        if _not_found(exc):
             return None
         raise
 
@@ -229,15 +243,22 @@ class HandoverExecutor:
         networks = []
         for port in conn.network.ports(device_id=server_id):
             network = conn.network.get_network(_attr(port, "network_id"))
-            for ip in _attr(port, "fixed_ips") or []:
-                networks.append(
-                    {
-                        "network_id": _attr(port, "network_id"),
-                        "network": _attr(network, "name"),
-                        "fixed_ip": ip.get("ip_address"),
-                    }
-                )
-                break
+            fixed_ips = [
+                {"subnet_id": ip.get("subnet_id"), "ip_address": ip.get("ip_address")}
+                for ip in _attr(port, "fixed_ips") or []
+            ]
+            # every port with its id, MAC and addresses, for the rollback (SDD §7.3 step 2); the
+            # destination keeps the first address on the mapped network (step 8)
+            networks.append(
+                {
+                    "network_id": _attr(port, "network_id"),
+                    "network": _attr(network, "name"),
+                    "fixed_ip": fixed_ips[0]["ip_address"] if fixed_ips else None,
+                    "port_id": _attr(port, "id"),
+                    "mac_address": _attr(port, "mac_address"),
+                    "fixed_ips": fixed_ips,
+                }
+            )
         attachments = []
         for att in conn.compute.volume_attachments(server):
             volume = conn.block_storage.get_volume(_attr(att, "volume_id"))
@@ -525,6 +546,39 @@ class HandoverExecutor:
             for a in ordered
         ]
 
+    @staticmethod
+    def _source_ports(
+        conn: Any, networks: list[dict[str, Any]], journal: _Journal
+    ) -> list[dict[str, str]]:
+        """The source server's NICs for its recreation (SDD §7.3 rollback): a port a user created
+        survives the server's deletion unbound and is used again; a port Nova created is gone and
+        is recreated with its MAC and every fixed IP (journaled, so a resume does not create it
+        twice). A definition journaled without ports keeps its network and first address."""
+        nics: list[dict[str, str]] = []
+        for n in networks:
+            if not n.get("port_id"):
+                nic = {"uuid": n["network_id"]}
+                if n.get("fixed_ip"):
+                    nic["fixed_ip"] = n["fixed_ip"]
+                nics.append(nic)
+                continue
+            key = f"rb:port:{n['port_id']}"
+            if not journal.done(key):
+                port = _existing_port(conn, n["port_id"])
+                if port is not None and not _attr(port, "device_id"):
+                    port_id = n["port_id"]
+                else:
+                    fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
+                    created = conn.network.create_port(
+                        network_id=n["network_id"],
+                        mac_address=n["mac_address"],
+                        fixed_ips=fixed_ips,
+                    )
+                    port_id = str(_attr(created, "id"))
+                journal.mark(key, port_id=port_id)
+            nics.append({"port": journal.get(key)["port_id"]})
+        return nics
+
     def _create_server(
         self,
         conn: Any,
@@ -683,19 +737,15 @@ class HandoverExecutor:
         if not journal.done("create_server"):
 
             def create() -> str:
-                networks = [
-                    {
-                        "uuid": _attr(
-                            dst.network.find_network(
-                                mappings.networks.get(n["network"], n["network"]),
-                                ignore_missing=False,
-                            ),
-                            "id",
-                        ),
-                        "fixed_ip": n["fixed_ip"],
+                networks = []
+                for n in definition["networks"]:
+                    mapped = mappings.networks.get(n["network"], n["network"])
+                    net = {
+                        "uuid": _attr(dst.network.find_network(mapped, ignore_missing=False), "id")
                     }
-                    for n in definition["networks"]
-                ]
+                    if n.get("fixed_ip"):
+                        net["fixed_ip"] = n["fixed_ip"]
+                    networks.append(net)
                 flavor = mappings.flavors.get(definition["flavor"], definition["flavor"])
                 return self._create_server(
                     dst, definition, flavor, networks, self._bdm(attachments, dest_ids)
@@ -801,10 +851,10 @@ class HandoverExecutor:
                 await self._call("delete the stale source server", delete_stale)
                 await asyncio.to_thread(journal.mark, "rb:delete_stale_source")
             if not journal.done("rb:create_source"):
-                networks = [
-                    {"uuid": n["network_id"], "fixed_ip": n["fixed_ip"]}
-                    for n in definition["networks"]
-                ]
+                networks = await self._call(
+                    "recreate the source ports",
+                    lambda: self._source_ports(src, definition["networks"], journal),
+                )
                 created = await self._call(
                     "recreate the source server",
                     lambda: self._create_server(

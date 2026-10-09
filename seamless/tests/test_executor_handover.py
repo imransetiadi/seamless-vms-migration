@@ -54,6 +54,12 @@ class HTTPError(Exception):
     """What keystoneauth raises for a 4xx answer."""
 
 
+class NotFoundException(HTTPError):
+    """openstacksdk's answer to a missing resource (``openstack.exceptions.NotFoundException``)."""
+
+    status_code = 404
+
+
 class FakeCompute:
     """Nova as verified upstream: PUT os-volume_attachments changes delete_on_termination only
     from microversion 2.85; deleting a server deletes the volumes attached with
@@ -120,6 +126,11 @@ class FakeCompute:
         sid = getattr(server, "id", server)
         self.c.record("delete_server", sid)
         server = self.c.servers.pop(sid, None)
+        for port in [p for p in self.c.ports.values() if p.device_id == sid]:
+            if port.created_by_nova:
+                self.c.ports.pop(port.id)
+            else:
+                port.device_id = ""
         for vid, _device in getattr(server, "attachments", []) or []:
             volume = self.c.volumes.get(vid)
             if volume is None:
@@ -150,6 +161,9 @@ class FakeCompute:
         for b in bdm:
             if b["uuid"] in self.c.volumes:
                 self.c.volumes[b["uuid"]].status = "in-use"
+        for net in params.get("networks") or []:
+            if "port" in net:
+                self.c.ports[net["port"]].device_id = server.id
         self.c.servers[server.id] = server
         return server
 
@@ -230,11 +244,32 @@ class FakeBlockStorage:
 
 
 class FakeNetwork:
+    """Neutron: deleting a server deletes the ports Nova created for it and only unbinds the ports
+    a user created and passed in; creating a port with a MAC and fixed IPs keeps them."""
+
     def __init__(self, cloud):
         self.c = cloud
 
     def ports(self, device_id=None):
-        return [NS(network_id="net-1", fixed_ips=[{"ip_address": "10.0.0.5"}])]
+        return [p for p in self.c.ports.values() if device_id is None or p.device_id == device_id]
+
+    def get_port(self, port_id):
+        if port_id not in self.c.ports:
+            raise NotFoundException(f"HTTP 404: port {port_id} not found")
+        return self.c.ports[port_id]
+
+    def create_port(self, **attrs):
+        self.c.record("create_port", attrs.get("mac_address"))
+        port = NS(
+            id=f"{self.c.name}-port-{len(self.c.ports) + 1}",
+            network_id=attrs["network_id"],
+            mac_address=attrs.get("mac_address") or "fa:16:3e:ff:ff:ff",
+            fixed_ips=list(attrs.get("fixed_ips") or []),
+            device_id="",
+            created_by_nova=False,
+        )
+        self.c.ports[port.id] = port
+        return port
 
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
@@ -258,6 +293,7 @@ class FakeCloud:
         self.crash_on = crash_on
         self.created = []
         self.managed = []
+        self.ports = {}
         self.image_metadata = {}
         self.deleted_by_nova = []
         self.refuse_metadata = False
@@ -314,7 +350,19 @@ def source_cloud(calls, crash_on=None):
         ),
     }
     pools = [("overcloud@tripleo_ceph#ssd", CEPH), ("overcloud@tripleo_ceph#hdd", CEPH)]
-    return FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on, pools=pools)
+    cloud = FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on, pools=pools)
+    cloud.ports["port-1"] = NS(
+        id="port-1",
+        network_id="net-1",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[
+            {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+            {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
+        ],
+        device_id="srv-1",
+        created_by_nova=True,
+    )
+    return cloud
 
 
 def setup(tmp_path, crash_on=None, dst_crash_on=None):
@@ -533,6 +581,7 @@ async def test_handover_rollback_reverses_order(tmp_path):
         ("dst", "unmanage", "dst-vol-1"),
         ("src", "manage", "volume-dst-vol-2"),
         ("src", "manage", "volume-dst-vol-1"),
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
     ]
     src_manage = clouds["src"].managed
@@ -592,13 +641,92 @@ async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_pa
     assert "srv-1" not in clouds["src"].servers and clouds["src"].deleted_by_nova == []
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert ops(calls) == [("src", "create_server", "web-01")]
+    assert ops(calls) == [
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
+        ("src", "create_server", "web-01"),
+    ]
     bdm = clouds["src"].created[0]["block_device_mapping"]
     assert [(b["uuid"], b["boot_index"], b["delete_on_termination"]) for b in bdm] == [
         ("vol-root", 0, True),
         ("vol-data", -1, False),
     ]
     assert result.details["vm"]["source_id"] == "src-new-1"
+
+
+async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
+    """SDD §7.3 step 2: every port with its id, MAC and every fixed IP (IPv4 and IPv6)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    [port] = saved["networks"]
+    assert (port["port_id"], port["mac_address"], port["network"]) == (
+        "port-1",
+        "fa:16:3e:00:00:01",
+        "app-net",
+    )
+    assert [ip["ip_address"] for ip in port["fixed_ips"]] == ["10.0.0.5", "fd00::5"]
+
+
+async def test_handover_rollback_recreates_nova_ports_with_their_mac_and_addresses(tmp_path):
+    """The source server is gone and Nova deleted the port it had created: the rollback recreates
+    the port with its MAC and both addresses and boots the source on it (SDD §7.3 rollback)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "port-1" not in clouds["src"].ports
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [port] = clouds["src"].ports.values()
+    assert port.mac_address == "fa:16:3e:00:00:01"
+    assert [ip["ip_address"] for ip in port.fixed_ips] == ["10.0.0.5", "fd00::5"]
+    assert clouds["src"].created[0]["networks"] == [{"port": port.id}]
+    assert port.device_id == "src-new-1"
+
+
+async def test_handover_rollback_reuses_a_port_the_user_created(tmp_path):
+    """A port created by a user survives the server's deletion, unbound: the rollback boots the
+    source on that port again instead of creating another."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    clouds["src"].ports["port-1"].created_by_nova = False
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("src", "create_port", "fa:16:3e:00:00:01") not in ops(calls)
+    assert clouds["src"].created[0]["networks"] == [{"port": "port-1"}]
+    assert clouds["src"].ports["port-1"].device_id == "src-new-1"
+
+
+async def test_handover_rollback_resume_does_not_recreate_a_port_twice(tmp_path):
+    """The rollback crashed after recreating the port: a resume boots on that port instead of
+    asking Neutron for a second one with the same MAC, which it would refuse."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_on = "create_server"
+    with pytest.raises(PermanentStepError, match="recreate the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "create_port"] == [
+        ("src", "create_port", "fa:16:3e:00:00:01")
+    ]
+    [port] = clouds["src"].ports.values()
+    assert clouds["src"].created[-1]["networks"] == [{"port": port.id}]
+
+
+async def test_handover_keeps_a_port_without_addresses(tmp_path):
+    """A port with no fixed IP is journaled too, and the destination gets a NIC on the mapped
+    network without asking for an address."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-1"].fixed_ips = []
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert [(n["port_id"], n["fixed_ips"]) for n in saved["networks"]] == [("port-1", [])]
+    assert clouds["dst"].created[0]["networks"] == [{"uuid": "dst-net-rhoso-app"}]
 
 
 async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_path):
@@ -613,6 +741,7 @@ async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_p
     assert ops(calls) == [
         ("src", "manage", "volume-vol-root"),
         ("src", "manage", "volume-vol-data"),
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
     ]
     new_vm = result.details["vm"]
@@ -836,7 +965,10 @@ async def test_handover_fails_fast_when_cinder_refuses_the_unmanage(tmp_path):
         await executor.run(StepName.CUTOVER, ctx)
     calls.clear()
     result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
-    assert ops(calls) == [("src", "create_server", "web-01")]
+    assert ops(calls) == [
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
+        ("src", "create_server", "web-01"),
+    ]
     assert result.details["source_running"] is True
 
 
