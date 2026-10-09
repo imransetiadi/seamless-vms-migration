@@ -136,7 +136,7 @@ export default function Plans() {
           description="Create a plan: pick a source, the VMs and the RHOSO destination, then validate it."
           action={
             canCreate ? (
-              <Button variant="primary" icon={Plus} onClick={() => setDialog({ open: true })}>
+              <Button size="lg" variant="primary" icon={Plus} onClick={() => setDialog({ open: true })}>
                 New plan
               </Button>
             ) : undefined

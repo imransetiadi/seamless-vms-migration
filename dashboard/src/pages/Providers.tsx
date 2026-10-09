@@ -371,7 +371,7 @@ export default function Providers() {
         title="Providers"
         description="Every cloud Seamless migrates between: OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1 and VMware vCenter as sources, RHOSO 18.0 as the destination."
         actions={
-          <Button variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
+          <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
             Add provider
           </Button>
         }
@@ -387,7 +387,7 @@ export default function Providers() {
           title="Connect your first cloud"
           description="Add the source you migrate from and the RHOSO destination you migrate to. Sign-in details go to the secret store, never to the database."
           action={
-            <Button variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
+            <Button size="lg" variant="primary" icon={Plus} onClick={openCreate} disabledReason={canEdit ? null : 'Adding a provider requires the admin role.'}>
               Add provider
             </Button>
           }

@@ -472,11 +472,12 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           {!ok && <p className="text-sm text-muted-foreground">Check the endpoint, the CA and the sign-in details, then test again.</p>}
           <div className="flex flex-wrap justify-end gap-2">
             {!ok && (
-              <Button variant="secondary" onClick={() => setOutcome(null)}>
+              <Button size="lg" variant="secondary" onClick={() => setOutcome(null)}>
                 Edit again
               </Button>
             )}
             <Button
+              size="lg"
               variant="primary"
               onClick={() => {
                 onSaved?.(outcome.provider, `${outcome.provider.name}: connection ${meta.label.toLowerCase()}.`);
@@ -854,13 +855,13 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button type="button" variant="secondary" loading={busy} onClick={() => void save(false)}>
+          <Button type="button" size="lg" variant="secondary" loading={busy} onClick={() => void save(false)}>
             {editing ? 'Save' : 'Add provider'}
           </Button>
-          <Button type="submit" variant="primary" icon={PlugZap} loading={busy}>
+          <Button type="submit" size="lg" variant="primary" icon={PlugZap} loading={busy}>
             {editing ? 'Save and test connection' : 'Add and test connection'}
           </Button>
         </div>
