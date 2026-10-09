@@ -140,7 +140,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   );
 
   const visible = sorted.slice(0, limit);
-  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all';
+  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all';
   const shownSelected = selectable ? filtered.filter((r) => selected?.has(r.vm.source_id)).length : 0;
   const allShownSelected = filtered.length > 0 && shownSelected === filtered.length;
 
@@ -153,6 +153,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setPower('all');
     setReadiness('all');
     setProject('all');
+    setOs('all');
   };
 
   const toggle = (id: string) => {

@@ -125,6 +125,25 @@ describe('VmTable', () => {
     expect(rowNames().sort()).toEqual(['jump-host-01', 'legacy-rhel6-app']);
   });
 
+  it('clears the guest OS filter with the other filters', async () => {
+    const user = userEvent.setup();
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+
+    // the OS filter alone is an active filter: the way back is offered and resets it
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    expect(bodyRows()).toHaveLength(2);
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByLabelText('Guest OS')).toHaveValue('all');
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+
+    // the empty state's Clear filters resets it too, instead of leaving the table empty
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'web');
+    expect(screen.getByText('No VMs match these filters')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
   it('warns about guests virt-v2v does not support on VMware sources', () => {
     render(<VmTable vms={vmwareVms} providerKind="vmware" />);
     const legacy = bodyRows().find((r) => r.textContent?.includes('vm-legacy-win2008'))!;
