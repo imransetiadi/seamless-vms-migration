@@ -479,6 +479,32 @@ def test_plan_refuses_non_finite_estimator_inputs(api):
     assert patched.status_code == 422 and "link_bps" in patched.json()["error"]["message"]
 
 
+def test_plan_texts_are_bounded_at_the_api_boundary(api):
+    """SDD §12: a plan name holds 200 characters, a description 2000; stored plans still load."""
+    vm_ids = first_clean_vms(api)
+    body = {
+        "name": "x" * 200,
+        "description": "d" * 2000,
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    for field, value in (("name", "x" * 201), ("description", "d" * 2001)):
+        res = api.post("/api/v1/plans", Role.operator, json={**body, field: value})
+        assert res.status_code == 422, res.text
+        assert field in res.json()["error"]["message"]
+        url = f"/api/v1/plans/{created.json()['id']}"
+        patched = api.client.patch(url, headers=api.h(Role.operator), json={field: value})
+        assert patched.status_code == 422, patched.text
+    # a plan stored before the check keeps loading
+    stored = api.store.get("plan", created.json()["id"], Plan)
+    stored.name = "n" * 5000
+    api.store.put("plan", stored)
+    assert api.get(f"/api/v1/plans/{stored.id}").json()["name"] == "n" * 5000
+
+
 def test_action_texts_hold_at_most_2000_characters(api):
     """SDD §12: comment, reason and confirm are bounded; 2000 characters still pass."""
     migs = seed_migrations(api.store)

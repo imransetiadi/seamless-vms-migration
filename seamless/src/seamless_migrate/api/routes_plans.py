@@ -54,6 +54,24 @@ def _check_plan_settings(spec: PlanCreate) -> None:
         raise ApiError(422, "validation_error", "; ".join(problems))
 
 
+#: SDD §12: the longest plan name and description a request may set; the stored model stays
+#: permissive so plans written before the check keep loading
+PLAN_NAME_MAX = 200
+PLAN_DESCRIPTION_MAX = 2000
+
+
+def _check_plan_texts(spec: PlanCreate) -> None:
+    problems = []
+    if len(spec.name) > PLAN_NAME_MAX:
+        problems.append(f"name: at most {PLAN_NAME_MAX} characters (got {len(spec.name)})")
+    if spec.description is not None and len(spec.description) > PLAN_DESCRIPTION_MAX:
+        problems.append(
+            f"description: at most {PLAN_DESCRIPTION_MAX} characters (got {len(spec.description)})"
+        )
+    if problems:
+        raise ApiError(422, "validation_error", "; ".join(problems))
+
+
 def _check_estimator_overrides(spec: PlanCreate) -> None:
     problems = invalid_estimator_overrides(spec.estimator_overrides)
     if problems:
@@ -111,6 +129,7 @@ async def create_plan(
 ) -> Plan:
     svc = services(request)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
+    _check_plan_texts(body)
     _check_vm_ids(body)
     _check_plan_settings(body)
     _check_estimator_overrides(body)
@@ -165,6 +184,7 @@ async def update_plan(
         )
     except ValidationError as exc:
         raise ApiError(422, "validation_error", _summarize(exc)) from None
+    _check_plan_texts(merged)
     _check_vm_ids(merged)
     _check_plan_settings(merged)
     _check_estimator_overrides(merged)
