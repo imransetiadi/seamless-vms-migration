@@ -324,7 +324,9 @@ active enters `cutover` when all hold:
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
 
-`POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`.
+`POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`. A
+repeated request records another approval and may add `force_window` — an approver can force a
+requested cutover that waits for a closed window — but never clears one.
 While waiting — for the gate or for a free cutover slot (rule 4) — a warm migration runs a keep-warm
 delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ago
 (`awaiting_cutover → syncing → awaiting_cutover`; the interval is at least 60 s).
@@ -1256,7 +1258,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name; choosing another strategy asks the same when it would clear the migration's approvals or
+  requires typing the VM name; while a requested cutover waits for a closed window, an approver can cut it over now,
+  outside the window (§5.4); choosing another strategy asks the same when it would clear the migration's approvals or
   cutover request), `/providers` (status cards + Check, each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
