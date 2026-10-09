@@ -456,7 +456,7 @@ seamless-help:
 	@echo "  seamless-test       - run the control-plane test suite (cd seamless && .venv/bin/pytest -q)"
 	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
-	@echo "  seamless-check      - every CI check that runs locally: tests, ruff, collection tests, scans, dashboard"
+	@echo "  seamless-check      - every CI check that runs locally: tests with the coverage gate, ruff, collection tests, playbook syntax, ansible-lint, scans, dashboard"
 	@echo "  deploy-runtime-check - run PostgreSQL (and the control-plane image, when built) the way the cluster manifests do: read-only, arbitrary UID"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
@@ -541,8 +541,12 @@ seamless-test:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -q
 
-# Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go.
-seamless-check: seamless-test
+# Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go: the
+# control-plane tests with CI's coverage gate (NFR-11), ruff, the collection's unit tests, playbook
+# syntax checks and ansible-lint (the venv's 'collection' extra), the scanners and the dashboard.
+seamless-check:
+	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
+	cd seamless && .venv/bin/pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
 	cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 	@seamless/.venv/bin/python -c "import ansible, yaml, openstack" 2>/dev/null \
 	 || { echo "The collection tests need the 'collection' extra: cd seamless && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
@@ -553,6 +557,16 @@ seamless-check: seamless-test
 	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q -rs tests/unit > "$(CURDIR)/.cache/unit.txt" 2>&1 \
 	  || { cat "$(CURDIR)/.cache/unit.txt"; exit 1; }; tail -n 3 "$(CURDIR)/.cache/unit.txt"; \
 	  if grep -qE '[0-9]+ skipped' "$(CURDIR)/.cache/unit.txt"; then echo "unexpected skipped collection tests"; exit 1; fi
+	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
+	  export PATH="$(CURDIR)/seamless/.venv/bin:$$PATH" PYTHONPATH="$(CURDIR)/.cache/colltree" \
+	    ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" && \
+	  for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
+	            rollback_workloads.yml import_from_hypervisor.yml; do \
+	    ansible-playbook --syntax-check -i inventory/localhost.yml "playbooks/$$pb" >/dev/null || exit 1; \
+	  done && \
+	  ansible-lint --offline roles/import_workloads_warm roles/import_from_hypervisor \
+	    playbooks/import_workloads_precopy.yml playbooks/import_workloads_cutover.yml \
+	    playbooks/rollback_workloads.yml
 	@if command -v gitleaks >/dev/null; then \
 	  gitleaks dir -c .gitleaks-tree.toml --redact --no-banner . && gitleaks git --redact --no-banner .; \
 	else echo "gitleaks not installed: skipped (S-17)"; fi

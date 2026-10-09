@@ -14,6 +14,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from seamless_migrate.config import find_repo_root
 
@@ -163,7 +164,7 @@ def _makefile_recipe_lines() -> list[str]:
     return lines
 
 
-def _run_recipe_line(line: str, path: Path) -> subprocess.CompletedProcess[str]:
+def _run_recipe_line(line: str, path: Path, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
     """Run one recipe line the way make does (the Makefile's SHELL and .SHELLFLAGS) with only
     ``path`` on PATH."""
     makefile = (ROOT / "Makefile").read_text()
@@ -172,12 +173,77 @@ def _run_recipe_line(line: str, path: Path) -> subprocess.CompletedProcess[str]:
     assert shell and flags, "the Makefile no longer sets SHELL and .SHELLFLAGS"
     return subprocess.run(
         [shell.group(1), *flags.group(1).split(), line],
-        cwd=ROOT,
+        cwd=cwd,
         env={"PATH": str(path)},
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def _makefile_target_recipe(target: str) -> str:
+    """One target's recipe, backslash continuations joined (the lines under ``target:``)."""
+    lines = (ROOT / "Makefile").read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{target}:"))
+    recipe = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("\t"):
+            break
+        recipe.append(line[1:])
+    return "\n".join(recipe).replace("\\\n", " ")
+
+
+def _ci_step_run(name: str) -> str:
+    """The run script of the CI step whose name starts with ``name``, continuations joined."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+    step = next(step for step in steps if step.get("name", "").startswith(name))
+    return step["run"].replace("\\\n", " ")
+
+
+def test_seamless_check_runs_the_ci_checks_that_run_locally():
+    """``make seamless-check`` is "everything CI runs that can run locally" (QASuite §13): the
+    control-plane coverage gate (NFR-11), the playbook syntax checks and ansible-lint, with CI's
+    threshold, playbooks and lint targets."""
+    recipe = _makefile_target_recipe("seamless-check")
+    gate = re.search(r"--cov-fail-under=(\d+)", _ci_step_run("Unit and integration tests"))
+    assert gate and "--cov=seamless_migrate" in recipe
+    assert f"--cov-fail-under={gate.group(1)}" in recipe
+    playbooks = r"for pb in (.*?); do"
+    ci_playbooks = re.search(playbooks, _ci_step_run("Playbook syntax checks"), re.S)
+    make_playbooks = re.search(playbooks, recipe, re.S)
+    assert ci_playbooks and make_playbooks and "--syntax-check" in recipe
+    assert make_playbooks.group(1).split() == ci_playbooks.group(1).split()
+    targets = r"ansible-lint\"? --offline ([^\n;]*)"
+    ci_lint = re.search(targets, _ci_step_run("ansible-lint"))
+    make_lint = re.search(targets, recipe)
+    assert ci_lint and make_lint
+    assert make_lint.group(1).split() == ci_lint.group(1).split()
+    # the venv the target runs in has what the gate needs
+    extras = tomllib.loads((ROOT / "seamless" / "pyproject.toml").read_text())["project"]
+    assert any(req.startswith("pytest-cov") for req in extras["optional-dependencies"]["dev"])
+
+
+def test_seamless_check_fails_when_any_playbook_syntax_check_fails(tmp_path):
+    """A failing syntax check fails ``make seamless-check`` even when a later playbook passes: bash
+    ignores errexit for a loop inside an && list, so the loop has to stop on the first failure."""
+    line = next(line for line in _makefile_recipe_lines() if "--syntax-check" in line)
+    bin_dir = tmp_path / "seamless" / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (tmp_path / ".cache/colltree/ansible_collections/os_migrate/os_migrate").mkdir(parents=True)
+    fakes = {
+        # the first playbook of the list has a syntax error, the others pass
+        "ansible-playbook": '#!/bin/sh\ncase "$*" in *playbooks/import_workloads.yml*) '
+        'echo "syntax error" >&2; exit 4;; esac\nexit 0\n',
+        "ansible-lint": "#!/bin/sh\nexit 0\n",
+    }
+    for name, body in fakes.items():
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    script = line.replace("$(CURDIR)", str(tmp_path)).replace("$$", "$")
+    run = _run_recipe_line(script, Path("/usr/bin:/bin"), cwd=tmp_path)
+    assert run.returncode != 0, run.stdout + run.stderr
+    assert "syntax error" in run.stderr
 
 
 @pytest.mark.parametrize("tool", ["gitleaks", "actionlint", "shellcheck"])

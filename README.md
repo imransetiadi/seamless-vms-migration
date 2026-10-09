@@ -98,7 +98,8 @@ make seamless-demo               # build + start postgres, jev (if enabled) and 
 open http://127.0.0.1:8080/      # sign in at /login with the admin token
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
-make seamless-check              # every CI check that runs locally (tests, ruff, collection, scans, dashboard)
+make seamless-check              # every CI check that runs locally: tests with the 85 % coverage gate, ruff,
+                                 # collection tests, playbook syntax, ansible-lint, scans, dashboard
 cd dashboard && npx playwright install chromium && npm run test:e2e   # browser smoke of the built dashboard (mock mode)
 pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
