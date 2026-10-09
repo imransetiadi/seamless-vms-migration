@@ -22,9 +22,10 @@ import { ProgressBar } from '../components/ProgressBar';
 import { LoadingBlock, Skeleton } from '../components/Skeleton';
 import { PhaseBadge, PlanStatusBadge } from '../components/StatusBadge';
 import { ThroughputChart } from '../components/ThroughputChart';
+import { Unavailable } from '../components/Unavailable';
 import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
-import { formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
+import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
@@ -205,7 +206,8 @@ function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans:
   );
 }
 
-function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migration[] }) {
+/** Completion per plan; `migrations` is null when they could not be loaded (progress unknown, SDD §16). */
+function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migration[] | null }) {
   if (plans.length === 0) {
     return <EmptyState icon={ClipboardList} title="No plans yet" description="Create a plan to start migrating." />;
   }
@@ -214,7 +216,7 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
     <div className="-my-2 overflow-hidden">
     <ul className="-mt-px grid gap-x-8 md:grid-cols-2 2xl:grid-cols-3">
       {plans.map((plan) => {
-        const mine = migrations.filter((m) => m.plan_id === plan.id);
+        const mine = migrations?.filter((m) => m.plan_id === plan.id) ?? [];
         const done = mine.filter((m) => ['completed', 'finalized'].includes(m.phase)).length;
         const pct = mine.length ? (done / mine.length) * 100 : 0;
         return (
@@ -225,9 +227,9 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
               </Link>
               <PlanStatusBadge status={plan.status} />
             </div>
-            <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />
+            {migrations && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">
-              {done} of {mine.length} done, downtime SLO {formatDuration(plan.downtime_slo_s)}
+              {migrations ? `${done} of ${mine.length} done` : 'Progress unknown'}, downtime SLO {formatDuration(plan.downtime_slo_s)}
             </p>
           </li>
         );
@@ -253,6 +255,10 @@ export default function Overview() {
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;
+  // a failed load with nothing cached is unknown, never an empty state or a zero (SDD §16)
+  const plansUnknown = Boolean(plansQuery.error) && !plansQuery.data;
+  const statsUnknown = Boolean(stats.error) && !s;
+  const migrationsUnknown = Boolean(migrationsQuery.error) && !migrationsQuery.data;
 
   const setPlan = (value: string) => {
     const next = new URLSearchParams(params);
@@ -277,10 +283,18 @@ export default function Overview() {
         }
       />
 
+      {plansQuery.error && <ErrorBanner error={plansQuery.error} title="Plans are unavailable" onRetry={() => void plansQuery.refetch()} className="mb-4" />}
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
 
       {!s ? (
-        <Skeleton className="h-[86px]" />
+        statsUnknown ? (
+          <MetricStrip
+            label="Key metrics"
+            metrics={['Migrations', 'In progress', 'Completed', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
+          />
+        ) : (
+          <Skeleton className="h-[86px]" />
+        )
       ) : (
         <MetricStrip
           label="Key metrics"
@@ -303,18 +317,32 @@ export default function Overview() {
       <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] xl:grid-rows-[auto_1fr]">
         {migrationsQuery.isPending ? (
           <LoadingBlock label="Loading the downtime clocks…" />
+        ) : migrationsUnknown ? (
+          <Panel title="Downtime now" description="VMs whose source is stopped appear here with a running clock.">
+            <Unavailable what="migrations" />
+          </Panel>
         ) : (
           <DowntimeNow migrations={migrations} plans={plansById} />
         )}
         <div className="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-1">
           {migrationsQuery.isPending ? (
             <LoadingBlock label="Loading items that need attention…" />
+          ) : migrationsUnknown ? (
+            <Panel title="Needs attention" description="The next human action, most urgent first">
+              <Unavailable what="migrations" />
+            </Panel>
           ) : (
             <NeedsAttention migrations={migrations} plans={plansById} />
           )}
         </div>
         <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
-          {s ? <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} /> : <Skeleton className="h-40" />}
+          {s ? (
+            <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+          ) : statsUnknown ? (
+            <Unavailable what="statistics" />
+          ) : (
+            <Skeleton className="h-40" />
+          )}
         </Panel>
       </div>
 
@@ -324,15 +352,21 @@ export default function Overview() {
           description={s ? `Last 60 minutes, ${formatBytes(s.bytes_transferred)} transferred in total` : 'Last 60 minutes'}
           className="xl:col-span-2"
         >
-          {s ? <ThroughputChart series={s.throughput_series} /> : <Skeleton className="h-56" />}
+          {s ? <ThroughputChart series={s.throughput_series} /> : statsUnknown ? <Unavailable what="statistics" /> : <Skeleton className="h-56" />}
         </Panel>
         <Panel title="Phase distribution" description={s ? `${formatNumber(s.total)} migrations by phase` : undefined}>
-          {s ? <PhaseDistribution byPhase={s.by_phase} /> : <LoadingBlock rows={6} />}
+          {s ? <PhaseDistribution byPhase={s.by_phase} /> : statsUnknown ? <Unavailable what="statistics" /> : <LoadingBlock rows={6} />}
         </Panel>
       </div>
 
       <Panel title="Plans" description="Completion per plan" className="mt-4">
-        {plansQuery.isPending ? <LoadingBlock rows={4} /> : <PlanProgress plans={scopedPlans} migrations={migrations} />}
+        {plansQuery.isPending || migrationsQuery.isPending ? (
+          <LoadingBlock rows={4} />
+        ) : plansUnknown ? (
+          <Unavailable what="plans" />
+        ) : (
+          <PlanProgress plans={scopedPlans} migrations={migrationsUnknown ? null : migrations} />
+        )}
       </Panel>
     </>
   );

@@ -192,6 +192,26 @@ describe('PlanDetail', () => {
     expect(m.approvals).toHaveLength(1);
   });
 
+  it('shows its KPIs as unknown, not zero, when the statistics cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/stats'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    expect(await screen.findByText(/statistics are unavailable/i)).toBeInTheDocument();
+    const metrics = screen.getByRole('region', { name: /plan metrics/i });
+    for (const label of ['In progress', 'Completed', 'Failed']) {
+      expect(within(metrics).getByRole('group', { name: label })).toHaveTextContent(`${label}—`);
+    }
+    // the count still comes from the plan's migrations, which did load
+    const count = server.migrations.filter((m) => m.plan_id === plan.id).length;
+    expect(count).toBeGreaterThan(0);
+    await waitFor(() => expect(within(metrics).getByRole('group', { name: 'Migrations' })).toHaveTextContent(`Migrations${count}`));
+  });
+
   it('asks anyway when the migrations cannot be counted at the click (SDD §5.4)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

@@ -128,4 +128,59 @@ describe('Overview page (mock data)', () => {
     const total = await screen.findByRole('group', { name: 'Migrations' });
     await within(total).findByText('5');
   });
+
+  it('never reads a failed load as all clear (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    // a 4xx is not retried: the error shows at once
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && (path === '/migrations' || path === '/plans' || path === '/stats')
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Overview />, { server });
+    // each failed load is named, with Retry
+    expect(await screen.findByText(/migrations are unavailable/i)).toBeInTheDocument();
+    expect(await screen.findByText(/plans are unavailable/i)).toBeInTheDocument();
+    expect(await screen.findByText(/statistics are unavailable/i)).toBeInTheDocument();
+    // no panel built from them reads as all clear or keeps loading
+    expect(screen.queryByText(/no vm is down right now/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/no plans yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
+    // they say they are unknown instead, and the key figures are dashes, not zeros
+    expect(screen.getAllByText(/unknown: the migrations could not be loaded/i)).toHaveLength(2);
+    expect(screen.getAllByText(/unknown: the statistics could not be loaded/i)).toHaveLength(3);
+    expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    const metrics = screen.getByRole('region', { name: /key metrics/i });
+    expect(within(metrics).getByRole('group', { name: 'Failed' })).toHaveTextContent('Failed—');
+  });
+
+  it('shows plan progress only once the migrations have loaded, never "0 of 0 done" before (SDD §16)', async () => {
+    const pending = new Promise<Response>(() => {});
+    const { server } = renderWithApp(<Overview />, {
+      wrapFetch: (mock) => (input, init) => (String(input).split('?')[0]!.endsWith('/api/v1/migrations') ? pending : mock(input, init)),
+    });
+    // the plans have loaded (the plan picker lists them), the migrations have not
+    await screen.findByRole('option', { name: server.plans[0]!.name });
+    const plans = screen.getByRole('region', { name: 'Plans' });
+    expect(within(plans).getByRole('status')).toBeInTheDocument();
+    expect(within(plans).queryByText(/of \d+ done/)).not.toBeInTheDocument();
+  });
+
+  it('says plan progress is unknown when only the migrations cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/migrations'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Overview />, { server });
+    expect(await screen.findByText(/migrations are unavailable/i)).toBeInTheDocument();
+    const plans = screen.getByRole('region', { name: 'Plans' });
+    const name = server.plans[0]!.name;
+    await within(plans).findByRole('link', { name });
+    expect(within(plans).getAllByText(/progress unknown/i)).toHaveLength(server.plans.length);
+    expect(within(plans).queryByText(/of \d+ done/)).not.toBeInTheDocument();
+    expect(within(plans).queryByRole('progressbar')).not.toBeInTheDocument();
+  });
 });

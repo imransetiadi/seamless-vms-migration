@@ -24,19 +24,26 @@ export interface RenderOptions {
   live?: boolean;
   /** Read the token from sessionStorage like the real app (login flows). */
   storedToken?: boolean;
+  /** Wraps the mock fetch, e.g. to hold one request pending and see a loading state. */
+  wrapFetch?: (fetchImpl: typeof fetch) => typeof fetch;
 }
 
 export function createTestServer(): MockServer {
   return new MockServer({ now: () => TEST_NOW, seed: 7 });
 }
 
-export function createTestClient(server: MockServer, token: string | null = 'admin', storedToken = false): ApiClient {
-  return new ApiClient({ getToken: storedToken ? getStoredToken : () => token, fetchImpl: createMockFetch(server) });
+export function createTestClient(
+  server: MockServer,
+  token: string | null = 'admin',
+  storedToken = false,
+  wrapFetch: (fetchImpl: typeof fetch) => typeof fetch = (fetchImpl) => fetchImpl,
+): ApiClient {
+  return new ApiClient({ getToken: storedToken ? getStoredToken : () => token, fetchImpl: wrapFetch(createMockFetch(server)) });
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): RenderResult & { server: MockServer; queryClient: QueryClient } {
   const server = options.server ?? createTestServer();
-  const client = createTestClient(server, options.token === undefined ? 'admin' : options.token, options.storedToken);
+  const client = createTestClient(server, options.token === undefined ? 'admin' : options.token, options.storedToken, options.wrapFetch);
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false } },
   });

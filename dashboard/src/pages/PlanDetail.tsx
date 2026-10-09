@@ -319,11 +319,13 @@ export default function PlanDetail() {
       {report && <ReportBanner report={report} />}
       {editing && <PlanCreateDialog open onClose={() => setEditing(false)} plan={p} />}
 
+      {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
+      {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
       <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
-        <KpiTile label="Migrations" value={formatNumber(s?.total ?? list.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
-        <KpiTile label="In progress" value={formatNumber(s?.in_progress ?? 0)} icon={Activity} tone="progress" />
-        <KpiTile label="Completed" value={formatNumber(s?.completed ?? 0)} icon={CircleCheck} tone="success" />
-        <KpiTile label="Failed" value={formatNumber(s?.failed ?? 0)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
+        <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
+        <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
+        <KpiTile label="Completed" value={formatNumber(s?.completed)} icon={CircleCheck} tone="success" />
+        <KpiTile label="Failed" value={formatNumber(s?.failed)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
         <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={`SLO ${formatDuration(p.downtime_slo_s)}`} />
         <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} />
       </section>
