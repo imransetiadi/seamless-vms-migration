@@ -482,3 +482,20 @@ def test_events_since(api):
     assert all(e["migration_id"] == "mig-0000000000" for e in filtered)
     assert len(api.get("/api/v1/events?limit=1").json()) == 1
     assert api.get("/api/v1/events?limit=1001").status_code == 422
+
+
+def test_events_tail_returns_the_newest_limit_events_ascending(api):
+    """SDD §12: ``GET /events?tail=true`` is the latest history in one request."""
+    seed_migrations(api.store)
+    api.post("/api/v1/migrations/mig-0000000000/approve", Role.approver, json={})
+    every = api.get("/api/v1/events?limit=1000").json()
+    assert len(every) > 2
+
+    tail = api.get("/api/v1/events?tail=true&limit=2").json()
+    assert [e["seq"] for e in tail] == [e["seq"] for e in every[-2:]]
+    assert tail[-1]["kind"] == "migration.approved"
+    mine = api.get("/api/v1/events?tail=true&limit=1&migration_id=mig-0000000000").json()
+    assert [e["kind"] for e in mine] == ["migration.approved"]
+    assert api.get(f"/api/v1/events?tail=true&since={every[-1]['seq']}").json() == []
+    # without tail the first page is unchanged: the oldest events after since
+    assert api.get("/api/v1/events?limit=2").json() == every[:2]

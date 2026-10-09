@@ -121,6 +121,27 @@ def test_events_since_and_filters(any_store: Store):
     assert roundtrip.kind == "migration.error" and roundtrip.ts.tzinfo is not None
 
 
+def test_events_tail_returns_the_newest_matching_events_in_seq_order(any_store: Store):
+    """SDD §12: ``tail`` selects the newest ``limit`` matching events after ``since``, ascending."""
+    stored = [
+        any_store.append_event(
+            Event(kind="migration.phase", plan_id=plan, migration_id=f"mig-{i}", message=str(i))
+        )
+        for i, plan in enumerate(["plan-a", "plan-b", "plan-a", "plan-b", "plan-a"])
+    ]
+    seqs = [e.seq for e in stored]
+    base = seqs[0] - 1
+
+    assert [e.seq for e in any_store.events(since_seq=base, limit=2, tail=True)] == seqs[3:]
+    plan_a = any_store.events(since_seq=base, plan_id="plan-a", limit=2, tail=True)
+    assert [e.message for e in plan_a] == ["2", "4"]
+    # only events after since, and fewer than limit when fewer match
+    assert [e.seq for e in any_store.events(since_seq=seqs[3], limit=10, tail=True)] == seqs[4:]
+    assert any_store.events(since_seq=seqs[-1], limit=10, tail=True) == []
+    # without tail the same query still pages forward
+    assert [e.seq for e in any_store.events(since_seq=base, limit=2)] == seqs[:2]
+
+
 def test_ping(any_store: Store, tmp_path):
     assert any_store.ping() is True
     broken = Store("postgresql+psycopg://nobody:nothing@127.0.0.1:1/none")

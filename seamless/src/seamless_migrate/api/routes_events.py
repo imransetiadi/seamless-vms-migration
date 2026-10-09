@@ -58,10 +58,12 @@ async def list_events(
     plan_id: str | None = None,
     migration_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
+    tail: bool = False,
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Event]:
+    # tail: the newest ``limit`` matching events instead of the first (SDD §12), still ascending
     return await services(request).db.events(
-        since_seq=since, plan_id=plan_id, migration_id=migration_id, limit=limit
+        since_seq=since, plan_id=plan_id, migration_id=migration_id, limit=limit, tail=tail
     )
 
 

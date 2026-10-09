@@ -338,7 +338,10 @@ class Store:
         migration_id: str | None = None,
         limit: int = 500,
         kinds: Iterable[str] | None = None,
+        tail: bool = False,
     ) -> list[Event]:
+        """Matching events after ``since_seq`` in ascending ``seq``: the first ``limit`` of them,
+        or with ``tail`` the newest ``limit`` (SDD §12)."""
         query = sa.select(events).where(events.c.seq > since_seq)
         if plan_id is not None:
             query = query.where(events.c.plan_id == plan_id)
@@ -346,9 +349,12 @@ class Store:
             query = query.where(events.c.migration_id == migration_id)
         if kinds is not None:
             query = query.where(events.c.kind.in_(list(kinds)))
-        query = query.order_by(events.c.seq).limit(max(0, int(limit)))
+        order = events.c.seq.desc() if tail else events.c.seq
+        query = query.order_by(order).limit(max(0, int(limit)))
         with self.engine.connect() as conn:
             rows = conn.execute(query).mappings().all()
+        if tail:
+            rows = rows[::-1]
         return [
             Event(
                 seq=row["seq"],
