@@ -1287,6 +1287,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
   Retry, and a panel or figure built from it says it is unavailable (or shows "—") instead of its empty
   state or a zero ("No VM is down", "Failed 0").
+* Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
+  if it had not been asked — the result names each item whose request failed, with Retry for those
+  items, and the announcement counts them ("Checked 2 of 3 providers: 2 healthy; 1 could not be
+  checked"). A provider whose check ran but could not reach its cloud is a result (status `error`,
+  §4.2), not a failed request.
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
