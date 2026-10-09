@@ -104,6 +104,29 @@ describe('MigrationActions', () => {
     expect(within(cancel).getByLabelText(/reason/i)).toHaveAttribute('maxlength', '2000');
   });
 
+  it('says a cancel removes the data copied so far when the migration has a data path (SDD §5.1, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    // converged with recorded passes, or copying its first pass: the cancel cleans up after it
+    for (const vm of ['app-billing-01', 'db-pg-01']) {
+      const { button, migration, unmount } = setup(vm, 'operator');
+      expect(migration.sync_passes.length > 0 || migration.phase === 'precopy').toBe(true);
+      await user.click(button(/^cancel/i));
+      const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`cancel ${vm}`, 'i') });
+      expect(dialog).toHaveTextContent(/the source VM keeps running/i);
+      expect(dialog).toHaveTextContent(/the data copied so far — destination volumes and source snapshots — is then removed/i);
+      expect(dialog).not.toHaveTextContent(/not touched/i);
+      unmount();
+    }
+    // nothing copied yet: nothing to remove
+    const { button, migration } = setup('ad-dc-01', 'operator');
+    expect(migration.phase).toBe('ready');
+    expect(migration.sync_passes).toHaveLength(0);
+    await user.click(button(/^cancel/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /cancel ad-dc-01/i });
+    expect(dialog).toHaveTextContent(/the source VM is not touched/i);
+    expect(dialog).not.toHaveTextContent(/data copied so far/i);
+  });
+
   it('asks for a reason before rolling back', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('legacy-rhel6-app', 'operator');

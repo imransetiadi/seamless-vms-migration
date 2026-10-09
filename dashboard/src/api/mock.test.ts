@@ -244,6 +244,33 @@ describe('mock API', () => {
     await expect(client.post(`/migrations/${failedAfterStop.id}/cancel`, {})).rejects.toMatchObject({ status: 409 });
   });
 
+  it('cleans up after a cancel that leaves a data path, like the API (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const actions = (id: string) =>
+      server.events.filter((e) => e.migration_id === id && e.kind === 'migration.action').map((e) => e.data.action);
+    const converged = server.migrations.find((m) => m.vm.name === 'app-billing-01')!;
+    expect(converged.phase).toBe('awaiting_cutover');
+    expect(converged.sync_passes.length).toBeGreaterThan(0);
+    await client.post(`/migrations/${converged.id}/cancel`, {});
+    expect(actions(converged.id).slice(-2)).toEqual(['cancel', 'cleanup']);
+    expect(server.events.at(-1)?.message).toBe('app-billing-01: temporary resources of the cancelled migration removed');
+
+    // a first pass still copying has no recorded pass yet: its copied data is cleaned up too
+    const copying = server.migrations.find((m) => m.vm.name === 'db-pg-01')!;
+    expect(copying.phase).toBe('precopy');
+    expect(copying.sync_passes).toHaveLength(0);
+    await client.post(`/migrations/${copying.id}/cancel`, {});
+    expect(actions(copying.id).slice(-2)).toEqual(['cancel', 'cleanup']);
+
+    // nothing copied yet: nothing to clean up
+    const cold = server.migrations.find((m) => m.vm.name === 'ad-dc-01')!;
+    expect(cold.phase).toBe('ready');
+    expect(cold.sync_passes).toHaveLength(0);
+    await client.post(`/migrations/${cold.id}/cancel`, {});
+    expect(actions(cold.id).at(-1)).toBe('cancel');
+    expect(actions(cold.id)).not.toContain('cleanup');
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');

@@ -11,7 +11,7 @@
  * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
 import { DEFAULT_API_BASE } from './client';
-import { canTransition } from '../lib/fsm';
+import { canTransition, hasDataPath } from '../lib/fsm';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
@@ -1191,8 +1191,11 @@ export class MockServer {
         }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
         const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
+        // like the API (SDD §5.1): the data copied so far is cleaned up after the cancel
+        const cleanup = hasDataPath(m);
         this.transition(m, 'cancelled', reason, me.name);
         record('cancelled', { reason });
+        if (cleanup) record('temporary resources of the cancelled migration removed', { action: 'cleanup' });
         break;
       }
       case 'finalize': {

@@ -14,6 +14,7 @@ import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatDuration } from '../lib/format';
+import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
 import { Button } from './Button';
@@ -244,7 +245,11 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         open={open === 'cancel'}
         tone="danger"
         title={`Cancel ${m.vm.name}?`}
-        description="The migration stops for good and is removed from its wave. The source VM is not touched."
+        description={
+          hasDataPath(m)
+            ? 'The migration stops for good and is removed from its wave. The source VM keeps running; the data copied so far — destination volumes and source snapshots — is then removed, and the timeline reports the outcome.'
+            : 'The migration stops for good and is removed from its wave. The source VM is not touched.'
+        }
         confirmLabel="Cancel migration"
         cancelLabel="Keep migration"
         onConfirm={() => submit({ action: 'cancel', body: reason.trim() ? { reason: reason.trim() } : {} })}

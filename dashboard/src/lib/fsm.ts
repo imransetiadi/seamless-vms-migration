@@ -1,4 +1,4 @@
-import type { Phase } from '../api/types';
+import type { Migration, Phase } from '../api/types';
 
 /** Allowed migration phase transitions — SDD §5.1 (`seamless_migrate.domain.fsm.TRANSITIONS`). */
 export const TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = {
@@ -21,4 +21,12 @@ export const TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = {
 
 export function canTransition(from: Phase, to: Phase): boolean {
   return TRANSITIONS[from]?.includes(to) ?? false;
+}
+
+/**
+ * Whether the migration has a data path that a cancel cleans up (SDD §5.1): it recorded passes, or a
+ * pass runs (or waits for its retry) in precopy/syncing — its copied data would otherwise stay behind.
+ */
+export function hasDataPath(m: Pick<Migration, 'phase' | 'sync_passes'>): boolean {
+  return m.sync_passes.length > 0 || m.phase === 'precopy' || m.phase === 'syncing';
 }
