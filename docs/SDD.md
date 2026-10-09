@@ -1229,10 +1229,12 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
   changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
-  operator's change), `/migrations/:id` (phase
+  operator's change; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name), `/providers` (status cards + Check, each card summarizing the storage backends by driver family —
+  requires typing the VM name; choosing another strategy asks the same when it would clear the migration's approvals or
+  cutover request), `/providers` (status cards + Check, each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
   enter write-only credentials and the conversion-host SSH key), `/inventory/:providerId`
