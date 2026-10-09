@@ -30,6 +30,10 @@ export interface SyncPassChartProps {
 }
 
 const byteTick = (v: number) => (v === 0 ? '0' : formatBytes(v).replace('.0 ', ' '));
+/** Chart width beside the plot: the y axis (64 px) and the right margin (12 px). */
+const PLOT_INSET = 76;
+/** Room a bar needs for its value label ("35.6 MiB" at 12 px) before labels run into each other. */
+const LABEL_SLOT_MIN = 60;
 
 /**
  * The passes a long wait dropped from the history (SDD §5.4, §16) — the numbers missing below the last
@@ -62,6 +66,8 @@ export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null,
   const sorted = useMemo(() => [...passes].sort((a, b) => a.number - b.number), [passes]);
   const deltas = sorted.filter((p) => p.kind !== 'full' && p.ended_at !== null);
   const data = deltas.map((p) => ({ label: `#${p.number} ${p.kind}`, number: p.number, changed: p.bytes_changed, duration: p.duration_s }));
+  // a long wait draws many bars: without room per bar the values move to the tooltip and the table
+  const crowded = width > 0 && (width - PLOT_INSET) / Math.max(1, data.length) < LABEL_SLOT_MIN;
 
   if (sorted.length === 0) {
     return <EmptyState icon={RefreshCw} title="No sync passes yet" description="Warm migrations copy while the VM runs; every pass appears here." />;
@@ -134,7 +140,7 @@ export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null,
                 />
               )}
               <Bar dataKey="changed" name="Bytes changed" fill={colors.series1} barSize={24} radius={[4, 4, 0, 0]} isAnimationActive={false}>
-                {!narrow && (
+                {!narrow && !crowded && (
                   <LabelList
                     dataKey="changed"
                     content={(props) => {
