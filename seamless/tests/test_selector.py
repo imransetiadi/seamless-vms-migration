@@ -228,3 +228,14 @@ def test_handover_eligible_on_netapp_nfs_with_matching_export():
     unknown = _netapp_vm("overcloud@elsewhere#x")
     reasons = eligibility(unknown, ProviderKind.openstack, NETAPP_PLAN, SRC_NETAPP, DST_NETAPP)
     assert reasons[Strategy.storage_handover] == []
+
+
+def test_handover_ineligible_with_encrypted_disk():
+    """Cinder refuses to unmanage encrypted volumes (SDD §9.2): handover is ruled out at planning,
+    not discovered after the VM was stopped."""
+    plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}))
+    vm = make_vm(disks=[make_disk(id="v1", volume_type="ceph-ssd", encrypted=True)])
+    caps = {"admin": True}
+    reasons = eligibility(vm, ProviderKind.openstack, plan, caps, caps)
+    assert any("encrypted" in r for r in reasons[Strategy.storage_handover])
+    assert not any("encrypted" in r for r in reasons[Strategy.cold])

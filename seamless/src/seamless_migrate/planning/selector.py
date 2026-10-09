@@ -87,6 +87,9 @@ def eligibility(
             )
         if multiattach:
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
+        encrypted = [d for d in vm.disks if d.encrypted]
+        if encrypted:
+            handover.append(f"encrypted disk(s), which Cinder cannot unmanage: {_ids(encrypted)}")
         handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps))
         if not src_caps.get("admin"):
             handover.append("admin rights are required on the source cloud")

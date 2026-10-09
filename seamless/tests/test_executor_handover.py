@@ -22,17 +22,71 @@ class Crash(Exception):
 
 
 class FakeResponse:
+    """openstacksdk's raw Proxy calls return the response even for 4xx (raise_exc=False)."""
+
     def __init__(self, body, status=202):
         self._body = body
         self.status_code = status
+
+    @property
+    def text(self):
+        return json.dumps(self._body)
 
     def json(self):
         return self._body
 
 
+def refused(message):
+    return FakeResponse({"badRequest": {"code": 400, "message": message}}, 400)
+
+
+def _mv(version):
+    major, minor = str(version).split(".")
+    return int(major), int(minor)
+
+
+class HTTPError(Exception):
+    """What keystoneauth raises for a 4xx answer."""
+
+
 class FakeCompute:
+    """Nova as verified upstream: PUT os-volume_attachments changes delete_on_termination only
+    from microversion 2.85; deleting a server deletes the volumes attached with
+    delete_on_termination=true and detaches the others."""
+
     def __init__(self, cloud):
         self.c = cloud
+        self.max_microversion = "2.88"  # Wallaby (RHOSP 17.1)
+
+    def get_endpoint_data(self):
+        return NS(max_microversion=self.max_microversion)
+
+    def _attachment_url(self, url):
+        _, servers, sid, kind, vid = url.split("/")
+        assert (servers, kind) == ("servers", "os-volume_attachments"), url
+        return self.c.servers[sid], vid
+
+    def put(self, url, json=None, microversion=None, **kw):
+        server, vid = self._attachment_url(url)
+        body = json["volumeAttachment"]
+        if "delete_on_termination" in body and (
+            microversion is None or _mv(microversion) < (2, 85)
+        ):
+            return refused("delete_on_termination needs microversion 2.85")
+        if body["volumeId"] != vid:
+            return refused("that would be a swap")
+        if vid not in server.dot:
+            return FakeResponse({"itemNotFound": {"message": "volume not attached"}}, 404)
+        self.c.record("keep" if body.get("delete_on_termination") is False else "dot", vid)
+        server.dot[vid] = body["delete_on_termination"]
+        return FakeResponse({"volumeAttachment": {"volumeId": vid}}, 202)
+
+    def get(self, url, microversion=None, **kw):
+        server, vid = self._attachment_url(url)
+        body = {"volumeId": vid}
+        if microversion and _mv(microversion) >= (2, 79):
+            body["delete_on_termination"] = server.dot[vid]
+        return FakeResponse({"volumeAttachment": body}, 200)
 
     def get_server(self, server_id):
         self.c.record("get_server", server_id)
@@ -49,13 +103,27 @@ class FakeCompute:
         return server
 
     def volume_attachments(self, server):
-        return [NS(volume_id=v, device=d) for v, d in server.attachments]
+        return [
+            NS(volume_id=v, device=d, delete_on_termination=server.dot.get(v))
+            for v, d in server.attachments
+        ]
 
     def delete_volume_attachment(self, server, volume, ignore_missing=True):
         self.c.record("detach", volume)
 
     def delete_server(self, server, ignore_missing=True):
-        self.c.record("delete_server", getattr(server, "id", server))
+        sid = getattr(server, "id", server)
+        self.c.record("delete_server", sid)
+        server = self.c.servers.pop(sid, None)
+        for vid, _device in getattr(server, "attachments", []) or []:
+            volume = self.c.volumes.get(vid)
+            if volume is None:
+                continue  # unmanaged: Nova cannot delete what Cinder no longer knows
+            if server.dot.get(vid):
+                self.c.volumes.pop(vid)
+                self.c.deleted_by_nova.append(vid)
+            else:
+                volume.status = "available"
 
     def wait_for_delete(self, res, interval=2, wait=120):
         return res
@@ -66,9 +134,17 @@ class FakeCompute:
     def create_server(self, **params):
         self.c.record("create_server", params["name"])
         self.c.created.append(params)
+        bdm = params.get("block_device_mapping") or []
         server = NS(
-            id=f"{self.c.name}-new-{len(self.c.created)}", name=params["name"], status="ACTIVE"
+            id=f"{self.c.name}-new-{len(self.c.created)}",
+            name=params["name"],
+            status="ACTIVE",
+            attachments=[(b["uuid"], None) for b in bdm],
+            dot={b["uuid"]: b["delete_on_termination"] for b in bdm},
         )
+        for b in bdm:
+            if b["uuid"] in self.c.volumes:
+                self.c.volumes[b["uuid"]].status = "in-use"
         self.c.servers[server.id] = server
         return server
 
@@ -78,9 +154,19 @@ class FakeBlockStorage:
         self.c = cloud
 
     def get_volume(self, volume_id):
+        if volume_id not in self.c.volumes:
+            raise HTTPError(f"HTTP 404: volume {volume_id} not found")
         return self.c.volumes[volume_id]
 
+    def snapshots(self, details=True, **query):
+        return [
+            NS(id=f"snap-{i}", volume_id=query.get("volume_id"))
+            for i in range(getattr(self.c.volumes.get(query.get("volume_id")), "snapshots", 0))
+        ]
+
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=120):
+        if getattr(res, "status", status) != status:
+            raise HTTPError(f"timeout waiting for {res.id} to be {status} (is {res.status})")
         return res
 
     def wait_for_delete(self, res, interval=2, wait=120):
@@ -94,12 +180,28 @@ class FakeBlockStorage:
     def post(self, url, json=None, **kw):
         if url.endswith("/action") and "os-set_image_metadata" in json:
             vid = url.split("/")[2]
+            if self.c.refuse_metadata:
+                return refused("Invalid image metadata")
             self.c.record("set_image_metadata", vid)
             self.c.image_metadata[vid] = dict(json["os-set_image_metadata"]["metadata"])
             return FakeResponse({"metadata": json["os-set_image_metadata"]["metadata"]}, 200)
         if url.endswith("/action") and "os-unmanage" in json:
             vid = url.split("/")[2]
+            volume = self.get_volume(vid)
+            # cinder.volume.api.API.delete(unmanage_only=True), verified on wallaby-eol and master
+            if getattr(volume, "encryption_key_id", None):
+                return refused("Unmanaging encrypted volumes is not supported.")
+            if (
+                volume.status not in ("available", "error", "error_restoring", "error_extending")
+                or getattr(volume, "snapshots", 0)
+                or getattr(volume, "group_id", None)
+            ):
+                return refused(
+                    "Invalid volume: Volume status must be available or error and must not be "
+                    "migrating, attached, belong to a group, have snapshots"
+                )
             self.c.record("unmanage", vid)
+            self.c.volumes.pop(vid)
             return FakeResponse({}, 202)
         if url == "/manageable_volumes":
             vol = json["volume"]
@@ -114,6 +216,9 @@ class FakeBlockStorage:
                 is_bootable=vol.get("bootable"),
                 host=vol["host"],
                 status="available",
+                encryption_key_id=None,
+                snapshots=0,
+                group_id=None,
             )
             return FakeResponse({"volume": {"id": new_id}}, 202)
         raise AssertionError(url)
@@ -149,6 +254,8 @@ class FakeCloud:
         self.created = []
         self.managed = []
         self.image_metadata = {}
+        self.deleted_by_nova = []
+        self.refuse_metadata = False
         self.compute = FakeCompute(self)
         self.block_storage = FakeBlockStorage(self)
         self.network = FakeNetwork(self)
@@ -173,6 +280,7 @@ def source_cloud(calls, crash_on=None):
         security_groups=[{"name": "default"}],
         availability_zone="nova",
         attachments=[("vol-root", "/dev/vda"), ("vol-data", "/dev/vdb")],
+        dot={"vol-root": True, "vol-data": False},
     )
     volumes = {
         "vol-root": NS(
@@ -183,6 +291,9 @@ def source_cloud(calls, crash_on=None):
             is_bootable=True,
             host="overcloud@tripleo_ceph#ssd",
             status="in-use",
+            encryption_key_id=None,
+            snapshots=0,
+            group_id=None,
         ),
         "vol-data": NS(
             id="vol-data",
@@ -192,18 +303,21 @@ def source_cloud(calls, crash_on=None):
             is_bootable=False,
             host="overcloud@tripleo_ceph#hdd",
             status="in-use",
+            encryption_key_id=None,
+            snapshots=0,
+            group_id=None,
         ),
     }
     pools = [("overcloud@tripleo_ceph#ssd", CEPH), ("overcloud@tripleo_ceph#hdd", CEPH)]
     return FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on, pools=pools)
 
 
-def setup(tmp_path, crash_on=None):
+def setup(tmp_path, crash_on=None, dst_crash_on=None):
     calls = []
     dst_pools = [("hostgroup@ceph-ssd#ssd", CEPH), ("hostgroup@ceph-hdd#hdd", CEPH)]
     clouds = {
         "src": source_cloud(calls, crash_on),
-        "dst": FakeCloud("dst", calls, pools=dst_pools),
+        "dst": FakeCloud("dst", calls, pools=dst_pools, crash_on=dst_crash_on),
     }
     settings = Settings(data_dir=tmp_path / "data")
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
@@ -250,16 +364,20 @@ async def test_handover_cutover_order_and_bdm(tmp_path):
     assert executor.supports(Strategy.storage_handover) and not executor.supports(Strategy.warm)
     ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
     result = await executor.run(StepName.CUTOVER, ctx)
+    # SDD §7.3: keep the volumes (delete_on_termination=false, microversion 2.85), delete the
+    # server, and only then unmanage: Cinder refuses to unmanage an attached volume
     assert ops(calls) == [
         ("src", "stop_server", "srv-1"),
-        ("src", "detach", "vol-data"),
+        ("src", "keep", "vol-data"),
+        ("src", "keep", "vol-root"),
+        ("src", "delete_server", "srv-1"),
         ("src", "unmanage", "vol-data"),
         ("src", "unmanage", "vol-root"),
-        ("src", "delete_server", "srv-1"),
         ("dst", "manage", "volume-vol-data"),
         ("dst", "manage", "volume-vol-root"),
         ("dst", "create_server", "web-01"),
     ]
+    assert clouds["src"].deleted_by_nova == [], "the boot volume survived its server's deletion"
     assert rec.downtime_marks == 1
     assert result.destination_server_id == "dst-new-1"
     data_manage, root_manage = clouds["dst"].managed
@@ -277,6 +395,8 @@ async def test_handover_cutover_order_and_bdm(tmp_path):
         "vol-data",
         "vol-root",
     ]
+    # the original delete_on_termination is journaled for the rollback
+    assert [a["delete_on_termination"] for a in saved["attachments"]] == [False, True]
 
 
 async def test_handover_journal_resume_skips_done_steps(tmp_path):
@@ -285,13 +405,9 @@ async def test_handover_journal_resume_skips_done_steps(tmp_path):
     with pytest.raises(PermanentStepError, match="delete the source server"):
         await executor.run(StepName.CUTOVER, ctx)
     journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
-    assert {
-        "stop_source",
-        "save_definition",
-        "detach:vol-data",
-        "unmanage_src:vol-data",
-        "unmanage_src:vol-root",
-    } <= set(journal["done"])
+    assert {"stop_source", "save_definition", "keep:vol-data", "keep:vol-root"} <= set(
+        journal["done"]
+    )
     assert "delete_source" not in journal["done"]
     first = list(calls)
     calls.clear()
@@ -302,6 +418,8 @@ async def test_handover_journal_resume_skips_done_steps(tmp_path):
     result = await executor2.run(StepName.CUTOVER, ctx2)
     assert ops(calls) == [
         ("src", "delete_server", "srv-1"),
+        ("src", "unmanage", "vol-data"),
+        ("src", "unmanage", "vol-root"),
         ("dst", "manage", "volume-vol-data"),
         ("dst", "manage", "volume-vol-root"),
         ("dst", "create_server", "web-01"),
@@ -339,7 +457,7 @@ async def test_handover_rollback_reverses_order(tmp_path):
     params = clouds["src"].created[0]
     assert [
         (b["boot_index"], b["delete_on_termination"]) for b in params["block_device_mapping"]
-    ] == [(0, False), (-1, False)]
+    ] == [(0, True), (-1, False)]
     # the recreated source VM has new ids; the executor reports them to the orchestrator
     assert result.details["source_running"] is True
     new_vm = result.details["vm"]
@@ -361,39 +479,54 @@ async def test_handover_rollback_with_empty_journal_is_a_noop(tmp_path):
     }
 
 
-async def test_handover_rollback_before_unmanage_reattaches_and_starts(tmp_path):
-    """Crash after the first detach: the rollback reattaches that volume and starts the source."""
-    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
-    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    with pytest.raises(PermanentStepError, match="unmanage"):
-        await executor.run(StepName.CUTOVER, ctx)
-    calls.clear()
-    attached = []
-    clouds["src"].compute.create_volume_attachment = lambda server_id, volume_id, device: (
-        attached.append((server_id, volume_id, device))
-    )
-    rb_ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
-    result = await executor.run(StepName.ROLLBACK, rb_ctx)
-    assert attached == [("srv-1", "vol-data", "/dev/vdb")]
-    assert ops(calls) == [("src", "start_server", "srv-1")]
-    assert result.details == {"source_running": True}, "same ids: nothing to report"
-    assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists()
-
-
-async def test_handover_rollback_after_unmanage_deletes_stale_source_and_recreates(tmp_path):
-    """Crash before the source server was deleted: both volumes are already unmanaged at the
-    source, so the rollback manages them back, removes the stale server and recreates it."""
+async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
+    """Crash before the server was deleted: the volumes are still attached and managed; the
+    rollback sets the journaled delete_on_termination back and starts the source."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
     ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
     with pytest.raises(PermanentStepError, match="delete the source server"):
         await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["src"].servers["srv-1"].dot == {"vol-root": False, "vol-data": False}
     calls.clear()
     rb_ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
     result = await executor.run(StepName.ROLLBACK, rb_ctx)
+    assert ops(calls) == [("src", "dot", "vol-root"), ("src", "start_server", "srv-1")]
+    assert clouds["src"].servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert result.details == {"source_running": True}, "same ids: nothing to report"
+    assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists()
+
+
+async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_path):
+    """Crash at the first unmanage: the server is gone, both volumes still managed at the source;
+    the rollback recreates the server on the same volumes with their delete_on_termination."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "srv-1" not in clouds["src"].servers and clouds["src"].deleted_by_nova == []
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [("src", "create_server", "web-01")]
+    bdm = clouds["src"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"], b["delete_on_termination"]) for b in bdm] == [
+        ("vol-root", 0, True),
+        ("vol-data", -1, False),
+    ]
+    assert result.details["vm"]["source_id"] == "src-new-1"
+
+
+async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_path):
+    """Crash at the RHOSO manage: both volumes are unmanaged at the source; the rollback manages
+    them back, recreates the server and reports the new ids."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert ops(calls) == [
         ("src", "manage", "volume-vol-root"),
         ("src", "manage", "volume-vol-data"),
-        ("src", "delete_server", "srv-1"),
         ("src", "create_server", "web-01"),
     ]
     new_vm = result.details["vm"]
@@ -403,6 +536,38 @@ async def test_handover_rollback_after_unmanage_deletes_stale_source_and_recreat
     calls.clear()
     again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert calls == [] and again.details["note"] == "nothing to roll back"
+
+
+@pytest.mark.parametrize(
+    ("trait", "reason"),
+    [
+        ({"encryption_key_id": "key-1"}, "encrypted"),
+        ({"snapshots": 2}, "2 snapshot"),
+        ({"group_id": "grp-1"}, "group"),
+        ({"consistency_group_id": "cg-1"}, "group"),
+    ],
+)
+async def test_handover_refuses_before_stop_when_cinder_cannot_unmanage_a_volume(
+    tmp_path, trait, reason
+):
+    """Cinder's unmanage rules (volume/api.py delete(unmanage_only=True)) are checked while the
+    VM runs: such a volume would otherwise fail after the stop."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    for key, value in trait.items():
+        setattr(clouds["src"].volumes["vol-data"], key, value)
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match=reason):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].compute.max_microversion = "2.79"
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="2.85"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
 
 
 # -- NetApp ONTAP (SDD §7.3.1) -------------------------------------------------------------------
@@ -565,6 +730,38 @@ async def test_handover_restores_boot_properties_on_managed_volumes(tmp_path):
     # the re-managed source volume boots the same way again
     assert ("src", "set_image_metadata", "src-vol-1") in ops(calls)
     assert clouds["src"].image_metadata == {"src-vol-1": BOOT_PROPS}
+
+
+async def test_handover_fails_fast_when_cinder_refuses_the_unmanage(tmp_path):
+    """A snapshot taken after the checks makes Cinder answer 400: the step fails with Cinder's
+    reason at once (openstacksdk returns 4xx answers instead of raising), and the rollback
+    recreates the deleted source server on its volumes."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    nova_delete = clouds["src"].compute.delete_server
+
+    def delete_then_snapshot(server, ignore_missing=True):
+        nova_delete(server, ignore_missing=ignore_missing)
+        clouds["src"].volumes["vol-data"].snapshots = 1
+
+    clouds["src"].compute.delete_server = delete_then_snapshot
+    executor.wait_s = 0.05
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="HTTP 400.*have snapshots"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [("src", "create_server", "web-01")]
+    assert result.details["source_running"] is True
+
+
+async def test_handover_fails_when_rhoso_refuses_the_boot_properties(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].volumes["vol-root"].volume_image_metadata = {"hw_firmware_type": "uefi"}
+    clouds["dst"].refuse_metadata = True
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="boot properties.*HTTP 400"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert all(op != "create_server" for _, op, _ in ops(calls)), "no server without its UEFI"
 
 
 def test_existing_server_and_write_json_helpers(tmp_path):

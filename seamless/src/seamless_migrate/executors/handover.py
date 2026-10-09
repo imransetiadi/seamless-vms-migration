@@ -1,9 +1,10 @@
 """Storage-handover executor for clouds sharing a Ceph cluster or a NetApp ONTAP SVM (SDD §7.3).
 
-Cutover per VM (data volumes first, then the boot volume): stop the source, record its
-definition and attachment order, detach data volumes, ``os-unmanage`` every volume at the source,
-delete the source server, ``manage`` the RBD images, ONTAP files or LUNs in RHOSO (references per
-driver family, §7.3.1, resolved before the stop) and boot the destination server from them.
+Cutover per VM (SDD §7.3): check while the VM runs that every volume can be handed over
+(references per driver family, §7.3.1; Cinder's unmanage rules; Nova microversion 2.85), stop the
+source, record its definition, set ``delete_on_termination=false`` on every attachment, delete the
+source server, ``os-unmanage`` the now available volumes, ``manage`` the RBD images, ONTAP files or
+LUNs in RHOSO, restore their boot properties and boot the destination server from them.
 Every completed sub-step is journaled in ``handover-journal.json`` so a crash resumes without
 repeating work; rollback reverses the journal (6 → 3) and recreates the source server.
 No data is copied in either direction.
@@ -39,6 +40,28 @@ T = TypeVar("T")
 JOURNAL_FILE = "handover-journal.json"
 DEFINITION_FILE = "source-server.json"
 ROOT_DEVICES = ("/dev/vda", "/dev/sda", "/dev/xvda")
+# PUT os-volume_attachments may change delete_on_termination from this compute microversion on
+KEEP_MICROVERSION = "2.85"
+
+
+def _checked(response: Any, what: str) -> Any:
+    """Raise for an error answer: openstacksdk's raw Proxy calls (post/put/get) do not
+    (``Proxy.request(raise_exc=False)``), so a refusal would otherwise pass silently."""
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status >= 400:
+        detail = str(getattr(response, "text", "") or "").strip().replace("\n", " ")[:300]
+        raise RuntimeError(f"{what}: HTTP {status}: {detail}")
+    return response
+
+
+def _microversion(value: Any) -> tuple[int, int]:
+    try:
+        major, minor = str(value).split(".")[:2]
+        return int(major), int(minor)
+    except ValueError:
+        return (0, 0)
+
+
 # volume_image_metadata keys that decide how the guest boots (SDD §7.3 step 7)
 BOOT_PROPERTY_PREFIXES = ("hw_", "os_", "img_")
 BOOT_PROPERTY_KEYS = frozenset({"architecture"})
@@ -190,6 +213,7 @@ class HandoverExecutor:
         for att in conn.compute.volume_attachments(server):
             volume = conn.block_storage.get_volume(_attr(att, "volume_id"))
             device = _attr(att, "device")
+            dot = _attr(att, "delete_on_termination")
             attachments.append(
                 {
                     "volume_id": _attr(volume, "id"),
@@ -200,6 +224,7 @@ class HandoverExecutor:
                     "volume_type": _attr(volume, "volume_type"),
                     "host": _attr(volume, "host"),
                     "image_metadata": boot_properties(_attr(volume, "volume_image_metadata")),
+                    "delete_on_termination": None if dot is None else bool(dot),
                 }
             )
         attachments.sort(key=lambda a: (a["boot"], a["device"] or ""))  # data first, boot last
@@ -266,15 +291,76 @@ class HandoverExecutor:
         return storage
 
     @staticmethod
+    def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
+        """What would make step 3 or 5 fail, found while the VM still runs (§7.3 step 0).
+
+        Cinder refuses to unmanage encrypted volumes, volumes with snapshots and volumes in a
+        group (``volume.api.API.delete(unmanage_only=True)``, Wallaby and later); keeping a volume
+        when its server is deleted needs compute microversion 2.85.
+        """
+        problems: list[str] = []
+        version = _attr(src.compute.get_endpoint_data(), "max_microversion")
+        if _microversion(version) < _microversion(KEEP_MICROVERSION):
+            problems.append(
+                f"the source compute API supports microversion {version or 'unknown'}; keeping the "
+                f"volumes when the source server is deleted needs {KEEP_MICROVERSION}"
+            )
+        for att in attachments:
+            vid = att["volume_id"]
+            volume = src.block_storage.get_volume(vid)
+            if _attr(volume, "encryption_key_id") or _attr(volume, "is_encrypted") is True:
+                problems.append(f"volume {vid} is encrypted: Cinder cannot unmanage it")
+            if _attr(volume, "group_id") or _attr(volume, "consistency_group_id"):
+                problems.append(f"volume {vid} belongs to a group: remove it from the group first")
+            snapshots = len(
+                list(src.block_storage.snapshots(details=False, all_projects=True, volume_id=vid))
+            )
+            if snapshots:
+                problems.append(
+                    f"volume {vid} has {snapshots} snapshot(s): Cinder cannot unmanage it "
+                    "until they are deleted"
+                )
+        return problems
+
+    def _set_delete_on_termination(
+        self, conn: Any, server_id: str, volume_id: str, value: bool
+    ) -> None:
+        """PUT os-volume_attachments (microversion 2.85) and read it back (§7.3 step 3)."""
+        url = f"/servers/{server_id}/os-volume_attachments/{volume_id}"
+        _checked(
+            conn.compute.put(
+                url,
+                json={"volumeAttachment": {"volumeId": volume_id, "delete_on_termination": value}},
+                microversion=KEEP_MICROVERSION,
+            ),
+            f"Nova refused delete_on_termination={value} on {volume_id}",
+        )
+        shown = _checked(
+            conn.compute.get(url, microversion=KEEP_MICROVERSION),
+            f"reading the attachment of {volume_id}",
+        ).json()["volumeAttachment"]
+        if shown.get("delete_on_termination") is not value:
+            raise PermanentStepError(
+                f"Nova did not set delete_on_termination={value} on {volume_id} "
+                f"(it reports {shown.get('delete_on_termination')!r})"
+            )
+
+    @staticmethod
     def _set_boot_properties(conn: Any, volume_id: str, metadata: dict[str, str]) -> None:
-        conn.block_storage.post(
-            f"/volumes/{volume_id}/action",
-            json={"os-set_image_metadata": {"metadata": metadata}},
+        _checked(
+            conn.block_storage.post(
+                f"/volumes/{volume_id}/action",
+                json={"os-set_image_metadata": {"metadata": metadata}},
+            ),
+            f"Cinder refused the boot properties of {volume_id}",
         )
 
     def _unmanage(self, conn: Any, volume_id: str) -> None:
         volume = conn.block_storage.get_volume(volume_id)
-        conn.block_storage.post(f"/volumes/{volume_id}/action", json={"os-unmanage": None})
+        _checked(
+            conn.block_storage.post(f"/volumes/{volume_id}/action", json={"os-unmanage": None}),
+            f"Cinder refused to unmanage {volume_id}",
+        )
         conn.block_storage.wait_for_delete(volume, interval=self.poll_s, wait=self.wait_s)
 
     def _manage(
@@ -294,7 +380,10 @@ class HandoverExecutor:
         }
         if volume_type:
             body["volume_type"] = volume_type
-        response = conn.block_storage.post("/manageable_volumes", json={"volume": body})
+        response = _checked(
+            conn.block_storage.post("/manageable_volumes", json={"volume": body}),
+            f"Cinder refused to manage {ref} on {host}",
+        )
         volume_id = response.json()["volume"]["id"]
         conn.block_storage.wait_for_status(
             conn.block_storage.get_volume(volume_id),
@@ -306,7 +395,11 @@ class HandoverExecutor:
         return str(volume_id)
 
     @staticmethod
-    def _bdm(attachments: list[dict[str, Any]], ids: dict[str, str]) -> list[dict[str, Any]]:
+    def _bdm(
+        attachments: list[dict[str, Any]], ids: dict[str, str], keep_original: bool = False
+    ) -> list[dict[str, Any]]:
+        """Block-device mapping in device order; the destination never deletes its volumes, a
+        recreated source keeps the journaled delete_on_termination."""
         ordered = sorted(attachments, key=lambda a: (not a["boot"], a["device"] or ""))
         return [
             {
@@ -314,7 +407,9 @@ class HandoverExecutor:
                 "uuid": ids[a["volume_id"]],
                 "source_type": "volume",
                 "destination_type": "volume",
-                "delete_on_termination": False,
+                "delete_on_termination": bool(a.get("delete_on_termination"))
+                if keep_original
+                else False,
             }
             for a in ordered
         ]
@@ -353,13 +448,19 @@ class HandoverExecutor:
         server_id = ctx.migration.vm.source_id
 
         if not journal.data["order"]:
-            # step 0: every reference must resolve while the VM still runs (§7.3.1)
+            # step 0: everything that can be checked while the VM still runs (§7.3, §7.3.1)
             live = await self._call(
                 "read the source definition", lambda: self._capture_definition(src, server_id)
             )
             await asyncio.to_thread(
                 self._resolve_storage, src, dst, live["attachments"], backend_map
             )
+            blockers = await self._call(
+                "check that Cinder can unmanage the volumes",
+                lambda: self._unmanage_blockers(src, live["attachments"]),
+            )
+            if blockers:
+                raise PermanentStepError("storage handover refused: " + "; ".join(blockers))
 
         if not journal.done("stop_source"):
 
@@ -388,24 +489,43 @@ class HandoverExecutor:
         definition = await asyncio.to_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
+        # step 3: keep every volume when the server is deleted (runs journaled before this order
+        # had detached and unmanaged volumes already: nothing to keep for those)
         for att in attachments:
-            key = f"detach:{att['volume_id']}"
-            if att["boot"] or journal.done(key):
+            vid = att["volume_id"]
+            if journal.done(f"detach:{vid}") or journal.done(f"unmanage_src:{vid}"):
                 continue
-
-            def detach(vid: str = att["volume_id"]) -> None:
-                server = src.compute.get_server(server_id)
-                src.compute.delete_volume_attachment(server, vid, ignore_missing=True)
-                src.block_storage.wait_for_status(
-                    src.block_storage.get_volume(vid),
-                    status="available",
-                    interval=self.poll_s,
-                    wait=self.wait_s,
+            key = f"keep:{vid}"
+            if not journal.done(key):
+                await self._call(
+                    f"keep {vid} when the source server is deleted",
+                    lambda v=vid: self._set_delete_on_termination(src, server_id, v, False),
                 )
+                await asyncio.to_thread(journal.mark, key)
 
-            await self._call(f"detach {att['volume_id']}", detach)
-            await asyncio.to_thread(journal.mark, key)
+        # step 4: delete the source server; its volumes become available
+        if not journal.done("delete_source"):
 
+            def delete_source() -> None:
+                server = _existing_server(src, server_id)
+                if server is not None:
+                    src.compute.delete_server(server, ignore_missing=True)
+                    src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
+                for att in attachments:
+                    if journal.done(f"unmanage_src:{att['volume_id']}"):
+                        continue
+                    src.block_storage.wait_for_status(
+                        src.block_storage.get_volume(att["volume_id"]),
+                        status="available",
+                        failures=["error"],
+                        interval=self.poll_s,
+                        wait=self.wait_s,
+                    )
+
+            await self._call("delete the source server", delete_source)
+            await asyncio.to_thread(journal.mark, "delete_source")
+
+        # step 5: unmanage at the source (Cinder refuses attached volumes)
         for att in attachments:
             key = f"unmanage_src:{att['volume_id']}"
             if not journal.done(key):
@@ -414,16 +534,6 @@ class HandoverExecutor:
                     lambda vid=att["volume_id"]: self._unmanage(src, vid),
                 )
                 await asyncio.to_thread(journal.mark, key)
-
-        if not journal.done("delete_source"):
-
-            def delete_source() -> None:
-                server = src.compute.get_server(server_id)
-                src.compute.delete_server(server, ignore_missing=True)
-                src.compute.wait_for_delete(server, interval=self.poll_s, wait=self.wait_s)
-
-            await self._call("delete the source server", delete_source)
-            await asyncio.to_thread(journal.mark, "delete_source")
 
         storage: dict[str, dict[str, Any]] = definition.get("storage") or {}
         dest_ids: dict[str, str] = {}
@@ -571,8 +681,11 @@ class HandoverExecutor:
                 await asyncio.to_thread(journal.mark, meta_key)
 
         any_unmanaged = any(journal.done(f"unmanage_src:{a['volume_id']}") for a in attachments)
+        source_gone = journal.done("delete_source") or (
+            await asyncio.to_thread(_existing_server, src, server_id) is None
+        )
         new_server_id = server_id
-        if any_unmanaged:
+        if any_unmanaged or source_gone:
             if not journal.done("delete_source") and not journal.done("rb:delete_stale_source"):
 
                 def delete_stale() -> None:
@@ -595,12 +708,26 @@ class HandoverExecutor:
                         definition,
                         definition["flavor"],
                         networks,
-                        self._bdm(attachments, new_ids),
+                        self._bdm(attachments, new_ids, keep_original=True),
                     ),
                 )
                 await asyncio.to_thread(journal.mark, "rb:create_source", server_id=created)
             new_server_id = journal.get("rb:create_source")["server_id"]
         else:
+            # the server still exists: give back the delete_on_termination step 3 changed
+            for att in attachments:
+                vid = att["volume_id"]
+                key = f"rb:dot:{vid}"
+                if (
+                    journal.done(f"keep:{vid}")
+                    and att.get("delete_on_termination") is True
+                    and not journal.done(key)
+                ):
+                    await self._call(
+                        f"restore delete_on_termination of {vid}",
+                        lambda v=vid: self._set_delete_on_termination(src, server_id, v, True),
+                    )
+                    await asyncio.to_thread(journal.mark, key)
             for att in attachments:
                 key = f"rb:attach:{att['volume_id']}"
                 if journal.done(f"detach:{att['volume_id']}") and not journal.done(key):
