@@ -43,7 +43,7 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { PHASES, STRATEGIES } from './types';
+import { ACTION_TEXT_MAX, PHASES, STRATEGIES } from './types';
 
 interface MockResponse {
   status: number;
@@ -967,6 +967,13 @@ export class MockServer {
   }
 
   private migrationAction(me: Me, m: Migration, action: string, input: Record<string, unknown>): MockResponse {
+    for (const field of ['comment', 'reason', 'confirm']) {
+      const text = input[field];
+      // the API bounds the free text of every action (SDD §12)
+      if (typeof text === 'string' && text.length > ACTION_TEXT_MAX) {
+        throw new HttpError(422, 'validation_error', `${field}: at most ${ACTION_TEXT_MAX} characters.`);
+      }
+    }
     const plan = this.plan(m.plan_id);
     const comment = typeof input.comment === 'string' && input.comment.trim() ? input.comment.trim() : null;
     const record = (message: string, data: Record<string, unknown> = {}) =>

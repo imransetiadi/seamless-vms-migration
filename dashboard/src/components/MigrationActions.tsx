@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
-import type { Migration, Plan, Role } from '../api/types';
+import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatDuration } from '../lib/format';
 import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
@@ -103,7 +103,7 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
     });
 
   const commentField = (
-    <TextAreaField label="Comment (optional)" rows={2} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
+    <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
   );
   const estimate = m.estimate ? formatDuration(m.estimate.downtime_s) : 'unknown';
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
@@ -222,7 +222,7 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
         canConfirm={reason.trim().length > 0}
         onConfirm={() => submit({ action: 'rollback', body: { reason: reason.trim() } })}
       >
-        <TextAreaField label="Reason" required rows={2} value={reason} onChange={(e) => setReason(e.target.value)} hint="Required; recorded in the audit trail." />
+        <TextAreaField label="Reason" required rows={2} maxLength={ACTION_TEXT_MAX} value={reason} onChange={(e) => setReason(e.target.value)} hint="Required; recorded in the audit trail." />
       </ConfirmDialog>
 
       <ConfirmDialog
@@ -235,7 +235,7 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
         cancelLabel="Keep migration"
         onConfirm={() => submit({ action: 'cancel', body: reason.trim() ? { reason: reason.trim() } : {} })}
       >
-        <TextAreaField label="Reason (optional)" rows={2} value={reason} onChange={(e) => setReason(e.target.value)} />
+        <TextAreaField label="Reason (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={reason} onChange={(e) => setReason(e.target.value)} />
       </ConfirmDialog>
 
       <ConfirmDialog

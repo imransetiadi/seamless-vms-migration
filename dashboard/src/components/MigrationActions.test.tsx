@@ -63,6 +63,28 @@ describe('MigrationActions', () => {
     expect(dialog).toHaveTextContent(/still stopped.*downtime clock keeps running/i);
   });
 
+  it('caps a rollback reason at the API limit of 2000 characters (SDD §12)', async () => {
+    const user = userEvent.setup();
+    const { button } = setup('legacy-rhel6-app', 'operator');
+
+    await user.click(button(/roll back/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /roll back legacy-rhel6-app/i });
+    expect(within(dialog).getByLabelText(/reason/i)).toHaveAttribute('maxlength', '2000');
+  });
+
+  it('caps an approval comment and a cancel reason at 2000 characters (SDD §12)', async () => {
+    const user = userEvent.setup();
+    const { button } = setup('app-billing-01', 'approver');
+
+    await user.click(button(/approve/i));
+    const approve = await screen.findByRole('alertdialog', { name: /approve/i });
+    expect(within(approve).getByLabelText(/comment/i)).toHaveAttribute('maxlength', '2000');
+    await user.click(within(approve).getByRole('button', { name: /^cancel$/i }));
+    await user.click(button(/^cancel/i));
+    const cancel = await screen.findByRole('alertdialog', { name: /cancel/i });
+    expect(within(cancel).getByLabelText(/reason/i)).toHaveAttribute('maxlength', '2000');
+  });
+
   it('asks for a reason before rolling back', async () => {
     const user = userEvent.setup();
     const { button, server, migration } = setup('legacy-rhel6-app', 'operator');

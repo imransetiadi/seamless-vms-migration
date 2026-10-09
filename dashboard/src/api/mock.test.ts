@@ -68,6 +68,22 @@ describe('mock fixtures', () => {
 });
 
 describe('mock API', () => {
+  it('refuses action texts over 2000 characters with 422, like the API (SDD §12)', async () => {
+    const { server, client } = setup('approver');
+    const m = byPhase(server, 'awaiting_cutover');
+    const long = 'x'.repeat(2001);
+    for (const [action, body] of [
+      ['approve', { comment: long }],
+      ['cutover', { comment: long }],
+      ['rollback', { reason: long }],
+      ['cancel', { reason: long }],
+      ['finalize', { confirm: long }],
+    ] as const) {
+      await expect(client.post(`/migrations/${m.id}/${action}`, body)).rejects.toMatchObject({ status: 422, code: 'validation_error' });
+    }
+    await expect(client.post<Migration>(`/migrations/${m.id}/approve`, { comment: 'x'.repeat(2000) })).resolves.toMatchObject({ id: m.id });
+  });
+
   it('maps tokens to roles and rejects unknown tokens', async () => {
     await expect(setup('viewer').client.get('/me')).resolves.toEqual({ name: 'dimas', role: 'viewer' });
     await expect(setup(null).client.get('/me')).resolves.toEqual({ name: 'anonymous', role: 'admin' });

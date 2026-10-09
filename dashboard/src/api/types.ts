@@ -524,6 +524,9 @@ export interface MigrationListQuery {
   offset?: number;
 }
 
+/** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
+export const ACTION_TEXT_MAX = 2000;
+
 export interface ApproveRequest {
   comment?: string;
 }
