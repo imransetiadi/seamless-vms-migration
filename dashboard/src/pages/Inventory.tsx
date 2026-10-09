@@ -170,7 +170,9 @@ export default function Inventory() {
   const role = useRole();
   const [selected, setSelected] = useState<{ providerId: string; ids: Set<string> }>({ providerId: '', ids: new Set() });
   const provider = providers.data?.find((p) => p.id === providerId);
-  const canPlan = hasRole(role, 'operator') && provider?.role === 'source';
+  // planning starts from a source; viewers see the action unavailable, with the reason (SDD §16)
+  const isSource = provider?.role === 'source';
+  const canPlan = hasRole(role, 'operator') && isSource;
   const selection = selected.providerId === providerId ? selected.ids : new Set<string>();
 
   if (!providerId) {
@@ -225,20 +227,20 @@ export default function Inventory() {
           <EmptyState icon={HardDrive} title="No VMs found" description="The provider reported an empty inventory." />
         ) : (
           <div className="flex flex-col gap-3">
-            {canPlan && (
+            {isSource && (
               <div className="flex flex-wrap items-center gap-2">
                 <Button
                   variant="primary"
                   size="lg"
                   icon={ClipboardPlus}
-                  disabledReason={selection.size === 0 ? 'Select VMs in the table first.' : null}
+                  disabledReason={!canPlan ? 'Creating a plan requires the operator role.' : selection.size === 0 ? 'Select VMs in the table first.' : null}
                   onClick={() =>
                     navigate('/plans', { state: { newPlan: { sourceId: provider.id, vmIds: [...selection] } } satisfies NewPlanState })
                   }
                 >
                   Create plan{selection.size ? ` with ${selection.size} VM${selection.size === 1 ? '' : 's'}` : ''}
                 </Button>
-                <span className="text-xs text-muted-foreground">Select VMs below to start a plan with them.</span>
+                {canPlan && <span className="text-xs text-muted-foreground">Select VMs below to start a plan with them.</span>}
               </div>
             )}
             <VmTable

@@ -209,11 +209,15 @@ function ProviderCard({
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
           Edit
         </Button>
-        {canEdit && (
-          <Button variant="ghost" icon={Trash2} onClick={() => setConfirmDelete(true)} className="ml-auto">
-            Delete
-          </Button>
-        )}
+        <Button
+          variant="ghost"
+          icon={Trash2}
+          onClick={() => setConfirmDelete(true)}
+          className="ml-auto"
+          disabledReason={canEdit ? null : 'Deleting a provider requires the admin role.'}
+        >
+          Delete
+        </Button>
       </footer>
 
       <ConfirmDialog

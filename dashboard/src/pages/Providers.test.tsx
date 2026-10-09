@@ -38,6 +38,18 @@ describe('Providers page', () => {
     expect(within(rhosp).getByRole('button', { name: /^edit$/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('shows Delete to non-admins as unavailable with the reason, like Edit (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('operator');
+    const from = await screen.findByRole('region', { name: 'Migrate from' });
+    const rhosp = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    const remove = within(rhosp).getByRole('button', { name: /^delete$/i });
+    expect(remove).toHaveAttribute('aria-disabled', 'true');
+    expect(remove).toHaveAccessibleDescription('Deleting a provider requires the admin role.');
+    await user.click(remove);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  });
+
   it('lists the storage backends of a cloud by driver family instead of raw pool names', async () => {
     renderPage('viewer');
     const from = await screen.findByRole('region', { name: 'Migrate from' });

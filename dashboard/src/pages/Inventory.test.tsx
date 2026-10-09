@@ -1,4 +1,4 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { createTestServer, renderWithApp } from '../test/utils';
@@ -22,6 +22,23 @@ describe('Inventory', () => {
     await user.click(within(alert).getByRole('button', { name: /retry/i }));
     expect(await screen.findByRole('table', { name: /vms on/i })).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('shows Create plan to viewers of a source as unavailable with the reason (SDD §16)', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1', path: '/inventory/:providerId', token: 'viewer' });
+    await screen.findByRole('table', { name: /vms on/i });
+    const create = screen.getByRole('button', { name: /^create plan/i });
+    expect(create).toHaveAttribute('aria-disabled', 'true');
+    expect(create).toHaveAccessibleDescription('Creating a plan requires the operator role.');
+    // viewers cannot select VMs, so the page does not ask them to
+    expect(screen.queryByText(/select vms below/i)).not.toBeInTheDocument();
+  });
+
+  it('offers no Create plan on a destination inventory', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'operator' });
+    await screen.findByRole('heading', { level: 1, name: 'Inventory' });
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /^create plan/i })).not.toBeInTheDocument();
   });
 
   it('shows that it is loading, not a blank page, while the providers load', async () => {
