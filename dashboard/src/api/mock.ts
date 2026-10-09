@@ -90,6 +90,17 @@ export interface MockServerOptions {
   seed?: number;
 }
 
+const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
+const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
+
+function checkDistribution(input: Record<string, unknown> | Provider) {
+  const distribution = (input as Record<string, unknown>).distribution;
+  const kind = (input as Record<string, unknown>).kind;
+  if (distribution && DISTRIBUTION_KIND[String(distribution)] !== kind) {
+    throw new HttpError(422, 'validation_error', `distribution ${String(distribution)} belongs to kind ${DISTRIBUTION_KIND[String(distribution)] ?? 'unknown'}, not ${String(kind)}`);
+  }
+}
+
 export class MockServer {
   /** What GET /health answers; tests flip it to a degraded state. */
   health: Health = {
@@ -513,6 +524,9 @@ export class MockServer {
           this.require(token, 'viewer', path);
           return ok(provider);
         }
+        if (!sub && method === 'PATCH') return this.patchProvider(this.require(token, 'admin', path), provider, input);
+        if (sub === 'credentials' && method === 'PUT') return this.setCredentials(this.require(token, 'admin', path), provider, input);
+        if (sub === 'conversion-key' && method === 'PUT') return this.setConversionKey(this.require(token, 'admin', path), provider, input);
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
           const inUse = this.plans.some(
@@ -642,18 +656,84 @@ export class MockServer {
 
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
-    if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'invalid_id', 'Provider id must match ^[a-z0-9][a-z0-9-]{1,62}$.');
-    if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `Provider ${id} already exists.`);
+    if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
+    if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
+    checkDistribution(input);
+    const defaults: Partial<Provider> = {
+      cloud: null,
+      credentials_secret: null,
+      region: null,
+      verify_tls: true,
+      ca_cert_path: null,
+      conversion_host: null,
+      distribution: null,
+    };
     const provider = {
+      ...defaults,
       ...(input as unknown as Provider),
       capabilities: {},
       status: 'unknown',
       status_message: null,
       last_checked_at: null,
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
     } as Provider;
     this.providers.push(provider);
     this.emit({ kind: 'provider.created', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} registered`, data: {} });
     return ok(provider, 201);
+  }
+
+  /** PATCH /providers/{id}: editable fields only, 409 while a running/paused plan uses it. */
+  private patchProvider(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    const unknown = Object.keys(input).filter((k) => !PROVIDER_EDITABLE.has(k)).sort();
+    if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
+    const users = this.plans.filter(
+      (p) => ['running', 'paused'].includes(p.status) && (p.source_provider_id === provider.id || p.destination_provider_id === provider.id),
+    );
+    if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
+    checkDistribution({ ...provider, ...input });
+    Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
+    this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });
+    return ok(provider);
+  }
+
+  /** PUT /providers/{id}/credentials: the mock keeps no values, only the "stored" stamp. */
+  private setCredentials(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    const values = Object.fromEntries(Object.entries(input).filter(([, v]) => typeof v === 'string' && v.trim())) as Record<string, string>;
+    const vmware = provider.kind === 'vmware';
+    const allowed = vmware ? ['username', 'password', 'datacenter'] : ['auth_url', 'username', 'password', 'project_name', 'user_domain_name', 'project_domain_name', 'application_credential_id', 'application_credential_secret', 'interface'];
+    const extra = Object.keys(values).filter((k) => !allowed.includes(k)).sort();
+    if (extra.length) throw new HttpError(422, 'validation_error', `not used by a ${provider.kind} provider: ${extra.join(', ')}`);
+    const app = !vmware && Boolean(values.application_credential_id || values.application_credential_secret);
+    const required = vmware ? ['username', 'password'] : app ? ['application_credential_id', 'application_credential_secret'] : ['username', 'password', 'project_name'];
+    const missing = required.filter((k) => !values[k]);
+    if (missing.length) throw new HttpError(422, 'validation_error', `missing: ${missing.join(', ')}`);
+    Object.assign(provider, {
+      credentials_secret: `provider-${provider.id}`,
+      credentials_updated_at: new Date(this.now()).toISOString(),
+      status: 'unknown',
+      status_message: null,
+      last_checked_at: null,
+      capabilities: {},
+    });
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `credentials of provider ${provider.id} updated`, data: { provider_id: provider.id, secret: provider.credentials_secret, keys: Object.keys(values).sort() } });
+    return ok(provider);
+  }
+
+  private setConversionKey(me: Me, provider: Provider, input: Record<string, unknown>): MockResponse {
+    const key = String(input.private_key ?? '').trim();
+    if (!key.startsWith('-----BEGIN') || !key.includes('PRIVATE KEY-----')) throw new HttpError(422, 'validation_error', 'private_key must be an OpenSSH or PEM private key');
+    const host = provider.conversion_host ?? { manage: false, name: null, flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: null, ssh_allowed_cidr: null, ssh_key_secret: null };
+    Object.assign(provider, {
+      conversion_host: { ...host, ssh_key_secret: `provider-${provider.id}-ssh` },
+      conversion_key_updated_at: new Date(this.now()).toISOString(),
+      status: 'unknown',
+      status_message: null,
+      last_checked_at: null,
+      capabilities: {},
+    });
+    this.emit({ kind: 'provider.credentials_updated', plan_id: null, migration_id: null, actor: me.name, message: `conversion-host key of provider ${provider.id} updated`, data: { provider_id: provider.id, keys: ['private_key'] } });
+    return ok(provider);
   }
 
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {

@@ -29,6 +29,9 @@ import type {
   PlanCreate,
   PlanPatch,
   Provider,
+  ProviderCreate,
+  ProviderCredentials,
+  ProviderPatch,
   ProviderInventory,
   RollbackRequest,
   SimilarIncidentsRequest,
@@ -245,6 +248,64 @@ export function useCheckProvider() {
       );
       invalidateAll(queryClient, [queryKeys.providers, queryKeys.inventory(provider.id)]);
     },
+  });
+}
+
+function useProviderWrite<V>(request: (api: ReturnType<typeof useApi>, vars: V) => Promise<Provider>) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: V) => request(api, vars),
+    onSuccess: (provider) => {
+      queryClient.setQueryData<Provider[]>(queryKeys.providers, (old) =>
+        old ? (old.some((p) => p.id === provider.id) ? old.map((p) => (p.id === provider.id ? provider : p)) : [...old, provider]) : old,
+      );
+      invalidateAll(queryClient, [queryKeys.providers, queryKeys.inventory(provider.id)]);
+    },
+  });
+}
+
+/** POST /providers (admin). */
+export function useCreateProvider() {
+  return useProviderWrite((api, body: ProviderCreate) => api.post<Provider>('/providers', body));
+}
+
+/** PATCH /providers/{id} (admin). */
+export function useUpdateProvider() {
+  return useProviderWrite((api, { id, patch }: { id: string; patch: ProviderPatch }) => api.patch<Provider>(`/providers/${enc(id)}`, patch));
+}
+
+/** PUT /providers/{id}/credentials (admin, write-only). */
+export function useSetProviderCredentials() {
+  return useProviderWrite((api, { id, credentials }: { id: string; credentials: ProviderCredentials }) =>
+    api.put<Provider>(`/providers/${enc(id)}/credentials`, credentials),
+  );
+}
+
+/** PUT /providers/{id}/conversion-key (admin, write-only). */
+export function useSetConversionKey() {
+  return useProviderWrite((api, { id, privateKey }: { id: string; privateKey: string }) =>
+    api.put<Provider>(`/providers/${enc(id)}/conversion-key`, { private_key: privateKey }),
+  );
+}
+
+/** POST /providers/{id}/check for every provider (operator), one after another. */
+export function useCheckAllProviders() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      const out: Provider[] = [];
+      for (const id of ids) {
+        try {
+          out.push(await api.post<Provider>(`/providers/${enc(id)}/check`));
+        } catch {
+          // one unreachable provider must not stop the others; its card shows the error
+        }
+      }
+      return out;
+    },
+    onSettled: () => invalidateAll(queryClient, [queryKeys.providers]),
   });
 }
 

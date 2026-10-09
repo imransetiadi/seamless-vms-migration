@@ -73,3 +73,25 @@ test('light theme switches the token values', async ({ page }) => {
     .poll(async () => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
     .toBe('rgb(248, 250, 252)');
 });
+
+test('an admin connects a Kolla-Ansible source and tests the connection', async ({ page }) => {
+  await signIn(page);
+  await page.goto('/providers');
+  await page.getByRole('button', { name: /^add provider$/i }).first().click();
+  const dialog = page.getByRole('dialog', { name: /connect a cloud/i });
+  await dialog.getByText('Kolla-Ansible', { exact: true }).click();
+  await dialog.getByLabel(/^name/i).fill('Kolla Browser Test');
+  await expect(dialog.getByLabel(/^id/i)).toHaveValue('kolla-browser-test');
+  await dialog.getByLabel(/keystone url/i).fill('https://kolla-b.example.com:5000/v3');
+  await dialog.getByLabel(/^user name/i).fill('svc-migrate');
+  await dialog.getByLabel(/^password/i).fill('browser-secret');
+  await dialog.getByLabel(/^project$/i).fill('admin');
+  await dialog.getByRole('button', { name: /add and test connection/i }).click();
+  const result = page.getByRole('dialog', { name: /kolla browser test is connected/i });
+  await expect(result).toBeVisible();
+  await result.getByRole('button', { name: /^done$/i }).click();
+  const card = page.getByRole('article', { name: 'Kolla Browser Test' });
+  await expect(card).toContainText('Kolla-Ansible');
+  await expect(card).toContainText(/stored just now/i);
+  await expect(page.locator('body')).not.toContainText('browser-secret');
+});

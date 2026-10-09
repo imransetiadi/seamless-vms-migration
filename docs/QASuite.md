@@ -753,6 +753,18 @@ Twenty-three further iterations after the integration run, each verified with th
   validation of the playbook-test stubs against the real modules, blocksync protocol-guard tests, mock/API
   error-code alignment in the dashboard, behavioural tests for the migration/providers/inventory pages.
 
+* Provider management from the dashboard (2026-10-09, user request): admins add and edit providers with a
+  platform preset (OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1, RHOSO 18.0, VMware vCenter),
+  enter write-only credentials (password, application credential, or a clouds.yaml entry; vCenter account)
+  and the conversion-host SSH key, and test the connection from the dialog; the page shows the clouds in the
+  direction of the migration with a fleet summary and Check all. API: `PATCH /providers/{id}`,
+  `PUT …/credentials`, `PUT …/conversion-key` (SDD §12); credentials go to the platform secret store (Compose
+  0600 files, OpenShift Secrets via a namespaced Role, SDD §13.3, Security.md R-15) and never to the database,
+  an event or a response. Verified: 681 control-plane tests (`test_provider_management.py`), 418 dashboard
+  tests (`Providers.test.tsx`, mock contract, axe on the open dialog), the Playwright journey
+  "an admin connects a Kolla-Ansible source", kubeconform on the new RBAC and egress manifests. The UI
+  followed the `frontend-design` guidance (plan, review against the brief, build, screenshot critique).
+
 ### 13.2 Exit criteria — release 0.1.0
 
 1. All unit suites green: collection (baseline + A1/A2), control plane on **SQLite and PostgreSQL 16**, dashboard

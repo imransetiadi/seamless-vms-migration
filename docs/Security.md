@@ -249,7 +249,7 @@ QASuite case that exercises the control.
 | `POST /migrations/{id}/sync`, `…/rollback`, `…/retry`, `…/cancel`; `PUT /migrations/{id}/strategy` | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /advisor/similar-incidents` | operator | ✗ | ✓ | ✓ | ✓ |
 | `POST /migrations/{id}/approve`, `…/cutover`, `…/finalize` | approver | ✗ | ✗ | ✓ | ✓ |
-| `POST /providers`, `DELETE /providers/{id}` | admin | ✗ | ✗ | ✗ | ✓ |
+| `POST /providers`, `PATCH /providers/{id}`, `PUT /providers/{id}/credentials`, `PUT /providers/{id}/conversion-key`, `DELETE /providers/{id}` | admin | ✗ | ✗ | ✗ | ✓ |
 
 Design intent: operators can run and *undo* (rollback, cancel) but cannot authorize the risky forward steps
 (cutover, finalize) nor change the policy that gates them (approval required, automatic cutover, change window: SDD §12); only admins can define the endpoints the control plane connects to (the SSRF surface,

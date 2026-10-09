@@ -29,6 +29,9 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 * **Assisted, never autonomous:** Jev may break ties between eligible strategies, classify workloads into
   risk tiers and review post-cutover evidence — always inside deterministic bounds, and everything works
   with Jev off ([SDD §14](docs/SDD.md)). agentmemory recalls similar past incidents on failures.
+* **One dashboard for every hypervisor:** add and edit OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1,
+  VMware vCenter and RHOSO 18.0 providers from the UI with platform presets, write-only credentials kept in the
+  platform secret store (never in the database), the conversion-host SSH key, and a one-click connection test.
 * **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
   structured JSON logs (uvicorn's access lines included), `/health` and a `/ready` probe that answers
   503 while the database or the orchestrator loop is down, audit log export and retention

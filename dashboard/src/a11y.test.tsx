@@ -94,4 +94,21 @@ describe('axe-core: no WCAG violations', () => {
     await within(dialog).findByRole('alert');
     expect(await violations()).toEqual([]);
   }, 30_000);
+
+  it('the provider dialog: platform tiles, sign-in methods, conversion host and errors', async () => {
+    const user = userEvent.setup();
+    renderAt('/providers', 'admin');
+    await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: /^add provider$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /connect a cloud/i });
+    await user.click(within(dialog).getByRole('radio', { name: /application credential/i }));
+    await user.click(within(dialog).getByRole('button', { name: /configure/i }));
+    await user.click(within(dialog).getByRole('checkbox', { name: /let seamless deploy/i }));
+    await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    expect(await violations()).toEqual([]);
+  }, 30_000);
 });

@@ -481,7 +481,8 @@ seamless-ps: seamless-check-context seamless-check-env
 seamless-logs: seamless-check-context seamless-check-env
 	$(SEAMLESS_COMPOSE) --profile '*' logs -f --tail=200 $(SEAMLESS_SERVICE)
 
-# Destructive: removes the pgdata and seamless-data volumes (all plans, events and run directories).
+# Destructive: removes the pgdata, seamless-data and seamless-secrets volumes (all plans, events, run
+# directories and the provider credentials entered in the dashboard).
 seamless-reset: seamless-check-context
 	@[ "$(CONFIRM)" = "yes" ] || { echo "This DELETES the PostgreSQL and data volumes of the seamless stack. Re-run with CONFIRM=yes"; exit 1; }
 	@if [ -f "$(SEAMLESS_ENV_FILE)" ]; then \

@@ -101,6 +101,10 @@ export interface ConversionHostConfig {
   ssh_key_secret: string | null;
 }
 
+/** Presets and display only (SDD §4.2); `kind` decides the code path. */
+export const DISTRIBUTIONS = ['openstack_community', 'kolla', 'rhosp', 'rhoso', 'vmware'] as const;
+export type Distribution = (typeof DISTRIBUTIONS)[number];
+
 export interface Provider {
   /** Regex `^[a-z0-9][a-z0-9-]{1,62}$`. */
   id: string;
@@ -118,6 +122,30 @@ export interface Provider {
   status: ProviderStatus;
   status_message: string | null;
   last_checked_at: Timestamp | null;
+  distribution: Distribution | null;
+  /** Server-owned: when the write-only credentials / conversion key were last stored. */
+  credentials_updated_at: Timestamp | null;
+  conversion_key_updated_at: Timestamp | null;
+}
+
+/** `POST /providers` body (status and server-owned fields are ignored by the API). */
+export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'>;
+
+/** `PATCH /providers/{id}`: the editable fields (SDD §12). */
+export type ProviderPatch = Partial<Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution'>>;
+
+/** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
+export interface ProviderCredentials {
+  auth_url?: string;
+  username?: string;
+  password?: string;
+  project_name?: string;
+  user_domain_name?: string;
+  project_domain_name?: string;
+  application_credential_id?: string;
+  application_credential_secret?: string;
+  interface?: 'public' | 'internal' | 'admin';
+  datacenter?: string;
 }
 
 export interface Disk {
@@ -442,9 +470,6 @@ export interface Me {
   role: Role;
 }
 
-/** POST /providers body: a Provider (status fields are ignored by the server). */
-export type ProviderCreate = Omit<Provider, 'status' | 'status_message' | 'last_checked_at' | 'capabilities'> &
-  Partial<Pick<Provider, 'capabilities'>>;
 
 type PlanServerFields = 'id' | 'waves' | 'status' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';

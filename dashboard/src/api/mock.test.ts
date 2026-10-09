@@ -13,6 +13,7 @@ import {
   type Event,
   type Migration,
   type Plan,
+  type Provider,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -85,6 +86,25 @@ describe('mock API', () => {
     expect(all).toHaveLength(server.migrations.length);
     const page = await client.get<Migration[]>('/migrations', { query: { limit: 2, offset: 1 } });
     expect(page.map((m) => m.id)).toEqual(all.slice(1, 3).map((m) => m.id));
+  });
+
+  it('manages providers: PATCH, write-only credentials and conversion key (SDD §12)', async () => {
+    const { server, client } = setup();
+    const patched = await client.patch<Provider>('/providers/community-lab', { region: 'R2', distribution: 'kolla' });
+    expect(patched).toMatchObject({ region: 'R2', distribution: 'kolla', status: 'unknown' });
+    await expect(client.patch('/providers/community-lab', { kind: 'vmware' })).rejects.toMatchObject({ status: 422 });
+    await expect(client.patch('/providers/community-lab', { distribution: 'vmware' })).rejects.toMatchObject({ status: 422 });
+    await expect(setup('operator').client.patch('/providers/community-lab', { region: 'x' })).rejects.toMatchObject({ status: 403 });
+    const stored = await client.put<Provider>('/providers/community-lab/credentials', { username: 'u', password: 'p', project_name: 'x' });
+    expect(stored.credentials_secret).toBe('provider-community-lab');
+    expect(JSON.stringify(stored)).not.toContain('"p"');
+    await expect(client.put('/providers/vcenter-hq/credentials', { username: 'u', password: 'p', project_name: 'x' })).rejects.toMatchObject({ status: 422 });
+    await expect(client.put('/providers/community-lab/conversion-key', { private_key: 'ssh-rsa AAAA' })).rejects.toMatchObject({ status: 422 });
+    const keyed = await client.put<Provider>('/providers/community-lab/conversion-key', {
+      private_key: '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----',
+    });
+    expect(keyed.conversion_host?.ssh_key_secret).toBe('provider-community-lab-ssh');
+    expect(server.events.filter((e) => e.kind === 'provider.credentials_updated')).toHaveLength(2);
   });
 
   it('filters and pages the plans list', async () => {
