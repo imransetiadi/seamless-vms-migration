@@ -89,6 +89,50 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
   });
 
+  it('offers to ignore a closed window with the first cutover request (SDD §5.4)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    migration.cutover_requested = false;
+    migration.force_window = false;
+    plan.cutover_window = { start: new Date(Date.now() + 86_400_000).toISOString(), end: new Date(Date.now() + 90_000_000).toISOString() };
+    const approver = 'approver' as const; // the component's role prop, not an ARIA role
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={approver} />, { server, token: approver });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+
+    await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01 now/i });
+    const ignore = within(dialog).getByRole('checkbox', { name: /ignore the cutover window/i });
+    expect(ignore).not.toBeChecked();
+    await user.click(ignore);
+    await user.click(within(dialog).getByRole('button', { name: /^start cutover$/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
+    expect(server.migrations.find((m) => m.id === migration.id)?.force_window).toBe(true);
+  });
+
+  it('lets an approver let a requested cutover start outside a closed window (SDD §5.4)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    migration.cutover_requested = true;
+    migration.force_window = false;
+    plan.cutover_window = { start: new Date(Date.now() + 86_400_000).toISOString(), end: new Date(Date.now() + 90_000_000).toISOString() };
+    const approver = 'approver' as const; // the component's role prop, not an ARIA role
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={approver} />, { server, token: approver });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+
+    await user.click(within(group).getByRole('button', { name: /^cut over outside the window$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /let app-billing-01 cut over outside the window/i });
+    expect(dialog).toHaveTextContent(/waits for the cutover window/i);
+    // forcing the window is not an immediate start: the rest of the gate still applies
+    expect(dialog).toHaveTextContent(/as soon as the plan, its wave and a free cutover slot allow/i);
+    expect(dialog).not.toHaveTextContent(/ignore the cutover window/i);
+    await user.click(within(dialog).getByRole('button', { name: /^cut over outside the window$/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.force_window).toBe(true));
+  });
+
   it('disables every action for viewers', () => {
     const { button } = setup('app-billing-01', 'viewer');
     for (const name of [/approve/i, /^cut over/i, /sync/i, /roll back/i, /retry/i, /cancel/i, /finalize/i]) {

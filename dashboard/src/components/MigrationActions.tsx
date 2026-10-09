@@ -14,7 +14,7 @@ import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import type { Migration, Plan, Role } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatDuration } from '../lib/format';
-import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, type MigrationActionKey } from '../lib/migrationActions';
+import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -68,7 +68,9 @@ export interface MigrationActionsProps {
  * destructive ones use the danger tone and Finalize requires typing the VM name.
  */
 export function MigrationActions({ migration: m, plan, role }: MigrationActionsProps) {
-  const availability = migrationActions(m, role);
+  const availability = migrationActions(m, role, plan);
+  // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
+  const forcing = waitsOnClosedWindow(m, plan, Date.now());
   const step = nextStep(m, plan);
   const action = useMigrationAction(m.id);
   const [open, setOpen] = useState<MigrationActionKey | null>(null);
@@ -133,7 +135,7 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
               onClick={() => show(key)}
               className={cn(destructive && key === 'cancel' && 'sm:ml-auto')}
             >
-              {LABEL[key]}
+              {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
             </Button>
           );
         })}
@@ -156,22 +158,25 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
       <ConfirmDialog
         {...common}
         open={open === 'cutover'}
-        title={`Cut over ${m.vm.name} now?`}
+        title={forcing ? `Let ${m.vm.name} cut over outside the window?` : `Cut over ${m.vm.name} now?`}
         description={
           <>
+            {forcing && plan?.cutover_window
+              ? `The cutover was requested and waits for the cutover window (${formatDateTime(plan.cutover_window.start)} → ${formatDateTime(plan.cutover_window.end)}). Confirming lets it start as soon as the plan, its wave and a free cutover slot allow. `
+              : ''}
             The source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
             {slo ? ` against an SLO of ${slo}` : ''}. This also records your approval; the migration can be rolled back until it is finalized.
           </>
         }
-        confirmLabel="Start cutover"
+        confirmLabel={forcing ? 'Cut over outside the window' : 'Start cutover'}
         onConfirm={() =>
           submit({
             action: 'cutover',
-            body: { force_window: closedWindow ? forceWindow : false, ...(comment.trim() ? { comment: comment.trim() } : {}) },
+            body: { force_window: forcing || (closedWindow && forceWindow), ...(comment.trim() ? { comment: comment.trim() } : {}) },
           })
         }
       >
-        {closedWindow && plan?.cutover_window && (
+        {closedWindow && !forcing && plan?.cutover_window && (
           <label htmlFor={forceId} className="flex min-h-11 cursor-pointer items-start gap-2.5 rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-sm">
             <input id={forceId} type="checkbox" className="mt-1 size-4 accent-accent" checked={forceWindow} onChange={(e) => setForceWindow(e.target.checked)} />
             <span>

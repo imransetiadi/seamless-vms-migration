@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
-import { PHASES, type Migration, type Phase, type Strategy } from '../api/types';
+import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { clearedByStrategyChange, clearedByValidation, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
@@ -62,6 +62,41 @@ describe('migrationActions rules', () => {
     const cutover = migrationActions(migration('awaiting_cutover', { cutover_requested: true }), 'approver').cutover;
     expect(cutover.enabled).toBe(false);
     expect(cutover.reason).toMatch(/already requested/i);
+  });
+
+  it('lets an approver force a requested cutover that waits for a closed window (SDD §5.4)', () => {
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const plan: Plan = {
+      ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+      cutover_window: { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' },
+    };
+    const requested = migration('awaiting_cutover', { cutover_requested: true, force_window: false });
+    expect(migrationActions(requested, 'approver', plan, now).cutover.enabled).toBe(true);
+    // nothing left to force: already forced, the window is open, or there is no window
+    const refused = { enabled: false, reason: expect.stringMatching(/already requested/i) };
+    expect(migrationActions({ ...requested, force_window: true }, 'approver', plan, now).cutover).toEqual(refused);
+    const open: Plan = { ...plan, cutover_window: { start: '2026-10-08T11:00:00Z', end: '2026-10-08T13:00:00Z' } };
+    expect(migrationActions(requested, 'approver', open, now).cutover).toEqual(refused);
+    expect(migrationActions(requested, 'approver', { ...plan, cutover_window: null }, now).cutover).toEqual(refused);
+    expect(migrationActions(requested, 'operator', plan, now).cutover).toEqual({ enabled: false, reason: expect.stringMatching(/approver role/i) });
+    // the next step says so, and points at the action
+    const step = nextStep(requested, plan, now);
+    expect(step.text).toMatch(/waiting for the cutover window.*an approver can let it cut over outside the window/i);
+    expect(step.action).toBe('cutover');
+    expect(nextStep(requested, open, now).action).toBeNull();
+  });
+
+  it('treats the window as closed only outside [start, end], as the API does (SDD §5.4)', () => {
+    const start = Date.parse('2026-10-09T22:00:00Z');
+    const end = Date.parse('2026-10-10T02:00:00Z');
+    const plan: Plan = {
+      ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+      cutover_window: { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' },
+    };
+    const requested = migration('awaiting_cutover', { cutover_requested: true, force_window: false });
+    const forcible = (now: number) => migrationActions(requested, 'approver', plan, now).cutover.enabled;
+    // the API's CutoverWindow.contains is start <= now <= end: both ends belong to the window
+    expect([forcible(start - 1), forcible(start), forcible(end), forcible(end + 1)]).toEqual([true, false, false, true]);
   });
 
   it('refuses Cancel once the source VM was stopped (failed → cancelled needs no downtime)', () => {

@@ -30,7 +30,14 @@ function isSingleShot(m: Migration): boolean {
   return !isWarmStrategy(m.strategy);
 }
 
-function phaseRule(m: Migration, key: MigrationActionKey): Availability {
+/** A requested cutover that waits for a closed window: an approver may let it cut over outside the window (SDD §5.4). */
+export function waitsOnClosedWindow(m: Migration, plan: Plan | null | undefined, now: number): boolean {
+  const w = plan?.cutover_window;
+  if (!m.cutover_requested || m.force_window || !w) return false;
+  return now < Date.parse(w.start) || now > Date.parse(w.end);
+}
+
+function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number): Availability {
   const ok: Availability = { enabled: true, reason: null };
   const no = (reason: string): Availability => ({ enabled: false, reason });
   switch (key) {
@@ -44,7 +51,8 @@ function phaseRule(m: Migration, key: MigrationActionKey): Availability {
         }
         return no('Cutover starts from awaiting cutover (warm) or ready (single-shot strategies).');
       }
-      return m.cutover_requested ? no('Cutover already requested — waiting for the gate (window, concurrency).') : ok;
+      if (!m.cutover_requested || waitsOnClosedWindow(m, plan, now)) return ok;
+      return no('Cutover already requested — waiting for the gate (window, concurrency).');
     }
     case 'sync':
       return m.phase === 'awaiting_cutover' ? ok : no('A delta sync can be requested only while awaiting cutover.');
@@ -77,11 +85,16 @@ function phaseRule(m: Migration, key: MigrationActionKey): Availability {
  * Which migration actions are valid now (SDD §5.1 transitions, §5.4 cutover gate, §12 roles).
  * Role gating wins so the reason names the missing role.
  */
-export function migrationActions(m: Migration, role: Role | undefined): Record<MigrationActionKey, Availability> {
+export function migrationActions(
+  m: Migration,
+  role: Role | undefined,
+  plan?: Plan | null,
+  now: number = Date.now(),
+): Record<MigrationActionKey, Availability> {
   const result = {} as Record<MigrationActionKey, Availability>;
   for (const key of MIGRATION_ACTION_ORDER) {
     const min = ACTION_MIN_ROLE[key];
-    result[key] = hasRole(role, min) ? phaseRule(m, key) : { enabled: false, reason: `Requires the ${min} role.` };
+    result[key] = hasRole(role, min) ? phaseRule(m, key, plan, now) : { enabled: false, reason: `Requires the ${min} role.` };
   }
   return result;
 }
@@ -92,7 +105,7 @@ export interface NextStep {
 }
 
 /** One sentence that tells the operator what happens next, and the action that moves it on. */
-export function nextStep(m: Migration, plan: Plan | null | undefined): NextStep {
+export function nextStep(m: Migration, plan: Plan | null | undefined, now: number = Date.now()): NextStep {
   switch (m.phase) {
     case 'pending':
       return { text: 'Waiting for plan validation.', action: null };
@@ -124,6 +137,9 @@ export function nextStep(m: Migration, plan: Plan | null | undefined): NextStep 
     case 'syncing':
       return { text: 'Delta passes run until the change rate converges.', action: null };
     case 'awaiting_cutover':
+      if (waitsOnClosedWindow(m, plan, now)) {
+        return { text: 'Cutover requested — waiting for the cutover window; an approver can let it cut over outside the window.', action: 'cutover' };
+      }
       if (m.cutover_requested) return { text: 'Cutover requested — waiting for the window or a free cutover slot.', action: null };
       return {
         text:
