@@ -867,6 +867,65 @@ async def test_retry_after_failure(tmp_path, store):
         await h.orch.retry(mid, "bayu")
 
 
+async def test_tick_relaunches_a_crashed_driver(tmp_path, store):
+    """SDD §8: a driver that dies outside a step (here: an error while it handles the cutover, as
+    a database error while persisting would) is resumed by the tick instead of leaving the
+    migration in cutover without a driver until a restart, and the crash is a migration.error."""
+    h, plan = await setup(tmp_path, store, [vm(1, "web-01")], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    original = h.orch._do_cutover
+    calls = {"n": 0}
+
+    async def crash_once(m):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        return await original(m)
+
+    h.orch._do_cutover = crash_once
+    await h.orch.start()
+    await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert calls["n"] >= 2
+    crashes = [
+        e
+        for e in h.store.events(since_seq=0, limit=100000)
+        if e.kind == "migration.error" and (e.data or {}).get("step") == "driver"
+    ]
+    assert len(crashes) == 1 and crashes[0].migration_id == mid
+    assert "database is locked" in crashes[0].data["message"]
+
+
+async def test_crashed_driver_relaunch_backs_off(tmp_path, store):
+    """A driver that keeps crashing is relaunched with a growing backoff (2^n x tick_s), not on
+    every tick, and each crash is reported with its count (SDD §8)."""
+    h, plan = await setup(tmp_path, store, [vm(1, "web-01")], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    calls = {"n": 0}
+
+    async def always_crash(m):
+        calls["n"] += 1
+        raise RuntimeError("database is locked")
+
+    h.orch._do_cutover = always_crash
+    await h.orch.start()
+    await h.wait_phase(mid, P.cutover)
+    await asyncio.sleep(60 * h.settings.tick_s)  # 60 ticks: one relaunch per tick would be ~60
+    await h.orch.stop()
+    assert 2 <= calls["n"] <= 10, calls
+    counts = [
+        e.data["crashes"]
+        for e in h.store.events(since_seq=0, limit=100000)
+        if e.kind == "migration.error" and (e.data or {}).get("step") == "driver"
+    ]
+    assert counts == list(range(1, len(counts) + 1)) and len(counts) == calls["n"]
+    assert (await h.migration(mid)).phase == P.cutover
+
+
 async def test_finalize_requires_confirm_name(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1, "web-01")], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")

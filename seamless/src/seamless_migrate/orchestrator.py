@@ -162,6 +162,8 @@ class Orchestrator:
         )
         self._locks: dict[str, asyncio.Lock] = {}
         self._drivers: dict[str, asyncio.Task[None]] = {}
+        #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
+        self._driver_crashes: dict[str, tuple[int, float]] = {}
         self._steps: dict[str, asyncio.Task[Any]] = {}
         self._prestage_done: set[str] = set()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
@@ -982,6 +984,7 @@ class Orchestrator:
             log.warning("orchestrator tick took %.3f s (budget %.3f s)", seconds, budget)
 
     async def tick(self) -> None:
+        await self._resume_orphans()
         all_plans = await self.db.list("plan", Plan)
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
@@ -1185,6 +1188,40 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # migration driver
+    async def _resume_orphans(self) -> None:
+        """SDD §8: drive again a migration in a resumable phase whose driver task died — after a
+        backoff while it keeps crashing, and never while its step task still runs."""
+        now = time.monotonic()
+        resumable = await self.db.list("migration", Migration, phase=list(fsm.RESUMABLE_PHASES))
+        for m in resumable:
+            driver, step = self._drivers.get(m.id), self._steps.get(m.id)
+            if (driver is not None and not driver.done()) or (step is not None and not step.done()):
+                continue
+            crashes, at = self._driver_crashes.get(m.id, (0, 0.0))
+            if crashes and now - at < min(300.0, 2**crashes * self.settings.tick_s):
+                continue
+            self._launch(m.id)
+
+    async def _report_driver_crash(self, mid: str, exc: Exception, crashes: int) -> None:
+        """Best effort: the store may be what failed."""
+        message = redact(str(exc)).strip() or type(exc).__name__
+        try:
+            m, _ = await self._load(mid)
+            await self._emit(
+                "migration.error",
+                f"{m.vm.name}: the migration driver stopped unexpectedly ({type(exc).__name__}); "
+                "it resumes from its checkpoint",
+                migration=m,
+                data={
+                    "step": "driver",
+                    "error_class": type(exc).__name__,
+                    "message": message[:1000],
+                    "crashes": crashes,
+                },
+            )
+        except Exception:
+            log.exception("could not report the crash of the driver of %s", mid)
+
     def _launch(self, mid: str) -> None:
         if self._stopping:
             return
@@ -1206,14 +1243,18 @@ class Orchestrator:
                 m, _ = await self._load(mid)
                 handler = handlers.get(m.phase)
                 if handler is None:
+                    self._driver_crashes.pop(mid, None)
                     return
                 await handler(m)
         except asyncio.CancelledError:
             raise
         except NotFound:
             return
-        except Exception:
+        except Exception as exc:
             log.exception("driver of %s crashed", mid)
+            crashes = self._driver_crashes.get(mid, (0, 0.0))[0] + 1
+            self._driver_crashes[mid] = (crashes, time.monotonic())
+            await self._report_driver_crash(mid, exc, crashes)
         finally:
             if self._drivers.get(mid) is asyncio.current_task():
                 del self._drivers[mid]
