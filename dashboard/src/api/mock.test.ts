@@ -196,6 +196,54 @@ describe('mock API', () => {
     expect(changed).toMatchObject({ require_approval: false, cutover_window: window });
   });
 
+  it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === first.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const second = await client.post<Plan>('/plans', {
+      name: 'Second wave',
+      source_provider_id: first.source_provider_id,
+      destination_provider_id: first.destination_provider_id,
+      vm_ids: [held.vm.source_id],
+    });
+    await expect(client.post(`/plans/${second.id}/validate`)).rejects.toMatchObject({
+      status: 409,
+      code: 'conflict',
+      message: expect.stringContaining(`${held.vm.name} (plan "${first.name}", ${held.phase})`),
+    });
+    // a rolled-back migration lets its VM go; its retry would take it back
+    held.phase = 'rolled_back';
+    const report = await client.post<{ migrations: { vm_name: string }[] }>(`/plans/${second.id}/validate`);
+    expect(report.migrations.map((m) => m.vm_name)).toEqual([held.vm.name]);
+    await expect(client.post(`/migrations/${held.id}/retry`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining('Second wave') });
+    expect(held.phase).toBe('rolled_back');
+  });
+
+  it('lets a never-validated plan hold nothing, and a retry go ahead once the other plan lets the VM go (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const first = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.find((m) => m.plan_id === first.id)!;
+    const second = await client.post<Plan>('/plans', {
+      name: 'Second wave',
+      source_provider_id: first.source_provider_id,
+      destination_provider_id: first.destination_provider_id,
+      vm_ids: [mine.vm.source_id],
+    });
+    // the second plan has not been validated: its migration (created with the plan) holds nothing
+    await client.post(`/plans/${first.id}/validate`);
+    await expect(client.post(`/plans/${second.id}/validate`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining(first.name) });
+
+    // the first plan's migration rolls back and the second plan takes the VM; once the second
+    // plan cancels its migration, the first plan's retry goes ahead
+    mine.phase = 'rolled_back';
+    await client.post(`/plans/${second.id}/validate`);
+    const theirs = server.migrations.find((m) => m.plan_id === second.id)!;
+    await expect(client.post(`/migrations/${mine.id}/retry`)).rejects.toMatchObject({ status: 409 });
+    await client.post(`/migrations/${theirs.id}/cancel`, { reason: 'back to the first plan' });
+    await client.post(`/migrations/${mine.id}/retry`);
+    expect(mine.phase).toBe('ready');
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');

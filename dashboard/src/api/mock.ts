@@ -91,6 +91,12 @@ export interface MockServerOptions {
   seed?: number;
 }
 
+/**
+ * Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4). The mock
+ * creates a plan's migrations with the plan, so a never-validated one (`pending`) holds nothing
+ * either — in the API it does not exist before the plan is validated.
+ */
+const RELEASES_VM: ReadonlySet<Phase> = new Set(['pending', 'cancelled', 'finalized', 'rolled_back']);
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
 const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
@@ -866,8 +872,25 @@ export class MockServer {
     return ok(plan);
   }
 
+  /** `name (plan "…", phase)` for each VM a migration of another plan with the same source holds (SDD §5.4). */
+  private heldElsewhere(plan: Plan, vmIds: readonly string[]): string[] {
+    const others = new Map(this.plans.filter((p) => p.id !== plan.id && p.source_provider_id === plan.source_provider_id).map((p) => [p.id, p]));
+    return this.migrations
+      .filter((m) => others.has(m.plan_id) && vmIds.includes(m.vm.source_id) && !RELEASES_VM.has(m.phase))
+      .map((m) => `${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.phase})`)
+      .sort();
+  }
+
   private validatePlan(me: Me, plan: Plan): MockResponse {
     if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    const held = this.heldElsewhere(plan, plan.vm_ids);
+    if (held.length) {
+      throw new HttpError(
+        409,
+        'conflict',
+        `${held.length} VM(s) already have a migration in another plan: ${held.slice(0, 10).join(', ')}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
+      );
+    }
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     for (const m of mine) {
       if (m.phase === 'pending' || m.phase === 'blocked' || m.phase === 'ready') {
@@ -959,8 +982,10 @@ export class MockServer {
         record('rollback requested', { reason });
         break;
       }
-      case 'retry':
+      case 'retry': {
         if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
+        const [holder] = this.heldElsewhere(this.plan(m.plan_id), [m.vm.source_id]);
+        if (holder) throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: a migration in another plan holds the VM: ${holder}; finish, roll back or cancel it there first`);
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
         if (!m.downtime_started_at || m.downtime_ended_at) {
@@ -976,6 +1001,7 @@ export class MockServer {
         m.bytes_transferred = 0;
         record('retry requested');
         break;
+      }
       case 'cancel': {
         if (m.downtime_started_at && !m.downtime_ended_at) {
           // SDD §5.1: never leave a stopped source behind

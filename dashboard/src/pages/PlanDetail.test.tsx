@@ -1,7 +1,8 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { createTestServer, renderWithApp } from '../test/utils';
+import type { Plan } from '../api/types';
+import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
 function renderPlan(planId: string, token = 'operator') {
@@ -61,6 +62,25 @@ describe('PlanDetail', () => {
     await user.click(await actionButton(/validate/i));
     expect(await screen.findByText(/validation finished/i)).toBeInTheDocument();
     expect(await actionButton(/^start/i)).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('says which plan holds a VM when validation is refused (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === first.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const second = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Second wave',
+      source_provider_id: first.source_provider_id,
+      destination_provider_id: first.destination_provider_id,
+      vm_ids: [held.vm.source_id],
+    });
+    const user = userEvent.setup();
+    renderWithApp(<PlanDetail />, { route: `/plans/${second.id}`, path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/validate/i));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/the plan action failed/i);
+    expect(alert).toHaveTextContent(`${held.vm.name} (plan "${first.name}", ${held.phase})`);
   });
 
   it('keeps every plan action disabled for viewers, with the reason', async () => {
