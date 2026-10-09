@@ -39,6 +39,7 @@ DEMO_PROVIDERS = (
         role=ProviderRole.source,
         endpoint="https://overcloud.dc1.example.com:13000/v3",
         cloud="rhosp17",
+        distribution="rhosp",
         conversion_host=ConversionHostConfig(
             name="os-migrate-conv-src", flavor="m1.large", external_network="public"
         ),
@@ -50,6 +51,7 @@ DEMO_PROVIDERS = (
         role=ProviderRole.source,
         endpoint="https://vcenter.dc2.example.com/sdk",
         credentials_secret="vcenter-dc2",
+        distribution="vmware",
     ),
     Provider(
         id="rhoso18",
@@ -58,6 +60,7 @@ DEMO_PROVIDERS = (
         role=ProviderRole.destination,
         endpoint="https://keystone-public-openstack.apps.ocp.example.com/v3",
         cloud="rhoso",
+        distribution="rhoso",
         conversion_host=ConversionHostConfig(
             name="os-migrate-conv-dst",
             flavor="m1.large",
@@ -117,6 +120,15 @@ async def seed_demo(
     for provider in DEMO_PROVIDERS:
         if provider.id not in existing_providers:
             await db.put("provider", provider, expected_version=0)
+            continue
+        # demo databases seeded before SDD §4.2 Distribution existed get the platform preset
+        stored, version = await db.get_versioned("provider", provider.id, Provider)
+        if stored.distribution is None and provider.distribution is not None:
+            await db.put(
+                "provider",
+                stored.model_copy(update={"distribution": provider.distribution}),
+                expected_version=version,
+            )
     existing_plans = {p.name for p in await db.list("plan", Plan)}
     for plan in await _plans(settings):
         if plan.name in existing_plans:
