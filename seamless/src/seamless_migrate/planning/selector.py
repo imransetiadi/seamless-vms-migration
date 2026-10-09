@@ -13,6 +13,7 @@ from ..domain.enums import (
     strategies_for,
 )
 from ..domain.models import Estimate, Finding, Plan, VMRef
+from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
 
 #: Two downtimes tie when they differ by less than 10 % (of the smaller one) or less than 60 s.
 TIE_RELATIVE = 0.10
@@ -86,6 +87,7 @@ def eligibility(
             )
         if multiattach:
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
+        handover.extend(_storage_reasons(vm, plan, src_caps, dst_caps))
         if not src_caps.get("admin"):
             handover.append("admin rights are required on the source cloud")
         if not dst_caps.get("admin"):
@@ -96,6 +98,35 @@ def eligibility(
             for reasons in out.values():
                 reasons.append(f"blocked by finding {finding.code}")
     return out
+
+
+def _storage_reasons(
+    vm: VMRef, plan: Plan, src_caps: Mapping[str, Any], dst_caps: Mapping[str, Any]
+) -> list[str]:
+    """Per-volume driver-family checks of a handover (SDD §7.3.1), where the pools are known.
+
+    A disk whose pool the source does not list is left to the executor's check before the stop.
+    """
+    families = {
+        str(b.get("pool")): str(b.get("family"))
+        for b in src_caps.get("storage_backends") or []
+        if isinstance(b, Mapping)
+    }
+    dst_backends = [b for b in dst_caps.get("storage_backends") or [] if isinstance(b, Mapping)]
+    reasons = []
+    for disk in vm.disks:
+        if disk.kind != "volume" or not disk.pool or disk.pool not in families:
+            continue
+        target = plan.handover.backend_map.get(disk.volume_type or "")
+        family = families[disk.pool]
+        try:
+            if family not in SUPPORTED:
+                resolve_destination(family, None, target or "", [])
+            elif target and dst_backends:
+                resolve_destination(family, split_host(disk.pool)[1], target, dst_backends)
+        except StorageError as exc:
+            reasons.append(f"{disk.name or disk.id}: {exc}")
+    return reasons
 
 
 def tie_set(estimates: Sequence[Estimate]) -> list[Strategy]:

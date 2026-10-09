@@ -168,3 +168,63 @@ def test_no_eligible_strategy_falls_back_to_simplest():
     estimates = [est(Strategy.cold, 100, eligible=False), est(Strategy.warm, 50, eligible=False)]
     strategy, reason = select_strategy(vm, estimates, make_plan())
     assert strategy == Strategy.cold and "no eligible" in reason
+
+
+def _storage(*entries):
+    return [
+        {"pool": pool, "vendor": None, "protocol": None, "family": fam} for pool, fam in entries
+    ]
+
+
+SRC_NETAPP = {
+    "admin": True,
+    "storage_backends": _storage(
+        ("overcloud@ontap_nfs#192.0.2.5:/cinder_vol", "netapp_nfs"),
+        ("overcloud@ontap_nfs#192.0.2.5:/cinder_gold", "netapp_nfs"),
+        ("overcloud@lvm#lvm", "other"),
+    ),
+}
+DST_NETAPP = {
+    "admin": True,
+    "storage_backends": _storage(("hostgroup@ontap_nfs#10.20.0.5:/cinder_vol", "netapp_nfs")),
+}
+
+
+def _netapp_vm(pool):
+    return make_vm(
+        disks=[
+            make_disk(id="v1", volume_type="netapp-nfs", device="/dev/vda", pool=pool),
+        ]
+    )
+
+
+NETAPP_PLAN = make_plan(
+    handover=HandoverConfig(enabled=True, backend_map={"netapp-nfs": "hostgroup@ontap_nfs"})
+)
+
+
+def test_handover_ineligible_on_unsupported_backend_family():
+    vm = _netapp_vm("overcloud@lvm#lvm")
+    reasons = eligibility(vm, ProviderKind.openstack, NETAPP_PLAN, SRC_NETAPP, DST_NETAPP)
+    assert any(
+        "unsupported storage family 'other'" in r for r in reasons[Strategy.storage_handover]
+    )
+    # cold and warm do not depend on the backend
+    assert not any("storage family" in r for r in reasons[Strategy.cold])
+
+
+def test_handover_ineligible_when_netapp_pool_has_no_destination():
+    vm = _netapp_vm("overcloud@ontap_nfs#192.0.2.5:/cinder_gold")
+    reasons = eligibility(vm, ProviderKind.openstack, NETAPP_PLAN, SRC_NETAPP, DST_NETAPP)
+    [reason] = [r for r in reasons[Strategy.storage_handover] if "v1" in r]
+    assert "no pool for the export /cinder_gold" in reason
+
+
+def test_handover_eligible_on_netapp_nfs_with_matching_export():
+    vm = _netapp_vm("overcloud@ontap_nfs#192.0.2.5:/cinder_vol")
+    reasons = eligibility(vm, ProviderKind.openstack, NETAPP_PLAN, SRC_NETAPP, DST_NETAPP)
+    assert reasons[Strategy.storage_handover] == []
+    # a pool the source does not list (stale inventory, no admin at planning) is checked at cutover
+    unknown = _netapp_vm("overcloud@elsewhere#x")
+    reasons = eligibility(unknown, ProviderKind.openstack, NETAPP_PLAN, SRC_NETAPP, DST_NETAPP)
+    assert reasons[Strategy.storage_handover] == []
