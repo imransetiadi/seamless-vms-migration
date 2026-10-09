@@ -511,9 +511,9 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 | S-04 | NBD read-only (SEC-01, SEC-05) | `ps -o args= -C qemu-nbd` shows `--read-only`; `qemu-io -c 'write -P 0xff 0 4096' nbd://127.0.0.1:<port>` | write fails with a read-only error; for nbdkit on conversion hosts the same (`--readonly`, SEC-05 fixed) |
 | S-05 | No credentials in DB/API/logs | run a migration with canary strings (`CANARY-7f3a91`) as cloud password and vCenter password, then search | zero hits in `pg_dump`, API responses (`/providers`, `/migrations`, `/events`), `compose logs`/pod logs, and `/data` after the run |
 | S-06 | Secret temp files | during a run list `secrets.yml` and `clouds.yaml` modes; after the run list again | mode 0600 while present; deleted after every run, including failed ones (`test_secrets_file_0600_and_deleted_after_run`) |
-| S-07 | API documentation exposure (Security.md R-04) | unauthenticated `GET /docs`, `/redoc`, `/openapi.json`, `/api/docs`, `/api/openapi.json` on a non-demo stack (`test_security_headers_and_api_docs_exposure`) | `/docs`, `/redoc`, `/openapi.json` 404; `/api/docs` and `/api/openapi.json` 401 without a token, 200 for a viewer (public in demo only) |
+| S-07 | API documentation exposure (Security.md R-04) | unauthenticated `GET /docs`, `/redoc`, `/openapi.json`, `/api/docs`, `/api/openapi.json` on a non-demo stack (`test_security_headers_and_api_docs_exposure`, `test_disabled_api_docs_paths_answer_404_where_the_dashboard_is_served`) | `/docs`, `/redoc`, `/openapi.json` 404 with the error envelope, also where the dashboard is served (the SPA fallback does not answer them); `/api/docs` and `/api/openapi.json` 401 without a token, 200 for a viewer (public in demo only) |
 | S-08 | SSRF and traversal | `POST /providers` with `endpoint=http://169.254.169.254/` and `credentials_secret: "../../etc/passwd"`, `ca_cert_path: "/etc/shadow"` | a traversal secret name is rejected (`security.secrets.resolve` name check, `test_secret_name_rejects_path_traversal`); metadata endpoint unreachable under the NetworkPolicy; `ca_cert_path` is admin-only and unvalidated (document); `test_secret_name_rejects_path_traversal` pins the name check |
-| S-09 | Input fuzzing | `schemathesis run http://127.0.0.1:8080/openapi.json -H "Authorization: Bearer $VIEWER" --checks all` (demo) | no 5xx, no stack traces, error envelope everywhere |
+| S-09 | Input fuzzing | `schemathesis run http://127.0.0.1:8080/api/openapi.json -H "Authorization: Bearer $VIEWER" --checks all` (demo; the API description lives under `/api`, `/openapi.json` is 404 — S-07) | no 5xx, no stack traces, error envelope everywhere |
 | S-10 | SSH host-key policy (SEC-02) | start a rogue `sshd` with a different host key at the conversion host's address | **target:** connection refused; **baseline 0.1.0:** connects — record as open finding |
 | S-11 | Link-key restrictions (SEC-06) | from the destination host run `ssh <src> id` and `ssh -L` to an arbitrary port with the link key | **target:** only the permitted forwards work, no shell; **baseline:** shell works — open |
 | S-12 | Helper script handling (R-02) | `ls -l /tmp/seamless-blocksync-*` during a pass; as another unprivileged user try to replace or delete it | the sticky bit blocks replacement and deletion by other users (baseline); **target:** installed 0700 in a private directory and checksum-verified before `sudo python3` |
@@ -534,7 +534,7 @@ ZAP (S-23) — run only against the **demo** stack, never against one connected 
 
 ```bash
 docker --context colima-seamless run --rm --network seamless_frontend -v "$PWD:/zap/wrk:rw" \
-  ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t http://seamless:8080/openapi.json -f openapi -S \
+  ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t http://seamless:8080/api/openapi.json -f openapi -S \
   -r zap-report.html -z "-config replacer.full_list(0).description=auth -config replacer.full_list(0).enabled=true \
   -config replacer.full_list(0).matchtype=REQ_HEADER -config replacer.full_list(0).matchstr=Authorization \
   -config replacer.full_list(0).regex=false -config replacer.full_list(0).replacement='Bearer ${VIEWER}'"
