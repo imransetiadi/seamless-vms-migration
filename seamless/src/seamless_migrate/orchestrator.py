@@ -344,7 +344,9 @@ class Orchestrator:
             try:
                 vms.append(await impl.get_vm(vm_id))
             except ProviderError as exc:
-                raise BadRequest(f"VM {vm_id!r}: {exc}") from None
+                # still a provider error: the API answers 502 with the redacted message (SDD §12),
+                # never a 400 carrying the SDK's raw text
+                raise ProviderError(f"VM {vm_id!r}: {exc}") from None
         return vms
 
     # ------------------------------------------------------------------------------------------
@@ -403,7 +405,7 @@ class Orchestrator:
             src_inv = await src_impl.inventory()
             dst_inv = await dst_impl.inventory()
         except ProviderError as exc:
-            raise BadRequest(f"inventory failed: {exc}") from None
+            raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
         vms = await self._vms(plan, src_impl)
         existing = {
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)

@@ -613,3 +613,40 @@ def test_auto_waves_takes_a_wave_size_from_1_to_1000(api):
         assert error["message"] == f"max_wave_size: Input should be {bound}"
     planned = api.post(url, Role.operator, json={"max_wave_size": 1000})
     assert planned.status_code == 200, planned.text
+
+
+def test_provider_failures_while_planning_answer_502_redacted(api, monkeypatch):
+    """SDD §12: a provider failure answers 502 provider_error with the redacted message — also
+    while validating (inventory) or planning waves (get_vm), never a 400 carrying the SDK's raw
+    text, which may hold endpoint URLs or credentials."""
+    from seamless_migrate.providers.base import ProviderError
+
+    body = {
+        "name": "Provider down",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api),
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    secret = "auth failed OS_PASSWORD=hunter2 at https://k:5000"
+
+    class Broken:
+        async def check(self):
+            return {}
+
+        async def inventory(self):
+            raise ProviderError(f"src-osp: {secret}")
+
+        async def get_vm(self, vm_id):
+            raise ProviderError(f"src-osp: {secret}")
+
+    monkeypatch.setattr(api.client.app.state.services.providers, "get", lambda p: Broken())
+    calls = (
+        (f"/api/v1/plans/{plan['id']}/validate", None),
+        (f"/api/v1/plans/{plan['id']}/waves/auto", {"max_wave_size": 5}),
+    )
+    for path, payload in calls:
+        res = api.post(path, Role.operator, json=payload)
+        assert res.status_code == 502, (path, res.text)
+        assert res.json()["error"]["code"] == "provider_error"
+        assert "hunter2" not in res.text and "auth failed" in res.text
