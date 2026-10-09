@@ -62,3 +62,6 @@ deploy/openshift/secrets/
 
 # local check scratch (make seamless-check)
 .cache/
+
+# macOS Finder metadata (written into every folder Finder opens)
+.DS_Store

@@ -116,6 +116,21 @@ def test_every_secret_path_is_git_ignored():
     assert tracked == [], f"git would track: {tracked}"
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_finder_metadata_is_git_ignored():
+    """macOS Finder writes ``.DS_Store`` into every folder it opens: ``git status`` must not offer
+    them for a ``git add -A``."""
+    tracked = [
+        path
+        for path in (".DS_Store", "dashboard/.DS_Store", "scripts/_skeleton_role_/.DS_Store")
+        if subprocess.run(
+            ["git", "-C", str(ROOT), "check-ignore", "-q", "--no-index", path], check=False
+        ).returncode
+        != 0
+    ]
+    assert tracked == [], f"git would track: {tracked}"
+
+
 def test_auth_file_generation_never_prints_credentials():
     """``make generate-auth-files`` writes cloud credentials to a 0600 file, never to the log."""
     recipe = [
