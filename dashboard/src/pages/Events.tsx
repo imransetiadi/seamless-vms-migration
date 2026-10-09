@@ -2,6 +2,7 @@ import {
   Activity,
   ArrowRightLeft,
   Bot,
+  Download,
   BrainCircuit,
   CircleX,
   ClipboardList,
@@ -153,6 +154,21 @@ export default function Events() {
     });
   }, [items, category, query, showProgress]);
 
+  /** The filtered audit events as JSON lines, oldest first — the format of `seamless events export`. */
+  const download = () => {
+    const events = filtered
+      .map(({ event }) => event)
+      .filter((event) => event.seq > 0)
+      .sort((a, b) => a.seq - b.seq);
+    const blob = new Blob(events.map((event) => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `seamless-events-${new Date().toISOString().slice(0, 19).replace(/:/g, '')}.jsonl`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const resume = () => {
     setLive((l) => [...l, ...held].slice(-MAX_LIVE));
     setHeld([]);
@@ -171,15 +187,20 @@ export default function Events() {
         title="Events"
         description="The audit trail of every plan, migration, advisor and provider action, followed live."
         actions={
-          paused ? (
-            <Button size="lg" variant="primary" icon={Play} onClick={resume}>
-              Resume ({held.length} new)
+          <div className="flex flex-wrap gap-2">
+            <Button size="lg" icon={Download} onClick={download} disabledReason={filtered.length ? null : 'No events match the filters.'}>
+              Download shown events
             </Button>
-          ) : (
-            <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
-              Pause live updates
-            </Button>
-          )
+            {paused ? (
+              <Button size="lg" variant="primary" icon={Play} onClick={resume}>
+                Resume ({held.length} new)
+              </Button>
+            ) : (
+              <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
+                Pause live updates
+              </Button>
+            )}
+          </div>
         }
       />
 

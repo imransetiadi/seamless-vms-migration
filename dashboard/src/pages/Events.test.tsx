@@ -1,6 +1,6 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { LiveContext, LiveEventHub } from '../api/live';
 import type { MockServer } from '../api/mock';
 import { renderWithApp } from '../test/utils';
@@ -97,5 +97,40 @@ describe('Events page', () => {
     await user.selectOptions(screen.getByLabelText('Category'), 'all');
     await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'legacy-rhel6-app');
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
+  });
+
+  it('downloads the shown events as JSON lines, oldest first, like `seamless events export`', async () => {
+    const user = userEvent.setup();
+    const blobs: Blob[] = [];
+    const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      blobs.push(b as Blob);
+      return 'blob:events';
+    });
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    try {
+      renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
+      const list = await screen.findByRole('list', { name: /events, newest first/i });
+      await within(list).findByText(/paused: vCenter degraded/i);
+      await user.selectOptions(screen.getByLabelText('Category'), 'security');
+      const shown = within(list).getAllByRole('listitem').length;
+
+      await user.click(screen.getByRole('button', { name: /download shown events/i }));
+      expect(click).toHaveBeenCalledTimes(1);
+      const text = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsText(blobs[0]!);
+      });
+      const lines = text.trim().split('\n').map((l) => JSON.parse(l) as { seq: number; kind: string });
+      expect(lines).toHaveLength(shown);
+      expect(lines.every((e) => e.kind.startsWith('auth.'))).toBe(true);
+      expect(lines.map((e) => e.seq)).toEqual([...lines.map((e) => e.seq)].sort((a, b) => a - b));
+      expect(blobs[0]!.type).toBe('application/x-ndjson');
+    } finally {
+      create.mockRestore();
+      revoke.mockRestore();
+      click.mockRestore();
+    }
   });
 });
