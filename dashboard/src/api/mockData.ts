@@ -1047,6 +1047,7 @@ export function buildFixtures(now: number): Fixtures {
         bytes_total: bytesTotal,
         bytes_transferred: Math.round((bytesTotal * progress) / 100),
         sync_passes: syncPasses,
+        sync_bytes_dropped: 0,
         estimate: chosen,
         estimates,
         // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not

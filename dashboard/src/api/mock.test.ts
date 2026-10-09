@@ -210,6 +210,51 @@ describe('mock API', () => {
     expect(again.downtime_started_at).toBe(stoppedAt);
   });
 
+  it('keeps the first max_sync_passes and the latest 20 sync passes of a long wait, like the API (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const m = byPhase(server, 'awaiting_cutover');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    // the cutover gate stays closed, so every requested sync is one more keep-warm pass
+    plan.auto_cutover = false;
+    m.cutover_requested = false;
+    const transferred = new Map<number, number>();
+    const record = () => m.sync_passes.forEach((p) => transferred.set(p.number, p.bytes_transferred));
+    record();
+    for (let i = 0; i < plan.max_sync_passes + 25; i++) {
+      await client.post(`/migrations/${m.id}/sync`, {});
+      for (let t = 0; t < 200 && m.phase !== 'awaiting_cutover'; t++) server.tick();
+      expect(m.phase).toBe('awaiting_cutover');
+      record();
+    }
+
+    // pass numbers keep counting; the list holds the first max_sync_passes and the latest 20
+    const last = transferred.size;
+    expect([...transferred.keys()]).toEqual(Array.from({ length: last }, (_, i) => i + 1));
+    const kept = [...Array.from({ length: plan.max_sync_passes }, (_, i) => i + 1), ...Array.from({ length: 20 }, (_, i) => last - 19 + i)];
+    expect(m.sync_passes.map((p) => p.number)).toEqual(kept);
+    // the dropped passes' bytes stay counted, on the migration and in the stats
+    const dropped = [...transferred].filter(([n]) => !kept.includes(n)).reduce((sum, [, b]) => sum + b, 0);
+    expect(dropped).toBeGreaterThan(0);
+    expect(m.sync_bytes_dropped).toBe(dropped);
+    const others = server.migrations
+      .filter((x) => x.id !== m.id)
+      .reduce((sum, x) => sum + x.sync_bytes_dropped + x.sync_passes.reduce((s, p) => s + p.bytes_transferred, 0) + (x.sync_passes.length ? 0 : x.bytes_transferred), 0);
+    const all = [...transferred.values()].reduce((sum, b) => sum + b, 0);
+    const stats = await client.get<{ bytes_transferred: number }>('/stats');
+    expect(stats.bytes_transferred).toBe(others + all);
+
+    // the final pass of the cutover is kept the same way
+    plan.status = 'running';
+    plan.cutover_window = null;
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    await approver.post(`/migrations/${m.id}/cutover`, {});
+    for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
+    expect(m.phase).toBe('verifying');
+    expect(m.sync_passes.map((p) => p.number)).toEqual([...kept.slice(0, plan.max_sync_passes), ...kept.slice(plan.max_sync_passes + 1), last + 1]);
+    expect(m.sync_passes.at(-1)?.kind).toBe('final');
+    expect(m.sync_bytes_dropped).toBe(dropped + transferred.get(last - 19)!);
+  });
+
   it('refuses to edit or re-plan the waves while a migration is in flight (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

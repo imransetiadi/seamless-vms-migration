@@ -101,6 +101,15 @@ function holdersText(held: Map<string, string[]>, limit = 10): string {
   const rest = entries.length - limit;
   return entries.slice(0, limit).join(', ') + (rest > 0 ? ` and ${rest} more` : '');
 }
+/** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4), as in the API. */
+const SYNC_PASSES_LATEST = 20;
+/** Drop the oldest passes between the first `keepFirst` and the latest 20; their bytes move to `sync_bytes_dropped`. */
+function keepSyncHistory(m: Migration, keepFirst: number): void {
+  const excess = m.sync_passes.length - keepFirst - SYNC_PASSES_LATEST;
+  if (excess <= 0) return;
+  const dropped = m.sync_passes.splice(keepFirst, excess);
+  m.sync_bytes_dropped += dropped.reduce((sum, p) => sum + p.bytes_transferred, 0);
+}
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
 const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
@@ -243,7 +252,7 @@ export class MockServer {
 
   private startPass(m: Migration, kind: SyncPass['kind']): SyncPass {
     const pass: SyncPass = {
-      number: m.sync_passes.length + 1,
+      number: (m.sync_passes.at(-1)?.number ?? 0) + 1,
       kind,
       started_at: new Date(this.now()).toISOString(),
       ended_at: null,
@@ -283,6 +292,7 @@ export class MockServer {
     pass.bytes_scanned = m.vm.disk_bytes;
     pass.bytes_changed = target;
     pass.bytes_transferred = Math.round(target * 0.98);
+    keepSyncHistory(m, plan.max_sync_passes);
     this.emit({
       kind: 'migration.sync_pass',
       plan_id: m.plan_id,
@@ -349,6 +359,7 @@ export class MockServer {
       pass.bytes_scanned = m.vm.disk_bytes;
       pass.bytes_changed = m.bytes_total;
       pass.bytes_transferred = m.bytes_total;
+      keepSyncHistory(m, plan.max_sync_passes);
       this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: final pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { pass } });
     }
     m.destination_server_id = `${hex(this.rand, 8)}-${hex(this.rand, 4)}-4${hex(this.rand, 3)}-a${hex(this.rand, 3)}-${hex(this.rand, 12)}`;
@@ -893,6 +904,7 @@ export class MockServer {
       bytes_total: vm.used_bytes,
       bytes_transferred: 0,
       sync_passes: [],
+      sync_bytes_dropped: 0,
       estimate: null,
       estimates: [],
       observed_scan_bps: null,
@@ -1146,7 +1158,7 @@ export class MockServer {
       completed: mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length,
       failed: mine.filter((m) => m.phase === 'failed').length,
       in_progress: mine.filter((m) => ['validating', 'precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back'].includes(m.phase)).length,
-      bytes_transferred: mine.reduce((sum, m) => sum + m.sync_passes.reduce((s, p) => s + p.bytes_transferred, 0) + (m.sync_passes.length ? 0 : m.bytes_transferred), 0),
+      bytes_transferred: mine.reduce((sum, m) => sum + m.sync_bytes_dropped + m.sync_passes.reduce((s, p) => s + p.bytes_transferred, 0) + (m.sync_passes.length ? 0 : m.bytes_transferred), 0),
       avg_downtime_s: values.length ? Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 10) / 10 : null,
       p95_downtime_s: percentile(values, 95),
       max_downtime_s: values.length ? (values.at(-1) ?? null) : null,

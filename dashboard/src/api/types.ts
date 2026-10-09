@@ -347,6 +347,8 @@ export interface Migration {
   bytes_total: number;
   bytes_transferred: number;
   sync_passes: SyncPass[];
+  /** Bytes transferred by the passes dropped from `sync_passes` (SDD §5.4); `bytes_transferred` counts them. */
+  sync_bytes_dropped: number;
   estimate: Estimate | null;
   estimates: Estimate[];
   /** Per-stream scan throughput measured by the last delta pass (SDD §9.1 calibration), null before it. */
