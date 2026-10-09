@@ -126,6 +126,9 @@ export default function Plans() {
 
       {plans.isPending && <LoadingBlock label="Loading plans…" rows={5} />}
       {plans.error && <ErrorBanner error={plans.error} title="Plans are unavailable" onRetry={() => void plans.refetch()} />}
+      {migrations.error && (
+        <ErrorBanner error={migrations.error} title="Migration progress is unavailable" onRetry={() => void migrations.refetch()} />
+      )}
       {plans.data && plans.data.length === 0 && (
         <EmptyState
           icon={ClipboardList}
@@ -179,12 +182,17 @@ export default function Plans() {
                     </td>
                     <td className="num text-right">{p.vm_ids.length}</td>
                     <td className="hidden w-40 sm:table-cell">
-                      <div className="flex items-center gap-2">
-                        <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
-                        <span className="num shrink-0 text-xs">
-                          {pr.done}/{pr.total}
-                        </span>
-                      </div>
+                      {migrations.error ? (
+                        // progress cannot be read: say so rather than show 0 done (the banner above explains)
+                        <span className="text-xs text-muted-foreground">unknown</span>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
+                          <span className="num shrink-0 text-xs">
+                            {pr.done}/{pr.total}
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td className="num hidden whitespace-nowrap text-right lg:table-cell">{formatDuration(p.downtime_slo_s)}</td>
                     <td className="hidden whitespace-nowrap text-muted-foreground lg:table-cell">

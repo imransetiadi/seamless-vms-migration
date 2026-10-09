@@ -51,6 +51,18 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
   });
 
+  it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
+    const user = userEvent.setup();
+    const { button } = setup('legacy-rhel6-app', 'operator');
+
+    await user.click(button(/retry/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /retry legacy-rhel6-app/i });
+    expect(dialog).not.toHaveTextContent(/checkpoint/i);
+    expect(dialog).toHaveTextContent(/starts over/i);
+    // this migration failed with its source stopped: the clock keeps running (SDD §5.2)
+    expect(dialog).toHaveTextContent(/still stopped.*downtime clock keeps running/i);
+  });
+
   it('asks for a reason before rolling back', async () => {
     const user = userEvent.setup();
     const { button, server, migration } = setup('legacy-rhel6-app', 'operator');

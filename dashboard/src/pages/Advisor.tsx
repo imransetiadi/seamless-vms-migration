@@ -214,7 +214,13 @@ export default function Advisor() {
         </Panel>
 
         <Panel title="Recent advisor notes" description="Across all migrations, newest first">
-          {migrations.isPending ? <LoadingBlock rows={4} /> : <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />}
+          {migrations.isPending ? (
+            <LoadingBlock rows={4} />
+          ) : migrations.error ? (
+            <ErrorBanner error={migrations.error} title="Advisor notes are unavailable" onRetry={() => void migrations.refetch()} />
+          ) : (
+            <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />
+          )}
         </Panel>
       </div>
     </>

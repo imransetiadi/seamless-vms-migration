@@ -198,7 +198,11 @@ export function MigrationActions({ migration: m, plan, role }: MigrationActionsP
         {...common}
         open={open === 'retry'}
         title={`Retry ${m.vm.name}?`}
-        description="The migration returns to ready and runs again from its last checkpoint. Make sure the cause of the failure is fixed."
+        description={`The migration returns to ready and starts over from its first step.${
+          m.downtime_started_at && !m.downtime_ended_at
+            ? ' The source VM is still stopped: its downtime clock keeps running until the next cutover is verified.'
+            : ''
+        } Make sure the cause of the failure is fixed.`}
         confirmLabel="Retry"
         onConfirm={() => submit({ action: 'retry' })}
       />

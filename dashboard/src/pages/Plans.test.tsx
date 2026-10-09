@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp } from '../test/utils';
 import Plans from './Plans';
 
 describe('Plans page', () => {
@@ -12,6 +12,23 @@ describe('Plans page', () => {
     expect(within(table).getByText('Paused')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /new plan/i })).toHaveAttribute('aria-disabled', 'true');
   });
+
+  it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/migrations'
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Plans />, { server });
+
+    // a 5xx is retried twice with backoff before the query reports the error
+    expect(await screen.findByText(/migration progress is unavailable/i, {}, { timeout: 8000 })).toBeInTheDocument();
+    // the Done column says it does not know, rather than showing every plan at 0 done
+    const table = screen.getByRole('table');
+    expect(within(table).queryByText(/^0\/\d+$/)).not.toBeInTheDocument();
+    expect(within(table).getAllByText('unknown').length).toBeGreaterThan(0);
+  }, 15_000); // the 5xx retries take about 3 s
 
   it('summarises validation errors and moves focus to the summary', async () => {
     const user = userEvent.setup();
