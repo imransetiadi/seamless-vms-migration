@@ -18,7 +18,7 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 |---|---|---|---|
 | `cold` | OpenStack | os-migrate stop → copy over NBD/SSH → create | the whole copy |
 | `warm` | OpenStack | snapshot pre-copy while the VM runs, then a hash-based delta pass (BLAKE2b chunks) after shutdown | the final delta **plus a device scan** (the largest disk; a VM's disks scan in parallel) |
-| `storage_handover` | OpenStack on shared Ceph | Cinder unmanage → manage, no data copy | metadata operations (minutes) |
+| `storage_handover` | OpenStack on shared Ceph or NetApp ONTAP (NFS, iSCSI, FC) | Cinder unmanage → manage, no data copy | metadata operations (minutes) |
 | `vmware_cold` / `vmware_warm` | VMware | `os_migrate.vmware_migration_kit` (full copy, or CBT passes + cutover) | full copy / final CBT delta |
 
 * **One workflow for every source:** providers, plans, waves (pilot first), pre-flight findings, downtime

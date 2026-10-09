@@ -528,6 +528,7 @@ is left to the operator is the plan-level starting point, so that the very first
 |---|---|---|---|
 | Ceph RBD | O(1) | O(1) copy-on-write clone (flatten is off by default) | `snapshot_s` ≈ seconds; pass time is the scan. Preferred |
 | LVM thin | O(1) | O(1) thin snapshot | similar to RBD |
+| NetApp ONTAP (NFS, iSCSI, FC) | O(1) FlexClone file/LUN clone | O(1) clone (FlexClone license required) | similar to RBD while the FlexVol has free space and snapshot reserve; without FlexClone the driver cannot clone and the warm path fails at the first pass — use cold or storage handover. Storage handover on a shared SVM is a rename (SDD §7.3.1) |
 | LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check |
 | Image-booted VMs | — | `boot_disk_copy: true` snapshots the server to Glance and builds a volume from the image **each pass** (SDD §6.1) | minutes per pass proportional to the disk; with `boot_disk_copy: false` only data volumes sync and the destination boots from the same image name — use it whenever the image exists on the destination |
 
