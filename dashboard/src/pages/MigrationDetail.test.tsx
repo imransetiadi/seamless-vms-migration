@@ -55,6 +55,21 @@ describe('MigrationDetail', () => {
     );
   });
 
+  it('shows the transferred bytes and the disk used bytes as two figures, never one over the other (SDD §4.2, §16)', async () => {
+    const GiB = 2 ** 30;
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    // every delta pass adds: a warm migration transfers more than its disk holds
+    m.bytes_total = 110 * GiB;
+    m.bytes_transferred = 112 * GiB;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const progress = await screen.findByRole('region', { name: /^progress$/i });
+    expect(within(progress).getByRole('definition', { name: /^transferred$/i })).toHaveTextContent(/^112 GiB$/);
+    expect(within(progress).getByRole('definition', { name: /^disk used$/i })).toHaveTextContent(/^110 GiB$/);
+    expect(progress).not.toHaveTextContent('112 GiB / 110 GiB');
+  });
+
   it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
     const server = createTestServer();
     const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');

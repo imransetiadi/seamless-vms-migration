@@ -109,6 +109,8 @@ function ProgressPanel({ m }: { m: Migration }) {
   const meta = phaseMeta(m.phase);
   const active = isActivePhase(m.phase);
   const openPass = m.sync_passes.find((p) => p.ended_at === null);
+  const transferredId = useId();
+  const diskId = useId();
   return (
     <Panel title="Progress" description={meta.description}>
       <div className="flex flex-col gap-3">
@@ -118,9 +120,19 @@ function ProgressPanel({ m }: { m: Migration }) {
         </div>
         <ProgressBar value={m.progress_pct} label={`${m.vm.name} ${meta.label} progress`} tone={active ? 'progress' : meta.tone} />
         <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-          <dt className="text-muted-foreground">Transferred</dt>
-          <dd className="num text-right">
-            {formatBytes(m.bytes_transferred)} / {formatBytes(m.bytes_total)}
+          {/* two figures, never one over the other: every pass counts, so a warm migration transfers
+              more than its disk holds (SDD §4.2, §16) */}
+          <dt id={transferredId} className="text-muted-foreground">
+            Transferred
+          </dt>
+          <dd aria-labelledby={transferredId} className="num text-right">
+            {formatBytes(m.bytes_transferred)}
+          </dd>
+          <dt id={diskId} className="text-muted-foreground">
+            Disk used
+          </dt>
+          <dd aria-labelledby={diskId} className="num text-right">
+            {formatBytes(m.bytes_total)}
           </dd>
           {openPass && (
             <>
