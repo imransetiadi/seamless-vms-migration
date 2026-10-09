@@ -109,6 +109,29 @@ describe('VmTable', () => {
     expect(onSelectedChange).toHaveBeenLastCalledWith(new Set(['os-0a11', 'os-0d51', 'os-0d52', 'os-0d53']));
   });
 
+  it('says the header checkbox selects every matching VM, also those not shown yet', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onSelectedChange = vi.fn();
+    const table = (selected: Set<string>) => (
+      <VmTable vms={openstackVms} providerKind="openstack" selected={selected} onSelectedChange={onSelectedChange} pageSize={2} />
+    );
+    const { rerender } = render(table(new Set()));
+    const total = openstackVms.length;
+    // two rows are rendered of all the VMs: the status and the checkbox say so
+    expect(bodyRows()).toHaveLength(2);
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of ${total} VMs, 0 selected`);
+    await user.click(screen.getByRole('checkbox', { name: `Select all ${total} matching VMs, 2 shown` }));
+    const chosen = onSelectedChange.mock.lastCall?.[0] as Set<string>;
+    expect(chosen.size).toBe(total);
+    rerender(table(chosen));
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of ${total} VMs, ${total} selected (${total - 2} not shown)`);
+
+    // with a filter, the counts are those of the matching VMs (three db- VMs, two of them shown)
+    await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'db-');
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of 3 matching VMs (${total} in total)`);
+    expect(screen.getByRole('checkbox', { name: 'Select all 3 matching VMs, 2 shown' })).toBeInTheDocument();
+  });
+
   it('names each guest OS, flags legacy releases and filters by OS', async () => {
     const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);

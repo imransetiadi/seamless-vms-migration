@@ -141,6 +141,15 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
   const visible = sorted.slice(0, limit);
   const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all';
+  // the header checkbox acts on every matching VM, also the rows not rendered yet: the labels say so
+  const allMatchingShown = visible.length === filtered.length;
+  const visibleIds = new Set(visible.map((r) => r.vm.source_id));
+  const notShownSelected = selectable ? [...(selected ?? [])].filter((id) => !visibleIds.has(id)).length : 0;
+  const showing = allMatchingShown
+    ? `Showing ${formatNumber(filtered.length)} of ${formatNumber(vms.length)} VMs`
+    : filtered.length === vms.length
+      ? `Showing ${formatNumber(visible.length)} of ${formatNumber(vms.length)} VMs`
+      : `Showing ${formatNumber(visible.length)} of ${formatNumber(filtered.length)} matching VMs (${formatNumber(vms.length)} in total)`;
   const shownSelected = selectable ? filtered.filter((r) => selected?.has(r.vm.source_id)).length : 0;
   const allShownSelected = filtered.length > 0 && shownSelected === filtered.length;
 
@@ -242,8 +251,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
       </div>
 
       <p role="status" className="text-xs text-muted-foreground">
-        Showing {formatNumber(filtered.length)} of {formatNumber(vms.length)} VMs
+        {showing}
         {selectable && `, ${formatNumber(selected?.size ?? 0)} selected`}
+        {notShownSelected > 0 && ` (${formatNumber(notShownSelected)} not shown)`}
       </p>
 
       {filtered.length === 0 ? (
@@ -265,7 +275,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                       ref={selectAllRef}
                       type="checkbox"
                       className="size-4 cursor-pointer accent-accent"
-                      aria-label={`Select all ${filtered.length} shown`}
+                      aria-label={
+                        allMatchingShown ? `Select all ${filtered.length} shown` : `Select all ${filtered.length} matching VMs, ${visible.length} shown`
+                      }
                       checked={allShownSelected}
                       onChange={toggleAllShown}
                     />
