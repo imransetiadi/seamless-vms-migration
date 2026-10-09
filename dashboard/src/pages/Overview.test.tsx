@@ -1,7 +1,7 @@
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
 describe('Overview page (mock data)', () => {
@@ -16,14 +16,45 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
   });
 
-  it('puts running cutovers first, with their downtime clock and a link', async () => {
+  it('puts the VMs that are down right now first, with their clock and SLO budget', async () => {
     renderWithApp(<Overview />);
 
-    const cutovers = await screen.findByRole('region', { name: /active cutovers/i });
-    const link = await within(cutovers).findByRole('link', { name: 'web-03' });
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    const link = await within(down).findByRole('link', { name: 'web-03' });
     expect(link).toHaveAttribute('href', '/migrations/mig-3c1a0f9e23');
-    expect(within(cutovers).getByRole('link', { name: 'web-02' })).toBeInTheDocument();
-    expect(within(cutovers).getAllByText(/downtime/i).length).toBeGreaterThan(0);
+    expect(within(down).getByRole('link', { name: 'web-02' })).toBeInTheDocument();
+    const meter = within(down).getByRole('meter', { name: /web-03 downtime against the slo/i });
+    expect(Number(meter.getAttribute('aria-valuemax'))).toBeGreaterThan(0);
+    expect(down).toHaveTextContent(/left in the .* slo|over the slo by/i);
+  });
+
+  it('turns the clock red and says by how much once a cutover runs over its SLO', async () => {
+    const server = createTestServer();
+    const web03 = server.migrations.find((m) => m.vm.name === 'web-03');
+    const slo = server.plans.find((p) => p.id === web03?.plan_id)?.downtime_slo_s;
+    if (!web03 || !slo) throw new Error('fixture without web-03 and its plan SLO');
+    web03.phase = 'cutover';
+    web03.downtime_started_at = new Date(Date.now() - (slo + 125) * 1000).toISOString();
+    renderWithApp(<Overview />, { server });
+
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    const meter = await within(down).findByRole('meter', { name: /web-03 downtime against the slo/i });
+    expect(meter).toHaveAttribute('aria-valuenow', String(slo));
+    expect(down).toHaveTextContent(/over the slo by 2m 0[5-9]s/i);
+  });
+
+  it('says so when no VM is down, and how many wait for the cutover', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations) {
+      if (m.phase === 'cutover' || m.phase === 'verifying') m.phase = 'awaiting_cutover';
+    }
+    const waiting = server.migrations.filter((m) => m.phase === 'awaiting_cutover').length;
+    renderWithApp(<Overview />, { server });
+
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    expect(await within(down).findByText(/no vm is down right now/i)).toBeInTheDocument();
+    expect(down).toHaveTextContent(`${waiting} migrations have converged and wait for the cutover`);
+    expect(within(down).queryByRole('meter')).not.toBeInTheDocument();
   });
 
   it('lists what needs a human, with the reason', async () => {
