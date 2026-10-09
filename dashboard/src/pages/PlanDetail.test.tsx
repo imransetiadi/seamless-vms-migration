@@ -264,6 +264,31 @@ describe('PlanDetail', () => {
     await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length).toBeGreaterThan(0));
   });
 
+  it.each([
+    ['plan-c81d44a0', /^start$/i, /^start plan$/i, 'Plan started.'],
+    ['plan-7b3e0d52', /^resume$/i, /^resume plan$/i, 'Plan resumed.'],
+    ['plan-95a7e3f1', /^start again$/i, /^start again$/i, 'Plan started again.'],
+    ['plan-4f2a9c1e', /^pause$/i, /^pause plan$/i, 'Plan paused.'],
+  ])('announces the outcome of the action on %s (SDD §16)', async (planId, action, confirmLabel, message) => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan(planId);
+    await user.click(await actionButton(action));
+    const dialog = await screen.findByRole('alertdialog');
+    await user.click(within(dialog).getByRole('button', { name: confirmLabel }));
+    expect(await screen.findByText(message)).toHaveAttribute('role', 'status');
+  });
+
+  it('announces how many waves were planned (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-0e9f6a17');
+    await user.click(await actionButton(/auto-plan waves/i));
+    const dialog = await screen.findByRole('alertdialog');
+    await user.click(within(dialog).getByRole('button', { name: /^plan waves$/i }));
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length).toBeGreaterThan(0));
+    const n = server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length;
+    expect(await screen.findByText(`Waves planned: ${n} wave${n === 1 ? '' : 's'}.`)).toHaveAttribute('role', 'status');
+  });
+
   it('keeps every plan action disabled for viewers, with the reason', async () => {
     renderPlan('plan-c81d44a0', 'viewer');
 

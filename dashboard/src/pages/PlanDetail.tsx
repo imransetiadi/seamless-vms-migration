@@ -216,6 +216,8 @@ export default function PlanDetail() {
   const [editing, setEditing] = useState(false);
   const [clearing, setClearing] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -317,6 +319,9 @@ export default function PlanDetail() {
         <ErrorBanner error={action.error} title="The plan action failed" className="mb-4" />
       )}
       {report && <ReportBanner report={report} />}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
       {editing && <PlanCreateDialog open onClose={() => setEditing(false)} plan={p} />}
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
@@ -392,7 +397,11 @@ export default function PlanDetail() {
         confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
-        onConfirm={() => run({ action: 'start' })}
+        onConfirm={() =>
+          run({ action: 'start' }, () =>
+            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.'),
+          )
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();
@@ -405,7 +414,7 @@ export default function PlanDetail() {
         confirmLabel="Pause plan"
         pending={pending('pause')}
         error={confirm === 'pause' ? action.error : null}
-        onConfirm={() => run({ action: 'pause' })}
+        onConfirm={() => run({ action: 'pause' }, () => setAnnouncement('Plan paused.'))}
         onCancel={() => {
           setConfirm(null);
           action.reset();
@@ -433,7 +442,12 @@ export default function PlanDetail() {
         confirmReason="Enter a whole number from 1 to 100."
         pending={pending('waves')}
         error={confirm === 'waves' ? action.error : null}
-        onConfirm={() => run({ action: 'waves', body: { max_wave_size: waveSizeNumber } })}
+        onConfirm={() =>
+          run({ action: 'waves', body: { max_wave_size: waveSizeNumber } }, (result) => {
+            const n = (result as Plan).waves.length;
+            setAnnouncement(`Waves planned: ${n} wave${n === 1 ? '' : 's'}.`);
+          })
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();

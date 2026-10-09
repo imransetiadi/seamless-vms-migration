@@ -168,7 +168,7 @@ export default function Advisor() {
               </Button>
             </div>
             {touched && !query.trim() && (
-              <p id={`${queryId}-error`} className="field-error">
+              <p id={`${queryId}-error`} role="alert" className="field-error">
                 Enter a few words about the failure to search for.
               </p>
             )}
