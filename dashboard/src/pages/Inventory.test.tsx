@@ -41,6 +41,21 @@ describe('Inventory', () => {
     expect(screen.queryByRole('button', { name: /^create plan/i })).not.toBeInTheDocument();
   });
 
+  it('lists the destination projects that plan project mappings point to (SDD §16)', async () => {
+    const { server } = renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer' });
+    const projects = await screen.findByRole('region', { name: 'Projects' });
+    const inventory = server.handle('GET', '/providers/rhoso-prod/inventory', new URLSearchParams(), undefined, 'viewer').body as { projects: string[] };
+    expect(inventory.projects.length).toBeGreaterThan(0);
+    const listed = within(projects).getAllByRole('listitem').map((item) => item.textContent);
+    expect(listed).toEqual([...inventory.projects].sort((a, b) => a.localeCompare(b)));
+  });
+
+  it('says when a destination reports no projects', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/rhoso-staging', path: '/inventory/:providerId', token: 'viewer' });
+    const projects = await screen.findByRole('region', { name: 'Projects' });
+    expect(projects).toHaveTextContent('No projects reported.');
+  });
+
   it('shows that it is loading, not a blank page, while the providers load', async () => {
     const pending = new Promise<Response>(() => {});
     renderWithApp(<Inventory />, {

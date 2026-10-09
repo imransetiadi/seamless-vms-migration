@@ -23,6 +23,7 @@ import type { NewPlanState } from './Plans';
 function DestinationInventoryView({ inventory }: { inventory: DestinationInventory }) {
   const networks = Object.entries(inventory.networks);
   const quotas = Object.entries(inventory.quotas);
+  const projects = [...inventory.projects].sort((a, b) => a.localeCompare(b));
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <Panel title="Networks" description="Name and MTU (Geneve tenant networks are typically 1442)">
@@ -105,6 +106,19 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
             {inventory.volume_types.map((t) => (
               <li key={t} className="rounded-sm border border-border px-2 py-0.5 font-mono text-xs">
                 {t}
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
+      <Panel title="Projects" description="The names plan project mappings point to; pre-flight blocks a VM whose project is not here (DST_PROJECT_MISSING)">
+        {projects.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No projects reported.</p>
+        ) : (
+          <ul className="flex flex-wrap gap-1.5">
+            {projects.map((name) => (
+              <li key={name} className="rounded-sm border border-border px-2 py-0.5 font-mono text-xs">
+                {name}
               </li>
             ))}
           </ul>
