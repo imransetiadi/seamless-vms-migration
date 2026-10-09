@@ -57,9 +57,12 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
       status !== 'running' && status !== 'completed',
       status === 'running' ? 'Pause the plan before re-validating it.' : 'A completed plan cannot be re-validated.',
     ),
+    // like the API (SDD §12): draft, validated or paused; the plan then returns to draft
     waves: gate(
-      (status === 'draft' || status === 'validated') && !busy,
-      status === 'draft' || status === 'validated' ? (busy ?? '') : 'Waves can only be planned while the plan is draft or validated.',
+      (status === 'draft' || status === 'validated' || status === 'paused') && !busy,
+      status === 'draft' || status === 'validated' || status === 'paused'
+        ? (busy ?? '')
+        : 'Waves can only be planned while the plan is draft, validated or paused.',
     ),
     start: start(),
     pause: gate(status === 'running', 'Only a running plan can be paused.'),

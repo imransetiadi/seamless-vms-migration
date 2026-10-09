@@ -251,6 +251,9 @@ describe('PlanDetail', () => {
     const { server } = renderPlan('plan-0e9f6a17');
     await user.click(await actionButton(/auto-plan waves/i));
     const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves|replace the waves/i });
+    // it warns before it runs: the plan returns to draft and is validated again, clearing approvals
+    expect(dialog).toHaveTextContent(/returns to draft/i);
+    expect(dialog).toHaveTextContent(/clears approvals and cutover requests/i);
     const size = within(dialog).getByLabelText(/maximum vms per wave/i);
     const confirm = within(dialog).getByRole('button', { name: /^plan waves$/i });
     await user.clear(size);

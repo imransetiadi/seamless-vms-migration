@@ -946,7 +946,8 @@ export class MockServer {
     if (typeof size !== 'number' || !Number.isInteger(size)) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be a valid integer');
     if (size < 1) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be greater than or equal to 1');
     if (size > 1000) throw new HttpError(422, 'validation_error', 'max_wave_size: Input should be less than or equal to 1000');
-    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Waves can only be planned in draft or validated (this plan is ${plan.status}).`);
+    // like the API (SDD §12): draft, validated or paused, and the plan returns to draft
+    if (!['draft', 'validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'conflict', `waves cannot change while the plan is ${plan.status}`);
     this.refuseInFlight(plan, 're-planning the waves');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
     const pilot = mine.slice(0, Math.min(3, mine.length));
@@ -959,6 +960,7 @@ export class MockServer {
     }
     plan.waves = waves;
     for (const wave of waves) for (const m of mine) if (wave.vm_ids.includes(m.vm.source_id)) m.wave_id = wave.id;
+    plan.status = 'draft'; // like the API: new waves are validated again before a start (SDD §12)
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}": ${waves.length} waves planned`, data: { waves: waves.length } });
     return ok(plan);

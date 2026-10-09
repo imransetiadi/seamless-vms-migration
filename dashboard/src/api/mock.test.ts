@@ -719,4 +719,15 @@ describe('mock API', () => {
     expect(post('cutover').status).toBe(200);
     expect(m).toMatchObject({ phase: 'precopy', cutover_requested: true });
   });
+
+  it('plans waves on a validated or paused plan and returns it to draft, like the API (SDD §12)', () => {
+    const { server } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    for (const status of ['validated', 'paused'] as const) {
+      plan.status = status;
+      const result = server.handle('POST', `/plans/${plan.id}/waves/auto`, new URLSearchParams(), { max_wave_size: 5 }, 'operator');
+      expect(result.status).toBe(200);
+      expect(plan.status).toBe('draft');
+    }
+  });
 });

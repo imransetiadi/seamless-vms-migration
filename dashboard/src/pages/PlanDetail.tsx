@@ -437,7 +437,7 @@ export default function PlanDetail() {
       <ConfirmDialog
         open={confirm === 'waves'}
         title={p.waves.length ? 'Replace the waves?' : 'Auto-plan waves?'}
-        description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together."
+        description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together. The plan returns to draft: validate it again before starting, which clears approvals and cutover requests."
         confirmLabel="Plan waves"
         canConfirm={waveSizeValid}
         confirmReason="Enter a whole number from 1 to 1000."

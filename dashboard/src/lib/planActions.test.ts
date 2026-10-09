@@ -12,7 +12,8 @@ const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
   draft: { validate: true, waves: true, start: false, pause: false, edit: true },
   validated: { validate: true, waves: true, start: true, pause: false, edit: true },
   running: { validate: false, waves: false, start: false, pause: true, edit: false },
-  paused: { validate: true, waves: false, start: true, pause: false, edit: false },
+  // the API plans waves on a paused plan too, returning it to draft (SDD §12)
+  paused: { validate: true, waves: true, start: true, pause: false, edit: false },
   completed: { validate: false, waves: false, start: false, pause: false, edit: false },
   // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
   failed: { validate: true, waves: false, start: true, pause: false, edit: false },
