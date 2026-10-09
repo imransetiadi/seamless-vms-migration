@@ -1344,7 +1344,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
   `/inventory/:providerId`
-  (VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5), `/events` (live audit stream with category and text filters; the shown audit events download as JSON
+  (a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  a destination: networks with MTU, flavors, volume types, free quota per project and the project names that plan
+  project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category and text filters; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
   similar-incident search), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
