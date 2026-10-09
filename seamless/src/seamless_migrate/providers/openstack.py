@@ -202,7 +202,10 @@ class OpenStackProvider:
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
         ctx = _MapContext(conn)
-        return [ctx.server_to_vmref(s) for s in conn.compute.servers(details=True)]
+        servers = list(conn.compute.servers(details=True))
+        if len(servers) > 1:
+            ctx.prefetch()
+        return [ctx.server_to_vmref(s) for s in servers]
 
     def _get_vm(self, source_id: str) -> VMRef:
         conn = self._connection()
@@ -322,6 +325,37 @@ class _MapContext:
         self.conn = conn
         self._projects: dict[str, str | None] = {}
         self._networks: dict[str, Any] = {}
+        # filled by prefetch(): one listing each instead of a call per volume and per server.
+        # None means "not prefetched" and the per-VM calls are used.
+        self._volumes: dict[str, Any] | None = None
+        self._ports: dict[str, list[Any]] | None = None
+
+    def prefetch(self) -> None:
+        """Lists the volumes and ports of the connection's scope once (inventory of many VMs).
+
+        Each listing is optional: a policy that refuses it (HTTP 403) or an old API falls back
+        to the per-VM calls, which is what a single-VM lookup always uses.
+        """
+        volumes = _try(lambda: list(self.conn.block_storage.volumes(details=True)), None)
+        if volumes is not None:
+            self._volumes = {str(_attr(v, "id")): v for v in volumes}
+        ports = _try(lambda: list(self.conn.network.ports()), None)
+        if ports is not None:
+            grouped: dict[str, list[Any]] = {}
+            for port in ports:
+                grouped.setdefault(str(_attr(port, "device_id", default="")), []).append(port)
+            self._ports = grouped
+
+    def volume(self, volume_id: str) -> Any:
+        if self._volumes is not None and volume_id in self._volumes:
+            return self._volumes[volume_id]
+        # not in the listing (e.g. a volume of another project attached by an admin)
+        return self.conn.block_storage.get_volume(volume_id)
+
+    def ports(self, server_id: str) -> list[Any]:
+        if self._ports is not None:
+            return self._ports.get(server_id, [])
+        return list(self.conn.network.ports(device_id=server_id))
 
     def project_name(self, project_id: str | None) -> str | None:
         if not project_id:
@@ -394,7 +428,7 @@ class _MapContext:
             )
         volume_disks: list[tuple[Disk, bool]] = []
         for attachment in conn.compute.volume_attachments(server):
-            volume = conn.block_storage.get_volume(_attr(attachment, "volume_id"))
+            volume = self.volume(str(_attr(attachment, "volume_id")))
             device = _attr(attachment, "device")
             disk = Disk(
                 id=str(_attr(volume, "id")),
@@ -422,7 +456,7 @@ class _MapContext:
         disks.sort(key=lambda d: (not d.bootable, d.device or ""))
 
         nics = []
-        for port in conn.network.ports(device_id=_attr(server, "id")):
+        for port in self.ports(server_id):
             network = self.network(_attr(port, "network_id"))
             nics.append(
                 Nic(

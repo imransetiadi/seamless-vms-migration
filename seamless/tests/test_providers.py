@@ -156,6 +156,9 @@ class FakeBlockStorage:
     def get_volume(self, volume_id):
         return self._volumes[volume_id]
 
+    def volumes(self, details=True, **_):
+        return list(self._volumes.values())
+
     def types(self):
         return [NS(name="ceph-ssd"), NS(name="ceph-hdd")]
 
@@ -170,6 +173,8 @@ class FakeNetwork:
         self._ovn = ovn
 
     def ports(self, device_id=None, **_):
+        if device_id is None:
+            return list(self._ports)
         return [p for p in self._ports if p.device_id == device_id]
 
     def get_network(self, network_id):
@@ -325,6 +330,97 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
     assert await provider.find_server("web-01") == "srv-1"
     inv = await provider.inventory()
     assert inv.networks == {"app-net": 1442}
+
+
+def _fleet_conn(count=3):
+    """fake_conn() with `count` servers, each with two volumes and a port, and call counters."""
+    conn = fake_conn()
+    base = conn.compute.get_server("srv-1")
+    servers, volumes, ports = [], [], []
+    for i in range(count):
+        sid = f"srv-{i}"
+        servers.append(
+            NS(
+                **{**vars(base), "id": sid, "name": f"web-{i:02d}"},
+            )
+        )
+        servers[-1].attachments = [
+            NS(volume_id=f"{sid}-root", device="/dev/vda"),
+            NS(volume_id=f"{sid}-data", device="/dev/vdb"),
+        ]
+        volumes += [
+            NS(id=f"{sid}-root", name="root", size=20, is_bootable=True, volume_type="ceph-ssd"),
+            NS(id=f"{sid}-data", name="data", size=50, is_bootable=False, volume_type="ceph-hdd"),
+        ]
+        ports.append(
+            NS(
+                id=f"port-{sid}",
+                device_id=sid,
+                network_id="net-1",
+                mac_address=f"fa:16:3e:0{i}",
+                fixed_ips=[{"ip_address": f"10.0.0.{10 + i}"}],
+                binding_vnic_type="normal",
+            )
+        )
+    conn.compute = FakeCompute(servers)
+    conn.block_storage = FakeBlockStorage(volumes)
+    conn.network = FakeNetwork(ports, [NS(id="net-1", name="app-net", mtu=1442)])
+    calls = {"get_volume": 0, "volumes": 0, "ports_one": 0, "ports_all": 0}
+    get_volume, list_volumes, list_ports = (
+        conn.block_storage.get_volume,
+        conn.block_storage.volumes,
+        conn.network.ports,
+    )
+
+    def counted_get_volume(volume_id):
+        calls["get_volume"] += 1
+        return get_volume(volume_id)
+
+    def counted_volumes(**kwargs):
+        calls["volumes"] += 1
+        return list_volumes(**kwargs)
+
+    def counted_ports(device_id=None, **kwargs):
+        calls["ports_one" if device_id else "ports_all"] += 1
+        return list_ports(device_id=device_id, **kwargs)
+
+    conn.block_storage.get_volume = counted_get_volume
+    conn.block_storage.volumes = counted_volumes
+    conn.network.ports = counted_ports
+    return conn, calls
+
+
+async def test_openstack_list_vms_fetches_volumes_and_ports_in_bulk(stub_openstack):
+    conn, calls = _fleet_conn(3)
+    stub_openstack(conn)
+    vms = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [vm.name for vm in vms] == ["web-00", "web-01", "web-02"]
+    assert [[d.id for d in vm.disks] for vm in vms][1] == ["srv-1-root", "srv-1-data"]
+    assert [vm.nics[0].fixed_ips for vm in vms] == [["10.0.0.10"], ["10.0.0.11"], ["10.0.0.12"]]
+    # one listing each instead of a call per volume and per server
+    assert calls == {"get_volume": 0, "volumes": 1, "ports_one": 0, "ports_all": 1}
+
+
+async def test_openstack_list_vms_falls_back_per_vm_when_bulk_listing_is_refused(stub_openstack):
+    conn, calls = _fleet_conn(2)
+
+    def refused(**_):
+        raise RuntimeError("HTTP 403")
+
+    conn.block_storage.volumes = refused
+    real_ports = conn.network.ports
+
+    def ports(device_id=None, **kwargs):
+        if device_id is None:
+            raise RuntimeError("HTTP 403")
+        return real_ports(device_id=device_id, **kwargs)
+
+    conn.network.ports = ports
+    stub_openstack(conn)
+    vms = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [len(vm.disks) for vm in vms] == [2, 2]
+    assert [vm.nics[0].mac for vm in vms] == ["fa:16:3e:00", "fa:16:3e:01"]
+    assert calls["get_volume"] == 4 and calls["ports_one"] == 2
 
 
 async def test_openstack_flavor_ephemeral_and_swap_become_disks(stub_openstack):
