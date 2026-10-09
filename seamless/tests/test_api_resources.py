@@ -115,6 +115,23 @@ def test_plan_rejects_duplicate_vm_ids(api):
     assert vm_ids[1] in patched.json()["error"]["message"]
 
 
+def test_plan_takes_an_empty_vm_ids_and_refuses_a_missing_one(api):
+    """SDD §12: vm_ids is required and must not repeat a VM; an empty list is a draft plan to fill
+    later. The dashboard's mock follows the same contract."""
+    body = {
+        "name": "later",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+    }
+    empty = api.post("/api/v1/plans", Role.operator, json={**body, "vm_ids": []})
+    assert empty.status_code == 201, empty.text
+    assert empty.json()["vm_ids"] == [] and empty.json()["status"] == "draft"
+    missing = api.post("/api/v1/plans", Role.operator, json=body)
+    assert missing.status_code == 422
+    error = missing.json()["error"]
+    assert error == {"code": "validation_error", "message": "vm_ids: Field required"}
+
+
 def test_plan_rejects_out_of_range_tcp_port(api):
     """SDD §12: verification settings that would roll back a good cutover or never open the gate
     are a 422 on create and on edit."""

@@ -887,7 +887,8 @@ export class MockServer {
     const body = input as unknown as PlanCreate;
     if (!body.name || !String(body.name).trim()) throw new HttpError(422, 'validation_error', 'name is required.');
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
-    if (!Array.isArray(body.vm_ids) || body.vm_ids.length === 0) throw new HttpError(422, 'validation_error', 'Select at least one VM.');
+    // like the API (SDD §12): vm_ids is required; an empty list is a plan to fill later (the form asks for a VM)
+    if (!Array.isArray(body.vm_ids)) throw new HttpError(422, 'validation_error', 'vm_ids: Field required');
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');

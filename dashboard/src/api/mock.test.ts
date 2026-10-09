@@ -110,6 +110,14 @@ describe('mock API', () => {
     await expect(client.patch(`/plans/${plan.id}`, { name: 'x'.repeat(201) })).rejects.toMatchObject({ status: 422 });
   });
 
+  it('creates a plan with an empty vm_ids and refuses one without vm_ids, like the API (SDD §12)', async () => {
+    const { client } = setup('operator');
+    const base = { name: 'Empty for now', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod' };
+    // vm_ids is required and must not repeat a VM; an empty list is a plan to fill later
+    await expect(client.post<Plan>('/plans', { ...base, vm_ids: [] })).resolves.toMatchObject({ status: 'draft', vm_ids: [] });
+    await expect(client.post('/plans', base)).rejects.toMatchObject({ status: 422, code: 'validation_error', message: 'vm_ids: Field required' });
+  });
+
   it('refuses action texts over 2000 characters with 422, like the API (SDD §12)', async () => {
     const { server, client } = setup('approver');
     const m = byPhase(server, 'awaiting_cutover');
