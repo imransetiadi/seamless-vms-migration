@@ -27,7 +27,7 @@ import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange } from '../lib/migrationActions';
-import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan } from '../lib/phase';
+import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
 import { hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -108,9 +108,10 @@ function Alerts({ m }: { m: Migration }) {
 function ProgressPanel({ m }: { m: Migration }) {
   const meta = phaseMeta(m.phase);
   const active = isActivePhase(m.phase);
-  const openPass = m.sync_passes.find((p) => p.ended_at === null);
+  const step = runningStep(m);
   const transferredId = useId();
   const diskId = useId();
+  const stepId = useId();
   return (
     <Panel title="Progress" description={meta.description}>
       <div className="flex flex-col gap-3">
@@ -134,11 +135,13 @@ function ProgressPanel({ m }: { m: Migration }) {
           <dd aria-labelledby={diskId} className="num text-right">
             {formatBytes(m.bytes_total)}
           </dd>
-          {openPass && (
+          {step && (
             <>
-              <dt className="text-muted-foreground">Current pass</dt>
-              <dd className="num text-right">
-                #{openPass.number} {openPass.kind}
+              <dt id={stepId} className="text-muted-foreground">
+                Current step
+              </dt>
+              <dd aria-labelledby={stepId} className="num text-right">
+                {step.label}
               </dd>
             </>
           )}
@@ -477,6 +480,7 @@ export default function MigrationDetail() {
               thresholdBytes={p?.convergence_threshold_bytes ?? null}
               maxPasses={p?.max_sync_passes ?? null}
               droppedBytes={m.sync_bytes_dropped}
+              running={runningStep(m)?.pass ?? null}
             />
           </Panel>
         )}

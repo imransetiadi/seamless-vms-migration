@@ -27,6 +27,8 @@ export interface SyncPassChartProps {
   maxPasses?: number | null;
   /** `Migration.sync_bytes_dropped`: what the passes dropped from a long wait's history transferred (SDD §5.4). */
   droppedBytes?: number;
+  /** The pass running now, named from the phase (`runningStep`, SDD §16): the API lists only passes that ended. */
+  running?: { number: number; kind: SyncPass['kind'] } | null;
 }
 
 const byteTick = (v: number) => (v === 0 ? '0' : formatBytes(v).replace('.0 ', ' '));
@@ -59,7 +61,7 @@ function droppedText(sorted: SyncPass[], maxPasses: number | null, droppedBytes:
  * The first full pass copies the whole disk, so it is summarised in text and the table rather than
  * drawn on the same linear scale (it would flatten every delta bar).
  */
-export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null, droppedBytes = 0 }: SyncPassChartProps) {
+export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null, droppedBytes = 0, running = null }: SyncPassChartProps) {
   const colors = useChartColors();
   const [measureRef, width] = useElementWidth<HTMLDivElement>();
   const narrow = width > 0 && width < 420;
@@ -69,12 +71,11 @@ export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null,
   // a long wait draws many bars: without room per bar the values move to the tooltip and the table
   const crowded = width > 0 && (width - PLOT_INSET) / Math.max(1, data.length) < LABEL_SLOT_MIN;
 
-  if (sorted.length === 0) {
+  if (sorted.length === 0 && !running) {
     return <EmptyState icon={RefreshCw} title="No sync passes yet" description="Warm migrations copy while the VM runs; every pass appears here." />;
   }
 
   const full = sorted.find((p) => p.kind === 'full');
-  const open = sorted.find((p) => p.ended_at === null);
   const last = deltas.at(-1);
   const previous = deltas.at(-2);
   const parts: string[] = [];
@@ -87,7 +88,7 @@ export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null,
       parts.push(`${change <= 0 ? 'Down' : 'Up'} ${Math.abs(Math.round(change))}% from pass ${previous.number}.`);
     }
   }
-  if (open) parts.push(`Pass ${open.number} (${open.kind}) is running.`);
+  if (running) parts.push(`Pass ${running.number} (${running.kind}) is running.`);
   if (maxPasses) parts.push(`Cutover is allowed after at most ${maxPasses} passes.`);
   const dropped = droppedText(sorted, maxPasses, droppedBytes);
   if (dropped) parts.push(dropped);

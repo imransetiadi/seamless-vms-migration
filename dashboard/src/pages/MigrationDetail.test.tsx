@@ -70,6 +70,19 @@ describe('MigrationDetail', () => {
     expect(progress).not.toHaveTextContent('112 GiB / 110 GiB');
   });
 
+  it('names the running step from the phase when the API lists only passes that ended (SDD §4.2, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'syncing' && x.strategy === 'warm');
+    if (!m) throw new Error('fixture: a warm migration syncing');
+    m.sync_passes = m.sync_passes.filter((p) => p.ended_at !== null);
+    const next = Math.max(...m.sync_passes.map((p) => p.number)) + 1;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const progress = await screen.findByRole('region', { name: /^progress$/i });
+    expect(within(progress).getByRole('definition', { name: /^current step$/i })).toHaveTextContent(`#${next} delta`);
+    const chart = screen.getByRole('region', { name: /sync-pass convergence/i });
+    expect(chart).toHaveTextContent(`Pass ${next} (delta) is running.`);
+  });
+
   it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
     const server = createTestServer();
     const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');

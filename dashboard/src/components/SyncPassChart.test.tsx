@@ -80,6 +80,17 @@ describe('SyncPassChart', () => {
     expect(container.querySelectorAll('tbody tr')).toHaveLength(25);
   });
 
+  it('names the running pass the page passes in, as the API lists only passes that ended (SDD §16)', () => {
+    const { container } = render(<SyncPassChart passes={[pass(1, 'full'), pass(2)]} running={{ number: 3, kind: 'delta' }} />);
+    expect(caption(container)).toHaveTextContent('Pass 3 (delta) is running.');
+  });
+
+  it('names the running full copy before any pass ended instead of showing an empty chart', () => {
+    const { container } = render(<SyncPassChart passes={[]} running={{ number: 1, kind: 'full' }} />);
+    expect(caption(container)).toHaveTextContent('Pass 1 (full) is running.');
+    expect(container).toHaveTextContent('Delta passes appear here after the first full copy.');
+  });
+
   it('says nothing about dropped passes while the history is complete', () => {
     const { container } = render(<SyncPassChart passes={[pass(1, 'full'), pass(2), pass(3)]} maxPasses={5} droppedBytes={0} />);
     expect(caption(container)).not.toHaveTextContent(/no longer listed/);

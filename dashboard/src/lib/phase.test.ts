@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { PHASES, STRATEGIES, type Phase } from '../api/types';
-import { happyPath, isActivePhase, isTerminalPhase, phaseMeta, preflightRan, TONES } from './phase';
+import type { Migration, SyncPass } from '../api/types';
+import { happyPath, isActivePhase, isTerminalPhase, phaseMeta, preflightRan, runningStep, TONES } from './phase';
 
 function isRenderableComponent(value: unknown): boolean {
   // lucide icons are forwardRef objects; plain function components are also fine.
@@ -92,5 +93,42 @@ describe('preflightRan', () => {
       expect(preflightRan({ phase, phase_history: history('pending', 'validating', 'ready') })).toBe(true);
     }
     expect(preflightRan({ phase: 'cancelled', phase_history: history('pending', 'validating', 'blocked', 'cancelled') })).toBe(true);
+  });
+});
+
+describe('runningStep', () => {
+  const ended = (number: number, kind: SyncPass['kind']): SyncPass => ({
+    number,
+    kind,
+    started_at: '2026-10-08T10:00:00Z',
+    ended_at: '2026-10-08T10:10:00Z',
+    bytes_scanned: 0,
+    bytes_changed: 0,
+    bytes_transferred: 0,
+    duration_s: 600,
+  });
+  const step = (phase: Migration['phase'], strategy: Migration['strategy'], sync_passes: SyncPass[] = []) =>
+    runningStep({ phase, strategy, sync_passes });
+
+  it('names the running step from the phase and the passes that ended, as the API lists them (SDD §4.2, §16)', () => {
+    expect(step('precopy', 'warm')).toEqual({ label: '#1 full', pass: { number: 1, kind: 'full' } });
+    expect(step('syncing', 'warm', [ended(1, 'full'), ended(2, 'delta')])).toEqual({ label: '#3 delta', pass: { number: 3, kind: 'delta' } });
+    expect(step('syncing', 'vmware_warm', [ended(1, 'full')])?.label).toBe('#2 delta');
+    expect(step('cutover', 'warm', [ended(1, 'full'), ended(26, 'delta')])?.label).toBe('#27 final');
+    expect(step('cutover', 'vmware_warm', [ended(1, 'full'), ended(2, 'delta')])?.label).toBe('#3 final');
+    expect(step('cutover', 'cold')).toEqual({ label: '#1 full', pass: { number: 1, kind: 'full' } });
+    expect(step('cutover', 'vmware_cold')?.label).toBe('#1 full');
+    expect(step('cutover', 'storage_handover')).toEqual({ label: 'Volume handover', pass: null });
+  });
+
+  it('names no step outside the phases that run one', () => {
+    for (const phase of ['pending', 'validating', 'ready', 'awaiting_cutover', 'verifying', 'completed', 'rolling_back'] as const) {
+      expect(step(phase, 'warm', [ended(1, 'full')]), phase).toBeNull();
+    }
+  });
+
+  it('counts a running pass the page lists (the mock) as the running step, not before it', () => {
+    const running = { ...ended(2, 'delta'), ended_at: null, duration_s: null };
+    expect(step('syncing', 'warm', [ended(1, 'full'), running])?.label).toBe('#2 delta');
   });
 });
