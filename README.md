@@ -197,7 +197,10 @@ seamless/                    control plane: src/seamless_migrate/, tests/, Conta
 dashboard/                   React 18 + Vite + TypeScript dashboard (design tokens: SDD §16)
 deploy/compose/              Docker Compose stack for the Colima profile "seamless"
 deploy/openshift/            kustomize manifests (OpenShift 4.16+)
+deploy/kubernetes/           kustomize overlay of those manifests for vanilla Kubernetes 1.28+
 scripts/compose-init.sh      generates .env and tokens.yaml for the Compose stack
+scripts/check-readonly-runtime.sh  runs the images as the manifests do (make deploy-runtime-check)
+tests/                       collection tests (unit/, sanity/, func/, perf/); demo-stack scripts (e2e/)
 docs/                        PRD, SDD, MEMORY, QASuite, Security, Performance, plans
 .mcp.json  .claude/  CLAUDE.md   agent tooling (Jev + agentmemory MCP servers, plugins, working agreement)
 ```
