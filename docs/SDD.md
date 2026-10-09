@@ -350,9 +350,11 @@ or estimate is approved again by a human. A VM whose migration is `cancelled` (t
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
-migrations of VMs removed from `vm_ids`, so it also refuses — before
-changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1): such a VM stays
-in the plan until it is cut over or rolled back. One VM, one migration holds across plans too: a migration
+migrations of VMs removed from `vm_ids` — `pending`, `blocked`, `ready`, and `failed` ones too, or a
+failed one would hold its VM and keep the plan from completing — so it also refuses — before
+changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1) or whose failed
+migration stopped it (a cancel is refused then, §5.1): such a VM stays in the plan until it is cut
+over or rolled back. One VM, one migration holds across plans too: a migration
 *holds* its VM in every phase but `cancelled`, `finalized` and `rolled_back`, and `validate_plan` refuses
 (409, before changing anything) a VM that a migration of another plan with the same source provider holds,
 naming the VM, that plan and the phase — finish, roll back or cancel it there, or remove the VM from
