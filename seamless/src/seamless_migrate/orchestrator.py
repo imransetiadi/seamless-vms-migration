@@ -304,17 +304,20 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # providers
     async def check_provider(self, provider_id: str, actor: str = "system") -> Provider:
-        # versioned write: a provider deleted or edited while the check ran is not re-inserted
-        provider, version = await self.db.get_versioned("provider", provider_id, Provider)
-        impl = self.providers.get(provider)
-        try:
-            caps = await impl.check()
-            update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
-        except ProviderError as exc:
-            update = {"status": "error", "status_message": redact(str(exc))[:500]}
-        update["last_checked_at"] = self._now()
-        updated = provider.model_copy(update=update)
-        await self.db.put("provider", updated, expected_version=version)
+        # one check per provider at a time (SDD §8): a validation's check and a manual Check would
+        # otherwise collide on the versioned write below; the innermost lock, it takes no other
+        async with self._lock(f"provider:{provider_id}"):
+            # versioned write: a provider deleted or edited while the check ran is not re-inserted
+            provider, version = await self.db.get_versioned("provider", provider_id, Provider)
+            impl = self.providers.get(provider)
+            try:
+                caps = await impl.check()
+                update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
+            except ProviderError as exc:
+                update = {"status": "error", "status_message": redact(str(exc))[:500]}
+            update["last_checked_at"] = self._now()
+            updated = provider.model_copy(update=update)
+            await self.db.put("provider", updated, expected_version=version)
         await self._emit(
             "provider.checked",
             f"provider {provider.id}: {updated.status}",

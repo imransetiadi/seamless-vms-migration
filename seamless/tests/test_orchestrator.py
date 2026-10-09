@@ -701,6 +701,28 @@ async def test_step_timeout_fails_the_attempt_and_rolls_back_after_a_stop(tmp_pa
     assert h.history(m)[-4:] == [P.cutover, P.failed, P.rolling_back, P.rolled_back]
 
 
+async def test_concurrent_checks_of_one_provider_do_not_conflict(tmp_path, store):
+    """SDD §8: checks of one provider run one after the other, instead of colliding on the
+    provider's versioned write (ConflictError, a 409 for a double-clicked Check)."""
+    h, _ = await setup(tmp_path, store, [vm(1)])
+    results = await asyncio.gather(
+        h.orch.check_provider(SRC_PROVIDER.id, "alice"),
+        h.orch.check_provider(SRC_PROVIDER.id, "bob"),
+        return_exceptions=True,
+    )
+    assert [type(r).__name__ for r in results] == ["Provider", "Provider"], results
+
+
+async def test_a_validation_and_a_manual_check_of_its_provider_both_succeed(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    results = await asyncio.gather(
+        h.orch.validate_plan(plan.id, "alice"),
+        h.orch.check_provider(SRC_PROVIDER.id, "bob"),
+        return_exceptions=True,
+    )
+    assert [type(r).__name__ for r in results] == ["ValidationReport", "Provider"], results
+
+
 async def test_check_provider_does_not_resurrect_a_deleted_provider(tmp_path, store):
     """A provider deleted while its check ran is not re-inserted by the check's write."""
     h, plan = await setup(tmp_path, store, [vm(1)])
