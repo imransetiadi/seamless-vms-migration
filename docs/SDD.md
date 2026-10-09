@@ -704,7 +704,10 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
 * Each tick: for every `running` plan, compute active waves (all `depends_on` waves complete, §5.1),
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
   advance gates (§5.4), and mark plans `completed` when all migrations are in terminal-success or
-  wave-complete phases with no `failed`.
+  wave-complete phases with no `failed`. A running plan is pre-staged once (`prestage`, §7.2) before
+  its first migration starts; when pre-staging fails the plan becomes `failed` (event `plan.updated`,
+  "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
+  one, pre-staging it again.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
   migration after **every** state change, emits events, and records `checkpoint` (last completed
   step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed, and
@@ -987,7 +990,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}` (409 while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
-| POST | `/plans/{id}/start` | operator | — | `Plan` (409 when any migration is `blocked`) |
+| POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0); creation order | `Migration[]` |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
@@ -1243,7 +1246,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
-  (§5.4: that plan and the phase), as validation refuses it; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
+  it again (§8); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
