@@ -98,6 +98,11 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
+RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
+#: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
+#: it is taken after a plan lock and before a migration lock
+VM_CLAIMS = "vm-claims"
 #: a migration in one of these depends on the plan's providers, mappings and strategy as they were
 #: when it started: the plan is not edited or re-waved meanwhile (SDD §12)
 IN_FLIGHT_PHASES = frozenset(
@@ -339,9 +344,26 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # planning actions
+    async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> list[str]:
+        """``name (plan "…", phase)`` for each VM of ``vm_ids`` that a migration of another plan
+        with the same source provider holds (SDD §5.4: one VM, one migration across plans)."""
+        others = {
+            other.id: other
+            for other in await self.db.list("plan", Plan)
+            if other.id != plan.id and other.source_provider_id == plan.source_provider_id
+        }
+        if not others or not vm_ids:
+            return []
+        return sorted(
+            f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
+            for m in await self.db.list("migration", Migration, plan_id=list(others))
+            if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM
+        )
+
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
-        # one validation per plan at a time: concurrent runs would create duplicate migrations
-        async with self._lock(f"plan:{plan_id}"):
+        # one validation per plan at a time: concurrent runs would create duplicate migrations;
+        # and one claim of VMs at a time across plans (SDD §5.4)
+        async with self._lock(f"plan:{plan_id}"), self._lock(VM_CLAIMS):
             return await self._validate_plan(plan_id, actor)
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
@@ -393,6 +415,14 @@ class Orchestrator:
             raise NotAllowed(
                 f"{', '.join(stopped[:10])}: the source VM is stopped after a failed cutover; keep "
                 "the VM in the plan until it is cut over or rolled back"
+            )
+        held = await self._held_elsewhere(plan, selected)
+        if held:
+            # SDD §5.4: two plans would both stop the source and cut it over
+            raise NotAllowed(
+                f"{len(held)} VM(s) already have a migration in another plan: "
+                f"{', '.join(held[:10])}; finish, roll back or cancel it there, or remove the VM "
+                "from vm_ids"
             )
         params = params_for_plan(plan)
         items: list[ValidationItem] = []
@@ -744,10 +774,17 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
-        async with self._lock(mid):
+        async with self._lock(VM_CLAIMS), self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
+            held = await self._held_elsewhere(await self._plan(m.plan_id), {m.vm.source_id})
+            if held:
+                # SDD §5.4: a rolled-back migration let its VM go; another plan may have taken it
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
+                    f"{held[0]}; finish, roll back or cancel it there first"
+                )
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)

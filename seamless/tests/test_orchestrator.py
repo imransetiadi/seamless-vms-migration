@@ -236,6 +236,118 @@ async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, stor
     assert len(await h.migrations(plan.id)) == 3
 
 
+async def test_validate_refuses_a_vm_another_plan_holds(tmp_path, store):
+    """SDD §5.4: one VM, one migration across plans. A second plan with a VM that a migration of
+    the first plan holds is refused, naming that plan and the phase, and nothing is created."""
+    h, first = await setup(tmp_path, store, [vm(1), vm(2), vm(3)], {"vm_ids": ["vm-1", "vm-2"]})
+    await h.orch.validate_plan(first.id, "alice")
+    second = plan_for([vm(2), vm(3)], name="Second wave")
+    store.put("plan", second)
+
+    with pytest.raises(NotAllowed, match=r"web-02.*Finance.*ready"):
+        await h.orch.validate_plan(second.id, "bob")
+    assert await h.migrations(second.id) == []
+
+
+@pytest.mark.parametrize("phase", [P.cancelled, P.finalized, P.rolled_back])
+async def test_a_vm_is_free_for_another_plan_once_cancelled_finalized_or_rolled_back(
+    tmp_path, store, phase
+):
+    h, first = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(first.id, "alice")
+    held = await h.by_vm(first.id, "vm-2")
+    held.phase = phase
+    store.put("migration", held)
+    second = plan_for([vm(2)], name="Second wave")
+    store.put("plan", second)
+
+    report = await h.orch.validate_plan(second.id, "bob")
+    assert [item.vm_name for item in report.migrations] == ["web-02"]
+
+
+async def test_a_plan_of_another_source_does_not_hold_the_vm(tmp_path, store):
+    """VM ids belong to a source cloud: a migration in a plan of another source provider with the
+    same VM id is another VM and does not hold this one (SDD §5.4)."""
+    h, first = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(first.id, "alice")
+    elsewhere = plan_for([vm(1)], name="Other cloud", source_provider_id="other-source")
+    store.put("plan", elsewhere)
+    mine = await h.by_vm(first.id, "vm-1")
+    store.put(
+        "migration",
+        mine.model_copy(update={"id": "mig-other", "plan_id": elsewhere.id, "phase": P.precopy}),
+    )
+
+    report = await h.orch.validate_plan(first.id, "alice")
+    assert [item.vm_name for item in report.migrations] == ["web-01"]
+
+
+async def test_retry_refused_while_another_plan_holds_the_vm(tmp_path, store):
+    """A rolled-back migration lets its VM go; a retry would take it back (rolled_back -> ready),
+    so it is refused while another plan holds the VM (SDD §5.4)."""
+    h, first = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(first.id, "alice")
+    old = await h.by_vm(first.id, "vm-1")
+    old.phase = P.rolled_back
+    store.put("migration", old)
+    second = plan_for([vm(1)], name="Second wave")
+    store.put("plan", second)
+    await h.orch.validate_plan(second.id, "bob")
+
+    with pytest.raises(NotAllowed, match=r"web-01.*Second wave.*ready"):
+        await h.orch.retry(old.id, "alice")
+    assert (await h.by_vm(first.id, "vm-1")).phase == P.rolled_back
+
+    await h.orch.cancel((await h.by_vm(second.id, "vm-1")).id, "bob", "back to the first plan")
+    assert (await h.orch.retry(old.id, "alice")).phase == P.ready
+
+
+async def test_concurrent_validations_of_two_plans_claim_a_vm_once(tmp_path, store):
+    h, first = await setup(tmp_path, store, [vm(1), vm(2)])
+    second = plan_for([vm(2)], name="Second wave")
+    store.put("plan", second)
+
+    results = await asyncio.gather(
+        h.orch.validate_plan(first.id, "alice"),
+        h.orch.validate_plan(second.id, "bob"),
+        return_exceptions=True,
+    )
+    assert sorted(type(r).__name__ for r in results) == ["NotAllowed", "ValidationReport"]
+    holders = [
+        m for p in (first, second) for m in await h.migrations(p.id) if m.vm.source_id == "vm-2"
+    ]
+    assert len(holders) == 1
+
+
+async def test_a_validation_waits_while_another_plan_claims_its_vms(tmp_path, store, monkeypatch):
+    """The first plan has passed its check and is still creating migrations: the second plan's
+    validation waits for it, then sees the claim (SDD §5.4), instead of claiming the VM too."""
+    h, first = await setup(tmp_path, store, [vm(1), vm(2)])
+    second = plan_for([vm(2)], name="Second wave")
+    store.put("plan", second)
+    creating, release = asyncio.Event(), asyncio.Event()
+    create = h.orch._create_migration
+
+    async def slow_create(plan, vm_ref, strategy, actor):
+        if plan.id == first.id:
+            creating.set()
+            await release.wait()
+        return await create(plan, vm_ref, strategy, actor)
+
+    monkeypatch.setattr(h.orch, "_create_migration", slow_create)
+    claiming = asyncio.create_task(h.orch.validate_plan(first.id, "alice"))
+    await creating.wait()
+    waiting = asyncio.create_task(h.orch.validate_plan(second.id, "bob"))
+    await asyncio.wait({waiting}, timeout=1)
+    assert not waiting.done(), "the second plan validated while the first was claiming the VM"
+
+    release.set()
+    await claiming
+    with pytest.raises(NotAllowed, match=r"web-02.*Finance"):
+        await waiting
+    assert await h.migrations(second.id) == []
+
+
 async def test_start_rejects_blocked_plan(tmp_path, store):
     gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
     h, plan = await setup(tmp_path, store, [vm(1), gpu])

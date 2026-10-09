@@ -130,7 +130,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | FR-01 | Register providers, check connectivity and capabilities | `test_openstack_check_reports_admin_and_ovn`, `test_missing_optional_dependency_raises_provider_error`, `test_registry_returns_fake_in_demo`, `test_provider_crud` | LAB-P01 (admin, compute microversion, OVN, CBT per platform) |
 | FR-02 | Inventory with disks, NICs, power state, CBT, snapshots | `test_fake_openstack_inventory_has_required_traits`, `test_fake_vmware_mixed_cbt`, `test_openstack_provider_maps_server_to_vmref`, `test_vmware_provider_maps_vm`; VmTable filtering | LAB-P02 (counts and attributes equal the cloud's own listing) |
 | FR-03 | Plans with selection, mappings, SLO, approval, window; editable in draft/validated | `test_models_roundtrip_json`, `test_put_get_roundtrip`, `test_optimistic_conflict_raises`, `test_plan_create_validate_start_flow`, `test_plan_apply_from_yaml`; plan list/detail UI tests | AC-1 |
-| FR-04 | Pre-flight validation, full finding catalog | a `test_finding_<code_lower>` test per SDD §9.3 code, `test_quota_aggregates_across_plan`, `test_duplicate_names_blocked`, `test_validate_creates_migrations_with_findings_and_estimates`, `test_start_rejects_blocked_plan` | LAB-N01…N09 |
+| FR-04 | Pre-flight validation, full finding catalog | a `test_finding_<code_lower>` test per SDD §9.3 code, `test_quota_aggregates_across_plan`, `test_duplicate_names_blocked`, `test_validate_creates_migrations_with_findings_and_estimates`, `test_start_rejects_blocked_plan`, `test_validate_refuses_a_vm_another_plan_holds` (one VM, one migration across plans, R-13) | LAB-N01…N09 |
 | FR-05 | Downtime/duration estimate per VM and strategy (SDD §9.1: parallel-disk scan term, `Plan.estimator_overrides`, per-pass calibration) | `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`, `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`, `test_ineligible_strategies_marked`, `test_estimate_table`; implemented for the §9.1 amendment: `test_warm_scan_uses_largest_disk_and_parallel_streams` (4 × 100 GiB equals 1 × 100 GiB at `P` = 4; 8 × 50 GiB and an aggregate ceiling `A`), `test_sdd_worked_example`, `test_estimate_final_downtime_uses_scan_term`, `test_estimator_overrides_with_plan_precedence`, `test_invalid_estimator_overrides` (unknown keys, plan-owned keys, non-positive values), `test_calibration_helpers`, `test_warm_passes_calibrate_change_rate_scan_rate_and_estimate` (after a delta pass: `vm.change_rate_bps`, `observed_scan_bps`, recomputed `estimate`), `test_first_pass_alone_does_not_calibrate` (Performance.md §1); the 400 on invalid overrides is asserted in `test_plan_create_validate_start_flow` | Performance.md Appendix A cross-check (incl. 4 × 100 GiB and 500 GiB); LAB-W12…W14; G2 accuracy (PERF-E2E-G2, §9) |
 | FR-06 | Automatic strategy selection; ineligible never selected; override rejected if ineligible | `test_multiattach_blocks_warm`, `test_handover_requires_backend_map_and_admin`, `test_vmware_warm_requires_cbt`, `test_override_ignored_when_ineligible`, `test_min_downtime_tie_prefers_simpler`, `test_recommend_never_returns_ineligible`, `test_migration_actions_transitions` (strategy PUT) | AC-5 |
 | FR-07 | Warm OpenStack migration: running source, final pass moves changed chunks only, checksums verified | A1 (all eleven), A2 (all nine), S-COL-LINT, `test_warm_precopy_runs_export_once_then_precopy`, `test_warm_flow_reaches_completed_with_downtime` | AC-1, LAB-W01…W15, D-01…D-09 |
@@ -586,6 +586,7 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 | R-10 | Racing operator actions | send two `POST …/cutover` in parallel; send `rollback` while a step runs | one cutover; the second call is a no-op or 409; rollback is serialized after the current step | `test_rollback_request_during_step_is_serialized`, FR-12 |
 | R-11 | SSE reconnect storm | kill 50 stream connections repeatedly and reconnect with `since=<last id>` | each event delivered exactly once; heartbeats continue | `test_sse_stream_resume_and_heartbeat`, FR-17 |
 | R-12 | Source cloud API outage during pre-copy | stop the source Nova for 5 minutes | transient errors; the source VM is unaffected; pre-copy resumes | NFR-04 |
+| R-13 | Two plans claim one VM | put a VM of a validated plan into a second plan with the same source and validate it, also both at once; then roll the first plan's migration back, validate the second plan and retry the first | the second validation is refused (409) naming the first plan and the phase, nothing is created, and of two simultaneous validations exactly one takes the VM; after the rollback the second plan takes the VM and the retry in the first plan is refused (409) — never two migrations stopping one source (SDD §5.4) | `test_validate_refuses_a_vm_another_plan_holds`, `test_a_vm_is_free_for_another_plan_once_cancelled_finalized_or_rolled_back`, `test_concurrent_validations_of_two_plans_claim_a_vm_once`, `test_a_validation_waits_while_another_plan_claims_its_vms`, `test_retry_refused_while_another_plan_holds_the_vm`, `test_a_plan_of_another_source_does_not_hold_the_vm`, FR-04 |
 
 ---
 
@@ -819,7 +820,7 @@ Twenty-three further iterations after the integration run, each verified with th
    deviation, each with the measured numbers and the reason); PERF-CP thresholds met.
 7. Security: S-01…S-24 executed; no open High finding ([Security.md](Security.md) §11); no secret-scan findings;
    no unaccepted High/Critical dependency or image vulnerability; checklist §12 signed.
-8. Resilience: R-01…R-12 executed with all invariants holding.
+8. Resilience: R-01…R-13 executed with all invariants holding.
 9. No open **S1** or **S2** defects; S3 defects triaged with owners.
 10. Documentation reconciled with measured numbers (Performance.md, QASuite.md results sections).
 
@@ -1128,5 +1129,5 @@ VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh        # S-01 o
 | 4 Image | build, S-19, S-20 | no unaccepted High/Critical |
 | 5 Demo E2E | §14.6, `smoke-demo.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs`, DEMO-01…06, UI manual checklist | pass |
 | 6 Lab | §7 matrix, §8 integrity, §9 performance | exit criteria §13.2 |
-| 7 Security and resilience | S-03…S-16, S-21…S-24, R-01…R-12 | no S1/S2 |
+| 7 Security and resilience | S-03…S-16, S-21…S-24, R-01…R-13 | no S1/S2 |
 | 8 Sign-off | report (§13.5), Security.md §12 checklist, docs reconciled | release |
