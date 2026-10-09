@@ -1,5 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { STRATEGY_LABELS } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
 
@@ -26,5 +28,59 @@ describe('MigrationDetail', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/source VM is still stopped/i);
     expect(alert).toHaveTextContent(/downtime clock keeps running/i);
+  });
+
+  it('asks before a strategy change clears the approvals and the cutover request (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.estimates.filter((e) => e.eligible).length >= 2)!;
+    m.phase = 'ready';
+    m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+    m.cutover_requested = true;
+    const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    const user = userEvent.setup();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+
+    await user.click(await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` }));
+    const dialog = await screen.findByRole('alertdialog', { name: /change the strategy/i });
+    expect(dialog).toHaveTextContent(/clears 1 approval and the cutover request/i);
+    await user.click(within(dialog).getByRole('button', { name: /^change and clear$/i }));
+    await waitFor(() => expect(m.strategy).toBe(other));
+    expect(m.approvals).toEqual([]);
+    expect(m.cutover_requested).toBe(false);
+  });
+
+  it('counts the approvals on the server when another strategy is chosen, not the migration loaded before them (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.estimates.filter((e) => e.eligible).length >= 2)!;
+    m.phase = 'ready';
+    m.approvals = [];
+    m.cutover_requested = false;
+    const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    const user = userEvent.setup();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const use = await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` });
+    // the page shows the migration without approvals; then an approver approves elsewhere
+    expect(await screen.findByText(/no approvals yet|does not require approval/i)).toBeInTheDocument();
+    m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+
+    await user.click(use);
+    const dialog = await screen.findByRole('alertdialog', { name: /change the strategy/i });
+    expect(dialog).toHaveTextContent(/clears 1 approval/i);
+    expect(m.strategy).not.toBe(other);
+  });
+
+  it('changes the strategy at once when nothing would be cleared', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.estimates.filter((e) => e.eligible).length >= 2)!;
+    m.phase = 'ready';
+    m.approvals = [];
+    m.cutover_requested = false;
+    const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    const user = userEvent.setup();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+
+    await user.click(await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` }));
+    await waitFor(() => expect(m.strategy).toBe(other));
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 });

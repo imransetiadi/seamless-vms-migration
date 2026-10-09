@@ -83,6 +83,71 @@ describe('PlanDetail', () => {
     expect(alert).toHaveTextContent(`${held.vm.name} (plan "${first.name}", ${held.phase})`);
   });
 
+  it('asks before Validate clears approvals and cutover requests, and says how many (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    const first = mine[0]!;
+    for (const m of mine.slice(0, 2)) {
+      m.phase = 'ready';
+      m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+    }
+    first.cutover_requested = true;
+    const user = userEvent.setup();
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+
+    await user.click(await actionButton(/validate/i));
+    let dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    expect(dialog).toHaveTextContent(/clears 2 approvals and 1 cutover request/i);
+    await user.click(within(dialog).getByRole('button', { name: /^cancel$/i }));
+    expect(first.approvals).toHaveLength(1);
+
+    await user.click(await actionButton(/validate/i));
+    dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    await user.click(within(dialog).getByRole('button', { name: /^validate and clear$/i }));
+    expect(await screen.findByText(/validation finished/i)).toBeInTheDocument();
+    expect(first.approvals).toEqual([]);
+    expect(first.cutover_requested).toBe(false);
+  });
+
+  it('counts the approvals on the server when Validate is clicked, not a list loaded before them (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const m = server.migrations.find((x) => x.plan_id === plan.id)!;
+    m.phase = 'ready';
+    const user = userEvent.setup();
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+    // an approver approves meanwhile (another tab or person): the list on screen does not show it yet
+    m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+
+    await user.click(await actionButton(/validate/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    expect(dialog).toHaveTextContent(/clears 1 approval/i);
+    expect(m.approvals).toHaveLength(1);
+  });
+
+  it('asks anyway when the migrations cannot be counted at the click (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const handle = server.handle.bind(server);
+    let failing = false;
+    server.handle = (method, path, query, body, token) =>
+      failing && method === 'GET' && path === '/migrations'
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    const user = userEvent.setup();
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+    failing = true;
+
+    await user.click(await actionButton(/validate/i));
+    // a 5xx is retried twice with backoff before the refetch reports the error
+    const dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i }, { timeout: 8000 });
+    expect(dialog).toHaveTextContent(/clears any approvals and cutover requests/i);
+  }, 15_000);
+
   it('keeps every plan action disabled for viewers, with the reason', async () => {
     renderPlan('plan-c81d44a0', 'viewer');
 

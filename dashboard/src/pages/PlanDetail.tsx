@@ -36,11 +36,12 @@ import { WavesBoard } from '../components/WavesBoard';
 import { cn } from '../lib/cn';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
+import { clearedByValidation } from '../lib/migrationActions';
 import { planActions } from '../lib/planActions';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
-type Confirm = 'start' | 'pause' | 'waves' | null;
+type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -212,6 +213,8 @@ export default function PlanDetail() {
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [waveSize, setWaveSize] = useState('10');
   const [editing, setEditing] = useState(false);
+  const [clearing, setClearing] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -245,6 +248,22 @@ export default function PlanDetail() {
         after?.(result);
       },
     });
+  const validate = () => run({ action: 'validate' }, (r) => setReport(r as ValidationReport));
+  // a re-validation clears the approvals and cutover requests of migrations that have not started (SDD §5.4):
+  // count them on the server at the click, as a list loaded before an approval would hide it; ask anyway
+  // when they cannot be counted
+  const askOrValidate = async () => {
+    setChecking(true);
+    const latest = await migrations.refetch();
+    setChecking(false);
+    const cleared = latest.data && !latest.isError ? clearedByValidation(latest.data) : 'any approvals and cutover requests';
+    if (!cleared) {
+      validate();
+      return;
+    }
+    setClearing(cleared);
+    setConfirm('validate');
+  };
   const waveSizeNumber = Number(waveSize);
   const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 100;
   const s = stats.data;
@@ -270,9 +289,9 @@ export default function PlanDetail() {
             <Button
               size="lg"
               icon={ListChecks}
-              loading={pending('validate')}
+              loading={pending('validate') || checking}
               disabledReason={actions.validate.reason}
-              onClick={() => run({ action: 'validate' }, (r) => setReport(r as ValidationReport))}
+              onClick={() => void askOrValidate()}
             >
               Validate
             </Button>
@@ -363,6 +382,19 @@ export default function PlanDetail() {
         pending={pending('pause')}
         error={confirm === 'pause' ? action.error : null}
         onConfirm={() => run({ action: 'pause' })}
+        onCancel={() => {
+          setConfirm(null);
+          action.reset();
+        }}
+      />
+      <ConfirmDialog
+        open={confirm === 'validate'}
+        title="Validate this plan again?"
+        description={`Validating again clears ${clearing ?? 'nothing'} of the migrations that have not started: approvers approve them again after the new assessment.`}
+        confirmLabel="Validate and clear"
+        pending={pending('validate')}
+        error={confirm === 'validate' ? action.error : null}
+        onConfirm={validate}
         onCancel={() => {
           setConfirm(null);
           action.reset();

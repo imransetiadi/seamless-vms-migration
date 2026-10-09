@@ -244,6 +244,26 @@ describe('mock API', () => {
     expect(mine.phase).toBe('ready');
   });
 
+  it('clears approvals, the cutover request and force_window on re-validation and on a strategy change, like the API (SDD §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const m = server.migrations.find((x) => x.plan_id === plan.id && x.estimates.filter((e) => e.eligible).length >= 2)!;
+    const approve = () => {
+      m.phase = 'ready';
+      m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+      m.cutover_requested = true;
+      m.force_window = true;
+    };
+    approve();
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(m).toMatchObject({ approvals: [], cutover_requested: false, force_window: false });
+
+    approve();
+    const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    await client.put(`/migrations/${m.id}/strategy`, { strategy: other });
+    expect(m).toMatchObject({ strategy: other, approvals: [], cutover_requested: false, force_window: false });
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');

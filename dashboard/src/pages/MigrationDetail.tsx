@@ -8,6 +8,7 @@ import { useRole } from '../api/session';
 import type { Event, GuestOS, Migration, Phase, Plan, Role, Strategy, VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
 import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
@@ -25,6 +26,7 @@ import { Timeline } from '../components/Timeline';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
+import { clearedByStrategyChange } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta } from '../lib/phase';
 import { hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
@@ -145,6 +147,21 @@ function hasResolvedMappings(m: Migration): boolean {
 
 function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   const setStrategy = useSetStrategy(m.id);
+  const migration = useMigration(m.id);
+  // a strategy change clears the migration's approvals and cutover request (SDD §5.4): count them on the
+  // server at the click, as the page may predate an approval, and ask first; ask anyway when they cannot
+  // be counted
+  const [asking, setAsking] = useState<{ strategy: Strategy; cleared: string } | null>(null);
+  const [checking, setChecking] = useState<Strategy | null>(null);
+  const choose = (strategy: Strategy) => setStrategy.mutate(strategy, { onSuccess: () => setAsking(null) });
+  const askOrChoose = async (strategy: Strategy) => {
+    setChecking(strategy);
+    const latest = await migration.refetch();
+    setChecking(null);
+    const cleared = latest.data && !latest.isError ? clearedByStrategyChange(latest.data) : 'any approvals and the cutover request';
+    if (cleared) setAsking({ strategy, cleared });
+    else choose(strategy);
+  };
   const canChangePhase = m.phase === 'pending' || m.phase === 'ready' || m.phase === 'blocked';
   const canChangeRole = hasRole(role, 'operator');
   const reasonFor = (strategy: Strategy, eligible: boolean): string | null => {
@@ -157,7 +174,7 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   if (m.estimates.length === 0) return <EmptyState icon={ClipboardX} title="Not estimated yet" description="Validate the plan to estimate every strategy." />;
   return (
     <div className="flex flex-col gap-2">
-      {setStrategy.error && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
+      {setStrategy.error && asking === null && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
       <div className="table-wrap rounded-md border border-border">
         <table className="data-table">
           <caption className="sr-only">Estimates per strategy</caption>
@@ -225,8 +242,8 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
                   <Button
                     size="sm"
                     disabledReason={reasonFor(e.strategy, e.eligible)}
-                    loading={setStrategy.isPending && setStrategy.variables === e.strategy}
-                    onClick={() => setStrategy.mutate(e.strategy)}
+                    loading={(setStrategy.isPending && setStrategy.variables === e.strategy) || checking === e.strategy}
+                    onClick={() => void askOrChoose(e.strategy)}
                     aria-label={`Use ${strategyLabel(e.strategy)}`}
                   >
                     Use
@@ -237,6 +254,19 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
           </tbody>
         </table>
       </div>
+      <ConfirmDialog
+        open={asking !== null}
+        title={`Change the strategy to ${asking ? strategyLabel(asking.strategy) : ''}?`}
+        description={`Changing the strategy clears ${asking?.cleared ?? 'nothing'}: approvers approve ${m.vm.name} again for the new strategy.`}
+        confirmLabel="Change and clear"
+        pending={setStrategy.isPending}
+        error={asking !== null ? setStrategy.error : null}
+        onConfirm={() => asking && choose(asking.strategy)}
+        onCancel={() => {
+          setAsking(null);
+          setStrategy.reset();
+        }}
+      />
     </div>
   );
 }

@@ -152,3 +152,25 @@ export function nextStep(m: Migration, plan: Plan | null | undefined): NextStep 
       return { text: 'Cancelled. Nothing further will run.', action: null };
   }
 }
+
+/** Phases a re-validation or a strategy change touches; it clears their approvals and cutover requests (SDD §5.4). */
+export const REVALIDATABLE: ReadonlySet<Phase> = new Set<Phase>(['pending', 'blocked', 'ready']);
+
+function count(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
+
+/** What validating the plan again would clear, e.g. "2 approvals and 1 cutover request"; null when nothing (SDD §5.4, §16). */
+export function clearedByValidation(migrations: readonly Migration[]): string | null {
+  const touched = migrations.filter((m) => REVALIDATABLE.has(m.phase));
+  const approvals = touched.reduce((n, m) => n + m.approvals.length, 0);
+  const requests = touched.filter((m) => m.cutover_requested).length;
+  const parts = [approvals ? count(approvals, 'approval') : '', requests ? count(requests, 'cutover request') : ''].filter(Boolean);
+  return parts.length ? parts.join(' and ') : null;
+}
+
+/** What choosing another strategy would clear, e.g. "1 approval and the cutover request"; null when nothing (SDD §5.4, §16). */
+export function clearedByStrategyChange(m: Migration): string | null {
+  const parts = [m.approvals.length ? count(m.approvals.length, 'approval') : '', m.cutover_requested ? 'the cutover request' : ''].filter(Boolean);
+  return parts.length ? parts.join(' and ') : null;
+}

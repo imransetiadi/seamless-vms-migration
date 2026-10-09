@@ -449,8 +449,16 @@ export class MockServer {
     return ties.sort((a, b) => SIMPLICITY[a.strategy] - SIMPLICITY[b.strategy])[0]?.strategy ?? best.strategy;
   }
 
+  /** A fresh assessment or strategy needs a fresh approval (SDD §5.4): nothing given before carries over. */
+  private clearApprovals(m: Migration): void {
+    m.approvals = [];
+    m.cutover_requested = false;
+    m.force_window = false;
+  }
+
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
     this.evaluate(m, plan);
+    this.clearApprovals(m);
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
   }
@@ -938,6 +946,7 @@ export class MockServer {
     if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
     m.strategy = strategy;
     m.estimate = est;
+    this.clearApprovals(m);
     m.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: strategy set to ${strategy}`, data: { action: 'strategy', strategy } });
     return ok(m);

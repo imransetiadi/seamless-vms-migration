@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Strategy } from '../api/types';
-import { migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { clearedByStrategyChange, clearedByValidation, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -113,5 +113,24 @@ describe('migrationActions rules', () => {
     expect(nextStep(migration('failed', { downtime_started_at: '2026-10-08T11:20:00Z' }), null).action).toBe('rollback');
     expect(nextStep(migration('precopy'), null).action).toBeNull();
     expect(nextStep(migration('precopy'), null).text).toMatch(/pre-copy/i);
+  });
+});
+
+describe('what re-validation or a strategy change clears (SDD §5.4)', () => {
+  const approval = { actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null };
+
+  it('counts approvals and cutover requests of migrations that have not started', () => {
+    const ready = migration('ready', { approvals: [approval, approval], cutover_requested: true });
+    const blocked = migration('blocked', { approvals: [approval] });
+    // an in-flight migration keeps its approvals: a re-validation does not touch it
+    const precopy = migration('precopy', { approvals: [approval], cutover_requested: true });
+    expect(clearedByValidation([ready, blocked, precopy])).toBe('3 approvals and 1 cutover request');
+    expect(clearedByValidation([precopy, migration('ready')])).toBeNull();
+  });
+
+  it('names what a strategy change clears for one migration', () => {
+    expect(clearedByStrategyChange(migration('ready', { approvals: [approval], cutover_requested: true }))).toBe('1 approval and the cutover request');
+    expect(clearedByStrategyChange(migration('ready', { cutover_requested: true }))).toBe('the cutover request');
+    expect(clearedByStrategyChange(migration('ready'))).toBeNull();
   });
 });
