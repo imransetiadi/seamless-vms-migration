@@ -36,6 +36,25 @@ describe('MigrationDetail', () => {
     expect(findings).not.toHaveTextContent(/pre-flight passed/i);
   });
 
+  it('says on the convergence chart how many passes a long wait dropped (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    const plan = server.plans.find((p) => p.id === m?.plan_id);
+    if (!m || !plan) throw new Error('fixture: a warm migration awaiting cutover');
+    const delta = m.sync_passes.at(-1)!;
+    const kept = Array.from({ length: plan.max_sync_passes - 1 }, (_, i) => ({ ...delta, number: i + 2 }));
+    const latest = Array.from({ length: 20 }, (_, i) => ({ ...delta, number: plan.max_sync_passes + 31 + i }));
+    m.sync_passes = [...m.sync_passes.slice(0, 1), ...kept, ...latest];
+    m.sync_bytes_dropped = 30 * 2 ** 30;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const chart = await screen.findByRole('region', { name: /sync-pass convergence/i });
+    await waitFor(() =>
+      expect(chart).toHaveTextContent(
+        `Passes ${plan.max_sync_passes + 1}–${plan.max_sync_passes + 30} are no longer listed: the history keeps the first ${plan.max_sync_passes} passes and the latest 20. The 30.0 GiB they transferred still counts toward the total.`,
+      ),
+    );
+  });
+
   it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
     const server = createTestServer();
     const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');

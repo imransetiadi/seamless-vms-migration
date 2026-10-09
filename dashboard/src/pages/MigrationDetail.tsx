@@ -460,7 +460,12 @@ export default function MigrationDetail() {
 
         {warm && (
           <Panel title="Sync-pass convergence" description="Bytes changed per pass; cutover becomes possible once a delta is below the threshold">
-            <SyncPassChart passes={m.sync_passes} thresholdBytes={p?.convergence_threshold_bytes ?? null} maxPasses={p?.max_sync_passes ?? null} />
+            <SyncPassChart
+              passes={m.sync_passes}
+              thresholdBytes={p?.convergence_threshold_bytes ?? null}
+              maxPasses={p?.max_sync_passes ?? null}
+              droppedBytes={m.sync_bytes_dropped}
+            />
           </Panel>
         )}
 

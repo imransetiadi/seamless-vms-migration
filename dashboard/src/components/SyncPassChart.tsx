@@ -12,7 +12,7 @@ import {
   YAxis,
   type TooltipProps,
 } from 'recharts';
-import type { SyncPass } from '../api/types';
+import { SYNC_PASSES_LATEST, type SyncPass } from '../api/types';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { niceByteTicks } from '../lib/ticks';
 import { useElementWidth } from '../lib/useElementWidth';
@@ -25,16 +25,37 @@ export interface SyncPassChartProps {
   /** `Plan.convergence_threshold_bytes` (SDD §5.3). */
   thresholdBytes?: number | null;
   maxPasses?: number | null;
+  /** `Migration.sync_bytes_dropped`: what the passes dropped from a long wait's history transferred (SDD §5.4). */
+  droppedBytes?: number;
 }
 
 const byteTick = (v: number) => (v === 0 ? '0' : formatBytes(v).replace('.0 ', ' '));
+
+/**
+ * The passes a long wait dropped from the history (SDD §5.4, §16) — the numbers missing below the last
+ * listed pass, named as a range when they are one — and that the bytes they transferred still count.
+ */
+function droppedText(sorted: SyncPass[], maxPasses: number | null, droppedBytes: number): string | null {
+  const gaps: [number, number][] = [];
+  sorted.forEach((p, i) => {
+    const previous = sorted[i - 1]?.number ?? 0;
+    if (p.number > previous + 1) gaps.push([previous + 1, p.number - 1]);
+  });
+  const count = gaps.reduce((sum, [first, last]) => sum + last - first + 1, 0);
+  const [first, last] = gaps[0] ?? [0, 0];
+  if (count === 0) return null;
+  const which = gaps.length > 1 ? `${count} earlier passes are` : count === 1 ? `Pass ${first} is` : `Passes ${first}–${last} are`;
+  const why = maxPasses ? `: the history keeps the first ${maxPasses} passes and the latest ${SYNC_PASSES_LATEST}` : '';
+  const counted = droppedBytes > 0 ? ` The ${formatBytes(droppedBytes)} ${count === 1 ? 'it' : 'they'} transferred still counts toward the total.` : '';
+  return `${which} no longer listed${why}.${counted}`;
+}
 
 /**
  * Warm convergence (SDD §5.3): bytes changed per delta/final pass against the convergence threshold.
  * The first full pass copies the whole disk, so it is summarised in text and the table rather than
  * drawn on the same linear scale (it would flatten every delta bar).
  */
-export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null }: SyncPassChartProps) {
+export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null, droppedBytes = 0 }: SyncPassChartProps) {
   const colors = useChartColors();
   const [measureRef, width] = useElementWidth<HTMLDivElement>();
   const narrow = width > 0 && width < 420;
@@ -62,6 +83,8 @@ export function SyncPassChart({ passes, thresholdBytes = null, maxPasses = null 
   }
   if (open) parts.push(`Pass ${open.number} (${open.kind}) is running.`);
   if (maxPasses) parts.push(`Cutover is allowed after at most ${maxPasses} passes.`);
+  const dropped = droppedText(sorted, maxPasses, droppedBytes);
+  if (dropped) parts.push(dropped);
   const summary = parts.join(' ');
   const ticks = niceByteTicks(Math.max(...data.map((d) => d.changed), thresholdBytes ?? 0) * 1.1);
 

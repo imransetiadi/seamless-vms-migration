@@ -43,7 +43,7 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { ACTION_TEXT_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES } from './types';
+import { ACTION_TEXT_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES, SYNC_PASSES_LATEST } from './types';
 
 interface MockResponse {
   status: number;
@@ -101,9 +101,7 @@ function holdersText(held: Map<string, string[]>, limit = 10): string {
   const rest = entries.length - limit;
   return entries.slice(0, limit).join(', ') + (rest > 0 ? ` and ${rest} more` : '');
 }
-/** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4), as in the API. */
-const SYNC_PASSES_LATEST = 20;
-/** Drop the oldest passes between the first `keepFirst` and the latest 20; their bytes move to `sync_bytes_dropped`. */
+/** Drop the oldest passes between the first `keepFirst` and the latest 20 (SDD §5.4, as in the API); their bytes move to `sync_bytes_dropped`. */
 function keepSyncHistory(m: Migration, keepFirst: number): void {
   const excess = m.sync_passes.length - keepFirst - SYNC_PASSES_LATEST;
   if (excess <= 0) return;

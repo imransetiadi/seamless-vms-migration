@@ -526,6 +526,8 @@ export interface MigrationListQuery {
   offset?: number;
 }
 
+/** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4). */
+export const SYNC_PASSES_LATEST = 20;
 /** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
 export const ACTION_TEXT_MAX = 2000;
 /** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
