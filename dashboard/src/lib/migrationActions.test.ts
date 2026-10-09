@@ -14,17 +14,19 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   pending: ['cancel'],
   validating: [],
   blocked: ['cancel'],
-  ready: ['approve', 'cancel'],
-  precopy: ['approve', 'cancel'],
-  syncing: ['approve', 'cancel'],
+  // a warm cutover may be requested before it converged; it starts once it does (SDD §5.4, §16)
+  ready: ['approve', 'cutover', 'cancel'],
+  precopy: ['approve', 'cutover', 'cancel'],
+  syncing: ['approve', 'cutover', 'cancel'],
   awaiting_cutover: ['approve', 'cutover', 'sync', 'cancel'],
   cutover: ['rollback'],
   verifying: ['rollback'],
   completed: ['rollback', 'finalize'],
   finalized: [],
-  failed: ['rollback', 'retry', 'cancel'],
+  // an approval given ahead of a retry lasts through it (SDD §5.1, §16)
+  failed: ['approve', 'rollback', 'retry', 'cancel'],
   rolling_back: [],
-  rolled_back: ['retry'],
+  rolled_back: ['approve', 'retry'],
   cancelled: [],
 };
 
@@ -53,9 +55,19 @@ describe('migrationActions rules', () => {
 
   it('lets single-shot strategies cut over from ready (SDD §5.2)', () => {
     expect(migrationActions(migration('ready', {}, 'cold'), 'approver').cutover.enabled).toBe(true);
-    const warm = migrationActions(migration('ready', {}, 'warm'), 'approver').cutover;
-    expect(warm.enabled).toBe(false);
-    expect(warm.reason).toMatch(/converge/i);
+    // a warm migration may be requested from ready too: it cuts over once pre-copy converged
+    expect(migrationActions(migration('ready', {}, 'warm'), 'approver').cutover.enabled).toBe(true);
+  });
+
+  it('offers Approve only where an approval lasts, and says why elsewhere (SDD §16)', () => {
+    for (const phase of ['pending', 'validating', 'blocked'] as const) {
+      const approve = migrationActions(migration(phase), 'approver').approve;
+      expect(approve.enabled).toBe(false);
+      expect(approve.reason).toMatch(/validation clears approvals/i);
+    }
+    for (const phase of ['cutover', 'verifying', 'completed'] as const) {
+      expect(migrationActions(migration(phase), 'approver').approve.reason).toMatch(/cutover has started/i);
+    }
   });
 
   it('does not request a cutover twice', () => {

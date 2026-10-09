@@ -19,7 +19,11 @@ export const ACTION_MIN_ROLE: Record<MigrationActionKey, Role> = {
   finalize: 'approver',
 };
 
-const PRE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+/** Where an approval lasts (SDD §16): the API also takes one before validation, which clears it. */
+const APPROVAL_LASTS: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover', 'failed', 'rolled_back']);
+const BEFORE_VALIDATION: ReadonlySet<Phase> = new Set(['pending', 'validating', 'blocked']);
+/** The API's CUTOVER_REQUESTABLE (SDD §5.4): a warm migration requested early cuts over once it converges. */
+const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 
 /** The downtime clock is open: the source VM was stopped and has not run since (SDD §5.2). */
 function sourceStopped(m: Migration): boolean {
@@ -42,17 +46,18 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
   const no = (reason: string): Availability => ({ enabled: false, reason });
   switch (key) {
     case 'approve':
-      return PRE_CUTOVER.has(m.phase) ? ok : no('Approval applies before cutover: ready, pre-copy, syncing or awaiting cutover.');
+      if (APPROVAL_LASTS.has(m.phase)) return ok;
+      if (BEFORE_VALIDATION.has(m.phase)) return no('Validate the plan first: validation clears approvals, so approve its new assessment.');
+      if (m.phase === 'cancelled') return no('A cancelled migration takes no approval.');
+      return no('The cutover has started or ended: an approval no longer applies.');
     case 'cutover': {
-      const gate = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && isSingleShot(m));
-      if (!gate) {
-        if (!isSingleShot(m) && (m.phase === 'ready' || m.phase === 'precopy' || m.phase === 'syncing')) {
-          return no('Warm migrations cut over once pre-copy has converged (awaiting cutover).');
-        }
-        return no('Cutover starts from awaiting cutover (warm) or ready (single-shot strategies).');
-      }
+      if (!CUTOVER_REQUESTABLE.has(m.phase)) return no('A cutover can be requested from ready until it starts.');
       if (!m.cutover_requested || waitsOnClosedWindow(m, plan, now)) return ok;
-      return no('Cutover already requested — waiting for the gate (window, concurrency).');
+      return no(
+        m.phase === 'awaiting_cutover' || isSingleShot(m)
+          ? 'Cutover already requested — waiting for the gate (window, concurrency).'
+          : 'Cutover already requested — it starts once pre-copy has converged and the gate opens.',
+      );
     }
     case 'sync':
       return m.phase === 'awaiting_cutover' ? ok : no('A delta sync can be requested only while awaiting cutover.');

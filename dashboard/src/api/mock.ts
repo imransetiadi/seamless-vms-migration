@@ -66,6 +66,9 @@ class HttpError extends Error {
 
 const PERSONAS: Record<Role, string> = { viewer: 'dimas', operator: 'bayu', approver: 'sari', admin: 'rina' };
 const SINGLE_SHOT: ReadonlySet<Strategy> = new Set(['cold', 'storage_handover', 'vmware_cold']);
+/** orchestrator.APPROVABLE and CUTOVER_REQUESTABLE (SDD §5.4). */
+const APPROVABLE: ReadonlySet<Phase> = new Set(['pending', 'validating', 'blocked', 'ready', 'precopy', 'syncing', 'awaiting_cutover', 'failed', 'rolled_back']);
+const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 const SIMPLICITY: Record<Strategy, number> = { cold: 0, storage_handover: 1, warm: 2, vmware_cold: 0, vmware_warm: 1 };
 const MAX_EVENTS = 5000;
 
@@ -1128,17 +1131,21 @@ export class MockServer {
 
     switch (action) {
       case 'approve':
-        if (!['ready', 'precopy', 'syncing', 'awaiting_cutover'].includes(m.phase)) throw new HttpError(409, 'conflict', `Cannot approve ${m.vm.name} while ${m.phase}.`);
+        // the API's APPROVABLE and message (SDD §5.4)
+        if (!APPROVABLE.has(m.phase)) throw new HttpError(409, 'conflict', `a migration in ${m.phase} cannot be approved`);
         approve();
         break;
       case 'cutover': {
-        const allowed = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
-        if (!allowed) throw new HttpError(409, 'conflict', `Cannot request cutover for ${m.vm.name} while ${m.phase}.`);
+        // the API's CUTOVER_REQUESTABLE and message: a warm migration requested early cuts over once it converges
+        if (!CUTOVER_REQUESTABLE.has(m.phase)) throw new HttpError(409, 'conflict', `cutover cannot be requested in ${m.phase}`);
         approve();
         m.cutover_requested = true;
         m.force_window = m.force_window || Boolean(input.force_window);
         record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window) });
-        if (plan.status === 'running' && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+        // only a converged warm migration or a ready single-shot one enters the cutover (SDD §5.4); an
+        // early request waits for convergence
+        const waiting = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
+        if (plan.status === 'running' && waiting && this.gateOpen(m, plan)) this.beginCutover(m, plan);
         break;
       }
       case 'sync':

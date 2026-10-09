@@ -14,6 +14,7 @@ import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatDuration } from '../lib/format';
+import { isWarmStrategy } from '../lib/phase';
 import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -76,6 +77,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
   const forcing = waitsOnClosedWindow(m, plan, Date.now());
+  // a warm cutover requested before pre-copy converged starts once it does (SDD §5.4)
+  const early = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
   const step = nextStep(m, plan);
   const action = useMigrationAction(m.id);
   const [open, setOpen] = useState<MigrationActionKey | null>(null);
@@ -163,17 +166,22 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'cutover'}
-        title={forcing ? `Let ${m.vm.name} cut over outside the window?` : `Cut over ${m.vm.name} now?`}
+        title={
+          forcing ? `Let ${m.vm.name} cut over outside the window?` : early ? `Cut over ${m.vm.name} once pre-copy converges?` : `Cut over ${m.vm.name} now?`
+        }
         description={
           <>
             {forcing && plan?.cutover_window
               ? `The cutover was requested and waits for the cutover window (${formatDateTime(plan.cutover_window.start)} → ${formatDateTime(plan.cutover_window.end)}). Confirming lets it start as soon as the plan, its wave and a free cutover slot allow. `
               : ''}
-            The source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
+            {early && !forcing
+              ? 'The cutover is requested now and starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. '
+              : ''}
+            {early && !forcing ? 'Then the' : 'The'} source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
             {slo ? ` against an SLO of ${slo}` : ''}. This also records your approval; the migration can be rolled back until it is finalized.
           </>
         }
-        confirmLabel={forcing ? 'Cut over outside the window' : 'Start cutover'}
+        confirmLabel={forcing ? 'Cut over outside the window' : early ? 'Request cutover' : 'Start cutover'}
         onConfirm={() =>
           submit({
             action: 'cutover',

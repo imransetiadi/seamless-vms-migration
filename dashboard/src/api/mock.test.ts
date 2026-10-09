@@ -703,4 +703,20 @@ describe('mock API', () => {
     plan.status = 'completed';
     expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(204);
   });
+
+  it('accepts approvals and cutover requests in the phases the API does (SDD §5.4)', () => {
+    const { server } = setup('approver');
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    const post = (action: string) => server.handle('POST', `/migrations/${m.id}/${action}`, new URLSearchParams(), {}, 'approver');
+    m.phase = 'pending';
+    expect(post('approve').status).toBe(200);
+    m.phase = 'verifying';
+    expect(post('approve')).toEqual({ status: 409, body: { error: { code: 'conflict', message: 'a migration in verifying cannot be approved' } } });
+    expect(post('cutover')).toEqual({ status: 409, body: { error: { code: 'conflict', message: 'cutover cannot be requested in verifying' } } });
+    // a warm cutover requested during pre-copy waits for convergence
+    m.phase = 'precopy';
+    m.cutover_requested = false;
+    expect(post('cutover').status).toBe(200);
+    expect(m).toMatchObject({ phase: 'precopy', cutover_requested: true });
+  });
 });

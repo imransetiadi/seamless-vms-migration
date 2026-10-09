@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import type { Migration } from '../api/types';
+import type { Migration, Role } from '../api/types';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { MigrationActions } from './MigrationActions';
 
@@ -29,6 +29,23 @@ describe('MigrationActions', () => {
     const { button } = setup('web-01', 'operator');
     expect(button(/finalize/i)).toHaveAttribute('aria-disabled', 'true');
     expect(button(/finalize/i)).toHaveAccessibleDescription(/approver role/i);
+  });
+
+  it('requests a warm cutover during pre-copy, which starts once it converges (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.id === 'mig-5d7e2b4a10')!;
+    expect(migration).toMatchObject({ phase: 'precopy', strategy: 'warm' });
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`cut over ${migration.vm.name} once pre-copy converges`, 'i') });
+    expect(dialog).toHaveTextContent(/starts once pre-copy has converged/i);
+    await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
+    expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
   });
 
   it('requires typing the VM name before finalizing', async () => {
