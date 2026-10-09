@@ -179,6 +179,7 @@ services:
         read_only: true
         bind:
           create_host_path: false
+          selinux: z      # relabel for SELinux hosts (RHEL/Fedora with Podman or Docker); ignored elsewhere
     networks:
       - backend
       - frontend          # outbound: cloud APIs, vCenter, conversion hosts (SSH), Jev provider, host agentmemory

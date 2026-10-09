@@ -413,9 +413,26 @@ SEAMLESS_PROJECT        ?= seamless
 SEAMLESS_ENV_OWNED = POSTGRES_PASSWORD JEV_MCP_AUTH_TOKEN TYPESAFE_API_KEY COMPOSE_PROFILES SEAMLESS_JEV_MODE SEAMLESS_MEMORY_URL SEAMLESS_MEMORY_SECRET
 SEAMLESS_UNSET_ENV = $(foreach v,$(SEAMLESS_ENV_OWNED),-u $(v))
 
+# Container engine: docker (default; Colima context colima-seamless, or any Docker host with
+# SEAMLESS_DOCKER_CONTEXT=default) or podman (`podman compose`, which runs docker-compose when it is installed —
+# recommended — or podman-compose). Example: make seamless-demo SEAMLESS_ENGINE=podman
+SEAMLESS_ENGINE ?= docker
+SEAMLESS_HOST_PORT ?= 8080
+ifeq ($(SEAMLESS_ENGINE),podman)
+SEAMLESS_DOCKER       = podman
+SEAMLESS_COMPOSE_CMD  = podman compose
+# podman-compose has no --wait: the targets poll /api/v1/health instead
+SEAMLESS_UP_WAIT      =
+else
 # DOCKER_HOST would override the context, so it is unset for these commands.
 SEAMLESS_DOCKER       = env -u DOCKER_HOST DOCKER_CONTEXT=$(SEAMLESS_DOCKER_CONTEXT) docker --context $(SEAMLESS_DOCKER_CONTEXT)
-SEAMLESS_COMPOSE_BASE = $(SEAMLESS_DOCKER) compose -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
+SEAMLESS_COMPOSE_CMD  = $(SEAMLESS_DOCKER) compose
+SEAMLESS_UP_WAIT      = --wait --wait-timeout 300
+endif
+SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
+# wait until the control plane answers (both engines; Docker's --wait already covers the healthchecks)
+SEAMLESS_WAIT_HEALTH  = for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
+                        [ $$i = 150 ] && { echo "the control plane did not become healthy in 300 s: make seamless-logs"; exit 1; }; sleep 2; done
 SEAMLESS_COMPOSE      = env $(SEAMLESS_UNSET_ENV) $(SEAMLESS_COMPOSE_BASE) --env-file $(SEAMLESS_ENV_FILE)
 # parse-only placeholders for down/reset when .env is gone (nothing is started with them)
 SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused $(SEAMLESS_COMPOSE_BASE)
@@ -425,7 +442,8 @@ SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused 
         seamless-test seamless-check dashboard-build
 
 seamless-help:
-	@echo "Seamless Migrate stack (Docker Compose on Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
+	@echo "Seamless Migrate stack (engine '$(SEAMLESS_ENGINE)'; Docker: Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
+	@echo "  engines: SEAMLESS_ENGINE=docker (default) | podman;  any Docker host: SEAMLESS_DOCKER_CONTEXT=default"
 	@echo "  seamless-colima-up  - start the dedicated Colima profile ($(SEAMLESS_COLIMA_CPU) CPU / $(SEAMLESS_COLIMA_MEMORY) GiB / $(SEAMLESS_COLIMA_DISK) GiB) without changing your active Docker context"
 	@echo "  seamless-init       - generate deploy/compose/.env and tokens.yaml (prints the admin token once)"
 	@echo "  seamless-up         - build and start postgres, seamless (and jev when COMPOSE_PROFILES=ai)"
@@ -448,8 +466,14 @@ seamless-colima-up:
 	@echo "active Docker context is still: $$(docker context show)"
 
 seamless-check-context:
+ifeq ($(SEAMLESS_ENGINE),podman)
+	@command -v podman >/dev/null 2>&1 || { echo "podman not found: https://podman.io/docs/installation"; exit 1; }
+	@podman info >/dev/null 2>&1 || { echo "podman is not reachable (macOS/Windows: podman machine start)"; exit 1; }
+	@podman compose version >/dev/null 2>&1 || { echo "podman compose needs docker-compose (recommended) or podman-compose installed"; exit 1; }
+else
 	@docker context inspect $(SEAMLESS_DOCKER_CONTEXT) >/dev/null 2>&1 || { echo "Docker context '$(SEAMLESS_DOCKER_CONTEXT)' not found. Run: make seamless-colima-up"; exit 1; }
 	@$(SEAMLESS_DOCKER) info >/dev/null 2>&1 || { echo "Colima profile '$(SEAMLESS_COLIMA_PROFILE)' is not running. Run: make seamless-colima-up"; exit 1; }
+endif
 
 seamless-check-env:
 	@[ -f "$(SEAMLESS_ENV_FILE)" ] && [ -f "$(SEAMLESS_TOKENS_FILE)" ] || { echo "Missing deploy/compose/.env or tokens.yaml. Run: make seamless-init (prints the admin token once)"; exit 1; }
@@ -458,13 +482,15 @@ seamless-init:
 	@scripts/compose-init.sh
 
 seamless-up: seamless-check-context seamless-check-env
-	$(SEAMLESS_COMPOSE) up -d --build --wait --wait-timeout 300
-	@echo "Seamless Migrate: http://$$($(SEAMLESS_COMPOSE) port seamless 8080)/   health: /api/v1/health"
+	$(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate: http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   health: /api/v1/health"
 
 # Same stack with simulated providers and executor against PostgreSQL (SDD 7.4, 15.1).
 seamless-demo: seamless-check-context seamless-check-env
-	SEAMLESS_DEMO=true $(SEAMLESS_COMPOSE) up -d --build --wait --wait-timeout 300
-	@echo "Seamless Migrate (demo): http://$$($(SEAMLESS_COMPOSE) port seamless 8080)/   sign in with your admin token"
+	SEAMLESS_DEMO=true $(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate (demo): http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   sign in with your admin token"
 
 # --profile '*' also stops the optional jev sidecar when COMPOSE_PROFILES is empty.
 # Works without .env (placeholder values are only needed to parse the file).

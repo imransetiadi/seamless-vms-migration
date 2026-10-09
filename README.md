@@ -108,6 +108,25 @@ is reachable only from the control plane. The stack reaches your host's agentmem
 `http://host.docker.internal:3111`. Details, troubleshooting and the full variable list:
 [deploy/compose/README.md](deploy/compose/README.md).
 
+### Other container hosts: any Docker host, Podman
+
+The same Compose stack runs on every engine; the Make targets take the engine as a variable.
+
+```bash
+# Docker on Linux, Docker Desktop or another context instead of Colima
+make seamless-demo SEAMLESS_DOCKER_CONTEXT=default
+
+# Podman 4.7+ (Linux, or macOS/Windows with `podman machine start`): `podman compose` drives the stack,
+# with docker-compose as its provider when installed (recommended) or podman-compose
+scripts/compose-init.sh
+make seamless-demo SEAMLESS_ENGINE=podman
+make seamless-logs SEAMLESS_ENGINE=podman      make seamless-down SEAMLESS_ENGINE=podman
+```
+
+On SELinux hosts (RHEL, Fedora) the token file mount is relabelled automatically (`selinux: z`). With Podman the
+control plane reaches the host's agentmemory at `http://host.containers.internal:3111`; set
+`SEAMLESS_MEMORY_URL` in `deploy/compose/.env` accordingly.
+
 ### Without containers (control plane development)
 
 ```bash
@@ -130,6 +149,32 @@ oc apply -k deploy/openshift
 oc -n seamless-migrate rollout status deploy/seamless
 oc -n seamless-migrate get route seamless
 ```
+
+## Deploy on Kubernetes
+
+[`deploy/kubernetes/`](deploy/kubernetes/) is a Kustomize overlay of the OpenShift manifests for vanilla
+Kubernetes 1.28+ (EKS, AKS, GKE, RKE2, k3s, kubeadm): an Ingress replaces the Route (ingress-nginx annotations for
+the live event stream), the pods get explicit UIDs, the NetworkPolicies target CoreDNS and the ingress controller,
+and PostgreSQL uses the public `quay.io/sclorg/postgresql-16-c9s` image (same interface as the Red Hat one).
+Build and push the image with Docker or Podman, set it and the Ingress host in the overlay, create the Secrets of
+`deploy/openshift/secret-example.yaml` plus the TLS secret `seamless-tls`, then:
+
+```bash
+kubectl apply -k deploy/kubernetes
+kubectl -n seamless-migrate rollout status deploy/seamless
+kubectl -n seamless-migrate get ingress seamless
+```
+
+Credentials entered in the dashboard are stored as Kubernetes Secrets on both platforms
+(`SEAMLESS_SECRET_STORE=kubernetes`, the Role in `secret-store-rbac.yaml`). CI renders both overlays and validates
+them against the Kubernetes 1.30 schemas.
+
+| Platform | Where | Command |
+|---|---|---|
+| Docker (Colima, Docker Desktop, Linux) | `deploy/compose/` | `make seamless-up` (`SEAMLESS_DOCKER_CONTEXT=…` for other hosts) |
+| Podman 4.7+ | `deploy/compose/` | `make seamless-up SEAMLESS_ENGINE=podman` |
+| Kubernetes 1.28+ | `deploy/kubernetes/` | `kubectl apply -k deploy/kubernetes` |
+| OpenShift 4.16+ | `deploy/openshift/` | `oc apply -k deploy/openshift` |
 
 ## Documentation
 

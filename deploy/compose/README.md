@@ -55,6 +55,20 @@ curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/
 
 After `--force`, recreate the stack so the control plane reloads the files: `make seamless-down seamless-up`.
 
+## Other engines and hosts
+
+| Engine | How | Notes |
+|---|---|---|
+| Docker via Colima (default) | `make seamless-up` | context `colima-seamless`; your active context is never changed |
+| Any Docker host | `make seamless-up SEAMLESS_DOCKER_CONTEXT=default` | Docker Desktop, Docker Engine on Linux, a remote context |
+| Podman 4.7+ | `make seamless-up SEAMLESS_ENGINE=podman` | `podman compose` with docker-compose as provider (recommended) or podman-compose; the targets poll `/api/v1/health` instead of `--wait` |
+
+Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podman`, `make seamless-down …`).
+With Podman, the host is `host.containers.internal` (set `SEAMLESS_MEMORY_URL` in `.env` for agentmemory);
+rootless Podman keeps the named volumes in your user's storage. On SELinux hosts the token mount is
+relabelled (`selinux: z`). If you changed `SEAMLESS_HOST_PORT` in `.env`, pass it to make too so the health
+wait polls the right port.
+
 ## Make targets
 
 | Target | What it does |
