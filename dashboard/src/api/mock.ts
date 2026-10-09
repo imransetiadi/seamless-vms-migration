@@ -647,7 +647,8 @@ export class MockServer {
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
           const inUse = this.plans.some(
-            (p) => (p.source_provider_id === id || p.destination_provider_id === id) && !['completed', 'failed'].includes(p.status),
+            // like the API (SDD §12): only a completed plan releases its providers; a failed one can start again
+            (p) => (p.source_provider_id === id || p.destination_provider_id === id) && p.status !== 'completed',
           );
           if (inUse) throw new HttpError(409, 'conflict', `${provider.name} is referenced by a plan that is not finished.`);
           this.providers.splice(this.providers.indexOf(provider), 1);

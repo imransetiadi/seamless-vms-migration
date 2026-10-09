@@ -692,4 +692,15 @@ describe('mock API', () => {
     expect(server.handle('POST', `/plans/${plan.id}/validate`, new URLSearchParams(), {}, 'operator').status).toBe(200);
     expect(dropped.phase).toBe('cancelled');
   });
+
+  it('keeps a provider a failed plan uses from deletion like the API; a completed plan releases it (SDD §12)', () => {
+    const { server } = setup('admin');
+    for (const p of server.plans) p.status = 'completed';
+    const plan = server.plans[0]!;
+    plan.status = 'failed';
+    const id = plan.source_provider_id;
+    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(409);
+    plan.status = 'completed';
+    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(204);
+  });
 });

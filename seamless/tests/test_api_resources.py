@@ -650,3 +650,31 @@ def test_provider_failures_while_planning_answer_502_redacted(api, monkeypatch):
         assert res.status_code == 502, (path, res.text)
         assert res.json()["error"]["code"] == "provider_error"
         assert "hunter2" not in res.text and "auth failed" in res.text
+
+
+def test_a_failed_plan_keeps_its_providers_from_deletion(api):
+    """SDD §12/§8: a failed plan (pre-staging failed) can be started again, so its providers
+    cannot be deleted under it; a completed plan releases them."""
+    from seamless_migrate.domain.enums import PlanStatus
+    from seamless_migrate.domain.models import Plan
+
+    body = {
+        "name": "Pre-staging failed",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    stored = api.store.get("plan", plan["id"], Plan)
+    stored.status = PlanStatus.failed
+    api.store.put("plan", stored)
+    delete = lambda: api.client.delete(  # noqa: E731
+        "/api/v1/providers/src-osp", headers=api.h(Role.admin)
+    )
+    refused = delete()
+    assert refused.status_code == 409, refused.text
+    assert plan["id"] in refused.json()["error"]["message"]
+    stored = api.store.get("plan", plan["id"], Plan)
+    stored.status = PlanStatus.completed
+    api.store.put("plan", stored)
+    assert delete().status_code == 204
