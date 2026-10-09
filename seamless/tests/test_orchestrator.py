@@ -276,6 +276,41 @@ async def test_validate_cancels_a_removed_vms_failed_migration(tmp_path, store):
     assert store.get("migration", dropped.id, Migration).phase == P.cancelled
 
 
+async def test_validate_cleans_up_a_removed_vms_warm_data_path(tmp_path, store):
+    """SDD §5.1/§5.4: validation cancels a removed VM's failed migration through cancel(), so a
+    warm one that recorded passes gets the same cleanup as any cancel with a data path."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    dropped = await h.by_vm(plan.id, "vm-2")
+    now = datetime.now(UTC)
+    dropped.phase = P.failed  # a delta pass failed after a full one; the source VM kept running
+    dropped.sync_passes = [SyncPass(number=1, kind="full", started_at=now, ended_at=now)]
+    store.put("migration", dropped)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+
+    await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("migration", dropped.id, Migration).phase == P.cancelled
+    assert await _settled(h, dropped.id) == ["cancel", "cleanup"]
+    assert rollbacks == [{"delete_dest_volumes": True}]
+
+
 @pytest.mark.parametrize("ended", [False, True])
 async def test_validate_refuses_to_drop_a_failed_migration_that_stopped_its_source(
     tmp_path, store, ended
@@ -1098,6 +1133,70 @@ async def test_an_attempt_never_starts_for_a_migration_cancelled_after_its_backo
     assert rollbacks == [{"delete_dest_volumes": True}]
     assert (await h.migration(m.id)).phase == P.cancelled
     await h.orch.stop()
+
+
+@pytest.mark.parametrize("where", ["awaiting_cutover", "failed"])
+async def test_cancel_with_recorded_passes_cleans_up_the_warm_data_path(tmp_path, store, where):
+    """SDD §5.1: a warm migration whose passes left a data path — converged and waiting for its
+    cutover, or failed after a pass — keeps destination volumes and source snapshots that no later
+    action could remove (cancelled is terminal): its cancel runs the rollback step once with
+    delete_dest_volumes, though no step runs."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    async def quota(ctx):
+        raise PermanentStepError("snapshot quota exceeded")
+
+    hooks = {StepName.ROLLBACK: rollback}
+    if where == "failed":
+        # a first pass that does not converge, then a delta pass that fails for good
+        hooks[StepName.PRECOPY] = scripted_pass(recent_base(), 0, 100.0, 10 * 2**30, "full")
+        hooks[StepName.SYNC] = quota
+    executor = ScriptedExecutor(settings, hooks=hooks)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300, "require_approval": True},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P(where))
+    assert m.sync_passes and m.downtime_started_at is None
+    assert m.id not in h.orch._steps, "no step runs"
+
+    cancelled = await h.orch.cancel(m.id, "rina", "descoped")
+    assert cancelled.phase == P.cancelled
+    assert await _settled(h, m.id) == ["cancel", "cleanup"]
+    assert rollbacks == [{"delete_dest_volumes": True}]
+    await h.orch.stop()
+
+
+async def test_cancel_without_a_data_path_runs_no_cleanup(tmp_path, store):
+    """SDD §5.1: a warm migration that never ran a pass (validated, its plan not started) left
+    nothing behind: its cancel runs no rollback step."""
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert m.phase == P.ready and not m.sync_passes
+
+    await h.orch.cancel(m.id, "rina", "descoped")
+    assert await _settled(h, m.id) == ["cancel"]
+    assert executor.calls == []
 
 
 async def test_wave_dependencies_respected(tmp_path, store):

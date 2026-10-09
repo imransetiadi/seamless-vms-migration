@@ -871,16 +871,17 @@ class Orchestrator:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
                     raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
-            previous = m.phase
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-            # between the attempts of a transient retry no step runs, but the failed attempt may
-            # have left the same resources behind; the cancel ends the retries (SDD §5.1, §8)
-            retrying = mid in self._backoff
+            # SDD §5.1: the data path of a warm migration — the killed pass, a failed attempt
+            # waiting for its retry (no step runs then; the cancel ends the retries, §8) or the
+            # passes it recorded — left snapshots, temporary and destination volumes behind, and
+            # `cancelled` is terminal: no later action could remove them
+            data_path = step is not None or mid in self._backoff or bool(m.sync_passes)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -888,13 +889,8 @@ class Orchestrator:
             actor=actor,
             data={"action": "cancel", "reason": reason},
         )
-        if (
-            (step is not None or retrying)
-            and previous in (P.precopy, P.syncing)
-            and not self._stopping
-        ):
-            # the killed pass left snapshots, temporary and destination volumes behind: the
-            # rollback step removes them (the source keeps running throughout a pass)
+        if data_path and not self._stopping:
+            # the rollback step removes them (a cancel never leaves the source stopped, §5.1)
             self._cleanups[mid] = asyncio.create_task(
                 self._cleanup_after_cancel(m, step, actor), name=f"cleanup:{mid}"
             )
@@ -930,7 +926,7 @@ class Orchestrator:
             self._cleanups.pop(m.id, None)
         await self._emit(
             "migration.action",
-            f"{m.vm.name}: temporary resources of the cancelled pass removed",
+            f"{m.vm.name}: temporary resources of the cancelled migration removed",
             migration=m,
             actor=actor,
             data={"action": "cleanup"},
