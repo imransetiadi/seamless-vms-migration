@@ -283,6 +283,28 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['prestage_resources'] });
   });
 
+  it('shows and removes a per-VM strategy override when editing; only the overrides are sent (SDD §16)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const vmId = plan.vm_ids[0]!;
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string; name: string }>> }).inventories;
+    const vmName = inventories[plan.source_provider_id]!.find((v) => v.source_id === vmId)!.name;
+    plan.strategy_overrides = { [vmId]: 'warm' };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
+    expect(await within(overrides).findByLabelText(new RegExp(`^strategy for ${vmName}$`, 'i'))).toHaveValue('warm');
+    await user.click(within(overrides).getByRole('button', { name: new RegExp(`^remove the override for ${vmName}$`, 'i') }));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.strategy_overrides).toEqual({});
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['strategy_overrides'] });
+  });
+
   it('edits the verification settings, prefilled from the plan; only verification is sent', async () => {
     const user = userEvent.setup();
     const server = createTestServer();

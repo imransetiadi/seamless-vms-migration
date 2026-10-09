@@ -156,6 +156,58 @@ describe('Plans page', () => {
     expect(created.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups']);
   });
 
+  it('sets a per-VM strategy override; a VM taken out of the plan loses its override (SDD §16)', async () => {
+    const user = userEvent.setup();
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Override wave');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select web-02' }));
+    const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
+    await user.selectOptions(within(overrides).getByLabelText(/^vm$/i), 'web-01');
+    await user.selectOptions(within(overrides).getByLabelText(/^override strategy$/i), 'warm');
+    await user.click(within(overrides).getByRole('button', { name: /^add override$/i }));
+    await user.selectOptions(within(overrides).getByLabelText(/^vm$/i), 'web-02');
+    await user.selectOptions(within(overrides).getByLabelText(/^override strategy$/i), 'cold');
+    await user.click(within(overrides).getByRole('button', { name: /^add override$/i }));
+    expect(within(overrides).getByLabelText(/^strategy for web-01$/i)).toHaveValue('warm');
+    expect(within(overrides).getByLabelText(/^strategy for web-02$/i)).toHaveValue('cold');
+    // web-02 leaves the plan: its override goes with it
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Select web-02' }));
+    expect(within(overrides).queryByLabelText(/^strategy for web-02$/i)).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Override wave')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Override wave')!.strategy_overrides).toEqual({ 'os-0a11': 'warm' });
+  });
+
+  it('changes an override in place, and another source clears every override (SDD §16)', async () => {
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
+    const add = within(overrides).getByRole('button', { name: /^add override$/i });
+    expect(add).toHaveAttribute('aria-disabled', 'true');
+    await user.selectOptions(within(overrides).getByLabelText(/^vm$/i), 'web-01');
+    await user.selectOptions(within(overrides).getByLabelText(/^override strategy$/i), 'warm');
+    await user.click(add);
+    await user.selectOptions(within(overrides).getByLabelText(/^strategy for web-01$/i), 'storage_handover');
+    expect(within(overrides).getByLabelText(/^strategy for web-01$/i)).toHaveValue('storage_handover');
+    // every selected VM has an override now: nothing left to choose
+    expect(within(overrides).getByLabelText(/^vm$/i)).toBeDisabled();
+
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'vcenter-hq');
+    expect(within(overrides).queryByLabelText(/^strategy for /i)).not.toBeInTheDocument();
+    expect(within(within(overrides).getByLabelText(/^override strategy$/i)).getAllByRole('option').map((o) => o.getAttribute('value'))).toEqual(['', 'vmware_cold', 'vmware_warm']);
+  });
+
   it('refuses a keep-warm interval under a minute (SDD §5.4)', async () => {
     const user = userEvent.setup();
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

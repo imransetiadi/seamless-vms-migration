@@ -28,6 +28,8 @@ interface FormState {
   destinationId: string;
   vmIds: Set<string>;
   defaultStrategy: Strategy | 'auto';
+  /** Per-VM strategy, keyed by the VM's source id (SDD §4.2 strategy_overrides); only selected VMs are sent. */
+  overrides: Record<string, Strategy>;
   policy: SelectionPolicy;
   sloMinutes: string;
   requireApproval: boolean;
@@ -73,6 +75,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     destinationId: '',
     vmIds: new Set(vmIds),
     defaultStrategy: 'auto',
+    overrides: {},
     policy: 'min_downtime',
     sloMinutes: '10',
     requireApproval: true,
@@ -143,6 +146,7 @@ function formFromPlan(plan: Plan): FormState {
     description: plan.description ?? '',
     destinationId: plan.destination_provider_id,
     defaultStrategy: plan.default_strategy,
+    overrides: { ...plan.strategy_overrides },
     policy: plan.selection_policy,
     sloMinutes: plain(plan.downtime_slo_s / 60),
     requireApproval: plan.require_approval,
@@ -264,6 +268,21 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const destinations = (providers.data ?? []).filter((p) => p.role === 'destination');
   const source = sources.find((p) => p.id === form.sourceId);
   const vms = inventory.data && !isDestinationInventory(inventory.data) ? inventory.data : [];
+  // per-VM strategy overrides (SDD §16): the VM and strategy of the override being added
+  const [pendingVm, setPendingVm] = useState('');
+  const [pendingStrategy, setPendingStrategy] = useState('');
+  const vmName = (vmId: string): string => vms.find((v) => v.source_id === vmId)?.name ?? vmId;
+  const overrideRows = Object.entries(form.overrides).filter(([vmId]) => form.vmIds.has(vmId));
+  const overrideCandidates = [...form.vmIds].filter((vmId) => !(vmId in form.overrides)).sort((a, b) => vmName(a).localeCompare(vmName(b)));
+  const strategyOptions = strategiesFor(source?.kind).map((s) => ({ value: s, label: STRATEGY_LABELS[s] }));
+  const addOverride = () => {
+    if (!pendingVm || !pendingStrategy) return;
+    setForm((f) => ({ ...f, overrides: { ...f.overrides, [pendingVm]: pendingStrategy as Strategy } }));
+    setPendingVm('');
+    setPendingStrategy('');
+  };
+  const removeOverride = (vmId: string) =>
+    setForm((f) => ({ ...f, overrides: Object.fromEntries(Object.entries(f.overrides).filter(([key]) => key !== vmId)) }));
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
 
   // storage handover (SDD §7.3, §7.3.1): one RHOSO backend per volume type of the selected VMs
@@ -364,6 +383,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         destination_provider_id: f.destinationId,
         vm_ids: [...f.vmIds],
         default_strategy: f.defaultStrategy,
+        // a VM taken out of the plan takes its override with it
+        strategy_overrides: Object.fromEntries(Object.entries(f.overrides).filter(([vmId]) => f.vmIds.has(vmId))),
         selection_policy: f.policy,
         downtime_slo_s: Math.round(slo * 60),
         require_approval: f.requireApproval,
@@ -501,7 +522,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Source provider"
                 required
                 value={form.sourceId}
-                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto' }))}
+                onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto', overrides: {} }))}
                 disabled={editing}
                 hint={editing ? 'The source of an existing plan stays the same; create a new plan for another source.' : undefined}
                 error={errors.source}
@@ -599,6 +620,61 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 error={errors.slo}
               />
             </div>
+            <fieldset className="flex min-w-0 flex-col gap-2">
+              <legend className="mb-1 text-sm font-medium text-foreground">Per-VM strategy</legend>
+              <p className="field-hint mt-0">
+                Overrides the default for one VM. An override that is not eligible for the VM is ignored at validation, and the
+                migration says why.
+              </p>
+              {overrideRows.length > 0 && (
+                <ul className="flex flex-col gap-2">
+                  {overrideRows.map(([vmId, strategy]) => (
+                    <li key={vmId} className="flex flex-wrap items-end gap-2">
+                      <SelectField
+                        id={id(`override-${vmId}`)}
+                        label={`Strategy for ${vmName(vmId)}`}
+                        className="min-w-48 flex-1"
+                        value={strategy}
+                        onChange={(e) => set('overrides', { ...form.overrides, [vmId]: e.target.value as Strategy })}
+                        options={strategyOptions}
+                      />
+                      <Button type="button" variant="ghost" aria-label={`Remove the override for ${vmName(vmId)}`} onClick={() => removeOverride(vmId)}>
+                        Remove
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div className="flex flex-wrap items-end gap-2">
+                <SelectField
+                  id={id('override-vm')}
+                  label="VM"
+                  className="min-w-48 flex-1"
+                  value={pendingVm}
+                  onChange={(e) => setPendingVm(e.target.value)}
+                  disabled={overrideCandidates.length === 0}
+                  options={[
+                    { value: '', label: form.vmIds.size === 0 ? 'Select VMs above first' : overrideCandidates.length ? 'Choose a selected VM' : 'Every selected VM has an override' },
+                    ...overrideCandidates.map((vmId) => ({ value: vmId, label: vmName(vmId) })),
+                  ]}
+                />
+                <SelectField
+                  id={id('override-strategy')}
+                  label="Override strategy"
+                  className="min-w-48 flex-1"
+                  value={pendingStrategy}
+                  onChange={(e) => setPendingStrategy(e.target.value)}
+                  options={[{ value: '', label: 'Choose a strategy' }, ...strategyOptions]}
+                />
+                <Button
+                  type="button"
+                  onClick={addOverride}
+                  disabledReason={!pendingVm ? 'Choose a selected VM first.' : !pendingStrategy ? 'Choose the strategy for this VM first.' : null}
+                >
+                  Add override
+                </Button>
+              </div>
+            </fieldset>
             <div className="grid gap-x-4 sm:grid-cols-2">
               <Checkbox
                 checked={form.requireApproval}
