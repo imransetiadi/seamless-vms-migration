@@ -113,6 +113,8 @@ unless the name ends in `_gb`. Durations are float seconds (`_s`).
 
 ```text
 ProviderKind   = openstack | vmware | rhoso
+Distribution   = openstack_community | kolla | rhosp | rhoso | vmware   # presets and display only;
+                 # kind decides the code path: openstack_community|kolla|rhosp → openstack, rhoso → rhoso, vmware → vmware
 ProviderRole   = source | destination
 Strategy       = cold | warm | storage_handover | vmware_cold | vmware_warm
 Phase          = pending | validating | blocked | ready | precopy | syncing | awaiting_cutover |
@@ -138,6 +140,9 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: Provider
            role: ProviderRole, endpoint: str, cloud: str|null, credentials_secret: str|null,
            region: str|null, verify_tls: bool = true, ca_cert_path: str|null,
            conversion_host: ConversionHostConfig|null,
+           distribution: Distribution|null,            # must match kind (see above); null = by kind
+           credentials_updated_at: datetime|null,      # server-owned: set by PUT …/credentials
+           conversion_key_updated_at: datetime|null,   # server-owned: set by PUT …/conversion-key
            capabilities: dict[str, Any] = {}, status: "unknown"|"ok"|"degraded"|"error" = "unknown",
            status_message: str|null, last_checked_at: datetime|null }
 
@@ -234,7 +239,9 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
-`provider.deleted`, `provider.checked`, `auth.denied`.
+`provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
+`auth.denied`. `provider.credentials_updated` carries the provider id and the key *names* written,
+never a value.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`.
@@ -835,7 +842,10 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | GET | `/providers` | viewer | — | `Provider[]` |
 | POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider` |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a non-terminal plan) |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider | `Provider` |
+| PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
+| PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a non-terminal plan); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -916,6 +926,29 @@ password}` or environment variables `SEAMLESS_SECRET_{NAME}_USERNAME/_PASSWORD` 
 is resolved the same way by `security.secrets.resolve_private_key(name) -> str` from
 `{SEAMLESS_SECRETS_DIR}/{name}/private_key` or `SEAMLESS_SECRET_{NAME}_PRIVATE_KEY`, and written as a
 0600 file for the run. Secret material is passed to Ansible only via 0600 files deleted after each run.
+
+**Credentials entered in the dashboard** (`PUT /providers/{id}/credentials`, `PUT …/conversion-key`,
+admin) are written to the platform's **secret store** — never to the database, never returned — under
+the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key). The
+provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
+time (`credentials_updated_at`, `conversion_key_updated_at`). `SEAMLESS_SECRET_STORE` selects it:
+
+* `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
+  each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
+  `seamless-secrets` volume there).
+* `kubernetes` (OpenShift): a `Secret` named `seamless-{name}` in `SEAMLESS_K8S_NAMESPACE` (default:
+  the pod's namespace) created or replaced through the API with the pod's ServiceAccount token
+  (labels `app.kubernetes.io/managed-by: seamless-migrate`, `seamless.io/provider: {id}`); reads go
+  through the API as well, so no pod restart is needed. Needs the Role of §17.
+
+Resolution order for a secret name: mounted files under `SEAMLESS_SECRETS_DIR`, then the store (when it
+is `kubernetes`), then `SEAMLESS_SECRET_{NAME}_{KEY}` variables. An **OpenStack/RHOSO provider with a
+`credentials_secret`** builds its connection from that secret — keys `auth_url` (default: the
+provider endpoint), `username`/`password`/`project_name`/`user_domain_name`/`project_domain_name`
+(`Default` when absent) for password auth, or `application_credential_id`/`application_credential_secret`
+for application credentials, plus optional `interface` — instead of the `clouds.yaml` entry named by
+`cloud`; without one, `clouds.yaml` is used as before. A VMware secret holds `username`, `password`
+and optional `datacenter`. Deleting a provider deletes the secrets the store manages for it.
 
 ### 13.4 AI data minimization
 
@@ -1045,6 +1078,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (valid tokens always pass; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
+| `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
@@ -1075,7 +1109,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves actions), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name), `/providers` (status cards + Check), `/inventory/:providerId`
+  requires typing the VM name), `/providers` (status cards + Check; admins add and edit providers with a distribution preset —
+  OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
+  enter write-only credentials and the conversion-host SSH key), `/inventory/:providerId`
   (VM table with filters), `/events` (live audit stream), `/advisor` (Jev/agentmemory status,
   similar-incident search), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
@@ -1096,6 +1132,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, liveness
   `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS), NetworkPolicy (ingress from router only;
   egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory).
+* Dashboard-entered credentials (`SEAMLESS_SECRET_STORE=kubernetes`, §13.3): the `seamless`
+  ServiceAccount gets a namespaced Role (`secrets`: get, create, update, delete) and its token is
+  mounted; the API answers 503 for the credential routes when the store cannot reach the API server.
 * Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
   a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
   existing database through the `seamless-db` Secret).
