@@ -1253,8 +1253,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   Route; explicit `runAsUser`/`runAsGroup`/`fsGroup` (1001/0/0 for the control plane, 26 for PostgreSQL)
   instead of the UIDs the restricted SCC injects; DNS egress to CoreDNS (`kube-system`, `k8s-app:
   kube-dns`) and ingress from the `ingress-nginx` namespace in the NetworkPolicies; API-server egress to
-  `10.96.0.1/32` (the usual `kubernetes` Service IP — set the cluster's own); PostgreSQL from
-  `quay.io/sclorg/postgresql-16-c9s` (the image interface of `registry.redhat.io/rhel9/postgresql-16`).
+  `10.96.0.1/32` (the usual `kubernetes` Service IP — set the cluster's own); the external and the
+  6443 egress rules except the cluster's pod and service networks instead of OpenShift's (kubeadm/kind
+  defaults `10.244.0.0/16`, `10.96.0.0/12`, and `169.254.0.0/16` — adjust per cluster; OpenShift's
+  ranges are ordinary private addresses there); PostgreSQL from `quay.io/sclorg/postgresql-16-c9s`
+  pinned by digest (the image interface of `registry.redhat.io/rhel9/postgresql-16`).
   kustomize silently ignores a patch whose target matches nothing, so CI renders the overlay and asserts
   each patch's result.
 * Dashboard-entered credentials (`SEAMLESS_SECRET_STORE=kubernetes`, §13.3): the `seamless`
