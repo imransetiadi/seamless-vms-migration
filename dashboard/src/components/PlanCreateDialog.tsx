@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useProviders } from '../api/hooks';
 import { isDestinationInventory, type PlanCreate, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { parseMappings } from '../lib/mappings';
+import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
@@ -39,9 +40,12 @@ interface FormState {
   parallelDisks: string;
   tcpPorts: string;
   autoRollback: boolean;
+  /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
+  handoverEnabled: boolean;
+  handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports';
+type FieldKey = 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -68,6 +72,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     parallelDisks: '',
     tcpPorts: '22',
     autoRollback: true,
+    handoverEnabled: false,
+    handoverMap: {},
   };
 }
 
@@ -132,6 +138,36 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
   const vms = inventory.data && !isDestinationInventory(inventory.data) ? inventory.data : [];
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
 
+  // storage handover (SDD §7.3, §7.3.1): one RHOSO backend per volume type of the selected VMs
+  const destination = destinations.find((p) => p.id === form.destinationId);
+  const selectedVms = vms.filter((vm) => form.vmIds.has(vm.source_id));
+  const sourceStorage = source ? storageBackends(source.capabilities) : [];
+  const destinationStorage = destination ? storageBackends(destination.capabilities) : [];
+  const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
+  const handoverTypes = [...typeFamilies.keys()];
+  const targetsFor = (type: string) => handoverTargets(typeFamilies.get(type) ?? null, destinationStorage);
+  const chosenTarget = (type: string): string => {
+    const targets = targetsFor(type);
+    return form.handoverMap[type] ?? (targets.length === 1 ? targets[0]! : '');
+  };
+  /** Destination pools (or the reasons a volume cannot be handed over) for one volume type. */
+  const landing = (type: string): { pools: string[]; errors: string[] } => {
+    const target = chosenTarget(type);
+    const families = new Map(sourceStorage.map((b) => [b.pool, b.family]));
+    const pools = new Set<string>();
+    const problems = new Set<string>();
+    if (!target) return { pools: [], errors: [] };
+    for (const vm of selectedVms) {
+      for (const disk of vm.disks) {
+        if (disk.kind !== 'volume' || disk.volume_type !== type || !disk.pool || !families.has(disk.pool)) continue;
+        const { host, error } = resolveDestination(families.get(disk.pool)!, splitHost(disk.pool)[1], target, destinationStorage);
+        if (host) pools.add(host);
+        if (error) problems.add(`${vm.name}: ${error}`);
+      }
+    }
+    return { pools: [...pools].sort(), errors: [...problems] };
+  };
+
   const validate = (): { errors: Errors; body: PlanCreate | null } => {
     const e: Errors = {};
     if (!form.name.trim()) e.name = 'Enter a plan name.';
@@ -168,6 +204,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     }
     const ports = form.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
+    const backendMap: Record<string, string> = {};
+    if (form.handoverEnabled && source?.kind !== 'vmware') {
+      const missing = handoverTypes.filter((t) => !chosenTarget(t));
+      const problems = handoverTypes.flatMap((t) => landing(t).errors);
+      if (missing.length) e.handover = `Choose a RHOSO backend for ${missing.join(', ')}.`;
+      else if (problems.length) e.handover = problems[0];
+      for (const t of handoverTypes) if (chosenTarget(t)) backendMap[t] = chosenTarget(t);
+    }
     if (Object.keys(e).length) return { errors: e, body: null };
     return {
       errors: e,
@@ -184,6 +228,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
         auto_cutover: form.autoCutover,
         cutover_window: form.windowStart ? { start: new Date(form.windowStart).toISOString(), end: new Date(form.windowEnd).toISOString() } : null,
         mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: {} },
+        handover: { enabled: form.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
@@ -233,8 +278,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     scan: id('scan'),
     parallel: id('parallel'),
     ports: id('ports'),
+    handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports'].some((k) => k in errors);
+  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!create.isPending} initialFocusRef={nameRef}>
@@ -372,7 +418,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
           </Fieldset>
 
           <details id={id('advanced')} className="rounded-md border border-border px-3 py-2" open={advancedHasErrors || undefined}>
-            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync and verification</summary>
+            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, verification and storage handover</summary>
             <div className="mt-3 flex flex-col gap-4 pb-2">
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('window-start')} label="Cutover window start" type="datetime-local" value={form.windowStart} onChange={(e) => set('windowStart', e.target.value)} error={errors.window} hint="Local time; leave empty for any time." />
@@ -419,6 +465,48 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Comma separated, e.g. 22, 443." />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
               </div>
+              {source?.kind !== 'vmware' && (
+                <Fieldset legend="Storage handover">
+                  <input id={id('handover')} type="hidden" />
+                  <Checkbox
+                    checked={form.handoverEnabled}
+                    onChange={(v) => set('handoverEnabled', v)}
+                    label="Hand volumes over without copying"
+                    hint="RHOSO takes over the volumes where they are (Cinder unmanage and manage). Both clouds need admin rights and must reach the same Ceph pool or NetApp ONTAP SVM."
+                  />
+                  {form.handoverEnabled &&
+                    (handoverTypes.length === 0 ? (
+                      <p className="text-sm text-muted-foreground">Select VMs with Cinder volumes to map their volume types.</p>
+                    ) : (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {handoverTypes.map((type, index) => {
+                          const family = typeFamilies.get(type) ?? null;
+                          const targets = targetsFor(type);
+                          const where = landing(type);
+                          const hint = where.pools.length
+                            ? `Lands on ${where.pools.join(', ')}`
+                            : targets.length === 0
+                              ? 'The destination reports no compatible backend.'
+                              : family === 'netapp_nfs' || family === 'netapp_block'
+                                ? 'The export or FlexVol is matched per volume.'
+                                : undefined;
+                          return (
+                            <SelectField
+                              key={type}
+                              id={id(`handover-${type}`)}
+                              label={`${type}${family ? ` on ${FAMILY_LABELS[family]}` : ''}`}
+                              value={chosenTarget(type)}
+                              onChange={(e) => set('handoverMap', { ...form.handoverMap, [type]: e.target.value })}
+                              options={[{ value: '', label: 'Choose a RHOSO backend' }, ...targets.map((t) => ({ value: t, label: t }))]}
+                              hint={hint}
+                              error={index === 0 ? errors.handover : undefined}
+                            />
+                          );
+                        })}
+                      </div>
+                    ))}
+                </Fieldset>
+              )}
             </div>
           </details>
 

@@ -17,6 +17,7 @@ import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative } from '../lib/format';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
+import { storageBackends, storageSummary } from '../lib/storage';
 import { providerStatusMeta } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -25,13 +26,16 @@ const CAPABILITY_LABELS: Record<string, string> = {
   compute_microversion: 'Compute API',
   ovn: 'OVN networking',
   volume_backends: 'Volume backends',
+  storage_backends: 'Storage',
   cbt: 'CBT support',
   version: 'Version',
   datastores: 'Datastores',
 };
 
 function Capabilities({ capabilities }: { capabilities: Record<string, unknown> }) {
-  const entries = Object.entries(capabilities);
+  // storage_backends (SDD §10) supersedes the plain pool-name list and is shown by driver family
+  const hasStorage = Array.isArray(capabilities.storage_backends);
+  const entries = Object.entries(capabilities).filter(([key]) => !(hasStorage && key === 'volume_backends'));
   if (entries.length === 0) {
     return <p className="text-sm text-muted-foreground">No capabilities reported yet. Run a check to see them.</p>;
   }
@@ -49,7 +53,12 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
             </li>
           );
         }
-        const text = Array.isArray(value) ? value.join(', ') : String(value);
+        const text =
+          key === 'storage_backends'
+            ? storageSummary(storageBackends(capabilities)) || 'no pools listed'
+            : Array.isArray(value)
+              ? value.join(', ')
+              : String(value);
         return (
           <li key={key} className="inline-flex max-w-full items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>

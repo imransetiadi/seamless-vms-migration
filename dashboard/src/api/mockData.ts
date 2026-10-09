@@ -22,6 +22,7 @@ import type {
   SyncPass,
   VMRef,
 } from './types';
+import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 
 export const GiB = 1024 ** 3;
 export const MiB = 1024 ** 2;
@@ -67,20 +68,58 @@ interface VmSpec {
   change_rate_mibps?: number;
 }
 
+/** Cinder pool of each mock volume type (SDD §4.2 `Disk.pool`): Ceph RBD and an ONTAP NFS export. */
+const MOCK_POOLS: Record<string, string> = {
+  'tripleo-ceph': 'overcloud@tripleo_ceph#tripleo-ceph',
+  'tripleo-ceph-ssd': 'overcloud@tripleo_ceph#tripleo-ceph-ssd',
+  'ceph-ssd': 'overcloud@tripleo_ceph#ceph-ssd',
+  'ceph-hdd': 'overcloud@tripleo_ceph#ceph-hdd',
+  'netapp-nfs': 'overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1',
+  lvm: 'lab@lvm#lvm',
+};
+
+const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other') => ({
+  pool,
+  vendor: family === 'netapp_nfs' ? 'NetApp' : 'Open Source',
+  protocol: family === 'netapp_nfs' ? 'nfs' : family === 'rbd' ? 'ceph' : 'iSCSI',
+  family,
+});
+
+const DC1_STORAGE = [
+  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd'),
+  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd'),
+  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1', 'netapp_nfs'),
+];
+
+const PROD_STORAGE = [
+  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd'),
+  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd'),
+  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd'),
+  // the same ONTAP export, mounted through the RHOSO storage network's LIF
+  backend('hostgroup@ontap-nfs#198.51.100.60:/cinder_dc1', 'netapp_nfs'),
+];
+
 export function makeVm(spec: VmSpec): VMRef {
-  const disks: Disk[] = spec.disks.map((d, i) => ({
+  const disks: Disk[] = spec.disks.map((d, i) => {
+    const kind = d.kind ?? 'volume';
+    const volumeType = d.volume_type === undefined ? 'tripleo-ceph' : d.volume_type;
+    return {
     id: d.id ?? `${spec.id}-disk-${i}`,
     name: d.name ?? `${spec.name}-${i === 0 ? 'root' : `data${i}`}`,
     size_gb: d.size_gb,
     used_gb: d.used_gb === undefined ? null : d.used_gb,
     bootable: d.bootable ?? i === 0,
-    volume_type: d.volume_type === undefined ? 'tripleo-ceph' : d.volume_type,
+    volume_type: volumeType,
     device: d.device ?? `/dev/vd${String.fromCharCode(97 + i)}`,
-    kind: d.kind ?? 'volume',
+    kind,
     multiattach: d.multiattach ?? false,
     encrypted: d.encrypted ?? false,
     independent: d.independent ?? false,
-  }));
+    pool: d.pool !== undefined ? d.pool : kind === 'volume' && volumeType ? (MOCK_POOLS[volumeType] ?? null) : null,
+    };
+  });
   const diskBytes = disks.reduce((sum, d) => sum + d.size_gb * GiB, 0);
   const everyUsed = disks.every((d) => d.used_gb !== null);
   const usedBytes = everyUsed
@@ -133,8 +172,8 @@ const OS_VMS: VmSpec[] = [
   { id: 'os-0e63', name: 'shared-disk-node-a', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 12 }, { size_gb: 300, used_gb: 140, multiattach: true }], tags: { app: 'gfs-cluster' } },
   { id: 'os-0e64', name: 'app-billing-01', project: 'finance', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 50, used_gb: 22 }, { size_gb: 150, used_gb: 88 }], tags: { app: 'billing' }, change_rate_mibps: 3 },
   { id: 'os-0e65', name: 'static-cdn-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 20, used_gb: 6, kind: 'image_root', volume_type: null }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'static' } },
-  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', disks: [{ size_gb: 60, used_gb: 25 }], tags: { app: 'reporting' } },
-  { id: 'os-0e67', name: 'old-ftp-01', project: 'platform', flavor: 'm1.small', power_state: 'stopped', disks: [{ size_gb: 30, used_gb: 4 }], tags: { app: 'ftp' } },
+  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', disks: [{ size_gb: 60, used_gb: 25, volume_type: 'netapp-nfs' }], tags: { app: 'reporting' } },
+  { id: 'os-0e67', name: 'old-ftp-01', project: 'platform', flavor: 'm1.small', power_state: 'stopped', disks: [{ size_gb: 30, used_gb: 4, volume_type: 'netapp-nfs' }], tags: { app: 'ftp' } },
   { id: 'os-0f71', name: 'analytics-node-1', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 380, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f72', name: 'analytics-node-2', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 362, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f73', name: 'analytics-node-3', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 15, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 371, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
@@ -179,7 +218,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: ['tripleo-ceph', 'tripleo-ceph-ssd'] },
+      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
@@ -263,7 +302,8 @@ export function buildProviders(now: number): Provider[] {
         admin: true,
         compute_microversion: '2.95',
         ovn: true,
-        volume_backends: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme'],
+        volume_backends: PROD_STORAGE.map((b) => b.pool),
+        storage_backends: PROD_STORAGE,
       },
       status: 'ok',
       status_message: 'All services healthy; OVN networking.',
@@ -304,7 +344,7 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       { name: 'm1.large', vcpus: 8, ram_mb: 32768, disk_gb: 160, extra_specs: {} },
       { name: 'db.xlarge', vcpus: 16, ram_mb: 131072, disk_gb: 200, extra_specs: { 'hw:cpu_policy': 'dedicated' } },
     ],
-    volume_types: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme'],
+    volume_types: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme', 'netapp-nfs'],
     quotas: {
       shop: { cores: 120, ram_mb: 262144, instances: 40, volumes: 80, gigabytes: 8000 },
       finance: { cores: 96, ram_mb: 393216, instances: 20, volumes: 40, gigabytes: 6000 },
@@ -408,6 +448,23 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
   };
 }
 
+/** Per-volume driver-family checks of a handover where the pools are known (SDD §9.2, §7.3.1). */
+function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Provider): string[] {
+  const families = new Map(storageBackends(source.capabilities).map((b) => [b.pool, b.family]));
+  const dst = storageBackends(destination.capabilities);
+  const reasons: string[] = [];
+  for (const disk of vm.disks) {
+    if (disk.kind !== 'volume' || !disk.pool || !families.has(disk.pool)) continue;
+    const family = families.get(disk.pool)!;
+    const target = plan.handover.backend_map[disk.volume_type ?? ''];
+    if (family !== 'other' && (!target || dst.length === 0)) continue;
+    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst);
+    if (error) reasons.push(`${disk.name ?? disk.id}: ${error}`);
+  }
+  return reasons;
+}
+
+
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -437,6 +494,7 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
     result.storage_handover = handover;
   }

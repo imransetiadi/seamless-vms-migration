@@ -37,6 +37,17 @@ describe('Providers page', () => {
     expect(within(rhosp).getByRole('button', { name: /^edit$/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('lists the storage backends of a cloud by driver family instead of raw pool names', async () => {
+    renderPage('viewer');
+    const from = await screen.findByRole('region', { name: 'Migrate from' });
+    const rhosp = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    const caps = within(rhosp).getByRole('list', { name: /capabilities/i });
+    expect(caps).toHaveTextContent('Storage');
+    expect(caps).toHaveTextContent('Ceph RBD (4 pools), NetApp ONTAP NFS (1 pool)');
+    expect(caps).not.toHaveTextContent('[object Object]');
+    expect(caps).not.toHaveTextContent('Volume backends');
+  });
+
   it('checks every provider at once for an operator', async () => {
     const user = userEvent.setup();
     const { server } = renderPage('operator');

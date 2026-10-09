@@ -160,6 +160,8 @@ export interface Disk {
   multiattach: boolean;
   encrypted: boolean;
   independent: boolean;
+  /** Cinder `host@backend#pool` of a volume (admin only; SDD §4.2, §7.3.1). */
+  pool?: string | null;
 }
 
 export interface Nic {
@@ -203,7 +205,7 @@ export interface Mappings {
 
 export interface HandoverConfig {
   enabled: boolean;
-  /** source volume_type -> RHOSO cinder host "hostgroup@backend#pool". */
+  /** source volume_type -> RHOSO cinder host "hostgroup@backend#pool", or "hostgroup@backend" to resolve the pool per volume (SDD §7.3.1). */
   backend_map: Record<string, string>;
 }
 
