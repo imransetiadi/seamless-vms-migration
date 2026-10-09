@@ -1020,6 +1020,8 @@ with a strategy override for each and 1,000 mapping entries is about 0.5 MB.
 
 The free-text fields of the migration actions — `comment` (approve, cutover), `reason` (rollback,
 cancel) and `confirm` (finalize) — hold at most 2000 characters; a longer value is refused with 422.
+A plan's `name` holds at most 200 characters and its `description` 2000: `POST /plans` and
+`PATCH /plans/{id}` refuse longer ones with 422, while plans stored before the check keep loading.
 
 `GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
 continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
