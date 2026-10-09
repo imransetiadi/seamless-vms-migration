@@ -332,7 +332,9 @@ Approvals, `cutover_requested` and a pending `force_window` belong to the assess
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
-plan them anew).
+plan them anew). It cancels the migrations of VMs removed from `vm_ids`, so it also refuses — before
+changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1): such a VM stays
+in the plan until it is cut over or rolled back.
 `vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
 them; the SLO estimate and `max_sync_passes` decide.
 
