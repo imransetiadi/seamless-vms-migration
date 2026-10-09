@@ -1239,7 +1239,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids).
   Tokens are CSS variables consumed by Tailwind (`bg-background`, `text-muted-foreground`, …).
 * Accessibility: WCAG 2.2 AA contrast, visible focus rings, keyboard reachable actions, `aria-live`
-  for progress, `prefers-reduced-motion` honoured, 44×44 px minimum targets for primary actions.
+  for progress, `prefers-reduced-motion` honoured, 44×44 px minimum targets for primary actions. An
+  action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
+  short note under it when it is clicked or tapped (touch screens have no hover).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans`, `/plans/:id` (settings summary, waves board, migrations table with
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
