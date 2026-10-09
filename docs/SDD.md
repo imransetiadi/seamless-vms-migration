@@ -1287,8 +1287,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
-  stepper, progress, sync-pass convergence chart, downtime clock, findings (before pre-flight ran: that it runs at
-  validation, or is running), advisor notes, timeline,
+  stepper, progress, sync-pass convergence chart (once a long wait dropped passes from `sync_passes`, it says how
+  many earlier passes are no longer listed and that the bytes they transferred stay counted, §5.4), downtime clock,
+  findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); choosing another strategy asks
