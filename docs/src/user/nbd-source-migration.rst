@@ -101,7 +101,8 @@ Each entry in the list represents one disk with:
 * ``device``: The device name on the destination instance
 * ``uri``: The NBD URI to connect to
 * ``port``: The qemu-nbd port number
-* ``size``: Disk size in GB (detected from qemu-img info)
+* ``size``: Disk size in GiB: the exact byte count ``qemu-img info`` reports, rounded up, so the
+  destination volume is never smaller than the disk; a disk whose size cannot be read stops the export
 * ``bootable``: Whether this is the boot disk
 
 Role configuration
