@@ -247,6 +247,42 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['auto_cutover'] });
   });
 
+  it('edits keep-warm and pre-staging, prefilled; a resource the form does not show is kept (SDD §16)', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.keep_warm_interval_s = 600;
+    plan.prestage_resources = ['networks', 'subnets', 'flavors'];
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    let dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const keepWarm = within(dialog).getByLabelText(/^keep-warm interval/i);
+    expect(keepWarm).toHaveValue(10);
+    const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
+    expect(within(prestage).getByRole('checkbox', { name: /^networks/i })).toBeChecked();
+    expect(within(prestage).getByRole('checkbox', { name: /^routers/i })).not.toBeChecked();
+    expect(prestage).toHaveTextContent(/also pre-staged: flavors/i);
+    await user.clear(keepWarm);
+    await user.type(keepWarm, '20');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.keep_warm_interval_s).toBe(1200);
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'flavors']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['keep_warm_interval_s'] });
+
+    // turning a default on keeps the canonical order and the extra entry
+    await user.click(await actionButton(/^edit plan$/i));
+    dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.click(within(within(dialog).getByRole('group', { name: /pre-staged at the destination/i })).getByRole('checkbox', { name: /^routers/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'flavors']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['prestage_resources'] });
+  });
+
   it('edits the verification settings, prefilled from the plan; only verification is sent', async () => {
     const user = userEvent.setup();
     const server = createTestServer();

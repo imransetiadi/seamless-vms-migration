@@ -40,6 +40,10 @@ interface FormState {
   linkMiBps: string;
   thresholdGiB: string;
   maxPasses: string;
+  /** Keep-warm cadence while a warm migration waits for its cutover (SDD §5.4): at least a minute. */
+  keepWarmMinutes: string;
+  /** Which of the default resources are pre-staged at the destination (SDD §4.2, §7.2). */
+  prestage: string[];
   /** Optional estimator overrides (SDD §9.1): empty = planning default. */
   scanMiBps: string;
   parallelDisks: string;
@@ -58,7 +62,7 @@ interface FormState {
   handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
+type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -81,6 +85,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     linkMiBps: '125',
     thresholdGiB: '1',
     maxPasses: '5',
+    keepWarmMinutes: '15',
+    prestage: [...DEFAULT_PRESTAGE],
     scanMiBps: '',
     parallelDisks: '',
     tcpPorts: '22',
@@ -110,6 +116,18 @@ const DEFAULT_VERIFICATION = {
   use_advisor: true,
 };
 
+/** The resources pre-staged by default, in the order they are created (SDD §4.2, §7.2). */
+const DEFAULT_PRESTAGE = ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'];
+const PRESTAGE_LABEL: Record<string, string> = {
+  networks: 'Networks',
+  subnets: 'Subnets',
+  routers: 'Routers',
+  router_interfaces: 'Router interfaces',
+  security_groups: 'Security groups',
+  security_group_rules: 'Security group rules',
+};
+const isDefaultPrestage = (resource: string): boolean => DEFAULT_PRESTAGE.includes(resource);
+
 /** Estimator overrides the form does not edit (it edits scan_bps and parallel_disks). */
 function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
   const { scan_bps: _scan, parallel_disks: _parallel, ...rest } = overrides ?? {};
@@ -137,6 +155,8 @@ function formFromPlan(plan: Plan): FormState {
     linkMiBps: plain(plan.link_bps / MiB),
     thresholdGiB: plain(plan.convergence_threshold_bytes / GiB),
     maxPasses: String(plan.max_sync_passes),
+    keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
+    prestage: plan.prestage_resources.filter(isDefaultPrestage),
     scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     tcpPorts: v.tcp_ports.join(', '),
@@ -161,7 +181,7 @@ interface CheckboxProps {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
-  hint: string;
+  hint?: string;
   disabled?: boolean;
   /** Id of the text that says why the box is disabled. */
   describedBy?: string;
@@ -180,7 +200,7 @@ function Checkbox({ checked, onChange, label, hint, disabled = false, describedB
       />
       <span className={cn('text-sm text-foreground', disabled && 'opacity-70')}>
         {label}
-        <span className="block text-xs text-muted-foreground">{hint}</span>
+        {hint && <span className="block text-xs text-muted-foreground">{hint}</span>}
       </span>
     </label>
   );
@@ -307,6 +327,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (!(threshold > 0)) e.threshold = 'Enter the convergence threshold in GiB (more than 0).';
     const passes = Number(f.maxPasses);
     if (!Number.isInteger(passes) || passes < 1 || passes > 50) e.passes = 'Enter a whole number of passes from 1 to 50.';
+    // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
+    const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
+    if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
     const overrides: Record<string, number> = {};
     if (f.scanMiBps.trim()) {
       const scan = Number(f.scanMiBps);
@@ -351,6 +374,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
+        keep_warm_interval_s: Math.round(keepWarm * 60),
+        // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
+        prestage_resources: [...DEFAULT_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isDefaultPrestage(r))],
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
           ...DEFAULT_VERIFICATION,
@@ -411,13 +437,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     link: id('link'),
     threshold: id('threshold'),
     passes: id('passes'),
+    keepWarm: id('keep-warm'),
     scan: id('scan'),
     parallel: id('parallel'),
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -598,7 +625,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </Fieldset>
 
           <details id={id('advanced')} className="rounded-md border border-border px-3 py-2" open={advancedHasErrors || undefined}>
-            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, verification and storage handover</summary>
+            <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, pre-staging, verification and storage handover</summary>
             <div className="mt-3 flex flex-col gap-4 pb-2">
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField
@@ -642,10 +669,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   hint="Source project = RHOSO project; unmapped projects keep their name."
                 />
               </div>
-              <div className="grid gap-3 sm:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('link')} label="Link bandwidth (MiB/s)" type="number" inputMode="decimal" min={0} step="any" value={form.linkMiBps} onChange={(e) => set('linkMiBps', e.target.value)} error={errors.link} />
                 <TextField id={id('threshold')} label="Convergence threshold (GiB)" type="number" inputMode="decimal" min={0} step="any" value={form.thresholdGiB} onChange={(e) => set('thresholdGiB', e.target.value)} error={errors.threshold} />
                 <TextField id={id('passes')} label="Max sync passes" type="number" inputMode="numeric" min={1} max={50} value={form.maxPasses} onChange={(e) => set('maxPasses', e.target.value)} error={errors.passes} />
+                <TextField
+                  id={id('keep-warm')}
+                  label="Keep-warm interval (minutes)"
+                  type="number"
+                  inputMode="decimal"
+                  min={1}
+                  step="any"
+                  value={form.keepWarmMinutes}
+                  onChange={(e) => set('keepWarmMinutes', e.target.value)}
+                  error={errors.keepWarm}
+                  hint="While a warm migration waits for its cutover, a delta pass runs when the last one is older than this"
+                />
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField
@@ -674,6 +713,30 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   error={errors.parallel}
                 />
               </div>
+              <Fieldset legend="Pre-staged at the destination">
+                <p id={id('prestage-note')} className="-mt-2 text-xs text-muted-foreground">
+                  {source?.kind === 'vmware'
+                    ? 'VMware sources pre-stage nothing: the migration kit prepares its own conversion host.'
+                    : 'Created in RHOSO before the first migration, in this order. Without networks, an unmapped network blocks the plan.'}
+                </p>
+                <div className="grid sm:grid-cols-3">
+                  {DEFAULT_PRESTAGE.map((resource) => (
+                    <Checkbox
+                      key={resource}
+                      label={PRESTAGE_LABEL[resource] ?? resource}
+                      checked={form.prestage.includes(resource)}
+                      disabled={source?.kind === 'vmware'}
+                      describedBy={id('prestage-note')}
+                      onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
+                    />
+                  ))}
+                </div>
+                {plan && plan.prestage_resources.some((r) => !isDefaultPrestage(r)) && (
+                  <p className="text-xs text-muted-foreground">
+                    Also pre-staged: {plan.prestage_resources.filter((r) => !isDefaultPrestage(r)).join(', ')} (set through the API; kept).
+                  </p>
+                )}
+              </Fieldset>
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Linux and other guests. Comma separated, e.g. 22, 443." />
                 <TextField

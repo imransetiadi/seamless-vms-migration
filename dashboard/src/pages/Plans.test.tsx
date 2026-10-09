@@ -129,6 +129,61 @@ describe('Plans page', () => {
     });
   });
 
+  it('sets the keep-warm interval and the pre-staged resources of a new plan (dashboard-first, SDD §16)', async () => {
+    const user = userEvent.setup();
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Warm wave');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const keepWarm = within(dialog).getByLabelText(/^keep-warm interval/i);
+    expect(keepWarm).toHaveValue(15);
+    await user.clear(keepWarm);
+    await user.type(keepWarm, '30');
+    const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
+    expect(within(prestage).getAllByRole('checkbox')).toHaveLength(6);
+    expect(within(prestage).getByRole('checkbox', { name: /^security group rules/i })).toBeChecked();
+    await user.click(within(prestage).getByRole('checkbox', { name: /^security group rules/i }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Warm wave')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'Warm wave')!;
+    expect(created.keep_warm_interval_s).toBe(1800);
+    expect(created.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups']);
+  });
+
+  it('refuses a keep-warm interval under a minute (SDD §5.4)', async () => {
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const keepWarm = within(dialog).getByLabelText(/^keep-warm interval/i);
+    await user.clear(keepWarm);
+    await user.type(keepWarm, '0.5');
+    await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent(/keep-warm interval in minutes \(1 or more\)/i);
+    expect(within(dialog).getByLabelText(/^keep-warm interval/i)).toHaveAttribute('aria-invalid', 'true');
+  });
+
+  it('says a VMware source pre-stages nothing (SDD §7.2)', async () => {
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'vcenter-hq');
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
+    expect(prestage).toHaveTextContent(/vmware sources pre-stage nothing/i);
+    for (const box of within(prestage).getAllByRole('checkbox')) expect(box).toBeDisabled();
+  });
+
   it('refuses a negative verification timeout and a malformed project mapping, and opens the advanced section', async () => {
     const user = userEvent.setup();
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
