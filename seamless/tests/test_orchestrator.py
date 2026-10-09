@@ -282,6 +282,42 @@ async def test_a_plan_of_another_source_does_not_hold_the_vm(tmp_path, store):
     assert [item.vm_name for item in report.migrations] == ["web-01"]
 
 
+async def test_cross_plan_refusal_counts_vms_and_names_each_holder_once(tmp_path, store):
+    """Plans validated before the rule (SDD §5.4) may hold one VM several times, under one name:
+    the refusal counts VMs, not migrations, and names each holder once."""
+    h, first = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(first.id, "alice")
+    legacy = plan_for([vm(1), vm(2)])  # another plan called "Finance", from before the rule
+    store.put("plan", legacy)
+    for vm_id in ("vm-1", "vm-2"):
+        held = await h.by_vm(first.id, vm_id)
+        store.put(
+            "migration", held.model_copy(update={"id": f"legacy-{vm_id}", "plan_id": legacy.id})
+        )
+    third = plan_for([vm(1), vm(2)], name="Third wave")
+    store.put("plan", third)
+
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.validate_plan(third.id, "bob")
+    assert str(refused.value).startswith(
+        '2 VM(s) already have a migration in another plan: web-01 (plan "Finance", ready), '
+        'web-02 (plan "Finance", ready); '
+    )
+
+
+async def test_cross_plan_refusal_says_how_many_holders_it_leaves_out(tmp_path, store):
+    vms = [vm(i) for i in range(1, 13)]
+    h, first = await setup(tmp_path, store, vms)
+    await h.orch.validate_plan(first.id, "alice")
+    second = plan_for(vms, name="Second wave")
+    store.put("plan", second)
+
+    with pytest.raises(
+        NotAllowed, match=r"^12 VM\(s\) .*web-10 \(plan \"Finance\", ready\) and 2 more; "
+    ):
+        await h.orch.validate_plan(second.id, "bob")
+
+
 async def test_retry_refused_while_another_plan_holds_the_vm(tmp_path, store):
     """A rolled-back migration lets its VM go; a retry would take it back (rolled_back -> ready),
     so it is refused while another plan holds the VM (SDD §5.4)."""

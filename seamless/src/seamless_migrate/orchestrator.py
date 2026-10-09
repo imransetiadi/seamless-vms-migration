@@ -344,21 +344,30 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # planning actions
-    async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> list[str]:
-        """``name (plan "…", phase)`` for each VM of ``vm_ids`` that a migration of another plan
-        with the same source provider holds (SDD §5.4: one VM, one migration across plans)."""
+    async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> dict[str, list[str]]:
+        """The VMs of ``vm_ids`` that migrations of other plans with the same source provider hold
+        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", phase)``
+        once per holder — plans validated before the rule may hold a VM several times."""
         others = {
             other.id: other
             for other in await self.db.list("plan", Plan)
             if other.id != plan.id and other.source_provider_id == plan.source_provider_id
         }
         if not others or not vm_ids:
-            return []
-        return sorted(
-            f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
-            for m in await self.db.list("migration", Migration, plan_id=list(others))
-            if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM
-        )
+            return {}
+        held: dict[str, set[str]] = {}
+        for m in await self.db.list("migration", Migration, plan_id=list(others)):
+            if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM:
+                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
+                held.setdefault(m.vm.source_id, set()).add(holder)
+        return {vm_id: sorted(holders) for vm_id, holders in held.items()}
+
+    @staticmethod
+    def _holders(held: dict[str, list[str]], limit: int = 10) -> str:
+        """At most ``limit`` holders from :meth:`_held_elsewhere`, and how many are left out."""
+        entries = sorted(holder for holders in held.values() for holder in holders)
+        rest = len(entries) - limit
+        return ", ".join(entries[:limit]) + (f" and {rest} more" if rest > 0 else "")
 
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         # one validation per plan at a time: concurrent runs would create duplicate migrations;
@@ -421,7 +430,7 @@ class Orchestrator:
             # SDD §5.4: two plans would both stop the source and cut it over
             raise NotAllowed(
                 f"{len(held)} VM(s) already have a migration in another plan: "
-                f"{', '.join(held[:10])}; finish, roll back or cancel it there, or remove the VM "
+                f"{self._holders(held)}; finish, roll back or cancel it there, or remove the VM "
                 "from vm_ids"
             )
         params = params_for_plan(plan)
@@ -783,7 +792,7 @@ class Orchestrator:
                 # SDD §5.4: a rolled-back migration let its VM go; another plan may have taken it
                 raise NotAllowed(
                     f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
-                    f"{held[0]}; finish, roll back or cancel it there first"
+                    f"{self._holders(held)}; finish, roll back or cancel it there first"
                 )
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
