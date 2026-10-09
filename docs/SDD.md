@@ -336,7 +336,10 @@ active enters `cutover` when all hold:
 
 `POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`. A
 repeated request records another approval and may add `force_window` — an approver can force a
-requested cutover that waits for a closed window — but never clears one.
+requested cutover that waits for a closed window — but never clears one. `POST …/approve` is accepted
+in `pending`, `validating`, `blocked`, `ready`, `precopy`, `syncing`, `awaiting_cutover`, `failed` and
+`rolled_back`, `POST …/cutover` in `ready`, `precopy`, `syncing` and `awaiting_cutover` — a warm
+migration requested before it converged cuts over once it does (409 otherwise).
 While waiting — for the gate or for a free cutover slot (rule 4) — a warm migration runs a keep-warm
 delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ago
 (`awaiting_cutover → syncing → awaiting_cutover`; the interval is at least 60 s).
@@ -1343,7 +1346,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   and that the bytes they transferred stay counted, §5.4), downtime clock,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name; while a requested cutover waits for a closed window, an approver can let it cut over
+  requires typing the VM name; Approve is offered where an approval lasts (from `ready` until the cutover
+  starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
+  validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
+  cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
   (`force_window`, §4.2); when the migration's plan
