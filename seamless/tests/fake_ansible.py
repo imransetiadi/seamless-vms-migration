@@ -88,6 +88,12 @@ SCRIPT = textwrap.dedent(
             "_info": {{"id": server_id}},
             "_migration_params": {{"boot_volume_params": {{"volume_type": "ceph-ssd"}}}},
         }}]}}
+        twin = os.environ.get("ANSIBLE_FAKE_TWIN_ID")
+        if twin:
+            # os-migrate exports by name: another server of the project with the same name
+            other = json.loads(json.dumps(doc["resources"][0]))
+            other["_info"]["id"] = twin
+            doc["resources"].append(other)
         (osm / "workloads.yml").write_text(yaml.safe_dump(doc))
 
     stop_task = {{

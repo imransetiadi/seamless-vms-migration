@@ -703,22 +703,45 @@ class AnsibleExecutor:
                 stop_skipped |= await self._run_playbook(
                     playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
                 )
-                if playbook.name == "export_workloads.yml" and mappings is not None:
-                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings)
+                if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
+                    planned = ctx.migration.vm.source_id if ctx is not None else None
+                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings, planned)
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
         return stop_skipped
 
     @staticmethod
-    def _rewrite_workloads(osm: Path, mappings: Mappings) -> None:
+    def _rewrite_workloads(
+        osm: Path, mappings: Mappings | None, planned_id: str | None = None
+    ) -> None:
+        """Keep only the planned server of the export and apply the mappings (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not any(r.get("type") == SERVER_TYPE for r in doc.get("resources") or []):
+        resources = doc.get("resources") or []
+        servers = [r for r in resources if r.get("type") == SERVER_TYPE]
+        if not servers:
             raise PermanentStepError("the exported workloads.yml contains no server")
-        path.write_text(yaml.safe_dump(apply_mappings(doc, mappings), sort_keys=False))
+        if planned_id is not None:
+            # os-migrate exports by name: a same-named server of the project that is not in the
+            # plan must never be imported, stopped or migrated
+            def server_id(resource: dict[str, Any]) -> Any:
+                return (resource.get("_info") or {}).get("id")
+
+            if not any(server_id(r) == planned_id for r in servers):
+                exported = ", ".join(str(server_id(r)) for r in servers)
+                raise PermanentStepError(
+                    f"the export holds no server with the planned id {planned_id} "
+                    f"(exported: {exported})"
+                )
+            doc["resources"] = [
+                r for r in resources if r.get("type") != SERVER_TYPE or server_id(r) == planned_id
+            ]
+        if mappings is not None:
+            doc = apply_mappings(doc, mappings)
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
     def _playbook_arg(self, name: str) -> str:
         if name.endswith(".yml"):

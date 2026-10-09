@@ -314,6 +314,26 @@ async def test_cutover_cold_sets_stop_before_migration(env):
     assert not env.executor.supports(Strategy.storage_handover)
 
 
+async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
+    """os-migrate exports workloads by name: a same-named server of the project that is not in
+    the plan must never be imported, stopped or migrated (SDD §7.2)."""
+    monkeypatch.setenv("ANSIBLE_FAKE_TWIN_ID", "srv-twin")
+    ctx, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    exported = yaml.safe_load((run_dir(env) / "osm" / "workloads.yml").read_text())
+    servers = [r for r in exported["resources"] if r["type"] == "openstack.compute.Server"]
+    assert [s["_info"]["id"] for s in servers] == ["srv-1"]
+
+
+async def test_rewrite_workloads_fails_without_the_planned_server(env, monkeypatch):
+    """The export holds only a same-named server with another id: nothing of it is migrated."""
+    monkeypatch.setenv("ANSIBLE_FAKE_SERVER_ID", "srv-other")
+    ctx, _ = ctx_for(env)
+    with pytest.raises(PermanentStepError, match="srv-1"):
+        await env.executor.run(StepName.PRECOPY, ctx)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+
+
 async def test_warm_cutover_reports_destination_from_warm_state(env):
     ctx, rec = ctx_for(env)
     await env.executor.run(StepName.PRECOPY, ctx)
