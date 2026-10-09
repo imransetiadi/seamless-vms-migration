@@ -967,11 +967,17 @@ callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` re
 
 JSON everywhere; errors are `{"error": {"code": str, "message": str}}` with HTTP 400 (validation,
 `bad_request`), 401 (no/invalid token), 403 (role), 404, 405 (`method_not_allowed`), 409 (invalid
-transition / conflict), 422 (schema), 429 (`too_many_requests`, the auth lockout of §15.1), 500
-(`internal_error`, message never carries internals), 502 (`provider_error`, the redacted provider
-message), 503 (`/ready` while degraded). Every response, including error responses written by the
-server-error handler, carries the security headers of Security.md R-05.
+transition / conflict), 413 (`payload_too_large`, below), 422 (schema), 429 (`too_many_requests`, the
+auth lockout of §15.1), 500 (`internal_error`, message never carries internals), 502
+(`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
+including error responses written by the server-error handler, carries the security headers of
+Security.md R-05.
 Authentication: `Authorization: Bearer <token>` (§13).
+A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
+that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
+body before the token is checked, so an unauthenticated client could otherwise make the server buffer
+any amount of data (Security.md R-17). A plan of 5,000 VMs (the PRD's scale test; NFR-03 is 1,000)
+with a strategy override for each and 1,000 mapping entries is about 0.5 MB.
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
