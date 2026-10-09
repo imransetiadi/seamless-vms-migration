@@ -98,6 +98,8 @@ export interface MockServerOptions {
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
+/** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
+const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed']);
 /** At most `limit` holders from `heldElsewhere`, and how many are left out (the API's wording). */
 function holdersText(held: Map<string, string[]>, limit = 10): string {
   const entries = [...held.values()].flat().sort();
@@ -1028,12 +1030,15 @@ export class MockServer {
     if (cancelled.length) {
       throw new HttpError(400, 'bad_request', `${cancelled.length} VM(s) have a cancelled migration: ${cancelled.slice(0, 10).join(', ')}; remove them from vm_ids or create a new plan for them`);
     }
-    const stopped = mine
-      .filter((m) => !selected.has(m.vm.source_id) && REVALIDATABLE.has(m.phase) && Boolean(m.downtime_started_at) && !m.downtime_ended_at)
-      .map((m) => m.vm.name)
-      .sort();
+    // a removed VM's failed migration is cancelled too, unless its cutover stopped the source
+    const removed = mine.filter((m) => !selected.has(m.vm.source_id) && REMOVABLE.has(m.phase));
+    const stopped = removed.filter((m) => Boolean(m.downtime_started_at) && !m.downtime_ended_at).map((m) => m.vm.name).sort();
     if (stopped.length) {
       throw new HttpError(409, 'conflict', `${stopped.slice(0, 10).join(', ')}: the source VM is stopped after a failed cutover; keep the VM in the plan until it is cut over or rolled back`);
+    }
+    const restarted = removed.filter((m) => m.phase === 'failed' && Boolean(m.downtime_started_at)).map((m) => m.vm.name).sort();
+    if (restarted.length) {
+      throw new HttpError(409, 'conflict', `${restarted.slice(0, 10).join(', ')}: the source VM was stopped by a failed cutover; keep the VM in the plan until it is rolled back`);
     }
     const held = this.heldElsewhere(plan, plan.vm_ids);
     if (held.size) {
@@ -1055,9 +1060,7 @@ export class MockServer {
       }
       validated.push(m);
     }
-    for (const m of mine) {
-      if (!selected.has(m.vm.source_id) && REVALIDATABLE.has(m.phase)) this.transition(m, 'cancelled', 'removed from the plan', me.name);
-    }
+    for (const m of removed) this.transition(m, 'cancelled', 'removed from the plan', me.name);
     plan.status = 'validated';
     plan.updated_at = new Date(this.now()).toISOString();
     const report: ValidationReport = {

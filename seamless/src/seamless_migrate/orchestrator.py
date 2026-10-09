@@ -100,6 +100,8 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4)
+REMOVABLE = REVALIDATABLE | {P.failed}
 #: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
 RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
@@ -420,17 +422,26 @@ class Orchestrator:
                 "remove them from vm_ids or create a new plan for them"
             )
         selected = set(plan.vm_ids)
-        stopped = sorted(
-            m.vm.name
-            for vm_id, m in existing.items()
-            if vm_id not in selected and m.phase in REVALIDATABLE and fsm.source_stopped(m)
-        )
+        # the removed VMs' migrations cancelled below (SDD §5.4) — a failed one too, or it would
+        # hold its VM and keep the plan from completing
+        removed = [
+            m for vm_id, m in existing.items() if vm_id not in selected and m.phase in REMOVABLE
+        ]
+        stopped = sorted(m.vm.name for m in removed if fsm.source_stopped(m))
         if stopped:
-            # removed VMs are cancelled below, which SDD §5.1 refuses while a source is stopped:
-            # refuse before anything changes
+            # SDD §5.1 refuses those cancels while a source is stopped: refuse before any change
             raise NotAllowed(
                 f"{', '.join(stopped[:10])}: the source VM is stopped after a failed cutover; keep "
                 "the VM in the plan until it is cut over or rolled back"
+            )
+        restarted = sorted(
+            m.vm.name for m in removed if m.phase == P.failed and m.downtime_started_at is not None
+        )
+        if restarted:
+            # a failed migration whose cutover stopped the source is rolled back, never cancelled
+            raise NotAllowed(
+                f"{', '.join(restarted[:10])}: the source VM was stopped by a failed cutover; keep "
+                "the VM in the plan until it is rolled back"
             )
         held = await self._held_elsewhere(plan, selected)
         if held:
@@ -483,9 +494,8 @@ class Orchestrator:
                     estimates=migration.estimates,
                 )
             )
-        for vm_id, stale in existing.items():
-            if vm_id not in selected and stale.phase in REVALIDATABLE:
-                await self.cancel(stale.id, actor, "removed from the plan")
+        for stale in removed:
+            await self.cancel(stale.id, actor, "removed from the plan")
 
         def mark_validated(fresh: Plan) -> None:
             fresh.status = PlanStatus.validated

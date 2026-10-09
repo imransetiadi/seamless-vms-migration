@@ -670,4 +670,26 @@ describe('mock API', () => {
     expect(m).toMatchObject({ phase: 'ready', cutover_requested: false, force_window: false });
     expect(m.approvals.map((a) => a.actor)).toEqual(['ana']);
   });
+
+  it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {
+    const { server } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    const dropped = mine[mine.length - 1]!;
+    dropped.phase = 'failed';
+    dropped.downtime_started_at = null;
+    dropped.downtime_ended_at = null;
+    plan.vm_ids = plan.vm_ids.filter((id) => id !== dropped.vm.source_id);
+    // a stopped source refuses before anything changes
+    dropped.downtime_started_at = '2026-10-08T11:50:00Z';
+    dropped.downtime_ended_at = '2026-10-08T11:55:00Z';
+    const refused = server.handle('POST', `/plans/${plan.id}/validate`, new URLSearchParams(), {}, 'operator');
+    expect(refused.status).toBe(409);
+    expect(dropped.phase).toBe('failed');
+    // its source never stopped: cancelled, the VM released
+    dropped.downtime_started_at = null;
+    dropped.downtime_ended_at = null;
+    expect(server.handle('POST', `/plans/${plan.id}/validate`, new URLSearchParams(), {}, 'operator').status).toBe(200);
+    expect(dropped.phase).toBe('cancelled');
+  });
 });

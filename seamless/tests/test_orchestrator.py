@@ -201,6 +201,51 @@ async def test_retry_clears_the_cutover_request_and_its_window_bypass(tmp_path, 
     assert [a.actor for a in stored.approvals] == ["ana"]
 
 
+async def test_validate_cancels_a_removed_vms_failed_migration(tmp_path, store):
+    """SDD §5.4: validation cancels the migrations of VMs removed from vm_ids, a failed one too
+    (its source never stopped): left failed it would hold the VM and keep the plan from
+    completing."""
+    from seamless_migrate.domain.models import Migration, Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    dropped = await h.by_vm(plan.id, "vm-2")
+    dropped.phase = P.failed  # a pre-copy failed; the source VM kept running
+    store.put("migration", dropped)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("migration", dropped.id, Migration).phase == P.cancelled
+
+
+@pytest.mark.parametrize("ended", [False, True])
+async def test_validate_refuses_to_drop_a_failed_migration_that_stopped_its_source(
+    tmp_path, store, ended
+):
+    """SDD §5.1/§5.4: a failed migration whose cutover stopped the source cannot be cancelled,
+    so validation refuses to drop its VM before it changes anything: roll it back first."""
+    from seamless_migrate.domain.models import Migration, Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    kept, dropped = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+    dropped.phase = P.failed
+    dropped.downtime_started_at = h.orch.now() - timedelta(seconds=300)
+    if ended:
+        dropped.downtime_ended_at = h.orch.now() - timedelta(seconds=60)
+    store.put("migration", dropped)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    with pytest.raises(NotAllowed, match="was stopped" if ended else "source VM is stopped"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("migration", dropped.id, Migration).phase == P.failed
+    # refused before anything changed: the kept VM was not validated again
+    untouched = store.get("migration", kept.id, Migration)
+    assert len(untouched.phase_history) == len(kept.phase_history)
+
+
 async def test_validate_refuses_to_drop_a_vm_whose_source_is_stopped(tmp_path, store):
     """Validation cancels the VMs removed from ``vm_ids``; one whose source is stopped (a retried
     cutover) cannot be cancelled (SDD §5.1), so validation refuses before it changes anything."""
