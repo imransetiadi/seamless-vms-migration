@@ -425,6 +425,8 @@ export default function MigrationDetail() {
   }
 
   const p = plan.data;
+  // SDD §16: without its plan the cutover window and approval policy are unknown
+  const planUnavailable = Boolean(plan.error) && !p;
   const warm = isWarmStrategy(m.strategy);
   const wave = p?.waves.find((w) => w.id === m.wave_id);
 
@@ -447,10 +449,13 @@ export default function MigrationDetail() {
       </p>
 
       <div className="flex flex-col gap-4">
+        {planUnavailable && (
+          <ErrorBanner error={plan.error} title="The plan of this migration is unavailable" onRetry={() => void plan.refetch()} />
+        )}
         <Alerts m={m} />
 
         <Panel title="Next step">
-          <MigrationActions migration={m} plan={p} role={role} />
+          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} />
         </Panel>
 
         <section aria-label="Lifecycle" className="card p-4">

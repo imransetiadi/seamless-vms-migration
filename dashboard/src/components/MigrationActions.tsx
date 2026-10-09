@@ -60,6 +60,8 @@ export interface MigrationActionsProps {
   migration: Migration;
   plan?: Plan | null;
   role: Role | undefined;
+  /** The plan failed to load: its cutover window and approval policy are unknown (SDD §16). */
+  planUnavailable?: boolean;
 }
 
 /**
@@ -67,8 +69,11 @@ export interface MigrationActionsProps {
  * and sufficient role (unavailable ones stay focusable and say why). Every action confirms first;
  * destructive ones use the danger tone and Finalize requires typing the VM name.
  */
-export function MigrationActions({ migration: m, plan, role }: MigrationActionsProps) {
+export function MigrationActions({ migration: m, plan, role, planUnavailable = false }: MigrationActionsProps) {
   const availability = migrationActions(m, role, plan);
+  if (planUnavailable && availability.cutover.enabled) {
+    availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
+  }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
   const forcing = waitsOnClosedWindow(m, plan, Date.now());
   const step = nextStep(m, plan);

@@ -83,6 +83,27 @@ describe('MigrationDetail', () => {
     expect(chart).toHaveTextContent(`Pass ${next} (delta) is running.`);
   });
 
+  it('says when its plan cannot be loaded and keeps Cutover unavailable until it can (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    m.cutover_requested = false;
+    const index = server.plans.findIndex((p) => p.id === m.plan_id);
+    const [plan] = server.plans.splice(index, 1);
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    expect(await screen.findByRole('alert')).toHaveTextContent(/the plan of this migration is unavailable/i);
+    const cutover = screen.getByRole('button', { name: /^cut over$/i });
+    expect(cutover).toHaveAttribute('aria-disabled', 'true');
+    expect(cutover).toHaveAccessibleDescription(/the plan could not be loaded/i);
+
+    // once the plan loads again, Cutover is available
+    server.plans.splice(index, 0, plan!);
+    await user.click(within(screen.getByRole('alert')).getByRole('button', { name: /retry/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^cut over$/i })).not.toHaveAttribute('aria-disabled'));
+    expect(screen.queryByText(/the plan of this migration is unavailable/i)).not.toBeInTheDocument();
+  });
+
   it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
     const server = createTestServer();
     const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');
