@@ -1017,7 +1017,10 @@ make seamless-down                                   # keeps data;  make seamles
 
 Committed scripts (`export TOKEN=…` then run them): [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh)
 covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
-decision on a fresh plan (exit code = failed checks); [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
+decision when it validates its plan — the smoke plan of an earlier run, or a new one on a VM no plan holds (one
+VM, one migration across plans, SDD §5.4; the demo leaves `report-01` and `batch-01` unplanned for it and for a
+plan of your own) — so it can run again on the same stack without adding a plan (exit code = failed checks);
+[`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
 is the RBAC matrix below (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
 runs DEMO-04 and DEMO-06; [`tests/e2e/browser-demo.mjs`](../tests/e2e/browser-demo.mjs) (`TOKEN_FILE=…`) opens
 the dashboard in headless Chromium through the control plane — real security headers, CSP and API — signs

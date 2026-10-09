@@ -8,7 +8,8 @@
 #
 # Checks health, RBAC, the dashboard, metrics, the seeded demo flow (approvals, cutovers, one
 # retry per rolled-back migration), SSE replay, stats, Jev through the sidecar and agentmemory,
-# then validates a fresh plan whose SLO nothing meets so Jev is asked for a strategy.
+# then validates a plan whose SLO nothing meets so Jev is asked for a strategy: the smoke plan of an
+# earlier run, or a new one on a VM no plan holds (SDD §5.4), so a re-run adds no plan.
 # Never prints the token. Exit code = number of failed checks.
 set -u
 BASE=${BASE:-http://127.0.0.1:8080}
@@ -88,14 +89,36 @@ check "memory available via host"   '[[ "$advisor" == *\"memory\":{\"enabled\":t
 sim=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d '{"query":"warm cutover converged database"}' "$BASE/api/v1/advisor/similar-incidents" || echo '{}')
 check "similar-incidents answers"   '[[ "$sim" == *\"hits\"* ]]'
 
-# Jev strategy decision through the HTTP sidecar: a new plan with an SLO nothing meets makes
-# the advisor consult Jev (cold and warm are both eligible on the demo OpenStack source)
-vm_ids=$(curl -fsS -m 30 -H "$H" "$BASE/api/v1/providers/rhosp17-finance/inventory" | python3 -c 'import json,sys; inv=json.load(sys.stdin); vms=inv if isinstance(inv, list) else inv.get("vms", []); print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs")][:2]))')
-newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
-npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
-check "smoke plan created"            '[ -n "$npid" ]'
-vreport=$(curl -fsS -m 120 -X POST -H "$H" "$BASE/api/v1/plans/$npid/validate" || echo '{}')
-check "smoke plan validated"          '[[ "$vreport" == *\"migrations\"* ]]'
+# Jev strategy decision through the HTTP sidecar: a plan whose SLO nothing meets makes the advisor
+# consult Jev at validation (cold and warm are both eligible on the demo OpenStack source). One VM has
+# one migration across plans (SDD §5.4) and the API has no plan delete, so the smoke plan of an earlier
+# run is validated again when it can be; otherwise a new one takes one VM no plan holds (the demo
+# leaves report-01 and batch-01 unplanned, SDD §10) and leaves the other for a plan of your own.
+smoke_validate() {  # the plan's validation report, then its HTTP status on the last line
+  curl -s -m 120 -w "\n%{http_code}" -X POST -H "$H" "$BASE/api/v1/plans/$1/validate"
+}
+npid=""
+vreport='{}'
+for earlier in $(curl -fsS -m 30 -H "$H" "$BASE/api/v1/plans" |
+  python3 -c 'import json,sys; print(" ".join(p["id"] for p in reversed(json.load(sys.stdin)) if p["name"] == "smoke jev"))'); do
+  answer=$(smoke_validate "$earlier")
+  if [ "${answer##*$'\n'}" = 200 ]; then npid=$earlier; vreport=${answer%$'\n'*}; break; fi
+done
+if [ -z "$npid" ]; then
+  vm_ids=$({ curl -fsS -m 30 -H "$H" "$BASE/api/v1/providers/rhosp17-finance/inventory"; echo; curl -fsS -m 30 -H "$H" "$BASE/api/v1/migrations"; } |
+    python3 -c '
+import json, sys
+inventory, migrations = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+vms = inventory if isinstance(inventory, list) else inventory.get("vms", [])
+held = {m["vm"]["source_id"] for m in migrations if m["phase"] not in ("cancelled", "finalized", "rolled_back")}
+print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs") and v["source_id"] not in held][:1]))')
+  check "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)" '[ "$vm_ids" != "[]" ]'
+  newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
+  npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
+  answer=$(smoke_validate "$npid")
+  [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
+fi
+check "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
 notes=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" | python3 -c 'import json,sys; ms=json.load(sys.stdin); print(json.dumps([(m["vm"]["name"], n["source"], n["summary"][:80], n["data"].get("applied")) for m in ms for n in m["advisor_notes"]]))')
 echo "advisor notes: $notes"
 check "jev strategy note recorded"    '[[ "$notes" == *\"jev\"* ]]'
