@@ -614,8 +614,12 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 
 ### 12.3 End-to-end UI (Playwright)
 
-Two layers exist: `dashboard/e2e/smoke.spec.ts` (`npm run test:e2e`, Chromium against the mock-mode build, CI
-job `dashboard-e2e`) and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
+Two layers exist: `dashboard/e2e/` (`npm run test:e2e`, Chromium against the mock-mode build, CI job
+`dashboard-e2e`) — `smoke.spec.ts` (design tokens and themes, the main journey, viewer soft-disabled actions, adding
+a provider) and `journeys.spec.ts` (UI-11 editing a validated plan saves the change and returns it to draft; UI-12
+the shown audit events download as JSON lines in sequence order; UI-13 the guest OS filter and Clear filters;
+UI-14 a NetApp NFS handover names the RHOSO pool per volume type; each was checked to fail when the behaviour it
+guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
 Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
 migration detail → Approve/Cutover as approver, controls hidden for viewer; UI-05 Finalize needs the typed VM name;
