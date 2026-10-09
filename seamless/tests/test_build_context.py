@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +127,67 @@ def test_auth_file_generation_never_prints_credentials():
     for line in recipe:
         assert "tee" not in line, line
         assert "umask 077" in line and "> " in line, line
+
+
+def _makefile_recipe_lines() -> list[str]:
+    """The Makefile's recipe lines, backslash continuations joined, without the tab and ``@``."""
+    lines: list[str] = []
+    current: str | None = None
+    for raw in (ROOT / "Makefile").read_text().splitlines():
+        if current is None:
+            if not raw.startswith("\t"):
+                continue
+            current = raw[1:]
+        else:
+            current += " " + raw.strip()
+        if current.endswith("\\"):
+            current = current[:-1].rstrip()
+            continue
+        lines.append(current.lstrip("@"))
+        current = None
+    return lines
+
+
+def _run_recipe_line(line: str, path: Path) -> subprocess.CompletedProcess[str]:
+    """Run one recipe line the way make does (the Makefile's SHELL and .SHELLFLAGS) with only
+    ``path`` on PATH."""
+    makefile = (ROOT / "Makefile").read_text()
+    shell = re.search(r"^SHELL := (.+)$", makefile, re.M)
+    flags = re.search(r"^\.SHELLFLAGS := (.+)$", makefile, re.M)
+    assert shell and flags, "the Makefile no longer sets SHELL and .SHELLFLAGS"
+    return subprocess.run(
+        [shell.group(1), *flags.group(1).split(), line],
+        cwd=ROOT,
+        env={"PATH": str(path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("tool", ["gitleaks", "actionlint", "shellcheck"])
+def test_seamless_check_fails_when_an_installed_scanner_fails(tool, tmp_path):
+    """``make seamless-check`` skips a scanner that is not installed, but one that is installed and
+    finds problems fails the check (QASuite §13): ``command -v tool && tool || echo skipped``
+    reported such a failure as "not installed: skipped" and passed."""
+    line = next(line for line in _makefile_recipe_lines() if f"command -v {tool}" in line)
+    fake = tmp_path / "bin" / tool
+    fake.parent.mkdir()
+    fake.write_text(f"#!/bin/sh\necho '{tool}: 1 problem found'\nexit 1\n")
+    fake.chmod(0o755)
+    run = _run_recipe_line(line, fake.parent)
+    assert run.returncode != 0, run.stdout + run.stderr
+    assert f"{tool}: 1 problem found" in run.stdout
+    assert "not installed" not in run.stdout
+
+
+@pytest.mark.parametrize("tool", ["gitleaks", "actionlint", "shellcheck"])
+def test_seamless_check_skips_a_scanner_that_is_not_installed(tool, tmp_path):
+    line = next(line for line in _makefile_recipe_lines() if f"command -v {tool}" in line)
+    (tmp_path / "bin").mkdir()
+    run = _run_recipe_line(line, tmp_path / "bin")
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert f"{tool} not installed: skipped" in run.stdout
 
 
 def test_strict_gitleaks_config_never_allowlists_a_secret_path():

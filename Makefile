@@ -556,8 +556,9 @@ seamless-check: seamless-test
 	@if command -v gitleaks >/dev/null; then \
 	  gitleaks dir -c .gitleaks-tree.toml --redact --no-banner . && gitleaks git --redact --no-banner .; \
 	else echo "gitleaks not installed: skipped (S-17)"; fi
-	@command -v actionlint >/dev/null && actionlint || echo "actionlint not installed: skipped"
-	@command -v shellcheck >/dev/null && shellcheck -S warning scripts/*.sh tests/e2e/*.sh || echo "shellcheck not installed: skipped"
+	@if command -v actionlint >/dev/null; then actionlint; else echo "actionlint not installed: skipped"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck -S warning scripts/*.sh tests/e2e/*.sh; \
+	else echo "shellcheck not installed: skipped"; fi
 	cd dashboard && npm run typecheck && npm run lint && npm test && npm run build
 
 dashboard-build:
