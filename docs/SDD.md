@@ -550,6 +550,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * Resolved mappings: preflight records, per migration, the flavor it matched automatically when no
   explicit mapping exists (`Migration.resolved_mappings: Mappings`); `apply_mappings` uses the plan
   mappings overlaid with the migration's resolved mappings, so an auto-matched flavor is really used.
+* Planned server only: os-migrate exports workloads by name, so a server of the source project that
+  shares the VM's name but is not in the plan lands in `workloads.yml` too and would be imported —
+  on a cold cutover stopped and migrated. After `export_workloads.yml` the executor keeps only the
+  server resource whose `_info.id` equals `vm.source_id` (other resource types are kept); when the
+  export holds no such server the step fails permanently before any import playbook runs.
 * Mappings: after `export_workloads.yml`, the executor rewrites the exported `workloads.yml` with the
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
