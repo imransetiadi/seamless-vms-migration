@@ -807,8 +807,19 @@ export class MockServer {
     return ok(plan, 201);
   }
 
+  /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409). */
+  private refuseInFlight(plan: Plan, what: string): void {
+    const inFlight = new Set(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
+    const busy = this.migrations
+      .filter((m) => m.plan_id === plan.id && (inFlight.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at)))
+      .map((m) => m.vm.name)
+      .sort();
+    if (busy.length) throw new HttpError(409, 'conflict', `migrations in flight: ${busy.slice(0, 10).join(', ')}; finish, roll back or cancel them before ${what}`);
+  }
+
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
+    this.refuseInFlight(plan, 'editing the plan');
     for (const key of Object.keys(input)) {
       if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
       (plan as unknown as Record<string, unknown>)[key] = input[key];
@@ -821,6 +832,7 @@ export class MockServer {
 
   private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Waves can only be planned in draft or validated (this plan is ${plan.status}).`);
+    this.refuseInFlight(plan, 're-planning the waves');
     const size = Math.max(1, Math.min(100, Number(input.max_wave_size ?? 10) || 10));
     const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
     const pilot = mine.slice(0, Math.min(3, mine.length));

@@ -37,6 +37,18 @@ describe('planActions', () => {
     expect(start.reason).toMatch(/1 migration is blocked/);
   });
 
+  it('refuses to edit or re-plan the waves while a migration is in flight, naming it (SDD §12)', () => {
+    const waiting = ready.map((m, i) => (i === 0 ? { ...m, phase: 'awaiting_cutover' as const } : m));
+    const actions = planActions(planWith('validated'), 'operator', waiting);
+    expect(actions.edit.enabled).toBe(false);
+    expect(actions.edit.reason).toContain(waiting[0]!.vm.name);
+    expect(actions.waves.enabled).toBe(false);
+    expect(actions.waves.reason).toMatch(/in flight/i);
+    // a failed migration whose source runs keeps the plan editable: fix the cause, then retry
+    const failed = ready.map((m, i) => (i === 0 ? { ...m, phase: 'failed' as const, downtime_started_at: null } : m));
+    expect(planActions(planWith('validated'), 'operator', failed).edit.enabled).toBe(true);
+  });
+
   it('requires the operator role for every plan action', () => {
     const actions = planActions(planWith('validated'), 'viewer', ready);
     for (const key of ['validate', 'waves', 'start', 'pause'] as const) {

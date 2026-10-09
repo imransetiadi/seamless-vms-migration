@@ -158,6 +158,15 @@ describe('mock API', () => {
     expect(again.downtime_started_at).toBe(stoppedAt);
   });
 
+  it('refuses to edit or re-plan the waves while a migration is in flight (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const waiting = server.migrations.find((x) => x.plan_id === plan.id)!;
+    waiting.phase = 'awaiting_cutover';
+    await expect(client.patch(`/plans/${plan.id}`, { description: 'move' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining(waiting.vm.name) });
+    await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({ status: 409 });
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');
