@@ -155,6 +155,50 @@ async def test_retry_after_rollback_counts_an_attempt(tmp_path, store):
     assert stored.actual_downtime_s is None
 
 
+async def test_retry_after_failed_cutover_keeps_clock_and_refuses_cancel(tmp_path, store):
+    """SDD §5.1/§5.2: a cutover failed with the source stopped (no automatic rollback). A retry
+    keeps the open downtime clock — the next attempt's downtime counts from the first stop — and
+    the migration cannot be cancelled, before or after the retry, while the source is stopped."""
+    from seamless_migrate.domain.models import Migration
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    stopped = h.orch.now() - timedelta(seconds=900)
+    m.phase = P.failed
+    m.downtime_started_at = stopped
+    store.put("migration", m)
+    with pytest.raises(NotAllowed, match="source VM is stopped"):
+        await h.orch.cancel(m.id, "bayu", "abandon")
+    again = await h.orch.retry(m.id, "bayu")
+    assert again.phase == P.ready and again.downtime_started_at == stopped
+    stored = store.get("migration", m.id, Migration)
+    assert stored.downtime_started_at == stopped and stored.downtime_ended_at is None
+    with pytest.raises(NotAllowed, match="source VM is stopped"):
+        await h.orch.cancel(m.id, "bayu", "abandon")
+    assert store.get("migration", m.id, Migration).phase == P.ready
+
+
+async def test_validate_refuses_to_drop_a_vm_whose_source_is_stopped(tmp_path, store):
+    """Validation cancels the VMs removed from ``vm_ids``; one whose source is stopped (a retried
+    cutover) cannot be cancelled (SDD §5.1), so validation refuses before it changes anything."""
+    from seamless_migrate.domain.models import Migration, Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    kept, dropped = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+    dropped.downtime_started_at = h.orch.now() - timedelta(seconds=300)
+    store.put("migration", dropped)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    with pytest.raises(NotAllowed, match="source VM is stopped"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert store.get("migration", dropped.id, Migration).phase == P.ready
+    untouched = store.get("migration", kept.id, Migration)
+    assert len(untouched.phase_history) == len(kept.phase_history)
+
+
 async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1), vm(2), vm(3)])
     reports = await asyncio.gather(

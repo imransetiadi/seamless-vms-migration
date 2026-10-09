@@ -363,6 +363,19 @@ class Orchestrator:
                 f"{len(cancelled)} VM(s) have a cancelled migration: {', '.join(cancelled[:10])}; "
                 "remove them from vm_ids or create a new plan for them"
             )
+        selected = set(plan.vm_ids)
+        stopped = sorted(
+            m.vm.name
+            for vm_id, m in existing.items()
+            if vm_id not in selected and m.phase in REVALIDATABLE and fsm.source_stopped(m)
+        )
+        if stopped:
+            # removed VMs are cancelled below, which SDD §5.1 refuses while a source is stopped:
+            # refuse before anything changes
+            raise NotAllowed(
+                f"{', '.join(stopped[:10])}: the source VM is stopped after a failed cutover; keep "
+                "the VM in the plan until it is cut over or rolled back"
+            )
         params = params_for_plan(plan)
         items: list[ValidationItem] = []
         for vm in vms:
@@ -406,7 +419,6 @@ class Orchestrator:
                     estimates=migration.estimates,
                 )
             )
-        selected = set(plan.vm_ids)
         for vm_id, stale in existing.items():
             if vm_id not in selected and stale.phase in REVALIDATABLE:
                 await self.cancel(stale.id, actor, "removed from the plan")
@@ -715,11 +727,13 @@ class Orchestrator:
             m.progress_pct = 0
             m.review_required = False
             m.review_reason = None
-            # the downtime clock belongs to the attempt: the source runs again after a
-            # rollback, so the next cutover starts a fresh clock
-            m.downtime_started_at = None
-            m.downtime_ended_at = None
-            m.actual_downtime_s = None
+            # the downtime clock belongs to the outage (SDD §5.2): a closed clock — verified boot,
+            # or the source running again after a rollback — starts afresh; an open one means the
+            # source has not run since it stopped, so the next cutover counts from that first stop
+            if not fsm.source_stopped(m):
+                m.downtime_started_at = None
+                m.downtime_ended_at = None
+                m.actual_downtime_s = None
             await self._save(m, v)
         await self._emit(
             "migration.action",
@@ -734,8 +748,11 @@ class Orchestrator:
     async def cancel(self, mid: str, actor: str, reason: str | None = None) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if not fsm.can_transition(m, P.cancelled):
-                raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
+            why = fsm.refusal(m, P.cancelled)
+            if why is not None:
+                if P.cancelled not in fsm.TRANSITIONS[m.phase]:
+                    raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
+                raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
             previous = m.phase
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor

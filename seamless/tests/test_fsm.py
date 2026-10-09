@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -63,6 +63,37 @@ def test_failed_to_cancelled_requires_no_downtime():
     )
     with pytest.raises(fsm.InvalidTransition):
         fsm.transition(stopped, Phase.cancelled, "source was stopped")
+
+
+def test_no_cancel_while_the_source_vm_is_stopped():
+    """SDD §5.1: with the downtime clock open the source VM is stopped, and a cancel would leave it
+    stopped with nothing left to restart it; once the clock closed, a cancel is fine again."""
+    stopped_at = datetime(2026, 10, 8, tzinfo=UTC)
+    for phase in (Phase.ready, Phase.awaiting_cutover, Phase.precopy, Phase.pending):
+        open_clock = make_migration(phase=phase, downtime_started_at=stopped_at)
+        with pytest.raises(fsm.InvalidTransition, match="stopped"):
+            fsm.transition(open_clock, Phase.cancelled, "abandon")
+        closed = make_migration(
+            phase=phase,
+            downtime_started_at=stopped_at,
+            downtime_ended_at=stopped_at + timedelta(minutes=5),
+        )
+        assert fsm.transition(closed, Phase.cancelled, "abandon").phase == Phase.cancelled
+    # the refusal says what to do instead: a failed one retries or rolls back, a ready one cuts over
+    failed_open = make_migration(phase=Phase.failed, downtime_started_at=stopped_at)
+    assert "roll back or retry" in fsm.refusal(failed_open, Phase.cancelled)
+    ready_open = make_migration(phase=Phase.ready, downtime_started_at=stopped_at)
+    assert "cut it over" in fsm.refusal(ready_open, Phase.cancelled)
+    failed_closed = make_migration(
+        phase=Phase.failed,
+        downtime_started_at=stopped_at,
+        downtime_ended_at=stopped_at + timedelta(minutes=5),
+    )
+    assert (
+        fsm.refusal(failed_closed, Phase.cancelled)
+        == "the source VM was stopped; roll back instead"
+    )
+    assert fsm.refusal(make_migration(phase=Phase.ready), Phase.cancelled) is None
 
 
 def test_retry_increments_attempts():
