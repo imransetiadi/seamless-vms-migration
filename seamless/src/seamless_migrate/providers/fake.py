@@ -32,6 +32,28 @@ class _Spec:
     image_root: bool = False
     encrypted: bool = False
     extra_specs: tuple[tuple[str, str], ...] = ()
+    netapp: bool = False  # volumes on the ONTAP NFS backend instead of Ceph
+
+
+# Cinder pools of the demo clouds: Ceph RBD and NetApp ONTAP over NFS (SDD §7.3.1, §10).
+_CEPH = {"vendor": "Open Source", "protocol": "ceph", "family": "rbd"}
+_ONTAP_NFS = {"vendor": "NetApp", "protocol": "nfs", "family": "netapp_nfs"}
+_SOURCE_POOLS = {
+    "ceph-ssd": ("overcloud@tripleo_ceph#ceph-ssd", _CEPH),
+    "ceph-hdd": ("overcloud@tripleo_ceph#hdd", _CEPH),
+    "netapp-nfs": ("overcloud@tripleo_netapp#192.0.2.50:/cinder_finance", _ONTAP_NFS),
+}
+_DESTINATION_POOLS = (
+    ("hostgroup@ceph-ssd#ssd", _CEPH),
+    ("hostgroup@ceph-hdd#hdd", _CEPH),
+    # same SVM export, mounted through the RHOSO storage network's LIF
+    ("hostgroup@ontap-nfs#198.51.100.50:/cinder_finance", _ONTAP_NFS),
+)
+
+
+def _storage_caps(pools: Any) -> dict[str, Any]:
+    backends = sorted(({"pool": name, **caps} for name, caps in pools), key=lambda b: b["pool"])
+    return {"volume_backends": [b["pool"] for b in backends], "storage_backends": backends}
 
 
 _FLAVORS = {
@@ -48,9 +70,13 @@ _OPENSTACK: tuple[_Spec, ...] = (
     _Spec("web-02", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
     _Spec("web-03", "m1.small", (40,), "rhel9", rate_mib=0.8, image_root=True),
     _Spec("api-gw-01", "m1.medium", (30,), "rhel9", rate_mib=1.0),
-    _Spec("portal-01", "m1.small", (25,), "rhel8", rate_mib=0.6),
-    _Spec("app-01", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),)),
-    _Spec("app-02", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),)),
+    _Spec("portal-01", "m1.small", (25,), "rhel8", rate_mib=0.6, netapp=True),
+    _Spec(
+        "app-01", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),), netapp=True
+    ),
+    _Spec(
+        "app-02", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),), netapp=True
+    ),
     _Spec("mq-01", "m1.medium", (50,), "rhel9", rate_mib=4.0, tags=(("role", "rabbitmq"),)),
     _Spec("mq-02", "m1.medium", (80,), "rhel9", rate_mib=6.0, tags=(("role", "kafka"),)),
     _Spec("cache-01", "m1.medium", (30,), "rhel9", rate_mib=3.0, tags=(("role", "redis"),)),
@@ -179,6 +205,9 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
         root = i == 0
         used = round(size * rng.uniform(0.25, 0.85), 1) if index % 5 != 4 else None
         kind = "image_root" if root and spec.image_root else "volume"
+        vtype = None
+        if kind == "volume":
+            vtype = "netapp-nfs" if spec.netapp else ("ceph-ssd" if root else "ceph-hdd")
         disks.append(
             Disk(
                 id=_stable_id("vol", f"{spec.name}-{i}"),
@@ -186,7 +215,8 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
                 size_gb=size,
                 used_gb=used,
                 bootable=root,
-                volume_type=None if kind == "image_root" else ("ceph-ssd" if root else "ceph-hdd"),
+                volume_type=vtype,
+                pool=_SOURCE_POOLS[vtype][0] if vtype else None,
                 device=f"/dev/vd{chr(ord('a') + i)}",
                 kind=kind,
                 multiattach=spec.multiattach and not root,
@@ -285,7 +315,7 @@ class FakeSourceProvider:
             "admin": True,
             "compute_microversion": "2.88",
             "ovn": True,
-            "volume_backends": ["overcloud@tripleo_ceph#ceph-ssd", "overcloud@tripleo_ceph#hdd"],
+            **_storage_caps(_SOURCE_POOLS.values()),
         }
 
     async def list_vms(self) -> list[VMRef]:
@@ -321,7 +351,7 @@ class FakeDestinationProvider:
             "admin": True,
             "compute_microversion": "2.95",
             "ovn": True,
-            "volume_backends": ["hostgroup@ceph-ssd#ssd", "hostgroup@ceph-hdd#hdd"],
+            **_storage_caps(_DESTINATION_POOLS),
         }
 
     async def inventory(self) -> DestinationInventory:
@@ -348,7 +378,7 @@ class FakeDestinationProvider:
                 "dc2-dmz": 1442,
             },
             flavors=flavors,
-            volume_types=["ceph-ssd", "ceph-hdd", "__DEFAULT__"],
+            volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
         )

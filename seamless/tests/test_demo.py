@@ -67,3 +67,44 @@ async def test_demo_runs_through_phases(tmp_path, store):
     finally:
         await services.orchestrator.stop()
     assert Phase.completed in phases and Phase.awaiting_cutover in phases
+
+
+async def test_demo_clouds_report_netapp_and_ceph_storage_backends():
+    """The demo shows a RHOSP 17.1 source on Ceph and NetApp ONTAP NFS (SDD §7.3.1, §10)."""
+    from seamless_migrate.domain.enums import ProviderKind, Strategy
+    from seamless_migrate.domain.models import HandoverConfig
+    from seamless_migrate.planning.selector import eligibility
+    from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
+    from tests.factories import make_plan
+
+    src = FakeSourceProvider(ProviderKind.openstack, seed=42)
+    dst = FakeDestinationProvider(seed=42)
+    src_caps, dst_caps = await src.check(), await dst.check()
+    families = {b["family"] for b in src_caps["storage_backends"]}
+    assert families == {"rbd", "netapp_nfs"}
+    assert {b["family"] for b in dst_caps["storage_backends"]} == {"rbd", "netapp_nfs"}
+    assert src_caps["volume_backends"] == [b["pool"] for b in src_caps["storage_backends"]]
+
+    vms = {vm.name: vm for vm in await src.list_vms()}
+    pools = {b["pool"] for b in src_caps["storage_backends"]}
+    volumes = [d for vm in vms.values() for d in vm.disks if d.kind == "volume"]
+    assert volumes and all(d.pool in pools for d in volumes)
+    netapp = [
+        name for name, vm in vms.items() if any(d.volume_type == "netapp-nfs" for d in vm.disks)
+    ]
+    assert netapp == ["portal-01", "app-01", "app-02"]
+    assert "netapp-nfs" in (await dst.inventory()).volume_types
+
+    # a handover plan mapping both families is eligible on the demo clouds
+    plan = make_plan(
+        handover=HandoverConfig(
+            enabled=True,
+            backend_map={
+                "netapp-nfs": "hostgroup@ontap-nfs",
+                "ceph-ssd": "hostgroup@ceph-ssd#ssd",
+                "ceph-hdd": "hostgroup@ceph-hdd#hdd",
+            },
+        )
+    )
+    reasons = eligibility(vms["app-01"], ProviderKind.openstack, plan, src_caps, dst_caps)
+    assert reasons[Strategy.storage_handover] == []
