@@ -332,7 +332,9 @@ Approvals, `cutover_requested` and a pending `force_window` belong to the assess
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
-plan them anew). It cancels the migrations of VMs removed from `vm_ids`, so it also refuses — before
+plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
+or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
+migrations of VMs removed from `vm_ids`, so it also refuses — before
 changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1): such a VM stays
 in the plan until it is cut over or rolled back.
 `vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
@@ -955,7 +957,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}` | `Plan` |
