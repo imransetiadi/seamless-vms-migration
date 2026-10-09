@@ -167,6 +167,35 @@ describe('mock API', () => {
     await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({ status: 409 });
   });
 
+  it('lets only an approver change the approval policy of a plan (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const base = { name: 'Policy', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['os-0a11'] };
+    // an operator may spell out the defaults…
+    const created = await client.post<Plan>('/plans', { ...base, require_approval: true, auto_cutover: false, cutover_window: null });
+    expect(created.status).toBe('draft');
+    // …but not change them, and the refusal comes before any other check (QASuite S-01)
+    await expect(client.post('/plans', { ...base, destination_provider_id: 'nope', auto_cutover: true })).rejects.toMatchObject({
+      status: 403,
+      code: 'forbidden',
+      message: expect.stringContaining('auto_cutover'),
+    });
+
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const window = { start: '2026-10-10T20:00:00Z', end: '2026-10-11T02:00:00Z' };
+    // re-sending the current values changes nothing
+    await client.patch(`/plans/${plan.id}`, { require_approval: plan.require_approval, cutover_window: plan.cutover_window });
+    await expect(client.patch(`/plans/${plan.id}`, { require_approval: !plan.require_approval })).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining('require_approval'),
+    });
+    await expect(client.patch(`/plans/${plan.id}`, { cutover_window: window, description: 'night' })).rejects.toMatchObject({ status: 403 });
+    expect(plan.description).not.toBe('night');
+
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    const changed = await approver.patch<Plan>(`/plans/${plan.id}`, { require_approval: false, cutover_window: window });
+    expect(changed).toMatchObject({ require_approval: false, cutover_window: window });
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');

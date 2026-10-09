@@ -243,7 +243,7 @@
   [role='button'],
   input[type='checkbox']:not(:disabled),
   input[type='radio']:not(:disabled),
-  label:has(> input[type='checkbox']) {
+  label:has(> input[type='checkbox']:not(:disabled)) {
     cursor: pointer;
   }
 

@@ -2,8 +2,12 @@ import { CircleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, usePatchPlan, useProviders } from '../api/hooks';
+import { useRole } from '../api/session';
 import { isDestinationInventory, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
+import { cn } from '../lib/cn';
 import { formatMappings, parseMappings } from '../lib/mappings';
+import { hasRole } from '../lib/roles';
+import { stable } from '../lib/stable';
 import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
@@ -130,30 +134,43 @@ function formFromPlan(plan: Plan): FormState {
   };
 }
 
-/** JSON with sorted object keys, so equal values compare equal whatever their key order. */
-function stable(value: unknown): string {
-  return JSON.stringify(value, (_key, v: unknown) =>
-    v && typeof v === 'object' && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
-      : v,
-  );
-}
-
 function strategiesFor(kind: ProviderKind | undefined): Strategy[] {
   if (kind === 'vmware') return ['vmware_cold', 'vmware_warm'];
   return ['cold', 'warm', 'storage_handover'];
 }
 
-function Checkbox({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint: string }) {
+interface CheckboxProps {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  hint: string;
+  disabled?: boolean;
+  /** Id of the text that says why the box is disabled. */
+  describedBy?: string;
+}
+
+function Checkbox({ checked, onChange, label, hint, disabled = false, describedBy }: CheckboxProps) {
   return (
-    <label className="flex min-h-11 cursor-pointer items-start gap-2.5 py-1">
-      <input type="checkbox" className="mt-1 size-4 shrink-0 cursor-pointer accent-accent" checked={checked} onChange={(e) => onChange(e.target.checked)} />
-      <span className="text-sm text-foreground">
+    <label className={cn('flex min-h-11 items-start gap-2.5 py-1', disabled ? 'cursor-not-allowed' : 'cursor-pointer')}>
+      <input
+        type="checkbox"
+        className="mt-1 size-4 shrink-0 cursor-pointer accent-accent disabled:cursor-not-allowed disabled:opacity-50"
+        checked={checked}
+        disabled={disabled}
+        aria-describedby={describedBy}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className={cn('text-sm text-foreground', disabled && 'opacity-70')}>
         {label}
         <span className="block text-xs text-muted-foreground">{hint}</span>
       </span>
     </label>
   );
+}
+
+/** `aria-describedby` for a field shown read-only; nothing otherwise, so the field keeps its own hint and error. */
+function readOnlyReason(editable: boolean, reasonId: string): { 'aria-describedby'?: string } {
+  return editable ? {} : { 'aria-describedby': reasonId };
 }
 
 function Fieldset({ legend, children }: { legend: string; children: ReactNode }) {
@@ -184,6 +201,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const editing = Boolean(plan);
   const saving = editing ? patch : create;
   const navigate = useNavigate();
+  // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
+  const canSetPolicy = hasRole(useRole(), 'approver');
   const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds)));
   const [errors, setErrors] = useState<Errors>({});
   const summaryRef = useRef<HTMLDivElement>(null);
@@ -503,18 +522,60 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               />
             </div>
             <div className="grid gap-x-4 sm:grid-cols-2">
-              <Checkbox checked={form.requireApproval} onChange={(v) => set('requireApproval', v)} label="Require approval" hint="An approver must approve every cutover." />
-              <Checkbox checked={form.autoCutover} onChange={(v) => set('autoCutover', v)} label="Automatic cutover" hint="Cut over as soon as the gate opens, without a request." />
+              <Checkbox
+                checked={form.requireApproval}
+                onChange={(v) => set('requireApproval', v)}
+                label="Require approval"
+                hint="An approver must approve every cutover."
+                disabled={!canSetPolicy}
+                describedBy={canSetPolicy ? undefined : id('policy-reason')}
+              />
+              <Checkbox
+                checked={form.autoCutover}
+                onChange={(v) => set('autoCutover', v)}
+                label="Automatic cutover"
+                hint="Cut over as soon as the gate opens, without a request."
+                disabled={!canSetPolicy}
+                describedBy={canSetPolicy ? undefined : id('policy-reason')}
+              />
             </div>
+            {!canSetPolicy && (
+              <p id={id('policy-reason')} className="field-hint -mt-2">
+                Changing the approval policy requires the approver role.
+              </p>
+            )}
           </Fieldset>
 
           <details id={id('advanced')} className="rounded-md border border-border px-3 py-2" open={advancedHasErrors || undefined}>
             <summary className="flex min-h-9 cursor-pointer items-center text-sm font-medium text-foreground">Advanced: window, mappings, sync, verification and storage handover</summary>
             <div className="mt-3 flex flex-col gap-4 pb-2">
               <div className="grid gap-3 sm:grid-cols-2">
-                <TextField id={id('window-start')} label="Cutover window start" type="datetime-local" value={form.windowStart} onChange={(e) => set('windowStart', e.target.value)} error={errors.window} hint="Local time; leave empty for any time." />
-                <TextField id={id('window-end')} label="Cutover window end" type="datetime-local" value={form.windowEnd} onChange={(e) => set('windowEnd', e.target.value)} />
+                <TextField
+                  id={id('window-start')}
+                  label="Cutover window start"
+                  type="datetime-local"
+                  value={form.windowStart}
+                  onChange={(e) => set('windowStart', e.target.value)}
+                  error={errors.window}
+                  hint={canSetPolicy ? 'Local time; leave empty for any time.' : undefined}
+                  disabled={!canSetPolicy}
+                  {...readOnlyReason(canSetPolicy, id('window-reason'))}
+                />
+                <TextField
+                  id={id('window-end')}
+                  label="Cutover window end"
+                  type="datetime-local"
+                  value={form.windowEnd}
+                  onChange={(e) => set('windowEnd', e.target.value)}
+                  disabled={!canSetPolicy}
+                  {...readOnlyReason(canSetPolicy, id('window-reason'))}
+                />
               </div>
+              {!canSetPolicy && (
+                <p id={id('window-reason')} className="field-hint -mt-2">
+                  Changing the cutover window requires the approver role.
+                </p>
+              )}
               <div className="grid gap-3 sm:grid-cols-3">
                 <TextAreaField id={id('networks')} label="Network mappings" rows={3} placeholder="tenant-net = tenant-net-ovn" value={form.networks} onChange={(e) => set('networks', e.target.value)} error={errors.networks} />
                 <TextAreaField id={id('flavors')} label="Flavor mappings" rows={3} placeholder="m1.xlarge = m2.xlarge" value={form.flavors} onChange={(e) => set('flavors', e.target.value)} error={errors.flavors} />

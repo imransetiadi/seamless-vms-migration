@@ -110,6 +110,42 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['downtime_slo_s'] });
   });
 
+  it('shows an operator the approval policy read-only, with the reason (SDD §12, §16)', async () => {
+    const user = userEvent.setup();
+    renderPlan('plan-c81d44a0', 'operator');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    for (const name of [/require approval/i, /automatic cutover/i]) {
+      const box = within(dialog).getByRole('checkbox', { name });
+      expect(box).toBeDisabled();
+      expect(box).toHaveAccessibleDescription(/changing the approval policy requires the approver role/i);
+    }
+    for (const label of [/cutover window start/i, /cutover window end/i]) {
+      const field = within(dialog).getByLabelText(label);
+      expect(field).toBeDisabled();
+      expect(field).toHaveAccessibleDescription(/changing the cutover window requires the approver role/i);
+    }
+  });
+
+  it('lets an approver change the approval policy; only that field is sent', async () => {
+    const user = userEvent.setup();
+    const { server } = renderPlan('plan-c81d44a0', 'approver');
+    const before = server.plans.find((p) => p.id === 'plan-c81d44a0')?.auto_cutover;
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const auto = within(dialog).getByRole('checkbox', { name: /automatic cutover/i });
+    await waitFor(() => expect(auto).toBeEnabled());
+    expect(auto).not.toHaveAccessibleDescription(/requires the approver role/i);
+    // the window keeps its own hint
+    expect(within(dialog).getByLabelText(/cutover window start/i)).toHaveAccessibleDescription(/local time; leave empty for any time/i);
+    await user.click(auto);
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.plans.find((p) => p.id === 'plan-c81d44a0')?.auto_cutover).toBe(!before);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['auto_cutover'] });
+  });
+
   it('explains why a plan cannot be edited', async () => {
     renderPlan('plan-4f2a9c1e');
     expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');

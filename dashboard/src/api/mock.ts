@@ -11,6 +11,7 @@
  */
 import { canTransition } from '../lib/fsm';
 import { hasRole } from '../lib/roles';
+import { stable } from '../lib/stable';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -90,6 +91,8 @@ export interface MockServerOptions {
   seed?: number;
 }
 
+/** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
+const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
@@ -740,7 +743,19 @@ export class MockServer {
     return ok(provider);
   }
 
+  /**
+   * The approval policy is approver-only (SDD §12): an operator may send a policy field only at
+   * its default (POST) or at the plan's current value (PATCH), and the refusal precedes every
+   * other check, like the API (QASuite S-01).
+   */
+  private refusePolicyChange(me: Me, input: Record<string, unknown>, current: Record<string, unknown>): void {
+    if (hasRole(me.role, 'approver')) return;
+    const touched = POLICY_FIELDS.filter((key) => key in input && stable(input[key] ?? null) !== stable(current[key] ?? null));
+    if (touched.length) throw new HttpError(403, 'forbidden', `setting ${[...touched].sort().join(', ')} requires the approver role`);
+  }
+
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
+    this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     const body = input as unknown as PlanCreate;
     if (!body.name || !String(body.name).trim()) throw new HttpError(422, 'validation_error', 'name is required.');
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
@@ -818,6 +833,7 @@ export class MockServer {
   }
 
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
     for (const key of Object.keys(input)) {

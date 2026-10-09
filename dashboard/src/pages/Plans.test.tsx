@@ -65,6 +65,21 @@ describe('Plans page', () => {
     expect(created?.status).toBe('draft');
   });
 
+  it('gives an operator the default approval policy, read-only (SDD §12, §16)', async () => {
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    const approval = within(dialog).getByRole('checkbox', { name: /require approval/i });
+    expect(approval).toBeChecked();
+    expect(approval).toBeDisabled();
+    const auto = within(dialog).getByRole('checkbox', { name: /automatic cutover/i });
+    expect(auto).not.toBeChecked();
+    expect(auto).toBeDisabled();
+    expect(within(dialog).getByLabelText(/cutover window start/i)).toBeDisabled();
+  });
+
   it('turns on storage handover with a RHOSO backend per volume type (Ceph and NetApp)', async () => {
     const user = userEvent.setup();
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
