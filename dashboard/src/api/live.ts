@@ -141,5 +141,12 @@ export function applyEventToCache(
     invalidate(['stats']);
     return;
   }
-  if (kind.startsWith('provider.')) invalidate(['providers']);
+  if (kind.startsWith('provider.')) {
+    invalidate(['providers']);
+    // new endpoint or credentials (or a deleted provider): the cached inventory came from the old ones
+    const providerId = event.data.provider_id;
+    if (kind !== 'provider.checked' && kind !== 'provider.created' && typeof providerId === 'string') {
+      invalidate(['inventory', providerId]);
+    }
+  }
 }
