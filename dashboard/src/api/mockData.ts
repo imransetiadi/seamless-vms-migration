@@ -1107,7 +1107,16 @@ export function buildFixtures(now: number): Fixtures {
   for (const provider of providers.filter((p) => p.last_checked_at)) {
     emit({ ts: provider.last_checked_at ?? iso(now), kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
   }
-  emit({ ts: iso(now - 52 * 60_000), kind: 'auth.denied', plan_id: null, migration_id: null, actor: 'anonymous', message: 'Rejected request with an invalid bearer token', data: { path: '/api/v1/plans' } });
+  // the API's audit of a refused request (SDD §13.1); 192.0.2.10 is a documentation address (RFC 5737)
+  emit({
+    ts: iso(now - 52 * 60_000),
+    kind: 'auth.denied',
+    plan_id: null,
+    migration_id: null,
+    actor: 'unauthenticated',
+    message: 'GET /api/v1/plans: missing or invalid bearer token',
+    data: { path: '/api/v1/plans', method: 'GET', reason: 'missing or invalid bearer token', required_role: 'viewer', client: '192.0.2.10' },
+  });
   emit({ ts: iso(now - 7 * D * 1000 + 600_000), kind: 'memory.lesson_saved', plan_id: 'plan-2d5c8b93', migration_id: 'mig-d4e6f8a091', actor: 'agentmemory', message: 'Lesson saved: warm, <50G, 3 passes, estimate 3m 40s vs actual 3m 08s', data: { type: 'fact' } });
 
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));

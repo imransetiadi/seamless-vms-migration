@@ -70,6 +70,16 @@ describe('mock fixtures', () => {
     }
   });
 
+  it('seed auth.denied events shaped like the API audit (SDD §13.1)', () => {
+    const denied = new MockServer({ now: () => NOW, seed: 1 }).events.filter((e) => e.kind === 'auth.denied');
+    expect(denied.length).toBeGreaterThan(0);
+    for (const e of denied) {
+      expect(Object.keys(e.data).sort()).toEqual(['client', 'method', 'path', 'reason', 'required_role']);
+      expect(e.message).toBe(`${e.data.method} ${e.data.path}: ${e.data.reason}`);
+      expect(e.actor).not.toBe('anonymous');
+    }
+  });
+
   it('numbers persisted events in increasing order', () => {
     const seqs = server.events.map((e) => e.seq);
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
@@ -101,6 +111,34 @@ describe('mock API', () => {
       await expect(client.post(`/migrations/${m.id}/${action}`, body)).rejects.toMatchObject({ status: 422, code: 'validation_error' });
     }
     await expect(client.post<Migration>(`/migrations/${m.id}/approve`, { comment: 'x'.repeat(2000) })).resolves.toMatchObject({ id: m.id });
+  });
+
+  it('audits every request refused for its role as auth.denied, like the API (SDD §13.1)', async () => {
+    const { server } = setup();
+    const as = (token: string) => new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+    const since = server.events.at(-1)?.seq ?? 0;
+    const plan = { name: 'Audit', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['os-0a11'] };
+    await expect(as('nope').get('/plans')).rejects.toMatchObject({ status: 401, message: 'missing or invalid bearer token' });
+    await expect(as('locked').get('/plans')).rejects.toMatchObject({ status: 429, code: 'too_many_requests' });
+    await expect(as('viewer').post('/plans', plan)).rejects.toMatchObject({ status: 403, message: 'this action requires the operator role' });
+    await expect(as('operator').post('/plans', { ...plan, auto_cutover: true })).rejects.toMatchObject({ status: 403 });
+    const stream = await createMockFetch(server)('/api/v1/events/stream', { headers: { Authorization: 'Bearer nope' } });
+    expect(stream.status).toBe(401);
+    // routes without a role check refuse nothing: the health route stays public, even when locked
+    await expect(as('locked').get('/health')).resolves.toMatchObject({ status: expect.any(String) });
+
+    const shape = (method: string, path: string, reason: string, required_role: string) => ({
+      message: `${method} /api/v1${path}: ${reason}`,
+      data: { path: `/api/v1${path}`, method, reason, required_role, client: 'browser' },
+    });
+    const denied = server.events.filter((e) => e.seq > since && e.kind === 'auth.denied');
+    expect(denied.map((e) => ({ actor: e.actor, message: e.message, data: e.data }))).toEqual([
+      { actor: 'unauthenticated', ...shape('GET', '/plans', 'missing or invalid bearer token', 'viewer') },
+      { actor: 'unauthenticated', ...shape('GET', '/plans', 'too many failed authentication attempts', 'viewer') },
+      { actor: 'dimas', ...shape('POST', '/plans', 'role viewer is below operator', 'operator') },
+      { actor: 'bayu', ...shape('POST', '/plans', 'setting auto_cutover requires the approver role', 'approver') },
+      { actor: 'unauthenticated', ...shape('GET', '/events/stream', 'missing or invalid bearer token', 'viewer') },
+    ]);
   });
 
   it('maps tokens to roles and rejects unknown tokens', async () => {

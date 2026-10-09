@@ -945,7 +945,9 @@ VITE_SEAMLESS_MOCK=1 npm run dev      # in-browser mock adapter that exercises e
 Mock conventions (`src/api/mock.ts`), for demos and tests of failure paths: the token `locked` answers
 every API route with the 429 auth lockout of SDD §15.1 (the health routes stay public), and a provider
 whose endpoint host starts with `unreachable` fails its connection test (status `error`), so the
-provider dialog's "Edit again" path can be shown without a real cloud.
+provider dialog's "Edit again" path can be shown without a real cloud. Like the API, the mock audits
+every refusal for a role — 401, the `locked` 429, 403 — as `auth.denied` in the SDD §13.1 shape (its
+`client` is `browser`).
 
 Test conventions that keep the suite deterministic: `renderWithApp` seeds `GET /me` for its token, as
 `RequireAuth` does in the app, so a role-gated action is enabled at the first render (a click used to race the

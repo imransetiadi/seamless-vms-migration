@@ -7,8 +7,10 @@
  * control plane. Roles are enforced per route; phase transitions follow SDD §5.1.
  *
  * Mock tokens: `viewer`, `operator`, `approver` or `admin` select a role; no token means the
- * anonymous admin of demo mode on loopback (SDD §13.1); any other token is rejected with 401.
+ * anonymous admin of demo mode on loopback (SDD §13.1); `locked` stands for the per-address lockout
+ * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
+import { DEFAULT_API_BASE } from './client';
 import { canTransition } from '../lib/fsm';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
@@ -140,6 +142,8 @@ export class MockServer {
   private readonly rand: () => number;
   private readonly now: () => number;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** The request being handled, for the `auth.denied` audit (SDD §13.1). */
+  private request = { method: 'GET', path: '/' };
 
   constructor(options: MockServerOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -490,15 +494,7 @@ export class MockServer {
   }
 
   handle(method: string, path: string, query: URLSearchParams, body: unknown, token: string | null): MockResponse {
-    // the token "locked" simulates the control plane's per-address lockout (SDD §15.1);
-    // like the real one it never affects the public health routes
-    const publicRoute = /^\/?(health|ready)$/.test(path);
-    if (token?.trim().toLowerCase() === 'locked' && !publicRoute) {
-      return {
-        status: 429,
-        body: { error: { code: 'too_many_requests', message: 'too many failed authentication attempts from this address; retry in a minute' } },
-      };
-    }
+    this.request = { method, path };
     try {
       return this.route(method, path, query, body, token);
     } catch (error) {
@@ -508,16 +504,40 @@ export class MockServer {
     }
   }
 
-  private require(token: string | null, min: Role, path: string): Me {
+  /**
+   * A route's role check, like the API's require_role (SDD §12, §13.1): the token "locked" simulates
+   * the control plane's per-address lockout (SDD §15.1), which like the real one only ever answers a
+   * route with a role check — the public health routes have none.
+   */
+  private require(token: string | null, min: Role, _path: string): Me {
     const me = this.principal(token);
     if (!me) {
-      this.emit({ kind: 'auth.denied', plan_id: null, migration_id: null, actor: 'anonymous', message: 'Rejected request with an invalid bearer token', data: { path } });
-      throw new HttpError(401, 'unauthorized', 'Missing or invalid bearer token.');
+      if (token?.trim().toLowerCase() === 'locked') {
+        this.auditDenied('too many failed authentication attempts', min, null);
+        throw new HttpError(429, 'too_many_requests', 'too many failed authentication attempts from this address; retry in a minute');
+      }
+      this.auditDenied('missing or invalid bearer token', min, null);
+      throw new HttpError(401, 'unauthorized', 'missing or invalid bearer token');
     }
     if (!hasRole(me.role, min)) {
-      throw new HttpError(403, 'forbidden', `This action requires the ${min} role (you are ${me.role}).`);
+      this.auditDenied(`role ${me.role} is below ${min}`, min, me);
+      throw new HttpError(403, 'forbidden', `this action requires the ${min} role`);
     }
     return me;
+  }
+
+  /** `auth.denied` in the API's shape (SDD §13.1); the in-browser mock's client is the browser. */
+  private auditDenied(reason: string, required: Role, me: Me | null): void {
+    const { method } = this.request;
+    const path = `${DEFAULT_API_BASE}/${this.request.path.replace(/^\//, '')}`;
+    this.emit({
+      kind: 'auth.denied',
+      plan_id: null,
+      migration_id: null,
+      actor: me?.name ?? 'unauthenticated',
+      message: `${method} ${path}: ${reason}`,
+      data: { path, method, reason, required_role: required, client: 'browser' },
+    });
   }
 
   private plan(id: string): Plan {
@@ -784,7 +804,10 @@ export class MockServer {
   private refusePolicyChange(me: Me, input: Record<string, unknown>, current: Record<string, unknown>): void {
     if (hasRole(me.role, 'approver')) return;
     const touched = POLICY_FIELDS.filter((key) => key in input && stable(input[key] ?? null) !== stable(current[key] ?? null));
-    if (touched.length) throw new HttpError(403, 'forbidden', `setting ${[...touched].sort().join(', ')} requires the approver role`);
+    if (!touched.length) return;
+    const reason = `setting ${[...touched].sort().join(', ')} requires the approver role`;
+    this.auditDenied(reason, 'approver', me);
+    throw new HttpError(403, 'forbidden', reason);
   }
 
   /** Plan name and description bounds, like the API's create and patch (SDD §12). */
@@ -1168,9 +1191,13 @@ export class MockServer {
 
   /** `GET /events/stream` as a real `text/event-stream` body. */
   openStream(query: URLSearchParams, token: string | null, signal: AbortSignal | null | undefined, heartbeatMs: number): Response {
-    if (!this.principal(token)) {
-      return new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'Missing or invalid bearer token.' } }), {
-        status: 401,
+    this.request = { method: 'GET', path: '/events/stream' };
+    try {
+      this.require(token, 'viewer', '/events/stream');
+    } catch (error) {
+      if (!(error instanceof HttpError)) throw error;
+      return new Response(JSON.stringify({ error: { code: error.code, message: error.message } }), {
+        status: error.status,
         headers: { 'Content-Type': 'application/json' },
       });
     }
