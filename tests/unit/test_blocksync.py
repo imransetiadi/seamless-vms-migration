@@ -822,3 +822,85 @@ def test_hash_chunk_zero_fast_path_matches_hashing(tmp_path):
     assert chunks[1].digest == blocksync.chunk_digest(late) != blocksync.zero_digest(chunk)
     assert chunks[2].digest == blocksync.chunk_digest(early)
     assert chunks[3].length == 100 and chunks[3].digest == blocksync.zero_digest(100)
+
+
+# --- protocol guards on the receiver ---------------------------------------------------------
+# A scripted sender speaks protocol v1 and breaks it in exactly one place. Every violation must
+# end in ProtocolError (exit 3); the ones caught before a write must leave the destination as it
+# was (data integrity, QASuite D-series; test review COLL-5).
+
+FAKE_SENDER = r'''
+import struct, sys
+sys.path.insert(0, sys.argv[2])
+import blocksync as b
+scenario, chunk, size = sys.argv[1], int(sys.argv[3]), int(sys.argv[4])
+count = b.chunk_count(size, chunk)
+out, inp = sys.stdout.buffer, sys.stdin.buffer
+magic, version = b.PROTOCOL_MAGIC, b.PROTOCOL_VERSION
+if scenario == "bad_magic":
+    magic = b"XXXX"
+if scenario == "bad_version":
+    version = 2
+out.write(b._HELLO.pack(magic, version, chunk, size)); out.flush()
+if scenario in ("bad_magic", "bad_version"):
+    sys.exit(0)
+theirs = [b._read_exact(inp, b.DIGEST_SIZE) for _ in range(count)]
+payload = b"\x5a" * chunk
+def frame(offset, length, data=True):
+    out.write((b.FRAME_DATA if data else b.FRAME_ZERO) + b._FRAME_HEADER.pack(offset, length))
+    if data:
+        out.write(payload[:length])
+changed = transferred = 0
+if scenario == "misaligned":
+    frame(1, chunk)
+elif scenario == "beyond":
+    frame(count * chunk, chunk)
+elif scenario == "wrong_length":
+    frame(0, chunk - 1)
+elif scenario == "unknown_type":
+    out.write(b"Q" + b._FRAME_HEADER.pack(0, chunk))
+elif scenario == "out_of_order":
+    frame(chunk, chunk); frame(0, chunk)
+elif scenario == "end_mismatch":
+    changed = 1
+elif scenario == "lying_manifest":
+    pass
+manifest = b.manifest_digest(theirs)
+if scenario == "lying_manifest":
+    manifest = bytes(16)
+out.write(b.FRAME_END + b._END.pack(count, changed, transferred, manifest))
+if scenario == "trailing":
+    out.write(b"!")
+out.flush()
+'''
+
+
+@pytest.mark.parametrize(
+    "scenario, message, untouched",
+    [
+        ("bad_magic", "bad protocol magic", True),
+        ("bad_version", "unsupported protocol version 2", True),
+        ("misaligned", "not chunk aligned", True),
+        ("beyond", "beyond the source size", True),
+        ("wrong_length", "has length", True),
+        ("unknown_type", "unknown frame type", True),
+        ("out_of_order", "out of order", False),
+        ("end_mismatch", "end frame mismatch", True),
+        ("lying_manifest", "manifest digest mismatch", True),
+        ("trailing", "unexpected data after the end frame", True),
+    ],
+)
+def test_receiver_rejects_protocol_violations(tmp_path, scenario, message, untouched):
+    module_dir = os.path.dirname(blocksync.__file__)
+    fake = tmp_path / "fake_sender.py"
+    fake.write_text(FAKE_SENDER)
+    original = rand_bytes(4 * CHUNK, 77)
+    dst = write(tmp_path / "dst", original)
+    sender = [PYTHON, str(fake), scenario, module_dir, str(CHUNK), str(4 * CHUNK)]
+
+    with pytest.raises(blocksync.ProtocolError, match=message) as caught:
+        blocksync.run_receiver(str(dst), CHUNK, 1, sender)
+
+    assert caught.value.exit_code == blocksync.EXIT_PROTOCOL
+    if untouched:
+        assert read(dst) == original, "a rejected frame must not reach the destination"
