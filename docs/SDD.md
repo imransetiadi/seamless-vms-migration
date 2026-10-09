@@ -1301,7 +1301,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 * Downtime against the SLO: Overview's Downtime now and the migration page's clock use one rule — calm
   below 80 % of the plan's downtime SLO, a warning (amber, hourglass icon) from 80 %, a breach (red,
   warning icon) past 100 % — so a VM never reads differently on the two pages, and the warning is never
-  colour alone.
+  colour alone; the time left or over reads as a clock (m:ss) on both, the SLO itself as a duration.
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
