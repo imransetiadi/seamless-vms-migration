@@ -495,6 +495,28 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
     store2.dispose()
 
 
+def test_disabled_api_docs_paths_answer_404_where_the_dashboard_is_served(tmp_path):
+    """FastAPI's default /docs, /redoc and /openapi.json are disabled (SDD §12, Security.md R-04,
+    QASuite S-07): the SPA fallback must not answer them with the dashboard, or a scanner pointed
+    at /openapi.json (S-09, S-23) reads HTML."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    prod, _ = api_settings(tmp_path, demo=False, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'docs.db'}")
+    store.create_schema()
+    with TestClient(create_app(prod, store)) as client:
+        for path in ("/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"):
+            res = client.get(path)
+            assert res.status_code == 404, path
+            assert res.json()["error"]["code"] == "not_found", path
+        # the dashboard's own routes still get the SPA
+        for path in ("/", "/plans", "/migrations/mig-1", "/docs-and-more"):
+            res = client.get(path)
+            assert res.status_code == 200 and "<title>Seamless</title>" in res.text, path
+    store.dispose()
+
+
 def test_dashboard_mock_error_codes_are_api_codes():
     """The dashboard's mock API (mock mode, unit tests) answers only with (status, code) pairs the
     real API sends (SDD §12), so the UI is never developed against an error the backend never

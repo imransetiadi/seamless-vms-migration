@@ -173,6 +173,11 @@ def _install_api_docs(app: FastAPI, settings: Settings) -> None:
         return response
 
 
+#: FastAPI's default documentation routes, disabled (SDD §12, Security.md R-04): the SPA fallback
+#: answers them with 404 too, so a stale link or a scanner never reads the dashboard as the API docs
+_DISABLED_DOCS = ("docs", "redoc", "openapi.json")
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -181,7 +186,8 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa(full_path: str) -> Any:
-        if full_path == "api" or full_path.startswith("api/"):
+        first = full_path.split("/", 1)[0]
+        if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
         candidate = (root / full_path).resolve()
         if full_path and candidate.is_file() and candidate.is_relative_to(root):
