@@ -20,7 +20,8 @@ dashboard/coverage
 seamless/data
 seamless/*.db
 
-# Secrets must never enter the build context (SDD 13.3)
+# Secrets must never enter the build context (SDD 13.3). seamless/Containerfile builds read
+# seamless/.containerignore instead; seamless/tests/test_build_context.py checks both files.
 deploy/compose/.env
 deploy/compose/.env.*
 deploy/compose/tokens.yaml
@@ -30,6 +31,9 @@ deploy/openshift/secret.yaml
 .env.*
 **/*.env
 **/clouds.yaml
+**/clouds.yml
+tests/auth_*.yml
+**/secrets
 **/secure.yaml
 **/*.pem
 **/*.key

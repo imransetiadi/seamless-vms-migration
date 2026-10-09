@@ -18,7 +18,13 @@ seamless/tests
 **/*.sqlite3
 docs/_build
 tests/e2e
-# never send secrets to the builder
+# never send secrets to the builder (seamless/tests/test_build_context.py keeps this list complete;
+# docker build reads this file through seamless/Containerfile.dockerignore, not the root .dockerignore)
+.claude
+deploy/compose/compose.local.yaml
+deploy/openshift/secret.yaml
+**/clouds.yml
+tests/auth_*.yml
 **/.env
 **/.env.*
 **/*.env
