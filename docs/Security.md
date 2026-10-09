@@ -389,8 +389,11 @@ malicious, corruption).
    and child processes all expose the environment). The Compose stack uses environment variables for its own
    development secrets because it is a developer stack; OpenShift uses Secret volumes for the cloud
    credentials.
-3. **Least read access:** Secret volumes `0440`, mounted read-only; the control plane's service account has no
-   Kubernetes API token.
+3. **Least read access:** Secret volumes `0440`, mounted read-only. The control plane's Kubernetes API token is
+   mounted only for the dashboard's Secret store (`SEAMLESS_SECRET_STORE=kubernetes`): a namespaced Role lets it
+   get, create, update and delete the Secrets of its own namespace (R-15), so keep that namespace to Seamless
+   Migrate alone. To manage credentials outside the dashboard, set `automountServiceAccountToken: false` and
+   `SEAMLESS_SECRET_STORE=files` (or remove it) in `deployment.yaml` and drop `secret-store-rbac.yaml`.
 4. **Shells and agents — one rule:** a key reaches a process **only through its environment** (or a Secret file),
    never as text on a command line (shell history, `ps` and agent transcripts keep command lines). Do not leave
    long-lived keys exported in shells where agents run commands; hand one to the single process that needs it from
@@ -450,11 +453,11 @@ CIDRs of your clouds, vCenter, conversion hosts, Jev provider and agentmemory be
 | Privilege escalation | `security_opt: no-new-privileges:true` on every service | `allowPrivilegeEscalation: false` |
 | Root filesystem | writable by default; `read_only: true` + `tmpfs: [/tmp]` is provided as a commented opt-in to rehearse the cluster profile | `readOnlyRootFilesystem: true` on `seamless`; writable only `/data` (PVC) and `/tmp` (`emptyDir`) |
 | Seccomp | Docker default profile | `seccompProfile: RuntimeDefault` (pod level) |
-| Kubernetes API token | n/a | `automountServiceAccountToken: false` |
+| Kubernetes API token | n/a | `automountServiceAccountToken: true` on the control plane only, for the dashboard's Secret store, with a namespaced Role on Secrets (R-15); `false` on the ServiceAccount and on PostgreSQL, and on the control plane when credentials are managed outside the dashboard |
 | Network exposure | only `seamless` on `127.0.0.1:8080`; `postgres` on an `internal: true` network; `jev` only on the app network | Route (edge TLS) → Service; default-deny NetworkPolicies (§8) |
 | Secrets | `.env` (0600, never mounted), `tokens.yaml` bind-mounted read-only, `create_host_path: false` | Secret volumes `defaultMode 0440`, read-only; DB URL from a `secretKeyRef` |
 | Resource limits | memory limits per service | requests/limits on both workloads |
-| Single instance | one container | `replicas: 1`, `strategy: Recreate` (the orchestrator is a singleton) |
+| Single instance | one container | `replicas: 1`, `strategy: Recreate` (the orchestrator is a singleton); no PodDisruptionBudget, which would block node drains: a control plane evicted mid-run resumes its migrations from their checkpoints (QASuite R-01) |
 | Logs | `json-file` with rotation | cluster logging; `SEAMLESS_LOG_JSON=true` |
 
 Not hardened in 0.1.0: the bundled PostgreSQL pod has a writable root filesystem (the SCL image writes its

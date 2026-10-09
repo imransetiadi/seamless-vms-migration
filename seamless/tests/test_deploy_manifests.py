@@ -65,3 +65,19 @@ def test_postgres_image_is_pinned_by_digest():
     assert postgres["newName"] == "quay.io/sclorg/postgresql-16-c9s"
     assert postgres.get("digest", "").startswith("sha256:") and len(postgres["digest"]) == 71
     assert "newTag" not in postgres
+
+
+def _deployment() -> dict:
+    manifests = yaml.safe_load_all((ROOT / "deploy" / "openshift" / "deployment.yaml").read_text())
+    return next(m for m in manifests if m and m["kind"] == "Deployment")
+
+
+def test_security_md_describes_the_api_token_the_deployment_mounts():
+    """Security.md's secrets rules and hardening table say what deployment.yaml does with the
+    control plane's Kubernetes API token: mounted for the dashboard's Secret store (R-15)."""
+    mounted = _deployment()["spec"]["template"]["spec"]["automountServiceAccountToken"]
+    text = (ROOT / "docs" / "Security.md").read_text(encoding="utf-8")
+    [row] = [line for line in text.splitlines() if line.startswith("| Kubernetes API token |")]
+    assert f"`automountServiceAccountToken: {str(mounted).lower()}`" in row, row
+    if mounted:
+        assert "service account has no Kubernetes API token" not in " ".join(text.split())
