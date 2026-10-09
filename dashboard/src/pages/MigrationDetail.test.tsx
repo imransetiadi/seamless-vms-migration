@@ -18,6 +18,24 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(os).toHaveTextContent(/verified on tcp 3389, without the console check/i));
   });
 
+  it('does not say pre-flight passed before it ran (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'ready')!;
+    m.findings = [];
+    m.phase = 'pending';
+    m.phase_history = [{ from_phase: null, to_phase: 'pending', at: '2026-10-08T11:00:00Z', reason: 'migration created', actor: 'sari' }];
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    let findings = await screen.findByRole('region', { name: /^findings$/i });
+    expect(findings).toHaveTextContent(/no findings yet — pre-flight runs when the plan is validated/i);
+    unmount();
+
+    m.phase = 'validating';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    findings = await screen.findByRole('region', { name: /^findings$/i });
+    expect(findings).toHaveTextContent(/no findings yet — pre-flight is running/i);
+    expect(findings).not.toHaveTextContent(/pre-flight passed/i);
+  });
+
   it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
     const server = createTestServer();
     const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');

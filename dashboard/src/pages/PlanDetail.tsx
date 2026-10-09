@@ -37,6 +37,7 @@ import { cn } from '../lib/cn';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
+import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -264,6 +265,10 @@ export default function PlanDetail() {
     setClearing(cleared);
     setConfirm('validate');
   };
+  // "pre-flight passed" only once every VM of vm_ids has a migration whose pre-flight ran and the plan is
+  // not a draft again: an added VM has no migration before the next validation (SDD §16)
+  const checked = new Set(list.filter(preflightRan).map((m) => m.vm.source_id));
+  const preflightDone = p.status !== 'draft' && p.vm_ids.length > 0 && p.vm_ids.every((vmId) => checked.has(vmId));
   const waveSizeNumber = Number(waveSize);
   const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 100;
   const s = stats.data;
@@ -363,7 +368,10 @@ export default function PlanDetail() {
             title="Findings"
             description={`${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`}
           >
-            <FindingGroupsList groups={groupFindings(findings)} />
+            <FindingGroupsList
+              groups={groupFindings(findings)}
+              emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
+            />
           </Panel>
         </section>
       </div>

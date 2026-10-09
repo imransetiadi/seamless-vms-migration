@@ -81,9 +81,51 @@ describe('PlanDetail', () => {
     const panel = await screen.findByRole('region', { name: /^migrations$/i });
     expect(await within(panel).findByText(/no migrations in this plan yet/i)).toBeInTheDocument();
     expect(panel).toHaveTextContent(/validation creates one migration per vm and runs the pre-flight checks/i);
+    // pre-flight has not run: the findings must not say it passed (SDD §16)
+    const findings = screen.getByRole('region', { name: /^findings$/i });
+    expect(findings).toHaveTextContent(/no findings yet — pre-flight runs when the plan is validated/i);
+    expect(findings).not.toHaveTextContent(/pre-flight passed/i);
     await user.click(within(panel).getByRole('button', { name: /^validate$/i }));
     expect(await within(panel).findByRole('table', { name: /migrations in fresh wave/i })).toBeInTheDocument();
     expect(server.migrations.filter((m) => m.plan_id === plan.id)).toHaveLength(2);
+    await waitFor(() => expect(findings).not.toHaveTextContent(/pre-flight runs when the plan is validated/i));
+  });
+
+  it('says pre-flight passed only when every VM of the plan was checked and the plan is not a draft (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    plan.vm_ids = mine.map((m) => m.vm.source_id);
+    for (const m of mine) {
+      m.findings = [];
+      m.phase = 'ready';
+      m.phase_history = [
+        { from_phase: null, to_phase: 'pending', at: '2026-10-08T10:00:00Z', reason: 'migration created', actor: 'sari' },
+        { from_phase: 'pending', to_phase: 'validating', at: '2026-10-08T10:00:01Z', reason: 'plan validation started', actor: 'sari' },
+        { from_phase: 'validating', to_phase: 'ready', at: '2026-10-08T10:00:02Z', reason: 'pre-flight passed', actor: 'sari' },
+      ];
+    }
+    const findingsText = async () => {
+      const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+      const region = await screen.findByRole('region', { name: /^findings$/i });
+      await waitFor(() => expect(region).toHaveTextContent(/no findings/i));
+      const text = region.textContent ?? '';
+      view.unmount();
+      return text;
+    };
+
+    plan.status = 'validated';
+    expect(await findingsText()).toMatch(/no findings — pre-flight passed/i);
+    // a VM added after the validation has no migration yet: nothing checked it
+    const taken = new Set(server.migrations.map((m) => m.vm.source_id));
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string }>> }).inventories;
+    const added = inventories[plan.source_provider_id]!.find((v) => !taken.has(v.source_id))!.source_id;
+    plan.vm_ids = [...plan.vm_ids, added];
+    expect(await findingsText()).toMatch(/pre-flight runs when the plan is validated/i);
+    // an edited plan is a draft again: it is validated again before it starts
+    plan.vm_ids = plan.vm_ids.filter((id) => id !== added);
+    plan.status = 'draft';
+    expect(await findingsText()).toMatch(/pre-flight runs when the plan is validated/i);
   });
 
   it('says which plan holds a VM when validation is refused (SDD §5.4)', async () => {

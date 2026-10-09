@@ -27,7 +27,7 @@ import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange } from '../lib/migrationActions';
-import { isActivePhase, isWarmStrategy, phaseMeta } from '../lib/phase';
+import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan } from '../lib/phase';
 import { hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -466,7 +466,16 @@ export default function MigrationDetail() {
 
         <div className="grid gap-4 xl:grid-cols-2">
           <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">
-            <FindingsList findings={m.findings} />
+            <FindingsList
+              findings={m.findings}
+              emptyText={
+                m.phase === 'validating'
+                  ? 'No findings yet — pre-flight is running.'
+                  : preflightRan(m)
+                    ? undefined
+                    : 'No findings yet — pre-flight runs when the plan is validated.'
+              }
+            />
           </Panel>
           <Panel title="Advisor notes" description="Jev, rules and agentmemory">
             <AdvisorNotes notes={m.advisor_notes} />

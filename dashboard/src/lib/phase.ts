@@ -17,7 +17,7 @@ import {
   Undo2,
   Zap,
 } from 'lucide-react';
-import type { Phase, Strategy } from '../api/types';
+import type { Migration, Phase, Strategy } from '../api/types';
 
 /** Semantic status tones. Colour is always paired with an icon and a text label (SDD §16). */
 export const TONES = ['neutral', 'info', 'progress', 'warning', 'success', 'danger'] as const;
@@ -190,4 +190,14 @@ export function happyPath(strategy: Strategy): Phase[] {
 export function phaseSortKey(phase: Phase): number {
   const index = PHASE_ORDER.indexOf(phase);
   return index === -1 ? PHASE_ORDER.length : index;
+}
+
+/**
+ * Whether a migration's pre-flight ran: validation finished it (SDD §8, §16). Pending and validating
+ * migrations have not been checked yet, nor has one cancelled before its validation finished.
+ */
+export function preflightRan(m: Pick<Migration, 'phase' | 'phase_history'>): boolean {
+  if (m.phase === 'pending' || m.phase === 'validating') return false;
+  if (m.phase !== 'cancelled') return true;
+  return m.phase_history.some((h) => h.to_phase === 'ready' || h.to_phase === 'blocked');
 }

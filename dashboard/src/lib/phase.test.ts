@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PHASES, STRATEGIES, type Phase } from '../api/types';
-import { happyPath, isActivePhase, isTerminalPhase, phaseMeta, TONES } from './phase';
+import { happyPath, isActivePhase, isTerminalPhase, phaseMeta, preflightRan, TONES } from './phase';
 
 function isRenderableComponent(value: unknown): boolean {
   // lucide icons are forwardRef objects; plain function components are also fine.
@@ -77,5 +77,20 @@ describe('phase helpers', () => {
       ]);
     }
     expect(STRATEGIES).toHaveLength(5);
+  });
+});
+
+
+describe('preflightRan', () => {
+  const history = (...phases: Phase[]) => phases.map((to_phase, i) => ({ from_phase: i ? phases[i - 1]! : null, to_phase, at: '2026-10-08T12:00:00Z', reason: '', actor: 'test' }));
+
+  it('is false until validation finished, and for a migration cancelled before it (SDD §16)', () => {
+    expect(preflightRan({ phase: 'pending', phase_history: history('pending') })).toBe(false);
+    expect(preflightRan({ phase: 'validating', phase_history: history('pending', 'validating') })).toBe(false);
+    expect(preflightRan({ phase: 'cancelled', phase_history: history('pending', 'cancelled') })).toBe(false);
+    for (const phase of ['blocked', 'ready', 'precopy', 'awaiting_cutover', 'completed', 'failed'] as Phase[]) {
+      expect(preflightRan({ phase, phase_history: history('pending', 'validating', 'ready') })).toBe(true);
+    }
+    expect(preflightRan({ phase: 'cancelled', phase_history: history('pending', 'validating', 'blocked', 'cancelled') })).toBe(true);
   });
 });
