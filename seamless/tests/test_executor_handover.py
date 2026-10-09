@@ -86,6 +86,11 @@ class FakeBlockStorage:
     def wait_for_delete(self, res, interval=2, wait=120):
         return res
 
+    def backend_pools(self):
+        if self.c.pools is None:
+            raise RuntimeError("HTTP 403: Policy doesn't allow scheduler_extension:scheduler_stats")
+        return [NS(name=name, capabilities=caps) for name, caps in self.c.pools]
+
     def post(self, url, json=None, **kw):
         if url.endswith("/action") and "os-unmanage" in json:
             vid = url.split("/")[2]
@@ -123,9 +128,15 @@ class FakeNetwork:
         return NS(id=f"{self.c.name}-net-{name}", name=name)
 
 
+CEPH = {"vendor_name": "Open Source", "storage_protocol": "ceph"}
+ONTAP_NFS = {"vendor_name": "NetApp", "storage_protocol": "nfs"}
+ONTAP_ISCSI = {"vendor_name": "NetApp", "storage_protocol": "iSCSI"}
+
+
 class FakeCloud:
-    def __init__(self, name, calls, servers=None, volumes=None, crash_on=None):
+    def __init__(self, name, calls, servers=None, volumes=None, crash_on=None, pools=()):
         self.name = name
+        self.pools = list(pools) if pools is not None else None
         self.calls = calls
         self.servers = servers or {}
         self.volumes = volumes or {}
@@ -177,12 +188,17 @@ def source_cloud(calls, crash_on=None):
             status="in-use",
         ),
     }
-    return FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on)
+    pools = [("overcloud@tripleo_ceph#ssd", CEPH), ("overcloud@tripleo_ceph#hdd", CEPH)]
+    return FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on, pools=pools)
 
 
 def setup(tmp_path, crash_on=None):
     calls = []
-    clouds = {"src": source_cloud(calls, crash_on), "dst": FakeCloud("dst", calls)}
+    dst_pools = [("hostgroup@ceph-ssd#ssd", CEPH), ("hostgroup@ceph-hdd#hdd", CEPH)]
+    clouds = {
+        "src": source_cloud(calls, crash_on),
+        "dst": FakeCloud("dst", calls, pools=dst_pools),
+    }
     settings = Settings(data_dir=tmp_path / "data")
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
     plan = make_plan(
@@ -381,6 +397,133 @@ async def test_handover_rollback_after_unmanage_deletes_stale_source_and_recreat
     calls.clear()
     again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert calls == [] and again.details["note"] == "nothing to roll back"
+
+
+# -- NetApp ONTAP (SDD §7.3.1) -------------------------------------------------------------------
+NFS_SRC = "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+NFS_DST = "hostgroup@ontap_nfs#10.20.0.5:/cinder_vol"
+
+
+def netapp_setup(tmp_path, family="nfs", crash_on=None, dst_pools=None):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on=crash_on)
+    if family == "nfs":
+        src_pool, caps, backend = NFS_SRC, ONTAP_NFS, "hostgroup@ontap_nfs"
+        default_dst = [
+            ("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS),
+            (NFS_DST, ONTAP_NFS),
+        ]
+    else:
+        src_pool, caps, backend = (
+            "overcloud@ontap_iscsi#flex_a",
+            ONTAP_ISCSI,
+            "hostgroup@ontap_iscsi",
+        )
+        default_dst = [
+            ("hostgroup@ontap_iscsi#flex_a", ONTAP_ISCSI),
+            ("hostgroup@ontap_iscsi#flex_b", ONTAP_ISCSI),
+        ]
+    for volume in clouds["src"].volumes.values():
+        volume.host = src_pool
+    clouds["src"].pools = [(src_pool, caps), ("overcloud@tripleo_ceph#ssd", CEPH)]
+    clouds["dst"].pools = default_dst if dst_pools is None else dst_pools
+    plan = plan.model_copy(
+        update={
+            "handover": HandoverConfig(
+                enabled=True, backend_map={"ceph-ssd": backend, "ceph-hdd": backend}
+            )
+        }
+    )
+    return executor, calls, clouds, plan, mig, settings
+
+
+async def test_handover_netapp_nfs_manages_by_share_path(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    managed = [(op, arg) for cloud, op, arg in calls if cloud == "dst" and op == "manage"]
+    # the destination's own LIF address, the export the source used
+    assert managed == [
+        ("manage", "10.20.0.5:/cinder_vol/volume-vol-data"),
+        ("manage", "10.20.0.5:/cinder_vol/volume-vol-root"),
+    ]
+    assert {m["host"] for m in clouds["dst"].managed} == {NFS_DST}
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert saved["storage"]["vol-data"] == {
+        "family": "netapp_nfs",
+        "src_pool": "192.0.2.5:/cinder_vol",
+        "dst_host": NFS_DST,
+    }
+
+
+async def test_handover_netapp_block_manages_by_lun_path(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "iscsi")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    assert [arg for cloud, op, arg in calls if cloud == "dst" and op == "manage"] == [
+        "/vol/flex_a/volume-vol-data",
+        "/vol/flex_a/volume-vol-root",
+    ]
+    assert {m["host"] for m in clouds["dst"].managed} == {"hostgroup@ontap_iscsi#flex_a"}
+
+
+@pytest.mark.parametrize(
+    ("dst_pools", "reason"),
+    [
+        ([("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS)], "no pool for the export"),
+        ([("hostgroup@ontap_nfs#flex_a", ONTAP_ISCSI)], "same driver family"),
+        (None, "Cinder pools of the destination"),
+    ],
+)
+async def test_handover_refuses_before_stop_when_a_pool_cannot_be_resolved(
+    tmp_path, dst_pools, reason
+):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    clouds["dst"].pools = dst_pools
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match=reason):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [], "nothing changed: the VM keeps running"
+    assert rec.downtime_marks == 0
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["note"] == "nothing to roll back"
+
+
+async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    cut = await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    mig.destination_server_id = cut.destination_server_id
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # RHOSO renamed the files to its own ids; the source mounts the export at its own address
+    assert [arg for cloud, op, arg in calls if cloud == "src" and op == "manage"] == [
+        "192.0.2.5:/cinder_vol/volume-dst-vol-2",
+        "192.0.2.5:/cinder_vol/volume-dst-vol-1",
+    ]
+    assert {m["host"] for m in clouds["src"].managed} == {NFS_SRC}
+
+
+async def test_handover_resume_of_a_definition_without_storage_stays_rbd(tmp_path):
+    """A run journaled before §7.3.1 has no `storage` in its definition: it resumes as RBD."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    definition = executor.run_dir(ctx) / "source-server.json"
+    legacy = json.loads(definition.read_text())
+    legacy.pop("storage")
+    definition.write_text(json.dumps(legacy))
+    clouds["src"].pools = clouds["dst"].pools = None  # not even readable any more
+    calls.clear()
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [arg for cloud, op, arg in calls if op == "manage"] == [
+        "volume-vol-data",
+        "volume-vol-root",
+    ]
+    assert [m["host"] for m in clouds["dst"].managed] == [
+        "hostgroup@ceph-hdd#hdd",
+        "hostgroup@ceph-ssd#ssd",
+    ]
 
 
 def test_existing_server_and_write_json_helpers(tmp_path):

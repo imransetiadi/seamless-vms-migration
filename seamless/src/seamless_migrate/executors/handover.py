@@ -1,10 +1,11 @@
-"""Storage-handover executor for clouds sharing a Ceph cluster (SDD §7.3).
+"""Storage-handover executor for clouds sharing a Ceph cluster or a NetApp ONTAP SVM (SDD §7.3).
 
 Cutover per VM (data volumes first, then the boot volume): stop the source, record its
 definition and attachment order, detach data volumes, ``os-unmanage`` every volume at the source,
-delete the source server, ``manage`` the RBD images in RHOSO and boot the destination server from
-them. Every completed sub-step is journaled in ``handover-journal.json`` so a crash resumes
-without repeating work; rollback reverses the journal (6 → 3) and recreates the source server.
+delete the source server, ``manage`` the RBD images, ONTAP files or LUNs in RHOSO (references per
+driver family, §7.3.1, resolved before the stop) and boot the destination server from them.
+Every completed sub-step is journaled in ``handover-journal.json`` so a crash resumes without
+repeating work; rollback reverses the journal (6 → 3) and recreates the source server.
 No data is copied in either direction.
 """
 
@@ -22,6 +23,13 @@ from typing import Any, TypeVar
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Plan, Provider, utcnow
+from ..storage import (
+    StorageError,
+    manage_reference,
+    resolve_destination,
+    split_host,
+    storage_family,
+)
 from .ansible import classify_failure, run_dir
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
@@ -194,6 +202,54 @@ class HandoverExecutor:
             "attachments": attachments,
         }
 
+    @staticmethod
+    def _pools(conn: Any, side: str) -> dict[str, dict[str, Any]]:
+        try:
+            pools = list(conn.block_storage.backend_pools())
+        except Exception as exc:
+            raise PermanentStepError(
+                f"cannot read the Cinder pools of the {side} (scheduler-stats/get_pools, admin): "
+                f"{exc}; the manage reference depends on the driver family (SDD §7.3.1)"
+            ) from exc
+        return {str(_attr(p, "name")): dict(_attr(p, "capabilities") or {}) for p in pools}
+
+    def _resolve_storage(
+        self, src: Any, dst: Any, attachments: list[dict[str, Any]], backend_map: dict[str, str]
+    ) -> dict[str, dict[str, Any]]:
+        """Family, source pool and destination host of every volume (§7.3 step 0, §7.3.1)."""
+        missing = sorted(
+            {
+                a["volume_type"] or "<default>"
+                for a in attachments
+                if (a["volume_type"] or "") not in backend_map
+            }
+        )
+        if missing:
+            raise PermanentStepError(f"no handover backend for volume type(s): {missing}")
+        src_pools = self._pools(src, "source")
+        dst_backends = [
+            {"pool": name, "family": storage_family(caps)}
+            for name, caps in self._pools(dst, "destination").items()
+        ]
+        storage: dict[str, dict[str, Any]] = {}
+        for att in attachments:
+            vid, host = att["volume_id"], att.get("host")
+            if not host or host not in src_pools:
+                raise PermanentStepError(
+                    f"volume {vid}: Cinder pool {host!r} is not listed by the source "
+                    "(admin credentials show os-vol-host-attr:host)"
+                )
+            family = storage_family(src_pools[host])
+            src_pool = split_host(host)[1]
+            try:
+                dst_host = resolve_destination(
+                    family, src_pool, backend_map[att["volume_type"] or ""], dst_backends
+                )
+            except StorageError as exc:
+                raise PermanentStepError(f"volume {vid}: {exc}") from None
+            storage[vid] = {"family": family, "src_pool": src_pool, "dst_host": dst_host}
+        return storage
+
     def _unmanage(self, conn: Any, volume_id: str) -> None:
         volume = conn.block_storage.get_volume(volume_id)
         conn.block_storage.post(f"/volumes/{volume_id}/action", json={"os-unmanage": None})
@@ -203,14 +259,14 @@ class HandoverExecutor:
         self,
         conn: Any,
         host: str,
-        source_name: str,
+        ref: dict[str, str],
         name: str | None,
         volume_type: str | None,
         bootable: bool,
     ) -> str:
         body: dict[str, Any] = {
             "host": host,
-            "ref": {"source-name": source_name},
+            "ref": ref,
             "name": name,
             "bootable": bootable,
         }
@@ -274,6 +330,15 @@ class HandoverExecutor:
         backend_map = ctx.plan.handover.backend_map
         server_id = ctx.migration.vm.source_id
 
+        if not journal.data["order"]:
+            # step 0: every reference must resolve while the VM still runs (§7.3.1)
+            live = await self._call(
+                "read the source definition", lambda: self._capture_definition(src, server_id)
+            )
+            await asyncio.to_thread(
+                self._resolve_storage, src, dst, live["attachments"], backend_map
+            )
+
         if not journal.done("stop_source"):
 
             def stop() -> None:
@@ -293,15 +358,9 @@ class HandoverExecutor:
             definition = await self._call(
                 "record source definition", lambda: self._capture_definition(src, server_id)
             )
-            missing = sorted(
-                {
-                    a["volume_type"] or "<default>"
-                    for a in definition["attachments"]
-                    if (a["volume_type"] or "") not in backend_map
-                }
+            definition["storage"] = await asyncio.to_thread(
+                self._resolve_storage, src, dst, definition["attachments"], backend_map
             )
-            if missing:
-                raise PermanentStepError(f"no handover backend for volume type(s): {missing}")
             await asyncio.to_thread(_write_json, definition_path, definition)
             await asyncio.to_thread(journal.mark, "save_definition")
         definition = await asyncio.to_thread(_read_json, definition_path)
@@ -344,17 +403,27 @@ class HandoverExecutor:
             await self._call("delete the source server", delete_source)
             await asyncio.to_thread(journal.mark, "delete_source")
 
+        storage: dict[str, dict[str, Any]] = definition.get("storage") or {}
         dest_ids: dict[str, str] = {}
         for att in attachments:
             key = f"manage_dst:{att['volume_id']}"
             if not journal.done(key):
                 vtype = att["volume_type"] or ""
+                ref = storage.get(att["volume_id"])
+                if ref:
+                    host = ref["dst_host"]
+                    manage_ref = manage_reference(
+                        ref["family"], split_host(host)[1], f"volume-{att['volume_id']}"
+                    )
+                else:  # a definition journaled before §7.3.1: RBD
+                    host = backend_map[vtype]
+                    manage_ref = {"source-name": f"volume-{att['volume_id']}"}
                 dest_id = await self._call(
                     f"manage {att['volume_id']} in RHOSO",
-                    lambda a=att, t=vtype: self._manage(
+                    lambda a=att, t=vtype, h=host, r=manage_ref: self._manage(
                         dst,
-                        backend_map[t],
-                        f"volume-{a['volume_id']}",
+                        h,
+                        r,
                         a["name"],
                         mappings.volume_types.get(t, a["volume_type"]),
                         a["boot"],
@@ -444,10 +513,16 @@ class HandoverExecutor:
             if not journal.done(key):
                 managed = journal.get(f"manage_dst:{vid}")
                 source_name = f"volume-{managed['dest_id']}" if managed else f"volume-{vid}"
+                ref = (definition.get("storage") or {}).get(vid)
+                back = (
+                    manage_reference(ref["family"], ref["src_pool"], source_name)
+                    if ref
+                    else {"source-name": source_name}
+                )
                 new_id = await self._call(
                     f"manage {source_name} back at the source",
-                    lambda a=att, s=source_name: self._manage(
-                        src, a["host"], s, a["name"], a["volume_type"], a["boot"]
+                    lambda a=att, r=back: self._manage(
+                        src, a["host"], r, a["name"], a["volume_type"], a["boot"]
                     ),
                 )
                 await asyncio.to_thread(journal.mark, key, volume_id=new_id)
