@@ -13,6 +13,7 @@ from typing import Any, TypeVar
 from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
+from ..guest_os import identify
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
@@ -327,6 +328,24 @@ class OpenStackProvider:
         return None if server is None else str(_attr(server, "id"))
 
 
+def _os_hint(properties: Mapping[str, Any]) -> str | None:
+    """``os_distro`` + ``os_version`` of image properties, else their ``os_type``."""
+    distro = str(properties.get("os_distro") or "").strip()
+    version = str(properties.get("os_version") or "").strip()
+    if distro:
+        return f"{distro} {version}".strip()
+    return str(properties.get("os_type") or "").strip() or None
+
+
+def _best_os_type(*candidates: str | None) -> str | None:
+    """The most specific candidate: one that names a distribution, else the first one given."""
+    given = [c for c in candidates if c]
+    for candidate in given:
+        if identify(candidate).distro is not None:
+            return candidate
+    return given[0] if given else None
+
+
 class _MapContext:
     """Per-call caches used while mapping servers to :class:`VMRef`."""
 
@@ -334,6 +353,7 @@ class _MapContext:
         self.conn = conn
         self._projects: dict[str, str | None] = {}
         self._networks: dict[str, Any] = {}
+        self._images: dict[str, dict[str, Any]] = {}
         # filled by prefetch(): one listing each instead of a call per volume and per server.
         # None means "not prefetched" and the per-VM calls are used.
         self._volumes: dict[str, Any] | None = None
@@ -373,6 +393,19 @@ class _MapContext:
             project = _try(lambda: self.conn.identity.get_project(project_id), None)
             self._projects[project_id] = _attr(project, "name") if project is not None else None
         return self._projects[project_id]
+
+    def image_properties(self, image_id: str | None) -> dict[str, Any]:
+        """``os_distro``/``os_version``/``os_type`` of a Glance image (cached per call)."""
+        if not image_id:
+            return {}
+        if image_id not in self._images:
+            image = _try(lambda: self.conn.image.get_image(image_id), None)
+            self._images[image_id] = {
+                key: _attr(image, key)
+                for key in ("os_distro", "os_version", "os_type")
+                if image is not None and _attr(image, key)
+            }
+        return self._images[image_id]
 
     def network(self, network_id: str) -> Any:
         if network_id not in self._networks:
@@ -436,6 +469,7 @@ class _MapContext:
                 )
             )
         volume_disks: list[tuple[Disk, bool]] = []
+        boot_meta: dict[str, Any] = {}
         for attachment in conn.compute.volume_attachments(server):
             volume = self.volume(str(_attr(attachment, "volume_id")))
             device = _attr(attachment, "device")
@@ -452,6 +486,10 @@ class _MapContext:
                 pool=_attr(volume, "host"),
             )
             volume_disks.append((disk, _truthy(_attr(volume, "is_bootable", "bootable"))))
+            if disk.bootable or (
+                not boot_meta and _truthy(_attr(volume, "is_bootable", "bootable"))
+            ):
+                boot_meta = dict(_attr(volume, "volume_image_metadata", default={}) or {})
         if not image_booted and volume_disks and not any(d.bootable for d, _ in volume_disks):
             # Nova reports no root_device_name (or a device the attachment does not carry, e.g.
             # virtio-scsi /dev/sda): fall back to Cinder's bootable flag, lowest device first
@@ -481,6 +519,13 @@ class _MapContext:
         metadata = {
             str(k): str(v) for k, v in (_attr(server, "metadata", default={}) or {}).items()
         }
+        image_props = self.image_properties(_attr(image, "id")) if image_booted else {}
+        os_type = _best_os_type(
+            metadata.get("os_type"),
+            _os_hint(metadata),
+            _os_hint(boot_meta),
+            _os_hint(image_props),
+        )
         project_id = _attr(server, "project_id")
         return VMRef(
             source_id=str(_attr(server, "id")),
@@ -492,7 +537,7 @@ class _MapContext:
             disks=disks,
             nics=nics,
             power_state=_POWER.get(str(_attr(server, "status", default="")).upper(), "unknown"),  # type: ignore[arg-type]
-            os_type=metadata.get("os_type") or metadata.get("os_distro"),
+            os_type=os_type,
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,
             flavor_extra_specs={str(k): str(v) for k, v in extra_specs.items()},

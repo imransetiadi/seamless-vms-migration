@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import ssl
 import time
 from collections.abc import Callable, Iterable
@@ -24,6 +25,16 @@ GIB = 2**30
 _POWER = {"poweredOn": "running", "poweredOff": "stopped", "suspended": "paused"}
 
 Connector = Callable[..., Any]
+
+
+_PRETTY_NAME = re.compile(r"prettyName='([^']+)'")
+
+
+def _tools_os_name(guest: Any) -> str | None:
+    """The exact release VMware Tools report (``guestDetailedData`` prettyName), if any."""
+    detailed = str(getattr(guest, "guestDetailedData", "") or "")
+    match = _PRETTY_NAME.search(detailed)
+    return match.group(1).strip() or None if match else None
 
 
 def _import_pyvmomi() -> tuple[Any, Any, Any]:
@@ -173,7 +184,7 @@ def map_vm(
         disks=disks,
         nics=nics,
         power_state=_POWER.get(str(getattr(runtime, "powerState", "")), "unknown"),  # type: ignore[arg-type]
-        os_type=getattr(config, "guestId", None),
+        os_type=_tools_os_name(guest) or getattr(config, "guestId", None),
         host=str(host) if host else None,
         tags=tags,
         flavor_extra_specs=extra_specs,

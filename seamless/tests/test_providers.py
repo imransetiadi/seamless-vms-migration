@@ -763,6 +763,67 @@ class PoweredOffVM(VirtualMachine):
         return task
 
 
+async def test_vmware_os_type_prefers_the_tools_pretty_name(tmp_path):
+    """SDD §10: VMware Tools report the exact release; the guest id only names the family."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u\n")
+    (secret_dir / "password").write_text("p\n")
+    with_tools = fake_vcenter_vm()
+    with_tools.config.guestId = "ubuntu64Guest"
+    with_tools.guest.guestDetailedData = (
+        "architecture='X86' bitness='64' distroName='Ubuntu' distroVersion='22.04' "
+        "familyName='Linux' kernelVersion='5.15.0-105-generic' prettyName='Ubuntu 22.04.4 LTS'"
+    )
+    without = fake_vcenter_vm()
+    without.name = "dc2-db-02"
+    without._moId = "vm-102"
+    without.config.instanceUuid = "5012-ef01"
+    without.config.guestId = "ubuntu64Guest"
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint="https://vcenter.dc2.example/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda *a, **kw: fake_service_instance([with_tools, without]),
+        vim=FAKE_VIM,
+    )
+    first, second = await provider.list_vms()
+    assert first.os_type == "Ubuntu 22.04.4 LTS" and first.guest_os.label == "Ubuntu 22.04"
+    assert second.os_type == "ubuntu64Guest" and second.guest_os.label == "Ubuntu"
+
+
+async def test_openstack_os_type_from_volume_or_image_properties(stub_openstack):
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.metadata = {"os_type": "linux", "app": "shop"}  # generic: the image is more specific
+    conn.block_storage.get_volume("vol-root").volume_image_metadata = {
+        "os_distro": "ubuntu",
+        "os_version": "22.04",
+        "hw_firmware_type": "uefi",
+    }
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.os_type == "ubuntu 22.04" and vm.guest_os.lifecycle == "current"
+
+    # an image-booted server: the Glance image's properties
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.metadata = {}
+    server.image = {"id": "img-1"}
+    server.attachments = []
+    conn.image = NS(
+        get_image=lambda image_id: NS(id=image_id, os_distro="windows", os_version="2022")
+    )
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.os_type == "windows 2022" and vm.guest_os.label == "Windows Server 2022"
+
+
 async def test_vmware_power_on_and_inventory(tmp_path):
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"
     secret_dir.mkdir(parents=True)
