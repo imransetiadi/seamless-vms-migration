@@ -300,6 +300,28 @@ def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
     return sorted(vm_id for vm_id, count in Counter(vm_ids).items() if count > 1)
 
 
+def invalid_plan_settings(spec: PlanSpec) -> list[str]:
+    """Settings that would fail every verification or never open the cutover gate (SDD §12).
+
+    Checked on create/patch and at validation; the model itself stays permissive so that plans
+    stored before the check keep loading.
+    """
+    problems: list[str] = []
+    verification = spec.verification
+    for name in ("tcp_ports", "windows_tcp_ports"):
+        bad = [port for port in getattr(verification, name) if not 1 <= port <= 65535]
+        if bad:
+            problems.append(f"verification.{name} {bad} outside 1-65535")
+    if verification.timeout_s < 0:  # 0 checks once without polling
+        problems.append(
+            f"verification.timeout_s must not be negative (got {verification.timeout_s})"
+        )
+    window = spec.cutover_window
+    if window is not None and window.end <= window.start:
+        problems.append("cutover_window: end must be after start")
+    return problems
+
+
 #: Fields a client may send in ``PlanCreate`` / ``PATCH /plans/{id}``.
 PLAN_EDITABLE_FIELDS = frozenset(PlanSpec.model_fields)
 

@@ -52,6 +52,7 @@ from .domain.models import (
     ValidationItem,
     ValidationReport,
     VMRef,
+    invalid_plan_settings,
     repeated_vm_ids,
     utcnow,
 )
@@ -346,6 +347,11 @@ class Orchestrator:
         if repeated:
             # SDD §5.4: two migrations of one VM would both cut it over
             raise BadRequest(f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}")
+        problems = invalid_plan_settings(plan)
+        if problems:
+            # SDD §12: a port outside 1-65535 fails every verification, a backwards window never
+            # opens the gate
+            raise BadRequest("; ".join(problems))
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
         src_impl = self.providers.get(source)

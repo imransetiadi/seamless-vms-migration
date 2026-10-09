@@ -213,6 +213,20 @@ async def test_validate_refuses_repeated_vm_ids(tmp_path, store):
     assert await h.migrations(plan.id) == []
 
 
+async def test_validate_refuses_invalid_verification_settings(tmp_path, store):
+    """A stored plan with a port outside 1-65535 (written before the API check, or by `plan
+    apply`) is refused at validation rather than failing every verification (SDD §12)."""
+    from seamless_migrate.domain.models import Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    current = store.get("plan", plan.id, Plan)
+    current.verification.tcp_ports = [22, 70000]
+    store.put("plan", current)
+    with pytest.raises(BadRequest, match="70000"):
+        await h.orch.validate_plan(plan.id, "alice")
+    assert await h.migrations(plan.id) == []
+
+
 async def test_concurrent_validations_do_not_duplicate_migrations(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1), vm(2), vm(3)])
     reports = await asyncio.gather(

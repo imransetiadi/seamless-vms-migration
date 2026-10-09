@@ -192,6 +192,16 @@ def windows_ctx(tcp_ports=(), windows_tcp_ports=(), timeout_s=0):
     )
 
 
+async def test_tcp_probe_counts_an_unusable_port_as_closed():
+    """A port asyncio refuses (above 65535, negative) is a closed port, never an exception that
+    would fail the verification step and roll back a good cutover (SDD §7.5)."""
+    from seamless_migrate.verification import _tcp_probe
+
+    for port in (70000, -1):
+        ok, detail = await _tcp_probe("127.0.0.1", port)
+        assert ok is False and str(port) in detail
+
+
 async def test_verification_windows_guest_skips_console_and_probes_windows_ports(listener):
     """SDD §7.5: Windows writes nothing to the serial console; RDP/WinRM ports replace SSH."""
     closed = unused_port()

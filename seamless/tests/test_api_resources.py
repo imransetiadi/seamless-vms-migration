@@ -114,6 +114,38 @@ def test_plan_rejects_duplicate_vm_ids(api):
     assert vm_ids[1] in patched.json()["error"]["message"]
 
 
+def test_plan_rejects_out_of_range_tcp_port(api):
+    """SDD §12: verification settings that would roll back a good cutover or never open the gate
+    are a 422 on create and on edit."""
+    vm_ids = first_clean_vms(api, n=1)
+    base = {
+        "name": "bad settings",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    bad = [
+        ({"verification": {"tcp_ports": [22, 70000]}}, "70000"),
+        ({"verification": {"windows_tcp_ports": [0]}}, "windows_tcp_ports"),
+        ({"verification": {"timeout_s": -1}}, "timeout_s"),
+    ]
+    for extra, needle in bad:
+        refused = api.post("/api/v1/plans", Role.operator, json={**base, **extra})
+        assert refused.status_code == 422, (extra, refused.text)
+        assert needle in refused.json()["error"]["message"]
+    window = {"start": "2026-10-10T22:00:00Z", "end": "2026-10-10T20:00:00Z"}
+    backwards = api.post("/api/v1/plans", Role.approver, json={**base, "cutover_window": window})
+    assert backwards.status_code == 422 and "cutover_window" in backwards.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.operator, json=base)
+    assert created.status_code == 201, created.text
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"verification": {"tcp_ports": [65536]}},
+    )
+    assert patched.status_code == 422 and "65536" in patched.json()["error"]["message"]
+
+
 def test_plan_create_validate_start_flow(api):
     vm_ids = first_clean_vms(api)
     body = {

@@ -15,6 +15,7 @@ from ..domain.models import (
     PlanSpec,
     Provider,
     ValidationReport,
+    invalid_plan_settings,
     repeated_vm_ids,
 )
 from ..events import emit
@@ -45,6 +46,12 @@ def _check_vm_ids(spec: PlanCreate) -> None:
         raise ApiError(
             422, "validation_error", f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}"
         )
+
+
+def _check_plan_settings(spec: PlanCreate) -> None:
+    problems = invalid_plan_settings(spec)
+    if problems:
+        raise ApiError(422, "validation_error", "; ".join(problems))
 
 
 def _check_estimator_overrides(spec: PlanCreate) -> None:
@@ -105,6 +112,7 @@ async def create_plan(
     svc = services(request)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
     _check_vm_ids(body)
+    _check_plan_settings(body)
     _check_estimator_overrides(body)
     await _check_providers(request, body)
     plan = Plan(**body.model_dump())
@@ -150,6 +158,7 @@ async def update_plan(
     except ValidationError as exc:
         raise ApiError(422, "validation_error", _summarize(exc)) from None
     _check_vm_ids(merged)
+    _check_plan_settings(merged)
     _check_estimator_overrides(merged)
     await _check_providers(request, merged)
     updated = Plan.model_validate(

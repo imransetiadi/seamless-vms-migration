@@ -59,7 +59,8 @@ async def _tcp_probe(host: str, port: int) -> tuple[bool, str]:
     started = time.monotonic()
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), TCP_TIMEOUT_S)
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, ValueError, OverflowError) as exc:
+        # a port asyncio refuses (above 65535, negative) is closed, never an error (SDD §7.5)
         return False, f"{host}:{port} unreachable ({type(exc).__name__})"
     writer.close()
     try:
