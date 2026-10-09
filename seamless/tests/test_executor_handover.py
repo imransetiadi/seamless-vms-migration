@@ -764,6 +764,31 @@ async def test_handover_fails_when_rhoso_refuses_the_boot_properties(tmp_path):
     assert all(op != "create_server" for _, op, _ in ops(calls)), "no server without its UEFI"
 
 
+async def test_handover_readiness_reports_references_without_changing_anything(tmp_path):
+    """The read-only report the lab runs first (and step 0 uses): per volume its family, pools and
+    the exact manage reference, plus every problem — no call that changes a cloud."""
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert calls == []
+    assert report["problems"] == []
+    by_id = {v["volume_id"]: v for v in report["volumes"]}
+    assert by_id["vol-root"] == {
+        "volume_id": "vol-root",
+        "volume_type": "ceph-ssd",
+        "family": "netapp_nfs",
+        "source_pool": NFS_SRC,
+        "destination_host": NFS_DST,
+        "reference": {"source-name": "10.20.0.5:/cinder_vol/volume-vol-root"},
+        "delete_on_termination": True,
+    }
+    clouds["src"].volumes["vol-data"].snapshots = 1
+    clouds["dst"].pools = [("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS)]
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert any("no pool for the export" in p for p in report["problems"])
+    assert any("1 snapshot" in p for p in report["problems"])
+    assert calls == []
+
+
 def test_existing_server_and_write_json_helpers(tmp_path):
     from seamless_migrate.executors.handover import _existing_server, _write_json
 

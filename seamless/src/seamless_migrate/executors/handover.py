@@ -290,6 +290,79 @@ class HandoverExecutor:
             storage[vid] = {"family": family, "src_pool": src_pool, "dst_host": dst_host}
         return storage
 
+    def _readiness(
+        self, src: Any, dst: Any, server_id: str, backend_map: dict[str, str]
+    ) -> dict[str, Any]:
+        """Step 0 as a read-only report: what each volume would become, and every problem."""
+        attachments = self._capture_definition(src, server_id)["attachments"]
+        problems: list[str] = []
+        missing = sorted(
+            {
+                a["volume_type"] or "<default>"
+                for a in attachments
+                if (a["volume_type"] or "") not in backend_map
+            }
+        )
+        if missing:
+            problems.append(f"no handover backend for volume type(s): {missing}")
+        src_pools: dict[str, dict[str, Any]] | None = None
+        dst_backends: list[dict[str, Any]] = []
+        try:
+            src_pools = self._pools(src, "source")
+            dst_backends = [
+                {"pool": name, "family": storage_family(caps)}
+                for name, caps in self._pools(dst, "destination").items()
+            ]
+        except PermanentStepError as exc:
+            problems.append(str(exc))
+        volumes: list[dict[str, Any]] = []
+        for att in attachments:
+            vid, host = att["volume_id"], att.get("host")
+            entry: dict[str, Any] = {
+                "volume_id": vid,
+                "volume_type": att["volume_type"],
+                "family": None,
+                "source_pool": host,
+                "destination_host": None,
+                "reference": None,
+                "delete_on_termination": att.get("delete_on_termination"),
+            }
+            target = backend_map.get(att["volume_type"] or "")
+            if src_pools is not None and target:
+                if not host or host not in src_pools:
+                    problems.append(
+                        f"volume {vid}: Cinder pool {host!r} is not listed by the source"
+                    )
+                else:
+                    family = storage_family(src_pools[host])
+                    entry["family"] = family
+                    try:
+                        dst_host = resolve_destination(
+                            family, split_host(host)[1], target, dst_backends
+                        )
+                        entry["destination_host"] = dst_host
+                        entry["reference"] = manage_reference(
+                            family, split_host(dst_host)[1], f"volume-{vid}"
+                        )
+                    except StorageError as exc:
+                        problems.append(f"volume {vid}: {exc}")
+            volumes.append(entry)
+        problems.extend(self._unmanage_blockers(src, attachments))
+        return {"server_id": server_id, "volumes": volumes, "problems": problems}
+
+    async def readiness(
+        self, source: Provider, destination: Provider, server_id: str, backend_map: dict[str, str]
+    ) -> dict[str, Any]:
+        """Read-only handover check of one server (SDD §7.3 step 0): per volume its driver
+        family, source pool, destination host and manage reference, and every problem that would
+        refuse the handover. Changes nothing; the lab runs it before a real cutover."""
+        src = await self._conn(source)
+        dst = await self._conn(destination)
+        return await self._call(
+            "check the handover readiness",
+            lambda: self._readiness(src, dst, server_id, backend_map),
+        )
+
     @staticmethod
     def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
         """What would make step 3 or 5 fail, found while the VM still runs (§7.3 step 0).
@@ -449,18 +522,11 @@ class HandoverExecutor:
 
         if not journal.data["order"]:
             # step 0: everything that can be checked while the VM still runs (§7.3, §7.3.1)
-            live = await self._call(
-                "read the source definition", lambda: self._capture_definition(src, server_id)
-            )
-            await asyncio.to_thread(
-                self._resolve_storage, src, dst, live["attachments"], backend_map
-            )
-            blockers = await self._call(
-                "check that Cinder can unmanage the volumes",
-                lambda: self._unmanage_blockers(src, live["attachments"]),
-            )
-            if blockers:
-                raise PermanentStepError("storage handover refused: " + "; ".join(blockers))
+            report = await self.readiness(ctx.source, ctx.destination, server_id, backend_map)
+            if report["problems"]:
+                raise PermanentStepError(
+                    "storage handover refused: " + "; ".join(report["problems"])
+                )
 
         if not journal.done("stop_source"):
 

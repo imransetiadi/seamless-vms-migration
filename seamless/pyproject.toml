@@ -57,6 +57,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
   "live: talks to real external services (Jev, agentmemory); skipped unless enabled",
+  "lab: runs against the reference lab clouds (QASuite §7); skipped unless SEAMLESS_LAB_* is set",
 ]
 
 [tool.ruff]
