@@ -72,7 +72,7 @@ Principles:
 | Unit — control plane | models, FSM, estimator, selector, preflight, waves, providers (stubbed SDKs), AI, executors (fake `ansible-playbook`), orchestrator, API, CLI | `pytest`, `pytest-asyncio` (`asyncio_mode = "auto"`), `httpx.MockTransport`, FastAPI `TestClient` | every change |
 | Unit — dashboard | formatters, phase metadata, SSE parser, API client, pages/components with mock data, WCAG contrast | Vitest + Testing Library (jsdom) | every change |
 | Integration | store on PostgreSQL 16; control plane + PostgreSQL; live Jev and agentmemory; deploy artifacts | `pytest` with `SEAMLESS_TEST_PG_URL`, `-m live`; `docker compose config`, schema validation | nightly + before merge to the integration branch |
-| E2E demo | the five journeys against the Compose stack in demo mode; UI smoke | `tests/e2e/smoke-demo.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs` | weekly + per release |
+| E2E demo | the five journeys against the Compose stack in demo mode; UI smoke | `tests/e2e/smoke-demo.sh`, `demo-journey.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs` | weekly + per release |
 | Lab | real clouds (§7), data integrity (§8), performance (§9), resilience (§11) | `ansible-playbook`, `openstack`, `fio`, `iperf3`, `k6` | per release candidate |
 | Security | secrets, dependencies, images, manifests, API, AI-safety cases (§10) | `gitleaks`, `pip-audit`, `npm audit`, `trivy`, ZAP, scripts | nightly (scans), per release (manual cases) |
 
@@ -143,7 +143,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 | FR-14 | Post-cutover verification; failure triggers rollback when enabled | `test_verification_checks`, `test_verification_console_unavailable_skips_with_warning`, `test_failed_cutover_auto_rolls_back`, `test_verification_contradiction_sets_review_never_flips_pass`, `test_verification_blocked_console_sets_review_required` | AC-4 |
 | FR-15 | Rollback until finalize; finalize needs approver and typed confirmation; source never deleted earlier | `test_failed_to_cancelled_requires_no_downtime`, `test_retry_increments_attempts`, `test_failed_cutover_auto_rolls_back`, `test_rollback_request_during_step_is_serialized`, `test_retry_after_failure`, `test_finalize_requires_confirm_name`, `test_finalize_confirm_mismatch_400`, `test_handover_rollback_reverses_order`; Finalize UI test | AC-1, AC-4, LAB-R01…R03 |
 | FR-16 | Resume after control-plane restart | `test_resume_mid_cutover_is_idempotent`, `test_handover_journal_resume_skips_done_steps`, `test_snapshot_create_is_idempotent_per_transfer_uuid` | R-01 |
-| FR-17 | REST + resumable SSE | `test_error_envelope_shape`, `test_events_since`, `test_sse_stream_resume_and_heartbeat`, `test_stats_shape`, `test_events_since_and_filters`, `test_ephemeral_events_not_persisted`, `test_subscribe_replays_since_then_live`; `stream.test.ts`, `client.test.ts` | R-11, `demo-journey.sh` |
+| FR-17 | REST + resumable SSE | `test_error_envelope_shape`, `test_events_since`, `test_sse_stream_resume_and_heartbeat`, `test_stats_shape`, `test_events_since_and_filters`, `test_ephemeral_events_not_persisted`, `test_subscribe_replays_since_then_live`; `stream.test.ts`, `client.test.ts` | R-11, `tests/e2e/demo-journey.sh` |
 | FR-18 | Dashboard routes, WCAG 2.2 AA | `format.test.ts`, `phase.test.ts`, `stream.test.ts`, `client.test.ts`, page/component tests, `contrast.test.ts`, `test_spa_fallback_serves_index` | §12 manual accessibility checklist |
 | FR-19 | RBAC and audit | `test_role_matrix`, `test_unauthenticated_401_and_audit_event`, `test_auth_disabled_only_on_loopback`, `test_token_create_prints_token_and_yaml_hash`, `test_serve_refuses_auth_disabled_on_public_bind` | S-01, S-02, `rbac-live.sh` |
 | FR-20 | Jev advisor, bounded, works with Jev off | `test_decide_parses_fixture`, `test_circuit_breaker_opens_after_three_failures`, `test_stdio_env_whitelist`, `test_recommend_applies_only_within_tie_set_and_threshold`, `test_recommend_ignores_escape_hatch_and_escalate`, `test_recommend_never_returns_ineligible`, `test_classify_review_items_fall_back_to_heuristic`, `test_advisor_tie_break_recorded`, live `test_live_jev_decide` | AC-5, R-03, S-14, S-15 |
@@ -1026,109 +1026,19 @@ decision when it validates its plan — the smoke plan of an earlier run, or a n
 VM, one migration across plans, SDD §5.4; the demo leaves `report-01` and `batch-01` unplanned for it and for a
 plan of your own) — so it can run again on the same stack without adding a plan (exit code = failed checks);
 [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
-is the RBAC matrix below (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
+is the RBAC matrix — every route × role of SDD §12 and Security.md §5.2, the plan policy fields included (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
 runs DEMO-04 and DEMO-06; [`tests/e2e/browser-demo.mjs`](../tests/e2e/browser-demo.mjs) (`TOKEN_FILE=…`) opens
 the dashboard in headless Chromium through the control plane — real security headers, CSP and API — signs
 in, visits every page, the first plan and its first migration, and fails on any console error, CSP
 violation, failed asset request, missing chart or theme token (it needs the dashboard's Playwright:
-`npm --prefix dashboard ci && npx --prefix dashboard playwright install chromium`). The journey script
-below remains proposed.
+`npm --prefix dashboard ci && npx --prefix dashboard playwright install chromium`).
+[`tests/e2e/demo-journey.sh`](../tests/e2e/demo-journey.sh) is the AC-1 journey: it waits for a warm or VMware
+warm migration that waits for its cutover (the VMware plan's wait for an approver), cuts it over with
+`force_window`, asserts `completed` — with downtime and a final pass — or `rolled_back` (the demo's injected
+failures), and prints the migration's audit trail. Run it on a fresh demo (`make seamless-reset CONFIRM=yes &&
+make seamless-demo`): the seeded plans finish within minutes, after which no migration waits for a cutover.
 
-The committed scripts pass `shellcheck`; the journey below is the reference transcript the smoke script follows.
-
-```bash
-#!/usr/bin/env bash
-# demo-journey.sh - AC-1 shape in demo mode: wait for a warm migration, cut over, assert the outcome
-set -euo pipefail
-BASE=${BASE:-http://127.0.0.1:8080/api/v1}
-: "${TOKEN:?export TOKEN=<admin or approver token>}"
-api() { curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$@"; }
-
-echo "== health";   curl -fsS "$BASE/health" | jq -e '.status == "ok" and .db == "ok" and .demo == true'
-echo "== identity"; api "$BASE/me" | jq -e '.role == "admin" or .role == "approver"'
-echo "== plans";    api "$BASE/plans" | jq -e 'length >= 2'
-
-MID=""
-for _ in $(seq 1 180); do                       # the demo runs at SEAMLESS_DEMO_SPEED, so poll
-  MID=$(api "$BASE/migrations?phase=awaiting_cutover" | jq -r '[.[] | select(.strategy == "warm")][0].id // empty')
-  [ -n "$MID" ] && break
-  sleep 5
-done
-[ -n "$MID" ] || { echo "no warm migration reached awaiting_cutover"; exit 1; }
-
-echo "== cutover $MID"
-api -X POST "$BASE/migrations/$MID/cutover" -d '{"force_window": true, "comment": "qa demo journey"}' \
-  | jq -e '.cutover_requested == true and (.approvals | length) >= 1'
-
-PHASE=""
-for _ in $(seq 1 120); do
-  PHASE=$(api "$BASE/migrations/$MID" | jq -r .phase)
-  case "$PHASE" in completed|rolled_back|failed) break ;; esac
-  sleep 5
-done
-api "$BASE/migrations/$MID" | jq '{phase, actual_downtime_s, passes: (.sync_passes | length), approvals: (.approvals | length)}'
-
-# the demo injects failures (SEAMLESS_DEMO_FAILURE_RATE, default 0.1): completed and rolled_back are both valid
-[ "$PHASE" = completed ] || [ "$PHASE" = rolled_back ] || { echo "unexpected terminal phase: $PHASE"; exit 1; }
-if [ "$PHASE" = completed ]; then
-  api "$BASE/migrations/$MID" | jq -e '.actual_downtime_s != null and .actual_downtime_s > 0 and (.sync_passes | map(.kind) | index("final")) != null'
-fi
-echo "== audit trail"
-api "$BASE/events?migration_id=$MID&limit=1000" | jq -r '.[].kind' | sort | uniq -c
-```
-
-```bash
-#!/usr/bin/env bash
-# rbac-live.sh - live RBAC matrix check against SDD 12 / Security.md 5.2 (bash 3.2 compatible)
-# usage: VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh
-set -u
-BASE=${BASE:-http://127.0.0.1:8080/api/v1}
-: "${VIEWER:?}" "${OPERATOR:?}" "${APPROVER:?}" "${ADMIN:?}"
-rank()  { case "$1" in viewer) echo 1 ;; operator) echo 2 ;; approver) echo 3 ;; admin) echo 4 ;; esac; }
-token() { case "$1" in viewer) echo "$VIEWER" ;; operator) echo "$OPERATOR" ;; approver) echo "$APPROVER" ;; admin) echo "$ADMIN" ;; esac; }
-fail=0
-check() { # METHOD PATH MIN_ROLE
-  local code want role
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d '{}' -H 'Content-Type: application/json' "$BASE$2")
-  [ "$code" = 401 ] || { echo "FAIL no token  $1 $2 -> $code (want 401)"; fail=1; }
-  for role in viewer operator approver admin; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d '{}' -H 'Content-Type: application/json' \
-           -H "Authorization: Bearer $(token "$role")" "$BASE$2")
-    if [ "$(rank "$role")" -lt "$(rank "$3")" ]; then want="403"; else want="not 401/403"; fi
-    if [ "$want" = 403 ] && [ "$code" != 403 ]; then echo "FAIL $role $1 $2 -> $code (want 403)"; fail=1; fi
-    if [ "$want" != 403 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then echo "FAIL $role $1 $2 -> $code (want allowed)"; fail=1; fi
-  done
-}
-check GET  /me viewer;                         check GET  /providers viewer
-check POST /providers admin;                   check DELETE /providers/nope admin
-check POST /providers/nope/check operator;     check GET  /plans viewer
-check POST /plans operator;                    check PATCH /plans/nope operator
-check POST /plans/nope/validate operator;      check POST /plans/nope/start operator
-check POST /plans/nope/pause operator;         check POST /plans/nope/waves/auto operator
-check GET  /migrations viewer;                 check POST /migrations/nope/approve approver
-check POST /migrations/nope/cutover approver;  check POST /migrations/nope/sync operator
-check POST /migrations/nope/rollback operator; check POST /migrations/nope/retry operator
-check POST /migrations/nope/cancel operator;   check POST /migrations/nope/finalize approver
-check PUT  /migrations/nope/strategy operator; check GET  /events viewer
-check GET  /stats viewer;                      check GET  /advisor/status viewer
-check POST /advisor/similar-incidents operator
-
-# plan policy fields (require_approval, auto_cutover, cutover_window) need approver, also on POST /plans (SDD 12);
-# the 403 for an operator must win over any 400/404/422 of the same request
-policy() { # METHOD PATH JSON-BODY
-  local code
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $OPERATOR" "$BASE$2")
-  [ "$code" = 403 ] || { echo "FAIL operator $1 $2 $3 -> $code (want 403)"; fail=1; }
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X "$1" -d "$3" -H 'Content-Type: application/json' \
-         -H "Authorization: Bearer $APPROVER" "$BASE$2")
-  if [ "$code" = 401 ] || [ "$code" = 403 ]; then echo "FAIL approver $1 $2 $3 -> $code (want allowed)"; fail=1; fi
-}
-policy POST  /plans      '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
-policy PATCH /plans/nope '{"require_approval":false}'
-policy PATCH /plans/nope '{"cutover_window":{"start":"2030-01-01T01:00:00Z","end":"2030-01-01T05:00:00Z"}}'
-if [ "$fail" = 0 ]; then echo "RBAC matrix OK"; else echo "RBAC matrix FAILED"; exit 1; fi
-```
+The committed scripts pass `shellcheck`.
 
 ### 14.8 Performance
 
@@ -1173,7 +1083,7 @@ VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh        # S-01 o
 | 2 Unit | §14.2, §14.3 (SQLite), §14.4 | green |
 | 3 Integration | §14.3 with PostgreSQL, coverage gate, live tests | green, ≥ 85 % |
 | 4 Image | build, S-19, S-20 | no unaccepted High/Critical |
-| 5 Demo E2E | §14.6, `smoke-demo.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs`, DEMO-01…06, UI manual checklist | pass |
+| 5 Demo E2E | §14.6, `smoke-demo.sh`, `demo-journey.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs`, DEMO-01…06, UI manual checklist | pass |
 | 6 Lab | §7 matrix, §8 integrity, §9 performance | exit criteria §13.2 |
 | 7 Security and resilience | S-03…S-16, S-21…S-25, R-01…R-13 | no S1/S2 |
 | 8 Sign-off | report (§13.5), Security.md §12 checklist, docs reconciled | release |
