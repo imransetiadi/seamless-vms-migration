@@ -440,7 +440,7 @@ SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused 
 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
         seamless-up seamless-demo seamless-down seamless-ps seamless-logs seamless-reset \
-        seamless-test seamless-check dashboard-build lab-handover
+        seamless-test seamless-check dashboard-build lab-handover deploy-runtime-check
 
 seamless-help:
 	@echo "Seamless Migrate stack (engine '$(SEAMLESS_ENGINE)'; Docker: Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
@@ -457,6 +457,7 @@ seamless-help:
 	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
 	@echo "  seamless-check      - every CI check that runs locally: tests, ruff, collection tests, scans, dashboard"
+	@echo "  deploy-runtime-check - run PostgreSQL (and the control-plane image, when built) the way the cluster manifests do: read-only, arbitrary UID"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
 # starts by default (--activate, default true), which would switch the developer's current Docker context:
@@ -525,6 +526,15 @@ seamless-reset: seamless-check-context
 lab-handover:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,openstack]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -m lab tests/lab/test_lab_storage_handover.py -v -s -rs
+
+# The manifests' security context at runtime (QASuite §14.5): static scans cannot see what an image writes
+# when it starts. PostgreSQL always; the control plane when its image exists locally (make seamless-demo builds it).
+SEAMLESS_CP_IMAGE ?= seamless-migrate:0.1.0
+deploy-runtime-check: seamless-check-context
+	@[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
+	DOCKER="$(SEAMLESS_DOCKER)" PYTHON=seamless/.venv/bin/python \
+	  CP_IMAGE="$$($(SEAMLESS_DOCKER) image inspect $(SEAMLESS_CP_IMAGE) >/dev/null 2>&1 && echo $(SEAMLESS_CP_IMAGE))" \
+	  scripts/check-readonly-runtime.sh
 
 # Control-plane tests (SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is exported).
 seamless-test:

@@ -215,6 +215,15 @@ jobs:
             echo "OpenShift networks are left in the egress policies"; exit 1
           fi
           grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
+      # static checks cannot see what an image writes when it starts: the PostgreSQL StatefulSet passed them
+      # and still exited 1 under readOnlyRootFilesystem (QASuite §14.5)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: PostgreSQL under the manifests' security context (read-only root, OpenShift and overlay UIDs)
+        run: |
+          python -m pip install pyyaml
+          PYTHON=python scripts/check-readonly-runtime.sh
 
   image:
     name: container image (build, trivy, SBOM)
@@ -242,6 +251,13 @@ jobs:
           curl -fsS http://127.0.0.1:18080/api/v1/health | grep -q '"db":"ok"'
           docker logs smoke | tail -20
           docker rm -f smoke
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: The image under the Deployment's security context (read-only root, OpenShift and overlay UIDs)
+        run: |
+          python -m pip install pyyaml
+          SKIP_POSTGRES=1 CP_IMAGE=seamless-migrate:ci PYTHON=python scripts/check-readonly-runtime.sh
       - name: trivy image — fixable HIGH/CRITICAL must be zero (S-19)
         uses: aquasecurity/trivy-action@v0.36.0
         with:

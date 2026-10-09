@@ -670,7 +670,7 @@ npx @axe-core/cli http://127.0.0.1:8080/ --exit
 | S-18 dependency audit | `pip-audit` in `seamless/.venv`: no known vulnerabilities; `npm audit --omit=dev`: 0 after `react-router-dom` 7.18.4; dev toolchain moved to vite 8.3.3 / vitest 5.0.3; the last dev-only findings (`braces`, `postcss-selector-parser` through tailwindcss 3) went away with the Tailwind 4.3.3 migration: `npm audit` 0 vulnerabilities, Security.md R-09 closed |
 | S-19 image scan and SBOM | `seamless-migrate:0.1.0` rebuilt with `dnf update`, setuptools/urllib3/msgpack upgraded and pip removed from the runtime layer: `trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1` → **0** (was 94 OS + 6 Python fixable); 323 HIGH remain **without a vendor fix** in the UBI 9.8 layer (accepted until Red Hat ships errata; re-scan nightly); CycloneDX 1.6 SBOM with 575 components generated (`trivy image --format cyclonedx`) |
 | CI (`.github/workflows/ci.yml`, run 37773623509 on `cc192cb`) | every job green on GitHub-hosted runners: control plane on Python 3.11 and 3.13 against SQLite and a PostgreSQL 16 service with the 85 % coverage gate, ruff and pip-audit; collection warm-path tests, playbook syntax checks and ansible-lint; dashboard typecheck/lint/tests/build and `npm audit --omit=dev --audit-level=high`; gitleaks and `trivy config`; container image build, API smoke, `trivy image --ignore-unfixed --exit-code 1` and CycloneDX SBOM (main, nightly 02:17 UTC, manual) |
-| S-20 configuration scan | `trivy config deploy/ --severity HIGH,CRITICAL --exit-code 1` → 0 after moving the credential-file paths from the ConfigMap to Deployment env values (AVD-KSV-0109) and running PostgreSQL with `readOnlyRootFilesystem` plus emptyDir scratch mounts (AVD-KSV-0014) — a static scan cannot see that the image writes its HOME at start, so since 2026-10-09 `/var/lib/pgsql` is an emptyDir too, checked at runtime by the §14.5 PostgreSQL run for both UIDs; Compose: only `seamless` publishes, on `127.0.0.1:8080` |
+| S-20 configuration scan | `trivy config deploy/ --severity HIGH,CRITICAL --exit-code 1` → 0 after moving the credential-file paths from the ConfigMap to Deployment env values (AVD-KSV-0109) and running PostgreSQL with `readOnlyRootFilesystem` plus emptyDir scratch mounts (AVD-KSV-0014) — a static scan cannot see that the image writes its HOME at start, so since 2026-10-09 `/var/lib/pgsql` is an emptyDir too, checked at runtime by `scripts/check-readonly-runtime.sh` (§14.5, CI) for both UIDs; Compose: only `seamless` publishes, on `127.0.0.1:8080` |
 | Lab (E3), PERF-E2E, D-01…D-10 on real storage | not run: no RHOSP/RHOSO lab in this environment; Performance.md §6.3 stays open |
 
 §13.2 status after this run: items 1, 2, 3 and 7 are met on the developer host (item 7 with the R-09 waiver and the
@@ -965,28 +965,26 @@ trivy config deploy/                                           # misconfiguratio
 
 (`route.yaml` is an OpenShift API object with no upstream schema; it is covered by the structure checks only.)
 
-PostgreSQL under the cluster security context — the scans above cannot see what the image writes at start.
-Run the pinned image (the digest in `deploy/kubernetes/kustomization.yaml`) read-only with the StatefulSet's
-mounts, once with an arbitrary UID (OpenShift's restricted SCC) and once with UID 26 (the Kubernetes overlay):
+The manifests' security context at runtime — the scans above cannot see what an image writes when it
+starts. `scripts/check-readonly-runtime.sh` runs the images the way the manifests do: read-only root, all
+capabilities dropped, no new privileges, the manifests' own writable mounts (emptyDir → tmpfs, PVC → a scratch
+volume, Secrets left out), once as OpenShift's arbitrary UID (1000680000:0) and once as the Kubernetes overlay's
+(26 for PostgreSQL, 1001 for the control plane). CI runs the PostgreSQL part in the `manifests` job and the
+control-plane part in the `image` job; locally:
 
 ```bash
-IMG=quay.io/sclorg/postgresql-16-c9s@sha256:beaf7f16890b05aac31197a9e0bbba0697cb93da34a60a47ad8134bb2c9d6911
-export POSTGRESQL_USER=check POSTGRESQL_DATABASE=check POSTGRESQL_PASSWORD="$(openssl rand -hex 16)"
-for U in 1000680000:0 26:26; do
-  docker --context colima-seamless volume create pgro >/dev/null
-  docker --context colima-seamless run -d --name pgro --read-only --user "$U" --cap-drop ALL \
-    --security-opt no-new-privileges -e POSTGRESQL_USER -e POSTGRESQL_DATABASE -e POSTGRESQL_PASSWORD \
-    --tmpfs /var/lib/pgsql:mode=1777 -v pgro:/var/lib/pgsql/data \
-    --tmpfs /var/run/postgresql:mode=1777 --tmpfs /tmp:mode=1777 "$IMG" >/dev/null
-  sleep 25; docker --context colima-seamless exec pgro /usr/libexec/check-container && echo "$U: ready"
-  docker --context colima-seamless rm -f pgro >/dev/null; docker --context colima-seamless volume rm pgro >/dev/null
-done
+make deploy-runtime-check    # DOCKER="docker --context colima-seamless" PYTHON=seamless/.venv/bin/python
+                             # CP_IMAGE=seamless-migrate:0.1.0 (when built) scripts/check-readonly-runtime.sh
 ```
 
-Both print `ready` (on 2026-10-09 a row also survived a restart on the same volume). Without the
-`/var/lib/pgsql` mount, both exit 1 with `common.sh: line 184: /var/lib/pgsql/passwd: Read-only file system`:
-the start script writes its `passwd` (nss_wrapper) and the generated `openshift-custom-*.conf` under
-`HOME=/var/lib/pgsql` for every UID (`test_postgres_gets_a_writable_home_under_its_read_only_root`).
+Expected: `ready` four times and `failed checks: 0` (the exit status counts failures). PostgreSQL — the image
+pinned in `deploy/kubernetes/kustomization.yaml` — is ready when `check-container` passes; the control plane
+(demo mode, the ConfigMap's settings) when `/api/v1/health` answers `ok` and Ansible runs with the executor's
+`ANSIBLE_HOME` under the data directory. Without the StatefulSet's `/var/lib/pgsql` emptyDir (the manifest
+before 2026-10-09) both PostgreSQL runs exit 1 with `common.sh: line 184: /var/lib/pgsql/passwd: Read-only
+file system`: the start script writes its `passwd` (nss_wrapper) and the generated `openshift-custom-*.conf`
+under `HOME=/var/lib/pgsql` for every UID (`test_postgres_gets_a_writable_home_under_its_read_only_root`).
+A Deployment without its `/data` mount fails the control-plane runs (`unable to open database file`).
 
 ### 14.6 Compose smoke test (E2)
 
