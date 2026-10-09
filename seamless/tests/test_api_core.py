@@ -493,3 +493,31 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
         assert client.get("/api/docs", headers=viewer).status_code == 200
         assert client.get("/docs").status_code == 404 and client.get("/redoc").status_code == 404
     store2.dispose()
+
+
+def test_dashboard_mock_error_codes_are_api_codes():
+    """The dashboard's mock API (mock mode, unit tests) answers only with (status, code) pairs the
+    real API sends (SDD §12), so the UI is never developed against an error the backend never
+    returns."""
+    import re
+
+    from seamless_migrate.api import app as app_module
+    from seamless_migrate.config import find_repo_root
+
+    root = find_repo_root()
+    api: set[tuple[int, str]] = {(s, c) for s, c in app_module._STATUS_CODES.items()}
+    for path in (root / "seamless" / "src" / "seamless_migrate" / "api").glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        api |= {
+            (int(s), c)
+            for s, c in re.findall(r'(?:ApiError|_error)\(\s*(\d{3}),\s*"([a-z_]+)"', text)
+        }
+    mock = (root / "dashboard" / "src" / "api" / "mock.ts").read_text(encoding="utf-8")
+    used = {(int(s), c) for s, c in re.findall(r"HttpError\((\d{3}), '([a-z_]+)'", mock)}
+    used |= {(int(s), c) for c, s in re.findall(r"code: '([a-z_]+)'[^\n]*?status: (\d{3})", mock)}
+    used |= {
+        (int(s), c)
+        for s, c in re.findall(r"status: (\d{3}),\s*body: \{ error: \{ code: '([a-z_]+)'", mock)
+    }
+    assert used, "no error responses found in mock.ts"
+    assert used <= api, f"mock-only error responses: {sorted(used - api)}"

@@ -138,7 +138,7 @@ describe('mock API', () => {
     const completed = byPhase(server, 'completed');
     await expect(
       client.post(`/migrations/${completed.id}/finalize`, { confirm: 'wrong', delete_source: false }),
-    ).rejects.toMatchObject({ status: 400, code: 'confirmation_mismatch' });
+    ).rejects.toMatchObject({ status: 400, code: 'bad_request' });
     const result = await client.post<Migration>(`/migrations/${completed.id}/finalize`, { confirm: completed.vm.name });
     expect(result.phase).toBe('finalized');
   });
@@ -149,7 +149,7 @@ describe('mock API', () => {
     const plan = server.plans.find((p) => p.id === blocked.plan_id);
     if (!plan) throw new Error('plan missing');
     plan.status = 'validated';
-    await expect(client.post(`/plans/${plan.id}/start`)).rejects.toMatchObject({ status: 409, code: 'blocked_migrations' });
+    await expect(client.post(`/plans/${plan.id}/start`)).rejects.toMatchObject({ status: 409, code: 'conflict' });
   });
 
   it('serves events over SSE to the real stream reader', async () => {

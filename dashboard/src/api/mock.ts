@@ -391,7 +391,7 @@ export class MockServer {
 
   private transition(m: Migration, to: Phase, reason: string, actor: string): void {
     if (!canTransition(m.phase, to)) {
-      throw new HttpError(409, 'invalid_transition', `Cannot move ${m.vm.name} from ${m.phase} to ${to}.`);
+      throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to ${to}.`);
     }
     const at = new Date(this.now()).toISOString();
     m.phase_history.push({ from_phase: m.phase, to_phase: to, at, reason, actor });
@@ -470,7 +470,8 @@ export class MockServer {
       return this.route(method, path, query, body, token);
     } catch (error) {
       if (error instanceof HttpError) return { status: error.status, body: { error: { code: error.code, message: error.message } } };
-      return { status: 500, body: { error: { code: 'internal', message: error instanceof Error ? error.message : 'mock failure' } } };
+      // like the API (SDD §12): an unexpected error never exposes internals
+      return { status: 500, body: { error: { code: 'internal_error', message: 'internal error' } } };
     }
   }
 
@@ -532,7 +533,7 @@ export class MockServer {
           const inUse = this.plans.some(
             (p) => (p.source_provider_id === id || p.destination_provider_id === id) && !['completed', 'failed'].includes(p.status),
           );
-          if (inUse) throw new HttpError(409, 'provider_in_use', `${provider.name} is referenced by a plan that is not finished.`);
+          if (inUse) throw new HttpError(409, 'conflict', `${provider.name} is referenced by a plan that is not finished.`);
           this.providers.splice(this.providers.indexOf(provider), 1);
           this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} deleted`, data: {} });
           return { status: 204 };
@@ -550,7 +551,7 @@ export class MockServer {
         }
         if (sub === 'inventory' && method === 'GET') {
           this.require(token, 'viewer', path);
-          if (provider.status === 'error') throw new HttpError(502, 'provider_unreachable', `${provider.name}: ${provider.status_message ?? 'unreachable'}`);
+          if (provider.status === 'error') throw new HttpError(502, 'provider_error', `${provider.name}: ${provider.status_message ?? 'unreachable'}`);
           return ok(this.inventories[provider.id] ?? (provider.role === 'source' ? [] : { networks: {}, flavors: [], volume_types: [], quotas: {}, projects: [] }));
         }
       }
@@ -743,7 +744,7 @@ export class MockServer {
     if (!Array.isArray(body.vm_ids) || body.vm_ids.length === 0) throw new HttpError(422, 'validation_error', 'Select at least one VM.');
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
-    if (!source || !destination) throw new HttpError(400, 'invalid_provider', 'Unknown source or destination provider.');
+    if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
     const inventory = (this.inventories[source.id] ?? []) as VMRef[];
     const now = this.now();
     const plan: Plan = {
@@ -804,7 +805,7 @@ export class MockServer {
   }
 
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
-    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'invalid_state', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
+    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     for (const key of Object.keys(input)) {
       if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
       (plan as unknown as Record<string, unknown>)[key] = input[key];
@@ -816,7 +817,7 @@ export class MockServer {
   }
 
   private autoWaves(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
-    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'invalid_state', `Waves can only be planned in draft or validated (this plan is ${plan.status}).`);
+    if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Waves can only be planned in draft or validated (this plan is ${plan.status}).`);
     const size = Math.max(1, Math.min(100, Number(input.max_wave_size ?? 10) || 10));
     const mine = this.migrations.filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled').sort((a, b) => a.vm.disk_bytes - b.vm.disk_bytes);
     const pilot = mine.slice(0, Math.min(3, mine.length));
@@ -835,7 +836,7 @@ export class MockServer {
   }
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
-    if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'invalid_state', `A ${plan.status} plan cannot be re-validated.`);
+    if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     for (const m of mine) {
       if (m.phase === 'pending' || m.phase === 'blocked' || m.phase === 'ready') {
@@ -855,9 +856,9 @@ export class MockServer {
   }
 
   private startPlan(me: Me, plan: Plan): MockResponse {
-    if (!['validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'invalid_state', `Only validated or paused plans can start (this plan is ${plan.status}).`);
+    if (!['validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated or paused plans can start (this plan is ${plan.status}).`);
     const blocked = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked');
-    if (blocked.length) throw new HttpError(409, 'blocked_migrations', `${blocked.length} migration(s) are blocked: ${blocked.map((m) => m.vm.name).join(', ')}.`);
+    if (blocked.length) throw new HttpError(409, 'conflict', `${blocked.length} migration(s) are blocked: ${blocked.map((m) => m.vm.name).join(', ')}.`);
     plan.status = 'running';
     plan.updated_at = new Date(this.now()).toISOString();
     for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {
@@ -868,7 +869,7 @@ export class MockServer {
   }
 
   private pausePlan(me: Me, plan: Plan): MockResponse {
-    if (plan.status !== 'running') throw new HttpError(409, 'invalid_state', `Only running plans can be paused (this plan is ${plan.status}).`);
+    if (plan.status !== 'running') throw new HttpError(409, 'conflict', `Only running plans can be paused (this plan is ${plan.status}).`);
     plan.status = 'paused';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.paused', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" paused`, data: {} });
@@ -878,9 +879,9 @@ export class MockServer {
   private setStrategy(me: Me, m: Migration, input: Record<string, unknown>): MockResponse {
     const strategy = input.strategy as Strategy;
     if (!STRATEGIES.includes(strategy)) throw new HttpError(422, 'validation_error', 'Unknown strategy.');
-    if (!['pending', 'ready', 'blocked'].includes(m.phase)) throw new HttpError(409, 'invalid_state', `Strategy can only change in pending, ready or blocked (now ${m.phase}).`);
+    if (!['pending', 'ready', 'blocked'].includes(m.phase)) throw new HttpError(409, 'conflict', `Strategy can only change in pending, ready or blocked (now ${m.phase}).`);
     const est: Estimate | undefined = m.estimates.find((e) => e.strategy === strategy);
-    if (!est || !est.eligible) throw new HttpError(409, 'ineligible_strategy', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
+    if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
     m.strategy = strategy;
     m.estimate = est;
     m.updated_at = new Date(this.now()).toISOString();
@@ -900,12 +901,12 @@ export class MockServer {
 
     switch (action) {
       case 'approve':
-        if (!['ready', 'precopy', 'syncing', 'awaiting_cutover'].includes(m.phase)) throw new HttpError(409, 'invalid_state', `Cannot approve ${m.vm.name} while ${m.phase}.`);
+        if (!['ready', 'precopy', 'syncing', 'awaiting_cutover'].includes(m.phase)) throw new HttpError(409, 'conflict', `Cannot approve ${m.vm.name} while ${m.phase}.`);
         approve();
         break;
       case 'cutover': {
         const allowed = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
-        if (!allowed) throw new HttpError(409, 'invalid_transition', `Cannot request cutover for ${m.vm.name} while ${m.phase}.`);
+        if (!allowed) throw new HttpError(409, 'conflict', `Cannot request cutover for ${m.vm.name} while ${m.phase}.`);
         approve();
         m.cutover_requested = true;
         m.force_window = m.force_window || Boolean(input.force_window);
@@ -914,7 +915,7 @@ export class MockServer {
         break;
       }
       case 'sync':
-        if (m.phase !== 'awaiting_cutover') throw new HttpError(409, 'invalid_transition', 'A delta sync can only be requested while awaiting cutover.');
+        if (m.phase !== 'awaiting_cutover') throw new HttpError(409, 'conflict', 'A delta sync can only be requested while awaiting cutover.');
         this.transition(m, 'syncing', 'keep-warm sync requested', me.name);
         this.startPass(m, 'delta');
         record('delta sync requested');
@@ -928,7 +929,7 @@ export class MockServer {
         break;
       }
       case 'retry':
-        if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'invalid_transition', `Cannot retry ${m.vm.name} while ${m.phase}.`);
+        if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
         m.error = null;
@@ -939,14 +940,14 @@ export class MockServer {
         record('retry requested');
         break;
       case 'cancel': {
-        if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'invalid_transition', 'The source VM was stopped; roll back instead of cancelling.');
+        if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
         const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
         this.transition(m, 'cancelled', reason, me.name);
         record('cancelled', { reason });
         break;
       }
       case 'finalize': {
-        if (input.confirm !== m.vm.name) throw new HttpError(400, 'confirmation_mismatch', `Type the VM name "${m.vm.name}" exactly to finalize.`);
+        if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
         m.checkpoint = 'finalize';
         record('finalized', { delete_source: Boolean(input.delete_source) });
@@ -1108,7 +1109,7 @@ export function createMockFetch(server: MockServer, options: MockFetchOptions = 
       try {
         body = JSON.parse(init.body);
       } catch {
-        return new Response(JSON.stringify({ error: { code: 'invalid_json', message: 'Request body is not JSON.' } }), { status: 422 });
+        return new Response(JSON.stringify({ error: { code: 'validation_error', message: 'Request body is not JSON.' } }), { status: 422 });
       }
     }
     const result = server.handle(method, path, url.searchParams, body, token);

@@ -67,14 +67,14 @@ describe('ApiClient', () => {
 
   it('maps the SDD §12 error envelope to ApiError', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
-      jsonResponse(409, { error: { code: 'invalid_transition', message: 'cannot cutover from syncing' } }),
+      jsonResponse(409, { error: { code: 'conflict', message: 'cannot cutover from syncing' } }),
     );
     const { client, onUnauthorized } = makeClient(fetchImpl);
 
     const error = await client.post('/migrations/mig-0123456789/cutover', {}).catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(ApiError);
-    expect(error).toMatchObject({ status: 409, code: 'invalid_transition', message: 'cannot cutover from syncing' });
+    expect(error).toMatchObject({ status: 409, code: 'conflict', message: 'cannot cutover from syncing' });
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
