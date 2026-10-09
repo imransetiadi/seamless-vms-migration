@@ -7,7 +7,7 @@ import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration } from './types';
+import type { Event, Migration, SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -72,6 +72,12 @@ export function useLiveEvents(listener: (event: Event) => void): void {
   const ref = useRef(listener);
   ref.current = listener;
   useEffect(() => hub.subscribe((event) => ref.current(event)), [hub]);
+}
+
+/** A `migration.sync_pass` payload when it is a pass that ended (SDD §4.3), else null. */
+function endedPass(data: Record<string, unknown>): SyncPass | null {
+  const ok = typeof data.number === 'number' && typeof data.kind === 'string' && typeof data.ended_at === 'string' && typeof data.bytes_transferred === 'number';
+  return ok ? (data as unknown as SyncPass) : null;
 }
 
 function num(value: unknown): number | null {
@@ -141,6 +147,22 @@ export function applyEventToCache(
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
     queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
     return;
+  }
+
+  if (kind === 'migration.sync_pass' && event.migration_id) {
+    // The event's data is the pass that ended (SDD §4.3): add it to the cached passes, so the next
+    // step's progress counts on top of it before the refetch below lands (§16).
+    const pass = endedPass(event.data);
+    const id = event.migration_id;
+    if (pass) {
+      const patch = (m: Migration): Migration => {
+        if (m.id !== id) return m;
+        const passes = [...m.sync_passes.filter((p) => p.number !== pass.number), pass].sort((a, b) => a.number - b.number);
+        return { ...m, sync_passes: passes, bytes_transferred: endedPassBytes({ ...m, sync_passes: passes }) };
+      };
+      queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
+      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+    }
   }
 
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {

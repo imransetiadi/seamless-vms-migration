@@ -265,10 +265,20 @@ describe('mock API', () => {
     server.subscribe((e) => {
       if (e.kind === 'migration.progress') progress.push(e);
     });
+    const syncPasses: Event[] = [];
+    server.subscribe((e) => {
+      if (e.kind === 'migration.sync_pass') syncPasses.push(e);
+    });
     const ended = (m: Migration) => m.sync_bytes_dropped + m.sync_passes.reduce((sum, p) => sum + (p.ended_at === null ? 0 : p.bytes_transferred), 0);
+    // while a migration moves forward, the figure never drops (a pass has one size, drawn once)
+    const forward = new Set<Migration['phase']>(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying']);
+    const seen = new Map(server.migrations.map((m) => [m.id, { phase: m.phase, bytes: m.bytes_transferred }]));
     for (let t = 0; t < 80; t++) {
       server.tick();
       for (const m of server.migrations) {
+        const before = seen.get(m.id)!;
+        if (forward.has(before.phase) && forward.has(m.phase)) expect(m.bytes_transferred, m.id).toBeGreaterThanOrEqual(before.bytes);
+        seen.set(m.id, { phase: m.phase, bytes: m.bytes_transferred });
         expect(m.bytes_total, m.id).toBe(m.vm.used_bytes);
         if (!m.sync_passes.length) continue;
         const running = m.sync_passes.find((p) => p.ended_at === null)?.bytes_transferred ?? 0;
@@ -280,6 +290,9 @@ describe('mock API', () => {
       expect(Object.keys(e.data).sort()).toEqual(['bytes_done', 'bytes_total', 'pct', 'phase']);
       expect(e.data.bytes_done as number).toBeLessThanOrEqual(e.data.bytes_total as number);
     }
+    // the sync_pass event's data is the pass that ended, as the API sends it (SDD §4.3)
+    expect(syncPasses.length).toBeGreaterThan(0);
+    for (const e of syncPasses) expect(e.data).toMatchObject({ number: expect.any(Number), ended_at: expect.any(String), bytes_transferred: expect.any(Number) });
     // a migration the fixtures start mid-cutover finishes its final pass with the bytes it moved
     const midCutover = server.migrations.find((m) => m.id === 'mig-3c1a0f9e23')!;
     expect(midCutover.phase).toBe('verifying');

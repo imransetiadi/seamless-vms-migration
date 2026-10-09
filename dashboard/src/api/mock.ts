@@ -143,8 +143,8 @@ export class MockServer {
   private readonly rand: () => number;
   private readonly now: () => number;
   private timer: ReturnType<typeof setInterval> | null = null;
-  /** Bytes the running cutover step moves (the final pass, a cold copy; 0 for a handover). */
-  private readonly cutoverBytes = new Map<string, number>();
+  /** The bytes each pass moves (`<migration id>#<pass number>`), drawn once per pass. */
+  private readonly passSizes = new Map<string, number>();
   /** The request being handled, for the `auth.denied` audit (SDD §13.1). */
   private request = { method: 'GET', path: '/' };
 
@@ -285,21 +285,23 @@ export class MockServer {
 
   private advanceTransfer(m: Migration, plan: Plan, pctPerTick: number): void {
     const pass = this.openPass(m) ?? this.startPass(m, m.sync_passes.length === 0 ? 'full' : 'delta');
-    const target = this.passTarget(m, pass.kind);
+    // a pass transfers 98 % of the bytes it finds changed (zeroed blocks are skipped)
+    const moved = this.passSize(m, pass, 0.98);
     m.progress_pct = Math.min(100, m.progress_pct + pctPerTick * (0.7 + this.rand() * 0.6));
-    const done = Math.round((target * m.progress_pct) / 100);
+    const done = Math.round((moved * m.progress_pct) / 100);
     pass.bytes_scanned = Math.round((m.vm.disk_bytes * m.progress_pct) / 100);
     pass.bytes_transferred = done;
     m.updated_at = new Date(this.now()).toISOString();
-    this.stepProgress(m, done, target);
+    this.stepProgress(m, done, moved);
     if (m.progress_pct < 100) return;
 
     const now = this.now();
     pass.ended_at = new Date(now).toISOString();
     pass.duration_s = Math.round((now - Date.parse(pass.started_at)) / 100) / 10;
     pass.bytes_scanned = m.vm.disk_bytes;
-    pass.bytes_changed = target;
-    pass.bytes_transferred = Math.round(target * 0.98);
+    pass.bytes_changed = Math.round(moved / 0.98);
+    pass.bytes_transferred = moved;
+    this.passSizes.delete(`${m.id}#${pass.number}`);
     keepSyncHistory(m, plan.max_sync_passes);
     m.bytes_transferred = endedPassBytes(m);
     this.emit({
@@ -308,7 +310,7 @@ export class MockServer {
       migration_id: m.id,
       actor: 'orchestrator',
       message: `${m.vm.name}: pass ${pass.number} (${pass.kind}) changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`,
-      data: { pass },
+      data: { ...pass },
     });
     m.checkpoint = m.phase === 'precopy' ? 'precopy' : 'sync';
     if (m.phase === 'precopy') {
@@ -345,39 +347,41 @@ export class MockServer {
     }
     m.progress_pct = 0;
     this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
-    this.cutoverBytes.delete(m.id);
-    this.cutoverTotal(m);
     // a cold copy is recorded as a full pass, as the API's executors record it
     if (m.strategy === 'warm' || m.strategy === 'vmware_warm') this.startPass(m, 'final');
     else if (m.strategy === 'cold' || m.strategy === 'vmware_cold') this.startPass(m, 'full');
   }
 
-  /** The bytes the cutover step moves: a warm final pass, a cold copy, nothing for a storage handover. */
-  private cutoverTotal(m: Migration): number {
-    let total = this.cutoverBytes.get(m.id);
-    if (total === undefined) {
-      // also for a migration the fixtures start mid-cutover
-      const cold = m.strategy === 'cold' || m.strategy === 'vmware_cold';
-      total = m.strategy === 'storage_handover' ? 0 : cold ? m.vm.used_bytes : this.passTarget(m, 'final');
-      this.cutoverBytes.set(m.id, total);
+  /**
+   * The bytes a pass transfers — `share` of the bytes it finds changed — drawn once, so a migration's
+   * figure never drops within a pass (SDD §16); a pass the fixtures start part-way keeps what it moved.
+   */
+  private passSize(m: Migration, pass: SyncPass, share: number): number {
+    const key = `${m.id}#${pass.number}`;
+    let size = this.passSizes.get(key);
+    if (size === undefined) {
+      const partWay = pass.bytes_transferred > 0 && m.progress_pct > 0;
+      size = partWay ? Math.round(pass.bytes_transferred / (m.progress_pct / 100)) : Math.round(this.passTarget(m, pass.kind) * share);
+      this.passSizes.set(key, size);
     }
-    return total;
+    return size;
   }
 
   private advanceCutover(m: Migration, plan: Plan): void {
     const rate = m.strategy === 'warm' || m.strategy === 'vmware_warm' ? 6 : m.strategy === 'storage_handover' ? 8 : 2.5;
-    m.progress_pct = Math.min(100, m.progress_pct + rate * (0.7 + this.rand() * 0.6));
-    const total = this.cutoverTotal(m);
-    const done = Math.round((total * m.progress_pct) / 100);
+    // the step's bytes: the final pass of a warm migration, the full pass of a cold copy, none for a handover
     const pass = this.openPass(m);
+    const total = pass ? this.passSize(m, pass, 1) : 0;
+    m.progress_pct = Math.min(100, m.progress_pct + rate * (0.7 + this.rand() * 0.6));
+    const done = Math.round((total * m.progress_pct) / 100);
     if (pass) {
       pass.bytes_scanned = Math.round((m.vm.disk_bytes * m.progress_pct) / 100);
       pass.bytes_transferred = done;
     }
     this.stepProgress(m, done, total);
     if (m.progress_pct < 100) return;
-    this.cutoverBytes.delete(m.id);
     if (pass) {
+      this.passSizes.delete(`${m.id}#${pass.number}`);
       const now = this.now();
       pass.ended_at = new Date(now).toISOString();
       pass.duration_s = Math.round((now - Date.parse(pass.started_at)) / 100) / 10;
@@ -386,7 +390,7 @@ export class MockServer {
       pass.bytes_transferred = total;
       keepSyncHistory(m, plan.max_sync_passes);
       m.bytes_transferred = endedPassBytes(m);
-      this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { pass } });
+      this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { ...pass } });
     }
     m.destination_server_id = `${hex(this.rand, 8)}-${hex(this.rand, 4)}-4${hex(this.rand, 3)}-a${hex(this.rand, 3)}-${hex(this.rand, 12)}`;
     m.checkpoint = 'cutover';
