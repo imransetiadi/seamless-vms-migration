@@ -540,9 +540,9 @@ seamless-check: seamless-test
 	 && ln -sfn "$(CURDIR)" .cache/colltree/ansible_collections/os_migrate/os_migrate
 	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
 	  PYTHONPATH="$(CURDIR)/.cache/colltree" ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" \
-	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q tests/unit/test_blocksync.py \
-	    tests/unit/test_warm_migration.py tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py \
-	    tests/unit/test_role_modules_resolve.py
+	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q -rs tests/unit > "$(CURDIR)/.cache/unit.txt" 2>&1 \
+	  || { cat "$(CURDIR)/.cache/unit.txt"; exit 1; }; tail -n 3 "$(CURDIR)/.cache/unit.txt"; \
+	  if grep -qE '[0-9]+ skipped' "$(CURDIR)/.cache/unit.txt"; then echo "unexpected skipped collection tests"; exit 1; fi
 	@if command -v gitleaks >/dev/null; then \
 	  gitleaks dir -c .gitleaks-tree.toml --redact --no-banner . && gitleaks git --redact --no-banner .; \
 	else echo "gitleaks not installed: skipped (S-17)"; fi

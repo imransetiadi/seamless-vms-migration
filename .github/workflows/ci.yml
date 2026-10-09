@@ -81,13 +81,14 @@ jobs:
           ln -s "$GITHUB_WORKSPACE" "$RUNNER_TEMP/colltree/ansible_collections/os_migrate/os_migrate"
           echo "PYTHONPATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
           echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
-      - name: Warm-path unit tests (blocksync, modules, playbooks with stub modules)
+      - name: Collection unit tests (all of tests/unit, including the security fixes; no skips)
         working-directory: ${{ runner.temp }}/colltree/ansible_collections/os_migrate/os_migrate
         run: |
           python plugins/module_utils/blocksync.py --help > /dev/null
-          pytest -q tests/unit/test_blocksync.py tests/unit/test_warm_migration.py \
-                    tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py \
-                    tests/unit/test_role_modules_resolve.py
+          # every file, not a list: SEC-01/03/05 regression tests live outside the warm path
+          pytest -q -rs tests/unit > "$RUNNER_TEMP/unit.txt" 2>&1 || { cat "$RUNNER_TEMP/unit.txt"; exit 1; }
+          tail -n 15 "$RUNNER_TEMP/unit.txt"
+          if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/unit.txt"; then echo "unexpected skipped tests"; exit 1; fi
       - name: Playbook syntax checks
         run: |
           for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \

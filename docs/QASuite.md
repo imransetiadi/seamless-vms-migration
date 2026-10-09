@@ -880,8 +880,9 @@ python3 -m venv .venv
 COLL=$(mktemp -d)                                      # outside the repo: no symlink recursion
 mkdir -p "$COLL/ansible_collections/os_migrate" && ln -s "$PWD" "$COLL/ansible_collections/os_migrate/os_migrate"
 
-# unit tests (verified on the baseline: 83 passed)
-PYTHONPATH="$COLL" .venv/bin/python -m pytest tests/unit -q
+# unit tests: the whole directory, as CI and `make seamless-check` run it — no test may skip (the hypervisor
+# NBD-export tests of SEC-01 build their own collection tree; 212 passed on 2026-10-09, ansible-core 2.18 and 2.21)
+PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit -q -rs
 .venv/bin/python -m pytest tests/unit/test_blocksync.py -v          # stdlib-only engine, no collection needed
 python3 plugins/module_utils/blocksync.py --help
 

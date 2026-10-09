@@ -39,9 +39,38 @@ options:
     description:
       - List of disk information dictionaries
       - Each dict contains device, uri, port, size, bootable
+      - Values are converted to their types, so a port or size rendered as a
+        string by Jinja (ansible-core before 2.19) is stored as an integer
     required: true
     type: list
     elements: dict
+    suboptions:
+      device:
+        description: Guest device name, e.g. /dev/vda
+        required: true
+        type: str
+      uri:
+        description: NBD URI the conversion host reads
+        required: true
+        type: str
+      port:
+        description: qemu-nbd port
+        required: true
+        type: int
+      size:
+        description: Disk size in GiB (from qemu-img info)
+        required: true
+        type: int
+      bootable:
+        description: Whether this is the boot disk
+        type: bool
+        default: false
+      disk_path:
+        description: Path of the disk file on the hypervisor
+        type: str
+      disk_name:
+        description: Name of the disk file
+        type: str
 """
 
 EXAMPLES = r"""
@@ -77,7 +106,21 @@ def run_module():
     argument_spec = dict(
         path=dict(type="str", required=True),
         instance_id=dict(type="str", required=True),
-        nbdkit_disks=dict(type="list", elements="dict", required=True),
+        nbdkit_disks=dict(
+            type="list",
+            elements="dict",
+            required=True,
+            # typed: Jinja renders "{{ x | int }}" as a string before ansible-core 2.19
+            options=dict(
+                device=dict(type="str", required=True),
+                uri=dict(type="str", required=True),
+                port=dict(type="int", required=True),
+                size=dict(type="int", required=True),
+                bootable=dict(type="bool", default=False),
+                disk_path=dict(type="str"),
+                disk_name=dict(type="str"),
+            ),
+        ),
     )
 
     result = dict(
