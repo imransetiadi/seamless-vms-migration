@@ -570,18 +570,24 @@ Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storag
 refuses `os-unmanage` on an attached (`in-use`) volume, and Nova deletes `delete_on_termination`
 volumes with their server, so the order is:
 
-0. Resolve the storage reference of every attached volume (§7.3.1). Any volume that cannot be
-   resolved fails the step with a permanent error **before** anything changes: the VM keeps running.
+0. Check everything that can be checked while the VM runs, and fail the step with a permanent
+   error **before** anything changes (the VM keeps running) when:
+   * a volume's storage reference does not resolve (§7.3.1);
+   * the source compute API does not support microversion **2.85** (step 3);
+   * Cinder would refuse to unmanage a volume (step 5) — it refuses encrypted volumes ("Unmanaging
+     encrypted volumes is not supported"), volumes with snapshots and volumes in a group or
+     consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later).
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it), and the volume attachments in device
-   order (volume id, device, boot index, bootable, type, size, Cinder host) and the resolved
-   storage references (`storage`: per volume its family, source pool and destination host).
+   order (volume id, device, boot index, bootable, type, size, Cinder host, the attachment's
+   original `delete_on_termination`) and the resolved storage references (`storage`: per volume
+   its family, source pool and destination host).
 3. For every attachment set `delete_on_termination=false`:
    `PUT /servers/{id}/os-volume_attachments/{volume_id}` `{"volumeAttachment": {"volumeId": …,
    "delete_on_termination": false}}` with compute microversion **2.85**; verify by re-reading.
-   If the source cloud does not support 2.85, abort before any destructive step (permanent error;
-   the VM is restarted and the migration fails with a clear reason).
+   Step 0 already refused a cloud without 2.85; a rejected update aborts before any destructive
+   step (permanent error; the VM is restarted and the migration fails with a clear reason).
 4. Delete the source server; wait until every journaled volume is `available`.
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
@@ -597,12 +603,15 @@ volumes with their server, so the order is:
 8. Create the destination server from the managed volumes (BDM in journaled device order,
    `delete_on_termination: false`).
 
-Rollback walks the journal backwards: delete the destination server; unmanage at RHOSO; manage at the
+Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
+it sets every attachment's journaled `delete_on_termination` back and starts the server. Otherwise:
+delete the destination server; unmanage at RHOSO; manage at the
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
 journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
 metadata set back (step 7); recreate
 the source ports with their journaled MAC and fixed IPs (admin is already required); recreate the
-source server from the journaled definition with the volumes in device order; start it. Every step is
+source server from the journaled definition with the volumes in device order and their journaled
+`delete_on_termination`; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. QASuite marks
 handover as **lab-verification required** before production use.
@@ -741,7 +750,8 @@ The scan term is the warm path's floor; removing it is the purpose of decision D
 * `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side.
 * `warm`: as `cold`, plus any disk `multiattach`.
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
-  `volume_type` in `plan.handover.backend_map`, no `multiattach`, and `src_caps["admin"]` and
+  `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
+  cannot unmanage encrypted volumes), and `src_caps["admin"]` and
   `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
   `storage_backends` — a destination pool that resolves (§7.3.1).
