@@ -429,7 +429,9 @@ provider supports per-key budgets or scopes, create one key per environment.
 **NetworkPolicy** (`deploy/openshift/networkpolicy.yaml`): default-deny for ingress and egress; ingress to the
 control plane only from the OpenShift ingress namespace (label `policy-group.network.openshift.io/ingress`);
 PostgreSQL accepts only `seamless` pods; egress limited to DNS, PostgreSQL and a port list towards networks
-outside the cluster, excluding the pod/service networks and `169.254.0.0/16`. **Tighten** `0.0.0.0/0` to the
+outside the cluster, excluding the pod/service networks and `169.254.0.0/16` (the Kubernetes overlay excepts the
+cluster's own networks — kubeadm/kind defaults `10.244.0.0/16` and `10.96.0.0/12`, to adjust per cluster — and
+keeps them out of the 6443 rule too). **Tighten** `0.0.0.0/0` to the
 CIDRs of your clouds, vCenter, conversion hosts, Jev provider and agentmemory before production.
 **DNS:** the conversion subnets default to the public resolver `8.8.8.8`
 (`roles/conversion_host/defaults/main.yml:15-16`, SEC-08); override

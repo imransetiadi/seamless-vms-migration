@@ -201,13 +201,19 @@ jobs:
         run: |
           kubectl kustomize deploy/kubernetes > /tmp/k8s.yaml
           kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default /tmp/k8s.yaml
-          ! grep -q '^kind: Route' /tmp/k8s.yaml
+          # `! grep` never fails a step under bash -e: refuse explicitly
+          if grep -q '^kind: Route' /tmp/k8s.yaml; then echo "a Route is left in the overlay"; exit 1; fi
           grep -q '^kind: Ingress' /tmp/k8s.yaml
           [ "$(grep -c 'runAsUser:' /tmp/k8s.yaml)" -eq 2 ]
           grep -q 'k8s-app: kube-dns' /tmp/k8s.yaml
           grep -q 'kubernetes.io/metadata.name: ingress-nginx' /tmp/k8s.yaml
           grep -q 'cidr: 10.96.0.1/32' /tmp/k8s.yaml
-          grep -q 'image: quay.io/sclorg/postgresql-16-c9s' /tmp/k8s.yaml
+          # both egress policies except the cluster's pod and service networks, none OpenShift's
+          [ "$(grep -c -- '- 10.244.0.0/16' /tmp/k8s.yaml)" -eq 2 ]
+          if grep -q -e '10.128.0.0/14' -e '172.30.0.0/16' /tmp/k8s.yaml; then
+            echo "OpenShift networks are left in the egress policies"; exit 1
+          fi
+          grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
 
   image:
     name: container image (build, trivy, SBOM)

@@ -6,7 +6,8 @@
 #   * openshift-dns      -> kube-system CoreDNS (k8s-app: kube-dns)
 #   * router namespace   -> the ingress controller's namespace (ingress-nginx)
 #   * 172.30.0.1         -> 10.96.0.1, the usual kubernetes Service IP (kubectl get svc kubernetes -n default)
-#   * registry.redhat.io/rhel9/postgresql-16 -> quay.io/sclorg/postgresql-16-c9s (same image interface,
+#   * OpenShift pod/service networks in the egress policies -> the cluster's (kubeadm defaults below)
+#   * registry.redhat.io/rhel9/postgresql-16 -> quay.io/sclorg/postgresql-16-c9s, pinned by digest (same image interface,
 #     public; keep the Red Hat image when you have a pull secret for registry.redhat.io)
 #
 # Deploy:
@@ -32,7 +33,9 @@ images:
     newTag: 0.1.0
   - name: registry.redhat.io/rhel9/postgresql-16
     newName: quay.io/sclorg/postgresql-16-c9s
-    newTag: latest
+    # pinned (multi-arch index of :latest on 2026-10-09); refresh with
+    #   docker buildx imagetools inspect quay.io/sclorg/postgresql-16-c9s:latest
+    digest: sha256:beaf7f16890b05aac31197a9e0bbba0697cb93da34a60a47ad8134bb2c9d6911
 
 patches:
   # no Routes outside OpenShift
@@ -97,10 +100,34 @@ patches:
           - namespaceSelector:
               matchLabels:
                 kubernetes.io/metadata.name: ingress-nginx
+  # ADJUST to your cluster: the pod and service networks below are the kubeadm/kind defaults
+  # (kubectl cluster-info dump | grep -m2 -E -- '--(cluster-cidr|service-cluster-ip-range)'); k3s uses
+  # 10.42.0.0/16 and 10.43.0.0/16. Calico's default pool 192.168.0.0/16 often overlaps lab networks where
+  # the clouds live — except it only when no OpenStack/vCenter endpoint or conversion host is in it.
+  # Outbound to clouds and conversion hosts, but never to a pod or Service of this cluster (and not to
+  # OpenShift's ranges, which are ordinary private addresses here).
+  - target:
+      kind: NetworkPolicy
+      name: seamless-allow-egress-external
+    patch: |
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/except
+        value:
+          - 10.244.0.0/16
+          - 10.96.0.0/12
+          - 169.254.0.0/16
+  # 6443 is the API server on the control-plane node addresses (after kube-proxy DNAT); keep pods and
+  # Services out. TIGHTEN BEFORE PRODUCTION: set the cidr to those nodes (kubectl get endpoints kubernetes).
   - target:
       kind: NetworkPolicy
       name: seamless-allow-egress-kube-api
     patch: |
+      - op: add
+        path: /spec/egress/0/to/0/ipBlock/except
+        value:
+          - 10.244.0.0/16
+          - 10.96.0.0/12
+          - 169.254.0.0/16
       - op: replace
         path: /spec/egress/1/to/0/ipBlock/cidr
         value: 10.96.0.1/32
