@@ -6,6 +6,7 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import math
 import secrets
 from collections import Counter
 from collections.abc import Sequence
@@ -319,6 +320,9 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")
+    # the JSON parser accepts the Infinity literal, which gt=0 lets through (SDD §9.1)
+    if not math.isfinite(spec.link_bps):
+        problems.append(f"link_bps must be a finite positive number (got {spec.link_bps})")
     return problems
 
 

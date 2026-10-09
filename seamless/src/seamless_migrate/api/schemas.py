@@ -16,6 +16,7 @@ class _Body(BaseModel):
 
 
 _SECRET = 4096  # longest accepted credential value
+_TEXT = 2000  # longest free text of a migration action: comment, reason, confirm (SDD §12)
 
 
 class ProviderCredentialsRequest(_Body):
@@ -53,25 +54,25 @@ class WavesAutoRequest(_Body):
 
 
 class ApproveRequest(_Body):
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=_TEXT)
 
 
 class CutoverRequest(_Body):
     force_window: bool = False
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=_TEXT)
 
 
 class RollbackRequest(_Body):
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=_TEXT)
 
 
 class CancelRequest(_Body):
-    reason: str | None = None
+    reason: str | None = Field(default=None, max_length=_TEXT)
 
 
 class FinalizeRequest(_Body):
     delete_source: bool = False
-    confirm: str
+    confirm: str = Field(max_length=_TEXT)
 
 
 class StrategyRequest(_Body):

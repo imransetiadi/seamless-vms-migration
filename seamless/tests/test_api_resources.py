@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -446,6 +447,55 @@ def test_migration_actions_transitions(api):
         "rollback",
     }
     assert all(e.actor.endswith("-user") for e in actions)
+
+
+def test_plan_refuses_non_finite_estimator_inputs(api):
+    """SDD §9.1: the JSON parser accepts the NaN and Infinity literals; plans must not."""
+    vm_ids = first_clean_vms(api)
+
+    def create(extra: str):
+        body = (
+            '{"name": "non-finite", "source_provider_id": "src-osp", '
+            f'"destination_provider_id": "dst-rhoso", "vm_ids": {json.dumps(vm_ids)}, {extra}}}'
+        )
+        headers = {**api.h(Role.operator), "Content-Type": "application/json"}
+        return api.client.post("/api/v1/plans", headers=headers, content=body)
+
+    for literal in ("NaN", "Infinity"):
+        res = create(f'"estimator_overrides": {{"scan_bps": {literal}}}')
+        assert res.status_code == 400, res.text
+        assert "scan_bps" in res.json()["error"]["message"]
+        res = create(f'"link_bps": {literal}')
+        assert res.status_code == 422, res.text
+        assert "link_bps" in res.json()["error"]["message"]
+    created = create('"link_bps": 1e9')
+    assert created.status_code == 201, created.text
+    # PATCH merges into the stored plan: the same check applies
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers={**api.h(Role.operator), "Content-Type": "application/json"},
+        content='{"link_bps": Infinity}',
+    )
+    assert patched.status_code == 422 and "link_bps" in patched.json()["error"]["message"]
+
+
+def test_action_texts_hold_at_most_2000_characters(api):
+    """SDD §12: comment, reason and confirm are bounded; 2000 characters still pass."""
+    migs = seed_migrations(api.store)
+    too_long = "x" * 2001
+    for action, role, body in (
+        ("approve", Role.approver, {"comment": too_long}),
+        ("cutover", Role.approver, {"comment": too_long}),
+        ("rollback", Role.operator, {"reason": too_long}),
+        ("cancel", Role.operator, {"reason": too_long}),
+        ("finalize", Role.approver, {"confirm": too_long}),
+    ):
+        res = api.post(f"/api/v1/migrations/{migs['awaiting'].id}/{action}", role, json=body)
+        assert res.status_code == 422, (action, res.text)
+        assert res.json()["error"]["code"] == "validation_error"
+    approve = f"/api/v1/migrations/{migs['awaiting'].id}/approve"
+    ok = api.post(approve, Role.approver, json={"comment": "x" * 2000})
+    assert ok.status_code == 200, ok.text
 
 
 def test_finalize_confirm_mismatch_400(api):

@@ -219,6 +219,16 @@ def test_invalid_estimator_overrides():
         make_plan(max_sync_passes=0)
 
 
+def test_invalid_estimator_overrides_refuses_non_finite_values():
+    """SDD §9.1: NaN <= 0 is false, so a positivity check alone lets NaN and infinity through."""
+    problems = invalid_estimator_overrides(
+        {"scan_bps": float("nan"), "boot_s": float("inf"), "snapshot_s": float("-inf")}
+    )
+    assert [p.split(":")[0] for p in problems] == ["boot_s", "scan_bps", "snapshot_s"]
+    assert all("finite positive number" in p for p in problems)
+    assert invalid_estimator_overrides({"scan_bps": 1e12}) == []
+
+
 def test_estimate_final_downtime_uses_scan_term():
     four = make_vm(
         disks=[make_disk(id=f"d{i}", size_gb=100, used_gb=10.0) for i in range(4)],
