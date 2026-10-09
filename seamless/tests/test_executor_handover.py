@@ -7,7 +7,12 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
 from seamless_migrate.domain.models import HandoverConfig, Mappings
 from seamless_migrate.executors.base import PermanentStepError, StepName
-from seamless_migrate.executors.handover import JOURNAL_FILE, HandoverExecutor
+from seamless_migrate.executors.handover import (
+    JOURNAL_FILE,
+    HandoverExecutor,
+    _cinder_bootable,
+    _mark_boot,
+)
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
 
@@ -397,6 +402,87 @@ async def test_handover_cutover_order_and_bdm(tmp_path):
     ]
     # the original delete_on_termination is journaled for the rollback
     assert [a["delete_on_termination"] for a in saved["attachments"]] == [False, True]
+
+
+async def test_handover_boots_from_the_root_device_nova_reports(tmp_path):
+    """A legacy guest on the IDE bus boots from /dev/hda, Nova's root_device_name: the recreated
+    server boots from that volume (SDD §7.3 step 2), as the inventory decides it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    server = clouds["src"].servers["srv-1"]
+    server.root_device_name = "/dev/hda"
+    server.attachments = [("vol-root", "/dev/hda"), ("vol-data", "/dev/hdb")]
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert [(a["volume_id"], a["boot"]) for a in saved["attachments"]] == [
+        ("vol-data", False),
+        ("vol-root", True),
+    ]
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_falls_back_to_the_cinder_bootable_volume(tmp_path):
+    """Nova shows no root device name and no volume is at /dev/vda: the volume Cinder marks
+    bootable is the boot volume, as in the inventory (SDD §7.3 step 2)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/vdc"),
+        ("vol-data", "/dev/vdb"),
+    ]
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_falls_back_to_the_first_disk_of_another_bus(tmp_path):
+    """No root device name, no Cinder bootable flag (a volume written by hand): a virtio-scsi
+    guest's first disk, /dev/sda, is the boot volume (SDD §7.3 step 2)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/sda"),
+        ("vol-data", "/dev/sdb"),
+    ]
+    clouds["src"].volumes["vol-root"].is_bootable = False
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+@pytest.mark.parametrize(
+    ("root", "devices", "flags", "boot"),
+    [
+        ("/dev/hda", ["/dev/hdb", "/dev/hda"], [False, False], "/dev/hda"),  # Nova's root device
+        ("/dev/vda", ["/dev/vdc", "/dev/vdb"], ["true", "true"], "/dev/vdb"),  # lowest bootable
+        ("/dev/vda", ["/dev/vdb", "/dev/vdc"], ["false", "TRUE"], "/dev/vdc"),  # flags as text
+        ("/dev/vda", ["/dev/hdb", "/dev/xvda", "/dev/hda"], [False] * 3, "/dev/hda"),  # bus order
+        ("/dev/vda", ["/dev/vdb", "/dev/vdc"], [False, None], None),  # nothing to boot from
+    ],
+)
+def test_mark_boot_follows_the_rules_of_sdd_7_3(root, devices, flags, boot):
+    attachments = [
+        {"device": d, "bootable": _cinder_bootable(NS(is_bootable=f))}
+        for d, f in zip(devices, flags, strict=True)
+    ]
+    _mark_boot(attachments, root)
+    assert [a["device"] for a in attachments if a["boot"]] == ([boot] if boot else [])
+
+
+async def test_handover_refuses_before_stop_when_no_volume_is_the_boot_volume(tmp_path):
+    """Without a boot volume the destination server cannot be created, and neither can the source
+    again on rollback: refuse while the VM still runs (SDD §7.3 step 0)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/vdc"),
+        ("vol-data", "/dev/vdb"),
+    ]
+    clouds["src"].volumes["vol-root"].is_bootable = False
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="which volume the server boots from"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
 
 
 async def test_handover_journal_resume_skips_done_steps(tmp_path):

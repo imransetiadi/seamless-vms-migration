@@ -39,7 +39,10 @@ T = TypeVar("T")
 
 JOURNAL_FILE = "handover-journal.json"
 DEFINITION_FILE = "source-server.json"
-ROOT_DEVICES = ("/dev/vda", "/dev/sda", "/dev/xvda")
+#: the first disk of each other bus — virtio-scsi, IDE (legacy guests), Xen: the last guess
+#: for the boot volume when neither Nova's root device nor Cinder's bootable flag names one
+#: (SDD §7.3 step 2)
+OTHER_ROOT_DEVICES = ("/dev/sda", "/dev/hda", "/dev/xvda")
 # PUT os-volume_attachments may change delete_on_termination from this compute microversion on
 KEEP_MICROVERSION = "2.85"
 
@@ -82,6 +85,32 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def _cinder_bootable(volume: Any) -> bool:
+    value = _attr(volume, "is_bootable")
+    if isinstance(value, str):  # Cinder's API answers "true"/"false"
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def _mark_boot(attachments: list[dict[str, Any]], root_device: str) -> None:
+    """Mark the attachment the server boots from (SDD §7.3 step 2): the one at ``root_device``, else
+    the Cinder-bootable volume with the lowest device — the inventory's rule for ``Disk.bootable`` —
+    else the first disk of another bus. With none of them, no attachment is marked."""
+    for att in attachments:
+        att["boot"] = att["device"] == root_device
+    if any(att["boot"] for att in attachments):
+        return
+    flagged = sorted((a for a in attachments if a["bootable"]), key=lambda a: a["device"] or "")
+    if flagged:
+        flagged[0]["boot"] = True
+        return
+    for device in OTHER_ROOT_DEVICES:
+        for att in attachments:
+            if att["device"] == device:
+                att["boot"] = True
+                return
 
 
 def _existing_server(conn: Any, server_id: str) -> Any:
@@ -218,7 +247,8 @@ class HandoverExecutor:
                 {
                     "volume_id": _attr(volume, "id"),
                     "device": device,
-                    "boot": device in ROOT_DEVICES,
+                    "boot": False,  # decided below, once every attachment is known
+                    "bootable": _cinder_bootable(volume),
                     "name": _attr(volume, "name"),
                     "size": _attr(volume, "size"),
                     "volume_type": _attr(volume, "volume_type"),
@@ -227,6 +257,8 @@ class HandoverExecutor:
                     "delete_on_termination": None if dot is None else bool(dot),
                 }
             )
+        # Nova's root device (an admin attribute; /dev/vda when not shown), as in the inventory
+        _mark_boot(attachments, _attr(server, "root_device_name") or "/dev/vda")
         attachments.sort(key=lambda a: (a["boot"], a["device"] or ""))  # data first, boot last
         groups = _attr(server, "security_groups") or []
         return {
@@ -296,6 +328,12 @@ class HandoverExecutor:
         """Step 0 as a read-only report: what each volume would become, and every problem."""
         attachments = self._capture_definition(src, server_id)["attachments"]
         problems: list[str] = []
+        if attachments and not any(a["boot"] for a in attachments):
+            # the destination server could not be created, nor the source again on rollback
+            problems.append(
+                "cannot tell which volume the server boots from: no volume is at its root device, "
+                "Cinder marks none bootable and none is the first disk of a bus"
+            )
         missing = sorted(
             {
                 a["volume_type"] or "<default>"
