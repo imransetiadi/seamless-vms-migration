@@ -474,6 +474,7 @@ socket and data directories) and no TLS.
 | Base images | `postgres:16-alpine`, `node:22-alpine` and the UBI 9 Python 3.11 base are pinned by digest in the Compose file and the Containerfile; `kustomization.yaml` `images:` still uses tags | Pin by digest in `kustomization.yaml` for production (comments show how) |
 | SBOM | CycloneDX generated per image by the CI `image` job (`trivy image --format cyclonedx`, uploaded as an artifact) | Publish it with each release |
 | Scanning | CI runs `pip-audit`, `npm audit`, `gitleaks` (tree and history), `trivy config` on the manifests and `trivy image` on the built image (QASuite §13.1a) | Keep them as release gates; Dependabot keeps the pins moving |
+| GitHub Actions | every `uses:` in `.github/workflows` is pinned to a full commit SHA with its release in a comment (`actions/checkout@11d5960… # v4.4.0`): a tag can be moved or force-pushed to run other code with the workflow's token, a SHA cannot (`test_every_action_is_pinned_to_a_commit_sha_with_its_version`); each pin was checked to be on its repository's default or release branch | Dependabot's `github-actions` updates move the pins weekly |
 | Signing / provenance | not in 0.1.0 | cosign signatures and provenance attestations for 1.0.0 (PRD §9) |
 | Reproducibility | Containerfile in the repository | Build in CI from a clean checkout; record image digests in release notes |
 
