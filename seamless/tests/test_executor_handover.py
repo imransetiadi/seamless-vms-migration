@@ -174,7 +174,7 @@ class FakeBlockStorage:
 
     def get_volume(self, volume_id):
         if volume_id not in self.c.volumes:
-            raise HTTPError(f"HTTP 404: volume {volume_id} not found")
+            raise NotFoundException(f"HTTP 404: volume {volume_id} not found")
         return self.c.volumes[volume_id]
 
     def snapshots(self, details=True, **query):
@@ -184,11 +184,17 @@ class FakeBlockStorage:
         ]
 
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=120):
+        if self.c.crash_wait == "status":
+            self.c.crash_wait = None
+            raise Crash("wait_for_status")
         if getattr(res, "status", status) != status:
             raise HTTPError(f"timeout waiting for {res.id} to be {status} (is {res.status})")
         return res
 
     def wait_for_delete(self, res, interval=2, wait=120):
+        if self.c.crash_wait == "delete":
+            self.c.crash_wait = None
+            raise Crash("wait_for_delete")
         return res
 
     def backend_pools(self):
@@ -291,6 +297,7 @@ class FakeCloud:
         self.servers = servers or {}
         self.volumes = volumes or {}
         self.crash_on = crash_on
+        self.crash_wait = None  # "delete" or "status": crash once inside that block-storage wait
         self.created = []
         self.managed = []
         self.ports = {}
@@ -727,6 +734,89 @@ async def test_handover_keeps_a_port_without_addresses(tmp_path):
     saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
     assert [(n["port_id"], n["fixed_ips"]) for n in saved["networks"]] == [("port-1", [])]
     assert clouds["dst"].created[0]["networks"] == [{"uuid": "dst-net-rhoso-app"}]
+
+
+async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_failing(tmp_path):
+    """The control plane died while Cinder was unmanaging the first volume: the resume knows the
+    unmanage was sent and does not trip over the volume Cinder no longer knows (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "delete"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "vol-data" not in clouds["src"].volumes  # Cinder did unmanage it
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [op for op in ops(calls) if op[1] == "unmanage"] == [
+        ("src", "unmanage", "vol-data"),
+        ("src", "unmanage", "vol-root"),
+    ]
+
+
+async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_volume(tmp_path):
+    """The control plane died while RHOSO was managing the first volume: the resume waits for that
+    volume instead of managing the renamed object again (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "status"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "manage"] == [
+        ("dst", "manage", "volume-vol-data"),
+        ("dst", "manage", "volume-vol-root"),
+    ]
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume(tmp_path):
+    """The RHOSO volume a crashed manage created is known to the journal: the rollback unmanages
+    it and manages the source back under its name (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "status"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("dst", "unmanage", "dst-vol-1") in ops(calls)
+    assert ("src", "manage", "volume-dst-vol-1") in ops(calls)
+    assert "dst-vol-1" not in clouds["dst"].volumes
+
+
+async def test_handover_rollback_after_a_crash_while_unmanaging_finishes_it_and_manages_back(
+    tmp_path,
+):
+    """A crash while Cinder unmanaged the first source volume, then a rollback: the volume Cinder
+    forgot is managed back with the other one and the source server boots on both (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "delete"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("src", "manage", "volume-vol-data") in ops(calls)
+    assert ("src", "unmanage", "vol-data") not in ops(calls)  # Cinder already did
+    bdm = clouds["src"].created[0]["block_device_mapping"]
+    assert len(bdm) == 2 and result.details["source_running"] is True
+
+
+async def test_handover_rollback_resume_after_a_crash_while_managing_back(tmp_path):
+    """The rollback itself crashed while the source managed a volume back: its resume waits for
+    that volume instead of managing the object again (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_wait = "status"
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "manage"] == [("src", "manage", "volume-vol-data")]
+    assert result.details["source_running"] is True
 
 
 async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_path):

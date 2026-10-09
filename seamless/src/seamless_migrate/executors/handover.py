@@ -487,12 +487,21 @@ class HandoverExecutor:
             f"Cinder refused the boot properties of {volume_id}",
         )
 
-    def _unmanage(self, conn: Any, volume_id: str) -> None:
-        volume = conn.block_storage.get_volume(volume_id)
-        _checked(
-            conn.block_storage.post(f"/volumes/{volume_id}/action", json={"os-unmanage": None}),
-            f"Cinder refused to unmanage {volume_id}",
-        )
+    def _unmanage(self, conn: Any, volume_id: str, journal: _Journal, sent: str) -> None:
+        """``os-unmanage``, journaled as ``sent`` once Cinder accepts it (SDD §7.3): after a crash
+        during the wait a resume waits again, or goes on when Cinder no longer knows the volume."""
+        try:
+            volume = conn.block_storage.get_volume(volume_id)
+        except Exception as exc:
+            if journal.done(sent) and _not_found(exc):
+                return
+            raise
+        if not journal.done(sent):
+            _checked(
+                conn.block_storage.post(f"/volumes/{volume_id}/action", json={"os-unmanage": None}),
+                f"Cinder refused to unmanage {volume_id}",
+            )
+            journal.mark(sent)
         conn.block_storage.wait_for_delete(volume, interval=self.poll_s, wait=self.wait_s)
 
     def _manage(
@@ -503,7 +512,22 @@ class HandoverExecutor:
         name: str | None,
         volume_type: str | None,
         bootable: bool,
+        journal: _Journal,
+        sent: str,
     ) -> str:
+        """``manage``, journaled as ``sent`` with the new volume id once Cinder accepts it (SDD
+        §7.3): after a crash during the wait a resume waits for that volume instead of managing
+        the object again, which the first manage renamed."""
+        if journal.done(sent):
+            volume_id = journal.get(sent)["volume_id"]
+            conn.block_storage.wait_for_status(
+                conn.block_storage.get_volume(volume_id),
+                status="available",
+                failures=["error", "error_managing"],
+                interval=self.poll_s,
+                wait=self.wait_s,
+            )
+            return str(volume_id)
         body: dict[str, Any] = {
             "host": host,
             "ref": ref,
@@ -517,6 +541,7 @@ class HandoverExecutor:
             f"Cinder refused to manage {ref} on {host}",
         )
         volume_id = response.json()["volume"]["id"]
+        journal.mark(sent, volume_id=str(volume_id))
         conn.block_storage.wait_for_status(
             conn.block_storage.get_volume(volume_id),
             status="available",
@@ -689,7 +714,9 @@ class HandoverExecutor:
             if not journal.done(key):
                 await self._call(
                     f"unmanage {att['volume_id']} at the source",
-                    lambda vid=att["volume_id"]: self._unmanage(src, vid),
+                    lambda vid=att["volume_id"]: self._unmanage(
+                        src, vid, journal, f"sent:unmanage_src:{vid}"
+                    ),
                 )
                 await asyncio.to_thread(journal.mark, key)
 
@@ -717,6 +744,8 @@ class HandoverExecutor:
                         a["name"],
                         mappings.volume_types.get(t, a["volume_type"]),
                         a["boot"],
+                        journal,
+                        f"sent:manage_dst:{a['volume_id']}",
                     ),
                 )
                 await asyncio.to_thread(journal.mark, key, dest_id=dest_id)
@@ -791,13 +820,21 @@ class HandoverExecutor:
             await self._call("delete the destination server", delete_destination)
             await asyncio.to_thread(journal.mark, "rb:delete_destination")
 
+        def managed_at_rhoso(vid: str) -> str | None:
+            """The RHOSO volume a manage created, confirmed or only sent before a crash (§7.3)."""
+            if journal.done(f"manage_dst:{vid}"):
+                return str(journal.get(f"manage_dst:{vid}")["dest_id"])
+            if journal.done(f"sent:manage_dst:{vid}"):
+                return str(journal.get(f"sent:manage_dst:{vid}")["volume_id"])
+            return None
+
         for att in reversed(attachments):
-            managed = journal.get(f"manage_dst:{att['volume_id']}")
+            dest_id = managed_at_rhoso(att["volume_id"])
             key = f"rb:unmanage_dst:{att['volume_id']}"
-            if managed and not journal.done(key):
+            if dest_id and not journal.done(key):
                 await self._call(
-                    f"unmanage {managed['dest_id']} in RHOSO",
-                    lambda vid=managed["dest_id"]: self._unmanage(dst, vid),
+                    f"unmanage {dest_id} in RHOSO",
+                    lambda v=dest_id, k=key: self._unmanage(dst, v, journal, f"sent:{k}"),
                 )
                 await asyncio.to_thread(journal.mark, key)
 
@@ -805,12 +842,19 @@ class HandoverExecutor:
         for att in reversed(attachments):
             vid = att["volume_id"]
             if not journal.done(f"unmanage_src:{vid}"):
-                new_ids[vid] = vid
-                continue
+                if not journal.done(f"sent:unmanage_src:{vid}"):
+                    new_ids[vid] = vid  # never unmanaged: still the source's volume
+                    continue
+                # sent before a crash: let Cinder finish it, then manage back as any other
+                await self._call(
+                    f"finish the unmanage of {vid} at the source",
+                    lambda v=vid: self._unmanage(src, v, journal, f"sent:unmanage_src:{v}"),
+                )
+                await asyncio.to_thread(journal.mark, f"unmanage_src:{vid}")
             key = f"rb:manage_src:{vid}"
             if not journal.done(key):
-                managed = journal.get(f"manage_dst:{vid}")
-                source_name = f"volume-{managed['dest_id']}" if managed else f"volume-{vid}"
+                dest_id = managed_at_rhoso(vid)
+                source_name = f"volume-{dest_id}" if dest_id else f"volume-{vid}"
                 ref = (definition.get("storage") or {}).get(vid)
                 back = (
                     manage_reference(ref["family"], ref["src_pool"], source_name)
@@ -819,8 +863,15 @@ class HandoverExecutor:
                 )
                 new_id = await self._call(
                     f"manage {source_name} back at the source",
-                    lambda a=att, r=back: self._manage(
-                        src, a["host"], r, a["name"], a["volume_type"], a["boot"]
+                    lambda a=att, r=back, k=key: self._manage(
+                        src,
+                        a["host"],
+                        r,
+                        a["name"],
+                        a["volume_type"],
+                        a["boot"],
+                        journal,
+                        f"sent:{k}",
                     ),
                 )
                 await asyncio.to_thread(journal.mark, key, volume_id=new_id)
