@@ -243,6 +243,10 @@ Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|
         actor: str, message: str, data: dict = {} }
 ```
 
+`progress_pct` is the running step's percentage. `bytes_total` is the VM's used bytes — what one full
+copy moves; `bytes_transferred` counts every pass (`sync_bytes_dropped` plus the listed passes, §5.4)
+and the running step's bytes, so a warm migration's grows past `bytes_total`.
+
 ### 4.3 Event kinds
 
 Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `plan.paused`,
@@ -255,7 +259,9 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 never a value.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
-`migration.log`, `heartbeat`.
+`migration.log`, `heartbeat`. `migration.progress` carries the running step's
+`{pct, bytes_done, bytes_total, phase}` as reported to the executor's progress callback (§7.1), not the
+migration's totals.
 
 ---
 
@@ -1291,7 +1297,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
-  stepper, progress, sync-pass convergence chart (once a long wait dropped passes from `sync_passes`, it says how
+  stepper, progress (the running step's percentage, and the bytes transferred over all passes and the disk's used
+  bytes as two figures, never one over the other — a warm migration transfers more than its disk holds; a
+  `migration.progress` event updates them by the API's rule: `pct`, and `sync_bytes_dropped` plus the listed passes
+  plus `bytes_done`), sync-pass convergence chart (once a long wait dropped passes from `sync_passes`, it says how
   many earlier passes are no longer listed and that the bytes they transferred stay counted, §5.4), downtime clock,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
