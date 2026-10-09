@@ -15,6 +15,7 @@ from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
+from ..storage import storage_family
 from .base import ProviderError, missing_dependency
 
 log = logging.getLogger(__name__)
@@ -186,17 +187,25 @@ class OpenStackProvider:
             or "ovn" in str(_attr(a, "binary", default="")).lower()
             for a in agents
         )
-        backends: list[str] = []
+        storage: list[dict[str, Any]] = []
         if admin:
-            backends = sorted(
-                str(_attr(p, "name"))
-                for p in _try(lambda: list(conn.block_storage.backend_pools()), [])
-            )
+            for pool in _try(lambda: list(conn.block_storage.backend_pools()), []):
+                caps = _attr(pool, "capabilities", default={}) or {}
+                storage.append(
+                    {
+                        "pool": str(_attr(pool, "name")),
+                        "vendor": caps.get("vendor_name"),
+                        "protocol": caps.get("storage_protocol"),
+                        "family": storage_family(caps),
+                    }
+                )
+            storage.sort(key=lambda b: b["pool"])
         return {
             "admin": admin,
             "compute_microversion": microversion,
             "ovn": ovn,
-            "volume_backends": backends,
+            "volume_backends": [b["pool"] for b in storage],
+            "storage_backends": storage,
         }
 
     def _list_vms(self) -> list[VMRef]:
@@ -440,6 +449,7 @@ class _MapContext:
                 kind="volume",
                 multiattach=_truthy(_attr(volume, "is_multiattach", "multiattach")),
                 encrypted=_truthy(_attr(volume, "is_encrypted", "encrypted")),
+                pool=_attr(volume, "host"),
             )
             volume_disks.append((disk, _truthy(_attr(volume, "is_bootable", "bootable"))))
         if not image_booted and volume_disks and not any(d.bootable for d, _ in volume_disks):

@@ -126,6 +126,8 @@ class Disk(_Model):
     multiattach: bool = False
     encrypted: bool = False
     independent: bool = False
+    # Cinder "host@backend#pool" of a volume (admin only); decides the handover reference (§7.3.1)
+    pool: str | None = None
 
 
 class Nic(_Model):

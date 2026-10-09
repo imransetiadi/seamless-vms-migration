@@ -163,7 +163,12 @@ class FakeBlockStorage:
         return [NS(name="ceph-ssd"), NS(name="ceph-hdd")]
 
     def backend_pools(self):
-        return [NS(name="hostgroup@ceph#ssd")]
+        return [
+            NS(
+                name="hostgroup@ceph#ssd",
+                capabilities={"vendor_name": "Open Source", "storage_protocol": "ceph"},
+            )
+        ]
 
 
 class FakeNetwork:
@@ -510,10 +515,61 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
         "compute_microversion": "2.95",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
+        "storage_backends": [
+            {
+                "pool": "hostgroup@ceph#ssd",
+                "vendor": "Open Source",
+                "protocol": "ceph",
+                "family": "rbd",
+            }
+        ],
     }
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["admin"] is False and caps["ovn"] is False
+
+
+async def test_openstack_check_reports_storage_backends_with_family(stub_openstack):
+    conn = fake_conn()
+    conn.block_storage.backend_pools = lambda: [
+        NS(
+            name="overcloud@ontap_nfs#192.0.2.5:/cinder_vol",
+            capabilities={"vendor_name": "NetApp", "storage_protocol": "nfs"},
+        ),
+        NS(
+            name="overcloud@ontap_iscsi#flex_a",
+            capabilities={"vendor_name": "NetApp", "storage_protocol": "iSCSI"},
+        ),
+        NS(name="overcloud@lvm#lvm", capabilities=None),
+    ]
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["volume_backends"] == [
+        "overcloud@lvm#lvm",
+        "overcloud@ontap_iscsi#flex_a",
+        "overcloud@ontap_nfs#192.0.2.5:/cinder_vol",
+    ]
+    assert [(b["pool"], b["family"]) for b in caps["storage_backends"]] == [
+        ("overcloud@lvm#lvm", "other"),
+        ("overcloud@ontap_iscsi#flex_a", "netapp_block"),
+        ("overcloud@ontap_nfs#192.0.2.5:/cinder_vol", "netapp_nfs"),
+    ]
+    assert caps["storage_backends"][1]["vendor"] == "NetApp"
+    assert caps["storage_backends"][1]["protocol"] == "iSCSI"
+    # without admin the pool listing is not attempted
+    stub_openstack(fake_conn(admin=False))
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["storage_backends"] == [] and caps["volume_backends"] == []
+
+
+async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
+    conn = fake_conn()
+    conn.block_storage.get_volume("vol-root").host = "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    root, data = vm.disks
+    assert root.pool == "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+    assert data.pool is None  # host attribute hidden from non-admin credentials
 
 
 async def test_openstack_destination_inventory(stub_openstack):
