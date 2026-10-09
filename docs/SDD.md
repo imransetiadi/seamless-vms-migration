@@ -938,7 +938,9 @@ name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
 12 VMware VMs with mixed CBT/snapshot/independent-disk states; a RHOSO destination with networks,
 flavors, volume types and quotas). `providers.registry.build(provider, settings)` returns the right
-implementation (fake when `settings.demo`).
+implementation (fake when `settings.demo`). The demo seeds two running plans: the finance plan takes
+22 of the 24 OpenStack VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them
+(one VM, one migration across plans, §5.4) — and the VMware plan all 12 VMware VMs.
 
 ---
 
