@@ -1260,7 +1260,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
-  active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, SLO,
+  active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, per-VM
+  strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
+  not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
   approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
   convergence threshold, maximum passes and the keep-warm interval (at least a minute, §5.4) — estimator overrides,
   the resources pre-staged at the destination (any of the six defaults of §4.2, in that order; other entries a plan
