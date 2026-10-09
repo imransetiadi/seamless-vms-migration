@@ -343,7 +343,19 @@ export default function PlanDetail() {
         <Panel title="Migrations" description="Strategy, estimated downtime and pre-flight findings per VM">
           {migrations.isPending && <LoadingBlock label="Loading migrations…" rows={5} />}
           {migrations.error && <ErrorBanner error={migrations.error} title="Migrations are unavailable" onRetry={() => void migrations.refetch()} />}
-          {migrations.data && <MigrationsTable migrations={list} plan={p} caption={`Migrations in ${p.name}`} />}
+          {migrations.data && (
+            <MigrationsTable
+              migrations={list}
+              plan={p}
+              caption={`Migrations in ${p.name}`}
+              emptyDescription="Validation creates one migration per VM and runs the pre-flight checks."
+              emptyAction={
+                <Button icon={ListChecks} loading={pending('validate') || checking} disabledReason={actions.validate.reason} onClick={() => void askOrValidate()}>
+                  Validate
+                </Button>
+              }
+            />
+          )}
         </Panel>
 
         <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-hidden">

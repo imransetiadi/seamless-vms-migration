@@ -114,3 +114,17 @@ describe('MigrationsTable', () => {
     expect(cell).toHaveTextContent(billing.estimate?.meets_slo ? /within SLO/ : /over SLO/);
   });
 });
+
+
+describe('MigrationsTable without migrations', () => {
+  it('shows what the page says about an empty plan and its action (SDD §16)', () => {
+    render(
+      <MemoryRouter>
+        <MigrationsTable migrations={[]} plan={plan} emptyDescription="Validation creates them." emptyAction={<button type="button">Validate</button>} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/no migrations in this plan yet/i)).toBeInTheDocument();
+    expect(screen.getByText('Validation creates them.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Validate' })).toBeInTheDocument();
+  });
+});

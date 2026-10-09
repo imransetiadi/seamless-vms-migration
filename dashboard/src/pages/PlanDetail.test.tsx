@@ -64,6 +64,28 @@ describe('PlanDetail', () => {
     expect(await actionButton(/^start/i)).not.toHaveAttribute('aria-disabled');
   });
 
+  it('says that validation creates the migrations of a new plan, with Validate there too (SDD §16)', async () => {
+    const server = createTestServer();
+    const taken = new Set(server.migrations.map((m) => m.vm.source_id));
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string }>> }).inventories;
+    const free = inventories['rhosp17-dc1']!.filter((v) => !taken.has(v.source_id)).slice(0, 2).map((v) => v.source_id);
+    const plan = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Fresh wave',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: free,
+    });
+    const user = userEvent.setup();
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+
+    const panel = await screen.findByRole('region', { name: /^migrations$/i });
+    expect(await within(panel).findByText(/no migrations in this plan yet/i)).toBeInTheDocument();
+    expect(panel).toHaveTextContent(/validation creates one migration per vm and runs the pre-flight checks/i);
+    await user.click(within(panel).getByRole('button', { name: /^validate$/i }));
+    expect(await within(panel).findByRole('table', { name: /migrations in fresh wave/i })).toBeInTheDocument();
+    expect(server.migrations.filter((m) => m.plan_id === plan.id)).toHaveLength(2);
+  });
+
   it('says which plan holds a VM when validation is refused (SDD §5.4)', async () => {
     const server = createTestServer();
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
