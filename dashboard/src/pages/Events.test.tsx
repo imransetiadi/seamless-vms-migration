@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { LiveContext, LiveEventHub } from '../api/live';
 import type { MockServer } from '../api/mock';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp } from '../test/utils';
 import Events from './Events';
 
 async function streamReady(server: MockServer) {
@@ -81,6 +81,22 @@ describe('Events page', () => {
 
     expect(within(list).getAllByRole('listitem')).toHaveLength(before);
     expect(screen.getByRole('status', { name: /event stream/i })).toHaveTextContent(/waiting for new events/i);
+  });
+
+  it('never says no events match when the history cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/events'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/the audit trail is unavailable/i);
+    expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryAllByText(/no events match/i)).toHaveLength(0);
+    // the download says why there is nothing to download
+    expect(screen.getByRole('button', { name: /download shown events/i })).toHaveAccessibleDescription(/audit trail could not be loaded/i);
   });
 
   it('filters by category and text', async () => {

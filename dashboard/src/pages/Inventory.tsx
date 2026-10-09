@@ -211,10 +211,12 @@ export default function Inventory() {
         }
       />
 
+      {/* the inventory shows with its provider: while that is loading or failed, say so (SDD §16) */}
+      {providers.error && <ErrorBanner error={providers.error} title="Providers are unavailable" onRetry={() => void providers.refetch()} />}
       {providers.data && !provider && (
         <EmptyState icon={Server} title={`Provider ${providerId} does not exist`} description="Pick another provider above." />
       )}
-      {inventory.isPending && provider && <LoadingBlock label="Reading inventory…" rows={6} />}
+      {(providers.isPending || (inventory.isPending && provider)) && <LoadingBlock label="Reading inventory…" rows={6} />}
       {inventory.error && (
         <ErrorBanner error={inventory.error} title={`Cannot read the inventory of ${provider?.name ?? providerId}`} onRetry={() => void inventory.refetch()} />
       )}

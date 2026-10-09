@@ -153,6 +153,8 @@ export default function Events() {
       return [event.message, event.kind, event.actor, event.plan_id ?? '', event.migration_id ?? ''].some((v) => v.toLowerCase().includes(q));
     });
   }, [items, category, query, showProgress]);
+  // a failed history load with nothing cached: the trail is unknown, not empty (SDD §16)
+  const historyUnknown = Boolean(history.error) && !history.data;
 
   /** The filtered audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
@@ -188,7 +190,12 @@ export default function Events() {
         description="The audit trail of every plan, migration, advisor and provider action, followed live."
         actions={
           <div className="flex flex-wrap gap-2">
-            <Button size="lg" icon={Download} onClick={download} disabledReason={filtered.length ? null : 'No events match the filters.'}>
+            <Button
+              size="lg"
+              icon={Download}
+              onClick={download}
+              disabledReason={filtered.length ? null : historyUnknown ? 'The audit trail could not be loaded.' : 'No events match the filters.'}
+            >
               Download shown events
             </Button>
             {paused ? (
@@ -246,7 +253,8 @@ export default function Events() {
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
-      {!history.isPending && filtered.length === 0 && (
+      {/* "No events match" only once the trail is known: a failed load is not an empty trail (SDD §16) */}
+      {history.data && filtered.length === 0 && (
         <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
       )}
 
