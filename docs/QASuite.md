@@ -931,8 +931,9 @@ SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1 SEAMLESS_MEMORY_URL=http://127.0.0.1:
 cd dashboard
 npm ci
 npm test                      # Vitest (jsdom)
-npm run typecheck
-npm run build                 # same as `make dashboard-build`; CI also runs `npm run lint` and `npm run typecheck`
+npm run typecheck             # src, the Vite/Tailwind configs and the Playwright specs (tsconfig.e2e.json)
+npm run build                 # same as `make dashboard-build`; type-checks the app only (typecheck:app), so a broken
+                              # test spec never blocks a build; CI also runs `npm run lint` and `npm run typecheck`
 VITE_SEAMLESS_MOCK=1 npm run dev      # in-browser mock adapter that exercises every phase
 ```
 
