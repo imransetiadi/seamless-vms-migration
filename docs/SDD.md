@@ -336,7 +336,13 @@ plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written be
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
 migrations of VMs removed from `vm_ids`, so it also refuses — before
 changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1): such a VM stays
-in the plan until it is cut over or rolled back.
+in the plan until it is cut over or rolled back. One VM, one migration holds across plans too: a migration
+*holds* its VM in every phase but `cancelled`, `finalized` and `rolled_back`, and `validate_plan` refuses
+(409, before changing anything) a VM that a migration of another plan with the same source provider holds,
+naming the VM, that plan and the phase — finish, roll back or cancel it there, or remove the VM from
+`vm_ids`; two plans would both stop the source and cut it over. For the same reason a retry (`failed` or
+`rolled_back` → `ready`) is refused (409) while another plan holds the VM. Validations and retries take one
+shared lock for this check, so two plans cannot claim a VM at the same time.
 `vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
 them; the SLO estimate and `max_sync_passes` decide.
 
