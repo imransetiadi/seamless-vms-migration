@@ -261,6 +261,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
   const editing = Boolean(current);
   const nameRef = useRef<HTMLInputElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
+  // the dialog swaps its content in place: the focus follows to the new step (SDD §16)
+  const outcomeRef = useRef<HTMLHeadingElement>(null);
   const [form, setForm] = useState<FormState>(() => initialState(provider));
   const [errors, setErrors] = useState<Errors>({});
   const [hostOpen, setHostOpen] = useState(false);
@@ -416,6 +418,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (test) {
         saved = keep(await check.mutateAsync(saved.id));
         setOutcome({ provider: saved, checked: true });
+        requestAnimationFrame(() => outcomeRef.current?.focus());
       } else {
         onSaved?.(saved, `${saved.name} ${provider ? 'saved' : 'added'}.`);
         onClose();
@@ -457,7 +460,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           <div className="flex items-start gap-3">
             <PlatformMark preset={preset} size="lg" />
             <div className="min-w-0">
-              <h2 id={titleId} className="text-lg font-semibold text-foreground">
+              <h2 ref={outcomeRef} id={titleId} tabIndex={-1} className="text-lg font-semibold text-foreground outline-hidden">
                 {ok ? `${outcome.provider.name} is connected` : `${outcome.provider.name} was saved, but the connection test did not pass`}
               </h2>
               <p className="text-sm text-muted-foreground">Connection test result: {meta.label}.</p>
@@ -472,7 +475,14 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           {!ok && <p className="text-sm text-muted-foreground">Check the endpoint, the CA and the sign-in details, then test again.</p>}
           <div className="flex flex-wrap justify-end gap-2">
             {!ok && (
-              <Button size="lg" variant="secondary" onClick={() => setOutcome(null)}>
+              <Button
+                size="lg"
+                variant="secondary"
+                onClick={() => {
+                  setOutcome(null);
+                  requestAnimationFrame(() => nameRef.current?.focus());
+                }}
+              >
                 Edit again
               </Button>
             )}

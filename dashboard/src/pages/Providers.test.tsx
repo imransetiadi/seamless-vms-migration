@@ -290,4 +290,37 @@ describe('Providers page', () => {
     expect(added).toHaveLength(1);
     expect(added[0]).toMatchObject({ endpoint: 'https://kolla-d.example.com:5000/v3', status: 'ok' });
   });
+
+  it('keeps the focus in the dialog when the test result replaces the form, and on Edit again (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab F');
+    await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://unreachable.example.com:5000/v3');
+    await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+    await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+    await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+    await user.click(within(dialog).getByRole('button', { name: /add and test connection/i }));
+
+    const failed = await screen.findByRole('dialog', { name: /kolla lab f was saved, but the connection test did not pass/i });
+    // the result's heading takes the focus from the button that went away
+    await waitFor(() => expect(within(failed).getByRole('heading', { level: 2 })).toHaveFocus());
+    await user.click(within(failed).getByRole('button', { name: /^edit again$/i }));
+    const form = await screen.findByRole('dialog', { name: /edit kolla lab f/i });
+    await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
+  });
+
+  it('moves the focus to the column heading once a deleted provider is gone (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('admin');
+    const from = await screen.findByRole('region', { name: 'Migrate from' });
+    const card = within(from).getByRole('article', { name: 'Kolla Edge (Bobcat)' });
+    await user.click(within(card).getByRole('button', { name: /^delete$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /delete kolla edge/i });
+    await user.type(within(dialog).getByLabelText(/type kolla-edge to confirm/i), 'kolla-edge');
+    await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
+    await waitFor(() => expect(within(from).queryByRole('article', { name: 'Kolla Edge (Bobcat)' })).not.toBeInTheDocument());
+    await waitFor(() => expect(within(from).getByRole('heading', { name: 'Migrate from' })).toHaveFocus());
+  });
 });

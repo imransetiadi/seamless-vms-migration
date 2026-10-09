@@ -127,4 +127,13 @@ describe('MigrationsTable without migrations', () => {
     expect(screen.getByText('Validation creates them.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Validate' })).toBeInTheDocument();
   });
+
+  it('keeps the focus in the filters when Clear filters goes away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderTable();
+    const search = screen.getByRole('searchbox', { name: /search migrations/i });
+    await user.type(search, migrations[0]!.vm.name);
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
+  });
 });

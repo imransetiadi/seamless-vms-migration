@@ -1,5 +1,5 @@
 import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCheckAllProviders, useCheckProvider, useDeleteProvider, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
@@ -103,12 +103,14 @@ function ProviderCard({
   canEdit,
   onEdit,
   onAnnounce,
+  onDeleted,
 }: {
   provider: Provider;
   canCheck: boolean;
   canEdit: boolean;
   onEdit: () => void;
   onAnnounce: (message: string) => void;
+  onDeleted: () => void;
 }) {
   const headingId = useId();
   const check = useCheckProvider();
@@ -234,6 +236,7 @@ function ProviderCard({
             onSuccess: () => {
               setConfirmDelete(false);
               onAnnounce(`${provider.name} deleted.`);
+              onDeleted();
             },
           })
         }
@@ -330,10 +333,20 @@ function ProviderColumn({
   onAnnounce: (message: string) => void;
 }) {
   const headingId = useId();
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const [deleted, setDeleted] = useState<string | null>(null);
+  useEffect(() => {
+    // the deleted card is gone (with the button the dialog returned the focus to): the column
+    // heading takes the focus, never the page body (SDD §16)
+    if (deleted && !items.some((p) => p.id === deleted)) {
+      headingRef.current?.focus();
+      setDeleted(null);
+    }
+  }, [deleted, items]);
   return (
     <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-3">
       <div>
-        <h2 id={headingId} className="text-base font-semibold text-foreground">
+        <h2 ref={headingRef} id={headingId} tabIndex={-1} className="text-base font-semibold text-foreground outline-hidden">
           {title}
         </h2>
         <p className="text-sm text-muted-foreground">{description}</p>
@@ -349,6 +362,7 @@ function ProviderColumn({
             canEdit={canEdit}
             onEdit={() => onEdit(provider)}
             onAnnounce={onAnnounce}
+            onDeleted={() => setDeleted(provider.id)}
           />
         ))
       )}

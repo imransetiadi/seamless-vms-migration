@@ -71,6 +71,20 @@ describe('VmTable', () => {
     expect(bodyRows()).toHaveLength(openstackVms.length);
   });
 
+  it('keeps the focus in the filters when Clear filters goes away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+    const search = screen.getByRole('searchbox', { name: /search vms/i });
+    // the toolbar's Clear filters
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
+    // the empty state's Clear filters
+    await user.type(search, 'no-such-vm');
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
+  });
+
   it('shows readiness flags as text, including VMware CBT state', () => {
     render(<VmTable vms={vmwareVms} providerKind="vmware" />);
     const row = (name: string) => bodyRows().find((r) => r.textContent?.includes(name));

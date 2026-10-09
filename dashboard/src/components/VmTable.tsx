@@ -82,6 +82,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   const selectable = Boolean(selected && onSelectedChange);
 
   const rows = useMemo<Row[]>(
@@ -163,6 +164,8 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setReadiness('all');
     setProject('all');
     setOs('all');
+    // the button goes away with the filters: the search field keeps the focus (SDD §16)
+    searchRef.current?.focus();
   };
 
   const toggle = (id: string) => {
@@ -191,6 +194,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             Search VMs
           </label>
           <input
+            ref={searchRef}
             id={searchId}
             type="search"
             className="input"
