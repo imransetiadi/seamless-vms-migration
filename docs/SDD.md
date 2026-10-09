@@ -1307,7 +1307,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
   approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
-  convergence threshold, maximum passes and the keep-warm interval (at least a minute, §5.4) — estimator overrides,
+  convergence threshold, maximum passes and the keep-warm interval (at least a minute, §5.4) — estimator overrides
+  (scan rate per disk stream, disks scanned in parallel, guest write rate `change_rate_bps`, aggregate scan cap
+  `max_aggregate_scan_bps`, §9.1; other overrides a plan already has are kept),
   the resources pre-staged at the destination (any of the six defaults of §4.2, in that order; other entries a plan
   already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review — and storage handover),
