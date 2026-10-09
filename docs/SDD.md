@@ -1004,12 +1004,17 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible) | `Migration` |
-| GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000) | `Event[]` |
+| GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false) | `Event[]` (ascending `seq`) |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str, "limit": int = 5}` | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
+
+`GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
+continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
+`since` instead, still in ascending `seq`, so a history of the latest events is one request however
+many events are persisted (§16).
 
 Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
@@ -1269,7 +1274,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
   similar-incident search), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
-  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). `VITE_SEAMLESS_MOCK=1` switches
+  typed errors); `src/api/stream.ts` (fetch-based SSE with resume); the event history of the Events page
+  and of a migration's timeline is one `GET /events?tail=true` request (§12). `VITE_SEAMLESS_MOCK=1` switches
   to an in-browser mock adapter (`src/api/mock.ts`) with fixture data that exercises every phase.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
