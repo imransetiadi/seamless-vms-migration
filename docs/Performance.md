@@ -616,7 +616,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 |---|---|---|
 | `/stats` and `/metrics` validate every migration document when the change stamp moved | one load per change; a busy fleet with thousands of migrations re-validates often | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
 | Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
-| Event table growth | append-only, no purge | partition by month, archive |
+| Event table growth | append-only; bounded by `seamless events export` and `seamless events prune` (SDD §15) on a retention schedule | partition by month for very large estates |
 
 ---
 

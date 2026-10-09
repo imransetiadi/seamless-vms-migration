@@ -157,8 +157,11 @@ application credentials ([Security.md](../../docs/Security.md) §7).
 
 ## Data, backup, reset
 
-* Volumes: `seamless_pgdata` (system of record: plans, migrations, events) and `seamless_seamless-data`
-  (run directories). `make seamless-down` keeps them; `make seamless-reset CONFIRM=yes` deletes them.
+* Volumes: `seamless_pgdata` (system of record: plans, migrations, events), `seamless_seamless-data`
+  (run directories) and `seamless_seamless-secrets` (provider credentials and conversion-host keys entered
+  in the dashboard, 0600 files). `make seamless-down` keeps them; `make seamless-reset CONFIRM=yes` deletes
+  them. Back up the secrets volume like a secret, separately from the database dump, or re-enter the
+  credentials after a restore.
 * Switching between demo and real use: reset first — demo seeds fake providers and plans into the database.
 * Every PostgreSQL connection needs a password, also inside the container; the container's own
   `POSTGRES_PASSWORD` is used so the secret never appears on a command line. The `initdb` options only apply
