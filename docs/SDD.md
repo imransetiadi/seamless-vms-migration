@@ -691,7 +691,12 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   wave-complete phases with no `failed`.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
   migration after **every** state change, emits events, and records `checkpoint` (last completed
-  step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed.
+  step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed, and
+  every tick resumes the same way any of them whose driver task died (an unexpected error outside a
+  step, e.g. a database error while persisting after a successful step — the VM may be stopped):
+  the crash is emitted as `migration.error` (`step: driver`, redacted message, crash count), and while
+  a driver keeps crashing its relaunch backs off (`2^n × tick_s`, at most 300 s). A migration whose
+  step task is still running is not relaunched.
 * Failure handling: `TransientStepError` → retry with backoff `2^attempt` s (×1/demo_speed) up to
   `max_step_retries`; then `failed`. If downtime had started and
   `plan.verification.auto_rollback` is true → `rolling_back` automatically. On every failure the
