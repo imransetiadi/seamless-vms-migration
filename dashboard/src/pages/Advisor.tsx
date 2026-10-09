@@ -76,6 +76,16 @@ export default function Advisor() {
 
   const s = status.data;
   const memoryEnabled = s?.memory.enabled ?? false;
+  // why Search is unavailable: a status still loading or not loaded is not "not enabled" (SDD §16)
+  const searchReason = !canSearch
+    ? 'Searching requires the operator role.'
+    : status.isPending
+      ? 'Checking whether agentmemory is enabled…'
+      : !s
+        ? 'The advisor status could not be loaded.'
+        : memoryEnabled
+          ? null
+          : 'agentmemory is not enabled.';
 
   const notes = useMemo<AdvisorNoteRow[]>(
     () =>
@@ -162,7 +172,7 @@ export default function Advisor() {
                 variant="primary"
                 icon={Search}
                 loading={search.isPending}
-                disabledReason={canSearch ? (memoryEnabled ? null : 'agentmemory is not enabled.') : 'Searching requires the operator role.'}
+                disabledReason={searchReason}
               >
                 Search
               </Button>
