@@ -29,7 +29,8 @@ repository's root). os-migrate stays the *data mover* and resource exporter/impo
 * a **warm migration path** for OpenStack sources (snapshot pre-copy while the VM runs, then a
   hash-based delta sync after shutdown) so downtime is proportional to the *final delta*, not the
   disk size (§6);
-* a **storage handover** path for clouds that share a Ceph cluster (Cinder unmanage/manage, §7.3);
+* a **storage handover** path for clouds that share a Ceph cluster or a NetApp ONTAP SVM (NFS, iSCSI,
+  FC) (Cinder unmanage/manage, §7.3);
 * **VMware warm migration** orchestration through `os_migrate.vmware_migration_kit` (CBT, §7.5);
 * a **control plane** (`seamless/`, Python): plans, waves, strategy selection, downtime estimation,
   pre-flight validation, an orchestrator with an explicit state machine, REST API + SSE, CLI (§8–§13);
@@ -55,6 +56,7 @@ from VMware. Seamless serves those cases and is designed to coexist with adoptio
 | OpenStack APIs are 2023.1 (Antelope) based; TLS everywhere is on by default. | `verify_tls` defaults to `true`; CA bundles are configurable per provider. |
 | Networking is ML2/OVN only (Geneve tenant networks, MTU typically 1442 on a 1500 underlay). | Pre-flight compares source/destination MTUs (finding `NET_MTU_SHRINK`); OVS-specific port bindings are not copied. |
 | Cinder supports `manage`/`unmanage`; RBD driver supports manage-existing by image name. | Enables the storage-handover strategy on shared Ceph (§7.3). |
+| The NetApp ONTAP Cinder drivers (RHOSP 17.1 and RHOSO 18.0; NFS, iSCSI, FC) support manage-existing by share path (NFS) or LUN path (block) and rename the object to the new volume's name; their snapshots and volumes-from-snapshot are FlexClone clones. | Storage handover on a shared ONTAP SVM (§7.3.1). Cold and warm work unchanged on ONTAP; the warm path's snapshot clones need the FlexClone license. |
 
 ---
 
@@ -95,7 +97,7 @@ Responsibilities:
 |---|---|---|---|---|
 | `cold` | OpenStack | os-migrate `import_workloads` (stop → snapshot/detach → NBD over SSH → create) | full copy of used data | conversion hosts in both clouds |
 | `warm` | OpenStack | N snapshot pre-copy passes while running, then stop + final `blocksync` delta pass (§6) | final delta + device scan | conversion hosts in both clouds; no multi-attach volumes |
-| `storage_handover` | OpenStack on shared Ceph | stop → Cinder `os-unmanage` at source → `manage` at RHOSO → boot (§7.3) | metadata operations (~minutes) | admin on both clouds; every volume type mapped to a RHOSO backend that sees the same pool; all disks are Cinder volumes |
+| `storage_handover` | OpenStack on shared Ceph or NetApp ONTAP (NFS, iSCSI, FC) | stop → Cinder `os-unmanage` at source → `manage` at RHOSO → boot (§7.3) | metadata operations (~minutes) | admin on both clouds; every volume type mapped to a RHOSO backend of the same driver family that sees the same pool (Ceph pool, ONTAP export or FlexVol, §7.3.1); all disks are Cinder volumes |
 | `vmware_cold` | VMware | vmware-migration-kit full copy + virt-v2v conversion | full copy + conversion | RHOSO conversion host with VDDK |
 | `vmware_warm` | VMware | vmware-migration-kit `cbt_sync` passes then `cutover` | final CBT delta + in-place conversion | CBT enabled; no independent disks |
 
@@ -149,7 +151,8 @@ Provider { id: str  (regex ^[a-z0-9][a-z0-9-]{1,62}$), name: str, kind: Provider
 Disk  { id: str, name: str|null, size_gb: int, used_gb: float|null, bootable: bool = false,
         volume_type: str|null, device: str|null,
         kind: "volume"|"ephemeral"|"image_root"|"vmdk" = "volume",
-        multiattach: bool = false, encrypted: bool = false, independent: bool = false }
+        multiattach: bool = false, encrypted: bool = false, independent: bool = false,
+        pool: str|null = null }   # Cinder "host@backend#pool" of a volume (admin only; §7.3.1)
 
 Nic   { network: str, mac: str|null, fixed_ips: list[str] = [], vnic_type: str = "normal",
         mtu: int|null }
@@ -168,7 +171,8 @@ Mappings { networks: dict[str,str] = {}, flavors: dict[str,str] = {},
            volume_types: dict[str,str] = {}, projects: dict[str,str] = {} }
 
 HandoverConfig { enabled: bool = false, backend_map: dict[str,str] = {} }
-        # source volume_type -> RHOSO cinder host "hostgroup@backend#pool"
+        # source volume_type -> RHOSO cinder host "hostgroup@backend#pool", or "hostgroup@backend"
+        # to resolve the pool per volume (§7.3.1)
 
 CutoverWindow { start: datetime, end: datetime }
 
@@ -560,10 +564,13 @@ Uses openstacksdk sessions (raw REST through `conn.compute` / `conn.block_storag
 refuses `os-unmanage` on an attached (`in-use`) volume, and Nova deletes `delete_on_termination`
 volumes with their server, so the order is:
 
+0. Resolve the storage reference of every attached volume (§7.3.1). Any volume that cannot be
+   resolved fails the step with a permanent error **before** anything changes: the VM keeps running.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it), and the volume attachments in device
-   order (volume id, device, boot index, bootable, type, size).
+   order (volume id, device, boot index, bootable, type, size, Cinder host) and the resolved
+   storage references (`storage`: per volume its family, source pool and destination host).
 3. For every attachment set `delete_on_termination=false`:
    `PUT /servers/{id}/os-volume_attachments/{volume_id}` `{"volumeAttachment": {"volumeId": …,
    "delete_on_termination": false}}` with compute microversion **2.85**; verify by re-reading.
@@ -572,19 +579,40 @@ volumes with their server, so the order is:
 4. Delete the source server; wait until every journaled volume is `available`.
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
-   backend_map[type], "ref": {"source-name": "volume-<source_volume_id>"}, "name": …,
-   "volume_type": mapped, "bootable": …}}`; wait `available`. The RBD driver renames the image to
-   `volume-<new_id>` — journal the new id/name, it is the reference for a reverse manage.
+   <resolved destination host>, "ref": <reference for the family and destination pool, named
+   "volume-<source_volume_id>">, "name": …, "volume_type": mapped, "bootable": …}}`; wait
+   `available`. Every supported driver renames the object to `volume-<new_id>` — journal the new
+   id/name, it is the reference for a reverse manage.
 7. Create the destination server from the managed volumes (BDM in journaled device order,
    `delete_on_termination: false`).
 
 Rollback walks the journal backwards: delete the destination server; unmanage at RHOSO; manage at the
-source with `source-name: "volume-<rhoso_volume_id>"` and the journaled source host/type; recreate
+source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
+journaled source host/type (a definition journaled without `storage` is RBD); recreate
 the source ports with their journaled MAC and fixed IPs (admin is already required); recreate the
 source server from the journaled definition with the volumes in device order; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
 (`handover-journal.json`, 0600) so a crash resumes at the first incomplete sub-step. QASuite marks
 handover as **lab-verification required** before production use.
+
+#### 7.3.1 Storage references per driver family
+
+The manage reference and the destination pool depend on the Cinder driver family of each volume's
+pool, read from `GET /scheduler-stats/get_pools?detail=True` (admin) on both clouds:
+
+| Family | Pool capabilities | Manage reference (`ref`) | Destination pool |
+|---|---|---|---|
+| `rbd` | `storage_protocol` = `ceph` | `{"source-name": "<name>"}` | the pool named in `backend_map[type]`; without one, the backend's only pool |
+| `netapp_nfs` | `vendor_name` contains `NetApp`, `storage_protocol` = `nfs` | `{"source-name": "<share>/<name>"}`, `<share>` = the pool (`address:/export`) as the managing cloud configures it | the mapped backend's pool whose export path (after `:`) equals the source's; the address (LIF) may differ |
+| `netapp_block` | `vendor_name` contains `NetApp`, `storage_protocol` = `iSCSI` or `FC` | `{"source-name": "/vol/<flexvol>/<name>"}`, `<flexvol>` = the pool | the mapped backend's pool named like the source FlexVol (same SVM) |
+| `other` | anything else | — | handover refused |
+
+`<name>` is `volume-<id>` (Cinder's default `volume_name_template`). A `backend_map` value
+`host@backend` lets the pool be resolved per volume; `host@backend#pool` names it (for the NetApp
+families it must equal the resolved pool). Source and destination families must be equal. Pools that
+cannot be read, an unsupported family, a missing destination pool or a family mismatch refuse the
+handover in step 0. For ONTAP the destination backend must reach the same SVM: the export in its NFS
+shares, or the FlexVol inside its pool search pattern.
 
 ### 7.4 SimulatedExecutor (`executors/simulated.py`)
 
@@ -699,7 +727,9 @@ The scan term is the warm path's floor; removing it is the purpose of decision D
 * `warm`: as `cold`, plus any disk `multiattach`.
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, and `src_caps["admin"]` and
-  `dst_caps["admin"]` truthy.
+  `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
+  `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
+  `storage_backends` — a destination pool that resolves (§7.3.1).
 * `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
@@ -782,7 +812,10 @@ gigabytes}] (free amounts), projects: list[str]}`.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
-"compute_microversion": str, "ovn": bool, "volume_backends": [...]}`), `VMwareProvider` (pyVmomi,
+"compute_microversion": str, "ovn": bool, "volume_backends": [pool names], "storage_backends":
+[{"pool": str, "vendor": str|null, "protocol": str|null, "family": "rbd"|"netapp_nfs"|
+"netapp_block"|"other"}]}`, both lists empty without admin; volume disks carry their Cinder `pool`),
+`VMwareProvider` (pyVmomi,
 lazy; reports CBT, snapshots, independent disks, tools state), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
