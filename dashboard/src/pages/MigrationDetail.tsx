@@ -408,25 +408,25 @@ export default function MigrationDetail() {
           </Panel>
         </div>
 
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="Estimate inputs" description="What the downtime estimate rests on; delta passes calibrate it (SDD §9.1)">
-            <CalibrationPanel migration={m} plan={p} />
-          </Panel>
-          {hasResolvedMappings(m) && (
-            <Panel title="Resolved mappings" description="Matched automatically by pre-flight; add a plan mapping to override (SDD §9.3)">
-              <ResolvedMappings migration={m} />
-            </Panel>
-          )}
-        </div>
-
         <Panel title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
           <EstimatesPanel m={m} role={role} />
         </Panel>
 
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="VM">
-            <VmDetails m={m} />
-          </Panel>
+        {/* the short panels stack beside the long timeline instead of leaving half rows empty */}
+        <div className="grid items-start gap-4 xl:grid-cols-2">
+          <div className="flex min-w-0 flex-col gap-4">
+            <Panel title="Estimate inputs" description="What the downtime estimate rests on; delta passes calibrate it (SDD §9.1)">
+              <CalibrationPanel migration={m} plan={p} />
+            </Panel>
+            {hasResolvedMappings(m) && (
+              <Panel title="Resolved mappings" description="Matched automatically by pre-flight; add a plan mapping to override (SDD §9.3)">
+                <ResolvedMappings migration={m} />
+              </Panel>
+            )}
+            <Panel title="VM">
+              <VmDetails m={m} />
+            </Panel>
+          </div>
           <Panel title="Timeline" description="Phase changes and audit events, newest first">
             {history.error && <ErrorBanner error={history.error} title="Events are unavailable" onRetry={() => void history.refetch()} />}
             <Timeline history={m.phase_history} events={events} />
