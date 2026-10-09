@@ -667,7 +667,8 @@ strategy.
 Not an executor step: the orchestrator calls `Verifier.verify(ctx) -> VerificationResult` with
 `passed: bool`, `checks: list[{name, ok, detail}]`, `evidence: dict`. Checks:
 `server_active` (destination server status `ACTIVE`), `ports_up` (all ports `ACTIVE`),
-`tcp:<port>` for each configured port (connect with 5 s timeout from the control plane),
+`tcp:<port>` for each configured port (connect with 5 s timeout from the control plane; a port the
+probe cannot use counts as closed instead of raising),
 `console` (any `console_success_patterns` regex matches the last 200 console lines; skipped with a
 warning if the console log is unavailable). The guest's family (`vm.guest_os.family`, §9.5) picks the
 profile: **Windows** guests probe `windows_tcp_ports` instead of `tcp_ports` and skip the `console`
@@ -962,7 +963,7 @@ Authentication: `Authorization: Bearer <token>` (§13).
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or `timeout_s` below 1, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}` | `Plan` |
