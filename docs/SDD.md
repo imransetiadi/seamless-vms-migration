@@ -1269,8 +1269,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review — and storage handover),
   `/plans/:id` (settings summary, waves board, migrations table with
-  strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
-  changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
+  strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
+  pre-flight checks, with Validate there too — Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan
+  form prefilled and sends only the changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or
+  edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
