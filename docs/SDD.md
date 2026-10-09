@@ -1317,8 +1317,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; while a requested cutover waits for a closed window, an approver can let it cut over
-  outside the window — the plan, its wave and the cutover slots still gate it (§5.4); choosing another strategy asks
-  the same when it would clear the migration's approvals or cutover request), `/providers` (status cards + Check,
+  outside the window — the plan, its wave and the cutover slots still gate it (§5.4); when the migration's plan
+  cannot be loaded, the page says so with Retry and Cutover stays unavailable — its window and approval policy are
+  unknown; choosing another strategy asks the same when it would clear the migration's approvals or cutover
+  request), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
