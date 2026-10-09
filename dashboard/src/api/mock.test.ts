@@ -80,6 +80,23 @@ describe('mock API', () => {
     await expect(client.get('/health')).resolves.toMatchObject({ status: expect.any(String) });
   });
 
+  it('answers GET /events?tail=true with the newest matching events, ascending (SDD §12)', async () => {
+    const { server, client } = setup('viewer');
+    const target = server.migrations[0] as Migration;
+    for (let i = 0; i < 1200; i += 1) {
+      server.emit({ kind: 'plan.updated', plan_id: target.plan_id, migration_id: i % 2 ? target.id : null, actor: 'test', message: `n${i}`, data: {} });
+    }
+    const persisted = server.events;
+    const tail = await client.get<Event[]>('/events', { query: { tail: true, limit: 3 } });
+    expect(tail.map((e) => e.seq)).toEqual(persisted.slice(-3).map((e) => e.seq));
+    const mine = await client.get<Event[]>('/events', { query: { tail: true, limit: 2, migration_id: target.id } });
+    expect(mine.map((e) => e.message)).toEqual(['n1197', 'n1199']);
+    // since still bounds the tail; without tail the first page is unchanged
+    await expect(client.get<Event[]>('/events', { query: { tail: true, since: persisted.at(-1)?.seq } })).resolves.toEqual([]);
+    const first = await client.get<Event[]>('/events', { query: { limit: 2 } });
+    expect(first.map((e) => e.seq)).toEqual(persisted.slice(0, 2).map((e) => e.seq));
+  });
+
   it('honours limit and offset on the migrations list', async () => {
     const { server, client } = setup();
     const all = await client.get<Migration[]>('/migrations');

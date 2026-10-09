@@ -641,11 +641,11 @@ export class MockServer {
       const limit = Math.min(1000, Math.max(1, Number(query.get('limit') ?? 500) || 500));
       const planId = query.get('plan_id');
       const migrationId = query.get('migration_id');
-      return ok(
-        this.events
-          .filter((e) => e.seq > since && (!planId || e.plan_id === planId) && (!migrationId || e.migration_id === migrationId))
-          .slice(0, limit),
+      const matching = this.events.filter(
+        (e) => e.seq > since && (!planId || e.plan_id === planId) && (!migrationId || e.migration_id === migrationId),
       );
+      // tail: the newest `limit` matching events instead of the first, still ascending (SDD §12)
+      return ok(query.get('tail') === 'true' ? matching.slice(-limit) : matching.slice(0, limit));
     }
 
     if (root === 'stats' && method === 'GET') {

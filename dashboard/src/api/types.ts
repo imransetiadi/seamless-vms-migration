@@ -557,6 +557,8 @@ export interface EventListQuery {
   migration_id?: string;
   /** ≤ 1000 */
   limit?: number;
+  /** The newest `limit` matching events instead of the first, still ascending (SDD §12). */
+  tail?: boolean;
 }
 
 export interface ThroughputPoint {

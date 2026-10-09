@@ -61,7 +61,7 @@ export const queryKeys = {
   plan: (id: string) => ['plans', id] as const,
   migrations: (query: MigrationListQuery = {}) => ['migrations', query] as const,
   migration: (id: string) => ['migration', id] as const,
-  eventTail: (query: Omit<EventListQuery, 'since' | 'limit'> = {}) => ['events', 'tail', query] as const,
+  eventTail: (query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}) => ['events', 'tail', query] as const,
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
 };
@@ -192,34 +192,26 @@ export function useAdvisorStatus() {
   });
 }
 
-const EVENT_PAGE = 1000;
+/** `GET /events` returns at most 1000 events per request (SDD §12). */
+const EVENT_LIMIT = 1000;
 
 /**
- * The newest `keep` persisted events. `GET /events` pages forward from `since` (SDD §12), so the
- * tail is reached by following the cursor until a short page arrives.
+ * The newest `keep` (≤ 1000) persisted events, ascending: one `GET /events?tail=true` request,
+ * however many events are persisted (SDD §12).
  */
 export async function fetchEventTail(
   api: ApiClient,
-  query: Omit<EventListQuery, 'since' | 'limit'> = {},
+  query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {},
   keep = 500,
   signal?: AbortSignal,
 ): Promise<Event[]> {
-  let since = 0;
-  let tail: Event[] = [];
-  for (let page = 0; page < 200; page += 1) {
-    const batch = await api.get<Event[]>('/events', {
-      signal,
-      query: { since, limit: EVENT_PAGE, plan_id: query.plan_id, migration_id: query.migration_id },
-    });
-    tail = tail.concat(batch).slice(-keep);
-    const last = batch.at(-1);
-    if (batch.length < EVENT_PAGE || !last) break;
-    since = last.seq;
-  }
-  return tail;
+  return api.get<Event[]>('/events', {
+    signal,
+    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id },
+  });
 }
 
-export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit'> = {}, keep = 500) {
+export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}, keep = 500) {
   const api = useApi();
   return useQuery({
     queryKey: queryKeys.eventTail(query),
