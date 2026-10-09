@@ -1282,8 +1282,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   Tokens are CSS variables consumed by Tailwind (`bg-background`, `text-muted-foreground`, …).
 * Accessibility: WCAG 2.2 AA contrast, visible focus rings, keyboard reachable actions, `aria-live`
   for progress and for the outcome of an action (a plan started, resumed, paused or its waves planned),
-  a form error announced when it appears (not only shown next to its field), `prefers-reduced-motion`
-  honoured, 44×44 px minimum targets for primary actions. An
+  a form error announced when it appears (not only shown next to its field), focus that never drops to the
+  page when the focused control goes away (Clear filters → the search field, a dialog's next step → its
+  heading, a deleted item → its list's heading), `prefers-reduced-motion` honoured, 44×44 px minimum
+  targets for primary actions. An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover).
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
