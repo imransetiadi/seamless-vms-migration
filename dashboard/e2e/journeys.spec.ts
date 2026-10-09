@@ -29,6 +29,19 @@ test('an operator edits a validated plan; the change is saved and the plan retur
   await expect(page.getByText('Draft', { exact: true }).first()).toBeVisible();
 });
 
+test('a keyboard user keeps focus on Validate while its request runs (SDD §16)', async ({ page }) => {
+  await signIn(page, 'operator');
+  await page.goto('/plans/plan-0e9f6a17');
+  const validate = page.getByRole('group', { name: /plan actions/i }).getByRole('button', { name: /^validate$/i });
+  await validate.focus();
+  await page.keyboard.press('Enter');
+  // the mock-mode build answers after 120 ms: the button is busy meanwhile, and a natively disabled
+  // button would drop focus to the page
+  await expect(page.getByRole('status').filter({ hasText: /validation finished/i })).toBeVisible();
+  await expect(validate).not.toHaveAttribute('aria-busy');
+  await expect(validate).toBeFocused();
+});
+
 test('the shown audit events download as JSON lines, oldest first', async ({ page }) => {
   await signIn(page);
   await page.goto('/events');

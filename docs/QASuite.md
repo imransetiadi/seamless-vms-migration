@@ -622,8 +622,8 @@ a provider; UI-15 no page scrolls sideways on a 320 px wide screen — NFR-08, W
 migration page while visually hidden text in the strategy table escaped its scroller) and `journeys.spec.ts`
 (UI-11 editing a validated plan saves the change and returns it to draft; UI-12
 the shown audit events download as JSON lines in sequence order; UI-13 the guest OS filter and Clear filters;
-UI-14 a NetApp NFS handover names the RHOSO pool per volume type; each was checked to fail when the behaviour it
-guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
+UI-14 a NetApp NFS handover names the RHOSO pool per volume type; UI-16 a keyboard user keeps focus on Validate
+while its request runs, SDD §16; each was checked to fail when the behaviour it guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
 Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
 migration detail → Approve/Cutover as approver, controls hidden for viewer; UI-05 Finalize needs the typed VM name;

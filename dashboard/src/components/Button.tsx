@@ -5,6 +5,10 @@ import { buttonClassName, type ButtonSize, type ButtonVariant } from '../lib/but
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  /**
+   * While its request runs the button shows a spinner, is busy and `aria-disabled`, and ignores presses;
+   * it is never natively disabled, which would drop keyboard focus to the page (SDD §16).
+   */
   loading?: boolean;
   icon?: LucideIcon;
   /**
@@ -68,8 +72,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       <button
         ref={ref}
         type={type}
-        disabled={disabled || (loading && !softDisabled)}
-        aria-disabled={softDisabled || undefined}
+        disabled={disabled}
+        aria-disabled={softDisabled || loading || undefined}
         aria-busy={loading || undefined}
         title={softDisabled ? (disabledReason ?? undefined) : title}
         onClick={handleClick}
