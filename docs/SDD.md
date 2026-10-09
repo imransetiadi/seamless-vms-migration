@@ -1270,8 +1270,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   probe address, console success patterns, timeout, automatic rollback, advisor review — and storage handover),
   `/plans/:id` (settings summary, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
-  pre-flight checks, with Validate there too; the findings say pre-flight passed only once every VM's pre-flight
-  ran, and until then that it runs at validation — Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan
+  pre-flight checks, with Validate there too; the findings say pre-flight passed only once every VM of `vm_ids`
+  has a migration whose pre-flight ran and the plan is not a draft again (an edited plan is validated again),
+  and until then that it runs at validation — Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan
   form prefilled and sends only the changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or
   edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
