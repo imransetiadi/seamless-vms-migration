@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from ..guest_os import GuestOS, identify
 from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
 
 GIB = 2**30
@@ -191,6 +192,12 @@ class VMRef(_Model):
             return int(sum(float(d.used_gb or 0.0) for d in self.disks) * GIB)
         return int(self.disk_bytes * USED_FALLBACK_RATIO)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def guest_os(self) -> GuestOS:
+        """Family, version, lifecycle and conversion support of the guest (SDD §9.5)."""
+        return identify(self.os_type)
+
     def root_disk(self) -> Disk | None:
         """The boot disk: first bootable disk, else the first disk."""
         for disk in self.disks:
@@ -225,6 +232,8 @@ DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached ta
 
 class VerificationConfig(_Model):
     tcp_ports: list[int] = Field(default_factory=list)
+    # Windows guests probe these instead and skip the console check (SDD §7.5)
+    windows_tcp_ports: list[int] = Field(default_factory=list)
     probe_address: Literal["fixed", "floating"] = "fixed"
     console_success_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_CONSOLE_PATTERNS)

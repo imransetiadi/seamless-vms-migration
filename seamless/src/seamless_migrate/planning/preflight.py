@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, Plan, Provider, VMRef
+from ..guest_os import identify
 
 S = Strategy
 
@@ -133,7 +133,27 @@ CATALOG: dict[str, CatalogEntry] = {
     "GUEST_OS_LEGACY": CatalogEntry(
         Severity.warning,
         (),
-        "End-of-life guest OS: verify virtio drivers and plan a longer verification.",
+        "Out of vendor support: it still migrates; test the application on RHOSO, check the "
+        "virtio drivers and plan a longer verification.",
+    ),
+    "GUEST_OS_UNKNOWN": CatalogEntry(
+        Severity.info,
+        (),
+        "Set the os_distro and os_version image properties (OpenStack) or run VMware Tools so "
+        "the guest can be identified; verification uses the Linux profile meanwhile.",
+    ),
+    "GUEST_CONVERSION_UNVERIFIED": CatalogEntry(
+        Severity.warning,
+        (S.vmware_cold, S.vmware_warm),
+        "virt-v2v converts this guest but Red Hat does not support the conversion: run a test "
+        "conversion of a copy first.",
+    ),
+    "GUEST_CONVERSION_UNSUPPORTED": CatalogEntry(
+        Severity.warning,
+        (S.vmware_cold, S.vmware_warm),
+        "The RHEL 9 conversion host has no drivers for this guest: install the virtio storage "
+        "and network drivers from an older virtio-win release inside the guest and test the "
+        "conversion, or migrate the VM another way.",
     ),
     "VMW_CBT_DISABLED": CatalogEntry(
         Severity.warning,
@@ -163,19 +183,13 @@ CATALOG: dict[str, CatalogEntry] = {
     ),
 }
 
-_LEGACY_OS = re.compile(r"rhel[3-6]|centos[3-6]|windows200[038]")
 _SRIOV_VNIC_TYPES = frozenset({"direct", "direct-physical", "macvtap"})
 _QUOTA_KEYS = ("cores", "ram_mb", "instances", "volumes", "gigabytes")
 
 
 def is_legacy_os(os_type: str | None) -> bool:
-    """True for ``rhel[3-6]``, ``centos[3-6]``, ``windows200[038]`` (separators ignored)."""
-    if not os_type:
-        return False
-    lowered = os_type.lower()
-    compact = re.sub(r"[^a-z0-9]", "", lowered)
-    variants = (lowered, compact, compact.replace("server", ""))
-    return any(_LEGACY_OS.search(v) for v in variants)
+    """True when the guest is out of standard vendor support (SDD §9.5 catalog)."""
+    return identify(os_type).lifecycle == "legacy"
 
 
 def finding(
@@ -574,8 +588,34 @@ def run_preflight(
     if encrypted:
         out.append(finding("VOL_ENCRYPTED", f"Encrypted disk(s): {_names(encrypted)}."))
 
-    if is_legacy_os(vm.os_type):
-        out.append(finding("GUEST_OS_LEGACY", f"Guest OS {vm.os_type} is end-of-life."))
+    guest = vm.guest_os
+    if guest.lifecycle == "legacy":
+        out.append(
+            finding("GUEST_OS_LEGACY", f"Guest OS {guest.label} is out of standard vendor support.")
+        )
+    if guest.family == "unknown":
+        shown = f" ({vm.os_type})" if vm.os_type else ""
+        out.append(finding("GUEST_OS_UNKNOWN", f"The guest OS is not identified{shown}."))
+    vmware = (source is not None and source.kind == ProviderKind.vmware) or any(
+        d.kind == "vmdk" for d in vm.disks
+    )
+    if vmware and guest.v2v in ("tech_preview", "unverified"):
+        level = (
+            "a Technology Preview" if guest.v2v == "tech_preview" else "not supported by Red Hat"
+        )
+        out.append(
+            finding(
+                "GUEST_CONVERSION_UNVERIFIED",
+                f"Converting {guest.label} with virt-v2v is {level}.",
+            )
+        )
+    if vmware and guest.v2v == "unsupported":
+        out.append(
+            finding(
+                "GUEST_CONVERSION_UNSUPPORTED",
+                f"virt-v2v on the RHEL 9 conversion host cannot prepare {guest.label}.",
+            )
+        )
 
     if vm.cbt_enabled is False:
         out.append(finding("VMW_CBT_DISABLED", "Changed Block Tracking is disabled."))

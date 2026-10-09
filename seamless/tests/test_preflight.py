@@ -88,6 +88,9 @@ def test_catalog_is_complete():
         "VMW_INDEPENDENT_DISK",
         "VMW_SNAPSHOTS_PRESENT",
         "VMW_TOOLS_MISSING",
+        "GUEST_OS_UNKNOWN",
+        "GUEST_CONVERSION_UNVERIFIED",
+        "GUEST_CONVERSION_UNSUPPORTED",
         "CONV_HOST_MISSING",
         "HANDOVER_BACKEND_UNMAPPED",
     }
@@ -442,11 +445,73 @@ def test_finding_vol_encrypted():
 
 
 def test_finding_guest_os_legacy():
-    for os_type in ("rhel6", "centos-5.11", "rhel6_64Guest", "windows2008", "windows-server-2003"):
+    """Legacy = out of standard vendor support as of the catalog date (SDD §9.5)."""
+    legacy = (
+        "rhel6",
+        "centos-5.11",
+        "rhel6_64Guest",
+        "centos7",
+        "rhel7",
+        "ubuntu 18.04",
+        "debian10",
+        "sles12",
+        "windows2008",
+        "windows-server-2003",
+        "Microsoft Windows Server 2012 R2 Standard",
+    )
+    for os_type in legacy:
         f = only(check(make_vm(os_type=os_type)), "GUEST_OS_LEGACY")
         assert f.severity == Severity.warning
-    for modern in ("rhel9", "rhel-8.10", "centos7", "windows2019", "windows-server-2022", None):
-        assert all(x.code != "GUEST_OS_LEGACY" for x in check(make_vm(os_type=modern)))
+        assert f.message.startswith(f"Guest OS {make_vm(os_type=os_type).guest_os.label}")
+    modern = (
+        "rhel9",
+        "rhel-8.10",
+        "rocky 9",
+        "ubuntu 24.04",
+        "debian12",
+        "windows2019",
+        "windows-server-2022",
+        None,
+    )
+    for os_type in modern:
+        assert all(x.code != "GUEST_OS_LEGACY" for x in check(make_vm(os_type=os_type)))
+
+
+def test_finding_guest_os_unknown():
+    for os_type in (None, "", "solaris11"):
+        assert only(check(make_vm(os_type=os_type)), "GUEST_OS_UNKNOWN").severity == Severity.info
+    for known in ("rhel9", "linux", "windows"):
+        assert all(x.code != "GUEST_OS_UNKNOWN" for x in check(make_vm(os_type=known)))
+
+
+VMWARE = make_provider(id="vc", kind=ProviderKind.vmware, conversion_host=None)
+
+
+def test_finding_guest_conversion_unverified():
+    for os_type in ("ubuntu64Guest", "debian12_64Guest", "rockylinux_64Guest", "rhel6_64Guest"):
+        f = only(check(make_vm(os_type=os_type), source=VMWARE), "GUEST_CONVERSION_UNVERIFIED")
+        assert f.severity == Severity.warning
+        assert set(f.strategies) == {Strategy.vmware_cold, Strategy.vmware_warm}
+    # OpenStack guests are not converted, and supported guests need no warning
+    assert all(
+        x.code != "GUEST_CONVERSION_UNVERIFIED" for x in check(make_vm(os_type="ubuntu 22.04"))
+    )
+    supported = check(make_vm(os_type="rhel9_64Guest"), source=VMWARE)
+    assert not {x.code for x in supported} & {
+        "GUEST_CONVERSION_UNVERIFIED",
+        "GUEST_CONVERSION_UNSUPPORTED",
+    }
+
+
+def test_finding_guest_conversion_unsupported():
+    for os_type in ("windows8Server64Guest", "winLonghorn64Guest", "rhel5_64Guest"):
+        f = only(check(make_vm(os_type=os_type), source=VMWARE), "GUEST_CONVERSION_UNSUPPORTED")
+        assert f.severity == Severity.warning
+        assert "virtio" in (f.remediation or "")
+    assert all(
+        x.code != "GUEST_CONVERSION_UNSUPPORTED"
+        for x in check(make_vm(os_type="windows2008"))  # OpenStack source: no conversion
+    )
 
 
 def test_finding_vmw_cbt_disabled():
