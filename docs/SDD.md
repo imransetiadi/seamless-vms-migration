@@ -297,8 +297,11 @@ an open clock and resets a closed one (§5.2); it clears the cutover request and
 granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
-no further attempt starts — and then runs the `rollback` step once with `delete_dest_volumes` as a
-best-effort cleanup of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
+no further attempt starts. Whenever the migration has a data path — a step was running, a failed
+attempt waited for its retry, or it recorded `sync_passes` (a warm migration cancelled in
+`awaiting_cutover`, between passes, or after a retry) — the cancel then runs the `rollback` step once
+with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
+volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run.
 
@@ -1352,7 +1355,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   and that the bytes they transferred stay counted, §5.4), downtime clock,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name; Approve is offered where an approval lasts (from `ready` until the cutover
+  requires typing the VM name; Cancel says that the data copied so far is removed when the migration
+  has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
   cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
