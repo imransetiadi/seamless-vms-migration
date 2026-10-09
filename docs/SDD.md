@@ -1284,6 +1284,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   for progress, `prefers-reduced-motion` honoured, 44×44 px minimum targets for primary actions. An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover).
+* Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
+  Retry, and a panel or figure built from it says it is unavailable (or shows "—") instead of its empty
+  state or a zero ("No VM is down", "Failed 0").
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
