@@ -1284,9 +1284,12 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
   similar-incident search), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
-  typed errors); `src/api/stream.ts` (fetch-based SSE with resume); the event history of the Events page
-  and of a migration's timeline is one `GET /events?tail=true` request (§12). `VITE_SEAMLESS_MOCK=1` switches
-  to an in-browser mock adapter (`src/api/mock.ts`) with fixture data that exercises every phase.
+  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
+  drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
+  event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
+  of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
+  `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
+  that exercises every phase.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
 
 ---
