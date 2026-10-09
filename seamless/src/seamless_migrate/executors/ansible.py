@@ -79,7 +79,8 @@ ANSIBLE_ENV_DENIED = frozenset(
         "ANSIBLE_VERBOSITY", "ANSIBLE_DEBUG", "ANSIBLE_LOG_PATH", "ANSIBLE_STDOUT_CALLBACK",
         "ANSIBLE_CALLBACKS_ENABLED", "ANSIBLE_CALLBACK_WHITELIST", "ANSIBLE_CALLBACK_PLUGINS",
         "ANSIBLE_DISPLAY_ARGS_TO_STDOUT", "ANSIBLE_DISPLAY_SKIPPED_HOSTS", "ANSIBLE_NOCOLOR",
-        "ANSIBLE_FORCE_COLOR", "ANSIBLE_HOME", "ANSIBLE_LOCAL_TEMP", "ANSIBLE_RETRY_FILES_ENABLED",
+        "ANSIBLE_FORCE_COLOR", "ANSIBLE_HOME", "ANSIBLE_LOCAL_TEMP", "ANSIBLE_REMOTE_TEMP",
+        "ANSIBLE_RETRY_FILES_ENABLED",
     }
 )  # fmt: skip
 
@@ -612,6 +613,9 @@ class AnsibleExecutor:
                 "ANSIBLE_COLLECTIONS_PATH": self._collections_path(),
                 "ANSIBLE_HOME": str(home),
                 "ANSIBLE_LOCAL_TEMP": str(home / "tmp"),
+                # modules of the local connection run from remote_tmp, which Ansible derives from
+                # the passwd home of the UID (/opt/app-root/src in the image: not writable)
+                "ANSIBLE_REMOTE_TEMP": str(home / "tmp"),
                 "ANSIBLE_RETRY_FILES_ENABLED": "0",
                 "ANSIBLE_NOCOLOR": "1",
                 # the downtime clock reads the stop task's result line: never hide skipped hosts

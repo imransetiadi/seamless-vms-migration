@@ -766,6 +766,11 @@ async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkey
         "ANSIBLE_CONFIG",
     }.isdisjoint(keys)
     assert {"ANSIBLE_SSH_ARGS", "ANSIBLE_DISPLAY_SKIPPED_HOSTS", "ANSIBLE_NOCOLOR"} <= keys
+    # module temp directories live under the data dir (the image's passwd home is read-only)
+    assert {"ANSIBLE_LOCAL_TEMP", "ANSIBLE_REMOTE_TEMP"} <= keys
+    child = env.executor._env()
+    assert child["ANSIBLE_REMOTE_TEMP"] == child["ANSIBLE_LOCAL_TEMP"]
+    assert child["ANSIBLE_REMOTE_TEMP"].startswith(str(env.settings.data_dir))
 
 
 async def test_vmware_rollback_and_lookup_failures(env):

@@ -127,7 +127,7 @@ VENDOR_MODULE_LINK_SRC := _vendor/openstack.cloud/plugins/modules
 VENDOR_UTIL_LINK_SRC   := ../modules/_vendor/openstack.cloud/plugins/module_utils
 
 # Latest stable release:
-OS_CLOUD_VERSION   ?= 2.5.0
+OS_CLOUD_VERSION   ?= 2.6.0
 
 # List of required modules from vendor openstack.cloud collection.
 VENDORED_MODULES := auth compute_flavor compute_flavor_info floating_ip identity_domain identity_role \
@@ -505,7 +505,8 @@ seamless-check: seamless-test
 	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
 	  PYTHONPATH="$(CURDIR)/.cache/colltree" ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" \
 	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q tests/unit/test_blocksync.py \
-	    tests/unit/test_warm_migration.py tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py
+	    tests/unit/test_warm_migration.py tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py \
+	    tests/unit/test_role_modules_resolve.py
 	@command -v gitleaks >/dev/null && gitleaks dir --redact --no-banner . || echo "gitleaks not installed: skipped (S-17)"
 	@command -v actionlint >/dev/null && actionlint || echo "actionlint not installed: skipped"
 	@command -v shellcheck >/dev/null && shellcheck -S warning scripts/*.sh tests/e2e/*.sh || echo "shellcheck not installed: skipped"

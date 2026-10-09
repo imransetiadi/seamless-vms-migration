@@ -21,6 +21,7 @@ jobs:
   control-plane:
     name: control plane (py${{ matrix.python }}, SQLite + PostgreSQL)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +64,7 @@ jobs:
   collection:
     name: collection (warm path, lint, syntax)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,7 +86,8 @@ jobs:
         run: |
           python plugins/module_utils/blocksync.py --help > /dev/null
           pytest -q tests/unit/test_blocksync.py tests/unit/test_warm_migration.py \
-                    tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py
+                    tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py \
+                    tests/unit/test_role_modules_resolve.py
       - name: Playbook syntax checks
         run: |
           for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
@@ -100,6 +103,7 @@ jobs:
   dashboard:
     name: dashboard (typecheck, lint, tests, build, audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: dashboard
@@ -126,6 +130,7 @@ jobs:
   dashboard-e2e:
     name: dashboard browser smoke (Playwright, mock mode)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: dashboard
@@ -150,6 +155,7 @@ jobs:
   security:
     name: secrets and configuration scans (S-17, S-20)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,6 +177,7 @@ jobs:
   manifests:
     name: OpenShift manifests (kustomize build + kubeconform)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       KUBECONFORM_VERSION: v0.7.0
       KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
@@ -196,6 +203,7 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: [control-plane, dashboard]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

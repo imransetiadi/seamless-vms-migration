@@ -49,6 +49,17 @@ COPY meta /opt/seamless/collection/meta
 COPY plugins /opt/seamless/collection/plugins
 COPY roles /opt/seamless/collection/roles
 COPY playbooks /opt/seamless/collection/playbooks
+COPY scripts/vendor-openstack-cloud.sh /opt/seamless/vendor-openstack-cloud.sh
+# The roles call openstack.cloud modules as os_migrate.os_migrate.<module> (server_action,
+# server_info, network, …): the checkout vendors them through a git submodule, the image from
+# the pinned Galaxy release (SDD §17.1).
+ARG OS_CLOUD_VERSION=2.6.0
+# openstack.cloud stays installed: the vendored modules extend its doc fragment
+# (openstack.cloud.openstack), which ansible-doc and ansible-lint resolve from there.
+RUN ansible-galaxy collection install "openstack.cloud:${OS_CLOUD_VERSION}" \
+        -p /usr/share/ansible/collections \
+ && bash /opt/seamless/vendor-openstack-cloud.sh /opt/seamless/collection \
+        /usr/share/ansible/collections/ansible_collections/openstack/cloud/plugins
 RUN ansible-galaxy collection build /opt/seamless/collection --output-path /tmp/collection \
  && ansible-galaxy collection install /tmp/collection/*.tar.gz \
         -p /usr/share/ansible/collections --force \
