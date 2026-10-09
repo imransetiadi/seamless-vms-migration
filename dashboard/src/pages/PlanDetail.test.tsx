@@ -247,6 +247,29 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['auto_cutover'] });
   });
 
+  it('edits the verification settings, prefilled from the plan; only verification is sent', async () => {
+    const user = userEvent.setup();
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // a pattern is a regular expression: its spaces are part of it and survive an unrelated edit
+    plan.verification.console_success_patterns = ['login: ', 'Reached target .*Multi-User'];
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    expect(within(dialog).getByLabelText(/^probe address/i)).toHaveValue(plan.verification.probe_address);
+    const timeout = within(dialog).getByLabelText(/^verification timeout/i);
+    expect(timeout).toHaveValue(plan.verification.timeout_s / 60);
+    await user.clear(timeout);
+    await user.type(timeout, '20');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.verification.timeout_s).toBe(1200);
+    expect(plan.verification.console_success_patterns).toEqual(['login: ', 'Reached target .*Multi-User']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['verification'] });
+  });
+
   it('explains why a plan cannot be edited', async () => {
     renderPlan('plan-4f2a9c1e');
     expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');

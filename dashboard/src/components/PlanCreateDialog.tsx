@@ -46,12 +46,19 @@ interface FormState {
   tcpPorts: string;
   windowsTcpPorts: string;
   autoRollback: boolean;
+  /** Source project -> RHOSO project (SDD §4.3 mappings). */
+  projects: string;
+  /** Verification (SDD §7.5): where the probes connect, how long they try, what the console must show. */
+  probeAddress: 'fixed' | 'floating';
+  timeoutMinutes: string;
+  consolePatterns: string;
+  useAdvisor: boolean;
   /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
   handoverEnabled: boolean;
   handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
+type FieldKey = 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'ports' | 'handover';
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -79,6 +86,11 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
+    projects: '',
+    probeAddress: DEFAULT_VERIFICATION.probe_address,
+    timeoutMinutes: plain(DEFAULT_VERIFICATION.timeout_s / 60),
+    consolePatterns: DEFAULT_VERIFICATION.console_success_patterns.join('\n'),
+    useAdvisor: DEFAULT_VERIFICATION.use_advisor,
     handoverEnabled: false,
     handoverMap: {},
   };
@@ -130,6 +142,11 @@ function formFromPlan(plan: Plan): FormState {
     tcpPorts: v.tcp_ports.join(', '),
     windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
     autoRollback: v.auto_rollback,
+    projects: formatMappings(plan.mappings.projects),
+    probeAddress: v.probe_address,
+    timeoutMinutes: plain(v.timeout_s / 60),
+    consolePatterns: v.console_success_patterns.join('\n'),
+    useAdvisor: v.use_advisor,
     handoverEnabled: plan.handover.enabled,
     handoverMap: { ...plan.handover.backend_map },
   };
@@ -273,10 +290,17 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const networks = parseMappings(f.networks);
     const flavors = parseMappings(f.flavors);
     const volumeTypes = parseMappings(f.volumeTypes);
+    const projects = parseMappings(f.projects);
     const formatHint = 'Use one "source = destination" pair per line.';
     if (!networks) e.networks = formatHint;
     if (!flavors) e.flavors = formatHint;
     if (!volumeTypes) e.volumeTypes = formatHint;
+    if (!projects) e.projects = formatHint;
+    // 0 checks once without polling (SDD §12)
+    const timeoutMinutes = f.timeoutMinutes.trim() === '' ? Number.NaN : Number(f.timeoutMinutes);
+    if (!(timeoutMinutes >= 0)) e.timeout = 'Enter the verification timeout in minutes (0 or more).';
+    // regular expressions: a pattern keeps its spaces; only blank lines are dropped
+    const consolePatterns = f.consolePatterns.split(/\r?\n/).filter((line) => line.trim() !== '');
     const link = Number(f.linkMiBps);
     if (!(link > 0)) e.link = 'Enter the link bandwidth in MiB/s (more than 0).';
     const threshold = Number(f.thresholdGiB);
@@ -322,7 +346,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         require_approval: f.requireApproval,
         auto_cutover: f.autoCutover,
         cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
-        mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: plan?.mappings.projects ?? {} },
+        mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: projects ?? {} },
         handover: { enabled: f.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),
@@ -334,6 +358,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           tcp_ports: ports,
           windows_tcp_ports: windowsPorts,
           auto_rollback: f.autoRollback,
+          probe_address: f.probeAddress,
+          timeout_s: Math.round(timeoutMinutes * 60),
+          console_success_patterns: consolePatterns,
+          use_advisor: f.useAdvisor,
         },
       },
     };
@@ -378,6 +406,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     networks: id('networks'),
     flavors: id('flavors'),
     volumeTypes: id('volume-types'),
+    projects: id('projects'),
+    timeout: id('timeout'),
     link: id('link'),
     threshold: id('threshold'),
     passes: id('passes'),
@@ -387,7 +417,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     windowsPorts: id('windows-ports'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -597,10 +627,20 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   Changing the cutover window requires the approver role.
                 </p>
               )}
-              <div className="grid gap-3 sm:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <TextAreaField id={id('networks')} label="Network mappings" rows={3} placeholder="tenant-net = tenant-net-ovn" value={form.networks} onChange={(e) => set('networks', e.target.value)} error={errors.networks} />
                 <TextAreaField id={id('flavors')} label="Flavor mappings" rows={3} placeholder="m1.xlarge = m2.xlarge" value={form.flavors} onChange={(e) => set('flavors', e.target.value)} error={errors.flavors} />
                 <TextAreaField id={id('volume-types')} label="Volume type mappings" rows={3} placeholder="tripleo-ceph = ceph-ssd" value={form.volumeTypes} onChange={(e) => set('volumeTypes', e.target.value)} error={errors.volumeTypes} />
+                <TextAreaField
+                  id={id('projects')}
+                  label="Project mappings"
+                  rows={3}
+                  placeholder="finance = finance-prod"
+                  value={form.projects}
+                  onChange={(e) => set('projects', e.target.value)}
+                  error={errors.projects}
+                  hint="Source project = RHOSO project; unmapped projects keep their name."
+                />
               </div>
               <div className="grid gap-3 sm:grid-cols-3">
                 <TextField id={id('link')} label="Link bandwidth (MiB/s)" type="number" inputMode="decimal" min={0} step="any" value={form.linkMiBps} onChange={(e) => set('linkMiBps', e.target.value)} error={errors.link} />
@@ -645,6 +685,45 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   hint="RDP 3389 or WinRM 5985. Windows guests skip the console check."
                 />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SelectField
+                  id={id('probe')}
+                  label="Probe address"
+                  value={form.probeAddress}
+                  onChange={(e) => set('probeAddress', e.target.value as FormState['probeAddress'])}
+                  hint="Where the TCP probes connect on the destination server."
+                  options={[
+                    { value: 'fixed', label: 'Fixed IP' },
+                    { value: 'floating', label: 'Floating IP' },
+                  ]}
+                />
+                <TextField
+                  id={id('timeout')}
+                  label="Verification timeout (minutes)"
+                  type="number"
+                  inputMode="decimal"
+                  min={0}
+                  step="any"
+                  value={form.timeoutMinutes}
+                  onChange={(e) => set('timeoutMinutes', e.target.value)}
+                  error={errors.timeout}
+                  hint="How long the checks keep trying; 0 checks once."
+                />
+                <TextAreaField
+                  id={id('console')}
+                  label="Console success patterns"
+                  rows={3}
+                  value={form.consolePatterns}
+                  onChange={(e) => set('consolePatterns', e.target.value)}
+                  hint="One regular expression per line; a Linux guest passes when one matches its last 200 console lines."
+                />
+                <Checkbox
+                  checked={form.useAdvisor}
+                  onChange={(v) => set('useAdvisor', v)}
+                  label="Advisor reviews the verification"
+                  hint="The advisor may flag a passed verification for a human; it never changes the result."
+                />
               </div>
               {source?.kind !== 'vmware' && (
                 <Fieldset legend="Storage handover">

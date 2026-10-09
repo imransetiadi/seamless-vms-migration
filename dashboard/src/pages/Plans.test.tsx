@@ -96,6 +96,57 @@ describe('Plans page', () => {
     expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
   });
 
+  it('sets project mappings and every verification setting from the form (dashboard-first, SDD §16)', async () => {
+    const user = userEvent.setup();
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Verified wave');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.type(within(dialog).getByLabelText(/^project mappings/i), 'shop = shop-prod');
+    await user.selectOptions(within(dialog).getByLabelText(/^probe address/i), 'floating');
+    const timeout = within(dialog).getByLabelText(/^verification timeout/i);
+    await user.clear(timeout);
+    await user.type(timeout, '15');
+    const patterns = within(dialog).getByLabelText(/^console success patterns/i);
+    await user.clear(patterns);
+    await user.type(patterns, 'login:{enter}Reached target .*Multi-User');
+    await user.click(within(dialog).getByRole('checkbox', { name: /advisor reviews the verification/i }));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Verified wave')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'Verified wave')!;
+    expect(created.mappings.projects).toEqual({ shop: 'shop-prod' });
+    expect(created.verification).toMatchObject({
+      probe_address: 'floating',
+      timeout_s: 900,
+      console_success_patterns: ['login:', 'Reached target .*Multi-User'],
+      use_advisor: false,
+    });
+  });
+
+  it('refuses a negative verification timeout and a malformed project mapping, and opens the advanced section', async () => {
+    const user = userEvent.setup();
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const timeout = within(dialog).getByLabelText(/^verification timeout/i);
+    await user.clear(timeout);
+    await user.type(timeout, '-1');
+    await user.type(within(dialog).getByLabelText(/^project mappings/i), 'no arrow here');
+    await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent(/verification timeout in minutes \(0 or more\)/i);
+    expect(within(dialog).getByLabelText(/^verification timeout/i)).toHaveAttribute('aria-invalid', 'true');
+    expect(within(dialog).getByLabelText(/^project mappings/i)).toHaveAttribute('aria-invalid', 'true');
+  });
+
   it('turns on storage handover with a RHOSO backend per volume type (Ceph and NetApp)', async () => {
     const user = userEvent.setup();
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
