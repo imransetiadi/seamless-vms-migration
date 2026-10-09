@@ -299,7 +299,7 @@ export default function PlanDetail() {
               Auto-plan waves
             </Button>
             <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
-              {p.status === 'paused' ? 'Resume' : 'Start'}
+              {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
             </Button>
             <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
               Pause
@@ -358,14 +358,16 @@ export default function PlanDetail() {
 
       <ConfirmDialog
         open={confirm === 'start'}
-        title={p.status === 'paused' ? 'Resume this plan?' : 'Start this plan?'}
+        title={p.status === 'paused' ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
         description={
           <>
+            {p.status === 'failed' &&
+              'Pre-staging failed (the events say why): starting again retries it before any migration starts. Failed migrations stay failed until you retry or roll them back. '}
             {list.length} migrations in {p.waves.length || 1} wave{(p.waves.length || 1) === 1 ? '' : 's'}. Warm migrations begin pre-copy while their
             source VMs keep running. {p.require_approval ? 'Every cutover still needs an approver.' : 'Cutovers do not need approval in this plan.'}
           </>
         }
-        confirmLabel={p.status === 'paused' ? 'Resume plan' : 'Start plan'}
+        confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
         onConfirm={() => run({ action: 'start' })}

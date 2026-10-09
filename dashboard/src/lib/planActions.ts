@@ -43,8 +43,7 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
         return gate(false, 'The plan is already running.');
       case 'completed':
         return gate(false, 'The plan has completed.');
-      case 'failed':
-        return gate(false, 'Retry, roll back or cancel the failed migrations first.');
+      // 'failed': pre-staging failed; Start pre-stages the plan again (SDD §8)
       default:
         if (blocked > 0) {
           return gate(false, `${blocked} migration${blocked === 1 ? ' is' : 's are'} blocked — fix the findings and re-validate.`);

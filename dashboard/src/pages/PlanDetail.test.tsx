@@ -148,6 +148,20 @@ describe('PlanDetail', () => {
     expect(dialog).toHaveTextContent(/clears any approvals and cutover requests/i);
   }, 15_000);
 
+  it('starts a failed plan again, saying that pre-staging failed and is retried (SDD §8, §16)', async () => {
+    const user = userEvent.setup();
+    const { server } = renderPlan('plan-95a7e3f1');
+    const start = await actionButton(/^start again$/i);
+    expect(start).not.toHaveAttribute('aria-disabled');
+
+    await user.click(start);
+    const dialog = await screen.findByRole('alertdialog', { name: /start this plan again/i });
+    expect(dialog).toHaveTextContent(/pre-staging failed/i);
+    expect(dialog).toHaveTextContent(/failed migrations stay failed until you retry or roll them back/i);
+    await user.click(within(dialog).getByRole('button', { name: /^start again$/i }));
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-95a7e3f1')?.status).toBe('running'));
+  });
+
   it('keeps every plan action disabled for viewers, with the reason', async () => {
     renderPlan('plan-c81d44a0', 'viewer');
 

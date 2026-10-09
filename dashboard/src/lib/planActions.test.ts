@@ -14,7 +14,8 @@ const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
   running: { validate: false, waves: false, start: false, pause: true, edit: false },
   paused: { validate: true, waves: false, start: true, pause: false, edit: false },
   completed: { validate: false, waves: false, start: false, pause: false, edit: false },
-  failed: { validate: true, waves: false, start: false, pause: false, edit: false },
+  // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
+  failed: { validate: true, waves: false, start: true, pause: false, edit: false },
 };
 
 describe('planActions', () => {
@@ -33,6 +34,13 @@ describe('planActions', () => {
   it('refuses to start while a migration is blocked (the API answers 409)', () => {
     const blocked = ready.map((m, i) => (i === 0 ? { ...m, phase: 'blocked' as const } : m));
     const start = planActions(planWith('validated'), 'operator', blocked).start;
+    expect(start.enabled).toBe(false);
+    expect(start.reason).toMatch(/1 migration is blocked/);
+  });
+
+  it('starts a failed plan again only when no migration is blocked, like a validated one (SDD §8)', () => {
+    const blocked = ready.map((m, i) => (i === 0 ? { ...m, phase: 'blocked' as const } : m));
+    const start = planActions(planWith('failed'), 'operator', blocked).start;
     expect(start.enabled).toBe(false);
     expect(start.reason).toMatch(/1 migration is blocked/);
   });

@@ -931,7 +931,8 @@ export class MockServer {
   }
 
   private startPlan(me: Me, plan: Plan): MockResponse {
-    if (!['validated', 'paused'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated or paused plans can start (this plan is ${plan.status}).`);
+    // a failed plan (pre-staging failed) starts again and pre-stages again, as in the API (SDD §8)
+    if (!['validated', 'paused', 'failed'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated, paused or failed plans can start (this plan is ${plan.status}).`);
     const blocked = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked');
     if (blocked.length) throw new HttpError(409, 'conflict', `${blocked.length} migration(s) are blocked: ${blocked.map((m) => m.vm.name).join(', ')}.`);
     plan.status = 'running';

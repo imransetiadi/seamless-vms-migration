@@ -286,6 +286,13 @@ describe('mock API', () => {
     });
   });
 
+  it('starts a failed plan again, like the API (SDD §8, §12)', async () => {
+    const { server, client } = setup('operator');
+    const failed = server.plans.find((p) => p.status === 'failed')!;
+    const started = await client.post<Plan>(`/plans/${failed.id}/start`);
+    expect(started.status).toBe('running');
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');
