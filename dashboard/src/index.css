@@ -106,6 +106,12 @@
   @apply sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-toast focus:rounded-md focus:bg-accent focus:px-4 focus:py-2 focus:font-medium focus:text-accent-foreground;
 }
 
+/* why an action is unavailable, under it after a click or tap (Button, SDD §16); max-w-72 = the
+   288 px Button.tsx keeps clear of the viewport edge */
+@utility disabled-reason {
+  @apply fixed z-toast max-w-72 rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground shadow-lg;
+}
+
 @utility table-wrap {
   @apply w-full overflow-x-auto;
 }
