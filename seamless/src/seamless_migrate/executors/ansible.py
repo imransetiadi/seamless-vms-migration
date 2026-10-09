@@ -247,6 +247,41 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
     return out
 
 
+class _Unsafe(str):
+    """A string Ansible must read verbatim: written with the ``!unsafe`` tag."""
+
+
+class _AnsibleInputDumper(yaml.SafeDumper):
+    """``safe_dump`` that writes :class:`_Unsafe` strings as ``!unsafe`` scalars."""
+
+
+_AnsibleInputDumper.add_representer(
+    _Unsafe, lambda dumper, value: dumper.represent_scalar("!unsafe", str(value))
+)
+
+
+def _mark_unsafe(value: Any) -> Any:
+    if isinstance(value, str):
+        return _Unsafe(value)
+    if isinstance(value, dict):
+        return {key: _mark_unsafe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mark_unsafe(item) for item in value]
+    return value
+
+
+def ansible_yaml(data: Any, *, sort_keys: bool = True) -> str:
+    """YAML for the files Ansible reads (``-e @vars.yml``, ``-e @secrets.yml``, the inventory).
+
+    Ansible templates every string it reads, so a VM name (chosen by whoever runs the source VM),
+    a mapping value or a password holding ``{{ … }}`` or ``{% … %}`` would run as Jinja on the
+    control plane, where ``lookup('pipe', …)`` executes commands next to every cloud credential.
+    Every string value is written ``!unsafe`` so Ansible keeps it verbatim (SDD §7.2, Security.md
+    C1-05); mapping keys — the variable names — stay plain.
+    """
+    return yaml.dump(_mark_unsafe(data), Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
+
+
 def _inventory(conversion_host: dict[str, Any] | None = None) -> str:
     doc: dict[str, Any] = {
         "migrator": {
@@ -260,7 +295,7 @@ def _inventory(conversion_host: dict[str, Any] | None = None) -> str:
     }
     if conversion_host:
         doc["conversion_host"] = {"hosts": conversion_host}
-    return yaml.safe_dump(doc, sort_keys=False)
+    return ansible_yaml(doc, sort_keys=False)
 
 
 def conversion_key_path(ctx: StepContext) -> Path | None:
@@ -649,10 +684,10 @@ class AnsibleExecutor:
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)
-            write_secret_file(vars_path, yaml.safe_dump(variables, sort_keys=True))
+            write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)
-            write_secret_file(secrets_path, yaml.safe_dump(secret_vars, sort_keys=True))
+            write_secret_file(secrets_path, ansible_yaml(secret_vars))
             if key_path is not None:
                 secret = destination.conversion_host.ssh_key_secret  # type: ignore[union-attr]
                 try:

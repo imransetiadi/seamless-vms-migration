@@ -25,6 +25,11 @@ SCRIPT = textwrap.dedent(
     from pathlib import Path
     import yaml
 
+    class Loader(yaml.SafeLoader):
+        pass  # like Ansible's loader: a !unsafe scalar is a plain (never templated) string
+
+    Loader.add_constructor("!unsafe", lambda loader, node: loader.construct_scalar(node))
+
     argv = sys.argv[1:]
     record = {{"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
               "env_keys": sorted(os.environ)}}
@@ -34,8 +39,11 @@ SCRIPT = textwrap.dedent(
     record["playbook"] = os.path.basename(playbook) if playbook.endswith(".yml") else playbook
     record["inventory"] = Path(inventory).read_text()
     merged = {{}}
+    record["raw"] = {{"inventory.yml": record["inventory"]}}
     for f in files:
-        data = yaml.safe_load(Path(f).read_text()) or {{}}
+        text = Path(f).read_text()
+        record["raw"][os.path.basename(f)] = text
+        data = yaml.load(text, Loader=Loader) or {{}}
         if os.path.basename(f) == "secrets.yml":
             record["secret_keys"] = sorted(data)
             record["secrets_mode"] = oct(stat.S_IMODE(os.stat(f).st_mode))

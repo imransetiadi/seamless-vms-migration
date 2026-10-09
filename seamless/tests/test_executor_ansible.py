@@ -1,6 +1,8 @@
 import copy
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +17,7 @@ from seamless_migrate.executors.ansible import (
     KIT_PLAYBOOK,
     STOP_TASK,
     AnsibleExecutor,
+    ansible_yaml,
     apply_mappings,
     build_inventory,
     build_vars,
@@ -22,6 +25,7 @@ from seamless_migrate.executors.ansible import (
     effective_mappings,
     workload_filter,
 )
+from seamless_migrate.executors.ansible import _inventory as build_inventory_doc
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
 from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
@@ -51,6 +55,17 @@ MAPPINGS = Mappings(
     volume_types={"ceph-hdd": "rbd-hdd"},
     projects={"finance": "finance-rhoso"},
 )
+
+
+class AnsibleLikeLoader(yaml.SafeLoader):
+    """Reads generated Ansible input like Ansible does: a ``!unsafe`` scalar is a plain string."""
+
+
+AnsibleLikeLoader.add_constructor("!unsafe", lambda loader, node: loader.construct_scalar(node))
+
+
+def load_ansible_yaml(text: str):
+    return yaml.load(text, Loader=AnsibleLikeLoader)
 
 
 class FakeImpl:
@@ -309,6 +324,111 @@ async def test_warm_cutover_reports_destination_from_warm_state(env):
     assert rec.downtime_marks == 1
 
 
+#: tags a scalar may carry in generated Ansible input: ``!unsafe`` strings and YAML's non-strings
+NEVER_TEMPLATED = {
+    "!unsafe",
+    "tag:yaml.org,2002:bool",
+    "tag:yaml.org,2002:int",
+    "tag:yaml.org,2002:float",
+    "tag:yaml.org,2002:null",
+}
+JINJA_NAME = "{{ lookup('pipe', 'id') }}{% if true %}-x{% endif %}"
+
+
+def value_scalars(node):
+    """The scalar nodes in value position (mapping values, sequence items) of a YAML node."""
+    if isinstance(node, yaml.MappingNode):
+        for _key, value in node.value:
+            yield from value_scalars(value)
+    elif isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            yield from value_scalars(item)
+    elif isinstance(node, yaml.ScalarNode):
+        yield node
+
+
+@pytest.mark.parametrize(
+    ("strategy", "source"), [(Strategy.vmware_warm, VCENTER), (Strategy.warm, SRC)]
+)
+async def test_generated_ansible_input_is_never_templated(env, strategy, source):
+    """Security.md C1-05, SDD §7.2: Ansible templates every string it reads, so a VM name (chosen
+    by whoever runs the source VM), a mapping value or a password holding Jinja would run on the
+    control plane (``lookup('pipe', …)``). Every string in vars.yml, secrets.yml and the
+    inventory is written ``!unsafe``, and the playbook still receives it unchanged."""
+    ctx, _ = ctx_for(env, strategy=strategy, source=source, name=JINJA_NAME)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    calls = read_log(env.log)
+    assert calls
+    for call in calls:
+        assert {"vars.yml", "secrets.yml", "inventory.yml"} <= set(call["raw"])
+        for name, text in call["raw"].items():
+            for node in value_scalars(yaml.compose(text)):
+                assert node.tag in NEVER_TEMPLATED, (call["playbook"], name, node.value)
+    if strategy is Strategy.vmware_warm:
+        assert calls[-1]["vars"]["vms_list"] == [JINJA_NAME]
+    else:
+        [query] = calls[-1]["vars"]["os_migrate_workloads_filter"]
+        assert re.search(query["regex"], JINJA_NAME)
+
+
+def test_ansible_reads_generated_input_verbatim(tmp_path):
+    """The real ``ansible-playbook`` keeps a Jinja VM name and password literal instead of running
+    them, and the run still works: modules execute through the ``!unsafe`` connection variables of
+    the executor's inventory and receive the nested secrets unchanged."""
+    playbook_bin = Path(sys.executable).with_name("ansible-playbook")
+    if not playbook_bin.exists():
+        pytest.skip("ansible-core is not installed (the collection extra)")
+    marker = "INJECTED-BY-VM-NAME"
+    name = "{{ lookup('pipe', 'echo " + marker + "') }}"
+    (tmp_path / "vars.yml").write_text(
+        ansible_yaml({"vms_list": [name], "network_map": {"a": name}})
+    )
+    (tmp_path / "secrets.yml").write_text(
+        ansible_yaml({"os_migrate_src_auth": {"username": "svc", "password": name + "%{x}"}})
+    )
+    # the executor's own inventory: local connection and interpreter are !unsafe strings
+    (tmp_path / "inventory.yml").write_text(build_inventory_doc())
+    (tmp_path / "play.yml").write_text(
+        "- hosts: migrator\n  gather_facts: false\n  tasks:\n"
+        "    - ansible.builtin.debug:\n"
+        '        msg: "name={{ vms_list[0] }} net={{ network_map.a }}"\n'
+        "    - ansible.builtin.debug:\n"
+        '        msg: "pw={{ os_migrate_src_auth.password }}"\n'
+        "    - ansible.builtin.ping:\n"
+        "        data: '{{ os_migrate_src_auth.password }}'\n"
+        "      register: pong\n"
+        "    - ansible.builtin.assert:\n"
+        "        that: pong.ping == os_migrate_src_auth.password\n"
+    )
+    run = subprocess.run(
+        [
+            str(playbook_bin),
+            "-i",
+            str(tmp_path / "inventory.yml"),
+            str(tmp_path / "play.yml"),
+            "-e",
+            f"@{tmp_path / 'vars.yml'}",
+            "-e",
+            f"@{tmp_path / 'secrets.yml'}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "ANSIBLE_LOCAL_TEMP": str(tmp_path / "tmp"),
+            "ANSIBLE_NOCOLOR": "1",
+            "ANSIBLE_STDOUT_CALLBACK": "default",
+        },
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert f"name={name} net={name}" in run.stdout
+    assert marker not in run.stdout.replace(name, "")
+    assert f"pw={name}%{{x}}" in run.stdout
+    assert "ok=4" in run.stdout and "failed=0" in run.stdout
+
+
 async def test_vmware_warm_flags(env):
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
     await env.executor.run(StepName.PRECOPY, ctx)
@@ -412,7 +532,7 @@ def test_build_vars_and_inventory_are_pure(env):
     dumped = yaml.safe_dump(v1)  # no credentials: those only ever reach secrets.yml
     assert not any(k.endswith("_auth") for k in v1) and "spw" not in dumped
     assert "dpw" not in dumped and "must-not-leak" not in dumped
-    inventory = yaml.safe_load(build_inventory(ctx))
+    inventory = load_ansible_yaml(build_inventory(ctx))
     assert inventory["migrator"]["hosts"]["localhost"]["ansible_connection"] == "local"
 
 
@@ -573,7 +693,7 @@ async def test_vmware_conversion_host_key_secret(env, monkeypatch):
     )
     ctx, _ = make_ctx(plan, mig, VCENTER, keyed, env.settings)
     key_path = run_dir(env) / CONVERSION_KEY_FILE
-    inventory = yaml.safe_load(build_inventory(ctx))
+    inventory = load_ansible_yaml(build_inventory(ctx))
     host = inventory["conversion_host"]["hosts"]["192.0.2.10"]
     assert host["ansible_ssh_private_key_file"] == str(key_path)
     assert host["ansible_ssh_user"] == "cloud-user"
