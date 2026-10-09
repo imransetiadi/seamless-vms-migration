@@ -876,6 +876,7 @@ class Orchestrator:
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
             m.cutover_requested = False
+            m.force_window = False
             await self._save(m, v)
         source_id = m.vm.source_id
 
@@ -1122,6 +1123,10 @@ class Orchestrator:
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in allowed:
+                return False
+            if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
+                # the tick saw the gate open on its snapshot; an action under this lock (e.g.
+                # set_strategy clearing the approvals) may have closed it since (SDD §5.4)
                 return False
             await self._transition(m, v, to, reason)
         self._launch(mid)

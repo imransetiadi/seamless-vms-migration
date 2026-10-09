@@ -978,6 +978,43 @@ async def test_cancel_and_set_strategy(tmp_path, store):
         await h.orch.cancel(m2.id, "rina", "again")
 
 
+async def test_set_strategy_clears_force_window(tmp_path, store):
+    """SDD §5.4: approvals, cutover_requested and a pending force_window belong to the assessment
+    they were given for — a strategy change clears all three."""
+    from seamless_migrate.domain.models import Approval, Migration
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.approvals = [Approval(actor="sari", at=h.orch.now())]
+    m.cutover_requested = True
+    m.force_window = True
+    store.put("migration", m)
+    await h.orch.set_strategy(m.id, Strategy.cold, "rina")
+    changed = store.get("migration", m.id, Migration)
+    assert changed.approvals == [] and changed.cutover_requested is False
+    assert changed.force_window is False
+
+
+async def test_begin_rechecks_gate_under_lock(tmp_path, store):
+    """The tick evaluates the cutover gate on its snapshot; an action under the migration's lock
+    (e.g. set_strategy clearing the approvals) may change it before _begin runs. _begin
+    re-checks the gate on the fresh copy, so a source VM is never stopped without approval."""
+    from seamless_migrate.domain.models import Migration
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"require_approval": True, "auto_cutover": True}
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.awaiting_cutover
+    m.approvals = []  # cleared after the tick's snapshot saw an approval
+    store.put("migration", m)
+    began = await h.orch._begin(m.id, {P.awaiting_cutover}, P.cutover, "cutover gate open")
+    assert began is False
+    assert store.get("migration", m.id, Migration).phase == P.awaiting_cutover
+
+
 async def test_pause_stops_new_work(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")
