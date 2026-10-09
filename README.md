@@ -32,6 +32,11 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 * **One dashboard for every hypervisor:** add and edit OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1,
   VMware vCenter and RHOSO 18.0 providers from the UI with platform presets, write-only credentials kept in the
   platform secret store (never in the database), the conversion-host SSH key, and a one-click connection test.
+* **Every common guest OS:** RHEL 5–10, CentOS, Rocky, AlmaLinux, Oracle Linux, Ubuntu (every LTS and
+  interim release), Debian 7–14, SLES/openSUSE, Windows Server 2003–2025 and Windows 7–11 are identified,
+  shown with their support state and migrated — legacy releases get warnings with remediation, never a
+  silent block. Windows guests are verified on RDP/WinRM ports instead of the serial console, and a storage
+  handover keeps UEFI, machine-type and bus settings ([SDD §9.5](docs/SDD.md)). See *Guest OS support* below.
 * **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
   structured JSON logs (uvicorn's access lines included), `/health` and a `/ready` probe that answers
   503 while the database or the orchestrator loop is down, audit log export and retention
@@ -50,6 +55,27 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
                                           ▼                                                     ▼
                          Source: RHOSP 17.1 / OpenStack / vCenter                  RHOSO 18.0 (boots the VM)
 ```
+
+## Guest OS support
+
+OpenStack sources (RHOSP 17.1, community, Kolla) move KVM guests to KVM: every guest that boots on the source
+boots on RHOSO, because the volumes keep their boot properties. VMware sources are converted by virt-v2v on the
+RHEL 9 conversion host, which is where vendor support differs ([SDD §9.5](docs/SDD.md), Red Hat's virt-v2v
+support matrix):
+
+| Guest | From OpenStack | From VMware (virt-v2v) | Lifecycle (2026-10) |
+|---|---|---|---|
+| RHEL 7, 8, 9, 10 | migrates | supported | 8–10 current; 7 legacy |
+| RHEL / CentOS 6 | migrates | works, not supported by Red Hat — test a copy (`GUEST_CONVERSION_UNVERIFIED`) | legacy |
+| RHEL / CentOS ≤ 5 | migrates | needs virtio drivers prepared in the guest (`GUEST_CONVERSION_UNSUPPORTED`) | legacy |
+| Rocky, AlmaLinux, Oracle Linux, CentOS 7/Stream | migrates | works, not supported by Red Hat — test a copy | Rocky/Alma/Oracle 8+ current |
+| Ubuntu (all releases), Debian (all releases) | migrates | Technology Preview — test a copy | Ubuntu 22.04/24.04/26.04 and Debian 12/13 current |
+| SLES, openSUSE | migrates | works, not supported; btrfs roots are not convertible | SLES 15 current |
+| Windows Server 2016, 2019, 2022, 2025; Windows 10/11 | migrates; verified on RDP/WinRM | supported | 2016+ current |
+| Windows Server 2003, 2008, 2008 R2, 2012, 2012 R2; Windows 7/8 | migrates; verified on RDP/WinRM | needs virtio-win drivers from an older release installed first | legacy |
+
+Legacy releases are flagged (`GUEST_OS_LEGACY`), never blocked. Set `os_distro`/`os_version` image properties
+or run VMware Tools so every guest is identified (`GUEST_OS_UNKNOWN` otherwise).
 
 ## Quick start — local stack on Docker Compose (Colima profile `seamless`)
 

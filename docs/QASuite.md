@@ -353,6 +353,13 @@ Every run records the environment descriptor ([Performance.md](Performance.md) �
 | LAB-V05 | independent disk | `VMW_INDEPENDENT_DISK` warning; `vmware_warm` ineligible | FR-04, FR-06 |
 | LAB-V06 | Windows VM without VMware Tools | `VMW_TOOLS_MISSING` info; boots after conversion | FR-04 |
 | LAB-V07 | rollback after a failed VMware cutover | destination server deleted via API, source powered on | FR-15 |
+| **Guest OS matrix (SDD §9.5, §7.5)** | | | |
+| LAB-G01 | OpenStack `warm`/`cold`: Ubuntu 22.04 and 24.04, Debian 12, Rocky 9, AlmaLinux 8, RHEL 7/8/9, CentOS 7 | each boots on RHOSO with the same NIC names and addresses; `guest_os` labels match the releases; legacy ones carry `GUEST_OS_LEGACY` and still complete | FR-04, FR-07 |
+| LAB-G02 | Windows Server 2016/2019/2022/2025 from OpenStack, plan `windows_tcp_ports: [3389]` | verification passes on 3389 with the console check skipped; a plan with Windows ports empty passes with the "no TCP port" warning | FR-11 |
+| LAB-G03 | UEFI Windows Server 2022 and a UEFI Ubuntu 24.04 by `storage_handover` | the managed boot volumes carry `hw_firmware_type=uefi` and the other `hw_*`/`os_*` keys; both boot; rollback restores them at the source | FR-09 |
+| LAB-G04 | VMware: RHEL 9, Windows Server 2022 (supported), Ubuntu 22.04 and Debian 12 (Technology Preview), Rocky 9 (unverified) | supported ones convert without findings; the others convert with `GUEST_CONVERSION_UNVERIFIED` | FR-10 |
+| LAB-G05 | VMware: Windows Server 2012 R2 and 2008 R2 with virtio drivers from an older virtio-win release installed beforehand; without them | with drivers: the conversion boots; without: `GUEST_CONVERSION_UNSUPPORTED` warns before the run and the documented failure is recorded | FR-10 |
+| LAB-G06 | legacy OpenStack guests: RHEL 6, Ubuntu 14.04, Windows Server 2008 R2 | migrate and boot (KVM to KVM, boot properties kept); `GUEST_OS_LEGACY` shown in the dashboard | FR-04 |
 | **Pre-flight (all platforms)** | | | |
 | LAB-N01 | two selected VMs with the same name (different projects) | `SRC_VM_DUPLICATE_NAME` blocker; `POST /plans/{id}/start` returns 409 | FR-04 |
 | LAB-N02 | VM named `web(1)[prod].*+?` | only that VM is selected (anchored, escaped regex); end-to-end success; no other VM touched | FR-04, FR-08 |
