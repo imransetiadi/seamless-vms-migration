@@ -434,6 +434,14 @@ SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAM
 # wait until the control plane answers (both engines; Docker's --wait already covers the healthchecks)
 SEAMLESS_WAIT_HEALTH  = for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
                         [ $$i = 150 ] && { echo "the control plane did not become healthy in 300 s: make seamless-logs"; exit 1; }; sleep 2; done
+# The stack publishes on 127.0.0.1 only, but a browser opens localhost on ::1 first: when another
+# program answers on [::1]:<port>, localhost is not this dashboard, so name the address that is.
+SEAMLESS_LOCALHOST_NOTE = if curl -gs -m 3 -o /dev/null "http://[::1]:$(SEAMLESS_HOST_PORT)/"; then \
+                            case "$$(curl -gs -m 3 "http://[::1]:$(SEAMLESS_HOST_PORT)/api/v1/health" || true)" in \
+                              *'"orchestrator"'*) ;; \
+                              *) echo "note: http://localhost:$(SEAMLESS_HOST_PORT)/ reaches another program on this machine (it answers on [::1]:$(SEAMLESS_HOST_PORT)); open http://127.0.0.1:$(SEAMLESS_HOST_PORT)/" ;; \
+                            esac; \
+                          fi
 SEAMLESS_COMPOSE      = env $(SEAMLESS_UNSET_ENV) $(SEAMLESS_COMPOSE_BASE) --env-file $(SEAMLESS_ENV_FILE)
 # parse-only placeholders for down/reset when .env is gone (nothing is started with them)
 SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused $(SEAMLESS_COMPOSE_BASE)
@@ -488,12 +496,14 @@ seamless-up: seamless-check-context seamless-check-env
 	$(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
 	@$(SEAMLESS_WAIT_HEALTH)
 	@echo "Seamless Migrate: http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   health: /api/v1/health"
+	@$(SEAMLESS_LOCALHOST_NOTE)
 
 # Same stack with simulated providers and executor against PostgreSQL (SDD 7.4, 15.1).
 seamless-demo: seamless-check-context seamless-check-env
 	SEAMLESS_DEMO=true $(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
 	@$(SEAMLESS_WAIT_HEALTH)
 	@echo "Seamless Migrate (demo): http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   sign in with your admin token"
+	@$(SEAMLESS_LOCALHOST_NOTE)
 
 # --profile '*' also stops the optional jev sidecar when COMPOSE_PROFILES is empty.
 # Works without .env (placeholder values are only needed to parse the file).

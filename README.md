@@ -95,7 +95,7 @@ scripts/compose-init.sh          # prints the admin API token ONCE - store it no
 make seamless-demo               # build + start postgres, jev (if enabled) and seamless with simulated clouds
 # make seamless-up               # same stack without the demo seed (bring your own clouds.yaml)
 
-open http://127.0.0.1:8080/      # sign in at /login with the admin token
+open http://127.0.0.1:8080/      # sign in at /login with the admin token (127.0.0.1: localhost may be another program)
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
 make seamless-check              # every CI check that runs locally: tests with the 85 % coverage gate, ruff,

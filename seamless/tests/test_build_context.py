@@ -7,9 +7,13 @@ create, because the Containerfile bind-mounts the whole context into a build ste
 reaches local, remote and CI builders.
 """
 
+import http.server
+import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import tomllib
 from pathlib import Path
 
@@ -199,6 +203,97 @@ def _ci_step_run(name: str) -> str:
     steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
     step = next(step for step in steps if step.get("name", "").startswith(name))
     return step["run"].replace("\\\n", " ")
+
+
+# what GET /api/v1/health of the control plane answers (SDD §12), and another program's 404
+SEAMLESS_HEALTH = (
+    b'{"status":"ok","version":"0.1.0","demo":true,"db":"ok",'
+    b'"orchestrator":{"running":true,"last_tick_age_s":1.0,"ticks":3,"healthy":true}}'
+)
+OTHER_PROGRAM = b'{"code":"not_found","status":404}'
+
+
+def _serve(host: str, port: int, status: int, body: bytes) -> http.server.ThreadingHTTPServer:
+    """A loopback HTTP server answering every GET with ``status`` and ``body``."""
+
+    class Answer(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 (http.server's name)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    class Server(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+    server = Server((host, port), Answer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("on_ipv6", ["another program", "nothing", "seamless"])
+def test_seamless_up_says_to_open_127_when_localhost_is_another_program(on_ipv6, tmp_path):
+    """The stack publishes on 127.0.0.1 only, but a browser opens ``localhost`` on ::1 first: when
+    another program answers on [::1]:<port>, ``make seamless-up``/``seamless-demo`` name the address
+    of the dashboard (a user took the other program's 404 for a dead dashboard, 2026-10-10)."""
+    servers = [_serve("127.0.0.1", 0, 200, SEAMLESS_HEALTH)]
+    port = servers[0].server_address[1]
+    try:
+        if on_ipv6 != "nothing":
+            try:
+                other = on_ipv6 == "another program"
+                servers.append(
+                    _serve(
+                        "::1",
+                        port,
+                        404 if other else 200,
+                        OTHER_PROGRAM if other else SEAMLESS_HEALTH,
+                    )
+                )
+            except OSError:
+                pytest.skip("no IPv6 loopback on this machine")
+        probe = tmp_path / "probe.mk"
+        probe.write_text("seamless-localhost-probe: ; @$(SEAMLESS_LOCALHOST_NOTE)\n")
+        result = subprocess.run(
+            [
+                "make",
+                "-s",
+                "--no-print-directory",
+                "-f",
+                "Makefile",
+                "-f",
+                str(probe),
+                "seamless-localhost-probe",
+                f"SEAMLESS_HOST_PORT={port}",
+            ],
+            cwd=ROOT,
+            env={"PATH": os.environ["PATH"]},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+    assert result.returncode == 0, result.stderr
+    if on_ipv6 == "another program":
+        assert f"http://localhost:{port}/ reaches another program" in result.stdout
+        assert f"open http://127.0.0.1:{port}/" in result.stdout
+    else:
+        assert result.stdout == ""
+
+
+@pytest.mark.parametrize("target", ["seamless-up", "seamless-demo"])
+def test_seamless_up_and_demo_check_localhost_once_healthy(target):
+    recipe = _makefile_target_recipe(target)
+    assert "$(SEAMLESS_LOCALHOST_NOTE)" in recipe
+    assert recipe.index("$(SEAMLESS_WAIT_HEALTH)") < recipe.index("$(SEAMLESS_LOCALHOST_NOTE)")
 
 
 def test_seamless_check_runs_the_ci_checks_that_run_locally():

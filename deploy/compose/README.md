@@ -190,6 +190,7 @@ application credentials ([Security.md](../../docs/Security.md) §7).
 | `jev` unhealthy for ~1 min after first start | `npx` downloads the pinned package; wait for `start_period` (90 s) and check `make seamless-logs SEAMLESS_SERVICE=jev` |
 | Memory calls fail from the container | `docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.internal:3111/agentmemory/livez`; start the host agentmemory, or delete `SEAMLESS_MEMORY_URL` from `.env` |
 | Port 8080 already in use | set `SEAMLESS_HOST_PORT=8081` in `.env` |
+| `http://localhost:8080/` shows another app (or its 404) although the stack is healthy | the stack listens on `127.0.0.1` only and a browser opens `localhost` on `::1` first, where another program answers (`lsof -nP -iTCP:8080 -sTCP:LISTEN`); `make seamless-up`/`seamless-demo` print a note then. Open `http://127.0.0.1:8080/`, stop that program, or set `SEAMLESS_HOST_PORT` |
 | `exec: "python3": executable file not found` in the health check | the image must provide `python3` on `PATH` (UBI Python base does) |
 
 ## Security notes
