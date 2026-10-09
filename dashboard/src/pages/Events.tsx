@@ -21,7 +21,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
@@ -97,7 +97,10 @@ function byNewest(a: Item, b: Item): number {
 export default function Events() {
   usePageTitle('Events');
   const searchId = useId();
-  const history = useEventTail();
+  // the plan filter lives in the address like Overview's (SDD §16): its history comes from the API
+  const [params, setParams] = useSearchParams();
+  const planId = params.get('plan') ?? '';
+  const history = useEventTail(planId ? { plan_id: planId } : {});
   const plans = usePlans();
   const [live, setLive] = useState<Item[]>([]);
   const [held, setHeld] = useState<Item[]>([]);
@@ -147,12 +150,13 @@ export default function Events() {
     const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
     const q = query.trim().toLowerCase();
     return items.filter(({ event }) => {
+      if (planId && event.plan_id !== planId) return false;
       if (!match(event.kind)) return false;
       if (event.seq === 0 && !showProgress) return false;
       if (!q) return true;
       return [event.message, event.kind, event.actor, event.plan_id ?? '', event.migration_id ?? ''].some((v) => v.toLowerCase().includes(q));
     });
-  }, [items, category, query, showProgress]);
+  }, [items, category, query, showProgress, planId]);
   // a failed history load with nothing cached: the trail is unknown, not empty (SDD §16)
   const historyUnknown = Boolean(history.error) && !history.data;
   // the shown audit events (SDD §16): the page as shown, without progress updates (never persisted)
@@ -243,6 +247,24 @@ export default function Events() {
             setLimit(PAGE);
           }}
           options={CATEGORIES.map((c) => ({ value: c.value, label: c.label }))}
+        />
+        <SelectField
+          label="Plan"
+          className="md:w-60"
+          value={planId}
+          onChange={(e) => {
+            const next = new URLSearchParams(params);
+            if (e.target.value) next.set('plan', e.target.value);
+            else next.delete('plan');
+            setParams(next, { replace: true });
+            setLimit(PAGE);
+          }}
+          options={[
+            { value: '', label: 'All plans' },
+            ...(plans.data ?? []).map((p) => ({ value: p.id, label: p.name })),
+            // a plan in the address that the list does not hold (not loaded, or gone) stays chosen
+            ...(planId && !(plans.data ?? []).some((p) => p.id === planId) ? [{ value: planId, label: planId }] : []),
+          ]}
         />
         <label className="flex min-h-11 cursor-pointer items-center gap-2 text-sm text-foreground md:mb-0.5">
           <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => setShowProgress(e.target.checked)} />

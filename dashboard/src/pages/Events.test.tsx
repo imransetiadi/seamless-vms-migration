@@ -99,6 +99,45 @@ describe('Events page', () => {
     expect(screen.getByRole('button', { name: /download shown events/i })).toHaveAccessibleDescription(/audit trail could not be loaded/i);
   });
 
+  it('shows the audit trail of one plan when it is chosen, live events too (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await streamReady(server);
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const before = within(list).getAllByRole('listitem').length;
+    await user.selectOptions(screen.getByLabelText('Plan'), plan.id);
+    // only that plan's events (the list is drawn again from the plan's history): each one links to it
+    const shown = () => within(screen.getByRole('list', { name: /events, newest first/i })).getAllByRole('listitem');
+    await waitFor(() => {
+      const items = shown();
+      expect(items.length).toBeGreaterThan(0);
+      expect(items.length).toBeLessThan(before);
+      for (const item of items) expect(within(item).getByRole('link', { name: plan.name })).toBeInTheDocument();
+    });
+    // a live event of another plan stays out, one of this plan comes in
+    act(() => {
+      server.emit({ kind: 'plan.updated', plan_id: 'plan-c81d44a0', migration_id: null, actor: 'rina', message: 'zz other plan event', data: {} });
+      server.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: 'rina', message: 'zz this plan event', data: {} });
+    });
+    expect(await screen.findByText('zz this plan event')).toBeInTheDocument();
+    expect(screen.queryByText('zz other plan event')).not.toBeInTheDocument();
+  });
+
+  it('opens on the plan in the address and loads only its history (SDD §16)', async () => {
+    const server = createTestServer();
+    const asked: string[] = [];
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET' && path === '/events') asked.push(query.get('plan_id') ?? '');
+      return handle(method, path, query, body, token);
+    };
+    renderWithApp(<Events />, { route: '/events?plan=plan-4f2a9c1e', token: 'viewer', server });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    await waitFor(() => expect(screen.getByLabelText('Plan')).toHaveValue('plan-4f2a9c1e'));
+    expect(asked).toContain('plan-4f2a9c1e');
+  });
+
   it('filters by category and text', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
