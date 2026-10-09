@@ -20,33 +20,61 @@ function progressEvent(data: Record<string, unknown>): Event {
   };
 }
 
-function setup() {
+function setup(m: Migration = migration) {
   const queryClient = new QueryClient();
-  queryClient.setQueryData(['migration', migration.id], migration);
-  queryClient.setQueryData(['migrations', { plan_id: migration.plan_id }], [migration]);
+  queryClient.setQueryData(['migration', m.id], m);
+  queryClient.setQueryData(['migrations', { plan_id: m.plan_id }], [m]);
   const invalidate = vi.fn();
   return { queryClient, invalidate };
 }
 
+const MiB = 2 ** 20;
+const GiB = 2 ** 30;
+
 describe('applyEventToCache', () => {
-  it('patches progress in place from the mock payload (progress_pct, bytes_transferred)', () => {
-    const { queryClient, invalidate } = setup();
-    applyEventToCache(queryClient, progressEvent({ progress_pct: 55.5, bytes_transferred: 123, bytes_total: 456 }), invalidate);
-    expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toMatchObject({ progress_pct: 55.5, bytes_transferred: 123, bytes_total: 456 });
-    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.progress_pct).toBe(55.5);
+  it('sets the step percentage and counts the step bytes on top of the passes that ended, like the API (SDD §4.3, §16)', () => {
+    const pass = { started_at: '2026-10-08T10:00:00Z', ended_at: '2026-10-08T10:30:00Z', bytes_scanned: 0, bytes_changed: 0, duration_s: 1800 };
+    const m: Migration = {
+      ...migration,
+      bytes_total: 110 * GiB,
+      bytes_transferred: 107 * GiB,
+      sync_bytes_dropped: 5 * GiB,
+      sync_passes: [
+        { ...pass, number: 1, kind: 'full', bytes_transferred: 100 * GiB },
+        { ...pass, number: 2, kind: 'delta', bytes_transferred: 2 * GiB },
+        // a running pass, as the mock lists one: its bytes arrive as bytes_done
+        { ...pass, number: 3, kind: 'delta', ended_at: null, duration_s: null, bytes_transferred: 512 * MiB },
+      ],
+    };
+    const { queryClient, invalidate } = setup(m);
+    applyEventToCache(queryClient, progressEvent({ pct: 40, bytes_done: 800 * MiB, bytes_total: 2 * GiB, phase: 'syncing' }), invalidate);
+    const expected = { progress_pct: 40, bytes_transferred: 107 * GiB + 800 * MiB, bytes_total: 110 * GiB };
+    expect(queryClient.getQueryData<Migration>(['migration', m.id])).toMatchObject(expected);
+    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: m.plan_id }])?.[0]).toMatchObject(expected);
     expect(invalidate).not.toHaveBeenCalled();
   });
 
-  it('accepts the executor report_progress shape (pct, bytes_done, bytes_total — SDD §7.1)', () => {
+  it('keeps the transferred bytes and the disk size when a progress event has no bytes_done', () => {
     const { queryClient, invalidate } = setup();
-    applyEventToCache(queryClient, progressEvent({ pct: 12.5, bytes_done: 1000, bytes_total: 8000 }), invalidate);
-    expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toMatchObject({ progress_pct: 12.5, bytes_transferred: 1000, bytes_total: 8000 });
+    applyEventToCache(queryClient, progressEvent({ pct: 12.5 }), invalidate);
+    expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toMatchObject({
+      progress_pct: 12.5,
+      bytes_transferred: migration.bytes_transferred,
+      bytes_total: migration.bytes_total,
+    });
+    expect(invalidate).not.toHaveBeenCalled();
   });
 
-  it('invalidates instead of guessing when a progress payload has no percentage', () => {
+  it('invalidates instead of guessing when a progress payload has no pct (SDD §4.3)', () => {
     const { queryClient, invalidate } = setup();
     applyEventToCache(queryClient, progressEvent({ note: 'unknown shape' }), invalidate);
-    expect(queryClient.getQueryData<Migration>(['migration', migration.id])?.progress_pct).toBe(migration.progress_pct);
+    // a Migration-field payload is not the event's shape either
+    applyEventToCache(queryClient, progressEvent({ progress_pct: 55.5, bytes_transferred: 123 }), invalidate);
+    expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toMatchObject({
+      progress_pct: migration.progress_pct,
+      bytes_transferred: migration.bytes_transferred,
+    });
+    expect(invalidate).toHaveBeenCalledTimes(2);
     expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
   });
 

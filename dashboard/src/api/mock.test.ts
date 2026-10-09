@@ -80,6 +80,16 @@ describe('mock fixtures', () => {
     }
   });
 
+  it('count bytes like the API: bytes_total is the disk, bytes_transferred every pass that ended plus the running one (SDD §4.2)', () => {
+    for (const m of new MockServer({ now: () => NOW, seed: 1 }).migrations) {
+      expect(m.bytes_total, m.id).toBe(m.vm.used_bytes);
+      if (!m.sync_passes.length) continue;
+      const ended = m.sync_passes.filter((p) => p.ended_at !== null).reduce((sum, p) => sum + p.bytes_transferred, 0);
+      const running = m.sync_passes.find((p) => p.ended_at === null)?.bytes_transferred ?? 0;
+      expect(m.bytes_transferred, m.id).toBe(m.sync_bytes_dropped + ended + running);
+    }
+  });
+
   it('numbers persisted events in increasing order', () => {
     const seqs = server.events.map((e) => e.seq);
     expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
@@ -246,6 +256,50 @@ describe('mock API', () => {
     const again = server.migrations.find((m) => m.id === failed.id)!;
     expect(again.phase).toBe('cutover');
     expect(again.downtime_started_at).toBe(stoppedAt);
+  });
+
+  it('counts bytes over every pass while migrations run and reports the running step in progress events, like the API (SDD §4.2, §4.3)', () => {
+    const { server } = setup('operator');
+    for (const plan of server.plans) plan.cutover_window = null;
+    const progress: Event[] = [];
+    server.subscribe((e) => {
+      if (e.kind === 'migration.progress') progress.push(e);
+    });
+    const ended = (m: Migration) => m.sync_bytes_dropped + m.sync_passes.reduce((sum, p) => sum + (p.ended_at === null ? 0 : p.bytes_transferred), 0);
+    for (let t = 0; t < 80; t++) {
+      server.tick();
+      for (const m of server.migrations) {
+        expect(m.bytes_total, m.id).toBe(m.vm.used_bytes);
+        if (!m.sync_passes.length) continue;
+        const running = m.sync_passes.find((p) => p.ended_at === null)?.bytes_transferred ?? 0;
+        expect(m.bytes_transferred, m.id).toBe(ended(m) + running);
+      }
+    }
+    expect(progress.length).toBeGreaterThan(0);
+    for (const e of progress) {
+      expect(Object.keys(e.data).sort()).toEqual(['bytes_done', 'bytes_total', 'pct', 'phase']);
+      expect(e.data.bytes_done as number).toBeLessThanOrEqual(e.data.bytes_total as number);
+    }
+    // a migration the fixtures start mid-cutover finishes its final pass with the bytes it moved
+    const midCutover = server.migrations.find((m) => m.id === 'mig-3c1a0f9e23')!;
+    expect(midCutover.phase).toBe('verifying');
+    expect(midCutover.sync_passes.at(-1)).toMatchObject({ kind: 'final', ended_at: expect.any(String) });
+    expect(midCutover.sync_passes.at(-1)!.bytes_transferred).toBeGreaterThan(0);
+  });
+
+  it('records a cold copy as a full pass and keeps its bytes, as the API executors do (SDD §4.2)', async () => {
+    const { server } = setup('approver');
+    const m = server.migrations.find((x) => x.strategy === 'cold' && x.phase === 'ready')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.status = 'running';
+    plan.cutover_window = null;
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    await approver.post(`/migrations/${m.id}/cutover`, {});
+    for (let t = 0; t < 200 && m.phase === 'cutover'; t++) server.tick();
+    expect(m.phase).toBe('verifying');
+    expect(m.sync_passes.at(-1)).toMatchObject({ kind: 'full', bytes_transferred: m.vm.used_bytes });
+    expect(m.bytes_transferred).toBe(m.vm.used_bytes);
+    expect(m.bytes_total).toBe(m.vm.used_bytes);
   });
 
   it('keeps the first max_sync_passes and the latest 20 sync passes of a long wait, like the API (SDD §5.4)', async () => {

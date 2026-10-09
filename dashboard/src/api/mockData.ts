@@ -1044,8 +1044,10 @@ export function buildFixtures(now: number): Fixtures {
         phase: m.phase,
         phase_history: history,
         progress_pct: progress,
-        bytes_total: bytesTotal,
-        bytes_transferred: Math.round((bytesTotal * progress) / 100),
+        // like the API (SDD §4.2): the disk's used bytes, and every pass that ended plus the running one
+        // (a migration without passes counts its copy's progress; a storage handover copies nothing)
+        bytes_total: vm.used_bytes,
+        bytes_transferred: syncPasses.length ? syncPasses.reduce((sum, p) => sum + p.bytes_transferred, 0) : Math.round((bytesTotal * progress) / 100),
         sync_passes: syncPasses,
         sync_bytes_dropped: 0,
         estimate: chosen,

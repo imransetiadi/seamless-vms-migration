@@ -14,6 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { canTransition } from '../lib/fsm';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
+import { endedPassBytes } from '../lib/transfer';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -142,6 +143,8 @@ export class MockServer {
   private readonly rand: () => number;
   private readonly now: () => number;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Bytes the running cutover step moves (the final pass, a cold copy; 0 for a handover). */
+  private readonly cutoverBytes = new Map<string, number>();
   /** The request being handled, for the `auth.denied` audit (SDD §13.1). */
   private request = { method: 'GET', path: '/' };
 
@@ -222,7 +225,7 @@ export class MockServer {
           break;
         case 'rolling_back':
           m.progress_pct = Math.min(100, m.progress_pct + 6);
-          this.progressEvent(m);
+          this.stepProgress(m, 0, 0);
           if (m.progress_pct >= 100) {
             this.transition(m, 'rolled_back', 'source VM running again', 'orchestrator');
             this.endDowntime(m);
@@ -234,7 +237,12 @@ export class MockServer {
     }
   }
 
-  private progressEvent(m: Migration): void {
+  /**
+   * The running step's progress, like the API (SDD §4.2, §4.3): the migration's bytes_transferred is
+   * every pass that ended plus the step's bytes, and the ephemeral event carries the step's own figures.
+   */
+  private stepProgress(m: Migration, done: number, total: number): void {
+    m.bytes_transferred = endedPassBytes(m) + done;
     this.emit(
       {
         kind: 'migration.progress',
@@ -242,7 +250,7 @@ export class MockServer {
         migration_id: m.id,
         actor: 'orchestrator',
         message: `${m.vm.name}: ${m.progress_pct.toFixed(1)}%`,
-        data: { progress_pct: m.progress_pct, bytes_transferred: m.bytes_transferred, bytes_total: m.bytes_total, phase: m.phase },
+        data: { pct: Math.round(m.progress_pct * 100) / 100, bytes_done: done, bytes_total: total, phase: m.phase },
       },
       false,
     );
@@ -265,7 +273,6 @@ export class MockServer {
     };
     m.sync_passes.push(pass);
     m.progress_pct = 0;
-    m.bytes_transferred = 0;
     return pass;
   }
 
@@ -279,13 +286,12 @@ export class MockServer {
   private advanceTransfer(m: Migration, plan: Plan, pctPerTick: number): void {
     const pass = this.openPass(m) ?? this.startPass(m, m.sync_passes.length === 0 ? 'full' : 'delta');
     const target = this.passTarget(m, pass.kind);
-    m.bytes_total = pass.kind === 'full' ? m.vm.used_bytes : target;
     m.progress_pct = Math.min(100, m.progress_pct + pctPerTick * (0.7 + this.rand() * 0.6));
-    m.bytes_transferred = Math.round((m.bytes_total * m.progress_pct) / 100);
+    const done = Math.round((target * m.progress_pct) / 100);
     pass.bytes_scanned = Math.round((m.vm.disk_bytes * m.progress_pct) / 100);
-    pass.bytes_transferred = m.bytes_transferred;
+    pass.bytes_transferred = done;
     m.updated_at = new Date(this.now()).toISOString();
-    this.progressEvent(m);
+    this.stepProgress(m, done, target);
     if (m.progress_pct < 100) return;
 
     const now = this.now();
@@ -295,6 +301,7 @@ export class MockServer {
     pass.bytes_changed = target;
     pass.bytes_transferred = Math.round(target * 0.98);
     keepSyncHistory(m, plan.max_sync_passes);
+    m.bytes_transferred = endedPassBytes(m);
     this.emit({
       kind: 'migration.sync_pass',
       plan_id: m.plan_id,
@@ -337,32 +344,49 @@ export class MockServer {
       m.actual_downtime_s = null;
     }
     m.progress_pct = 0;
-    m.bytes_transferred = 0;
     this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
+    this.cutoverBytes.delete(m.id);
+    this.cutoverTotal(m);
+    // a cold copy is recorded as a full pass, as the API's executors record it
     if (m.strategy === 'warm' || m.strategy === 'vmware_warm') this.startPass(m, 'final');
-    m.bytes_total = m.strategy === 'storage_handover' ? 0 : m.strategy === 'cold' || m.strategy === 'vmware_cold' ? m.vm.used_bytes : this.passTarget(m, 'final');
+    else if (m.strategy === 'cold' || m.strategy === 'vmware_cold') this.startPass(m, 'full');
+  }
+
+  /** The bytes the cutover step moves: a warm final pass, a cold copy, nothing for a storage handover. */
+  private cutoverTotal(m: Migration): number {
+    let total = this.cutoverBytes.get(m.id);
+    if (total === undefined) {
+      // also for a migration the fixtures start mid-cutover
+      const cold = m.strategy === 'cold' || m.strategy === 'vmware_cold';
+      total = m.strategy === 'storage_handover' ? 0 : cold ? m.vm.used_bytes : this.passTarget(m, 'final');
+      this.cutoverBytes.set(m.id, total);
+    }
+    return total;
   }
 
   private advanceCutover(m: Migration, plan: Plan): void {
     const rate = m.strategy === 'warm' || m.strategy === 'vmware_warm' ? 6 : m.strategy === 'storage_handover' ? 8 : 2.5;
     m.progress_pct = Math.min(100, m.progress_pct + rate * (0.7 + this.rand() * 0.6));
-    m.bytes_transferred = Math.round((m.bytes_total * m.progress_pct) / 100);
+    const total = this.cutoverTotal(m);
+    const done = Math.round((total * m.progress_pct) / 100);
     const pass = this.openPass(m);
     if (pass) {
       pass.bytes_scanned = Math.round((m.vm.disk_bytes * m.progress_pct) / 100);
-      pass.bytes_transferred = m.bytes_transferred;
+      pass.bytes_transferred = done;
     }
-    this.progressEvent(m);
+    this.stepProgress(m, done, total);
     if (m.progress_pct < 100) return;
+    this.cutoverBytes.delete(m.id);
     if (pass) {
       const now = this.now();
       pass.ended_at = new Date(now).toISOString();
       pass.duration_s = Math.round((now - Date.parse(pass.started_at)) / 100) / 10;
       pass.bytes_scanned = m.vm.disk_bytes;
-      pass.bytes_changed = m.bytes_total;
-      pass.bytes_transferred = m.bytes_total;
+      pass.bytes_changed = total;
+      pass.bytes_transferred = total;
       keepSyncHistory(m, plan.max_sync_passes);
-      this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: final pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { pass } });
+      m.bytes_transferred = endedPassBytes(m);
+      this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { pass } });
     }
     m.destination_server_id = `${hex(this.rand, 8)}-${hex(this.rand, 4)}-4${hex(this.rand, 3)}-a${hex(this.rand, 3)}-${hex(this.rand, 12)}`;
     m.checkpoint = 'cutover';
@@ -1101,7 +1125,6 @@ export class MockServer {
         m.cutover_requested = false;
         m.force_window = false;
         m.progress_pct = 0;
-        m.bytes_transferred = 0;
         record('retry requested');
         break;
       }
@@ -1179,7 +1202,7 @@ export class MockServer {
       completed: mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length,
       failed: mine.filter((m) => m.phase === 'failed').length,
       in_progress: mine.filter((m) => ['validating', 'precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back'].includes(m.phase)).length,
-      bytes_transferred: mine.reduce((sum, m) => sum + m.sync_bytes_dropped + m.sync_passes.reduce((s, p) => s + p.bytes_transferred, 0) + (m.sync_passes.length ? 0 : m.bytes_transferred), 0),
+      bytes_transferred: mine.reduce((sum, m) => sum + m.bytes_transferred, 0),
       avg_downtime_s: values.length ? Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 10) / 10 : null,
       p95_downtime_s: percentile(values, 95),
       max_downtime_s: values.length ? (values.at(-1) ?? null) : null,

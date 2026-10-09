@@ -5,6 +5,7 @@
  */
 import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
+import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
 import type { Event, Migration } from './types';
 
@@ -126,17 +127,17 @@ export function applyEventToCache(
   if (kind === 'migration.progress') {
     const id = event.migration_id;
     if (!id) return;
-    // Tolerant reader: `progress_pct`/`bytes_transferred` (Migration field names) or the executor's
-    // report_progress(pct, bytes_done, bytes_total) names (SDD §7.1).
-    const pct = num(event.data.progress_pct) ?? num(event.data.pct);
+    // The event carries the running step's {pct, bytes_done, bytes_total} (SDD §4.3); the migration's
+    // figures follow the API's rule (§4.2, §16): bytes_transferred is every pass that ended plus the
+    // step's bytes_done, and bytes_total stays the disk's used bytes.
+    const pct = num(event.data.pct);
     if (pct === null) {
       invalidate(['migration', id]);
       return;
     }
-    const done = num(event.data.bytes_transferred) ?? num(event.data.bytes_done);
-    const total = num(event.data.bytes_total);
+    const done = num(event.data.bytes_done);
     const patch = (m: Migration): Migration =>
-      m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done ?? m.bytes_transferred, bytes_total: total ?? m.bytes_total } : m;
+      m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done === null ? m.bytes_transferred : endedPassBytes(m) + done } : m;
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
     queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
     return;
