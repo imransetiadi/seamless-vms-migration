@@ -1,6 +1,7 @@
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
@@ -28,6 +29,29 @@ describe('Overview page (mock data)', () => {
     const meter = within(down).getByRole('meter', { name: /web-03 downtime against the slo/i });
     expect(Number(meter.getAttribute('aria-valuemax'))).toBeGreaterThan(0);
     expect(down).toHaveTextContent(/left in the .* slo|over the slo by/i);
+  });
+
+  it.each([
+    [0.78, 'calm'],
+    [0.85, 'warning'],
+  ])('reads a VM at %s of its SLO like the migration page does, the warning with an icon (SDD §16)', async (share, expected) => {
+    const server = createTestServer();
+    const web03 = server.migrations.find((m) => m.vm.name === 'web-03');
+    const slo = server.plans.find((p) => p.id === web03?.plan_id)?.downtime_slo_s;
+    if (!web03 || !slo) throw new Error('fixture without web-03 and its plan SLO');
+    web03.phase = 'cutover';
+    web03.downtime_started_at = new Date(Date.now() - share * slo * 1000).toISOString();
+    renderWithApp(<Overview />, { server });
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    const item = (await within(down).findByRole('link', { name: 'web-03' })).closest('li')!;
+    const line = within(item).getByText(/left in the .* slo/i);
+    if (expected === 'warning') {
+      expect(line).toHaveClass(TONE_CLASSES.warning.text);
+      expect(line.querySelector('.lucide-hourglass')).not.toBeNull();
+    } else {
+      expect(line).not.toHaveClass(TONE_CLASSES.warning.text);
+      expect(line.querySelector('svg')).toBeNull();
+    }
   });
 
   it('turns the clock red and says by how much once a cutover runs over its SLO', async () => {

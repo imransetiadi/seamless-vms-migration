@@ -25,6 +25,7 @@ import { ThroughputChart } from '../components/ThroughputChart';
 import { Unavailable } from '../components/Unavailable';
 import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
+import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -35,13 +36,6 @@ const ATTENTION_ICONS: Record<'danger' | 'warning' | 'info', LucideIcon> = {
   warning: TriangleAlert,
   info: Activity,
 };
-
-/** Share of the downtime SLO used: below 75 % calm, then a warning, above 100 % a breach. */
-function budgetTone(used: number): 'success' | 'warning' | 'danger' {
-  if (used > 1) return 'danger';
-  if (used >= 0.75) return 'warning';
-  return 'success';
-}
 
 const BAR_CLASSES: Record<'success' | 'warning' | 'danger', string> = {
   success: 'bg-status-success',
@@ -99,8 +93,9 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
             const plan = plans.get(m.plan_id);
             const slo = plan?.downtime_slo_s ?? null;
             const elapsed = secondsBetween(m.downtime_started_at, now) ?? 0;
-            const used = slo ? elapsed / slo : 0;
-            const tone = budgetTone(used);
+            // the migration page's rule, with an icon beside the warning and the breach (SDD §16)
+            const tone = slo ? sloTone(elapsed, slo) : 'success';
+            const ToneIcon = SLO_ICONS[tone];
             const scale = slo ? Math.max(slo, elapsed) : 1;
             const left = slo !== null ? slo - elapsed : null;
             return (
@@ -147,7 +142,7 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                       )}
                     </div>
                     <p className={cn('flex items-center gap-1 text-xs', tone === 'success' ? 'text-muted-foreground' : TONE_CLASSES[tone].text)}>
-                      {tone === 'danger' && <TriangleAlert aria-hidden className="size-3.5" />}
+                      {tone !== 'success' && <ToneIcon aria-hidden className="size-3.5" />}
                       {left !== null && left >= 0
                         ? `${formatDuration(left)} left in the ${formatDuration(slo)} SLO`
                         : `Over the SLO by ${formatDuration(-(left ?? 0))}`}
