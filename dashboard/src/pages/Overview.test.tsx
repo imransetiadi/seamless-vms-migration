@@ -22,7 +22,9 @@ describe('Overview page (mock data)', () => {
     const down = await screen.findByRole('region', { name: /downtime now/i });
     const link = await within(down).findByRole('link', { name: 'web-03' });
     expect(link).toHaveAttribute('href', '/migrations/mig-3c1a0f9e23');
-    expect(within(down).getByRole('link', { name: 'web-02' })).toBeInTheDocument();
+    // what each one waits for: the final copy of the cutover, the boot check while verifying
+    expect(link.closest('li')).toHaveTextContent(/final copy 62/i);
+    expect(within(down).getByRole('link', { name: 'web-02' }).closest('li')).toHaveTextContent(/checking the boot on rhoso/i);
     const meter = within(down).getByRole('meter', { name: /web-03 downtime against the slo/i });
     expect(Number(meter.getAttribute('aria-valuemax'))).toBeGreaterThan(0);
     expect(down).toHaveTextContent(/left in the .* slo|over the slo by/i);
@@ -43,10 +45,35 @@ describe('Overview page (mock data)', () => {
     expect(down).toHaveTextContent(/over the slo by 2m 0[5-9]s/i);
   });
 
+  it('lists a failed cutover and a running rollback while their source is still stopped', async () => {
+    renderWithApp(<Overview />);
+
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    // SDD §5.2: the clock runs from the source stop until the VM boots verified or the source runs again
+    const failed = await within(down).findByRole('link', { name: 'legacy-rhel6-app' });
+    expect(failed).toHaveAttribute('href', '/migrations/mig-e5f7a9b1a0');
+    expect(failed.closest('li')).toHaveTextContent(/failed with the source stopped/i);
+    const rollingBack = within(down).getByRole('link', { name: 'shared-disk-node-a' });
+    expect(rollingBack.closest('li')).toHaveTextContent(/rolling back, restarting the source/i);
+    // a finished rollback restarted its source: not down any more
+    expect(within(down).queryByRole('link', { name: 'report-gen-01' })).not.toBeInTheDocument();
+    // longest down first: the failed cutover (41 min) before the rollback (19 min) and the cutovers
+    const order = within(down).getAllByRole('listitem').map((item) => within(item).getAllByRole('link')[0]?.textContent);
+    expect(order).toEqual(['legacy-rhel6-app', 'shared-disk-node-a', 'web-02', 'web-03']);
+    expect(down).toHaveTextContent(/or its source runs again/i);
+  });
+
   it('says so when no VM is down, and how many wait for the cutover', async () => {
     const server = createTestServer();
     for (const m of server.migrations) {
-      if (m.phase === 'cutover' || m.phase === 'verifying') m.phase = 'awaiting_cutover';
+      if (m.phase === 'cutover' || m.phase === 'verifying') {
+        m.phase = 'awaiting_cutover';
+        m.downtime_started_at = null;
+      } else if (m.downtime_started_at && !m.downtime_ended_at) {
+        // the failed cutover and the rollback of the fixture: their sources run again
+        m.phase = 'rolled_back';
+        m.downtime_ended_at = new Date().toISOString();
+      }
     }
     const waiting = server.migrations.filter((m) => m.phase === 'awaiting_cutover').length;
     renderWithApp(<Overview />, { server });

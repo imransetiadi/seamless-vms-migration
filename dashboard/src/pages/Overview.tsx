@@ -9,7 +9,7 @@ import {
 import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useMigrations, usePlans, useStats } from '../api/hooks';
-import type { Migration, Plan } from '../api/types';
+import type { Migration, Phase, Plan } from '../api/types';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { DowntimeSloChart } from '../components/DowntimeSloChart';
@@ -49,12 +49,27 @@ const BAR_CLASSES: Record<'success' | 'warning' | 'danger', string> = {
 };
 
 /**
+ * Down right now: in the cutover window (the stop may not be reported yet) or with an open downtime
+ * clock — a failed cutover or a rollback keeps the source stopped until it runs again (SDD §5.2).
+ */
+function isDown(m: Migration): boolean {
+  return m.phase === 'cutover' || m.phase === 'verifying' || (Boolean(m.downtime_started_at) && !m.downtime_ended_at);
+}
+
+/** What the VM is waiting for while it is down, after the strategy and plan. */
+const DOWN_DETAIL: Partial<Record<Phase, string>> = {
+  verifying: ', checking the boot on RHOSO',
+  rolling_back: ', rolling back, restarting the source VM',
+  failed: ', failed with the source stopped: roll back or retry',
+};
+
+/**
  * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
  * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
  */
 function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
   const active = migrations
-    .filter((m) => m.phase === 'cutover' || m.phase === 'verifying')
+    .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
   const waiting = migrations.filter((m) => m.phase === 'awaiting_cutover').length;
   const now = useNow(1000, active.length > 0);
@@ -64,7 +79,7 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
       title="Downtime now"
       description={
         active.length
-          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO.`
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.`
           : 'VMs whose source is stopped appear here with a running clock.'
       }
     >
@@ -100,7 +115,7 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                     <p className="text-xs text-muted-foreground">
                       {strategyLabel(m.strategy)}
                       {plan ? ` in ${plan.name}` : ''}
-                      {m.phase === 'cutover' ? `, final copy ${formatPct(m.progress_pct)}` : ', checking the boot on RHOSO'}
+                      {m.phase === 'cutover' ? `, final copy ${formatPct(m.progress_pct)}` : (DOWN_DETAIL[m.phase] ?? ', source VM stopped')}
                     </p>
                   </div>
                   <p className="flex items-baseline gap-2">
