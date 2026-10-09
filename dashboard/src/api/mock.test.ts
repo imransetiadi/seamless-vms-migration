@@ -80,13 +80,16 @@ describe('mock fixtures', () => {
     }
   });
 
-  it('count bytes like the API: bytes_total is the disk, bytes_transferred every pass that ended plus the running one (SDD §4.2)', () => {
+  it('list only passes that ended and count bytes like the API: the disk, and the passes plus the running step (SDD §4.2)', () => {
+    const steps = new Set<Migration['phase']>(['precopy', 'syncing', 'cutover']);
     for (const m of new MockServer({ now: () => NOW, seed: 1 }).migrations) {
       expect(m.bytes_total, m.id).toBe(m.vm.used_bytes);
+      expect(m.sync_passes.filter((p) => p.ended_at === null), m.id).toEqual([]);
       if (!m.sync_passes.length) continue;
-      const ended = m.sync_passes.filter((p) => p.ended_at !== null).reduce((sum, p) => sum + p.bytes_transferred, 0);
-      const running = m.sync_passes.find((p) => p.ended_at === null)?.bytes_transferred ?? 0;
-      expect(m.bytes_transferred, m.id).toBe(m.sync_bytes_dropped + ended + running);
+      const ended = m.sync_bytes_dropped + m.sync_passes.reduce((sum, p) => sum + p.bytes_transferred, 0);
+      // a migration mid-step has the running step's bytes on top of its passes
+      if (steps.has(m.phase)) expect(m.bytes_transferred, m.id).toBeGreaterThan(ended);
+      else expect(m.bytes_transferred, m.id).toBe(ended);
     }
   });
 
@@ -262,12 +265,18 @@ describe('mock API', () => {
     const { server } = setup('operator');
     for (const plan of server.plans) plan.cutover_window = null;
     const progress: Event[] = [];
-    server.subscribe((e) => {
-      if (e.kind === 'migration.progress') progress.push(e);
-    });
     const syncPasses: Event[] = [];
+    // the running step's bytes, as the page learns them: a progress event's bytes_done until its pass ends
+    const stepBytes = new Map<string, number>();
     server.subscribe((e) => {
-      if (e.kind === 'migration.sync_pass') syncPasses.push(e);
+      if (e.kind === 'migration.progress') {
+        progress.push(e);
+        stepBytes.set(e.migration_id!, e.data.bytes_done as number);
+      }
+      if (e.kind === 'migration.sync_pass') {
+        syncPasses.push(e);
+        stepBytes.set(e.migration_id!, 0);
+      }
     });
     const ended = (m: Migration) => m.sync_bytes_dropped + m.sync_passes.reduce((sum, p) => sum + (p.ended_at === null ? 0 : p.bytes_transferred), 0);
     // while a migration moves forward, the figure never drops (a pass has one size, drawn once)
@@ -280,9 +289,9 @@ describe('mock API', () => {
         if (forward.has(before.phase) && forward.has(m.phase)) expect(m.bytes_transferred, m.id).toBeGreaterThanOrEqual(before.bytes);
         seen.set(m.id, { phase: m.phase, bytes: m.bytes_transferred });
         expect(m.bytes_total, m.id).toBe(m.vm.used_bytes);
-        if (!m.sync_passes.length) continue;
-        const running = m.sync_passes.find((p) => p.ended_at === null)?.bytes_transferred ?? 0;
-        expect(m.bytes_transferred, m.id).toBe(ended(m) + running);
+        // like the API, the running pass is listed only once it ends (SDD §4.2)
+        expect(m.sync_passes.filter((p) => p.ended_at === null), m.id).toEqual([]);
+        if (stepBytes.has(m.id)) expect(m.bytes_transferred, m.id).toBe(ended(m) + stepBytes.get(m.id)!);
       }
     }
     expect(progress.length).toBeGreaterThan(0);
@@ -298,6 +307,35 @@ describe('mock API', () => {
     expect(midCutover.phase).toBe('verifying');
     expect(midCutover.sync_passes.at(-1)).toMatchObject({ kind: 'final', ended_at: expect.any(String) });
     expect(midCutover.sync_passes.at(-1)!.bytes_transferred).toBeGreaterThan(0);
+  });
+
+  it('records nothing for a pass a rollback interrupts, so a retried migration runs a new pass, like the API (SDD §4.2)', async () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    // a warm migration the fixtures start mid-cutover: its final pass runs
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e23')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    server.tick();
+    const listed = m.sync_passes.map((p) => p.number);
+    await approver.post(`/migrations/${m.id}/rollback`, { reason: 'interrupt the final pass' });
+    for (let t = 0; t < 50 && m.phase !== 'rolled_back'; t++) server.tick();
+    expect(m.phase).toBe('rolled_back');
+    expect(m.sync_passes.map((p) => p.number)).toEqual(listed);
+
+    await approver.post(`/migrations/${m.id}/retry`, {});
+    // the plan starts again (its blocked VM set aside)
+    for (const x of server.migrations) if (x.plan_id === plan.id && x.phase === 'blocked') x.phase = 'cancelled';
+    plan.status = 'paused';
+    clock += 3_600_000;
+    const restarted = Date.parse(new Date(clock).toISOString());
+    await approver.post(`/plans/${plan.id}/start`, {});
+    expect(m.phase).toBe('precopy');
+    for (let t = 0; t < 300 && m.sync_passes.length === listed.length; t++) server.tick();
+    // the first pass recorded after the restart is a new one, not the interrupted final pass
+    expect(m.sync_passes.length).toBe(listed.length + 1);
+    expect(m.sync_passes.at(-1)!.kind).not.toBe('final');
+    expect(Date.parse(m.sync_passes.at(-1)!.started_at)).toBeGreaterThanOrEqual(restarted);
   });
 
   it('records a cold copy as a full pass and keeps its bytes, as the API executors do (SDD §4.2)', async () => {

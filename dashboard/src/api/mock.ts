@@ -143,6 +143,8 @@ export class MockServer {
   private readonly rand: () => number;
   private readonly now: () => number;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** The pass each migration is running: like the API, sync_passes lists a pass only once it ends (SDD §4.2). */
+  private readonly running = new Map<string, SyncPass>();
   /** The bytes each pass moves (`<migration id>#<pass number>`), drawn once per pass. */
   private readonly passSizes = new Map<string, number>();
   /** The request being handled, for the `auth.denied` audit (SDD §13.1). */
@@ -257,7 +259,31 @@ export class MockServer {
   }
 
   private openPass(m: Migration): SyncPass | undefined {
-    return m.sync_passes.find((p) => p.ended_at === null);
+    return this.running.get(m.id);
+  }
+
+  /** The running pass of a migration the fixtures start mid-step: it continues from the bytes it moved. */
+  private resumePass(m: Migration, kind: SyncPass['kind']): SyncPass {
+    const pass: SyncPass = {
+      number: (m.sync_passes.at(-1)?.number ?? 0) + 1,
+      kind,
+      started_at: m.phase_history.at(-1)?.at ?? m.updated_at,
+      ended_at: null,
+      bytes_scanned: Math.round((m.vm.disk_bytes * m.progress_pct) / 100),
+      bytes_changed: 0,
+      bytes_transferred: Math.max(0, m.bytes_transferred - endedPassBytes(m)),
+      duration_s: null,
+    };
+    this.running.set(m.id, pass);
+    return pass;
+  }
+
+  /** A step that ends without its pass (a rollback, a cancel) records nothing, like the API. */
+  private dropRunningPass(m: Migration): void {
+    const pass = this.running.get(m.id);
+    if (!pass) return;
+    this.running.delete(m.id);
+    this.passSizes.delete(`${m.id}#${pass.number}`);
   }
 
   private startPass(m: Migration, kind: SyncPass['kind']): SyncPass {
@@ -271,7 +297,7 @@ export class MockServer {
       bytes_transferred: 0,
       duration_s: null,
     };
-    m.sync_passes.push(pass);
+    this.running.set(m.id, pass);
     m.progress_pct = 0;
     return pass;
   }
@@ -284,7 +310,8 @@ export class MockServer {
   }
 
   private advanceTransfer(m: Migration, plan: Plan, pctPerTick: number): void {
-    const pass = this.openPass(m) ?? this.startPass(m, m.sync_passes.length === 0 ? 'full' : 'delta');
+    const kind = m.sync_passes.length === 0 ? 'full' : 'delta';
+    const pass = this.openPass(m) ?? (m.progress_pct > 0 ? this.resumePass(m, kind) : this.startPass(m, kind));
     // a pass transfers 98 % of the bytes it finds changed (zeroed blocks are skipped)
     const moved = this.passSize(m, pass, 0.98);
     m.progress_pct = Math.min(100, m.progress_pct + pctPerTick * (0.7 + this.rand() * 0.6));
@@ -301,6 +328,8 @@ export class MockServer {
     pass.bytes_scanned = m.vm.disk_bytes;
     pass.bytes_changed = Math.round(moved / 0.98);
     pass.bytes_transferred = moved;
+    m.sync_passes.push(pass);
+    this.running.delete(m.id);
     this.passSizes.delete(`${m.id}#${pass.number}`);
     keepSyncHistory(m, plan.max_sync_passes);
     m.bytes_transferred = endedPassBytes(m);
@@ -370,7 +399,8 @@ export class MockServer {
   private advanceCutover(m: Migration, plan: Plan): void {
     const rate = m.strategy === 'warm' || m.strategy === 'vmware_warm' ? 6 : m.strategy === 'storage_handover' ? 8 : 2.5;
     // the step's bytes: the final pass of a warm migration, the full pass of a cold copy, none for a handover
-    const pass = this.openPass(m);
+    const kind = m.strategy === 'warm' || m.strategy === 'vmware_warm' ? 'final' : m.strategy === 'storage_handover' ? null : 'full';
+    const pass = this.openPass(m) ?? (kind === null ? undefined : m.progress_pct > 0 ? this.resumePass(m, kind) : this.startPass(m, kind));
     const total = pass ? this.passSize(m, pass, 1) : 0;
     m.progress_pct = Math.min(100, m.progress_pct + rate * (0.7 + this.rand() * 0.6));
     const done = Math.round((total * m.progress_pct) / 100);
@@ -388,6 +418,8 @@ export class MockServer {
       pass.bytes_scanned = m.vm.disk_bytes;
       pass.bytes_changed = total;
       pass.bytes_transferred = total;
+      m.sync_passes.push(pass);
+      this.running.delete(m.id);
       keepSyncHistory(m, plan.max_sync_passes);
       m.bytes_transferred = endedPassBytes(m);
       this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { ...pass } });
@@ -455,6 +487,7 @@ export class MockServer {
     const from = m.phase;
     m.phase = to;
     m.updated_at = at;
+    if (to !== 'precopy' && to !== 'syncing' && to !== 'cutover') this.dropRunningPass(m);
     this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason } });
   }
 

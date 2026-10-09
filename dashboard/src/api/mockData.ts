@@ -1048,7 +1048,8 @@ export function buildFixtures(now: number): Fixtures {
         // (a migration without passes counts its copy's progress; a storage handover copies nothing)
         bytes_total: vm.used_bytes,
         bytes_transferred: syncPasses.length ? syncPasses.reduce((sum, p) => sum + p.bytes_transferred, 0) : Math.round((bytesTotal * progress) / 100),
-        sync_passes: syncPasses,
+        // like the API, only passes that ended are listed (SDD §4.2); a running one counts in bytes_transferred
+        sync_passes: syncPasses.filter((p) => p.ended_at !== null),
         sync_bytes_dropped: 0,
         estimate: chosen,
         estimates,
