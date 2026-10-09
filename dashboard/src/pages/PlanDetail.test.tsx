@@ -1,4 +1,4 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { createTestServer, renderWithApp } from '../test/utils';
@@ -86,5 +86,32 @@ describe('PlanDetail', () => {
     expect(resume).toHaveAttribute('aria-disabled', 'true');
     expect(resume).toHaveAccessibleDescription(/1 migration is blocked/i);
     expect(await actionButton(/pause/i)).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('edits a validated plan: prefilled, only the changed field is sent, the plan returns to draft', async () => {
+    const user = userEvent.setup();
+    const { server } = renderPlan('plan-c81d44a0');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    expect(within(dialog).getByLabelText(/^name/i)).toHaveValue('Shared Ceph handover — analytics');
+    expect(within(dialog).getByText(/saving returns the plan to draft/i)).toBeInTheDocument();
+    expect(within(dialog).getByRole('checkbox', { name: /hand volumes over without copying/i })).toBeChecked();
+    expect(within(dialog).getByLabelText(/^source provider/i)).toBeDisabled();
+
+    const slo = within(dialog).getByLabelText(/downtime slo/i);
+    await user.clear(slo);
+    await user.type(slo, '15');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0');
+    expect(plan?.downtime_slo_s).toBe(900);
+    expect(plan?.status).toBe('draft');
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['downtime_slo_s'] });
+  });
+
+  it('explains why a plan cannot be edited', async () => {
+    renderPlan('plan-4f2a9c1e');
+    expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');
   });
 });

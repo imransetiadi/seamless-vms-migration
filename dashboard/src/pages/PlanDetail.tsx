@@ -7,6 +7,7 @@ import {
   Layers,
   ListChecks,
   Pause,
+  Pencil,
   Play,
   Rows3,
   Timer,
@@ -20,6 +21,7 @@ import { useRole } from '../api/session';
 import type { Plan, Provider, ValidationReport } from '../api/types';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { PlanCreateDialog } from '../components/PlanCreateDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
@@ -209,6 +211,7 @@ export default function PlanDetail() {
   const [confirm, setConfirm] = useState<Confirm>(null);
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [waveSize, setWaveSize] = useState('10');
+  const [editing, setEditing] = useState(false);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -261,6 +264,9 @@ export default function PlanDetail() {
         }
         actions={
           <div role="group" aria-label="Plan actions" className="flex flex-wrap gap-2">
+            <Button size="lg" icon={Pencil} disabledReason={actions.edit.reason} onClick={() => setEditing(true)}>
+              Edit plan
+            </Button>
             <Button
               size="lg"
               icon={ListChecks}
@@ -287,6 +293,7 @@ export default function PlanDetail() {
         <ErrorBanner error={action.error} title="The plan action failed" className="mb-4" />
       )}
       {report && <ReportBanner report={report} />}
+      {editing && <PlanCreateDialog open onClose={() => setEditing(false)} plan={p} />}
 
       <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? list.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />

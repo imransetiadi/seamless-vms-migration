@@ -9,12 +9,12 @@ const planWith = (status: PlanStatus): Plan => ({ ...base, status });
 const ready: Migration[] = fx.migrations.filter((m) => m.plan_id === base.id);
 
 const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
-  draft: { validate: true, waves: true, start: false, pause: false },
-  validated: { validate: true, waves: true, start: true, pause: false },
-  running: { validate: false, waves: false, start: false, pause: true },
-  paused: { validate: true, waves: false, start: true, pause: false },
-  completed: { validate: false, waves: false, start: false, pause: false },
-  failed: { validate: true, waves: false, start: false, pause: false },
+  draft: { validate: true, waves: true, start: false, pause: false, edit: true },
+  validated: { validate: true, waves: true, start: true, pause: false, edit: true },
+  running: { validate: false, waves: false, start: false, pause: true, edit: false },
+  paused: { validate: true, waves: false, start: true, pause: false, edit: false },
+  completed: { validate: false, waves: false, start: false, pause: false, edit: false },
+  failed: { validate: true, waves: false, start: false, pause: false, edit: false },
 };
 
 describe('planActions', () => {

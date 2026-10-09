@@ -1,7 +1,7 @@
 import type { Migration, Plan, Role } from '../api/types';
 import { hasRole } from './roles';
 
-export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause';
+export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit';
 
 export interface Availability {
   enabled: boolean;
@@ -51,5 +51,7 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
     waves: gate(status === 'draft' || status === 'validated', 'Waves can only be planned while the plan is draft or validated.'),
     start: start(),
     pause: gate(status === 'running', 'Only a running plan can be paused.'),
+    // PATCH /plans/{id} (SDD §12): only in draft or validated; saving returns the plan to draft
+    edit: gate(status === 'draft' || status === 'validated', `Only a draft or validated plan can be edited (this one is ${status}).`),
   };
 }

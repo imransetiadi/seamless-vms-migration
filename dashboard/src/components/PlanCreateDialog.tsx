@@ -1,9 +1,9 @@
 import { CircleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useCreatePlan, useInventory, useProviders } from '../api/hooks';
-import { isDestinationInventory, type PlanCreate, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
-import { parseMappings } from '../lib/mappings';
+import { useCreatePlan, useInventory, usePatchPlan, useProviders } from '../api/hooks';
+import { isDestinationInventory, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
+import { formatMappings, parseMappings } from '../lib/mappings';
 import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
@@ -79,6 +79,66 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
   };
 }
 
+const toLocalInput = (iso: string): string => {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+const plain = (n: number): string => String(Number(n.toFixed(3)));
+
+const DEFAULT_VERIFICATION = {
+  probe_address: 'fixed' as const,
+  console_success_patterns: ['login:', 'Cloud-init v\\. .* finished', 'Reached target .*Multi-User'],
+  timeout_s: 600,
+  use_advisor: true,
+};
+
+/** Estimator overrides the form does not edit (it edits scan_bps and parallel_disks). */
+function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
+  const { scan_bps: _scan, parallel_disks: _parallel, ...rest } = overrides ?? {};
+  return rest;
+}
+
+/** The form of an existing plan (edit mode, PATCH /plans/{id}). */
+function formFromPlan(plan: Plan): FormState {
+  const v = plan.verification;
+  return {
+    ...initialForm(plan.source_provider_id, plan.vm_ids),
+    name: plan.name,
+    description: plan.description ?? '',
+    destinationId: plan.destination_provider_id,
+    defaultStrategy: plan.default_strategy,
+    policy: plan.selection_policy,
+    sloMinutes: plain(plan.downtime_slo_s / 60),
+    requireApproval: plan.require_approval,
+    autoCutover: plan.auto_cutover,
+    windowStart: plan.cutover_window ? toLocalInput(plan.cutover_window.start) : '',
+    windowEnd: plan.cutover_window ? toLocalInput(plan.cutover_window.end) : '',
+    networks: formatMappings(plan.mappings.networks),
+    flavors: formatMappings(plan.mappings.flavors),
+    volumeTypes: formatMappings(plan.mappings.volume_types),
+    linkMiBps: plain(plan.link_bps / MiB),
+    thresholdGiB: plain(plan.convergence_threshold_bytes / GiB),
+    maxPasses: String(plan.max_sync_passes),
+    scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
+    parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
+    tcpPorts: v.tcp_ports.join(', '),
+    windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
+    autoRollback: v.auto_rollback,
+    handoverEnabled: plan.handover.enabled,
+    handoverMap: { ...plan.handover.backend_map },
+  };
+}
+
+/** JSON with sorted object keys, so equal values compare equal whatever their key order. */
+function stable(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      : v,
+  );
+}
+
 function strategiesFor(kind: ProviderKind | undefined): Strategy[] {
   if (kind === 'vmware') return ['vmware_cold', 'vmware_warm'];
   return ['cold', 'warm', 'storage_handover'];
@@ -110,16 +170,21 @@ export interface PlanCreateDialogProps {
   onClose: () => void;
   initialSourceId?: string;
   initialVmIds?: string[];
+  /** Edit this plan instead of creating one (PATCH /plans/{id}; only the changed fields are sent). */
+  plan?: Plan;
 }
 
 /** Create a draft plan (POST /plans, operator). Validation happens on submit with an error summary. */
-export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds }: PlanCreateDialogProps) {
+export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan }: PlanCreateDialogProps) {
   const titleId = useId();
   const id = (key: string) => `plan-create-${key}`;
   const providers = useProviders();
   const create = useCreatePlan();
+  const patch = usePatchPlan(plan?.id ?? '');
+  const editing = Boolean(plan);
+  const saving = editing ? patch : create;
   const navigate = useNavigate();
-  const [form, setForm] = useState<FormState>(() => initialForm(initialSourceId, initialVmIds));
+  const [form, setForm] = useState<FormState>(() => (plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds)));
   const [errors, setErrors] = useState<Errors>({});
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -127,9 +192,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
 
   useEffect(() => {
     if (!open) return;
-    setForm(initialForm(initialSourceId, initialVmIds));
+    setForm(plan ? formFromPlan(plan) : initialForm(initialSourceId, initialVmIds));
     setErrors({});
     create.reset();
+    patch.reset();
     // Reset only when the dialog opens.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -148,13 +214,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
   const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
   const handoverTypes = [...typeFamilies.keys()];
   const targetsFor = (type: string) => handoverTargets(typeFamilies.get(type) ?? null, destinationStorage);
-  const chosenTarget = (type: string): string => {
+  const chosenTarget = (type: string, f: FormState = form): string => {
     const targets = targetsFor(type);
-    return form.handoverMap[type] ?? (targets.length === 1 ? targets[0]! : '');
+    return f.handoverMap[type] ?? (targets.length === 1 ? targets[0]! : '');
   };
   /** Destination pools (or the reasons a volume cannot be handed over) for one volume type. */
-  const landing = (type: string): { pools: string[]; errors: string[] } => {
-    const target = chosenTarget(type);
+  const landing = (type: string, f: FormState = form): { pools: string[]; errors: string[] } => {
+    const target = chosenTarget(type, f);
     const families = new Map(sourceStorage.map((b) => [b.pool, b.family]));
     const pools = new Set<string>();
     const problems = new Set<string>();
@@ -170,81 +236,80 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
     return { pools: [...pools].sort(), errors: [...problems] };
   };
 
-  const validate = (): { errors: Errors; body: PlanCreate | null } => {
+  const validate = (f: FormState = form): { errors: Errors; body: PlanCreate | null } => {
     const e: Errors = {};
-    if (!form.name.trim()) e.name = 'Enter a plan name.';
-    if (!form.sourceId) e.source = 'Choose the source provider.';
-    if (!form.destinationId) e.destination = 'Choose the RHOSO destination.';
-    if (form.vmIds.size === 0) e.vms = 'Select at least one VM.';
-    const slo = Number(form.sloMinutes);
+    if (!f.name.trim()) e.name = 'Enter a plan name.';
+    if (!f.sourceId) e.source = 'Choose the source provider.';
+    if (!f.destinationId) e.destination = 'Choose the RHOSO destination.';
+    if (f.vmIds.size === 0) e.vms = 'Select at least one VM.';
+    const slo = Number(f.sloMinutes);
     if (!(slo > 0)) e.slo = 'Enter the downtime SLO in minutes (more than 0).';
-    if (Boolean(form.windowStart) !== Boolean(form.windowEnd)) e.window = 'Set both the window start and end, or neither.';
-    else if (form.windowStart && Date.parse(form.windowEnd) <= Date.parse(form.windowStart)) e.window = 'The window must end after it starts.';
-    const networks = parseMappings(form.networks);
-    const flavors = parseMappings(form.flavors);
-    const volumeTypes = parseMappings(form.volumeTypes);
+    if (Boolean(f.windowStart) !== Boolean(f.windowEnd)) e.window = 'Set both the window start and end, or neither.';
+    else if (f.windowStart && Date.parse(f.windowEnd) <= Date.parse(f.windowStart)) e.window = 'The window must end after it starts.';
+    const networks = parseMappings(f.networks);
+    const flavors = parseMappings(f.flavors);
+    const volumeTypes = parseMappings(f.volumeTypes);
     const formatHint = 'Use one "source = destination" pair per line.';
     if (!networks) e.networks = formatHint;
     if (!flavors) e.flavors = formatHint;
     if (!volumeTypes) e.volumeTypes = formatHint;
-    const link = Number(form.linkMiBps);
+    const link = Number(f.linkMiBps);
     if (!(link > 0)) e.link = 'Enter the link bandwidth in MiB/s (more than 0).';
-    const threshold = Number(form.thresholdGiB);
+    const threshold = Number(f.thresholdGiB);
     if (!(threshold > 0)) e.threshold = 'Enter the convergence threshold in GiB (more than 0).';
-    const passes = Number(form.maxPasses);
+    const passes = Number(f.maxPasses);
     if (!Number.isInteger(passes) || passes < 1 || passes > 50) e.passes = 'Enter a whole number of passes from 1 to 50.';
     const overrides: Record<string, number> = {};
-    if (form.scanMiBps.trim()) {
-      const scan = Number(form.scanMiBps);
+    if (f.scanMiBps.trim()) {
+      const scan = Number(f.scanMiBps);
       if (!(scan > 0)) e.scan = 'Enter the scan rate in MiB/s (more than 0), or leave it empty.';
       else overrides.scan_bps = scan * MiB;
     }
-    if (form.parallelDisks.trim()) {
-      const parallel = Number(form.parallelDisks);
+    if (f.parallelDisks.trim()) {
+      const parallel = Number(f.parallelDisks);
       if (!Number.isInteger(parallel) || parallel < 1 || parallel > 64) e.parallel = 'Enter a whole number of disks from 1 to 64, or leave it empty.';
       else overrides.parallel_disks = parallel;
     }
-    const ports = form.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
+    const ports = f.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
-    const windowsPorts = form.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
+    const windowsPorts = f.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (windowsPorts.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.windowsPorts = 'Use port numbers from 1 to 65535, separated by commas.';
     const backendMap: Record<string, string> = {};
-    if (form.handoverEnabled && source?.kind !== 'vmware') {
-      const missing = handoverTypes.filter((t) => !chosenTarget(t));
-      const problems = handoverTypes.flatMap((t) => landing(t).errors);
-      if (missing.length) e.handover = `Choose a RHOSO backend for ${missing.join(', ')}.`;
+    if (f.handoverEnabled && source?.kind !== 'vmware') {
+      const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
+      const problems = handoverTypes.flatMap((t) => landing(t, f).errors);
+      // a new plan maps every type; an existing one may keep unmapped types (those VMs are not eligible)
+      if (missing.length && !plan) e.handover = `Choose a RHOSO backend for ${missing.join(', ')}.`;
       else if (problems.length) e.handover = problems[0];
-      for (const t of handoverTypes) if (chosenTarget(t)) backendMap[t] = chosenTarget(t);
+      for (const t of handoverTypes) if (chosenTarget(t, f)) backendMap[t] = chosenTarget(t, f);
     }
     if (Object.keys(e).length) return { errors: e, body: null };
     return {
       errors: e,
       body: {
-        name: form.name.trim(),
-        description: form.description.trim() || null,
-        source_provider_id: form.sourceId,
-        destination_provider_id: form.destinationId,
-        vm_ids: [...form.vmIds],
-        default_strategy: form.defaultStrategy,
-        selection_policy: form.policy,
+        name: f.name.trim(),
+        description: f.description.trim() || null,
+        source_provider_id: f.sourceId,
+        destination_provider_id: f.destinationId,
+        vm_ids: [...f.vmIds],
+        default_strategy: f.defaultStrategy,
+        selection_policy: f.policy,
         downtime_slo_s: Math.round(slo * 60),
-        require_approval: form.requireApproval,
-        auto_cutover: form.autoCutover,
-        cutover_window: form.windowStart ? { start: new Date(form.windowStart).toISOString(), end: new Date(form.windowEnd).toISOString() } : null,
-        mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: {} },
-        handover: { enabled: form.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
+        require_approval: f.requireApproval,
+        auto_cutover: f.autoCutover,
+        cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
+        mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: plan?.mappings.projects ?? {} },
+        handover: { enabled: f.handoverEnabled && source?.kind !== 'vmware', backend_map: backendMap },
         link_bps: link * MiB,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
-        estimator_overrides: overrides,
+        estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
+          ...DEFAULT_VERIFICATION,
+          ...plan?.verification,
           tcp_ports: ports,
           windows_tcp_ports: windowsPorts,
-          probe_address: 'fixed',
-          console_success_patterns: ['login:', 'Cloud-init v\\. .* finished', 'Reached target .*Multi-User'],
-          timeout_s: 600,
-          auto_rollback: form.autoRollback,
-          use_advisor: true,
+          auto_rollback: f.autoRollback,
         },
       },
     };
@@ -258,10 +323,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
       requestAnimationFrame(() => summaryRef.current?.focus());
       return;
     }
-    create.mutate(body, {
-      onSuccess: (plan) => {
+    if (plan) {
+      // only what the operator changed: compare with the body the untouched form produces, so rounding
+      // and fields the form does not show never count as changes (and never touch approver-only policy)
+      const baseline = (validate(formFromPlan(plan)).body ?? {}) as Record<string, unknown>;
+      const changes = Object.fromEntries(Object.entries(body).filter(([key, value]) => stable(value) !== stable(baseline[key])));
+      if (Object.keys(changes).length === 0) {
         onClose();
-        navigate(`/plans/${plan.id}`);
+        return;
+      }
+      patch.mutate(changes as PlanPatch, { onSuccess: () => onClose() });
+      return;
+    }
+    create.mutate(body, {
+      onSuccess: (created) => {
+        onClose();
+        navigate(`/plans/${created.id}`);
       },
     });
   };
@@ -289,13 +366,19 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
   const advancedHasErrors = ['window', 'networks', 'flavors', 'volumeTypes', 'link', 'threshold', 'passes', 'scan', 'parallel', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!create.isPending} initialFocusRef={nameRef}>
+    <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
       <form onSubmit={submit} noValidate className="flex flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
-            New migration plan
+            {plan ? 'Edit plan' : 'New migration plan'}
           </h2>
-          <p className="text-sm text-muted-foreground">Creates a draft. Validate it next to get findings and downtime estimates.</p>
+          <p className="text-sm text-muted-foreground">
+            {!plan
+              ? 'Creates a draft. Validate it next to get findings and downtime estimates.'
+              : plan.status === 'validated'
+                ? 'Saving returns the plan to draft: validate it again before starting.'
+                : 'Only the settings you change are saved.'}
+          </p>
         </div>
 
         <div className="flex flex-col gap-6 px-5 py-4">
@@ -303,7 +386,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
             <div ref={summaryRef} tabIndex={-1} role="alert" aria-labelledby={id('summary')} className="rounded-md border border-status-danger/40 bg-status-danger/10 p-3 outline-hidden">
               <p id={id('summary')} className="flex items-center gap-2 font-medium text-foreground">
                 <CircleAlert aria-hidden className="size-4 text-status-danger" />
-                Fix {errorEntries.length} problem{errorEntries.length === 1 ? '' : 's'} to create the plan
+                Fix {errorEntries.length} problem{errorEntries.length === 1 ? '' : 's'} to {plan ? 'save' : 'create'} the plan
               </p>
               <ul className="mt-1 list-disc pl-6 text-sm">
                 {errorEntries.map(([key, message]) => (
@@ -338,6 +421,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
                 required
                 value={form.sourceId}
                 onChange={(e) => setForm((f) => ({ ...f, sourceId: e.target.value, vmIds: new Set(), defaultStrategy: 'auto' }))}
+                disabled={editing}
+                hint={editing ? 'The source of an existing plan stays the same; create a new plan for another source.' : undefined}
                 error={errors.source}
                 options={[
                   { value: '', label: 'Choose a source…' },
@@ -499,6 +584,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
                           const where = landing(type);
                           const hint = where.pools.length
                             ? `Lands on ${where.pools.join(', ')}`
+                            : editing && !chosenTarget(type)
+                              ? 'Not mapped: VMs with this volume type are not eligible for storage handover.'
                             : targets.length === 0
                               ? 'The destination reports no compatible backend.'
                               : family === 'netapp_nfs' || family === 'netapp_block'
@@ -524,15 +611,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds 
             </div>
           </details>
 
-          {create.error && <ErrorBanner error={create.error} title="The plan was not created" />}
+          {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} />}
         </div>
 
         <div className="sticky bottom-0 flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
-          <Button size="lg" onClick={onClose} disabled={create.isPending}>
+          <Button size="lg" onClick={onClose} disabled={saving.isPending}>
             Cancel
           </Button>
-          <Button size="lg" type="submit" variant="primary" loading={create.isPending}>
-            Create plan{form.vmIds.size ? ` with ${form.vmIds.size} VM${form.vmIds.size === 1 ? '' : 's'}` : ''}
+          <Button size="lg" type="submit" variant="primary" loading={saving.isPending}>
+            {plan ? 'Save changes' : `Create plan${form.vmIds.size ? ` with ${form.vmIds.size} VM${form.vmIds.size === 1 ? '' : 's'}` : ''}`}
           </Button>
         </div>
       </form>
