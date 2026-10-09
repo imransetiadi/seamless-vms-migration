@@ -523,6 +523,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   warm state file. Non-zero exit → `TransientStepError` when the output matches a transient pattern
   (`Timeout`, `HTTP 503`, `Connection reset`), otherwise `PermanentStepError`.
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
+* Every string value in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag
+  `!unsafe` (`ansible_yaml`); mapping keys — the variable names — stay plain. Ansible templates every
+  string it reads, so a VM name (chosen by whoever runs the source VM), a mapping value or a password
+  holding `{{ … }}` or `{% … %}` would otherwise run as Jinja on the control plane
+  (`lookup('pipe', …)` executes commands next to every cloud credential; Security.md R-16).
 * Downtime clock for Ansible-driven cutovers: the executor calls `mark_downtime_start(at=…)` with the
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
@@ -742,8 +747,9 @@ The scan term is the warm path's floor; removing it is the purpose of decision D
 
 ### 9.2 Strategy selection (`planning/selector.py`)
 
-`eligibility(vm, source_kind, plan, src_caps, dst_caps) -> dict[Strategy, list[str]]` (empty list
-= eligible; otherwise reasons):
+`eligibility(vm, source_kind, plan, src_caps, dst_caps, findings=()) -> dict[Strategy, list[str]]`
+(empty list = eligible; otherwise reasons; a `blocker` among the pre-flight `findings` makes every
+strategy ineligible):
 
 * OpenStack sources consider `cold`, `warm`, `storage_handover`; VMware sources consider
   `vmware_cold`, `vmware_warm`.
@@ -769,7 +775,9 @@ replace the choice only **within the tie set** or when **no** eligible strategy 
 
 ### 9.3 Pre-flight validation (`planning/preflight.py`)
 
-`run_preflight(vm, plan, src_inv: SourceInventory, dst_inv: DestinationInventory) -> list[Finding]`.
+`run_preflight(vm, plan, src_inv: SourceInventory, dst_inv: DestinationInventory, all_vms=None, *,
+source=None, destination=None) -> list[Finding]` — `all_vms` are the plan's selected VMs (duplicate
+names, cumulative quotas), `source`/`destination` the providers (conversion-host check).
 Finding catalog (code — severity — condition):
 
 | Code | Severity | Condition |
@@ -800,6 +808,20 @@ Finding catalog (code — severity — condition):
 | `CONV_HOST_MISSING` | warning (cold, warm, vmware_*) | the relevant provider has no `conversion_host` |
 | `HANDOVER_BACKEND_UNMAPPED` | info (storage_handover) | handover enabled but a volume type is unmapped |
 
+### 9.4 Wave planner (`planning/waves.py`)
+
+`plan_waves(vms: list[VMRef], tiers: dict[str, str], max_wave_size: int = 10) -> list[Wave]`.
+Tiers (from the advisor, §14.2; deterministic fallback by regex on name/tags/os_type):
+`stateless_web`, `middleware_queue`, `infrastructure_service`, `stateful_database`, `legacy_os`,
+`manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
+disks first). Remaining VMs are ordered by tier (the order above) then disk size ascending and
+chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
+`max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
+VMs go to a final wave named `Manual review`.
+`start_plan` refuses a plan with waves while a non-terminal migration belongs to no wave (a VM added
+to `vm_ids` after the waves were planned): re-run the planner or add the VM to a wave, otherwise it
+would start at once outside every wave's order and `max_parallel`.
+
 ### 9.5 Guest OS catalog (`seamless_migrate/guest_os.py`)
 
 `identify(os_type) -> GuestOS` parses what the providers report (§10): OpenStack server metadata or
@@ -821,20 +843,6 @@ Rocky, AlmaLinux, Oracle Linux, CentOS 7+, SLES/openSUSE (btrfs roots are not co
 `unsupported` — RHEL/CentOS ≤ 5, Windows Server 2003–2012 R2, Windows client 7–8.1 (current
 virtio-win ships no drivers for them). OpenStack sources need no conversion (KVM to KVM): their
 guests boot unchanged when the boot properties travel with the volumes (§6, §7.3 step 7).
-
-### 9.4 Wave planner (`planning/waves.py`)
-
-`plan_waves(vms: list[VMRef], tiers: dict[str, str], max_wave_size: int = 10) -> list[Wave]`.
-Tiers (from the advisor, §14.2; deterministic fallback by regex on name/tags/os_type):
-`stateless_web`, `middleware_queue`, `infrastructure_service`, `stateful_database`, `legacy_os`,
-`manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
-disks first). Remaining VMs are ordered by tier (the order above) then disk size ascending and
-chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
-`max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
-VMs go to a final wave named `Manual review`.
-`start_plan` refuses a plan with waves while a non-terminal migration belongs to no wave (a VM added
-to `vm_ids` after the waves were planned): re-run the planner or add the VM to a wave, otherwise it
-would start at once outside every wave's order and `max_parallel`.
 
 ---
 
@@ -1100,7 +1108,7 @@ skips approval, never triggers rollback or finalize.
   `selected` ∈ candidates and `confidence >= SEAMLESS_JEV_MIN_CONFIDENCE` (default `0.6`; a clear
   live case scored 0.65–0.68, so 0.8 would almost never apply); the note records `source="jev"`
   either way.
-* `classify_workloads(vms) -> dict[source_id, tier]` — `jev_classify` with the six tier classes of
+* `classify_workloads(vms) -> (dict[source_id, tier], AdvisorNote)` — `jev_classify` with the six tier classes of
   §9.4 (each with a precise description); items with `decision == "review"` or invalid responses
   fall back to the regex heuristic. Without Jev, the heuristic is used (`source="rules"`).
 * `review_verification(vm, result) -> AdvisorNote | None` — when `use_advisor`: redacts the console
@@ -1192,13 +1200,16 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   for progress, `prefers-reduced-motion` honoured, 44×44 px minimum targets for primary actions.
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans`, `/plans/:id` (settings summary, waves board, migrations table with
-  strategy/estimate/findings, Validate/Start/Pause/Auto-waves actions), `/migrations/:id` (phase
+  strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
+  changed fields as `PATCH`, in `draft`/`validated` only), `/migrations/:id` (phase
   stepper, progress, sync-pass convergence chart, downtime clock, findings, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
-  requires typing the VM name), `/providers` (status cards + Check; admins add and edit providers with a distribution preset —
+  requires typing the VM name), `/providers` (status cards + Check, each card summarizing the storage backends by driver family —
+  `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
   enter write-only credentials and the conversion-host SSH key), `/inventory/:providerId`
-  (VM table with filters), `/events` (live audit stream), `/advisor` (Jev/agentmemory status,
+  (VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5), `/events` (live audit stream with category and text filters; the shown audit events download as JSON
+  lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
   similar-incident search), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). `VITE_SEAMLESS_MOCK=1` switches
@@ -1218,6 +1229,15 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, liveness
   `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS), NetworkPolicy (ingress from router only;
   egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory).
+* Kubernetes 1.28+ (`deploy/kubernetes/`, a kustomize overlay of `../openshift`) replaces what OpenShift
+  provides by itself: an Ingress (`ingress.yaml`, ingress-nginx, TLS Secret `seamless-tls`) instead of the
+  Route; explicit `runAsUser`/`runAsGroup`/`fsGroup` (1001/0/0 for the control plane, 26 for PostgreSQL)
+  instead of the UIDs the restricted SCC injects; DNS egress to CoreDNS (`kube-system`, `k8s-app:
+  kube-dns`) and ingress from the `ingress-nginx` namespace in the NetworkPolicies; API-server egress to
+  `10.96.0.1/32` (the usual `kubernetes` Service IP — set the cluster's own); PostgreSQL from
+  `quay.io/sclorg/postgresql-16-c9s` (the image interface of `registry.redhat.io/rhel9/postgresql-16`).
+  kustomize silently ignores a patch whose target matches nothing, so CI renders the overlay and asserts
+  each patch's result.
 * Dashboard-entered credentials (`SEAMLESS_SECRET_STORE=kubernetes`, §13.3): the `seamless`
   ServiceAccount gets a namespaced Role (`secrets`: get, create, update, delete) and its token is
   mounted; the API answers 503 for the credential routes when the store cannot reach the API server.
@@ -1249,6 +1269,11 @@ bind mount; `.env` is 0600.
 against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
 collection, dashboard).
 
+Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host, and
+`SEAMLESS_ENGINE=podman` runs them with `podman compose` (Podman 4.7+; it drives docker-compose when
+installed, podman-compose otherwise). Without `--wait` there, the targets poll `/api/v1/health` for up to
+300 s. The read-only token-file bind mount sets `selinux: z`, so SELinux hosts (RHEL, Fedora) relabel it.
+
 ---
 
 ## 18. Observability
@@ -1275,7 +1300,7 @@ tests/unit/test_warm_migration.py             tests/unit/test_warm_destination.p
 tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
-deploy/openshift/   deploy/compose/   scripts/compose-init.sh   tests/e2e/
+deploy/openshift/   deploy/kubernetes/   deploy/compose/   scripts/compose-init.sh   tests/e2e/
 docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
