@@ -179,6 +179,28 @@ async def test_retry_after_failed_cutover_keeps_clock_and_refuses_cancel(tmp_pat
     assert store.get("migration", m.id, Migration).phase == P.ready
 
 
+async def test_retry_clears_the_cutover_request_and_its_window_bypass(tmp_path, store):
+    """SDD §5.1/§5.4: a retry clears the cutover request and the window bypass granted with it
+    (force_window), so a bypass never carries over to the next attempt; the approvals stay, as
+    the assessment did not change."""
+    from seamless_migrate.domain.models import Approval, Migration
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.approvals = [Approval(actor="ana", at=h.orch.now(), comment="after the backup")]
+    m.cutover_requested = True
+    m.force_window = True
+    m.phase = P.failed
+    store.put("migration", m)
+    again = await h.orch.retry(m.id, "bayu")
+    assert again.phase == P.ready
+    stored = store.get("migration", m.id, Migration)
+    assert stored.cutover_requested is False
+    assert stored.force_window is False
+    assert [a.actor for a in stored.approvals] == ["ana"]
+
+
 async def test_validate_refuses_to_drop_a_vm_whose_source_is_stopped(tmp_path, store):
     """Validation cancels the VMs removed from ``vm_ids``; one whose source is stopped (a retried
     cutover) cannot be cancelled (SDD §5.1), so validation refuses before it changes anything."""

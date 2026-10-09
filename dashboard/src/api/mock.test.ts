@@ -657,4 +657,17 @@ describe('mock API', () => {
     }
     expect(server.handle('POST', path, new URLSearchParams(), { max_wave_size: 1000 }, 'operator').status).toBe(200);
   });
+
+  it('retries like the API: clears the cutover request and its window bypass, keeps approvals (SDD §5.1)', () => {
+    const { server } = setup('operator');
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    m.phase = 'failed';
+    m.approvals = [{ actor: 'ana', at: '2026-10-08T11:00:00Z', comment: null }];
+    m.cutover_requested = true;
+    m.force_window = true;
+    const result = server.handle('POST', `/migrations/${m.id}/retry`, new URLSearchParams(), {}, 'operator');
+    expect(result.status).toBe(200);
+    expect(m).toMatchObject({ phase: 'ready', cutover_requested: false, force_window: false });
+    expect(m.approvals.map((a) => a.actor)).toEqual(['ana']);
+  });
 });

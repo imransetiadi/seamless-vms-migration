@@ -805,7 +805,10 @@ class Orchestrator:
                 m.attempts += 1
             m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
             m.error = None
+            # a new attempt is requested anew: the window bypass granted with the old request goes
+            # with it, approvals stay (SDD §5.1, §5.4)
             m.cutover_requested = False
+            m.force_window = False
             m.checkpoint = None
             m.progress_pct = 0
             m.review_required = False
