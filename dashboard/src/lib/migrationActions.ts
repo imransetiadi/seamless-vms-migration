@@ -21,6 +21,11 @@ export const ACTION_MIN_ROLE: Record<MigrationActionKey, Role> = {
 
 const PRE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 
+/** The downtime clock is open: the source VM was stopped and has not run since (SDD §5.2). */
+function sourceStopped(m: Migration): boolean {
+  return Boolean(m.downtime_started_at) && !m.downtime_ended_at;
+}
+
 function isSingleShot(m: Migration): boolean {
   return !isWarmStrategy(m.strategy);
 }
@@ -51,6 +56,15 @@ function phaseRule(m: Migration, key: MigrationActionKey): Availability {
     case 'retry':
       return m.phase === 'failed' || m.phase === 'rolled_back' ? ok : no('Retry is available after a failure or a rollback.');
     case 'cancel':
+      // SDD §5.1: a cancel would leave a stopped source with nothing left to restart it (only where the
+      // phase could be cancelled at all: a cutover in progress has its clock open by design)
+      if (canTransition(m.phase, 'cancelled') && sourceStopped(m)) {
+        return no(
+          m.phase === 'failed'
+            ? 'The source VM is stopped — roll back to restart it, or retry the cutover.'
+            : 'The source VM is stopped after a failed cutover — cut it over; it cannot be cancelled until it runs again.',
+        );
+      }
       if (m.phase === 'failed' && m.downtime_started_at) return no('The source VM was stopped — roll back instead of cancelling.');
       return canTransition(m.phase, 'cancelled') ? ok : no('Cancel is not possible once cutover has started or the migration has ended.');
     case 'finalize':
@@ -87,6 +101,15 @@ export function nextStep(m: Migration, plan: Plan | null | undefined): NextStep 
     case 'blocked':
       return { text: 'Blocked. Next: fix the blocker findings, then re-validate the plan (operator).', action: null };
     case 'ready':
+      if (sourceStopped(m)) {
+        // a retried cutover (SDD §5.2): the source has been down since the failed attempt
+        if (!isSingleShot(m)) {
+          return { text: 'Retried: the source VM is still stopped and its downtime clock keeps running; pre-copy starts when its wave runs, then the cutover.', action: null };
+        }
+        return m.cutover_requested
+          ? { text: 'Cutover requested again — the source VM is still stopped and its downtime clock keeps running.', action: null }
+          : { text: 'Retried: the source VM is still stopped and its downtime clock keeps running. Next: an approver starts the cutover again.', action: 'cutover' };
+      }
       if (isSingleShot(m)) {
         return m.cutover_requested
           ? { text: 'Cutover requested — waiting for the wave, the window or a free cutover slot.', action: null }

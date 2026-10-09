@@ -133,6 +133,31 @@ describe('mock API', () => {
     await expect(client.post(`/migrations/${failedAfterStop.id}/cancel`, {})).rejects.toMatchObject({ status: 409 });
   });
 
+  it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
+    const { server, client } = setup('operator');
+    const failed = byPhase(server, 'failed');
+    const stoppedAt = failed.downtime_started_at;
+    expect(stoppedAt).not.toBeNull();
+    expect(failed.downtime_ended_at).toBeNull();
+    await expect(client.post(`/migrations/${failed.id}/cancel`, {})).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/source VM is stopped/) });
+
+    const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
+    expect(retried.phase).toBe('ready');
+    expect(retried.downtime_started_at).toBe(stoppedAt);
+    await expect(client.post(`/migrations/${failed.id}/cancel`, {})).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/source VM is stopped/) });
+
+    // the next cutover counts from the first stop
+    const plan = server.plans.find((p) => p.id === failed.plan_id)!;
+    plan.status = 'running';
+    plan.cutover_window = null;
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    await approver.post(`/migrations/${failed.id}/cutover`, {});
+    server.tick();
+    const again = server.migrations.find((m) => m.id === failed.id)!;
+    expect(again.phase).toBe('cutover');
+    expect(again.downtime_started_at).toBe(stoppedAt);
+  });
+
   it('finalizes only with the typed VM name', async () => {
     const { server, client } = setup('approver');
     const completed = byPhase(server, 'completed');

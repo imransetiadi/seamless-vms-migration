@@ -56,10 +56,24 @@ function useProgressAnnouncement(m: Migration | undefined): string {
   return text;
 }
 
+/** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
+const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+
 function Alerts({ m }: { m: Migration }) {
-  const sourceStopped = m.phase === 'failed' && m.downtime_started_at && !m.downtime_ended_at;
+  const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
+  const sourceStopped = m.phase === 'failed' && clockOpen;
+  const stillStopped = clockOpen && BEFORE_CUTOVER.has(m.phase);
   return (
     <div className="flex flex-col gap-2 empty:hidden">
+      {stillStopped && (
+        <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="text-foreground">
+            <strong className="font-semibold">The source VM is still stopped</strong> since {formatDateTime(m.downtime_started_at)}: the failed
+            cutover was retried, so its downtime clock keeps running until the next cutover is verified.
+          </p>
+        </div>
+      )}
       {sourceStopped && (
         <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />

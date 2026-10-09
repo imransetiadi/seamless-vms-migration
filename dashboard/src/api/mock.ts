@@ -305,9 +305,12 @@ export class MockServer {
 
   private beginCutover(m: Migration, plan: Plan): void {
     this.transition(m, 'cutover', 'cutover gate satisfied', 'orchestrator');
-    m.downtime_started_at = new Date(this.now()).toISOString();
-    m.downtime_ended_at = null;
-    m.actual_downtime_s = null;
+    if (!m.downtime_started_at || m.downtime_ended_at) {
+      // a retried cutover keeps the clock of the first stop (SDD §5.2)
+      m.downtime_started_at = new Date(this.now()).toISOString();
+      m.downtime_ended_at = null;
+      m.actual_downtime_s = null;
+    }
     m.progress_pct = 0;
     m.bytes_transferred = 0;
     this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
@@ -932,6 +935,12 @@ export class MockServer {
         if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
+        if (!m.downtime_started_at || m.downtime_ended_at) {
+          // a closed clock starts afresh; an open one means the source is still stopped (SDD §5.2)
+          m.downtime_started_at = null;
+          m.downtime_ended_at = null;
+          m.actual_downtime_s = null;
+        }
         m.error = null;
         m.cutover_requested = false;
         m.force_window = false;
@@ -940,6 +949,11 @@ export class MockServer {
         record('retry requested');
         break;
       case 'cancel': {
+        if (m.downtime_started_at && !m.downtime_ended_at) {
+          // SDD §5.1: never leave a stopped source behind
+          const advice = m.phase === 'failed' ? 'roll back or retry' : 'cut it over';
+          throw new HttpError(409, 'conflict', `${m.vm.name} cannot be cancelled: the source VM is stopped; ${advice} instead.`);
+        }
         if (m.phase === 'failed' && m.downtime_started_at) throw new HttpError(409, 'conflict', 'The source VM was stopped; roll back instead of cancelling.');
         const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : 'cancelled by operator';
         this.transition(m, 'cancelled', reason, me.name);

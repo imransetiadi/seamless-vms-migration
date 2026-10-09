@@ -68,14 +68,43 @@ describe('migrationActions rules', () => {
     const stopped = migration('failed', { downtime_started_at: '2026-10-08T11:20:00Z' });
     const cancel = migrationActions(stopped, 'operator').cancel;
     expect(cancel.enabled).toBe(false);
-    expect(cancel.reason).toMatch(/roll back instead/i);
+    expect(cancel.reason).toMatch(/roll back/i);
     expect(migrationActions(stopped, 'operator').rollback.enabled).toBe(true);
+  });
+
+  it('refuses Cancel in any phase while the source VM is stopped, and says what to do (SDD §5.1)', () => {
+    const open = { downtime_started_at: '2026-10-08T11:20:00Z', downtime_ended_at: null };
+    const failed = migrationActions(migration('failed', open), 'operator').cancel;
+    expect(failed.enabled).toBe(false);
+    expect(failed.reason).toMatch(/source VM is stopped.*roll back.*retry/i);
+    // a retried cutover keeps the open clock (SDD §5.2): the way on is the cutover
+    const ready = migrationActions(migration('ready', open), 'operator').cancel;
+    expect(ready.enabled).toBe(false);
+    expect(ready.reason).toMatch(/source VM is stopped.*cut it over/i);
+    // a cutover in progress has its clock open by design: the reason stays the phase rule
+    const cutover = migrationActions(migration('cutover', open), 'operator').cancel;
+    expect(cutover.enabled).toBe(false);
+    expect(cutover.reason).toMatch(/once cutover has started/i);
+    // once the source runs again (closed clock), a cancel is possible
+    const closed = migrationActions(migration('ready', { ...open, downtime_ended_at: '2026-10-08T11:40:00Z' }), 'operator').cancel;
+    expect(closed.enabled).toBe(true);
   });
 
   it('gives viewers nothing and says which role is needed', () => {
     const actions = migrationActions(migration('awaiting_cutover'), 'viewer');
     expect(actions.sync).toEqual({ enabled: false, reason: 'Requires the operator role.' });
     expect(actions.cutover).toEqual({ enabled: false, reason: 'Requires the approver role.' });
+  });
+
+  it('says a retried cutover still has its source stopped (SDD §5.2)', () => {
+    const open = { downtime_started_at: '2026-10-08T11:20:00Z', downtime_ended_at: null };
+    const cold = nextStep(migration('ready', { ...open, strategy: 'cold' }), null);
+    expect(cold.text).toMatch(/still stopped/i);
+    expect(cold.text).not.toMatch(/stops for about/i);
+    expect(cold.action).toBe('cutover');
+    const warm = nextStep(migration('ready', open), null);
+    expect(warm.text).toMatch(/still stopped/i);
+    expect(warm.text).not.toMatch(/source VM keeps running/i);
   });
 
   it('names the next step', () => {

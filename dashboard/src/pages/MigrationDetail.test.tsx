@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
 
 function renderMigration(id: string) {
@@ -14,5 +14,17 @@ describe('MigrationDetail', () => {
     const os = within(vm).getByRole('definition', { name: /guest os/i });
     expect(os).toHaveTextContent('Windows Server 2019');
     await waitFor(() => expect(os).toHaveTextContent(/verified on tcp 3389, without the console check/i));
+  });
+
+  it('warns that the source VM is still stopped after a retried cutover (SDD §5.2)', async () => {
+    const server = createTestServer();
+    const retried = server.migrations.find((m) => m.id === 'mig-e5f7a9b1a0');
+    if (!retried?.downtime_started_at || retried.downtime_ended_at) throw new Error('fixture: failed with the source stopped');
+    retried.phase = 'ready';
+    retried.error = null;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${retried.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/source VM is still stopped/i);
+    expect(alert).toHaveTextContent(/downtime clock keeps running/i);
   });
 });
