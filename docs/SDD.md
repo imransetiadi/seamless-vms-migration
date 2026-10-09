@@ -1261,9 +1261,12 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   short note under it when it is clicked or tapped (touch screens have no hover).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, SLO,
-  approval policy and window, network/flavor/volume-type/project mappings, sync settings, estimator overrides, the
-  verification settings — TCP and Windows ports, probe address, console success patterns, timeout, automatic
-  rollback, advisor review — and storage handover), `/plans/:id` (settings summary, waves board, migrations table with
+  approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
+  convergence threshold, maximum passes and the keep-warm interval (at least a minute, §5.4) — estimator overrides,
+  the resources pre-staged at the destination (any of the six defaults of §4.2, in that order; other entries a plan
+  already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
+  probe address, console success patterns, timeout, automatic rollback, advisor review — and storage handover),
+  `/plans/:id` (settings summary, waves board, migrations table with
   strategy/estimate/findings, Validate/Start/Pause/Auto-waves/Edit actions — Edit reopens the plan form prefilled and sends only the
   changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or edited, the approval policy — Require approval,
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
