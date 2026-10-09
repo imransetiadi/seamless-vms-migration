@@ -281,8 +281,11 @@ Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second p
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
 else, appends a `PhaseChange`, and updates `updated_at`. `failed → cancelled` is only allowed when
-`downtime_started_at is None` (the source VM was never stopped). `failed → ready` (retry) increments
-`attempts`. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
+`downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
+while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at` null): the source
+VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
+it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
+an open clock and resets a closed one (§5.2). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) and then runs the `rollback` step once with `delete_dest_volumes` as a best-effort cleanup
 of the abandoned pass (source snapshots, temporary and destination volumes); the migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
@@ -300,7 +303,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
   (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. `actual_downtime_s` = difference.
+  rollback, when the source VM is running again. `actual_downtime_s` = difference. A retry resets a
+  closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
+  the next attempt counts from that first stop and the stats report the VM's whole outage.
 
 ### 5.3 Convergence rule (warm strategies)
 
