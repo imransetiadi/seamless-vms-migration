@@ -354,6 +354,8 @@ export const PERSISTED_EVENT_KINDS = [
   'advisor.similar_incidents',
   'memory.lesson_saved',
   'provider.created',
+  'provider.updated',
+  'provider.credentials_updated',
   'provider.deleted',
   'provider.checked',
   'auth.denied',

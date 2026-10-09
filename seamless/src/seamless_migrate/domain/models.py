@@ -10,7 +10,15 @@ import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
 
@@ -61,6 +69,17 @@ class ConversionHostConfig(_Model):
 ProviderStatus = Literal["unknown", "ok", "degraded", "error"]
 
 
+#: Presets and display only (SDD §4.2); ``kind`` decides the code path.
+Distribution = Literal["openstack_community", "kolla", "rhosp", "rhoso", "vmware"]
+DISTRIBUTION_KIND: dict[str, ProviderKind] = {
+    "openstack_community": ProviderKind.openstack,
+    "kolla": ProviderKind.openstack,
+    "rhosp": ProviderKind.openstack,
+    "rhoso": ProviderKind.rhoso,
+    "vmware": ProviderKind.vmware,
+}
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -77,6 +96,19 @@ class Provider(_Model):
     status: ProviderStatus = "unknown"
     status_message: str | None = None
     last_checked_at: UTCDateTime | None = None
+    distribution: Distribution | None = None
+    #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
+    credentials_updated_at: UTCDateTime | None = None
+    conversion_key_updated_at: UTCDateTime | None = None
+
+    @model_validator(mode="after")
+    def _distribution_matches_kind(self) -> Provider:
+        if self.distribution is not None and DISTRIBUTION_KIND[self.distribution] != self.kind:
+            raise ValueError(
+                f"distribution {self.distribution} belongs to kind "
+                f"{DISTRIBUTION_KIND[self.distribution]}, not {self.kind}"
+            )
+        return self
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]

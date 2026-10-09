@@ -118,6 +118,23 @@ ROUTES = [
     ("GET", "/api/v1/providers", Role.viewer, None),
     ("POST", "/api/v1/providers", Role.admin, {**SOURCE, "id": "matrix-src"}),
     ("GET", "/api/v1/providers/src-osp", Role.viewer, None),
+    ("PATCH", "/api/v1/providers/src-osp", Role.admin, {"name": "renamed"}),
+    (
+        "PUT",
+        "/api/v1/providers/src-osp/credentials",
+        Role.admin,
+        {"username": "u", "password": "p", "project_name": "x"},
+    ),
+    (
+        "PUT",
+        "/api/v1/providers/src-osp/conversion-key",
+        Role.admin,
+        {
+            "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            + "A" * 64
+            + "\n-----END OPENSSH PRIVATE KEY-----"
+        },
+    ),
     ("DELETE", "/api/v1/providers/nope-1", Role.admin, None),
     ("POST", "/api/v1/providers/src-osp/check", Role.operator, None),
     ("GET", "/api/v1/providers/src-osp/inventory", Role.viewer, None),
@@ -161,7 +178,9 @@ ROUTES = [
 def matrix_api(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("matrix")
     # the matrix fires >100 unauthenticated requests from one client: no lockout here
-    settings, tokens = api_settings(tmp_path, auth_lockout_per_minute=0)
+    settings, tokens = api_settings(
+        tmp_path, auth_lockout_per_minute=0, secrets_dir=tmp_path / "secrets"
+    )
     store = Store(f"sqlite:///{tmp_path / 'matrix.db'}")
     store.create_schema()
     with TestClient(create_app(settings, store)) as client:

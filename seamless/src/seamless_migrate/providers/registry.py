@@ -38,6 +38,8 @@ class ProviderRegistry:
 
     def _credentials_stamp(self) -> str:
         """Change marker of the mounted credential files (a rotated clouds.yaml reconnects)."""
+        if self.settings.clouds_yaml is None:
+            return "-"  # credentials from the secret store: the provider document's stamp moves
         try:
             st = os.stat(self.settings.clouds_yaml)
         except OSError:

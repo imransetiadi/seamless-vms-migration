@@ -53,6 +53,9 @@ class Settings(BaseModel):
     cors_origins: list[str] = Field(default_factory=list)
     clouds_yaml: Path | None = None
     secrets_dir: Path = Path("/var/run/secrets/seamless")
+    #: where dashboard-entered credentials are written (SDD §13.3)
+    secret_store: Literal["files", "kubernetes"] = "files"
+    k8s_namespace: str | None = None
     ansible_playbook: str = "ansible-playbook"
     collection_root: Path = Field(default_factory=find_repo_root)
     max_concurrent_migrations: int = 10
@@ -98,6 +101,8 @@ class Settings(BaseModel):
             "TOKENS_FILE": "tokens_file",
             "CLOUDS_YAML": "clouds_yaml",
             "SECRETS_DIR": "secrets_dir",
+            "SECRET_STORE": "secret_store",
+            "K8S_NAMESPACE": "k8s_namespace",
             "ANSIBLE_PLAYBOOK": "ansible_playbook",
             "COLLECTION_ROOT": "collection_root",
             "JEV_MODE": "jev_mode",

@@ -14,7 +14,7 @@ from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import DestinationInventory, SourceInventory
-from ..security.secrets import SecretNotFound, load_cloud_auth
+from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from .base import ProviderError, missing_dependency
 
 log = logging.getLogger(__name__)
@@ -58,9 +58,9 @@ def connect(provider: Provider, settings: Settings) -> Any:
     """Open an openstacksdk connection for ``provider`` (credentials from ``clouds.yaml``)."""
     openstack = _import_openstack()
     kwargs: dict[str, Any] = {"app_name": "seamless-migrate"}
-    if settings.clouds_yaml is not None and provider.cloud:
+    if provider.credentials_secret or (settings.clouds_yaml is not None and provider.cloud):
         try:
-            entry = load_cloud_auth(provider.cloud, settings)
+            entry = openstack_cloud_entry(provider, settings)
         except SecretNotFound as exc:
             raise ProviderError(f"{provider.id}: {exc}") from None
         kwargs.update(entry)

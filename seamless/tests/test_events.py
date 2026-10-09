@@ -44,6 +44,8 @@ def test_kind_catalog_matches_sdd():
         "advisor.similar_incidents",
         "memory.lesson_saved",
         "provider.created",
+        "provider.updated",
+        "provider.credentials_updated",
         "provider.deleted",
         "provider.checked",
         "auth.denied",

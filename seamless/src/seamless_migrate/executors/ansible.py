@@ -32,7 +32,7 @@ from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
     SecretNotFound,
-    load_cloud_auth,
+    openstack_cloud_entry,
     remove_quietly,
     resolve,
     resolve_private_key,
@@ -302,7 +302,7 @@ def build_secret_vars(
             if not source.credentials_secret:
                 raise SecretNotFound(f"{source.id} has no credentials_secret")
             creds = resolve(source.credentials_secret, settings)
-            entry = load_cloud_auth(destination.cloud or "", settings)
+            entry = openstack_cloud_entry(destination, settings)
             dst_cloud = {"auth": entry["auth"]}
             for key in ("region_name", "interface", "identity_api_version", "auth_type"):
                 if entry.get(key):
@@ -319,7 +319,7 @@ def build_secret_vars(
             return out
         out = {}
         for side, provider in (("src", source), ("dst", destination)):
-            entry = load_cloud_auth(provider.cloud or "", settings)
+            entry = openstack_cloud_entry(provider, settings)
             out[f"os_migrate_{side}_auth"] = entry["auth"]
             if entry.get("auth_type"):
                 out[f"os_migrate_{side}_auth_type"] = entry["auth_type"]
