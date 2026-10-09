@@ -80,15 +80,10 @@ def resolve_destination(
         for b in destination_backends
         if split_host(str(b.get("pool")))[0] == backend
     ]
-    if family == "rbd":
-        if wanted:
-            return target
-        if len(pools) == 1:
-            return pools[0][0]
-        raise StorageError(f"{backend} has {len(pools)} pools: name the pool in backend_map")
     if not pools:
+        what = "RBD" if family == "rbd" else "NetApp"
         raise StorageError(
-            f"the destination lists no pools for {backend}: the NetApp pool cannot be checked"
+            f"the destination lists no pools for {backend}: the {what} pool cannot be checked"
         )
     families = sorted({f for _, f in pools})
     candidates = [p for p, f in pools if f == family]
@@ -97,6 +92,19 @@ def resolve_destination(
             f"{backend} is {', '.join(families)}, the source volume is {family}: "
             "map the volume type to a backend of the same driver family"
         )
+    if family == "rbd":
+        # step 0 refuses a pool the destination does not list (SDD §7.3.1): manage would fail
+        # only after the source server was deleted and its volumes unmanaged
+        if wanted:
+            if target in candidates:
+                return target
+            raise StorageError(
+                f"the destination lists no pool {target} (RBD pools of {backend}: "
+                f"{', '.join(candidates)})"
+            )
+        if len(candidates) == 1:
+            return candidates[0]
+        raise StorageError(f"{backend} has {len(candidates)} pools: name the pool in backend_map")
     if family == "netapp_nfs":
         source_export = _export(source_pool or "")
         matches = [p for p in candidates if _export(split_host(p)[1] or "") == source_export]

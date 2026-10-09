@@ -88,8 +88,23 @@ def test_resolve_destination_rbd_uses_the_mapped_or_only_pool():
         resolve_destination("rbd", "ssd", "hostgroup@ceph-ssd#ssd", dst) == "hostgroup@ceph-ssd#ssd"
     )
     assert resolve_destination("rbd", "x", "hostgroup@ceph-ssd", dst) == "hostgroup@ceph-ssd#ssd"
-    # an explicit RBD target is used as configured (SDD §7.3 before the amendment)
-    assert resolve_destination("rbd", "x", "hostgroup@other#p", []) == "hostgroup@other#p"
+
+
+def test_resolve_destination_refuses_unlisted_or_non_rbd_pool():
+    """SDD §7.3.1: a named RBD pool the destination does not list, or a backend that is not RBD,
+    refuses the handover in step 0 — not at manage time, after the source server was deleted."""
+    dst = [
+        backend("hostgroup@ceph#a", "rbd"),
+        backend("hostgroup@ontap-iscsi#flex_a", "netapp_block"),
+    ]
+    with pytest.raises(StorageError, match="lists no pool"):
+        resolve_destination("rbd", "x", "hostgroup@ceph#typo", dst)
+    with pytest.raises(StorageError, match="lists no pool"):
+        resolve_destination("rbd", "x", "hostgroup@other#p", [])
+    with pytest.raises(StorageError, match="netapp_block"):
+        resolve_destination("rbd", "x", "hostgroup@ontap-iscsi#flex_a", dst)
+    with pytest.raises(StorageError, match="netapp_block"):
+        resolve_destination("rbd", "x", "hostgroup@ontap-iscsi", dst)
 
 
 def test_resolve_destination_refuses_mismatch_missing_pool_and_other():

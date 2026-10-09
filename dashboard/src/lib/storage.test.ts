@@ -68,5 +68,9 @@ describe('storage backends (SDD §7.3.1, §10)', () => {
     expect(resolveDestination('netapp_nfs', '192.0.2.50:/cinder', 'hostgroup@ontap-iscsi', DST).error).toMatch(/same driver family/);
     expect(resolveDestination('other', null, 'hostgroup@ceph#ssd', DST).error).toMatch(/unsupported storage family/);
     expect(resolveDestination('rbd', 'x', 'hostgroup@ceph', DST).error).toMatch(/name the pool/);
+    // SDD §7.3.1: a named RBD pool the destination does not list, or a non-RBD backend, is refused up front
+    expect(resolveDestination('rbd', 'x', 'hostgroup@ceph#typo', DST).error).toMatch(/lists no pool hostgroup@ceph#typo/);
+    expect(resolveDestination('rbd', 'x', 'hostgroup@other#p', []).error).toMatch(/lists no pools for hostgroup@other/);
+    expect(resolveDestination('rbd', 'x', 'hostgroup@ontap-iscsi', DST).error).toMatch(/netapp_block/);
   });
 });

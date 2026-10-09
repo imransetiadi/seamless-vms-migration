@@ -108,16 +108,23 @@ export function resolveDestination(
   if (!SUPPORTED.includes(family)) return { error: `unsupported storage family '${family}': handover supports Ceph RBD and NetApp ONTAP (NFS, iSCSI, FC)` };
   const [backend, wanted] = splitHost(target);
   const pools = destination.filter((b) => splitHost(b.pool)[0] === backend);
-  if (family === 'rbd') {
-    if (wanted) return { host: target };
-    if (pools.length === 1) return { host: pools[0]!.pool };
-    return { error: `${backend} has ${pools.length} pools: name the pool in backend_map` };
+  if (pools.length === 0) {
+    return { error: `the destination lists no pools for ${backend}: the ${family === 'rbd' ? 'RBD' : 'NetApp'} pool cannot be checked` };
   }
-  if (pools.length === 0) return { error: `the destination lists no pools for ${backend}: the NetApp pool cannot be checked` };
   const candidates = pools.filter((b) => b.family === family);
   if (candidates.length === 0) {
     const families = [...new Set(pools.map((b) => b.family))].sort().join(', ');
     return { error: `${backend} is ${families}, the source volume is ${family}: map the volume type to a backend of the same driver family` };
+  }
+  if (family === 'rbd') {
+    // a pool the destination does not list is refused in step 0 (SDD §7.3.1)
+    if (wanted) {
+      return candidates.some((b) => b.pool === target)
+        ? { host: target }
+        : { error: `the destination lists no pool ${target} (RBD pools of ${backend}: ${candidates.map((b) => b.pool).join(', ')})` };
+    }
+    if (candidates.length === 1) return { host: candidates[0]!.pool };
+    return { error: `${backend} has ${candidates.length} pools: name the pool in backend_map` };
   }
   const what = family === 'netapp_nfs' ? `export ${exportPath(sourcePool)}` : `FlexVol ${sourcePool}`;
   const match = candidates.find((b) =>
