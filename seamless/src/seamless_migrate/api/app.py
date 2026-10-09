@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
 from .. import __version__
 from ..ai.advisor import Advisor
@@ -141,6 +142,26 @@ def _apply_security_headers(headers: Any, path: str) -> None:
 
 #: SDD §12: the largest request body. A 5,000-VM plan with an override per VM is about 0.5 MB.
 MAX_BODY_BYTES = 1024 * 1024
+#: SDD §12: responses of 1 KiB and more are gzip-compressed when the client accepts gzip.
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 6
+
+
+class GZipExceptEventStream:
+    """Gzip responses (SDD §12), never the event stream: a compressor holds small writes back until
+    its buffer fills, which would delay live events (older Starlette versions compress
+    ``text/event-stream`` too, so the stream is routed around the compressor)."""
+
+    def __init__(self, app, stream_path: str = "/api/v1/events/stream"):
+        self.app = app
+        self.stream_path = stream_path
+        self.gzip = GZipMiddleware(app, minimum_size=GZIP_MIN_BYTES, compresslevel=GZIP_LEVEL)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == self.stream_path:
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
 
 
 class BodyLimitMiddleware:
@@ -321,6 +342,8 @@ def create_app(
     )
     app.state.services = svc
     _install_error_handlers(app)
+    # innermost: the compressed response still gets the security headers (SDD §12)
+    app.add_middleware(GZipExceptEventStream, stream_path=f"{API_PREFIX}/events/stream")
     # added before the security headers middleware, which therefore wraps it: a 413 carries the
     # R-05 headers too
     app.add_middleware(BodyLimitMiddleware)

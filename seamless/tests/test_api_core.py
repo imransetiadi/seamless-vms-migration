@@ -92,6 +92,24 @@ def test_provider_errors_are_redacted_in_the_api(api, monkeypatch):
     assert "hunter2" not in res.text and "auth failed" in res.text
 
 
+def test_large_responses_are_gzip_compressed_when_the_client_accepts_gzip(api):
+    """SDD §12: responses of 1 KiB and more are gzip-compressed when Accept-Encoding allows it."""
+    path = "/api/v1/stats"  # 60 throughput buckets: well over 1 KiB
+    accepted = api.client.get(path, headers={**api.h(Role.viewer), "Accept-Encoding": "gzip"})
+    assert accepted.status_code == 200
+    assert len(accepted.content) >= 1024, "the stats should be a large response"
+    assert accepted.headers.get("content-encoding") == "gzip"
+    assert "accept-encoding" in accepted.headers.get("vary", "").lower()
+    # the security headers (Security.md R-05) wrap the compressor
+    assert accepted.headers.get("x-content-type-options") == "nosniff"
+    assert "content-security-policy" in accepted.headers
+    plain = api.client.get(path, headers={**api.h(Role.viewer), "Accept-Encoding": "identity"})
+    assert "content-encoding" not in plain.headers and plain.json() == accepted.json()
+    # small responses are sent as they are
+    health = api.client.get("/api/v1/health", headers={"Accept-Encoding": "gzip"})
+    assert len(health.content) < 1024 and "content-encoding" not in health.headers
+
+
 def test_unauthenticated_401_and_audit_event(api):
     res = api.client.get("/api/v1/plans")
     assert res.status_code == 401
