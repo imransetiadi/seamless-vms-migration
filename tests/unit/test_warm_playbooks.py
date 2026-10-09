@@ -375,7 +375,7 @@ def test_warm_playbooks_story(env):
     with open(os.path.join(env.state_dir, "srv-2.json"), "w") as f:
         json.dump(state, f)
     rc, out, calls = env.run(
-        "rollback_workloads", os_migrate_rollback_delete_dest_volumes=True
+        "rollback_workloads", os_migrate_rollback_delete_dest_volumes=True, os_migrate_rollback_all=True
     )
     assert rc == 0, out
     assert modules_for(calls, "vm1", "srv-1") == [
@@ -447,7 +447,9 @@ def test_rollback_passes_the_destination_conversion_host(env):
     rc, out, _ = env.run("import_workloads_precopy")
     assert rc == 0, out
 
-    rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_delete_dest_volumes=True)
+    rc, out, calls = env.run(
+        "rollback_workloads", os_migrate_rollback_delete_dest_volumes=True, os_migrate_rollback_all=True
+    )
 
     assert rc == 0, out
     rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
@@ -458,10 +460,26 @@ def test_rollback_keeps_destination_volumes_by_default(env):
     rc, out, _ = env.run("import_workloads_precopy")
     assert rc == 0, out
 
-    rc, out, calls = env.run("rollback_workloads")
+    rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_all=True)
 
     assert rc == 0, out
     rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
     assert [r["delete_dest_volumes"] for r in rollback] == [False, False]
     assert env.state("srv-1")["dest_volumes"]  # kept for a later cutover
     assert not [c for c in calls if c["module"] == "os_conversion_host_info"]
+
+
+def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
+    """SDD 6.5: without a workload filter a rollback would revert every cut-over workload of the
+    data dir; it refuses unless os_migrate_rollback_all is true. An exact filter rolls back one."""
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+
+    rc, out, calls = env.run("rollback_workloads")
+    assert rc != 0
+    assert "os_migrate_rollback_all" in out
+    assert not [c for c in calls if c["module"] == "import_workload_rollback"]
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm1$"}])
+    assert rc == 0, out
+    assert len([c for c in calls if c["module"] == "import_workload_rollback"]) == 1

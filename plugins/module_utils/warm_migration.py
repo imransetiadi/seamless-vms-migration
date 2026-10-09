@@ -1037,10 +1037,18 @@ class WarmRollback:
         }
         recorded = self.state.exists()
         volume_ids = [entry["dest_id"] for _, entry in sorted(self.state.dest_volumes.items())]
+        # With a warm state its volumes are the migration's; another volume attached to the
+        # destination server (e.g. by an operator after the cutover) is kept (SDD 6.5). Without
+        # one (cold) the destination server's attachments are the migration's.
+        foreign = []
         destination = self._find_destination_server()
         if destination is not None:
             for attachment in self.conn.compute.volume_attachments(destination):
-                if attachment.volume_id not in volume_ids:
+                if attachment.volume_id in volume_ids:
+                    continue
+                if recorded:
+                    foreign.append(attachment.volume_id)
+                else:
                     volume_ids.append(attachment.volume_id)
             self.log.info("Deleting destination server %s", destination.id)
             self.conn.compute.delete_server(destination)
@@ -1053,6 +1061,7 @@ class WarmRollback:
         if not delete_volumes:
             return result
 
+        result["kept_volume_ids"].extend(foreign)
         for volume_id in volume_ids:
             deleted = self._delete_volume(volume_id)
             if deleted is None:

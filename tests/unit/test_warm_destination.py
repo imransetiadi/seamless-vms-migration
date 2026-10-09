@@ -182,6 +182,7 @@ def test_rollback_deletes_recorded_server_and_keeps_volumes(tmp_path):
 
 def test_rollback_deletes_volumes_and_state_when_asked(tmp_path):
     dst, state_dir = migrated(tmp_path)
+    # attached to the destination server after the cutover: not the migration's (SDD 6.5)
     dst.add_volume("dvol-extra", "attached-later", 5)
     dst.volumes["dvol-extra"].attachments.append(
         {"server_id": "dst-srv", "device": "/dev/vdc", "volume_id": "dvol-extra"}
@@ -192,9 +193,10 @@ def test_rollback_deletes_volumes_and_state_when_asked(tmp_path):
     )
 
     assert result["deleted_server_id"] == "dst-srv"
-    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data", "dvol-extra"]
+    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
+    assert result["kept_volume_ids"] == ["dvol-extra"]
     assert result["state_deleted"] is True
-    assert set(dst.volumes) == {"unrelated"}
+    assert set(dst.volumes) == {"unrelated", "dvol-extra"}
     assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
 
 

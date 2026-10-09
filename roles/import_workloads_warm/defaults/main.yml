@@ -8,6 +8,9 @@ os_migrate_warm_chunk_size: 4194304  # noqa: var-naming[no-role-prefix]
 os_migrate_warm_workers: 4  # noqa: var-naming[no-role-prefix]
 # Rollback: also delete the destination volumes and the warm state.
 os_migrate_rollback_delete_dest_volumes: false  # noqa: var-naming[no-role-prefix]
+# Rollback with the catch-all workload filter (every workload of the data dir):
+# refused unless this confirms it.
+os_migrate_rollback_all: false  # noqa: var-naming[no-role-prefix]
 
 # Optional tuning.
 # Disks of one workload synchronised at the same time.
