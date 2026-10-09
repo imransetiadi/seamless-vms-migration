@@ -601,13 +601,18 @@ volumes with their server, so the order is:
    * the source compute API does not support microversion **2.85** (step 3);
    * Cinder would refuse to unmanage a volume (step 5) — it refuses encrypted volumes ("Unmanaging
      encrypted volumes is not supported"), volumes with snapshots and volumes in a group or
-     consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later).
+     consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later);
+   * no attachment is the boot volume (step 2): the destination server could not be created, nor the
+     source again on rollback.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it), and the volume attachments in device
    order (volume id, device, boot index, bootable, type, size, Cinder host, the attachment's
    original `delete_on_termination`) and the resolved storage references (`storage`: per volume
-   its family, source pool and destination host).
+   its family, source pool and destination host). The boot volume is the attachment at Nova's
+   `root_device_name` (`/dev/vda` when Nova does not report one), else the Cinder-bootable volume
+   with the lowest device — the inventory's rule for `Disk.bootable` — else the first disk of
+   another bus (`/dev/sda`, `/dev/hda` for legacy IDE guests, `/dev/xvda`).
 3. For every attachment set `delete_on_termination=false`:
    `PUT /servers/{id}/os-volume_attachments/{volume_id}` `{"volumeAttachment": {"volumeId": …,
    "delete_on_termination": false}}` with compute microversion **2.85**; verify by re-reading.
