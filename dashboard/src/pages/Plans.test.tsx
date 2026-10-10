@@ -105,6 +105,61 @@ describe('Plans page', () => {
     expect(server.plans).toHaveLength(before);
   });
 
+  it('accepts the sync values the API accepts: threshold 0, 60 passes, 100 disks in parallel (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'API bounds');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    for (const [label, value] of [
+      [/convergence threshold/i, '0'],
+      [/max sync passes/i, '60'],
+      [/disks scanned in parallel/i, '100'],
+    ] as const) {
+      await user.clear(within(dialog).getByLabelText(label));
+      await user.type(within(dialog).getByLabelText(label), value);
+    }
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'API bounds')).toBe(true));
+    const created = server.plans.find((p) => p.name === 'API bounds')!;
+    expect([created.convergence_threshold_bytes, created.max_sync_passes, created.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
+  }, 30_000);
+
+  it('refuses a negative threshold, 0 passes and 0 disks in parallel, like the API (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const before = server.plans.length;
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Below the bounds');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    for (const [label, value] of [
+      [/convergence threshold/i, '-1'],
+      [/max sync passes/i, '0'],
+      [/disks scanned in parallel/i, '0'],
+    ] as const) {
+      await user.clear(within(dialog).getByLabelText(label));
+      await user.type(within(dialog).getByLabelText(label), value);
+    }
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent('Enter the convergence threshold in GiB (0 or more).');
+    expect(summary).toHaveTextContent('Enter a whole number of passes (1 or more).');
+    expect(summary).toHaveTextContent('Enter a whole number of disks (1 or more), or leave it empty.');
+    // an empty threshold is not 0
+    await user.clear(within(dialog).getByLabelText(/convergence threshold/i));
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(within(dialog).getByLabelText(/convergence threshold/i)).toHaveAccessibleDescription(/0 or more/));
+    expect(server.plans).toHaveLength(before);
+  }, 30_000);
+
   it('gives an operator the default approval policy, read-only (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

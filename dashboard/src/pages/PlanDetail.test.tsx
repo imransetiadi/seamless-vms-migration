@@ -402,6 +402,33 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['downtime_slo_s'] });
   });
 
+  it('edits a plan stored with sync values the old form refused: threshold 0, 60 passes, 100 disks (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // as the API or `seamless plan apply` may store them
+    plan.convergence_threshold_bytes = 0;
+    plan.max_sync_passes = 60;
+    plan.estimator_overrides = { ...plan.estimator_overrides, parallel_disks: 100 };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    expect(within(dialog).getByLabelText(/convergence threshold/i)).toHaveValue(0);
+    expect(within(dialog).getByLabelText(/max sync passes/i)).toHaveValue(60);
+    expect(within(dialog).getByLabelText(/disks scanned in parallel/i)).toHaveValue(100);
+
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === plan.id)!;
+    expect(saved.name).toBe('Analytics, renamed');
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
+    expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
+  });
+
   it('shows an operator the approval policy read-only, with the reason (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPlan('plan-c81d44a0', 'operator');

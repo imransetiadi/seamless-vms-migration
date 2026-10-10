@@ -352,10 +352,11 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const consolePatterns = f.consolePatterns.split(/\r?\n/).filter((line) => line.trim() !== '');
     const link = Number(f.linkMiBps);
     if (!(link > 0)) e.link = 'Enter the link bandwidth in MiB/s (more than 0).';
-    const threshold = Number(f.thresholdGiB);
-    if (!(threshold > 0)) e.threshold = 'Enter the convergence threshold in GiB (more than 0).';
+    // the API's bounds (SDD §16): a stricter form would keep a plan stored with such a value from being edited
+    const threshold = f.thresholdGiB.trim() === '' ? Number.NaN : Number(f.thresholdGiB);
+    if (!(threshold >= 0)) e.threshold = 'Enter the convergence threshold in GiB (0 or more).';
     const passes = Number(f.maxPasses);
-    if (!Number.isInteger(passes) || passes < 1 || passes > 50) e.passes = 'Enter a whole number of passes from 1 to 50.';
+    if (!Number.isInteger(passes) || passes < 1) e.passes = 'Enter a whole number of passes (1 or more).';
     // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
     const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
     if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
@@ -367,7 +368,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     }
     if (f.parallelDisks.trim()) {
       const parallel = Number(f.parallelDisks);
-      if (!Number.isInteger(parallel) || parallel < 1 || parallel > 64) e.parallel = 'Enter a whole number of disks from 1 to 64, or leave it empty.';
+      if (!Number.isInteger(parallel) || parallel < 1) e.parallel = 'Enter a whole number of disks (1 or more), or leave it empty.';
       else overrides.parallel_disks = parallel;
     }
     // like the API (SDD §9.1): every override is a finite number above 0
@@ -782,7 +783,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('link')} label="Link bandwidth (MiB/s)" type="number" inputMode="decimal" min={0} step="any" value={form.linkMiBps} onChange={(e) => set('linkMiBps', e.target.value)} error={errors.link} />
                 <TextField id={id('threshold')} label="Convergence threshold (GiB)" type="number" inputMode="decimal" min={0} step="any" value={form.thresholdGiB} onChange={(e) => set('thresholdGiB', e.target.value)} error={errors.threshold} />
-                <TextField id={id('passes')} label="Max sync passes" type="number" inputMode="numeric" min={1} max={50} value={form.maxPasses} onChange={(e) => set('maxPasses', e.target.value)} error={errors.passes} />
+                <TextField id={id('passes')} label="Max sync passes" type="number" inputMode="numeric" min={1} value={form.maxPasses} onChange={(e) => set('maxPasses', e.target.value)} error={errors.passes} />
                 <TextField
                   id={id('keep-warm')}
                   label="Keep-warm interval (minutes)"
@@ -816,7 +817,6 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   type="number"
                   inputMode="numeric"
                   min={1}
-                  max={64}
                   placeholder="4 (planning default)"
                   value={form.parallelDisks}
                   onChange={(e) => set('parallelDisks', e.target.value)}
