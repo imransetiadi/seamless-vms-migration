@@ -1684,7 +1684,8 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   `before`), emits `decision.approved` or `decision.overridden` (actor `user:<name>`), sets `migration.strategy`
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
-  `PUT …/strategy`, so a later validation keeps it. Neither acts while the plan sets the VM's strategy
+  `PUT …/strategy`, so a later validation keeps it — under the plan's lock, with the decision, so a validation
+  waiting for that lock sees the override and asks no one again. Neither acts while the plan sets the VM's strategy
   (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation honours that without
   recording a recommendation, so the newest one no longer stands — 409 "The plan sets the strategy of <vm>
   (<option>): change it in the plan."), and an approve of a decision already `approved` is refused (409 "The
