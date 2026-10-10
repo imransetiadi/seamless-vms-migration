@@ -423,15 +423,31 @@ class Orchestrator:
         actor: str = "system",
         data: dict[str, Any] | None = None,
     ) -> tuple[Migration, int]:
-        new = fsm.transition(m, to, reason, actor, now=self._now())
+        return await self._transitions(m, version, [(to, reason, data)], actor)
+
+    async def _transitions(
+        self,
+        m: Migration,
+        version: int,
+        steps: list[tuple[Phase, str, dict[str, Any] | None]],
+        actor: str = "system",
+    ) -> tuple[Migration, int]:
+        """Several transitions in one write — a crash or a failed event write never splits them
+        (SDD §8) — then one ``migration.phase`` event each."""
+        new = m
+        for to, reason, _ in steps:
+            new = fsm.transition(new, to, reason, actor, now=self._now())
         version = await self._save(new, version)
-        await self._emit(
-            "migration.phase",
-            f"{new.vm.name}: {m.phase} -> {to} ({reason})",
-            migration=new,
-            actor=actor,
-            data={"from": str(m.phase), "to": str(to), "reason": reason, **(data or {})},
-        )
+        before = m.phase
+        for to, reason, data in steps:
+            await self._emit(
+                "migration.phase",
+                f"{new.vm.name}: {before} -> {to} ({reason})",
+                migration=new,
+                actor=actor,
+                data={"from": str(before), "to": str(to), "reason": reason, **(data or {})},
+            )
+            before = to
         return new, version
 
     # ------------------------------------------------------------------------------------------
@@ -2673,15 +2689,28 @@ class Orchestrator:
             if isinstance(exc, PermanentStepError) and fsm.source_stopped(cur):
                 # the model seconds a failed simulated step kept the source stopped (SDD §5.2)
                 _add_model_s(cur, exc.details)
-            cur, v = await self._transition(
-                cur, v, P.failed, f"{step} failed: {message[:200]}", data=data
+            plan = await self._plan(cur.plan_id)
+            steps: list[tuple[Phase, str, dict[str, Any] | None]] = [
+                (P.failed, f"{step} failed: {message[:200]}", data)
+            ]
+            rollback = (
+                expected != P.rolling_back
+                and cur.downtime_started_at is not None
+                and plan.verification.auto_rollback
             )
+            if rollback:
+                # SDD §8: saved with the failure — a restart or a failed event write right after
+                # it resumes the rollback, never leaving the stopped VM in failed
+                steps.append((P.rolling_back, f"automatic rollback after {step} failure", None))
+            cur, v = await self._transitions(cur, v, steps)
         await self._emit(
             "migration.error",
             f"{cur.vm.name}: {step} failed: {message[:300]}",
             migration=cur,
             data={"step": str(step), "error_class": type(exc).__name__, "message": message[:1000]},
         )
+        if rollback:
+            self._launch(mid)
         if self.knowledge is not None:
             note = await self.knowledge.on_failure(cur, str(step), exc)
             if note is not None:
@@ -2689,19 +2718,6 @@ class Orchestrator:
                     cur, v = await self._load(mid)
                     cur.advisor_notes.append(note)
                     await self._save(cur, v)
-        plan = await self._plan(cur.plan_id)
-        if (
-            expected != P.rolling_back
-            and cur.downtime_started_at is not None
-            and plan.verification.auto_rollback
-        ):
-            async with self._lock(mid):
-                cur, v = await self._load(mid)
-                if cur.phase == P.failed:
-                    await self._transition(
-                        cur, v, P.rolling_back, f"automatic rollback after {step} failure"
-                    )
-            self._launch(mid)
 
 
 def phases(migrations: Iterable[Migration]) -> Counter[str]:

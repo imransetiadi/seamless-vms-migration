@@ -1936,6 +1936,112 @@ async def test_step_output_lines_are_redacted_before_they_are_cut(tmp_path, stor
     assert redacted == [2000 + 16384]
 
 
+class _HangingKnowledge:
+    """agentmemory that does not answer the failure's lookup until released."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def on_failure(self, migration, step, error):
+        self.entered.set()
+        await self.release.wait()
+        return None
+
+    async def on_completed(self, migration):
+        return None
+
+    async def on_rolled_back(self, migration, reason):
+        return None
+
+    async def similar_for(self, option, vm):
+        return []
+
+
+def _stopping_cutover(settings):
+    async def failing_cutover(ctx):
+        await ctx.mark_downtime_start()  # the source VM is stopped
+        raise PermanentStepError("conversion host lost")
+
+    return ScriptedExecutor(settings, hooks={StepName.CUTOVER: failing_cutover})
+
+
+async def test_a_restart_right_after_a_failure_still_rolls_the_stopped_vm_back(tmp_path, store):
+    """SDD §8: the automatic rollback is saved in the same write as the failure, so a restart
+    while the knowledge lookup still waits on agentmemory resumes it — the VM never stays stopped
+    in failed."""
+    settings = make_settings(tmp_path)
+    knowledge = _HangingKnowledge()
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        knowledge=knowledge,
+        settings=settings,
+    )
+    assert plan.verification.auto_rollback is True
+    await run_plan(h, plan)
+    await asyncio.wait_for(knowledge.entered.wait(), 10)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.phase, m.downtime_ended_at) == (P.rolling_back, None)
+    assert [str(c.to_phase) for c in m.phase_history][-3:] == ["cutover", "failed", "rolling_back"]
+    await h.orch.stop()  # a restart while the lookup waits
+
+    again = build_harness(
+        tmp_path, store, [vm(1)], executor=ScriptedExecutor(settings), settings=settings
+    )
+    await again.orch.start()
+    done = await again.wait_phase(m.id, P.rolled_back)
+    await again.orch.stop()
+    assert done.downtime_ended_at is not None
+    assert [str(c.to_phase) for c in done.phase_history][-4:] == [
+        "cutover",
+        "failed",
+        "rolling_back",
+        "rolled_back",
+    ]
+
+
+async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_back(
+    tmp_path, store
+):
+    """SDD §8: an event that fails to be written right after the failure — the first one, its
+    phase event (a database blip) — crashes the driver, but the rollback was saved in the same
+    write as the failure: the tick resumes it."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.cold},
+        executor=_stopping_cutover(settings),
+        settings=settings,
+    )
+    real_emit = h.orch._emit
+    blips = {"left": 1}
+
+    async def flaky_emit(kind, message, **kw):
+        if kind == "migration.phase" and (kw.get("data") or {}).get("to") == "failed":
+            if blips["left"]:
+                blips["left"] -= 1
+                raise OSError("server closed the connection unexpectedly")
+        return await real_emit(kind, message, **kw)
+
+    h.orch._emit = flaky_emit
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert blips["left"] == 0 and done.downtime_ended_at is not None
+    assert [str(c.to_phase) for c in done.phase_history][-4:] == [
+        "cutover",
+        "failed",
+        "rolling_back",
+        "rolled_back",
+    ]
+
+
 async def test_failed_verification_rolls_back(tmp_path, store):
     h, plan = await setup(
         tmp_path,
