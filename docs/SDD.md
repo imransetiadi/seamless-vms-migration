@@ -295,7 +295,11 @@ VM is stopped, so the way out is a rollback (from `failed`) or another cutover �
 it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
 granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
-bypass never carries over to it — while approvals stay (the assessment did not change). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
+bypass never carries over to it — while approvals stay (the assessment did not change). A retry in a
+`completed` plan (a plan completes with a rolled-back migration, which is wave-complete, §8) reopens the plan:
+under the plan's lock it becomes `running` again (event `plan.updated`, data `{"status": "running"}`), so
+the tick runs the new attempt through the usual gate (§5.4); the providers of a completed plan may be
+deleted (§12), so such a retry is refused (409) when one of them no longer exists. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
 no further attempt starts. Whenever the migration has a data path — it was cancelled in `precopy` or
 `syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it recorded
@@ -733,7 +737,8 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
 * Each tick: for every `running` plan, compute active waves (all `depends_on` waves complete, §5.1),
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
   advance gates (§5.4), and mark plans `completed` when all migrations are in terminal-success or
-  wave-complete phases with no `failed`. The tick decides on a snapshot; starting a step re-checks,
+  wave-complete phases with no `failed` — under the plan's lock, on the migrations re-read there, so a
+  retry that returned after the tick's snapshot keeps the plan running (§5.1). The tick decides on a snapshot; starting a step re-checks,
   under the plan's lock and then the migration's, what the decision rested on — that the plan still
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
@@ -764,8 +769,8 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
-  validate, auto-waves, start, pause, and an edit (`PATCH /plans/{id}`, which returns the plan to
-  draft) — run under the plan's lock and re-check the status on the fresh copy before they write it,
+  validate, auto-waves, start, pause, an edit (`PATCH /plans/{id}`, which returns the plan to
+  draft), the tick's completion and a retry that reopens a completed plan (§5.1) — run under the plan's lock and re-check the status on the fresh copy before they write it,
   so none writes over another's change (auto-waves never turns a plan started meanwhile back into a
   draft, validation never marks a started plan `validated`, and an edit waits for a running validation:
   a plan edited during a validation ends up `draft`, never `validated` with settings no validation saw).
@@ -1055,7 +1060,7 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` |
-| POST | `/migrations/{id}/retry` | operator | — | `Migration` |
+| POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible) | `Migration` |
@@ -1377,7 +1382,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; Cancel says that the data copied so far is removed when the migration
-  has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Approve is offered where an approval lasts (from `ready` until the cutover
+  has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
+  completed, that the retry reopens it (§5.1); Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
   cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
