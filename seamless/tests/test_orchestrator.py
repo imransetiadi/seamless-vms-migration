@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from seamless_migrate.executors.base import (
     TransientStepError,
 )
 from seamless_migrate.orchestrator import BadRequest, NotAllowed
+from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
 from tests.factories import make_disk, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
@@ -36,6 +38,7 @@ from tests.orch_support import (
     SRC_PROVIDER,
     Clock,
     ScriptedExecutor,
+    StaticDestination,
     build_harness,
     make_settings,
 )
@@ -1496,6 +1499,45 @@ async def test_failed_verification_rolls_back(tmp_path, store):
     assert h.history(m)[-5:] == [P.cutover, P.verifying, P.failed, P.rolling_back, P.rolled_back]
     assert "server_active" in m.error
     assert reviews == []
+
+
+async def test_a_failed_verification_keeps_provider_secrets_out_of_every_event(tmp_path, store):
+    """SDD §12, §13.3: a provider error during verification is redacted wherever it goes - the
+    check details of the verification summary in the migration.phase event included, which any
+    viewer reads through /events and the stream; the failure itself stays readable."""
+
+    class LeakyDestination(StaticDestination):
+        async def get_server(self, server_id):
+            raise ProviderError(
+                "dst-rhoso: Unauthorized (HTTP 401): password=hunter2 token=gAAAAAsecret"
+            )
+
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(timeout_s=0, tcp_ports=[]),
+        },
+        destination=LeakyDestination(),
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+
+    events = h.store.events(since_seq=0, limit=10000)
+    leaked = [
+        (e.kind, e.seq)
+        for e in events
+        if any(secret in e.message + json.dumps(e.data) for secret in ("hunter2", "gAAAAAsecret"))
+    ]
+    assert leaked == []
+    failed = [e for e in events if e.kind == "migration.phase" and e.data.get("to") == "failed"]
+    assert [c["detail"] for c in failed[-1].data["verification"]["checks"]] == [
+        "dst-rhoso: Unauthorized (HTTP 401): password=[REDACTED] token=[REDACTED]"
+    ]
+    assert "hunter2" not in (m.error or "")
 
 
 async def test_rollback_request_during_step_is_serialized(tmp_path, store):

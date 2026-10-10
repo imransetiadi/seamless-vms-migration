@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .ai.memory import redact
 from .config import Settings
 from .providers.base import ProviderError
 
@@ -49,7 +50,8 @@ class VerificationResult:
 
 
 def _check(name: str, ok: bool, detail: str, skipped: bool = False) -> dict[str, Any]:
-    out: dict[str, Any] = {"name": name, "ok": ok, "detail": detail}
+    # a detail may quote a provider's error: it reaches events any viewer reads (SDD §12, §13.3)
+    out: dict[str, Any] = {"name": name, "ok": ok, "detail": redact(detail)}
     if skipped:
         out["skipped"] = True
     return out
