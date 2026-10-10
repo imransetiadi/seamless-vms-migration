@@ -273,7 +273,7 @@ migration's totals.
 | From | To |
 |---|---|
 | `pending` | `validating`, `cancelled` |
-| `validating` | `ready`, `blocked`, `failed` |
+| `validating` | `ready`, `blocked`, `failed`, `cancelled` |
 | `blocked` | `validating`, `cancelled` |
 | `ready` | `precopy`, `cutover`, `validating`, `cancelled` |
 | `precopy` | `syncing`, `awaiting_cutover`, `failed`, `cancelled` |
@@ -288,7 +288,9 @@ migration's totals.
 | `finalized`, `cancelled` | — (terminal) |
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
-else, appends a `PhaseChange`, and updates `updated_at`. `failed → cancelled` is only allowed when
+else, appends a `PhaseChange`, and updates `updated_at`. `validating → cancelled` is taken only by a validation of the plan, for a
+migration an interrupted validation left in `validating` whose VM has left `vm_ids` (§5.4); the cancel action
+refuses a migration in `validating` — a validation may be moving it — and says to validate the plan again. `failed → cancelled` is only allowed when
 `downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
 while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at` null): the source
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
@@ -366,7 +368,8 @@ re-validated inside the plan: `validate_plan` refuses with the VM names (remove 
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
 migrations of VMs removed from `vm_ids` — `pending`, `blocked`, `ready`, and `failed` ones too, or a
-failed one would hold its VM and keep the plan from completing — so it also refuses — before
+failed one would hold its VM and keep the plan from completing, and one an interrupted validation left in
+`validating`, which would otherwise hold its VM for good with no action to release it — so it also refuses — before
 changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1) or whose failed
 migration stopped it (a cancel is refused then, §5.1): such a VM stays in the plan until it is cut
 over or rolled back. One VM, one migration holds across plans too: a migration
