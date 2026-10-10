@@ -997,6 +997,13 @@ The **finalize queue** is the plan's `completed` migrations: verified on RHOSO, 
 finalize. Each one's time in `completed` counts from its last transition into it; past `plan.finalize_warning_h`
 hours (default 72, ≥ 1; the owner's open question 14, `TODO(ADV-19): confirm`) it is flagged for finalize or
 rollback. `Stats.completed` stays the verified ones; `awaiting_finalize` and `finalized` split it.
+A finalize that deletes the source records `checkpoint: "finalizing"` before its step runs. When the step then
+fails, the migration stays `completed` with that checkpoint: the source may be gone — a deletion that timed out
+may still finish — so it stays in the queue to be finalized again (deleting a VM that is gone already succeeds)
+and can no longer be rolled back: `POST …/rollback` answers 409 ("the finalize began deleting the source VM:
+finalize it again"), since a rollback deletes the destination server and would find no source to start, and the
+dashboard keeps Rollback unavailable with that reason. A provider call is bounded (300 s); the provider's wait
+for a deletion stays within that bound.
 
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
 in demo mode ÷ `demo_speed`) the source watch asks its source provider for the source VM (`get_vm`). The tick only
@@ -1338,7 +1345,7 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
-| POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1) |
+| POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
