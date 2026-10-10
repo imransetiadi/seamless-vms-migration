@@ -35,6 +35,21 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(policy).toHaveTextContent('user:rina');
   });
 
+  it('lists a Force cutover with its approver, its reason and the migration it forced (SDD §14.5, ADV-16)', async () => {
+    const server = createTestServer();
+    const warm = server.migrations.find((m) => m.phase === 'syncing')!;
+    const forced = server.handle('POST', `/migrations/${warm.id}/force-cutover`, new URLSearchParams(), { reason: 'the window closes in ten minutes' }, 'approver');
+    expect(forced.status).toBe(200);
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await auditTable();
+    const row = within(table)
+      .getAllByRole('row')
+      .find((r) => within(r).queryByText('Cutover forced'))!;
+    expect(row).toHaveTextContent('the window closes in ten minutes');
+    expect(row).toHaveTextContent('sari');
+    expect(within(row).getByRole('link', { name: warm.vm.name })).toHaveAttribute('href', `/migrations/${warm.id}`);
+  });
+
   it('filters by action, actor and text', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });

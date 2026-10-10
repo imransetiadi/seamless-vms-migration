@@ -12,6 +12,7 @@ const ACTION_LABELS: Record<AuditEventKind, string> = {
   'policy.created': 'Policy created',
   'policy.updated': 'Policy changed',
   'policy.deleted': 'Policy deleted',
+  'migration.force_cutover': 'Cutover forced',
 };
 
 export function auditActionLabel(kind: string): string {

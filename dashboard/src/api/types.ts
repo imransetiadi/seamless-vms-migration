@@ -709,6 +709,8 @@ export const AUDIT_EVENT_KINDS = [
   'policy.created',
   'policy.updated',
   'policy.deleted',
+  // a cutover before convergence, with its approver and reason (SDD §5.4, §14.5, ADV-16)
+  'migration.force_cutover',
 ] as const;
 export type AuditEventKind = (typeof AUDIT_EVENT_KINDS)[number];
 

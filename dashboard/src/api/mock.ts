@@ -1976,7 +1976,8 @@ export class MockServer {
           migration_id: m.id,
           actor: me.name,
           message: `cutover of ${m.vm.name} forced by ${me.name}: ${reason}`,
-          data: { reason, delta_bytes: force.delta_bytes, estimated_downtime_s: force.estimated_downtime_s },
+          // in the audit trail like the API (SDD §14.5): its target is the migration
+          data: { target_id: m.id, vm: m.vm.name, reason, delta_bytes: force.delta_bytes, estimated_downtime_s: force.estimated_downtime_s },
         });
         break;
       }

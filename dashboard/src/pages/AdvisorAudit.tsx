@@ -131,6 +131,8 @@ export default function AdvisorAudit() {
               <tbody>
                 {shown.map((e) => {
                   const target = text(e.data.target_id);
+                  // a Force cutover's target is the migration it forced (SDD §14.5)
+                  const forced = e.kind === 'migration.force_cutover';
                   // a policy change names the policy (SDD §14.5); the policies page lists it
                   const policyName = text((e.data.after as { name?: unknown } | null)?.name) || text((e.data.before as { name?: unknown } | null)?.name);
                   return (
@@ -138,12 +140,20 @@ export default function AdvisorAudit() {
                       <td className="whitespace-nowrap">
                         <time dateTime={e.ts}>{formatDateTime(e.ts)}</time>
                       </td>
-                      <td>{auditActionLabel(e.kind)}</td>
+                      <td>
+                        {auditActionLabel(e.kind)}
+                        {/* a Force cutover's reason goes with it (SDD §14.5, ADV-16) */}
+                        {forced && text(e.data.reason) && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{text(e.data.reason)}</p>}
+                      </td>
                       <td className="font-mono text-xs">{e.actor}</td>
                       <td>
                         {target && e.kind.startsWith('policy.') ? (
                           <Link to="/advisor/policies" className="underline underline-offset-4">
                             {policyName || target}
+                          </Link>
+                        ) : target && forced ? (
+                          <Link to={`/migrations/${encodeURIComponent(target)}`} className="font-mono underline underline-offset-4">
+                            {text(e.data.vm) || target}
                           </Link>
                         ) : target ? (
                           <Link to={`/advisor/recommendations/${encodeURIComponent(target)}`} className="font-mono underline underline-offset-4">
