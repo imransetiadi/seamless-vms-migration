@@ -3827,6 +3827,8 @@ async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_p
     async def watch(seconds=h.settings.source_watch_s + 1):
         h.clock.advance(seconds)
         await h.orch.tick()
+        if h.orch._watch_task is not None:
+            await h.orch._watch_task  # the watch runs beside the tick (SDD §8.1)
         return await h.by_vm(plan.id, "vm-1")
 
     assert (await watch()).source_running_at is None
@@ -3863,11 +3865,74 @@ async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_p
     assert stopped == [(m.id, {"power_state": "stopped"})]
 
 
+async def test_a_slow_source_never_holds_the_tick(tmp_path, store):
+    """SDD §8.1 (advisor Phase 1 audit, A7): the tick starts the source watch and never waits for
+    it - a hanging source provider delays the watch only, one watch runs at a time, and stopping
+    the orchestrator cancels it."""
+    h, plan = await _completed_plan(tmp_path, store, n=2, waves=[])
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    release, calls = asyncio.Event(), []
+    get_vm = h.source.get_vm
+
+    async def hanging_get_vm(vm_id):
+        calls.append(vm_id)
+        await release.wait()
+        return await get_vm(vm_id)
+
+    h.source.get_vm = hanging_get_vm
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await asyncio.wait_for(h.orch.tick(), 1)  # the tick does not wait for the provider
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await asyncio.wait_for(h.orch.tick(), 1)  # due again, but the first watch still runs
+    await asyncio.sleep(0.05)
+    assert calls == ["vm-1"]
+    release.set()
+    await h.orch._watch_task
+    assert (await h.by_vm(plan.id, "vm-1")).source_running_at is not None
+    # a watch still waiting when the orchestrator stops is cancelled with it
+    release.clear()
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await asyncio.sleep(0.05)
+    watch = h.orch._watch_task
+    await asyncio.wait_for(h.orch.stop(), 1)
+    assert watch.cancelled()
+
+
+async def test_a_source_watch_that_fails_is_logged_and_the_next_one_runs(tmp_path, store, caplog):
+    """SDD §8.1: the watch's own failure is only logged - its task ends cleanly, never with an
+    exception nobody retrieves, and the next watch runs when it is due."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    once = h.orch._watch_sources_once
+    failures = []
+
+    async def failing_once():
+        if not failures:
+            failures.append(1)
+            raise RuntimeError("the store was briefly unavailable")
+        await once()
+
+    h.orch._watch_sources_once = failing_once
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    first = h.orch._watch_task
+    await first
+    assert first.exception() is None
+    assert "the source watch failed" in caplog.text
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    assert (await h.by_vm(plan.id, "vm-1")).source_running_at is not None
+
+
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover
     h.clock.advance(h.settings.source_watch_s + 1)
     await h.orch.tick()
+    assert h.orch._watch_task is not None
+    await h.orch._watch_task
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None
 
 

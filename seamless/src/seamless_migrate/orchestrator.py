@@ -273,6 +273,8 @@ class Orchestrator:
         self._locks: dict[str, asyncio.Lock] = {}
         #: when the next source watch is due (SDD §8.1); set by the first tick
         self._source_watch_due: datetime | None = None
+        #: the source watch in progress: the tick starts it and never waits for it (SDD §8.1)
+        self._watch_task: asyncio.Task[None] | None = None
         self._drivers: dict[str, asyncio.Task[None]] = {}
         #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
         self._driver_crashes: dict[str, tuple[int, float]] = {}
@@ -1432,9 +1434,12 @@ class Orchestrator:
             return vm
         raise NotFound("source VM", source_id)
 
-    async def _watch_sources(self) -> None:
-        """A completed migration's source VM seen running again is flagged once, and cleared once
-        seen stopped again; each change is an event (SDD §8.1)."""
+    def _start_source_watch(self) -> None:
+        """Start the source watch when it is due, as a task of its own, one at a time; the tick
+        never waits for it - a slow source provider must not hold the gates and passes (SDD
+        §8.1)."""
+        if self._watch_task is not None and not self._watch_task.done():
+            return  # a slow watch delays the next one, nothing else
         now = self._now()
         scale = max(self.settings.demo_speed, 1.0) if self.settings.demo else 1.0
         interval = timedelta(seconds=self.settings.source_watch_s / scale)
@@ -1443,6 +1448,20 @@ class Orchestrator:
         if now < self._source_watch_due:
             return
         self._source_watch_due = now + interval
+        self._watch_task = asyncio.create_task(self._watch_sources(), name="seamless-source-watch")
+
+    async def _watch_sources(self) -> None:
+        """A completed migration's source VM seen running again is flagged once, and cleared once
+        seen stopped again; each change is an event (SDD §8.1)."""
+        try:
+            await self._watch_sources_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("the source watch failed", exc_info=True)
+
+    async def _watch_sources_once(self) -> None:
+        now = self._now()
         clients: dict[str, Any] = {}
         for m in await self.db.list("migration", Migration, phase=P.completed):
             try:
@@ -1665,6 +1684,7 @@ class Orchestrator:
             t
             for t in (
                 self._tick_task,
+                self._watch_task,
                 *self._drivers.values(),
                 *self._prestage_tasks.values(),
                 *self._steps.values(),
@@ -1676,6 +1696,7 @@ class Orchestrator:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tick_task = None
+        self._watch_task = None
         self._started = False
         self._drivers.clear()
         self._steps.clear()
@@ -1736,7 +1757,7 @@ class Orchestrator:
 
     async def tick(self) -> None:
         await self._resume_orphans()
-        await self._watch_sources()
+        self._start_source_watch()
         all_plans = await self.db.list("plan", Plan)
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
