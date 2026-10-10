@@ -119,9 +119,22 @@ print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs")
   [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
 fi
 check "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
-notes=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" | python3 -c 'import json,sys; ms=json.load(sys.stdin); print(json.dumps([(m["vm"]["name"], n["source"], n["summary"][:80], n["data"].get("applied")) for m in ms for n in m["advisor_notes"]]))')
-echo "advisor notes: $notes"
-check "jev strategy note recorded"    '[[ "$notes" == *\"jev\"* ]]'
+# validation records the recommendation and its decision apart; the migration runs the decision (SDD §14.4)
+advice=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" || echo '[]'; } |
+  python3 -c '
+import json, sys
+page, migrations = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+stored = [r for r in page.get("items", []) if not r["legacy"]]  # newest first
+newest = {}
+for r in stored:
+    newest.setdefault(r["migration_id"], r)
+decided = [m for m in migrations if m["id"] in newest and newest[m["id"]]["decision"]["final_option"]]
+runs = bool(decided) and all(m["strategy"] == newest[m["id"]]["decision"]["final_option"] for m in decided)
+seen = [(r["subject"]["name"], r["model"]["name"], r["recommendation"]["option"], r["recommendation"]["confidence"], r["decision"]["status"], r["decision"]["final_option"]) for r in stored[:3]]
+print(json.dumps({"recommendations": seen, "runs_decision": runs}, separators=(",", ":")))')
+echo "advisor recommendations: $advice"
+check "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
+check "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
 check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]]'
 echo "advisor after: $advisor"
