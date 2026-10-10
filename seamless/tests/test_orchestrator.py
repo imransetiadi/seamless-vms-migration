@@ -1897,7 +1897,7 @@ async def test_step_output_lines_are_redacted_before_they_are_cut(tmp_path, stor
             redacted.append(len(text))
         return redact(text, *args, **kwargs)
 
-    monkeypatch.setattr("seamless_migrate.orchestrator.redact", measured_redact)
+    monkeypatch.setattr("seamless_migrate.ai.redaction.redact", measured_redact)
 
     async def chatty_precopy(ctx):
         for line in lines:

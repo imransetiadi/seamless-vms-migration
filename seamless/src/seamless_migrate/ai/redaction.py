@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 REDACTED = "[REDACTED]"
+#: how far past a cut ``redact_cut`` redacts, so it still sees the end of a secret the cut splits
+CUT_MARGIN = 16384
 _KEYWORDS = (
     r"password|passwd|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
     r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?"
@@ -76,6 +78,15 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
         # so web-01-data, web-01_root and data-web-01 lose it while web-010 (another VM) stays
         out = re.sub(rf"(?<![^\W_]){re.escape(name)}(?![^\W_])", "[vm]", out)
     return out
+
+
+def redact_cut(text: str, limit: int, redact_names: Sequence[str] | None = None) -> str:
+    """``redact`` the first ``limit`` + CUT_MARGIN characters, then cut to ``limit`` (SDD §13.4).
+
+    Cutting first could leave a PEM block without its END line or a URL without the ``@`` of its
+    credentials, which ``redact`` no longer recognizes; the margin bounds the work whatever the
+    text's length."""
+    return redact(str(text)[: limit + CUT_MARGIN], redact_names)[:limit]
 
 
 def redact_payload(value: Any, redact_names: Sequence[str] | None = None) -> Any:

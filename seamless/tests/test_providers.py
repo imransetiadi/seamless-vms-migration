@@ -586,6 +586,51 @@ async def test_openstack_destination_inventory(stub_openstack):
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
 
 
+#: an SDK error whose 500-character cut falls inside the password of a URL
+SDK_ERROR = "x" * 479 + " https://svc:Sup3rS3cretPw@keystone.example:5000/v3 refused"
+
+
+async def test_openstack_errors_are_redacted_before_they_are_cut():
+    """SDD §13.4: a provider SDK's error message is redacted over its cut plus 16384 characters
+    before it is cut to 500 — a URL whose password the cut splits would otherwise reach a 502
+    answer, an event or Migration.error, as the later redaction no longer recognizes it."""
+
+    def failing_connect(provider, settings):
+        raise RuntimeError(SDK_ERROR)
+
+    provider = OpenStackProvider(make_provider(), settings(), connect_fn=failing_connect)
+    with pytest.raises(ProviderError) as failed:
+        await provider.check()
+    assert "Sup3r" not in str(failed.value) and "[REDACTED]" in str(failed.value)
+
+
+async def test_vmware_errors_are_redacted_before_they_are_cut(tmp_path):
+    """SDD §13.4: the same for the VMware provider."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("svc-migrate@vsphere.local\n")
+    (secret_dir / "password").write_text("pw\n")
+
+    def failing_connector(host, port, user, pwd, verify, ca_cert):
+        raise RuntimeError(SDK_ERROR)
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint="https://vcenter.dc2.example:8443/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=failing_connector,
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError) as failed:
+        await provider.list_vms()
+    assert "Sup3r" not in str(failed.value) and "[REDACTED]" in str(failed.value)
+
+
 async def test_openstack_connection_errors_become_provider_errors(monkeypatch):
     openstack = pytest.importorskip("openstack")
 

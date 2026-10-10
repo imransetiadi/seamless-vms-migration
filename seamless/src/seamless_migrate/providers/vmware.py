@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 from urllib.parse import urlparse
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
@@ -259,7 +260,7 @@ class VMwareProvider:
             ) from None
         except Exception as exc:
             message = str(getattr(exc, "msg", "") or exc).strip() or type(exc).__name__
-            raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+            raise ProviderError(f"{self.provider.id}: {redact_cut(message, 500)}") from exc
 
     @staticmethod
     def _find_by_uuid(content: Any, source_id: str) -> Any:

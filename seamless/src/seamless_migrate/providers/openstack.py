@@ -10,6 +10,7 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
@@ -140,7 +141,7 @@ class OpenStackProvider:
             ) from None
         except Exception as exc:
             message = str(exc).strip() or type(exc).__name__
-            raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+            raise ProviderError(f"{self.provider.id}: {redact_cut(message, 500)}") from exc
 
     def close(self) -> None:
         """Close the cached connection (a replaced provider must not keep its session)."""

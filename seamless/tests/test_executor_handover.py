@@ -1097,6 +1097,19 @@ async def test_handover_readiness_reports_references_without_changing_anything(t
     assert calls == []
 
 
+def test_an_http_error_body_is_redacted_before_it_is_cut():
+    """SDD §13.4: an HTTP error body is redacted over its cut plus 16384 characters before it is
+    cut to 300 — a URL whose password the cut splits would otherwise reach Migration.error."""
+    from seamless_migrate.executors.handover import _checked
+
+    body = "x" * 270 + "\n postgresql://svc:Sup3rS3cretPw@db.example:5432/seamless"
+    with pytest.raises(RuntimeError) as failed:
+        _checked(NS(status_code=500, text=body), "attach the volume")
+    message = str(failed.value)
+    assert message.startswith("attach the volume: HTTP 500: xxx") and "\n" not in message
+    assert "Sup3r" not in message and "[REDACTED]" in message
+
+
 def test_existing_server_and_write_json_helpers(tmp_path):
     from seamless_migrate.executors.handover import _existing_server, _write_json
 

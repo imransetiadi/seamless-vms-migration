@@ -932,6 +932,20 @@ async def test_a_huge_output_line_does_not_fail_the_step(env, monkeypatch):
     assert any(line.startswith("ok: [localhost] => xxx") for line in rec.logs)
 
 
+async def test_a_failing_steps_error_is_redacted_before_it_is_cut(env, monkeypatch):
+    """SDD §13.4: the failing output line in a step's error is redacted over its cut plus 16384
+    characters before it is cut to 500 — a PEM block that the cut splits would otherwise reach
+    Migration.error, as the orchestrator's later redaction no longer recognizes it."""
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 900 + "-----END RSA PRIVATE KEY-----"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "key rejected: ' + pem + '"}')
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    with pytest.raises(PermanentStepError) as failed:
+        await env.executor.run(StepName.PRECOPY, ctx)
+    message = str(failed.value)
+    assert message.startswith("export_workloads.yml failed (exit 2): fatal: [localhost]: FAILED!")
+    assert "[REDACTED PEM]" in message and "KKKK" not in message
+
+
 async def test_output_lines_reach_the_log_whole(env, monkeypatch):
     """SDD §4, §7.1: the executor hands every output line to ``StepContext.log`` whole — the
     orchestrator redacts it before the cut to 2000 characters, so a cut here first could split a

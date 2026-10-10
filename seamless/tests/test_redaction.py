@@ -7,9 +7,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from seamless_migrate.ai import redaction
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.memory import MemoryClient
-from seamless_migrate.ai.redaction import REDACTED, redact, redact_payload
+from seamless_migrate.ai.redaction import CUT_MARGIN, REDACTED, redact, redact_cut, redact_payload
 from seamless_migrate.config import Settings
 from tests.jev_fakes import session_factory
 
@@ -91,6 +92,38 @@ def test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot():
 
 def test_redaction_is_idempotent():
     assert redact(SNAPSHOT) == SNAPSHOT
+
+
+PEM_KEY = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 900 + "-----END RSA PRIVATE KEY-----"
+URL_WITH_PASSWORD = "postgresql://svc:Sup3rS3cretPw@db.example:5432/seamless"
+
+
+@pytest.mark.parametrize(
+    ("text", "leak"),
+    [
+        ("x" * 400 + " " + PEM_KEY + " tail", "KKKK"),  # the cut falls inside the key
+        ("x" * 470 + " " + URL_WITH_PASSWORD + " tail", "Sup3r"),  # ... inside the password
+    ],
+)
+def test_redact_cut_finds_a_secret_the_cut_splits(text, leak):
+    """SDD §13.4: cutting first leaves a PEM block without its END line and a URL without the @
+    of its credentials, which redact no longer recognizes; redact_cut redacts the cut plus
+    CUT_MARGIN characters and cuts after."""
+    assert leak in redact(text[:500])
+    cut = redact_cut(text, 500)
+    assert len(cut) <= 500 and leak not in cut and "[REDACTED" in cut  # [REDACTED PEM] too
+
+
+def test_redact_cut_redacts_no_more_than_the_cut_and_its_margin(monkeypatch):
+    """SDD §13.4: the work is bounded whatever the text's length."""
+    assert CUT_MARGIN == 16384
+    seen: list[int] = []
+    real = redaction.redact
+    monkeypatch.setattr(
+        redaction, "redact", lambda text, *a: seen.append(len(text)) or real(text, *a)
+    )
+    assert redaction.redact_cut("y" * 10**6, 500) == "y" * 500
+    assert seen == [500 + CUT_MARGIN]
 
 
 @pytest.mark.parametrize(

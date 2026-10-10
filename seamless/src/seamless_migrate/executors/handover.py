@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Plan, Provider, utcnow
@@ -52,7 +53,8 @@ def _checked(response: Any, what: str) -> Any:
     (``Proxy.request(raise_exc=False)``), so a refusal would otherwise pass silently."""
     status = int(getattr(response, "status_code", 200) or 200)
     if status >= 400:
-        detail = str(getattr(response, "text", "") or "").strip().replace("\n", " ")[:300]
+        detail = redact_cut(str(getattr(response, "text", "") or "").strip(), 300)
+        detail = detail.replace("\n", " ")
         raise RuntimeError(f"{what}: HTTP {status}: {detail}")
     return response
 

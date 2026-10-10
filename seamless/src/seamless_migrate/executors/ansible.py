@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
 from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
@@ -879,7 +880,9 @@ class AnsibleExecutor:
                 log.warning(
                     "%s failed (exit %s); last lines:\n%s", name, returncode, output[-4000:]
                 )
-            raise classify_failure(output)(f"{name} failed (exit {returncode}): {detail[:500]}")
+            raise classify_failure(output)(
+                f"{name} failed (exit {returncode}): {redact_cut(detail, 500)}"
+            )
         return stop_skipped
 
     @staticmethod

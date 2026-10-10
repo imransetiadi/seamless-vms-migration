@@ -30,7 +30,7 @@ from .ai.decision import Advice, Approve, Override, decide
 from .ai.evidence import build_strategy_evidence, evidence_count, keep_reasons
 from .ai.policies import resolve_policy
 from .ai.recommendations import LEGACY_PREFIX
-from .ai.redaction import redact
+from .ai.redaction import redact, redact_cut
 from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
 from .domain import fsm
@@ -107,11 +107,8 @@ log = logging.getLogger(__name__)
 P = Phase
 
 PROGRESS_MIN_INTERVAL_S = 1.0
-#: a migration.log line is cut to this many characters (SDD §4) ...
+#: a migration.log line is cut to this many characters, after redaction (SDD §4)
 LOG_LINE_CHARS = 2000
-#: ... after this many more were redacted with it: a secret the cut splits is still found, and a
-#: line of megabytes costs the event loop no more than this window
-LOG_REDACT_MARGIN = 16384
 APPROVABLE = frozenset(
     {
         P.pending,
@@ -2136,7 +2133,7 @@ class Orchestrator:
                 await self._mark_downtime(mid, at)
 
         async def log_line(line: str) -> None:
-            text = redact(line[: LOG_LINE_CHARS + LOG_REDACT_MARGIN])[:LOG_LINE_CHARS]
+            text = redact_cut(line, LOG_LINE_CHARS)
             await self._emit("migration.log", text, plan_id=m.plan_id, persist=False, migration=m)
 
         return StepContext(
