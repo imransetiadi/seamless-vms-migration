@@ -1379,7 +1379,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
-  it again (§8); Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
+  it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
+  with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
   stepper, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
   pass 1; in `syncing` the next delta pass; in `cutover` the final pass of a warm migration, the full copy of a cold
