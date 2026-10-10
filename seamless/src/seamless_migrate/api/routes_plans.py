@@ -20,6 +20,7 @@ from ..domain.models import (
     repeated_vm_ids,
 )
 from ..events import emit
+from ..orchestrator import in_flight_refusal
 from ..plan_status import derive_plan_status
 from ..planning.estimator import invalid_estimator_overrides
 from ..security.auth import Principal
@@ -197,12 +198,7 @@ async def update_plan(
             raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
         busy = await svc.orchestrator.in_flight(plan_id)
         if busy:
-            raise ApiError(
-                409,
-                "conflict",
-                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
-                "before editing the plan",
-            )
+            raise ApiError(409, "conflict", in_flight_refusal(busy, "editing the plan"))
         try:
             merged = PlanCreate.model_validate(
                 {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}

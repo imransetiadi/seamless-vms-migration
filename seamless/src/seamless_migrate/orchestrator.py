@@ -134,6 +134,35 @@ VM_CLAIMS = "vm-claims"
 IN_FLIGHT_PHASES = frozenset(
     {P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.rolling_back, P.completed}
 )
+#: what releases a migration that keeps its plan from changing, most urgent first (SDD §12): a
+#: failed one holds the plan only while its cutover keeps the source stopped (the VM is down), a
+#: completed one is finished and awaits finalize (§8.1); singular and plural of what it is
+_RELEASES: tuple[tuple[str, str, str], ...] = (
+    (
+        "roll back or retry",
+        "the failed migration whose source VM is stopped",
+        "the failed migrations whose source VM is stopped",
+    ),
+    ("finish, roll back or cancel", "the migration in flight", "the migrations in flight"),
+    ("finalize or roll back", "the completed migration", "the completed migrations"),
+)
+
+
+def in_flight_refusal(busy: Iterable[Migration], before: str, limit: int = 10) -> str:
+    """The 409 of an edit or re-wave while ``busy`` are in flight (SDD §12): each VM, at most
+    ``limit`` per kind and how many are left out, with what releases it."""
+    names: list[list[str]] = [[], [], []]
+    for m in busy:
+        names[0 if m.phase == P.failed else 2 if m.phase == P.completed else 1].append(m.vm.name)
+    clauses = []
+    for (action, one, many), group in zip(_RELEASES, names, strict=True):
+        if not group:
+            continue
+        group.sort()
+        rest = len(group) - limit
+        listed = ", ".join(group[:limit]) + (f" and {rest} more" if rest > 0 else "")
+        clauses.append(f"{action} {one if len(group) == 1 else many} ({listed})")
+    return f"{'; '.join(clauses)} before {before}"
 
 
 class OrchestratorError(Exception):
@@ -807,13 +836,13 @@ class Orchestrator:
             await self._emit(kind, message, migration=migration, actor=actor, data=data)
         return rec
 
-    async def in_flight(self, plan_id: str) -> list[str]:
-        """VM names of the plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
-        return sorted(
-            m.vm.name
+    async def in_flight(self, plan_id: str) -> list[Migration]:
+        """The plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
+        return [
+            m
             for m in await self.db.list("migration", Migration, plan_id=plan_id)
             if m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
-        )
+        ]
 
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
         # status changes serialize on the plan's lock (SDD §8): a start waits instead of being
@@ -827,10 +856,7 @@ class Orchestrator:
             raise NotAllowed(f"waves cannot change while the plan is {plan.status}")
         busy = await self.in_flight(plan.id)
         if busy:
-            raise NotAllowed(
-                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
-                "before re-planning the waves"
-            )
+            raise NotAllowed(in_flight_refusal(busy, "re-planning the waves"))
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)

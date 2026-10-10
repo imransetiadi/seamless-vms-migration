@@ -369,6 +369,41 @@ def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
     assert allowed.status_code == 200, allowed.text
 
 
+def test_the_in_flight_refusal_says_what_releases_each_vm(api):
+    """SDD §12: a completed migration is finished and cannot be cancelled, nor can a failed one
+    whose cutover stopped the source — the 409 of an edit or re-wave names each VM with what
+    releases it."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "finished",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    done, stopped = api.store.list("migration", Migration, plan_id=plan["id"])
+    done.phase = Phase.completed
+    stopped.phase = Phase.failed
+    stopped.downtime_started_at = utcnow()
+    for m in (done, stopped):
+        api.store.put("migration", m)
+    clauses = (
+        f"roll back or retry the failed migration whose source VM is stopped ({stopped.vm.name}); "
+        f"finalize or roll back the completed migration ({done.vm.name})"
+    )
+    refused = api.client.patch(
+        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json={"description": "x"}
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == f"{clauses} before editing the plan"
+    waves = api.post(
+        f"/api/v1/plans/{plan['id']}/waves/auto", Role.operator, json={"max_wave_size": 5}
+    )
+    assert waves.status_code == 409
+    assert waves.json()["error"]["message"] == f"{clauses} before re-planning the waves"
+
+
 def test_plan_create_validate_start_flow(api):
     vm_ids = first_clean_vms(api)
     body = {
