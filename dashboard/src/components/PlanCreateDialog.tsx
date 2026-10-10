@@ -5,6 +5,7 @@ import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, use
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { heldElsewhere } from '../lib/holds';
+import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
@@ -15,6 +16,7 @@ import { Checkbox } from './Checkbox';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
 import { Modal } from './Modal';
+import { ProbeListEditor } from './ProbeListEditor';
 import { LoadingBlock } from './Skeleton';
 import { VmTable } from './VmTable';
 
@@ -66,6 +68,8 @@ interface FormState {
   timeoutMinutes: string;
   consolePatterns: string;
   useAdvisor: boolean;
+  /** The application probes of every VM (SDD §7.5, ADV-18); a VM's own are set on its migration page. */
+  appProbes: ProbeDraft[];
   /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
   handoverEnabled: boolean;
   handoverMap: Record<string, string>;
@@ -81,7 +85,7 @@ const STEP_TIMES = [
 type StepTimeKey = (typeof STEP_TIMES)[number]['key'];
 const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, ''])) as Record<StepTimeKey, string>;
 
-type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
+type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -121,6 +125,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     timeoutMinutes: plain(DEFAULT_VERIFICATION.timeout_s / 60),
     consolePatterns: DEFAULT_VERIFICATION.console_success_patterns.join('\n'),
     useAdvisor: DEFAULT_VERIFICATION.use_advisor,
+    appProbes: [],
     handoverEnabled: false,
     handoverMap: {},
   };
@@ -199,6 +204,7 @@ function formFromPlan(plan: Plan): FormState {
     timeoutMinutes: plain(v.timeout_s / 60),
     consolePatterns: v.console_success_patterns.join('\n'),
     useAdvisor: v.use_advisor,
+    appProbes: v.app_probes.map(toDraft),
     handoverEnabled: plan.handover.enabled,
     handoverMap: { ...plan.handover.backend_map },
   };
@@ -403,6 +409,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
     const windowsPorts = f.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (windowsPorts.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.windowsPorts = 'Use port numbers from 1 to 65535, separated by commas.';
+    // like the API (SDD §12): what it refuses, the first problem at a time
+    const appProbes = parseDrafts(f.appProbes);
+    if (appProbes.problems.length) e.appProbes = appProbes.problems[0];
     const backendMap: Record<string, string> = {};
     if (f.handoverEnabled && source?.kind !== 'vmware') {
       const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
@@ -424,6 +433,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         default_strategy: f.defaultStrategy,
         // a VM taken out of the plan takes its override with it
         strategy_overrides: Object.fromEntries(Object.entries(f.overrides).filter(([vmId]) => f.vmIds.has(vmId))),
+        // a VM's own probes are kept, and go with the VM when it leaves the plan (SDD §7.5)
+        probe_overrides: Object.fromEntries(Object.entries(plan?.probe_overrides ?? {}).filter(([vmId]) => f.vmIds.has(vmId))),
         selection_policy: f.policy,
         downtime_slo_s: Math.round(slo * 60),
         require_approval: f.requireApproval,
@@ -449,6 +460,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           timeout_s: Math.round(timeoutMinutes * 60),
           console_success_patterns: consolePatterns,
           use_advisor: f.useAdvisor,
+          app_probes: appProbes.probes,
         },
       },
     };
@@ -514,9 +526,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     boot: id('boot'),
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
+    appProbes: id('app-probes'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -967,6 +980,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
               </div>
+              <ProbeListEditor
+                id={id('app-probes')}
+                legend="Application probes of every VM"
+                drafts={form.appProbes}
+                onChange={(drafts) => set('appProbes', drafts)}
+                hint="Checked after the boot: a refused port or a wrong HTTP status fails the verification, an address the control plane cannot reach asks for review. A VM's own probes, set on its migration page, replace these."
+                error={errors.appProbes}
+              />
               <div className="grid gap-3 sm:grid-cols-2">
                 <SelectField
                   id={id('probe')}

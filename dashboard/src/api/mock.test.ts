@@ -1407,3 +1407,109 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     expect(m.data_issues).toEqual([]);
   });
 });
+
+describe('mock application probes, like the API (SDD §7.5, §9.3, §9.6, ADV-18)', () => {
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const tcp = (port: number) => ({ kind: 'tcp' as const, port, path: '/', expect_status: null });
+  const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
+
+  it('flags database VMs without an application probe at validation and records the suggestion', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const mysql = byName(server, 'db-mysql-02');
+    expect(mysql.findings.find((f) => f.code === 'APP_PROBE_MISSING')).toMatchObject({
+      severity: 'warning',
+      message: 'db-mysql-02 is a database VM without an application probe: verification would check only that it booted. Suggested: TCP 3306.',
+    });
+    expect(mysql.suggested_probes).toEqual([tcp(3306)]);
+    expect(byName(server, 'analytics-db').suggested_probes).toEqual([]);
+    const web = byName(server, 'web-01');
+    expect(web.findings.map((f) => f.code)).not.toContain('APP_PROBE_MISSING');
+    expect(web.suggested_probes).toEqual([{ kind: 'http', port: 80, path: '/', expect_status: null }]);
+  });
+
+  it('refuses the probes the API refuses and keeps those it accepts', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const operator = as(server, 'operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    await expect(
+      operator.patch(`/plans/${plan.id}`, { verification: { ...plan.verification, app_probes: [tcp(70000)] } }),
+    ).rejects.toMatchObject({ status: 422, message: expect.stringContaining('70000') });
+    const db = byName(server, 'analytics-db');
+    const saved = await operator.patch<Plan>(`/plans/${plan.id}`, { probe_overrides: { [db.vm.source_id]: [tcp(5432)] } });
+    expect(saved.probe_overrides).toEqual({ [db.vm.source_id]: [tcp(5432)] });
+    expect(saved.status).toBe('draft');
+    // a validation clears the finding of the VM that now has a probe, and suggests anew
+    db.suggested_probes = [tcp(1)];
+    await operator.post(`/plans/${plan.id}/validate`);
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(byName(server, 'analytics-db').findings.map((f) => f.code)).not.toContain('APP_PROBE_MISSING');
+    expect(byName(server, 'analytics-db').suggested_probes).toEqual([]);
+  });
+
+  it('records a failed boot check as a failed verification, whatever ports the plan probes', () => {
+    for (const ports of [[22], []]) {
+      const clock = { t: NOW };
+      const server = new MockServer({ now: () => clock.t, seed: 3 });
+      const m = byName(server, 'web-02');
+      const plan = server.plans.find((p) => p.id === m.plan_id)!;
+      plan.verification = { ...plan.verification, tcp_ports: ports };
+      // the one verification in ten that fails on its boot checks
+      (server as unknown as { rand: () => number }).rand = () => 0.01;
+      verifyNow(server, m, clock);
+      expect(m.phase, String(ports)).toBe('rolling_back');
+      expect(m.verification!.passed, String(ports)).toBe(false);
+      const failed = m.verification!.checks.filter((c) => !c.ok && !c.skipped).map((c) => c.name);
+      expect(failed, String(ports)).toEqual(ports.length ? ['tcp:22'] : ['console']);
+      expect(m.error).toBe(`Verification failed: ${ports.length ? 'tcp:22 (connection refused)' : 'console (no success pattern in the last 200 console lines)'}`);
+    }
+  });
+
+  it("runs none of a VM's services when it carries the demo fault, like the demo (SDD §7.4)", () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    m.vm = { ...m.vm, name: 'orders-db-02', tags: { role: 'postgresql', 'demo-fault': 'app-down' } };
+    server.plans.find((p) => p.id === m.plan_id)!.probe_overrides = { [m.vm.source_id]: [tcp(5432)] };
+    verifyNow(server, m, clock);
+    expect(m.verification!.probes.map((p) => p.result)).toEqual(['failed']);
+  });
+
+  function verifyNow(server: MockServer, m: Migration, clock: { t: number }) {
+    for (let i = 0; i < 40 && m.phase === 'verifying'; i += 1) {
+      clock.t += 1000;
+      server.tick();
+    }
+  }
+
+  it("records the verification with every probe's result; a database without one needs review", () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    expect(m.phase).toBe('verifying');
+    m.vm = { ...m.vm, name: 'db-web-02', tags: { tier: 'database' } };
+    verifyNow(server, m, clock);
+    expect(m.phase).toBe('completed');
+    expect(m.verification).toMatchObject({ passed: true, probes: [] });
+    // the plan's boot checks run as before: its TCP ports, then the console (SDD §7.5)
+    expect(m.verification!.checks.map((c) => c.name)).toEqual(['server_active', 'ports_up', 'tcp:22', 'console']);
+    expect([m.review_required, m.review_reason]).toEqual([true, 'database VM without an application probe: only its boot was verified']);
+  });
+
+  it('fails the verification when a probe is refused, and rolls back as the plan says', () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.probe_overrides = { [m.vm.source_id]: [tcp(80), tcp(9999)] };
+    verifyNow(server, m, clock);
+    expect(m.phase).toBe('rolling_back');
+    expect(m.verification!.passed).toBe(false);
+    expect(m.verification!.probes.map((p) => [p.target.split(':').at(-1), p.result])).toEqual([
+      ['80', 'passed'],
+      ['9999', 'failed'],
+    ]);
+    expect(m.error).toContain('app:tcp:9999');
+  });
+});

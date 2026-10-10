@@ -244,6 +244,50 @@ export interface CutoverWindow {
   end: Timestamp;
 }
 
+export const PROBE_KINDS = ['tcp', 'http', 'https'] as const;
+export type ProbeKind = (typeof PROBE_KINDS)[number];
+
+/** An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of `path`. */
+export interface AppProbe {
+  kind: ProbeKind;
+  port: number;
+  /** http(s) only. */
+  path: string;
+  /** http(s) only: the status that passes; null = any 2xx or 3xx. */
+  expect_status: number | null;
+}
+
+/** What one application probe found (SDD §7.5): unreachable does not fail the verification. */
+export interface ProbeResult {
+  target: string;
+  kind: ProbeKind;
+  result: 'passed' | 'failed' | 'unreachable';
+  /** The time to the service's answer; null when it did not answer. */
+  latency_ms: number | null;
+  at: Timestamp;
+  detail: string;
+}
+
+export interface VerificationCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  skipped?: boolean;
+}
+
+/** A migration's last verification: its checks and probe results (SDD §7.5). */
+export interface VerificationRecord {
+  at: Timestamp;
+  passed: boolean;
+  checks: VerificationCheck[];
+  probes: ProbeResult[];
+  warnings: string[];
+}
+
+/** What one probe list may hold, and the longest http(s) path (SDD §12). */
+export const MAX_PROBES_PER_VM = 10;
+export const MAX_PROBE_PATH = 200;
+
 export interface VerificationConfig {
   tcp_ports: number[];
   /** Probed instead of `tcp_ports` for Windows guests, whose console check is skipped (SDD §7.5). */
@@ -253,6 +297,8 @@ export interface VerificationConfig {
   timeout_s: number;
   auto_rollback: boolean;
   use_advisor: boolean;
+  /** The application probes of every VM; `Plan.probe_overrides` replaces them per VM (SDD §7.5, ADV-18). */
+  app_probes: AppProbe[];
 }
 
 export interface Wave {
@@ -291,6 +337,8 @@ export interface Plan {
   estimator_overrides: Record<string, number>;
   handover: HandoverConfig;
   verification: VerificationConfig;
+  /** Per VM (source id): its application probes instead of `verification.app_probes`; [] = none (SDD §7.5). */
+  probe_overrides: Record<string, AppProbe[]>;
   prestage_resources: string[];
   waves: Wave[];
   status: PlanStatus;
@@ -532,6 +580,10 @@ export interface Migration {
   data_issues: string[];
   /** Demo: the model seconds a simulated cutover kept the source stopped (SDD §5.2). */
   downtime_model_s: number | null;
+  /** The last verification: its checks and application probe results (SDD §7.5, ADV-18). */
+  verification: VerificationRecord | null;
+  /** The rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan. */
+  suggested_probes: AppProbe[];
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;

@@ -32,6 +32,7 @@ import { MigrationsTable } from '../components/MigrationsTable';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
+import { ProbeWarnings } from '../components/ProbeWarnings';
 import { PlanStatusBadge } from '../components/StatusBadge';
 import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
@@ -368,6 +369,7 @@ export default function PlanDetail() {
 
       <div className="flex flex-col gap-4">
         <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
+        <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
           <SettingsSummary plan={p} providers={providers.data ?? []} />

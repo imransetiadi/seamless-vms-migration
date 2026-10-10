@@ -231,6 +231,47 @@ describe('PlanDetail', () => {
     await waitFor(() => expect(within(metrics).getByRole('group', { name: 'Avg downtime' })).toHaveTextContent('1 left out: data inconsistent'));
   });
 
+  it('says how many database VMs have no application probe, with each one\'s suggestion (SDD §16, ADV-18)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    expect(plan.status).toBe('validated');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    // a second database, whose engine the rules name
+    node.findings = [...node.findings, { code: 'APP_PROBE_MISSING', severity: 'warning', message: 'analytics-node-1 is a database VM without an application probe.', remediation: null, strategies: [] }];
+    node.suggested_probes = [{ kind: 'tcp', port: 5432, path: '/', expect_status: null }];
+    expect(db.findings.map((f) => f.code)).toContain('APP_PROBE_MISSING');
+    expect(db.suggested_probes).toEqual([]);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+
+    const panel = await screen.findByRole('region', { name: 'Application probes' });
+    expect(panel).toHaveTextContent('2 database VMs have no application probe.');
+    const dbRow = within(panel).getByRole('listitem', { name: 'analytics-db' });
+    expect(dbRow).toHaveTextContent('No suggestion: add a probe for its service on its migration page.');
+    const nodeRow = within(panel).getByRole('listitem', { name: 'analytics-node-1' });
+    expect(nodeRow).toHaveTextContent('Suggested: TCP 5432');
+    await user.click(within(nodeRow).getByRole('button', { name: 'Use suggested probe' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Probe analytics-node-1 on TCP 5432?' });
+    expect(dialog).toHaveTextContent('The plan returns to draft: validate it again before it starts.');
+    await user.click(within(dialog).getByRole('button', { name: 'Use suggested probe' }));
+    await waitFor(() => expect(plan.probe_overrides[node.vm.source_id]).toEqual([{ kind: 'tcp', port: 5432, path: '/', expect_status: null }]));
+    expect(plan.status).toBe('draft');
+  });
+
+  it('keeps Use suggested probe from a viewer, and from a plan that cannot be edited, saying why', async () => {
+    const server = createTestServer();
+    const running = server.plans.find((p) => p.status === 'running')!;
+    const db = server.migrations.find((m) => m.plan_id === running.id && m.findings.some((f) => f.code === 'APP_PROBE_MISSING'));
+    expect(db).toBeDefined();
+    db!.suggested_probes = [{ kind: 'tcp', port: 3306, path: '/', expect_status: null }];
+    renderWithApp(<PlanDetail />, { route: `/plans/${running.id}`, path: '/plans/:planId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Application probes' });
+    const use = within(within(panel).getByRole('listitem', { name: db!.vm.name })).getByRole('button', { name: 'Use suggested probe' });
+    expect(use).toHaveAttribute('aria-disabled', 'true');
+    expect(use).toHaveAccessibleDescription(/Only a draft or validated plan can be edited \(this one is running\)/);
+  });
+
   it('shows its KPIs as unknown, not zero, when the statistics cannot be loaded (SDD §16)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
@@ -582,6 +623,68 @@ describe('PlanDetail', () => {
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(plan.estimator_overrides).toEqual({ change_rate_bps: 6 * 2 ** 20, v2v_s: 240 });
+  });
+
+  it("edits the application probes of every VM, prefilled; each VM's own probes are kept (SDD §16, ADV-18)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const own = { [plan.vm_ids[0]!]: [{ kind: 'tcp' as const, port: 5432, path: '/', expect_status: null }] };
+    plan.verification = { ...plan.verification, app_probes: [{ kind: 'http', port: 80, path: '/', expect_status: null }] };
+    plan.probe_overrides = own;
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const probes = within(dialog).getByRole('group', { name: 'Application probes of every VM' });
+    expect(within(probes).getByRole('combobox', { name: /^probe 1 kind$/i })).toHaveValue('http');
+    await user.click(within(probes).getByRole('button', { name: 'Add probe' }));
+    await user.selectOptions(within(probes).getByRole('combobox', { name: /^probe 2 kind$/i }), 'https');
+    await user.type(within(probes).getByRole('spinbutton', { name: /^probe 2 port$/i }), '443');
+    const path = within(probes).getByRole('textbox', { name: /^probe 2 path$/i });
+    await user.clear(path);
+    await user.type(path, '/health');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.verification.app_probes).toEqual([
+      { kind: 'http', port: 80, path: '/', expect_status: null },
+      { kind: 'https', port: 443, path: '/health', expect_status: null },
+    ]);
+    expect(plan.probe_overrides).toEqual(own);
+  });
+
+  it('drops the own probes of a VM taken out of the plan (SDD §7.5)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    const probe = { kind: 'tcp' as const, port: 5432, path: '/', expect_status: null };
+    plan.probe_overrides = { [db.vm.source_id]: [probe], [node.vm.source_id]: [probe] };
+    // analytics-db leaves the plan: cancel its migration so the plan may drop it (SDD §5.4)
+    db.phase = 'cancelled';
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select analytics-db' }));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.probe_overrides).toEqual({ [node.vm.source_id]: [probe] });
+  });
+
+  it('refuses to save a probe the API would refuse, and says why', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-c81d44a0');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const probes = within(dialog).getByRole('group', { name: 'Application probes of every VM' });
+    await user.click(within(probes).getByRole('button', { name: 'Add probe' }));
+    await user.type(within(probes).getByRole('spinbutton', { name: /^probe 1 port$/i }), '70000');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    expect(await within(dialog).findAllByText('Probe 1: use a port from 1 to 65535.')).not.toHaveLength(0);
+    expect(screen.getByRole('dialog', { name: /edit plan/i })).toBeInTheDocument();
   });
 
   it('edits the measured step times, prefilled; a cleared one goes back to the planning default (SDD §16)', async () => {

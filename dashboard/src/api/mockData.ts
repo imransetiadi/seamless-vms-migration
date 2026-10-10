@@ -25,11 +25,14 @@ import type {
   ReasonCode,
   Strategy,
   SyncPass,
+  VerificationRecord,
   VMRef,
 } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
+import { isDatabase, suggestProbes } from './mockProbes';
 
 export const GiB = 1024 ** 3;
 export const MiB = 1024 ** 2;
@@ -788,6 +791,16 @@ export function preflight(
   }
   if (plan.handover.enabled && sourceKind !== 'vmware' && vm.disks.some((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map)))
     add('HANDOVER_BACKEND_UNMAPPED', 'info', 'Handover is enabled but a volume type has no RHOSO backend mapping.', 'Add the volume type to the handover backend map.', ['storage_handover']);
+  // like the API (SDD §9.3, ADV-18): a database VM verified only by its boot
+  if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
+    const suggested = suggestProbes(vm);
+    add(
+      'APP_PROBE_MISSING',
+      'warning',
+      `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`,
+      "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.",
+    );
+  }
   return findings;
 }
 
@@ -821,7 +834,9 @@ export function defaultPlanFields(now: number) {
       timeout_s: 600,
       auto_rollback: true,
       use_advisor: true,
+      app_probes: [],
     },
+    probe_overrides: {},
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
     waves: [],
     created_at: iso(now),
@@ -1060,7 +1075,7 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'failed',
     createdAgo: 2 * D,
-    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
+    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true, app_probes: [] }, downtime_slo_s: 900 },
     waves: [{ id: 'wave-1', name: 'Legacy', vms: ['os-0e61', 'os-0e63', 'os-0e66', 'os-0e67'], max_parallel: 2 }],
     migrations: [
       {
@@ -1219,6 +1234,30 @@ function fixtureConvergedBy(strategy: Strategy, phase: Phase, passes: SyncPass[]
   return last.number >= plan.max_sync_passes ? 'max_passes' : null;
 }
 
+/**
+ * The last verification of a fixture (SDD §7.5): passed for one that completed, failed for one whose
+ * error says verification failed; no application probe, as the fixture plans configure none.
+ */
+function fixtureVerification(phase: Phase, endedAt: number | null, error: string | null): VerificationRecord | null {
+  const passed = phase === 'completed' || phase === 'finalized';
+  if (!passed && !error?.startsWith('Verification failed')) return null;
+  const at = iso(endedAt ?? Date.parse('2026-10-08T00:00:00Z'));
+  const checks = passed
+    ? [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+        { name: 'tcp:22', ok: true, detail: 'connected in 4 ms' },
+        { name: 'console', ok: true, detail: "matched 'login:'" },
+      ]
+    : [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+        { name: 'tcp:22', ok: false, detail: 'connection refused' },
+        { name: 'console', ok: false, detail: 'no success pattern in the last 200 console lines' },
+      ];
+  return { at, passed, checks, probes: [], warnings: [] };
+}
+
 export interface Fixtures {
   providers: Provider[];
   inventories: Record<string, VMRef[] | DestinationInventory>;
@@ -1372,6 +1411,8 @@ export function buildFixtures(now: number): Fixtures {
         force_cutover: null,
         data_issues: [],
         downtime_model_s: null,
+        verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
+        suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,

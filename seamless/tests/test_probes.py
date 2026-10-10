@@ -1,5 +1,8 @@
 """Application probes: SDD §9.6 suggestions and the probes a VM's verification runs (§7.5)."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from seamless_migrate.domain.models import AppProbe, VerificationConfig
@@ -15,39 +18,16 @@ def http(port, path="/"):
     return AppProbe(kind="http", port=port, path=path)
 
 
-@pytest.mark.parametrize(
-    ("name", "tags", "os_type", "expected"),
-    [
-        # the demo's finance databases name their engine in a role tag
-        ("ledger-db-01", {"role": "postgresql"}, "rhel9", [tcp(5432)]),
-        ("pg-orders", {}, "rhel9", [tcp(5432)]),
-        ("payroll-db-01", {"role": "mysql"}, "rhel9", [tcp(3306)]),
-        ("galera-02", {}, "rhel9", [tcp(3306)]),
-        ("billing-db-01", {"role": "oracle"}, "rhel9", [tcp(1521)]),
-        ("erp-sqlserver", {}, "windows2019srvNext_64Guest", [tcp(1433)]),
-        ("events-mongo-1", {}, "rhel9", [tcp(27017)]),
-        ("metrics-cassandra", {}, "rhel9", [tcp(9042)]),
-        ("ledger-db2", {}, "rhel9", [tcp(50000)]),
-        ("search-elastic-01", {}, "rhel9", [http(9200)]),
-        ("docs-couchdb", {}, "rhel9", [http(5984)]),
-        ("orders-rabbit-01", {}, "rhel9", [tcp(5672)]),
-        ("stream-kafka-1", {}, "rhel9", [tcp(9092)]),
-        ("sessions-redis", {}, "rhel9", [tcp(6379)]),
-        ("shop-tomcat-01", {}, "rhel9", [http(8080)]),
-        ("hr-weblogic", {}, "rhel9", [http(7001)]),
-        ("idm-ldap-01", {}, "rhel9", [tcp(389)]),
-        ("ns1", {}, "rhel9", [tcp(53)]),
-        ("ledger-web-01", {"role": "frontend"}, "rhel9", [http(80)]),
-        # a database that names no engine, an old OS, an unknown role: nothing to suggest
-        ("dc2-db-01", {}, "rhel8_64Guest", []),
-        # the service must be of the VM's tier: the database behind a directory is no LDAP server
-        ("ldap-db-01", {}, "rhel9", []),
-        ("legacy-rhel6-app", {}, "rhel6", []),
-        ("report-01", {}, "rhel9", []),
-    ],
-)
-def test_suggestions_follow_the_tier_and_the_service_a_vm_names(name, tags, os_type, expected):
-    assert suggest_probes(make_vm(name=name, tags=tags, os_type=os_type)) == expected
+CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "probe_suggestion_cases.json").read_text()
+)["cases"]
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])
+def test_suggestions_follow_the_tier_and_the_service_a_vm_names(case):
+    """One case table for the control plane and the dashboard's mock (SDD §9.6)."""
+    vm = make_vm(name=case["name"], tags=case["tags"], os_type=case["os_type"])
+    assert [p.model_dump() for p in suggest_probes(vm)] == case["probes"]
 
 
 def test_a_suggestion_is_a_fresh_copy_each_time():

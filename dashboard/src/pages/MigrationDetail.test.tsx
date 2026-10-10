@@ -386,4 +386,79 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(chart).toHaveTextContent('Converged on the threshold: pass 2 changed less than 1.0 GiB.'));
     expect(chart).toHaveTextContent('Final sync (pass 3), after the source stopped:');
   });
+
+  it("shows the last verification: every probe's target, result, latency and time, and the checks (SDD §16, ADV-18)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;
+    const at = '2026-10-08T10:03:00Z';
+    m.verification = {
+      at,
+      passed: true,
+      checks: [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'app:tcp:5432', ok: true, detail: 'connected to 10.20.0.5:5432' },
+        { name: 'app:https:443', ok: false, detail: '10.20.0.5:443 unreachable (TimeoutError)', skipped: true },
+      ],
+      probes: [
+        { target: '10.20.0.5:5432', kind: 'tcp', result: 'passed', latency_ms: 3.2, at, detail: 'connected to 10.20.0.5:5432' },
+        { target: 'https://10.20.0.5:443/health', kind: 'https', result: 'unreachable', latency_ms: null, at, detail: '10.20.0.5:443 unreachable (TimeoutError)' },
+      ],
+      warnings: [],
+    };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    const probes = within(panel).getByRole('table', { name: 'Application probes of the last verification' });
+    const rows = within(probes).getAllByRole('row').slice(1);
+    expect(rows.map((r) => within(r).getAllByRole('cell').map((c) => c.textContent))).toEqual([
+      ['Passed', '3.2 ms', expect.any(String)],
+      ['Unreachable', '—', expect.any(String)],
+    ]);
+    expect(within(rows[0]!).getByRole('rowheader')).toHaveTextContent('10.20.0.5:5432');
+    expect(panel).toHaveTextContent('Passed');
+    expect(within(panel).getByRole('list', { name: 'Checks of the last verification' })).toHaveTextContent('app:https:443');
+  });
+
+  it('says no verification ran yet, before the cutover', async () => {
+    renderMigration('mig-5d7e2b4a11');
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    expect(panel).toHaveTextContent('Not verified yet: verification runs after the cutover.');
+  });
+
+  it("lists the VM's probes and where they come from, and lets an operator set this VM's own (SDD §16, ADV-18)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.verification = { ...plan.verification, app_probes: [{ kind: 'http', port: 80, path: '/', expect_status: null }] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    await waitFor(() => expect(panel).toHaveTextContent("The plan's probes: HTTP 80 /"));
+
+    await user.click(within(panel).getByRole('button', { name: 'Edit probes' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Application probes of analytics-db' });
+    expect(dialog).toHaveTextContent('Saving edits the plan: it returns to draft and is validated again.');
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: /^probe 1 kind$/i }), 'tcp');
+    const port = within(dialog).getByRole('spinbutton', { name: /^probe 1 port$/i });
+    await user.clear(port);
+    await user.type(port, '5432');
+    await user.click(within(dialog).getByRole('button', { name: 'Save probes' }));
+    await waitFor(() => expect(plan.probe_overrides[m.vm.source_id]).toEqual([{ kind: 'tcp', port: 5432, path: '/', expect_status: null }]));
+    expect(plan.status).toBe('draft');
+    await waitFor(() => expect(panel).toHaveTextContent("This VM's own probes: TCP 5432"));
+
+    // back to the plan's probes: the override goes
+    await user.click(within(panel).getByRole('button', { name: 'Edit probes' }));
+    const again = await screen.findByRole('dialog', { name: 'Application probes of analytics-db' });
+    await user.click(within(again).getByRole('button', { name: "Use the plan's probes" }));
+    await waitFor(() => expect(m.vm.source_id in plan.probe_overrides).toBe(false));
+  });
+
+  it('keeps Edit probes from a viewer, saying which role it needs', async () => {
+    renderMigration('mig-5d7e2b4a11');
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    // the probes show once the plan has loaded
+    const edit = await within(panel).findByRole('button', { name: 'Edit probes' });
+    expect(edit).toHaveAttribute('aria-disabled', 'true');
+    expect(edit).toHaveAccessibleDescription('Requires the operator role.');
+  });
 });

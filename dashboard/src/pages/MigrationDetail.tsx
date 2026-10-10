@@ -25,6 +25,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
+import { VerificationPanel } from '../components/VerificationPanel';
 import { decidable, nonStrategyNotes } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
@@ -541,6 +542,8 @@ export default function MigrationDetail() {
   const history = useEventTail({ migration_id: migrationId }, 300);
   const role = useRole();
   const demoSpeed = useDemoSpeed();
+  // a probe edit, announced from a live region already on the page (SDD §16)
+  const [probeAnnouncement, setProbeAnnouncement] = useState('');
   const [liveEvents, setLiveEvents] = useState<Event[]>([]);
   usePageTitle(m ? `${m.vm.name} · ${phaseMeta(m.phase).label}` : 'Migration');
   const announcement = useProgressAnnouncement(m);
@@ -650,6 +653,13 @@ export default function MigrationDetail() {
             />
           </Panel>
         )}
+
+        <Panel title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
+          <VerificationPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
+        </Panel>
+        <p role="status" className="sr-only">
+          {probeAnnouncement}
+        </p>
 
         <div className="grid gap-4 xl:grid-cols-2">
           <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">

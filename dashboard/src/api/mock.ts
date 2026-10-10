@@ -12,8 +12,10 @@
  */
 import { DEFAULT_API_BASE } from './client';
 import { canTransition, hasDataPath } from '../lib/fsm';
+import { guestOsOf } from '../lib/guestOs';
 import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
+import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
@@ -36,8 +38,13 @@ import {
   strategySnapshot,
   type StrategyDecision,
 } from './mockData';
+import { isDatabase, suggestProbes } from './mockProbes';
 import type {
+  AppProbe,
   Health,
+  ProbeKind,
+  ProbeResult,
+  VerificationCheck,
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
@@ -71,11 +78,14 @@ import {
   AUDIT_EVENT_KINDS,
   DECISION_TYPES,
   FORCE_REASON_MIN,
+  MAX_PROBE_PATH,
+  MAX_PROBES_PER_VM,
   OVERRIDE_REASON_MIN,
   PHASES,
   POLICY_MODES,
   PLAN_DESCRIPTION_MAX,
   PLAN_NAME_MAX,
+  PROBE_KINDS,
   RECOMMENDATION_LIMIT_DEFAULT,
   RECOMMENDATION_LIMIT_MAX,
   STRATEGIES,
@@ -227,6 +237,50 @@ function clearRequest(m: Migration): void {
   m.force_window = false;
   // a Force cutover belongs to the request too (ADV-16)
   m.force_cutover = null;
+}
+
+/** The API's `_probe_problems` (SDD §12, ADV-18): the application probes it refuses, with its words. */
+function probeProblemsOf(where: string, value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const probes = value as Array<Partial<AppProbe>>;
+  const problems = probes.filter((p) => !PROBE_KINDS.includes(p.kind as ProbeKind)).map((p) => `${where}: kind ${JSON.stringify(p.kind)} is not one of tcp, http, https`);
+  problems.push(...probes.filter((p) => typeof p.port !== 'number' || p.port < 1 || p.port > 65535).map((p) => `${where}: port ${String(p.port)} outside 1-65535`));
+  problems.push(
+    ...probes
+      .filter((p) => p.kind !== 'tcp' && typeof p.path === 'string' && (!p.path.startsWith('/') || p.path.length > MAX_PROBE_PATH))
+      .map((p) => `${where}: path ${JSON.stringify(p.path)} must start with '/' (at most ${MAX_PROBE_PATH} characters)`),
+  );
+  problems.push(
+    ...probes
+      .filter((p) => typeof p.expect_status === 'number' && (p.expect_status < 100 || p.expect_status > 599))
+      .map((p) => `${where}: expect_status ${String(p.expect_status)} outside 100-599`),
+  );
+  if (probes.length > MAX_PROBES_PER_VM) problems.push(`${where}: ${probes.length} probes, at most ${MAX_PROBES_PER_VM}`);
+  return problems;
+}
+
+function refuseBadProbes(input: Record<string, unknown>): void {
+  const verification = input.verification as { app_probes?: unknown } | undefined;
+  const overrides = (input.probe_overrides ?? {}) as Record<string, unknown>;
+  const problems = [
+    ...probeProblemsOf('verification.app_probes', verification?.app_probes),
+    ...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)),
+  ];
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+}
+
+/**
+ * The simulated guest's answer to an application probe, like the demo's fake destination (SDD §7.4):
+ * it runs its suggested services and SSH (RDP on Windows); `demo-fault: app-down` runs none of its own.
+ */
+function simulatedProbe(vm: VMRef, probe: AppProbe, address: string, at: string): ProbeResult {
+  const listening = new Set([guestOsOf(vm).family === 'windows' ? 3389 : 22]);
+  if (vm.tags['demo-fault'] !== 'app-down') for (const p of suggestProbes(vm)) listening.add(p.port);
+  const target = probe.kind === 'tcp' ? `${address}:${probe.port}` : `${probe.kind}://${address}:${probe.port}${probe.path}`;
+  if (!listening.has(probe.port)) return { target, kind: probe.kind, result: 'failed', latency_ms: null, at, detail: `${address}:${probe.port} refused the connection` };
+  if (probe.kind === 'tcp') return { target, kind: probe.kind, result: 'passed', latency_ms: 3, at, detail: `connected to ${address}:${probe.port}` };
+  const ok = probe.expect_status === null || probe.expect_status === 200;
+  return { target, kind: probe.kind, result: ok ? 'passed' : 'failed', latency_ms: 3, at, detail: ok ? 'HTTP 200' : `HTTP 200, expected ${probe.expect_status}` };
 }
 
 /** The phase-history reason of a rule, like the API's _converged (SDD §5.3). */
@@ -694,27 +748,65 @@ export class MockServer {
   }
 
   private finishVerification(m: Migration, plan: Plan): void {
-    if (this.rand() < 0.1) {
-      m.error = 'Verification failed: tcp:22 connection refused after 600 s.';
+    const at = new Date(this.now()).toISOString();
+    // one verification in ten fails on the boot checks (an exercised rollback path), like the demo
+    const flaky = this.rand() < 0.1;
+    const windows = guestOsOf(m.vm).family === 'windows';
+    const ports = windows ? plan.verification.windows_tcp_ports : plan.verification.tcp_ports;
+    const configured = probesFor(m.vm.source_id, plan).probes;
+    const address = m.vm.nics[0]?.fixed_ips[0] ?? '10.20.0.10';
+    const probes = configured.map((probe) => simulatedProbe(m.vm, probe, address, at));
+    const checks: VerificationCheck[] = [
+      { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+      { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+      ...ports.map((port) => ({ name: `tcp:${port}`, ok: !flaky, detail: flaky ? 'connection refused' : `connected to ${address}:${port}` })),
+      ...configured.map((probe, i) => {
+        const result = probes[i]!;
+        return { name: `app:${probe.kind}:${probe.port}`, ok: result.result === 'passed', detail: result.detail, ...(result.result === 'unreachable' ? { skipped: true } : {}) };
+      }),
+      // a boot that fails without a TCP port to show it shows on the console
+      ...(windows
+        ? []
+        : [flaky && ports.length === 0 ? { name: 'console', ok: false, detail: 'no success pattern in the last 200 console lines' } : { name: 'console', ok: true, detail: "matched 'login:'" }]),
+    ];
+    const refused = checks.filter((c) => !c.ok && !c.skipped);
+    m.verification = { at, passed: refused.length === 0, checks, probes, warnings: [] };
+    if (refused.length) {
+      // a failed check — a boot check, or a refused application probe (SDD §7.5, ADV-18) — fails the
+      // verification, and the plan's automatic rollback runs
+      m.error = `Verification failed: ${refused.map((c) => `${c.name} (${c.detail})`).join('; ')}`;
       this.emit({ kind: 'migration.error', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${m.error}`, data: {} });
-      this.transition(m, 'failed', 'verification failed', 'orchestrator');
-      m.advisor_notes.push({
-        kind: 'similar_incidents',
-        source: 'memory',
-        summary: '1 similar incident: sshd bound to the old fixed IP after migration.',
-        confidence: null,
-        data: { hits: [{ title: 'sshd ListenAddress pinned to the source IP', content: 'Remove ListenAddress or use 0.0.0.0; re-run verification.', score: 0.77 }] },
-        created_at: new Date(this.now()).toISOString(),
-      });
-      this.emit({ kind: 'advisor.similar_incidents', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `${m.vm.name}: 1 similar incident found`, data: {} });
+      this.transition(m, 'failed', 'verification failed', 'orchestrator', { verification: m.verification });
+      if (flaky) {
+        m.advisor_notes.push({
+          kind: 'similar_incidents',
+          source: 'memory',
+          summary: '1 similar incident: sshd bound to the old fixed IP after migration.',
+          confidence: null,
+          data: { hits: [{ title: 'sshd ListenAddress pinned to the source IP', content: 'Remove ListenAddress or use 0.0.0.0; re-run verification.', score: 0.77 }] },
+          created_at: new Date(this.now()).toISOString(),
+        });
+        this.emit({ kind: 'advisor.similar_incidents', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `${m.vm.name}: 1 similar incident found`, data: {} });
+      }
       if (plan.verification.auto_rollback) {
         m.progress_pct = 0;
         this.transition(m, 'rolling_back', 'automatic rollback after failed verification', 'orchestrator');
       }
       return;
     }
+    // what the rules ask review for (SDD §7.5): an unreachable probe, a database VM that only booted
+    const unreachable = probes.filter((p) => p.result === 'unreachable').map((p) => p.target);
+    const review = unreachable.length
+      ? `application probe unreachable from the control plane: ${unreachable.join(', ')}`
+      : isDatabase(m.vm) && configured.length === 0
+        ? 'database VM without an application probe: only its boot was verified'
+        : null;
+    if (review) {
+      m.review_required = true;
+      m.review_reason = review;
+    }
     m.checkpoint = 'verify';
-    this.transition(m, 'completed', 'verification passed', 'orchestrator');
+    this.transition(m, 'completed', 'verification passed', 'orchestrator', { verification: m.verification });
     this.endDowntime(m);
     this.emit({ kind: 'memory.lesson_saved', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `Lesson saved: ${m.strategy}, actual downtime ${Math.round(m.actual_downtime_s ?? 0)} s`, data: { type: 'fact' } });
     this.maybeCompletePlan(plan);
@@ -742,7 +834,7 @@ export class MockServer {
   // Domain helpers
   // ---------------------------------------------------------------------------------------
 
-  private transition(m: Migration, to: Phase, reason: string, actor: string): void {
+  private transition(m: Migration, to: Phase, reason: string, actor: string, data: Record<string, unknown> = {}): void {
     if (!canTransition(m.phase, to)) {
       throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to ${to}.`);
     }
@@ -752,7 +844,7 @@ export class MockServer {
     m.phase = to;
     m.updated_at = at;
     if (to !== 'precopy' && to !== 'syncing' && to !== 'cutover') this.dropRunningPass(m);
-    this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason } });
+    this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason, ...data } });
   }
 
   private sourceFor(plan: Plan): Provider {
@@ -778,6 +870,8 @@ export class MockServer {
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;
+    // what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+    m.suggested_probes = suggestProbes(m.vm);
   }
 
   private select(m: Migration, plan: Plan): Strategy {
@@ -1373,6 +1467,7 @@ export class MockServer {
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
+    refuseBadProbes(input);
     const body = input as unknown as PlanCreate;
     if (!body.name || !String(body.name).trim()) throw new HttpError(422, 'validation_error', 'name is required.');
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
@@ -1411,6 +1506,7 @@ export class MockServer {
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     this.refuseLongPlanTexts(input);
+    refuseBadProbes(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
     for (const key of Object.keys(input)) {
@@ -1503,6 +1599,8 @@ export class MockServer {
       force_cutover: null,
       data_issues: [],
       downtime_model_s: null,
+      verification: null,
+      suggested_probes: [],
       review_required: false,
       review_reason: null,
       destination_server_id: null,
