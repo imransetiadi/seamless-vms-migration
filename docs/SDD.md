@@ -1443,7 +1443,9 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
 * the `auth` section of a `clouds.yaml`, in YAML or JSON;
 * seamless API tokens (`smg_…`) and JWTs;
 * VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
-  `SEAMLESS_MEMORY_REDACT_NAMES`.
+  `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
+  name inside another word stays (`web-010` is another VM than `web-01`) while names built from it are covered:
+  `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
 
 `redact_payload(value, names=None)` applies `redact` to every string of a JSON-like value and replaces
 the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) whatever its type. Guest
