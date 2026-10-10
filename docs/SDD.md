@@ -339,7 +339,10 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
-`migration.log`, `heartbeat`. `migration.progress` carries the running step's
+`migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
+§7.1): the whole line passes through `redact` (§13.4) and is then cut to 2000 characters, so what
+`redact` recognizes — a password a task prints without `no_log`, a token, a PEM block whose end lies
+beyond the cut — reaches no subscriber. `migration.progress` carries the running step's
 `{pct, bytes_done, bytes_total, phase}` as reported to the executor's progress callback (§7.1), not the
 migration's totals.
 
@@ -686,7 +689,7 @@ class StepContext:
     plan: Plan; migration: Migration; source: Provider; destination: Provider; settings: Settings
     report_progress: Callable[[float, int, int], Awaitable[None]]   # pct, bytes_done, bytes_total
     mark_downtime_start: Callable[[], Awaitable[None]]
-    log: Callable[[str], Awaitable[None]]
+    log: Callable[[str], Awaitable[None]]   # one whole output line; the orchestrator redacts and cuts it (§4)
 
 @dataclass
 class StepResult:
@@ -1473,6 +1476,9 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
   `SEAMLESS_MEMORY_REDACT_NAMES` — wherever a name stands between characters that are not letters or digits, so a
   name inside another word stays (`web-010` is another VM than `web-01`) while names built from it are covered:
   `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
+
+The control plane uses the same `redact` for the text it publishes from outside sources: step and
+provider error messages and every `migration.log` line (§4).
 
 `redact_payload(value, names=None)` applies `redact` to every string of a JSON-like value and replaces
 the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) whatever its type. Guest
