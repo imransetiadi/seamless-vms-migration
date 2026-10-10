@@ -1285,6 +1285,35 @@ describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
     expect(node.phase).toBe('cutover');
   });
 
+  it('refuses a decision while the plan sets the VM\'s strategy, and a second approve, like the API (SDD §14.6)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const held = server.migrations.find((m) => m.advisor_hold)!;
+    const recId = held.advisor_hold!;
+    const plan = server.plans.find((p) => p.id === held.plan_id)!;
+    plan.strategy_overrides = { ...plan.strategy_overrides, [held.vm.source_id]: 'cold' };
+    const pinned = `The plan sets the strategy of ${held.vm.name} (cold): change it in the plan.`;
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {})).rejects.toMatchObject({ status: 409, message: pinned });
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/override`, { option: 'cold', reason: 'the owner chose cold' })).rejects.toMatchObject({
+      status: 409,
+      message: pinned,
+    });
+    const { [held.vm.source_id]: _, ...rest } = plan.strategy_overrides;
+    plan.strategy_overrides = rest;
+    await as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {});
+    const approvals = server.events.filter((e) => e.kind === 'decision.approved').length;
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {})).rejects.toMatchObject({
+      status: 409,
+      message: 'The decision is already approved.',
+    });
+    expect(server.events.filter((e) => e.kind === 'decision.approved')).toHaveLength(approvals);
+    // another option is still a person's call while nothing started
+    const overridden = await as(server, ADMIN_TOKEN).post<AdvisorRecommendation>(`/advisor/recommendations/${recId}/override`, {
+      option: 'cold',
+      reason: 'the owner chose cold',
+    });
+    expect(overridden.decision.status).toBe('overridden');
+  });
+
   it('clears the advisor hold of a migration it cancels, like the API (SDD §14.6)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const held = server.migrations.find((m) => m.advisor_hold)!;

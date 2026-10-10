@@ -1352,6 +1352,11 @@ export class MockServer {
       throw new HttpError(422, 'validation_error', `policy ${policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
     }
     if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
+    // like the API (SDD §14.6): the plan's own choice stands over the newest recommendation, and an approved
+    // decision is not approved again (one event per decision status change)
+    const pinned = plan.strategy_overrides[m.vm.source_id];
+    if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
+    if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
     const at = new Date(this.now()).toISOString();
     let decided: AdvisorRecommendation;

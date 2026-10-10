@@ -348,6 +348,32 @@ describe('MigrationDetail', () => {
     }
   });
 
+  it("keeps Approve and Override while the plan sets the VM's strategy, and Approve from an approved decision, with the reason (SDD §14.6)", async () => {
+    const server = createTestServer();
+    const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;
+    const plan = server.plans.find((p) => p.id === db.plan_id)!;
+    const overrides = plan.strategy_overrides;
+    plan.strategy_overrides = { ...overrides, [db.vm.source_id]: 'cold' };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${db.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    for (const name of ['Approve', 'Override']) {
+      const button = within(group).getByRole('button', { name });
+      await waitFor(() => expect(button).toHaveAttribute('aria-disabled', 'true'));
+      expect(button).toHaveAccessibleDescription('The plan sets the strategy of analytics-node-2 (Cold migration): change it in the plan.');
+    }
+    view.unmount();
+    plan.strategy_overrides = overrides;
+    const rec = server.recommendations.find((r) => r.id === db.advisor_hold)!;
+    rec.decision = { ...rec.decision, status: 'approved', final_option: rec.recommendation.option };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${db.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const approved = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    const approve = within(approved).getByRole('button', { name: 'Approve' });
+    expect(approve).toHaveAttribute('aria-disabled', 'true');
+    expect(approve).toHaveAccessibleDescription('The decision is already approved.');
+    // another option is still a person's call while nothing started
+    expect(within(approved).getByRole('button', { name: 'Override' })).not.toHaveAttribute('aria-disabled');
+  });
+
   it('badges a migration whose numbers do not hold, and lists what the invariants found (SDD §5.5, ADV-16)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;

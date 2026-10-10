@@ -1,6 +1,6 @@
 import { Replace, ThumbsUp } from 'lucide-react';
 import { useRef, useState, type RefObject } from 'react';
-import { useDecideRecommendation, useMe, usePolicies } from '../api/hooks';
+import { useDecideRecommendation, useMe, usePlan, usePolicies } from '../api/hooks';
 import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type Strategy } from '../api/types';
 import { optionLabel } from '../lib/advisor';
 import { resolvePolicy } from '../lib/policies';
@@ -57,13 +57,21 @@ export function RecommendationActions({
     onDecided?.(message);
   };
   const name = rec.subject.name;
+  // like the API (SDD §14.6), after the requester: the plan's own choice of strategy stands over the newest
+  // recommendation, and an approved decision is not approved again
+  const pinned = usePlan(migration.plan_id).data?.strategy_overrides[migration.vm.source_id];
+  const pinnedReason = pinned ? `The plan sets the strategy of ${name} (${optionLabel(pinned)}): change it in the plan.` : null;
+  const approveReason = own
+    ? OWN_DECISION
+    : (pinnedReason ?? (rec.decision.status === 'approved' ? 'The decision is already approved.' : canApprove ? null : 'The recommended option is not eligible for this VM now.'));
+  const overrideReason = own ? OWN_DECISION : (pinnedReason ?? (alternatives.length ? null : 'No other option is eligible for this VM.'));
   return (
     <>
       <div role="group" aria-label={`Decide on the recommendation for ${name}`} className="mt-2 flex flex-wrap gap-2">
-        <Button size="lg" variant="primary" icon={ThumbsUp} disabledReason={own ? OWN_DECISION : canApprove ? null : 'The recommended option is not eligible for this VM now.'} onClick={() => setOpen('approve')}>
+        <Button size="lg" variant="primary" icon={ThumbsUp} disabledReason={approveReason} onClick={() => setOpen('approve')}>
           Approve
         </Button>
-        <Button size="lg" icon={Replace} disabledReason={own ? OWN_DECISION : alternatives.length ? null : 'No other option is eligible for this VM.'} onClick={() => setOpen('override')}>
+        <Button size="lg" icon={Replace} disabledReason={overrideReason} onClick={() => setOpen('override')}>
           Override
         </Button>
       </div>
