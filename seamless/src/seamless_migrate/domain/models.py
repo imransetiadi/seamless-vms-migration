@@ -460,8 +460,22 @@ class AdvisorRecommendation(_Model):
     model: AdvisorModelInfo
     recommendation: RecommendedOption
     decision: Decision
+    #: the redacted input the recommendation rests on (document kind ``advisor_snapshot``, §14.5)
+    input_snapshot_sha256: str | None = None
     legacy: bool = False
     legacy_text: str | None = None
+
+
+class AdvisorSnapshot(_Model):
+    """A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5)."""
+
+    sha256: str
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    payload: dict[str, Any]
+
+    @property
+    def id(self) -> str:
+        return self.sha256
 
 
 class Approval(_Model):

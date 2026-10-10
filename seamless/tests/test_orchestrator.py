@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -10,12 +11,15 @@ from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
 from seamless_migrate.ai.memory import MemoryClient
+from seamless_migrate.ai.snapshots import canonical_json
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
 from seamless_migrate.domain.models import (
     AdvisorNote,
     AdvisorRecommendation,
+    AdvisorSnapshot,
     CutoverWindow,
+    Event,
     Migration,
     Nic,
     Plan,
@@ -24,6 +28,7 @@ from seamless_migrate.domain.models import (
     VerificationConfig,
     Wave,
 )
+from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -2190,6 +2195,10 @@ def _recommendations(store) -> list[AdvisorRecommendation]:
     return store.list("recommendation", AdvisorRecommendation)
 
 
+def _audit(store) -> list[Event]:
+    return store.events(since_seq=0, limit=1000, kinds=AUDIT_KINDS)
+
+
 async def test_advisor_tie_break_recorded(tmp_path, store):
     """SDD §14.4: the tie is recorded as a recommendation and its decision; the strategy note of
     earlier versions is no longer written."""
@@ -2211,16 +2220,68 @@ async def test_advisor_tie_break_recorded(tmp_path, store):
     assert (rec.model.name, rec.model.version) == ("jev", "jev-1.13.0")
     assert (rec.recommendation.option, rec.recommendation.confidence) == ("warm", 0.9)
     assert (rec.decision.status, rec.decision.final_option) == (DecisionStatus.auto_applied, "warm")
-    [event] = [e for e in store.events(since_seq=0, limit=1000) if e.kind == "advisor.strategy"]
-    assert event.data == {
-        "recommendation_id": rec.id,
-        "option": "warm",
-        "confidence": 0.9,
-        "final_option": "warm",
-        "status": "auto_applied",
-        "reason_code": "ABOVE_THRESHOLD_AUTO_APPLY",
-    }
+    assert [e.kind for e in _audit(store)] == ["recommendation.created", "decision.auto_applied"]
+    assert not [e for e in store.events(since_seq=0, limit=1000) if e.kind == "advisor.strategy"]
     assert session.calls and session.calls[0][0] == "jev_decide"
+
+
+@pytest.mark.parametrize(
+    ("confidence", "kind", "status"),
+    [
+        (0.9, "decision.auto_applied", "auto_applied"),
+        (0.57, "decision.below_threshold", "below_threshold"),
+    ],
+)
+async def test_a_recommendation_is_audited_once_with_its_redacted_input(
+    tmp_path, store, confidence, kind, status
+):
+    """SDD §14.5 (ADV-05): recommendation.created, then exactly one decision event with its actor
+    and model version; the input snapshot is stored under the hash of its content."""
+    advisor, _ = _tie_advisor("warm", confidence)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    created, decided = _audit(store)
+    assert (created.kind, created.actor, created.migration_id) == (
+        "recommendation.created",
+        "system:advisor",
+        m.id,
+    )
+    assert created.data == {
+        "target_id": rec.id,
+        "model_version": "jev-1.13.0",
+        "decision_type": "migration_strategy",
+        "subject": {"kind": "vm", "id": "vm-1", "name": m.vm.name},
+        "option": "warm",
+        "confidence": confidence,
+        "snapshot_sha256": rec.input_snapshot_sha256,
+    }
+    assert (decided.kind, decided.actor, decided.plan_id) == (
+        kind,
+        "policy:global-default",
+        plan.id,
+    )
+    assert decided.data == {
+        "target_id": rec.id,
+        "model_version": "jev-1.13.0",
+        "before": None,
+        "after": {
+            "status": status,
+            "final_option": rec.decision.final_option,
+            "reason_code": str(rec.decision.reason_code),
+            "policy_id": "global-default",
+            "threshold_used": 0.6,
+        },
+    }
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    assert snapshot.sha256 == hashlib.sha256(canonical_json(snapshot.payload).encode()).hexdigest()
+    assert snapshot.payload["tool"] == "jev_decide"
+    assert snapshot.payload["arguments"]["candidates"]
+    assert (snapshot.payload["deterministic"], snapshot.payload["scope"]) == (
+        "cold",
+        ["cold", "warm"],
+    )
 
 
 async def test_a_revalidation_asks_and_records_nothing_for_a_migration_it_leaves_alone(
@@ -2306,6 +2367,13 @@ async def test_with_jev_off_an_automatic_choice_is_recorded_as_a_rules_fallback(
     )
     assert (rec.decision.actor.kind, rec.decision.actor.id) == ("system", "fallback")
     assert m.strategy == Strategy(rec.decision.final_option) == Strategy.cold
+    # SDD §14.5: the fallback is audited too, and the input the rules decided on is kept
+    [created, decided] = _audit(store)
+    assert (created.data["model_version"], created.data["option"]) == ("rules", None)
+    assert (decided.kind, decided.actor) == ("decision.fallback", "system:fallback")
+    assert decided.data["after"]["status"] == "fallback_rules"
+    snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
+    assert "vCPU" in snapshot.payload["arguments"]["evidence"]
 
 
 async def test_validation_keeps_the_notes_a_migration_already_has(tmp_path, store):

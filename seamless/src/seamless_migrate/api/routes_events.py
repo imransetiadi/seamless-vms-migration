@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from ..domain.enums import Role
 from ..domain.models import Event
-from ..events import Subscription
+from ..events import AUDIT_KINDS, Subscription
 from ..security.auth import Principal
 from .deps import require_role, services
 
@@ -59,11 +59,18 @@ async def list_events(
     migration_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
     tail: bool = False,
+    audit: bool = False,
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Event]:
-    # tail: the newest ``limit`` matching events instead of the first (SDD §12), still ascending
+    # tail: the newest ``limit`` matching events instead of the first (SDD §12), still ascending;
+    # audit: only the audit events (SDD §14.5)
     return await services(request).db.events(
-        since_seq=since, plan_id=plan_id, migration_id=migration_id, limit=limit, tail=tail
+        since_seq=since,
+        plan_id=plan_id,
+        migration_id=migration_id,
+        limit=limit,
+        tail=tail,
+        kinds=AUDIT_KINDS if audit else None,
     )
 
 

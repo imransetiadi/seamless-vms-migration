@@ -7,10 +7,10 @@ compares a confidence with a threshold.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from ..config import Settings
 from ..domain.enums import DecisionStatus, ReasonCode
@@ -41,6 +41,8 @@ class Advice:
     model_version: str | None = None
     deterministic: str | None = None
     deterministic_reason: str | None = None
+    #: the jev_decide arguments, built even when Jev is not asked: the input snapshot (§14.5)
+    request: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,7 @@ from typing import Any
 
 from .ai.decision import Advice, decide, default_policy
 from .ai.redaction import redact
+from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
 from .domain import fsm
 from .domain.enums import (
@@ -632,8 +633,21 @@ class Orchestrator:
     async def _record_strategy_recommendation(
         self, plan: Plan, vm: VMRef, migration: Migration, advice: Advice, decision: Decision
     ) -> AdvisorRecommendation:
-        """Store the strategy recommendation and its decision (SDD §14.4)."""
+        """Store the strategy recommendation, its decision and its input; audit both (SDD §14.4,
+        §14.5)."""
         answered = advice.unavailable is None
+        snapshot = await store_snapshot(
+            self.db,
+            {
+                "tool": "jev_decide",
+                "arguments": dict(advice.request or {}),
+                "scope": list(advice.scope),
+                "options": list(advice.options),
+                "deterministic": advice.deterministic,
+                "deterministic_reason": advice.deterministic_reason,
+            },
+            now=decision.decided_at,
+        )
         rec = AdvisorRecommendation(
             created_at=decision.decided_at,
             decision_type=DecisionType.migration_strategy,
@@ -651,25 +665,11 @@ class Orchestrator:
                 distribution=dict(advice.distribution),
             ),
             decision=decision,
+            input_snapshot_sha256=snapshot,
         )
         await self.db.put("recommendation", rec)
-        confidence = (
-            f"{advice.confidence:.0%}" if advice.confidence is not None else "no confidence"
-        )
-        await self._emit(
-            "advisor.strategy",
-            f"{vm.name}: recommended {advice.option or 'nothing'} ({confidence}); decision "
-            f"{decision.final_option or 'pending'} ({decision.status})",
-            migration=migration,
-            data={
-                "recommendation_id": rec.id,
-                "option": advice.option,
-                "confidence": advice.confidence,
-                "final_option": decision.final_option,
-                "status": str(decision.status),
-                "reason_code": str(decision.reason_code),
-            },
-        )
+        for kind, message, actor, data in (created_event(rec), decision_event(rec)):
+            await self._emit(kind, message, migration=migration, actor=actor, data=data)
         return rec
 
     async def in_flight(self, plan_id: str) -> list[str]:

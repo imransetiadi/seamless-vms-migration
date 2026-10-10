@@ -19,6 +19,18 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
+#: Audit events (SDD §14.5): ``GET /events?audit=true`` returns only these.
+AUDIT_KINDS = frozenset(
+    {
+        "recommendation.created",
+        "decision.auto_applied",
+        "decision.pending_approval",
+        "decision.approved",
+        "decision.overridden",
+        "decision.below_threshold",
+        "decision.fallback",
+    }
+)
 PERSISTED_KINDS = frozenset(
     {
         "plan.created",
@@ -48,6 +60,7 @@ PERSISTED_KINDS = frozenset(
         "provider.deleted",
         "provider.checked",
         "auth.denied",
+        *AUDIT_KINDS,
     }
 )
 EPHEMERAL_KINDS = frozenset({"migration.progress", "migration.log", "heartbeat"})

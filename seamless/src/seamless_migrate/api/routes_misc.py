@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from .. import __version__
 from ..ai.recommendations import LEGACY_PREFIX, legacy_by_id, listing
 from ..domain.enums import DecisionType, Role
-from ..domain.models import AdvisorRecommendation, Migration, Plan
+from ..domain.models import AdvisorRecommendation, AdvisorSnapshot, Migration, Plan
 from ..metrics import advisor_calls, render_metrics
 from ..security.auth import Principal
 from ..stats import Stats, compute_stats
@@ -140,6 +140,16 @@ async def get_recommendation(
             raise NotFound("recommendation", rec_id)
         return found
     return await svc.db.get("recommendation", rec_id, AdvisorRecommendation)
+
+
+@router.get("/advisor/snapshots/{sha256}", response_model=AdvisorSnapshot)
+async def get_snapshot(
+    request: Request,
+    sha256: str = Path(pattern=r"^[0-9a-f]{64}$"),
+    _: Principal = Depends(require_role(Role.viewer)),
+) -> AdvisorSnapshot:
+    """A redacted advisor input; its hash can be recomputed from the payload (SDD §14.5)."""
+    return await services(request).db.get("advisor_snapshot", sha256, AdvisorSnapshot)
 
 
 @router.post("/advisor/similar-incidents", response_model=SimilarIncidentsResponse)

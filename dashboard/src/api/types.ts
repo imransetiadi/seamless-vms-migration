@@ -479,6 +479,14 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.deleted',
   'provider.checked',
   'auth.denied',
+  // audit events (SDD §14.5)
+  'recommendation.created',
+  'decision.auto_applied',
+  'decision.pending_approval',
+  'decision.approved',
+  'decision.overridden',
+  'decision.below_threshold',
+  'decision.fallback',
 ] as const;
 export type PersistedEventKind = (typeof PERSISTED_EVENT_KINDS)[number];
 

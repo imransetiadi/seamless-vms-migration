@@ -162,11 +162,28 @@ class Advisor:
         ]
         if len(candidates) < 2:
             return None  # nothing to decide: jev_decide needs at least two candidates
+        # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
+        request: dict[str, Any] = {
+            "decision": self._redact(
+                f"Which migration strategy should be used for VM {vm.name} moving to RHOSO 18.0?",
+                [vm.name],
+            ),
+            "evidence": self._strategy_evidence(vm, estimates, plan, findings),
+            "priorities": (
+                f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
+                "simpler strategy when downtimes differ by less than 10 %; never pick an "
+                "ineligible strategy"
+            ),
+            "candidates": candidates,
+            "requirements": list(STRATEGY_REQUIREMENTS),
+            "escalate_on_contradiction": True,
+        }
         base: dict[str, Any] = {
             "scope": tuple(s.value for s in scope),
             "options": tuple(c["id"] for c in candidates),
             "deterministic": deterministic.value,
             "deterministic_reason": reason,
+            "request": request,
         }
         if not self.jev_enabled:
             return Advice(
@@ -177,22 +194,7 @@ class Advisor:
             )
         assert self.jev is not None
         try:
-            response = await self.jev.decide(
-                decision=self._redact(
-                    f"Which migration strategy should be used for VM {vm.name} moving to "
-                    "RHOSO 18.0?",
-                    [vm.name],
-                ),
-                evidence=self._strategy_evidence(vm, estimates, plan, findings),
-                priorities=(
-                    f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
-                    "simpler strategy when downtimes differ by less than 10 %; never pick an "
-                    "ineligible strategy"
-                ),
-                candidates=candidates,
-                requirements=list(STRATEGY_REQUIREMENTS),
-                escalate_on_contradiction=True,
-            )
+            response = await self.jev.decide(**request)
         except JevUnavailable as exc:
             return Advice(option=None, confidence=None, unavailable=str(exc), **base)
         rec = response.get("recommendation") or {}
