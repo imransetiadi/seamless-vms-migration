@@ -237,6 +237,12 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         spec = PlanCreate.model_validate(document)
     except ValidationError as exc:
         raise CliError(f"invalid plan: {exc}") from None
+    from .plan_checks import PlanSpecError, check_plan_spec
+
+    try:
+        check_plan_spec(spec)  # SDD §15: what POST /plans refuses, the CLI refuses too
+    except PlanSpecError as exc:
+        raise CliError(str(exc)) from None
     store = _store(settings)
     _resolve_providers(store, spec)
     plans = store.list("plan", Plan)

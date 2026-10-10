@@ -165,6 +165,36 @@ def test_plan_apply_never_overwrites_a_change_it_did_not_see(env, capsys, monkey
     assert (plan.status, plan.downtime_slo_s) == (PlanStatus.running, 600)
 
 
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"name": "x" * 201}, "name: at most 200 characters (got 201)"),
+        ({"vm_ids": ["vm-1", "vm-1"]}, "vm_ids lists a VM more than once: vm-1"),
+        (
+            {"cutover_window": {"start": "2026-10-11T02:00:00Z", "end": "2026-10-11T01:00:00Z"}},
+            "cutover_window: end must be after start",
+        ),
+        (
+            {"estimator_overrides": {"nope": 1.0}},
+            "invalid estimator_overrides: nope: unknown field",
+        ),
+    ],
+    ids=["name", "vm_ids", "settings", "estimator_overrides"],
+)
+def test_plan_apply_refuses_what_the_api_refuses(env, capsys, change, message):
+    """SDD §15: the checks of POST /plans, in its order and with its messages (§12) - a plan the
+    API and the dashboard's form refuse is never stored, neither created nor updated."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    doc = yaml.safe_load(path.read_text())
+    for name, extra in (("new", {"name": "Another plan"}), ("update", {})):
+        bad = env / f"{name}.yaml"
+        bad.write_text(yaml.safe_dump({**doc, **extra, **change}))
+        assert cli.main(["plan", "apply", "-f", str(bad)]) == 1, name
+        assert capsys.readouterr().err.strip() == f"error: {message}", name
+    assert [p.id for p in store.list("plan", Plan)] == [plan_id]
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
+
+
 def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):
     monkeypatch.setenv("SEAMLESS_DEMO", "true")
     store = store_for(env)

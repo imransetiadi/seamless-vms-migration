@@ -700,6 +700,39 @@ def test_plan_refuses_non_finite_estimator_inputs(api):
     assert patched.status_code == 422 and "link_bps" in patched.json()["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    ("change", "status", "message"),
+    [
+        ({"name": "x" * 201}, 422, "name: at most 200 characters (got 201)"),
+        ({"vm_ids": ["vm-1", "vm-1"]}, 422, "vm_ids lists a VM more than once: vm-1"),
+        (
+            {"cutover_window": {"start": "2026-10-11T02:00:00Z", "end": "2026-10-11T01:00:00Z"}},
+            422,
+            "cutover_window: end must be after start",
+        ),
+        (
+            {"estimator_overrides": {"nope": 1.0}},
+            400,
+            "invalid estimator_overrides: nope: unknown field",
+        ),
+    ],
+    ids=["name", "vm_ids", "settings", "estimator_overrides"],
+)
+def test_plan_checks_answer_like_plan_apply(api, change, status, message):
+    """SDD §12/§15: POST /plans and `seamless plan apply` run one set of checks with one wording
+    (test_plan_apply_refuses_what_the_api_refuses holds the CLI to the same messages)."""
+    body = {
+        "name": "checked",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "require_approval": True,
+    }
+    refused = api.post("/api/v1/plans", Role.approver, json={**body, **change})
+    assert refused.status_code == status, refused.text
+    assert refused.json()["error"]["message"] == message
+
+
 def test_plan_texts_are_bounded_at_the_api_boundary(api):
     """SDD §12: a plan name holds 200 characters, a description 2000; stored plans still load."""
     vm_ids = first_clean_vms(api)

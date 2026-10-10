@@ -16,13 +16,11 @@ from ..domain.models import (
     PlanSpec,
     Provider,
     ValidationReport,
-    invalid_plan_settings,
-    repeated_vm_ids,
 )
 from ..events import emit
 from ..orchestrator import in_flight_refusal
+from ..plan_checks import PlanSpecError, check_plan_spec
 from ..plan_status import derive_plan_status
-from ..planning.estimator import invalid_estimator_overrides
 from ..security.auth import Principal
 from ..store import NotFound
 from .deps import ApiError, _audit_denied, require_role, services
@@ -44,43 +42,12 @@ async def _check_policy_fields(request: Request, fields: set[str], principal: Pr
         raise ApiError(403, "forbidden", reason)
 
 
-def _check_vm_ids(spec: PlanCreate) -> None:
-    """One VM, one migration (SDD §12): a repeated id would make two migrations cut it over."""
-    repeated = repeated_vm_ids(spec.vm_ids)
-    if repeated:
-        raise ApiError(
-            422, "validation_error", f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}"
-        )
-
-
-def _check_plan_settings(spec: PlanCreate) -> None:
-    problems = invalid_plan_settings(spec)
-    if problems:
-        raise ApiError(422, "validation_error", "; ".join(problems))
-
-
-#: SDD §12: the longest plan name and description a request may set; the stored model stays
-#: permissive so plans written before the check keep loading
-PLAN_NAME_MAX = 200
-PLAN_DESCRIPTION_MAX = 2000
-
-
-def _check_plan_texts(spec: PlanCreate) -> None:
-    problems = []
-    if len(spec.name) > PLAN_NAME_MAX:
-        problems.append(f"name: at most {PLAN_NAME_MAX} characters (got {len(spec.name)})")
-    if spec.description is not None and len(spec.description) > PLAN_DESCRIPTION_MAX:
-        problems.append(
-            f"description: at most {PLAN_DESCRIPTION_MAX} characters (got {len(spec.description)})"
-        )
-    if problems:
-        raise ApiError(422, "validation_error", "; ".join(problems))
-
-
-def _check_estimator_overrides(spec: PlanCreate) -> None:
-    problems = invalid_estimator_overrides(spec.estimator_overrides)
-    if problems:
-        raise ApiError(400, "bad_request", f"invalid estimator_overrides: {'; '.join(problems)}")
+def _check_plan_spec(spec: PlanCreate) -> None:
+    """The checks every stored plan passes (SDD §12), shared with `seamless plan apply` (§15)."""
+    try:
+        check_plan_spec(spec)
+    except PlanSpecError as exc:
+        raise ApiError(400 if exc.code == "bad_request" else 422, exc.code, str(exc)) from None
 
 
 def _non_default_policy_fields(body: PlanCreate) -> set[str]:
@@ -151,10 +118,7 @@ async def create_plan(
 ) -> PlanOut:
     svc = services(request)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
-    _check_plan_texts(body)
-    _check_vm_ids(body)
-    _check_plan_settings(body)
-    _check_estimator_overrides(body)
+    _check_plan_spec(body)
     plan = Plan(**body.model_dump())
     # SDD §12: a provider's deletion waits until the plan that uses it is saved, and then refuses
     async with svc.orchestrator.provider_lock():
@@ -207,10 +171,7 @@ async def update_plan(
             )
         except ValidationError as exc:
             raise ApiError(422, "validation_error", _summarize(exc)) from None
-        _check_plan_texts(merged)
-        _check_vm_ids(merged)
-        _check_plan_settings(merged)
-        _check_estimator_overrides(merged)
+        _check_plan_spec(merged)
         updated = Plan.model_validate(
             {
                 **plan.model_dump(mode="json"),
