@@ -629,7 +629,7 @@ export interface Migration {
   force_cutover: ForceCutover | null;
   /** What the invariants found when it completed, one "CODE: text" each (SDD §5.5). */
   data_issues: string[];
-  /** Demo: the model seconds a simulated cutover kept the source stopped (SDD §5.2). */
+  /** Demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (SDD §5.2). */
   downtime_model_s: number | null;
   /** The last verification: its checks and application probe results (SDD §7.5, ADV-18). */
   verification: VerificationRecord | null;
