@@ -126,6 +126,11 @@ Severity       = blocker | warning | info
 Role           = viewer | operator | approver | admin          (ordered, see §13)
 PlanStatus     = draft | validated | running | paused | completed | failed
 SyncPassKind   = full | delta | final
+DecisionType   = migration_strategy | workload_tier | verification_review | console_screening   (§14.4)
+DecisionStatus = auto_applied | pending_approval | approved | overridden | below_threshold | fallback_rules
+ReasonCode     = ABOVE_THRESHOLD_AUTO_APPLY | POLICY_REQUIRES_APPROVAL | INSUFFICIENT_EVIDENCE |
+                 APPROVED_BY_USER | OVERRIDDEN_BY_USER | BELOW_THRESHOLD_DEFAULT_KEPT |
+                 ADVISOR_UNAVAILABLE_FALLBACK
 ```
 
 ### 4.2 Models
@@ -219,6 +224,23 @@ Estimate { strategy: Strategy, eligible: bool, reasons: list[str] = [], precopy_
 AdvisorNote { kind: "strategy"|"classification"|"verification"|"similar_incidents"|"screen",
               source: "jev"|"rules"|"memory", summary: str, confidence: float|null,
               data: dict = {}, created_at: datetime }
+
+AdvisorActor { kind: "policy"|"user"|"system", id: str }    # policy:<id>, user:<name>, system:fallback
+
+AdvisorModelInfo { name: "jev"|"rules", version: str, deployment: "on_prem"|"remote"|"unknown" = "unknown",
+                   endpoint_host: str|null }
+
+RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only number compared with a threshold
+                    distribution: dict[str, float] = {} }       # raw probabilities, shown only in Details
+
+Decision { final_option: str|null, status: DecisionStatus, reason_code: ReasonCode, reason_text: str|null,
+           actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime }
+
+AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type: DecisionType,
+                        subject: { kind: "vm"|"plan"|"wave", id: str, name: str },
+                        plan_id: str|null, migration_id: str|null, provider_id: str|null,   # provider = source
+                        model: AdvisorModelInfo, recommendation: RecommendedOption, decision: Decision,
+                        legacy: bool = false, legacy_text: str|null }                        # §14.4
 
 Approval { actor: str, at: datetime, comment: str|null }
 
@@ -1005,6 +1027,8 @@ documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
 ```
 
+Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4).
+
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
 top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
@@ -1078,6 +1102,8 @@ such lists again on persisted migration events.
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
+| GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
+| GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
@@ -1233,10 +1259,10 @@ skips approval, never triggers rollback or finalize.
   findings and estimates (redacted), priorities = "Minimize downtime within the SLO of {slo} s;
   prefer the simpler strategy when downtimes differ by less than 10 %; never pick an ineligible
   strategy", requirements = ["Estimated downtime is within the SLO", "The source VM keeps running
-  until cutover"], `escalate_on_contradiction: true`. The recommendation is applied only if
-  `selected` ∈ candidates and `confidence >= SEAMLESS_JEV_MIN_CONFIDENCE` (default `0.6`; a clear
-  live case scored 0.65–0.68, so 0.8 would almost never apply); the note records `source="jev"`
-  either way.
+  until cutover"], `escalate_on_contradiction: true`. It returns the advice — Jev's selected option,
+  confidence, probability distribution, status, escape flag and model version, or why Jev gave no usable
+  answer — and no longer decides: `decide()` does (§14.4). The threshold is `SEAMLESS_JEV_MIN_CONFIDENCE`
+  (default `0.6`; a clear live case scored 0.65–0.68, so 0.8 would almost never apply).
 * `classify_workloads(vms) -> (dict[source_id, tier], AdvisorNote)` — `jev_classify` with the six tier classes of
   §9.4 (each with a precise description); items with `decision == "review"` or invalid responses
   fall back to the regex heuristic. Without Jev, the heuristic is used (`source="rules"`).
@@ -1268,6 +1294,41 @@ body `{query, limit, project}`; parses hits tolerantly from `results|memories|it
   `<50G|50-200G|200-500G|>500G`, strategy), passes, final delta, estimated vs actual downtime.
 * `on_rolled_back(migration, reason)` → `remember` type `workflow`.
 All memory failures are logged and swallowed (never fail a migration).
+
+### 14.4 Recommendations and decisions (`ai/decision.py`)
+
+An advisor recommendation and the decision taken on it are stored apart, as an `AdvisorRecommendation`
+document (kind `recommendation`, §4.2); the engine reads only the decision.
+
+* `decide(recommendation, policy, evidence_count, default_option, *, action=None) -> Decision` is the only
+  place a decision is made (the dashboard never compares a confidence with a threshold). In order:
+  1. a user action: approve → `approved` (`APPROVED_BY_USER`, final = the recommended option); override with
+     another option → `overridden` (`OVERRIDDEN_BY_USER`, final = that option, `reason_text` = the reason);
+  2. no usable recommendation — Jev off, unavailable or timed out, an escape hatch (`ask_user`, `investigate`,
+     `none`), `escalate`/`invalid_response`, or an option outside the candidates → `fallback_rules`
+     (`ADVISOR_UNAVAILABLE_FALLBACK`, final = `default_option`, actor `system:fallback`, `reason_text` says which);
+  3. a policy that always requires approval → `pending_approval` (`POLICY_REQUIRES_APPROVAL`, final null);
+  4. confidence below the policy's threshold → `below_threshold` (`BELOW_THRESHOLD_DEFAULT_KEPT`, final =
+     `default_option`);
+  5. fewer evidence items than the policy's minimum → `pending_approval` (`INSUFFICIENT_EVIDENCE`, final null);
+  6. otherwise `auto_applied` (`ABOVE_THRESHOLD_AUTO_APPLY`, final = the recommended option).
+  Rules 3–6 record `actor = policy:<id>`, `policy_id` and `threshold_used`. Until stored policies exist the
+  global default applies: id `global-default`, auto-apply above `SEAMLESS_JEV_MIN_CONFIDENCE`, minimum
+  evidence 0 — so behaviour is unchanged.
+* A strategy recommendation is created by `validate_plan` for every automatic choice (plan default `auto`,
+  no override) whose advisor scope is not empty (§9.2): `decision_type migration_strategy`, subject the VM,
+  `migration_id`, `plan_id`, `provider_id` = the plan's source provider, `model` = Jev and its version (or
+  `rules` when Jev gave no usable answer), `default_option` = the deterministic choice of `select_strategy`.
+  The migration's `strategy` is `decision.final_option`, or the deterministic choice while it is null. Each
+  validation adds a recommendation (history is kept); validation no longer writes strategy notes and keeps the
+  notes a migration already has. Event `advisor.strategy` carries `{recommendation_id, option, confidence,
+  final_option, status, reason_code}`.
+* Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
+  are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
+  the note's summary, the option, confidence and distribution parsed from `data` where present, and a decision
+  read from it (`applied` → `auto_applied`; `source rules` → `fallback_rules`; otherwise `below_threshold`,
+  final = `data.deterministic`), actor `system:legacy`. Nothing is copied or rewritten: the listing adapts the
+  notes when it reads them, so the number of legacy entries always equals the number of strategy notes.
 
 ---
 
@@ -1426,6 +1487,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
+  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence" and "Decision:
+  <final option> — <why>" (applied automatically by policy <policy>; below threshold (<confidence>% <
+  <threshold>%); advisor unavailable, decided by rules; …), never the word "Selected"; a legacy entry shows a
+  "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
+  way (§14.4) —
   similar-incident search — the query field takes at most 2000 characters and the result count stays in
   1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,

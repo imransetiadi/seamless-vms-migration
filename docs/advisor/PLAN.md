@@ -14,7 +14,7 @@ commit before the code**; TDD; Jev decides between options and gates each change
 | D2 | `AuditEvent` = new persisted event kinds in the existing append-only `events` table (actor `policy:<id>` / `user:<id>` / `system:fallback`; `data.{target_id, model_version, before, after, snapshot_sha256}`); audit page, filters and CSV/JSON export read `GET /events`. | The table is already append-only (no API updates or deletes), streamed and exported; a second audit table would duplicate it. | `jev_decide` 0.99 over a new table |
 | D3 | Input snapshots: write-once document kind `advisor_snapshot`, id = SHA-256 of the redacted payload. | Content-addressed = immutable and verifiable. | — |
 | D4 | The engine keeps reading `migration.strategy`; `_validate_plan` writes it from `decision.final_option` (the deterministic choice while `pending_approval`, and the migration does not start until the decision is approved or overridden). | Smallest change to the migration engine; the spec's "engine reads only the final decision". | — |
-| D5 | Old strategy notes are copied once into `recommendation` with `legacy: true` (fields parsed where possible) by an idempotent step; originals stay in `Migration.advisor_notes`; rollback = delete the copies. | Reversible "migration" without a migration framework; counts verifiable. | — |
+| D5 | Old strategy notes are not copied: the recommendations listing adapts each strategy note left in `Migration.advisor_notes` into a `legacy: true` entry when it reads it (fields parsed where possible); validation keeps existing notes. | No data migration at all, so nothing to roll back and the counts match by construction (refined while writing the SDD for PR-1; it replaces a one-time copy). | — |
 | D6 | Permissions are named in the API and mapped to a minimum role: `advisor.policy.manage` → `admin`, `advisor.approve` → `admin`. | Existing role model (SDD §13); spec default "Admin". `TODO(ADV-04): confirm` (`approver` is the alternative). | — |
 
 ## Open questions — defaults in force
@@ -30,7 +30,7 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 
 | PR | Item | Scope here | Status |
 |---|---|---|---|
-| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy copy step, feed from the new route, notes show "Recommended … / Decision …" (no "Selected") | planned |
+| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | in progress |
 | PR-2 | ADV-06 core | one redaction gateway every Jev call and memory write passes; fixture test (password, bearer, PEM, clouds.yaml `auth`) | planned |
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | planned |
 | PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | planned |
