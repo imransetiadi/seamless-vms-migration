@@ -601,11 +601,11 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 | Foundations | `format.test.ts` (bytes/duration/percent edge cases), `phase.test.ts` (every `Phase` has label, tone and icon — status is never color alone), `stream.test.ts` (multi-line SSE chunks, heartbeats ignored, last id tracked), `client.test.ts` (bearer header, error envelope → `ApiError`, 401 → `onUnauthorized`) |
 | Pages | VmTable filtering; Overview rendering with mock data; MigrationsTable sorting/filtering and actions enabled by plan status |
 | Migration actions | actions enabled per phase **and** role (Finalize only in `completed`, only for approvers, requires typing the VM name); downtime clock counts from `downtime_started_at`; events list appends streamed events |
-| Accessibility | `contrast.test.ts` computes WCAG ratios for the SDD §16 token pairs in both themes (≥ 4.5:1 for text) |
+| Accessibility | `contrast.test.ts` computes WCAG ratios for the SDD §16 token pairs in both themes (≥ 4.5:1 for text); focus never drops to the page (WCAG 2.4.3, SDD §16): `PlanDetail.test.tsx` — Start, Resume, Finalize all, Finalize wave and the not-finalized notice's Dismiss move it to the plan's heading, a later Cancel still returns it to its button — and `ProbeListEditor.test.tsx` — Remove probe moves it to the list's legend; each failed with focus on `<body>` before the fix |
 
 ### 12.2 Manual accessibility and responsive checklist (WCAG 2.2 AA, SDD §16) — per release
 
-- [ ] Keyboard only: every action reachable, logical tab order, no traps; dialogs return focus.
+- [ ] Keyboard only: every action reachable, logical tab order, no traps; dialogs return focus — to the button that opened them, or to the plan's heading when the action took that button with it (Start, Resume, Finalize).
 - [ ] Visible focus ring on every interactive element in both themes.
 - [ ] Status shown by icon **and** text label, never color alone (check with a grayscale filter).
 - [ ] Progress and phase changes announced (`aria-live`); `prefers-reduced-motion` removes animation.
