@@ -614,6 +614,14 @@ describe('mock API', () => {
     expect(kept!.phase).not.toBe('validating'); // taken over by the validation (SDD §5.4)
   });
 
+  it('refuses a similar-incident search outside the bounds the API accepts (SDD §12)', async () => {
+    const { client } = setup('operator');
+    for (const body of [{ query: '' }, { query: 'x'.repeat(2001) }, { query: 'disk', limit: 0 }, { query: 'disk', limit: 21 }]) {
+      await expect(client.post('/advisor/similar-incidents', body), JSON.stringify(body).slice(0, 40)).rejects.toMatchObject({ status: 422 });
+    }
+    await expect(client.post('/advisor/similar-incidents', { query: 'x'.repeat(2000), limit: 20 })).resolves.toMatchObject({ hits: expect.any(Array) });
+  });
+
   it('lets a never-validated plan hold nothing, and a retry go ahead once the other plan lets the VM go (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

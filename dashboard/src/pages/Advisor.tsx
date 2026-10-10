@@ -2,6 +2,7 @@ import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, Search, SearchX }
 import { useId, useMemo, useState, type FormEvent } from 'react';
 import { useAdvisorStatus, useMigrations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
+import { ADVISOR_QUERY_MAX } from '../api/types';
 import { AdvisorNotes, type AdvisorNoteRow } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
@@ -154,6 +155,7 @@ export default function Advisor() {
                   type="search"
                   className="input"
                   placeholder="e.g. warm sync does not converge on PostgreSQL"
+                  maxLength={ADVISOR_QUERY_MAX}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   aria-invalid={touched && !query.trim() ? true : undefined}

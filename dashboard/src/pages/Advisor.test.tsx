@@ -60,6 +60,14 @@ describe('Advisor page', () => {
     await waitFor(() => expect(search).toHaveAccessibleDescription('agentmemory is not enabled.'));
   });
 
+  it('keeps the search within the bounds the API accepts: 2000 characters, 1 to 20 results (SDD §12, §16)', async () => {
+    renderWithApp(<Advisor />, { token: 'operator' });
+    expect(await screen.findByLabelText('Describe the problem')).toHaveAttribute('maxlength', '2000');
+    const counts = Array.from((screen.getByLabelText('Results') as HTMLSelectElement).options).map((o) => Number(o.value));
+    expect(counts.length).toBeGreaterThan(0);
+    expect(counts.every((n) => Number.isInteger(n) && n >= 1 && n <= 20)).toBe(true);
+  });
+
   it('announces the error when the search is submitted empty (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Advisor />, { token: 'operator' });

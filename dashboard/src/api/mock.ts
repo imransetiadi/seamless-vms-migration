@@ -47,7 +47,7 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { ACTION_TEXT_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES, SYNC_PASSES_LATEST } from './types';
+import { ACTION_TEXT_MAX, ADVISOR_LIMIT_MAX, ADVISOR_QUERY_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES, SYNC_PASSES_LATEST } from './types';
 
 interface MockResponse {
   status: number;
@@ -766,7 +766,12 @@ export class MockServer {
       }
       if (id === 'similar-incidents' && method === 'POST') {
         this.require(token, 'operator', path);
-        return ok(this.similarIncidents(String(input.query ?? ''), Number(input.limit ?? 5) || 5));
+        // like the API (SDD §12): a query of 1-2000 characters, 1-20 results
+        const queryText = typeof input.query === 'string' ? input.query : '';
+        const limit = input.limit === undefined ? 5 : Number(input.limit);
+        if (!queryText || queryText.length > ADVISOR_QUERY_MAX) throw new HttpError(422, 'validation_error', `query must be 1-${ADVISOR_QUERY_MAX} characters.`);
+        if (!Number.isInteger(limit) || limit < 1 || limit > ADVISOR_LIMIT_MAX) throw new HttpError(422, 'validation_error', `limit must be 1-${ADVISOR_LIMIT_MAX}.`);
+        return ok(this.similarIncidents(queryText, limit));
       }
     }
 
