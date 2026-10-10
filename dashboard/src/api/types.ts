@@ -438,12 +438,13 @@ export interface DestinationFlavor {
   extra_specs: Record<string, string>;
 }
 
+/** Free amounts per destination project (SDD §10): -1 is unlimited, null not reported. */
 export interface ProjectQuota {
-  cores: number;
-  ram_mb: number;
-  instances: number;
-  volumes: number;
-  gigabytes: number;
+  cores: number | null;
+  ram_mb: number | null;
+  instances: number | null;
+  volumes: number | null;
+  gigabytes: number | null;
 }
 
 export interface DestinationInventory {

@@ -61,6 +61,23 @@ describe('Inventory', () => {
     expect(screen.queryByText(/\bGB\b/)).not.toBeInTheDocument();
   });
 
+  it('shows an unlimited (-1) or unreported (null) free quota as such, never as a number (SDD §10, §16)', async () => {
+    const server = createTestServer();
+    const inventories = (server as unknown as { inventories: Record<string, { quotas: Record<string, Record<string, number | null>> }> }).inventories;
+    inventories['rhoso-prod']!.quotas = {
+      admin: { cores: -1, ram_mb: -1, instances: -1, volumes: -1, gigabytes: -1 },
+      ops: { cores: 10, ram_mb: null, instances: 5, volumes: 4, gigabytes: null },
+    };
+    renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'viewer', server });
+    const quotas = await screen.findByRole('region', { name: 'Free quota per project' });
+    const cells = (project: string) =>
+      within(within(quotas).getByRole('row', { name: new RegExp(`^${project}`) }))
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent);
+    expect(cells('admin')).toEqual(['Unlimited', 'Unlimited', 'Unlimited', 'Unlimited', 'Unlimited']);
+    expect(cells('ops')).toEqual(['10', 'Not reported', '5', '4', 'Not reported']);
+  });
+
   it('says when a destination reports no projects', async () => {
     renderWithApp(<Inventory />, { route: '/inventory/rhoso-staging', path: '/inventory/:providerId', token: 'viewer' });
     const projects = await screen.findByRole('region', { name: 'Projects' });

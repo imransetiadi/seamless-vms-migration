@@ -15,13 +15,19 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
-
-/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
-const GIB = 1024 ** 3;
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import type { NewPlanState } from './Plans';
+
+/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
+const GIB = 1024 ** 3;
+
+/** A free quota (SDD §10): -1 is unlimited and null not reported, never shown as a number. */
+function quotaText(value: number | null, format: (value: number) => string): string {
+  if (value === null) return 'Not reported';
+  return value < 0 ? 'Unlimited' : format(value);
+}
 
 function DestinationInventoryView({ inventory }: { inventory: DestinationInventory }) {
   const networks = Object.entries(inventory.networks);
@@ -158,11 +164,11 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                 {quotas.map(([project, q]) => (
                   <tr key={project}>
                     <th scope="row">{project}</th>
-                    <td className="num text-right">{formatNumber(q.cores)}</td>
-                    <td className="num text-right">{formatBytes(q.ram_mb * 1024 * 1024)}</td>
-                    <td className="num text-right">{formatNumber(q.instances)}</td>
-                    <td className="num text-right">{formatNumber(q.volumes)}</td>
-                    <td className="num text-right">{formatBytes(q.gigabytes * GIB)}</td>
+                    <td className="num text-right">{quotaText(q.cores, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.ram_mb, (mb) => formatBytes(mb * 1024 * 1024))}</td>
+                    <td className="num text-right">{quotaText(q.instances, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.volumes, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.gigabytes, (gb) => formatBytes(gb * GIB))}</td>
                   </tr>
                 ))}
               </tbody>
