@@ -315,7 +315,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
 `migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5), `migration.source_running`,
-`plan.finalized` (§8.1),
+`migration.source_stopped`, `plan.finalized` (§8.1),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
@@ -948,7 +948,9 @@ rollback. `Stats.completed` stays the verified ones; `awaiting_finalize` and `fi
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
 in demo mode ÷ `demo_speed`) the tick asks its source provider for the source VM (`get_vm`). Seen `running`, the
 migration records `source_running_at` once and emits `migration.source_running` (data `{"power_state"}`): the VM
-writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears. A VM
+writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
+migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
+the timeline records it. A VM
 the provider no longer has (a storage handover rebuilt it, a finalize deleted it) and a provider error are skipped
 (logged), never a failure. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
