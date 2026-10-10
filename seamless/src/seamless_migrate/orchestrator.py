@@ -1433,6 +1433,10 @@ class Orchestrator:
                 )
             except NotAllowed as exc:  # left completed meanwhile, or the cleanup failed
                 skipped.append({"migration_id": m.id, "reason": str(exc)})
+            except Exception as exc:  # any other error skips this VM, not the others (SDD §8.1)
+                log.warning("finalize of %s failed", m.id, exc_info=True)
+                reason = redact_cut(str(exc), 500).strip() or type(exc).__name__
+                skipped.append({"migration_id": m.id, "reason": f"finalize failed: {reason}"})
         names = {m.id: m.vm.name for m in waiting}
         await self._emit(
             "plan.finalized",

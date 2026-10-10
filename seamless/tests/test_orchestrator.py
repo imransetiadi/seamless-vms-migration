@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -4164,6 +4165,49 @@ async def test_finalize_plan_finalizes_a_wave_with_one_approval_and_audits_each_
     assert rest == {"finalized": [ms["vm-3"].id], "skipped": []}
     with pytest.raises(NotAllowed, match="no completed migration"):
         await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
+
+
+async def test_finalize_plan_skips_a_vm_whose_finalize_raised_any_error(tmp_path, store, caplog):
+    """SDD §8.1: an unexpected error in one VM's finalize — a provider error, an OSError — skips
+    that VM with its redacted reason instead of aborting the approval: the VMs after it are still
+    finalized, the skipped ones stay completed, one plan.finalized event reports both, and the
+    traceback goes to the service log."""
+    h, plan = await _completed_plan(tmp_path, store, n=3, waves=[])
+    password = "Sup3r" + "S3cretPw"
+
+    async def flaky(ctx):
+        if ctx.migration.vm.source_id == "vm-1":
+            raise ProviderError(
+                f"src-osp: Unauthorized: POST https://svc:{password}@keystone.example/v3"
+            )
+        if ctx.migration.vm.source_id == "vm-2":
+            raise OSError(28, "No space left on device")
+        return StepResult(details={"finalized": True})
+
+    h.executor.hooks[StepName.FINALIZE] = flaky
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.orchestrator"):
+        out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
+    ms = {v: await h.by_vm(plan.id, v) for v in ("vm-1", "vm-2", "vm-3")}
+    logged = [r for r in caplog.records if r.getMessage().startswith("finalize of ")]
+    assert [(r.getMessage(), r.exc_info[0]) for r in logged] == [
+        (f"finalize of {ms['vm-1'].id} failed", ProviderError),
+        (f"finalize of {ms['vm-2'].id} failed", OSError),
+    ]
+    assert out["finalized"] == [ms["vm-3"].id]
+    assert [s["migration_id"] for s in out["skipped"]] == [ms["vm-1"].id, ms["vm-2"].id]
+    assert [s["reason"] for s in out["skipped"]] == [
+        "finalize failed: src-osp: Unauthorized: POST https://[REDACTED]@keystone.example/v3",
+        "finalize failed: [Errno 28] No space left on device",
+    ]
+    assert [ms[v].phase for v in ("vm-1", "vm-2", "vm-3")] == [
+        P.completed,
+        P.completed,
+        P.finalized,
+    ]
+    [batch] = [e for e in store.events(since_seq=0, limit=100000) if e.kind == "plan.finalized"]
+    assert batch.data["finalized"] == ["web-03"]
+    assert [s["vm"] for s in batch.data["skipped"]] == ["web-01", "web-02"]
+    assert password not in str(batch.data)
 
 
 async def test_finalize_plan_reports_the_vms_it_could_not_finalize(tmp_path, store):
