@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Migration, Role } from '../api/types';
+import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatDuration } from '../lib/format';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { MigrationActions } from './MigrationActions';
@@ -58,9 +59,12 @@ describe('MigrationActions', () => {
     await user.click(button(/^force cutover$/i));
     const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
     expect(dialog).toHaveTextContent('The last pass (pass 2) changed 12.6 GiB.');
-    // forcing a VM whose estimate misses the SLO says so (db-mysql-02: about 24 min against 15)
-    expect(migration.estimate!.downtime_s).toBeGreaterThan(plan.downtime_slo_s);
-    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(migration.estimate!.downtime_s)}, over the SLO of ${formatDuration(plan.downtime_slo_s)}.`);
+    // the figure a Force cutover records (SDD §5.4, §16): after the running pass - not the converged estimate;
+    // forcing a VM whose downtime misses the SLO says so (db-mysql-02: about 21 min against 15)
+    const forced = forcedDowntime(migration, plan);
+    expect(Math.abs(forced - migration.estimate!.downtime_s)).toBeGreaterThan(60);
+    expect(forced).toBeGreaterThan(plan.downtime_slo_s);
+    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(forced)}, over the SLO of ${formatDuration(plan.downtime_slo_s)}.`);
     // maker-checker still applies (SDD §5.4, ADV-17)
     expect(dialog).toHaveTextContent('Another approver still approves the cutover');
     const confirm = within(dialog).getByRole('button', { name: /^force cutover$/i });
@@ -79,6 +83,7 @@ describe('MigrationActions', () => {
         actor: 'sari',
         reason: 'The change window closes in 20 minutes',
         delta_bytes: Math.round(12.6 * 2 ** 30),
+        estimated_downtime_s: forced, // the figure the dialog showed
       }),
     );
     expect(server.events.at(-1)).toMatchObject({ kind: 'migration.force_cutover', actor: 'sari' });
@@ -90,7 +95,7 @@ describe('MigrationActions', () => {
     const server = createTestServer();
     const migration = server.migrations.find((m) => m.id === 'mig-5d7e2b4a10')!;
     expect(migration).toMatchObject({ phase: 'precopy', sync_passes: [] });
-    // an estimate within the SLO
+    // the converged estimate is not what a Force cutover records: the dialog shows the downtime after the running full pass
     migration.estimate = { ...migration.estimate!, downtime_s: 600 };
     const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
     const role: Role = 'approver';
@@ -99,7 +104,9 @@ describe('MigrationActions', () => {
     const dialog = await screen.findByRole('alertdialog', { name: `Force the cutover of ${migration.vm.name}?` });
     expect(dialog).toHaveTextContent('The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile.');
     expect(plan?.downtime_slo_s).toBe(900);
-    expect(dialog).toHaveTextContent('The estimated downtime is 10m 00s against an SLO of 15m 00s.');
+    const forced = forcedDowntime(migration, plan!);
+    expect(forced).toBeGreaterThan(900);
+    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(forced)}, over the SLO of 15m 00s.`);
     expect(dialog).not.toHaveTextContent(/last pass/i);
   });
 

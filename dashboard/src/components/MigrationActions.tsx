@@ -15,6 +15,7 @@ import { useId, useState } from 'react';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
+import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
@@ -124,6 +125,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
   );
   const estimate = m.estimate ? formatDuration(m.estimate.downtime_s) : 'unknown';
+  // what a Force cutover records (SDD §5.4, §16): the downtime after the running pass, not the converged estimate
+  const forced = plan && isWarmStrategy(m.strategy) ? forcedDowntime(m, plan) : null;
   // the API lists only passes that ended (SDD §4.2): the last one is what a Force cutover records
   const lastPass = m.sync_passes.filter((p) => p.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
@@ -228,9 +231,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             {lastPass
               ? `The cutover skips the convergence rule: the running pass finishes, then the source VM stops and the final sync copies what changed. The last pass (pass ${lastPass.number}) changed ${formatBytes(lastPass.bytes_changed)}. `
               : 'The cutover skips the convergence rule. The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile. '}
-            The estimated downtime is {estimate}
+            The estimated downtime is {forced !== null ? formatDuration(forced) : 'unknown'}
             {/* forcing skips the passes that would shorten it: say when it misses the SLO already */}
-            {slo ? (m.estimate && plan && m.estimate.downtime_s > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
+            {slo ? (forced !== null && plan && forced > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
             {fourEyes
               ? 'Another approver still approves the cutover; the window and a free cutover slot still apply.'
               : 'This also records your approval; the window and a free cutover slot still apply.'}

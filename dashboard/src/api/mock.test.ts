@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { forcedDowntime } from '../lib/forcedEstimate';
 import { createMockFetch, MockServer } from './mock';
 import { streamEvents } from './stream';
 import {
@@ -1475,13 +1476,16 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
     expect([m.phase, m.strategy, m.converged_by, m.force_cutover]).toEqual(['syncing', 'warm', null, null]);
+    // the API's figure (SDD §5.4): the downtime after the running pass, as the dialog shows it - not the converged estimate
+    const expected = forcedDowntime(m, server.plans.find((p) => p.id === m.plan_id)!);
+    expect(Math.abs(expected - m.estimate!.downtime_s)).toBeGreaterThan(60);
     const forced = await as(server, 'approver').post<Migration>(`/migrations/${m.id}/force-cutover`, { reason: `  ${REASON}  ` });
     expect(forced.force_cutover).toEqual({
       actor: 'sari',
       at: new Date(NOW).toISOString(),
       reason: REASON,
       delta_bytes: Math.round(12.6 * GiB),
-      estimated_downtime_s: m.estimate!.downtime_s,
+      estimated_downtime_s: expected,
     });
     // maker-checker (SDD §5.4, ADV-17): the forcer requested the cutover; another approver approves it
     expect([forced.cutover_requested, forced.cutover_requested_by, forced.approvals]).toEqual([true, 'sari', []]);
@@ -1489,7 +1493,7 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
       kind: 'migration.force_cutover',
       actor: 'sari',
       migration_id: m.id,
-      data: { reason: REASON, delta_bytes: Math.round(12.6 * GiB), estimated_downtime_s: m.estimate!.downtime_s },
+      data: { reason: REASON, delta_bytes: Math.round(12.6 * GiB), estimated_downtime_s: expected },
     });
     // the running pass finishes, then the migration waits for the gate with the rule recorded
     for (let i = 0; i < 200 && m.phase === 'syncing'; i += 1) server.tick();

@@ -11,6 +11,7 @@
  * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
 import { DEFAULT_API_BASE } from './client';
+import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
@@ -1969,7 +1970,8 @@ export class MockServer {
         if (m.force_cutover) throw new HttpError(409, 'conflict', `Already forced by ${m.force_cutover.actor}: the cutover follows the running pass.`);
         const last = m.sync_passes.filter((p) => p.ended_at !== null).at(-1);
         const at = new Date(this.now()).toISOString();
-        const force = { actor: me.name, at, reason, delta_bytes: last?.bytes_changed ?? 0, estimated_downtime_s: m.estimate?.downtime_s ?? 0 };
+        // the API's figure (SDD §5.4): the downtime after the running pass, as the Force cutover dialog shows it
+        const force = { actor: me.name, at, reason, delta_bytes: last?.bytes_changed ?? 0, estimated_downtime_s: forcedDowntime(m, plan) };
         m.force_cutover = force;
         // a request too, under maker-checker like POST …/cutover (SDD §5.4, ADV-17)
         if (!plan.require_distinct_approver) m.approvals.push({ actor: me.name, at, comment: reason });
