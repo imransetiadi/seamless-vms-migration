@@ -1285,6 +1285,18 @@ describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
     expect(node.phase).toBe('cutover');
   });
 
+  it('refuses the approval of the approver who forced the cutover, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const warm = byPhase(server, 'syncing');
+    await as(server, ADMIN_TOKEN).post(`/migrations/${warm.id}/cutover`, { comment: 'Window agreed' });
+    await as(server, 'approver').post(`/migrations/${warm.id}/force-cutover`, { reason: 'the window closes in ten minutes' });
+    await expect(as(server, 'approver').post(`/migrations/${warm.id}/approve`, { comment: 'my own force' })).rejects.toMatchObject({
+      status: 409,
+      message: 'You forced this cutover. Another approver must approve it.',
+    });
+    expect(warm.approvals.map((a) => a.actor)).not.toContain('sari');
+  });
+
   it("does not count an approval the requester gave before requesting: the gate waits for another approver's", async () => {
     const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'storage_handover', confidence: 0.99 }) });
     await as(server, 'operator').post('/plans/plan-c81d44a0/validate');

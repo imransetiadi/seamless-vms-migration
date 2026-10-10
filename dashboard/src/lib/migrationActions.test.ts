@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
-import { OWN_CUTOVER } from './roles';
+import { OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -190,6 +190,25 @@ describe('migrationActions rules', () => {
     expect(countedApprovals(m, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
     // stored before ADV-17: no requester, every approval counts
     expect(countedApprovals({ ...m, cutover_requested_by: null }, { ...plan, require_distinct_approver: true })).toHaveLength(2);
+  });
+
+  it('holds the approver who forced the cutover to the requester\'s rule, also when another user requested it (SDD §5.4)', () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const at = '2026-10-08T11:00:00Z';
+    const forced = migration('awaiting_cutover', {
+      cutover_requested: true,
+      cutover_requested_by: 'bob',
+      cutover_requested_at: at,
+      force_cutover: { actor: 'sari', at, reason: 'the window closes', delta_bytes: 0, estimated_downtime_s: 60 },
+      approvals: [{ actor: 'sari', at, comment: null }, { actor: 'rina', at, comment: 'Checked' }],
+    });
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const distinct = { ...plan, require_distinct_approver: true };
+    expect(migrationActions(forced, 'approver', distinct, now, 'sari').approve).toEqual({ enabled: false, reason: OWN_FORCE });
+    expect(migrationActions(forced, 'approver', distinct, now, 'rina').approve.enabled).toBe(true);
+    expect(migrationActions(forced, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
+    expect(countedApprovals(forced, distinct).map((a) => a.actor)).toEqual(['rina']);
+    expect(countedApprovals(forced, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
   });
 
   it('says that a requested cutover waits for another approver, and that a request is not an approval (ADV-17)', () => {

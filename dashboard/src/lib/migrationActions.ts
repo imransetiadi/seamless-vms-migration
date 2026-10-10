@@ -4,7 +4,7 @@ import { formatRelative } from './format';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
-import { hasRole, OWN_CUTOVER, PERMISSIONS } from './roles';
+import { hasRole, OWN_CUTOVER, OWN_FORCE, PERMISSIONS } from './roles';
 
 export type MigrationActionKey = 'approve' | 'cutover' | 'force-cutover' | 'sync' | 'rollback' | 'retry' | 'cancel' | 'finalize';
 
@@ -39,11 +39,15 @@ function isSingleShot(m: Migration): boolean {
   return !isWarmStrategy(m.strategy);
 }
 
-/** The approvals the cutover gate counts (SDD §5.4 rule 1): all but the requester's when the plan requires a distinct approver. */
+/**
+ * The approvals the cutover gate counts (SDD §5.4 rule 1): all but, when the plan requires a distinct
+ * approver, the requester's and the forcer's.
+ */
 export function countedApprovals(m: Migration, plan: Plan | null | undefined): Approval[] {
   // while the plan loads, the API's default holds: a distinct approver
-  if (plan?.require_distinct_approver !== false && m.cutover_requested_by) return m.approvals.filter((a) => a.actor !== m.cutover_requested_by);
-  return m.approvals;
+  if (plan?.require_distinct_approver === false) return m.approvals;
+  const own = new Set([m.cutover_requested_by, m.force_cutover?.actor].filter(Boolean));
+  return own.size ? m.approvals.filter((a) => !own.has(a.actor)) : m.approvals;
 }
 
 /** Maker-checker (ADV-17): the plan wants an approval, and not from the cutover's requester. */
@@ -64,8 +68,9 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
   switch (key) {
     case 'approve':
       if (APPROVAL_LASTS.has(m.phase)) {
-        // maker-checker (SDD §5.4): the API refuses the requester's approval
+        // maker-checker (SDD §5.4): the API refuses the requester's approval, and the forcer's
         if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(OWN_CUTOVER);
+        if (user && m.force_cutover?.actor === user && plan?.require_distinct_approver !== false) return no(OWN_FORCE);
         return ok;
       }
       if (BEFORE_VALIDATION.has(m.phase)) return no('Validate the plan first: validation clears approvals, so approve its new assessment.');

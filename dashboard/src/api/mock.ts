@@ -17,7 +17,7 @@ import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { probesFor } from '../lib/probes';
-import { hasRole, OWN_CUTOVER, OWN_DECISION } from '../lib/roles';
+import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
 import { WAVE_COMPLETE_PHASES } from '../lib/waves';
@@ -1915,6 +1915,8 @@ export class MockServer {
         if (!APPROVABLE.has(m.phase)) throw new HttpError(409, 'conflict', `a migration in ${m.phase} cannot be approved`);
         // maker-checker (SDD §5.4, ADV-17): the requester never approves their own cutover
         if (plan.require_distinct_approver && m.cutover_requested_by === me.name) throw new HttpError(409, 'conflict', OWN_CUTOVER);
+        // and the approver who forced it (SDD §5.4)
+        if (plan.require_distinct_approver && m.force_cutover?.actor === me.name) throw new HttpError(409, 'conflict', OWN_FORCE);
         approve();
         break;
       case 'cutover': {
