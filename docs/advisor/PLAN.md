@@ -47,7 +47,15 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    Reported in [ADV-16-investigation.md](ADV-16-investigation.md): the numbers come from the demo simulator's time
    compression (model seconds next to wall-clock timestamps), a chart that reads the final sync as a delta, and the
    SDD §5.3 SLO rule the owner's invariant 3 leaves out; the real VMware warm cutover records no final pass.
-   Proposals P1–P7 wait for the owner.
+   The owner kept the SLO rule (P1) and approved P2–P6. Done — f1b5bc3, 957caa1, 1a24c1d (SDD), 0b930df (API: the
+   five invariants at completion in `Migration.data_issues` with `migration.data_inconsistent`, stats that count and
+   leave them out, `converged_by`, the estimate the rule used with its `downtime_parts`, a simulated cutover's
+   downtime in model seconds, `POST …/force-cutover`, `/health` `demo_speed`), fd10b78 (dashboard: the final sync as
+   its own bar, the rules in force and the one that converged, the downtime parts and estimate vs actual, demo clocks
+   in model time, the "Data inconsistent" badge and KPI notes, Force cutover; the mock checked against the
+   invariants). `TODO(ADV-16): P6` — the real VMware warm cutover's final CBT sync waits for the lab. Follow-up: a
+   demo rollback still records its downtime in wall seconds (SDD §5.2 counts model time for a verified cutover only),
+   so its clock freezes at a few seconds after running in model time.
 2. ADV-17 — maker-checker for approvals (a requester never approves their own request; no break-glass). Done —
    02d0dad, 77a6078 (SDD), 2b1a3b4 (API: `Plan.require_distinct_approver`, `cutover_requested_by/at`, the requester's
    approval refused with 409 and not counted by the gate; `AdvisorPolicy.require_distinct_approver`,
