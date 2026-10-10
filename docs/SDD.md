@@ -220,7 +220,10 @@ Finding { code: str, severity: Severity, message: str, remediation: str|null,
 
 Estimate { strategy: Strategy, eligible: bool, reasons: list[str] = [], precopy_s: float,
            passes: int, downtime_s: float, total_s: float, final_delta_bytes: int,
-           meets_slo: bool }
+           meets_slo: bool,
+           downtime_parts: dict[str, float] = {} }   # shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s: they add up to downtime_s (§9.1, ADV-16)
+
+ForceCutover { actor: str, at: datetime, reason: str, delta_bytes: int, estimated_downtime_s: float }   # §5.4
 
 AdvisorNote { kind: "strategy"|"classification"|"verification"|"similar_incidents"|"screen",
               source: "jev"|"rules"|"memory", summary: str, confidence: float|null,
@@ -272,6 +275,8 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             cutover_requested_by: str|null, cutover_requested_at: datetime|null,  # who asked for the cutover first, and when (§5.4)
             advisor_notes: list[AdvisorNote] = [],
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
+            converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
+            force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             created_at: datetime, updated_at: datetime }
@@ -290,6 +295,7 @@ passes that ended: a pass is recorded when it ends, and the running step is name
 Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `plan.paused`,
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
+`migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
@@ -363,7 +369,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
   (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. `actual_downtime_s` = difference. A retry resets a
+  rollback, when the source VM is running again. `actual_downtime_s` = difference — in demo mode in model
+  seconds, the difference times `SEAMLESS_DEMO_SPEED`, like the passes' `duration_s` (§7.4; the downtime events
+  say the same number), so a demo's downtime compares with its estimate (ADV-16). A retry resets a
   closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
   the next attempt counts from that first stop and the stats report the VM's whole outage.
 
@@ -372,7 +380,10 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
 After each pass, the migration moves to `awaiting_cutover` when **any** of these holds:
 `last_pass.bytes_changed <= plan.convergence_threshold_bytes`, or
 `estimate_final_downtime(last pass) <= plan.downtime_slo_s`, or `passes >= plan.max_sync_passes`.
-Otherwise another delta pass runs.
+Otherwise another delta pass runs. The rule that moved the migration is recorded in `Migration.converged_by`
+(`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4). The owner kept the SLO rule after the
+review of 10 October 2026 (ADV-16 P1): it lets a large VM cut over within its SLO without delta passes that would
+not shorten its downtime.
 
 ### 5.4 Cutover gate
 
@@ -409,6 +420,13 @@ delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ag
 grow the migration without bound: when a pass takes the list past that, the oldest pass in between is
 dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transferred` stays the total
 (`sync_bytes_dropped` plus the listed passes), and pass numbers keep counting from the last one.
+**Force cutover** (ADV-16): `POST /migrations/{id}/force-cutover {"reason": str}` (approver; the reason at least 10
+characters) is the only way to cut over before convergence. In `precopy` or `syncing` of a warm migration it records
+`Migration.force_cutover` — actor, time, reason, the last pass's `bytes_changed` and the estimated final downtime — and a
+cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
+finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
+approval by another approver (maker-checker), the window, the cutover slots. A request alone (`POST …/cutover`) never
+forces: it waits for convergence.
 Approvals, `cutover_requested` (with its requester) and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
@@ -432,6 +450,25 @@ naming the VM, that plan and the phase — finish, roll back or cancel it there,
 shared lock for this check, so two plans cannot claim a VM at the same time.
 `vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
 them; the SLO estimate and `max_sync_passes` decide.
+
+### 5.5 Migration invariants (`seamless_migrate.invariants`, ADV-16)
+
+`check_invariants(migration, plan, settings) -> list[str]` runs when a migration reaches `completed` and stores its
+findings in `Migration.data_issues` (code and text each); when any is found it emits `migration.data_inconsistent`.
+Every migration is checked, real and demo:
+
+1. `FINAL_SYNC_MISSING` — a warm migration has a `final` pass that started at or after `downtime_started_at`.
+2. `BYTES_MISMATCH` — `bytes_transferred` = `sync_bytes_dropped` + every listed pass.
+3. `CUTOVER_NOT_CONVERGED` — a warm migration converged by its recorded rule: `threshold` (the last pass before the
+   cutover changed at most `convergence_threshold_bytes`), `max_passes`, `slo` (the estimate recorded then fitted the
+   SLO) or `force` (a recorded Force cutover).
+4. `DOWNTIME_BELOW_FINAL_SYNC` — `actual_downtime_s` is at least the final pass's bytes over `plan.link_bps`.
+5. `ESTIMATE_PARTS_MISMATCH` — the estimate's `downtime_parts` add up to its `downtime_s`.
+
+The real VMware warm cutover does not record its final CBT sync yet (`TODO(ADV-16): P6`, needs the lab): outside demo
+mode invariants 1 and 4 skip `vmware_warm`. The plan statistics leave migrations with `data_issues` out of the
+average, p95 and maximum downtime and the SLO compliance and count them (`Stats.data_inconsistent`); the dashboard
+badges them "Data inconsistent". A property test runs the demo seed to the end and finds no issue.
 
 ---
 
@@ -760,7 +797,8 @@ shares, or the FlexVol inside its pool search pattern.
 
 Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default 60). Byte counts
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
-`bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`. Cutover fails with
+`bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
+source is stopped (ADV-16). Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
 strategy.
 
@@ -1098,7 +1136,7 @@ such lists again on persisted migration events.
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
@@ -1122,6 +1160,7 @@ such lists again on persisted migration events.
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester when the plan requires a distinct approver, §5.4) |
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
+| POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
@@ -1166,6 +1205,7 @@ ValidationReport { plan_id: str, ok: bool,
 Stats { total: int, by_phase: dict[Phase,int], completed: int, failed: int, in_progress: int,
         bytes_transferred: int, avg_downtime_s: float|null, p95_downtime_s: float|null,
         max_downtime_s: float|null, slo_compliance_pct: float|null,
+        data_inconsistent: int = 0,   # completed migrations with data_issues, left out of the downtime figures (§5.5)
         downtime_by_strategy: dict[Strategy, float],
         throughput_series: [{ "ts": datetime, "bps": float }]   # last 60 one-minute buckets
 }
@@ -1600,9 +1640,16 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   bytes as two figures, never one over the other — a warm migration transfers more than its disk holds; a
   `migration.progress` event updates them by the API's rule: `pct`, and `sync_bytes_dropped` plus the listed passes
   plus `bytes_done`; a `migration.sync_pass` event adds the pass that ended to the page's passes, so the figure does
-  not drop while the page fetches the migration again), sync-pass convergence chart (it names the running pass the
+  not drop while the page fetches the migration again), sync-pass convergence chart (the final sync, after the source
+  stopped, is its own bar and never a delta; its text names the rules in force — "Cutover is allowed when a pass changes
+  less than 1.0 GiB, when the estimated downtime fits the SLO, or after 5 passes", for VMware "CBT passes report no bytes:
+  the estimated downtime or the pass limit decides", ADV-16; it names the running pass the
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
-  and that the bytes they transferred stay counted, §5.4), downtime clock,
+  and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
+  `/health` `demo_speed`; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
+  difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
+  for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
+  estimated downtime and asks for the reason (§5.4) —,
   findings (before pre-flight ran: that it runs at validation, or is running), advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; Cancel says that the data copied so far is removed when the migration
