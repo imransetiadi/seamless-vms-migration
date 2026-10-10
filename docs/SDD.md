@@ -1524,7 +1524,9 @@ skips approval, never triggers rollback or finalize.
   (default `0.6`; a clear live case scored 0.65–0.68, so 0.8 would almost never apply).
 * `classify_workloads(vms) -> (dict[source_id, tier], AdvisorNote)` — `jev_classify` with the six tier classes of
   §9.4 (each with a precise description); items with `decision == "review"` or invalid responses
-  fall back to the regex heuristic. Without Jev, the heuristic is used (`source="rules"`).
+  fall back to the regex heuristic. Without Jev, the heuristic is used (`source="rules"`). Each item is sent as
+  `{"id": "item-<n>", "text": …}` — `id` the item's position in its batch, mapped back to the VM on the answer, so the
+  VM's own id never leaves the installation; "Data sent to advisor" declares it (§13.4).
 * `review_verification(vm, result) -> AdvisorNote | None` — when `use_advisor`: when the console excerpt may
   leave the installation (§13.4: on-prem, or `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`), redacts the console
   excerpt with `redact()` (§13.4 — guests print secrets to consoles too), then screens it with
