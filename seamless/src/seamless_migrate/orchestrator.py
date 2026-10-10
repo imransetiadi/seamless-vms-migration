@@ -481,8 +481,12 @@ class Orchestrator:
             automatic = (
                 plan.default_strategy == "auto" and vm.source_id not in plan.strategy_overrides
             )
+            # SDD §14.4: validation makes no choice for a migration in flight or finished (it
+            # leaves it alone), so the advisor is not asked about it
+            current = existing.get(vm.source_id)
+            chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
             advice = None
-            if self.advisor is not None and automatic:
+            if self.advisor is not None and automatic and chooses:
                 advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
             decision = None
             if advice is not None:
@@ -504,7 +508,10 @@ class Orchestrator:
             migration = await self._apply_validation(
                 migration.id, plan, vm, strategy, why, estimates, findings, actor, resolved
             )
-            if advice is not None and decision is not None:
+            # recorded only when this validation took the choice (ready or blocked now): one that
+            # went in flight meanwhile was left alone and runs what it ran
+            validated = migration.phase in (P.ready, P.blocked)
+            if advice is not None and decision is not None and validated:
                 await self._record_strategy_recommendation(plan, vm, migration, advice, decision)
             items.append(
                 ValidationItem(

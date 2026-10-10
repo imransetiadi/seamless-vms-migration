@@ -2223,6 +2223,45 @@ async def test_advisor_tie_break_recorded(tmp_path, store):
     assert session.calls and session.calls[0][0] == "jev_decide"
 
 
+async def test_a_revalidation_asks_and_records_nothing_for_a_migration_it_leaves_alone(
+    tmp_path, store
+):
+    """SDD §14.4: validation makes no choice for a migration already in flight, so the advisor is
+    not asked about it and no recommendation claims a strategy the engine is not running."""
+    advisor, session = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    store.put("migration", m.model_copy(update={"phase": P.precopy}))
+    asked = len(session.calls)
+
+    await h.orch.validate_plan(plan.id, "alice")
+    assert len(session.calls) == asked
+    assert [r.migration_id for r in _recommendations(store)] == [m.id]
+    assert (await h.migration(m.id)).phase == P.precopy
+
+
+async def test_a_migration_that_goes_in_flight_during_validation_gets_no_recommendation(
+    tmp_path, store
+):
+    """SDD §14.4: a migration that left ready while the advisor answered is left alone by the
+    validation, so its decision is not recorded either."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    apply = h.orch._apply_validation
+
+    async def started_meanwhile(mid, *args, **kwargs):
+        store.put("migration", (await h.migration(mid)).model_copy(update={"phase": P.precopy}))
+        return await apply(mid, *args, **kwargs)
+
+    h.orch._apply_validation = started_meanwhile
+    await h.orch.validate_plan(plan.id, "alice")
+    assert [r.migration_id for r in _recommendations(store)] == [m.id]
+    assert (await h.migration(m.id)).strategy == Strategy.warm
+
+
 @pytest.mark.parametrize(
     ("confidence", "status", "first_step"),
     [
