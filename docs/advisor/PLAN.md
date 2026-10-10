@@ -95,8 +95,9 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    and "Advisor policy" with mode, threshold and a link to `#policy-{id}` on `/advisor/policies`, which lands focus on
    the card). jev_decide 0.87 (compose from the routes the dashboard reads, no approvals route) and 0.99 (an approval
    listed once). Found on the way: Needs attention had counted the requester's own approval (maker-checker).
-   Follow-up (live stack, ADV-19): Edit plan's reason calls completed migrations "in flight … finish, roll back or
-   cancel them first" — for a completed one, finalize or roll back is meant.
+   Follow-up (live stack, ADV-19), done: Edit plan's reason called completed migrations "in flight … finish, roll back
+   or cancel them first"; the refusal now names each VM with what releases it — finalize or roll back a completed one
+   (SDD 434fc23, API 1fd2ad2, dashboard d5b188b; jev_decide 0.99).
 7. PR-6 ADV-02 evidence card. Done — see the table above. Recommendations recorded before ADV-02 (the live demo's) show
    "No evidence was recorded with this recommendation."; evidence appears with the next validation.
 8. Then the original order (after PR-6); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
