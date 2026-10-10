@@ -970,7 +970,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
   On every failure the knowledge service looks up similar incidents (§14.3) and attaches them as an
   `AdvisorNote` — after that write, so a slow agentmemory never holds the rollback back.
-* Locks: one `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
+* Locks: a lock lives while a coroutine holds it or waits for it (a weak table), so the table does not grow
+  with the ids requests name, known or not. One `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
   plan id serializes validations; one shared lock serializes the cross-plan claim of validations and
   retries (§5.4); one lock per provider id serializes provider checks, so a validation and a manual
   `POST /providers/{id}/check` do not collide on the provider's versioned write (a provider edited or
