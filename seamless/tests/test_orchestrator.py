@@ -797,6 +797,24 @@ async def test_a_retry_waiting_for_the_vm_claims_leaves_its_plans_lock_free(tmp_
     assert (await retry).phase == P.ready
 
 
+async def test_a_validation_of_a_running_plan_is_refused_before_it_waits_for_the_vm_claims(
+    tmp_path, store
+):
+    """SDD §8: a validation of another plan holds the claim lock through its provider calls; a
+    validation of a running plan is refused (409) under its own plan's lock before it waits for
+    the claims, so it never holds the lock the tick needs to start that plan's steps."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    async with h.orch._lock(VM_CLAIMS):  # another plan's validation
+        validation = asyncio.create_task(h.orch.validate_plan(plan.id, "bayu"))
+        await asyncio.sleep(0.05)
+        assert validation.done(), "it waits for the claims, holding the running plan's lock"
+        assert not h.orch.plan_lock(plan.id).locked(), "the tick's _begin would wait on it"
+        with pytest.raises(NotAllowed, match="pause the plan before validating it again"):
+            await validation
+
+
 async def test_a_retry_during_the_plans_completion_reopens_it(tmp_path, store):
     """SDD §8: the completion holds the plan's lock from its re-read to its write; a retry that
     arrives meanwhile waits for it, then finds the plan completed and reopens it."""

@@ -527,8 +527,13 @@ class Orchestrator:
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         # one validation per plan at a time: concurrent runs would create duplicate migrations;
         # and one claim of VMs at a time across plans (SDD §5.4)
-        async with self._lock(f"plan:{plan_id}"), self._lock(VM_CLAIMS):
-            return await self._validate_plan(plan_id, actor)
+        async with self._lock(f"plan:{plan_id}"):
+            # SDD §8: refused before waiting for the claims — another plan's validation may hold
+            # them for minutes, and the tick starts a running plan's steps under this lock
+            if (await self._plan(plan_id)).status == PlanStatus.running:
+                raise NotAllowed("pause the plan before validating it again")
+            async with self._lock(VM_CLAIMS):
+                return await self._validate_plan(plan_id, actor)
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
