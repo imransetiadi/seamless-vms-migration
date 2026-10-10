@@ -1245,6 +1245,7 @@ class Orchestrator:
                     raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
             previous = m.phase
+            m.advisor_hold = None  # a cancelled migration takes no decision (SDD §14.6)
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )

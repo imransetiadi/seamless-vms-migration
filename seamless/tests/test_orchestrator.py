@@ -2359,6 +2359,28 @@ async def test_with_the_finance_policy_a_decision_waits_and_holds_its_migration(
     )
 
 
+async def test_a_cancel_clears_the_advisor_hold(tmp_path, store):
+    """SDD §14.6 (advisor Phase 1 audit, A5): a cancelled migration takes no decision - the cancel
+    action and a validation's cancel of a VM that left the plan both clear the hold, or Pending
+    approvals would list a decision nobody can take."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    vms = [vm(1, size_gb=4, used_gb=1.0), vm(2, size_gb=4, used_gb=1.0)]
+    h, plan = await setup(tmp_path, store, vms, NO_GATE, advisor=advisor)
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    one, two = await h.by_vm(plan.id, "vm-1"), await h.by_vm(plan.id, "vm-2")
+    assert one.advisor_hold is not None and two.advisor_hold is not None
+    cancelled = await h.orch.cancel(one.id, "bayu", "not this one")
+    assert (cancelled.phase, cancelled.advisor_hold) == (P.cancelled, None)
+    assert (await h.migration(one.id)).advisor_hold is None
+    edited = store.get("plan", plan.id, Plan)
+    edited.vm_ids = []  # both VMs leave the plan: the validation cancels vm-2's migration
+    store.put("plan", edited)
+    await h.orch.validate_plan(plan.id, "alice")
+    removed = await h.migration(two.id)
+    assert (removed.phase, removed.advisor_hold) == (P.cancelled, None)
+
+
 async def test_after_an_override_the_engine_runs_the_chosen_option(tmp_path, store):
     """ADV-04 scenario 4: override to cold with a reason; the engine runs cold, the plan keeps
     the choice and the audit trail records who overrode what."""
