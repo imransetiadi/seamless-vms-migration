@@ -336,6 +336,21 @@ describe('mock API', () => {
     expect(m.phase).toBe('cutover');
   });
 
+  it("records a strategy change as the plan's override, so a re-validation keeps it, like the API (SDD §5.4)", async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'validated')!;
+    const m = server.migrations.find((x) => x.plan_id === plan.id && x.phase === 'ready' && x.estimates.filter((e) => e.eligible).length >= 2)!;
+    const chosen = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    await client.put(`/migrations/${m.id}/strategy`, { strategy: chosen });
+    expect(plan.strategy_overrides[m.vm.source_id]).toBe(chosen);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)).toMatchObject({
+      plan_id: plan.id,
+      data: { strategy_overrides: { [m.vm.source_id]: chosen } },
+    });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe(chosen);
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');

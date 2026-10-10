@@ -1127,7 +1127,12 @@ export class MockServer {
     m.estimate = est;
     this.clearApprovals(m);
     m.updated_at = new Date(this.now()).toISOString();
+    // like the API (SDD §5.4): the choice is the plan's override for the VM, so a re-validation keeps it
+    const plan = this.plan(m.plan_id);
+    plan.strategy_overrides = { ...plan.strategy_overrides, [m.vm.source_id]: strategy };
+    plan.updated_at = m.updated_at;
     this.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: strategy set to ${strategy}`, data: { action: 'strategy', strategy } });
+    this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name}: strategy override for ${m.vm.name}`, data: { strategy_overrides: { [m.vm.source_id]: strategy } } });
     return ok(m);
   }
 
