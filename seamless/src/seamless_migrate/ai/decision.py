@@ -143,6 +143,9 @@ def decide(
         "policy_id": policy.id,
         "threshold_used": policy.threshold,
         "decided_at": now,
+        # how a person may decide it later, whatever the policy says then (SDD §14.6)
+        "require_distinct_approver": policy.require_distinct_approver,
+        "require_override_reason": policy.require_override_reason,
     }
     if policy.mode == "always_require_approval":
         return Decision(

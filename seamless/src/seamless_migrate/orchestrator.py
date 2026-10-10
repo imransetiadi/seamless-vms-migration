@@ -1556,12 +1556,21 @@ class Orchestrator:
             policy = resolve_policy(
                 policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
             )
-            if policy.require_distinct_approver and rec.requested_by == actor:
+            # SDD §14.6: the rules of the policy that took the decision, as they were then; the
+            # policy in force only for a decision that recorded none (the fallback, older data)
+            distinct = rec.decision.require_distinct_approver
+            if distinct is None:
+                distinct = policy.require_distinct_approver
+            reason_required = rec.decision.require_override_reason
+            if reason_required is None:
+                reason_required = policy.require_override_reason
+            if distinct and rec.requested_by == actor:
                 raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
-            if isinstance(action, Override) and policy.require_override_reason:
+            if isinstance(action, Override) and reason_required:
                 if len(action.reason or "") < 10:
                     raise Unprocessable(
-                        f"policy {policy.id} requires an override reason of at least 10 characters"
+                        f"policy {rec.decision.policy_id or policy.id} requires an override "
+                        "reason of at least 10 characters"
                     )
             m, v = await self._load(mid)
             if m.phase not in REVALIDATABLE:
@@ -1591,6 +1600,13 @@ class Orchestrator:
                     raise Unprocessable(str(exc)) from None
                 raise NotAllowed(str(exc)) from None
             before = rec.decision
+            # the rules go on with a person's decision: a later one follows them too
+            decision = decision.model_copy(
+                update={
+                    "require_distinct_approver": distinct,
+                    "require_override_reason": reason_required,
+                }
+            )
             rec = rec.model_copy(update={"decision": decision})
             await self.db.put("recommendation", rec)
             final = Strategy(str(decision.final_option))

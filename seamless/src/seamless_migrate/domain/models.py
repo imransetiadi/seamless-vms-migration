@@ -516,6 +516,10 @@ class Decision(_Model):
     policy_id: str | None = None
     threshold_used: float | None = None
     decided_at: UTCDateTime = Field(default_factory=utcnow)
+    #: the deciding policy's rules for a person's approve or override, as they were then (SDD
+    #: §14.6); None: the fallback, or a decision stored before - the policy in force applies
+    require_distinct_approver: bool | None = None
+    require_override_reason: bool | None = None
 
 
 class AdvisorSubject(_Model):

@@ -2400,6 +2400,67 @@ async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_
     assert overridden.decision.status == DecisionStatus.overridden
 
 
+async def test_a_decision_keeps_the_rules_of_the_policy_that_took_it(tmp_path, store):
+    """SDD §14.6 (advisor Phase 1 audit, A3): a policy change applies from the next validation and
+    never rewrites a decision - switching maker-checker or the override reason off afterwards lets
+    nobody decide what the policy put to another person, also after a first person's decision."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    finance = _finance(plan)
+    store.put("advisor_policy", finance)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.requested_by, rec.decision.require_distinct_approver) == ("alice", True)
+    assert rec.decision.require_override_reason is True
+    relaxed = finance.model_copy(
+        update={"require_distinct_approver": False, "require_override_reason": False}
+    )
+    store.put("advisor_policy", relaxed)
+    with pytest.raises(NotAllowed) as own:
+        await h.orch.approve_recommendation(rec.id, "alice")
+    assert str(own.value) == OWN_DECISION
+    with pytest.raises(Unprocessable, match="requires an override reason"):
+        await h.orch.override_recommendation(rec.id, "cold", None, "rina")
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    # the rules go on with the person's decision
+    assert approved.decision.require_distinct_approver is True
+    with pytest.raises(NotAllowed) as again:
+        await h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "alice")
+    assert str(again.value) == OWN_DECISION
+
+
+async def test_a_decision_that_recorded_no_rules_follows_the_policy_in_force(tmp_path, store):
+    """SDD §14.6: a decision stored before it recorded its policy's rules (or the fallback's)
+    follows the policy in force - strict while it is strict, relaxed once it is relaxed."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    finance = _finance(plan)
+    store.put("advisor_policy", finance)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    older = rec.decision.model_copy(
+        update={"require_distinct_approver": None, "require_override_reason": None}
+    )
+    store.put("recommendation", rec.model_copy(update={"decision": older}))
+    with pytest.raises(NotAllowed) as own:
+        await h.orch.approve_recommendation(rec.id, "alice")
+    assert str(own.value) == OWN_DECISION
+    with pytest.raises(Unprocessable, match="requires an override reason"):
+        await h.orch.override_recommendation(rec.id, "cold", None, "rina")
+    store.put(
+        "advisor_policy",
+        finance.model_copy(
+            update={"require_distinct_approver": False, "require_override_reason": False}
+        ),
+    )
+    overridden = await h.orch.override_recommendation(rec.id, "cold", None, "alice")
+    assert overridden.decision.status == DecisionStatus.overridden
+
+
 async def test_a_person_may_still_approve_an_auto_applied_decision(tmp_path, store):
     """SDD §14.6: approve acts on the newest recommendation of an unstarted migration whatever its
     decision - only an approved one is not approved again."""
