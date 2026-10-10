@@ -1300,19 +1300,20 @@ class Orchestrator:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
                     raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
-            previous = m.phase
             m.advisor_hold = None  # a cancelled migration takes no decision (SDD §14.6)
+            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
+            # the retries, §8) or has just finished unrecorded; with the passes a migration
+            # recorded, that data path left snapshots, temporary and destination volumes behind,
+            # and `cancelled` is terminal: no later action could remove them
+            data_path = m.phase in (P.precopy, P.syncing) or bool(m.sync_passes)
+            if data_path:
+                m.checkpoint = "cleanup"  # saved with cancelled: a crash cannot lose the cleanup
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
-            # the retries, §8) or has just finished unrecorded; with the passes a migration
-            # recorded, that data path left snapshots, temporary and destination volumes behind,
-            # and `cancelled` is terminal: no later action could remove them
-            data_path = previous in (P.precopy, P.syncing) or bool(m.sync_passes)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -1354,6 +1355,7 @@ class Orchestrator:
                     migration=m,
                     data={"step": "cleanup", "error_class": type(exc).__name__},
                 )
+                await self._cleanup_recorded(m.id, "cleanup_failed")
                 return
             await self._emit(
                 "migration.action",
@@ -1362,13 +1364,15 @@ class Orchestrator:
                 actor=actor,
                 data={"action": "cleanup"},
             )
+            await self._cleanup_recorded(m.id, "cleaned")
         except asyncio.CancelledError:
-            # a shutdown interrupted the cleanup: its outcome is still recorded (SDD §5.1)
+            # a shutdown interrupted the cleanup: its outcome is still recorded, and its mark
+            # stays, so the next start runs it (SDD §5.1)
             with contextlib.suppress(Exception):
                 await self._emit(
                     "migration.error",
-                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; run "
-                    "rollback_workloads.yml for the workload to remove its temporary resources",
+                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; it runs "
+                    "again when the orchestrator starts",
                     migration=m,
                     data={"step": "cleanup", "error_class": "CancelledError"},
                 )
@@ -1377,6 +1381,15 @@ class Orchestrator:
             # tracked until it has finished, its outcome event included: whoever waits for the
             # cleanup (or cancels it, as stop() does) never finds it gone before its outcome
             self._cleanups.pop(m.id, None)
+
+    async def _cleanup_recorded(self, mid: str, outcome: str) -> None:
+        """The cancel's cleanup recorded its outcome: its mark goes, so no start runs it again
+        (SDD §5.1)."""
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if m.phase == P.cancelled and m.checkpoint == "cleanup":
+                m.checkpoint = outcome
+                await self._save(m, v)
 
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""
@@ -1744,6 +1757,13 @@ class Orchestrator:
         for m in await self.db.list("migration", Migration):
             if m.phase in fsm.RESUMABLE_PHASES:
                 self._launch(m.id)
+            elif (
+                m.phase == P.cancelled and m.checkpoint == "cleanup" and m.id not in self._cleanups
+            ):
+                # a cleanup a stop or a crash cut short runs again (SDD §5.1)
+                self._cleanups[m.id] = asyncio.create_task(
+                    self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
+                )
             if any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history):
                 self._prestage_done.add(m.plan_id)  # work started: resources were pre-staged
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
