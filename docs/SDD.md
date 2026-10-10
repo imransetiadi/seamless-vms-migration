@@ -1644,8 +1644,11 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
   (the policy, null where there is none).
+* `migration.force_cutover` — a cutover before convergence (§5.4): actor the approver who forced it; data
+  `{target_id, vm, reason, delta_bytes, estimated_downtime_s}`, `target_id` the migration id and `vm` its VM's name.
+  The audit page shows the reason with the action and links the target to the migration.
 
-`target_id` is the recommendation id (the policy id for `policy.*`) and `model_version` its `model.version`
+`target_id` is the recommendation id (the policy id for `policy.*`, the migration id for `migration.force_cutover`) and `model_version` its `model.version`
 (`jev-…`, `rules`, `unknown`).
 The input snapshot is what the advisor based the recommendation on — for a migration strategy
 `{tool: "jev_decide", arguments: {decision, evidence, priorities, candidates, requirements,
