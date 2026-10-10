@@ -1,7 +1,9 @@
 """ADV-02: the evidence of a strategy recommendation (SDD §4.2, §14.4)."""
 
+import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +16,15 @@ from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.demo import DEMO_PROVIDERS
 from seamless_migrate.domain.enums import Phase, ProviderKind, Role, Strategy
-from seamless_migrate.domain.models import AdvisorPolicySpec, CutoverWindow, Estimate, EvidenceItem
+from seamless_migrate.domain.models import (
+    AdvisorPolicySpec,
+    CutoverWindow,
+    Estimate,
+    EvidenceItem,
+    Finding,
+    Plan,
+    VMRef,
+)
 from seamless_migrate.events import EventBus
 from seamless_migrate.planning.preflight import finding
 from seamless_migrate.store import Store
@@ -406,3 +416,27 @@ def test_the_evidence_of_a_recommendation_matches_the_inventory(tmp_path):
         # Jev is off here: the effects are measured against the deterministic choice
         assert rec["recommendation"]["option"] is None
         assert rec["evidence_option"] == rec["decision"]["final_option"]
+
+
+CASES = json.loads((Path(__file__).parent / "fixtures" / "evidence_cases.json").read_text())
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c["name"] for c in CASES])
+def test_the_shared_evidence_cases(case):
+    """The case table the dashboard's mock runs too (dashboard/src/api/mockEvidence.test.ts)."""
+    vm = VMRef(**case["vm"])
+    plan = Plan(**case["plan"])
+    earlier = None
+    if case["earlier"]:
+        earlier = make_migration(vm=vm, plan_id=plan.id, phase=Phase.ready, **case["earlier"])
+    items = build_strategy_evidence(
+        vm,
+        plan,
+        case["provider_kind"],
+        [Estimate(**e) for e in case["estimates"]],
+        [Finding(**f) for f in case["findings"]],
+        case["option"],
+        earlier,
+        migration_id=case["migration_id"],
+    )
+    assert [i.model_dump(mode="json") for i in items] == case["expected"]

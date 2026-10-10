@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from ..domain.enums import ProviderKind, Severity, Strategy
@@ -58,8 +59,13 @@ def _round(value: float) -> int:
     return int(value + 0.5)
 
 
+def _fixed(value: float, decimals: int) -> str:
+    """JavaScript's toFixed: half up on the exact binary value (812.5 -> "813", 1.005 -> "1.00")."""
+    return str(Decimal(value).quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP))
+
+
 def _scaled(value: float) -> str:
-    return f"{value:.0f}" if value >= 100 else f"{value:.1f}"
+    return _fixed(value, 0) if value >= 100 else _fixed(value, 1)
 
 
 def format_bytes(n: float) -> str:
@@ -86,7 +92,7 @@ def format_duration(seconds: float) -> str:
     if s < 10:
         tenths = _round(s * 10) / 10
         if tenths < 10:
-            return f"{tenths:.0f} s" if tenths == int(tenths) else f"{tenths:.1f} s"
+            return f"{_fixed(tenths, 0)} s" if tenths == int(tenths) else f"{_fixed(tenths, 1)} s"
     total = _round(s)
     if total < 60:
         return f"{total} s"

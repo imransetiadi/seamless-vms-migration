@@ -1,0 +1,1080 @@
+[
+  {
+    "name": "vmware warm, CBT on, a measured write rate, a window",
+    "vm": {
+      "source_id": "vmw-17",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 100,
+          "used_gb": 40.0,
+          "bootable": true,
+          "volume_type": null,
+          "device": "sda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        },
+        {
+          "id": "d2",
+          "name": null,
+          "size_gb": 50,
+          "used_gb": 10.0,
+          "bootable": false,
+          "volume_type": null,
+          "device": "sdb",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": true,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 4194304.0,
+      "disk_bytes": 161061273600,
+      "used_bytes": 53687091200,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "vcenter-1",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": {
+        "start": "2026-10-11T22:00:00Z",
+        "end": "2026-10-12T02:30:00Z"
+      },
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "vmware",
+    "estimates": [
+      {
+        "strategy": "vmware_warm",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 240.0,
+        "total_s": 840.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      },
+      {
+        "strategy": "vmware_cold",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 3000.0,
+        "total_s": 3600.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": false,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [],
+    "option": "vmware_warm",
+    "earlier": null,
+    "migration_id": "mig-0123456789",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 240.0,
+        "display": "Estimated downtime 4m 00s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "cbt",
+        "label": "Changed Block Tracking",
+        "value": true,
+        "display": "Changed Block Tracking is on",
+        "effect": "supports",
+        "weight": 90,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to VMware warm migration (CBT)",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "RHEL 9",
+        "display": "RHEL 9; virt-v2v supported",
+        "effect": "supports",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 161061273600,
+        "display": "150 GiB provisioned, 50.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 2,
+        "display": "2 disks",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "write_rate",
+        "label": "Guest write rate",
+        "value": 4194304.0,
+        "display": "Guest write rate 4.0 MiB/s, measured",
+        "effect": "context",
+        "weight": 40,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-17"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": "2026-10-11T22:00:00+00:00/2026-10-12T02:30:00+00:00",
+        "display": "2026-10-11 22:00 – 2026-10-12 02:30 UTC",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "vmware",
+        "display": "VMware vSphere",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "vcenter-1"
+        }
+      }
+    ]
+  },
+  {
+    "name": "vmware cold, CBT off, a legacy guest virt-v2v leaves unverified",
+    "vm": {
+      "source_id": "vmw-18",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 20,
+          "used_gb": 10.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel6",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": false,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 21474836480,
+      "used_bytes": 10737418240,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "6",
+        "label": "RHEL 6",
+        "lifecycle": "legacy",
+        "v2v": "unverified"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "vcenter-1",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "vmware",
+    "estimates": [
+      {
+        "strategy": "vmware_cold",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 410.0,
+        "total_s": 1010.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [
+      {
+        "code": "VMW_CBT_DISABLED",
+        "severity": "warning",
+        "message": "CBT is off",
+        "remediation": "Enable Changed Block Tracking on the VM or accept a cold migration.",
+        "strategies": [
+          "vmware_warm"
+        ]
+      },
+      {
+        "code": "GUEST_CONVERSION_UNVERIFIED",
+        "severity": "warning",
+        "message": "RHEL 6 conversion is unverified",
+        "remediation": "virt-v2v converts this guest but Red Hat does not support the conversion: run a test conversion of a copy first.",
+        "strategies": [
+          "vmware_cold",
+          "vmware_warm"
+        ]
+      },
+      {
+        "code": "MAP_NETWORK_PRESTAGED",
+        "severity": "info",
+        "message": "pre-staging creates app-net",
+        "remediation": "Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.",
+        "strategies": []
+      }
+    ],
+    "option": "vmware_cold",
+    "earlier": null,
+    "migration_id": "mig-0123456789",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 410.0,
+        "display": "Estimated downtime 6m 50s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "cbt",
+        "label": "Changed Block Tracking",
+        "value": false,
+        "display": "Changed Block Tracking is off",
+        "effect": "context",
+        "weight": 90,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-18"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 1,
+        "display": "1 finding applies to VMware cold migration: GUEST_CONVERSION_UNVERIFIED",
+        "effect": "opposes",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "RHEL 6",
+        "display": "RHEL 6; virt-v2v unverified",
+        "effect": "opposes",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-18"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 21474836480,
+        "display": "20.0 GiB provisioned, 10.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-18"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-18"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "vmware",
+        "display": "VMware vSphere",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "vcenter-1"
+        }
+      }
+    ]
+  },
+  {
+    "name": "openstack warm, unmapped, an earlier warm attempt, over the SLO",
+    "vm": {
+      "source_id": "vm-2",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 20,
+          "used_gb": 10.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": null,
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 21474836480,
+      "used_bytes": 10737418240,
+      "guest_os": {
+        "family": "unknown",
+        "distro": null,
+        "version": null,
+        "label": "Unknown OS",
+        "lifecycle": "unknown",
+        "v2v": "unknown"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "src-osp",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 300,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "openstack",
+    "estimates": [
+      {
+        "strategy": "warm",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 1250.0,
+        "total_s": 1850.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": false,
+        "downtime_parts": {}
+      },
+      {
+        "strategy": "cold",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 4000.0,
+        "total_s": 4600.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": false,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [
+      {
+        "code": "MAP_NETWORK_MISSING",
+        "severity": "blocker",
+        "message": "app-net has no mapping",
+        "remediation": "Add a network mapping or create a same-named network in RHOSO.",
+        "strategies": []
+      },
+      {
+        "code": "MAP_NETWORK_MISSING",
+        "severity": "blocker",
+        "message": "db-net has no mapping",
+        "remediation": "Add a network mapping or create a same-named network in RHOSO.",
+        "strategies": []
+      },
+      {
+        "code": "MAP_VOLUME_TYPE_MISSING",
+        "severity": "warning",
+        "message": "ceph-ssd has no mapping",
+        "remediation": "Add a volume type mapping; otherwise the destination default volume type is used.",
+        "strategies": []
+      },
+      {
+        "code": "GUEST_OS_UNKNOWN",
+        "severity": "info",
+        "message": "not identified",
+        "remediation": "Set the os_distro and os_version image properties (OpenStack) or run VMware Tools so the guest can be identified; verification uses the Linux profile meanwhile.",
+        "strategies": []
+      }
+    ],
+    "option": "warm",
+    "earlier": {
+      "id": "mig-earlier01",
+      "strategy": "warm",
+      "attempts": 2
+    },
+    "migration_id": "mig-earlier01",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 1250.0,
+        "display": "Estimated downtime 20m 50s, SLO 5m 00s",
+        "effect": "opposes",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-earlier01"
+        }
+      },
+      {
+        "key": "earlier_runs",
+        "label": "Earlier attempts",
+        "value": 2,
+        "display": "2 earlier attempts with Warm migration",
+        "effect": "opposes",
+        "weight": 85,
+        "source": {
+          "kind": "run",
+          "ref_id": "mig-earlier01"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 3,
+        "display": "Not mapped: MAP_NETWORK_MISSING, MAP_VOLUME_TYPE_MISSING",
+        "effect": "opposes",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier01"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to Warm migration",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier01"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 21474836480,
+        "display": "20.0 GiB provisioned, 10.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-2"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-2"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "openstack",
+        "display": "OpenStack",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "src-osp"
+        }
+      }
+    ]
+  },
+  {
+    "name": "openstack cold, an earlier attempt of another strategy, a Windows guest",
+    "vm": {
+      "source_id": "vm-3",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 1500,
+          "used_gb": 812.5,
+          "bootable": true,
+          "volume_type": null,
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "windows2019",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 1610612736000,
+      "used_bytes": 872415232000,
+      "guest_os": {
+        "family": "windows",
+        "distro": "windows-server",
+        "version": "2019",
+        "label": "Windows Server 2019",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "src-osp",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "openstack",
+    "estimates": [
+      {
+        "strategy": "cold",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 5.4,
+        "total_s": 605.4,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [],
+    "option": "cold",
+    "earlier": {
+      "id": "mig-earlier02",
+      "strategy": "warm",
+      "attempts": 1
+    },
+    "migration_id": "mig-earlier02",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 5.4,
+        "display": "Estimated downtime 5.4 s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-earlier02"
+        }
+      },
+      {
+        "key": "earlier_runs",
+        "label": "Earlier attempts",
+        "value": 1,
+        "display": "1 earlier attempt with Warm migration",
+        "effect": "context",
+        "weight": 85,
+        "source": {
+          "kind": "run",
+          "ref_id": "mig-earlier02"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier02"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to Cold migration",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier02"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "Windows Server 2019",
+        "display": "Windows Server 2019; virt-v2v supported",
+        "effect": "context",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-3"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 1610612736000,
+        "display": "1.5 TiB provisioned, 813 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-3"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-3"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "openstack",
+        "display": "OpenStack",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "src-osp"
+        }
+      }
+    ]
+  },
+  {
+    "name": "openstack storage handover, a tiny disk",
+    "vm": {
+      "source_id": "vm-4",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 1,
+          "used_gb": 0.25,
+          "bootable": true,
+          "volume_type": null,
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 1073741824,
+      "used_bytes": 268435456,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "src-osp",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "openstack",
+    "estimates": [
+      {
+        "strategy": "storage_handover",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 75.0,
+        "total_s": 675.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [],
+    "option": "storage_handover",
+    "earlier": null,
+    "migration_id": "mig-0123456789",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 75.0,
+        "display": "Estimated downtime 1m 15s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to Storage handover",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "RHEL 9",
+        "display": "RHEL 9; virt-v2v supported",
+        "effect": "context",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-4"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 1073741824,
+        "display": "1.0 GiB provisioned, 256 MiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-4"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-4"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "openstack",
+        "display": "OpenStack",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "src-osp"
+        }
+      }
+    ]
+  }
+]
