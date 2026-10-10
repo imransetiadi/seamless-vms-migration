@@ -11,7 +11,7 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { auditActionLabel, auditCsv } from '../lib/audit';
-import { formatDateTime } from '../lib/format';
+import { formatDateTime, formatNumber } from '../lib/format';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** The newest audit events one request returns (SDD §12). */
@@ -107,6 +107,10 @@ export default function AdvisorAudit() {
       </div>
 
       <Panel title="Audit events" description={`Newest first; the newest ${AUDIT_KEEP} events the API returns`}>
+        {/* a live region already on the page: what the filters show is read out, none too (SDD §16) */}
+        <p role="status" className="mb-2 text-xs text-muted-foreground empty:hidden">
+          {events.length > 0 ? `Showing ${formatNumber(shown.length)} of ${formatNumber(events.length)} audit events` : ''}
+        </p>
         {audit.isPending ? (
           <LoadingBlock rows={5} />
         ) : audit.error ? (

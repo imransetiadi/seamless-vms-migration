@@ -138,6 +138,17 @@ describe('Events page', () => {
     expect(asked).toContain('plan-4f2a9c1e');
   });
 
+  it('says from a live region already on the page when its filters match no event (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText(/paused: vCenter degraded/i);
+    const regions = screen.getAllByRole('status');
+    await user.type(screen.getByRole('searchbox', { name: /search events/i }), 'zzzz-no-match');
+    const none = await screen.findByText('No events match');
+    expect(regions).toContain(none.closest('[role="status"]'));
+  });
+
   it('filters by category and text', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });

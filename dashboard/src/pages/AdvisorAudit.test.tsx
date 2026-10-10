@@ -50,6 +50,20 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(within(row).getByRole('link', { name: warm.vm.name })).toHaveAttribute('href', `/migrations/${warm.id}`);
   });
 
+  it('says how many audit events its filters show from a live region already on the page, also when none match (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });
+    const table = await auditTable();
+    const total = within(table).getAllByRole('row').length - 1;
+    const status = screen.getByText(`Showing ${total} of ${total} audit events`);
+    expect(status).toHaveAttribute('role', 'status');
+    await user.selectOptions(screen.getByLabelText('Action'), 'decision.fallback');
+    expect(status).toHaveTextContent(`Showing 1 of ${total} audit events`);
+    await user.type(screen.getByLabelText('Search'), 'zzzz-no-match');
+    expect(status).toHaveTextContent(`Showing 0 of ${total} audit events`);
+    expect(screen.getByText('No audit events match')).toBeInTheDocument();
+  });
+
   it('filters by action, actor and text', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });

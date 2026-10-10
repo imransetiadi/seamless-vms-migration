@@ -14,7 +14,7 @@ import { ProgressBar } from '../components/ProgressBar';
 import { LoadingBlock } from '../components/Skeleton';
 import { SortableHeader } from '../components/SortableHeader';
 import { PlanStatusBadge } from '../components/StatusBadge';
-import { formatDateTime, formatDuration, formatRelative } from '../lib/format';
+import { formatDateTime, formatDuration, formatNumber, formatRelative } from '../lib/format';
 import { hasRole } from '../lib/roles';
 import { nextSort, sortBy, type SortState } from '../lib/sort';
 import { planStatusMeta } from '../lib/status';
@@ -125,6 +125,10 @@ export default function Plans() {
         />
       </div>
 
+      {/* a live region already on the page: what the filters show is read out, none too (SDD §16) */}
+      <p role="status" className="mb-2 text-xs text-muted-foreground empty:hidden">
+        {plans.data && plans.data.length > 0 ? `Showing ${formatNumber(rows.length)} of ${formatNumber(plans.data.length)} plans` : ''}
+      </p>
       {plans.isPending && <LoadingBlock label="Loading plans…" rows={5} />}
       {plans.error && <ErrorBanner error={plans.error} title="Plans are unavailable" onRetry={() => void plans.refetch()} />}
       {migrations.error && (

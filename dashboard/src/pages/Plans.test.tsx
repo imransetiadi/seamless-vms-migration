@@ -232,6 +232,17 @@ describe('Plans page', () => {
     expect(within(dialog).getByLabelText(/cutover window start/i)).toBeDisabled();
   });
 
+  it('says how many plans its filters show from a live region already on the page, also when none match (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
+    const n = server.plans.length;
+    const status = await screen.findByText(`Showing ${n} of ${n} plans`);
+    expect(status).toHaveAttribute('role', 'status');
+    await user.type(screen.getByRole('searchbox', { name: /search plans/i }), 'zzzz-no-match');
+    expect(status).toHaveTextContent(`Showing 0 of ${n} plans`);
+    expect(screen.getByText('No plans match these filters')).toBeInTheDocument();
+  });
+
   it('names a selected VM that another plan holds, as validation would refuse it (SDD §5.4, §16)', async () => {
     const server = createTestServer();
     const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;

@@ -289,10 +289,13 @@ export default function Events() {
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
-      {/* "No events match" only once the trail is known: a failed load is not an empty trail (SDD §16) */}
-      {history.data && filtered.length === 0 && (
-        <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
-      )}
+      {/* "No events match" only once the trail is known: a failed load is not an empty trail; read out from a live
+          region already on the page — the count is not, as it moves with every live event (SDD §16) */}
+      <div role="status">
+        {history.data && filtered.length === 0 && (
+          <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
+        )}
+      </div>
 
       {filtered.length > 0 && (
         <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
