@@ -686,6 +686,23 @@ describe('PlanDetail', () => {
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['downtime_slo_s'] });
   });
 
+  it('keeps the destination of a plan with a failed migration, saying why (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const failed = server.migrations.find((m) => m.plan_id === 'plan-c81d44a0')!;
+    Object.assign(failed, { phase: 'failed', downtime_started_at: null, downtime_ended_at: null }); // its source kept running
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const destination = within(dialog).getByLabelText(/^destination/i);
+    expect(destination).toBeDisabled();
+    expect(destination).toHaveAccessibleDescription(
+      `The failed migration of ${failed.vm.name} still needs this destination for its rollback: roll it back or cancel it first.`,
+    );
+    // the rest stays editable, to fix the cause before a retry
+    expect(within(dialog).getByLabelText(/downtime slo/i)).toBeEnabled();
+  });
+
   it('edits a plan stored with sync values the old form refused: threshold 0, 60 passes, 100 disks (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

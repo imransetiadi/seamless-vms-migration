@@ -243,10 +243,12 @@ export interface PlanCreateDialogProps {
   plan?: Plan;
   /** Called once the edited plan was saved, so the page can announce it (SDD §16). */
   onSaved?: () => void;
+  /** VMs whose failed migration still needs the plan's destination for its rollback (SDD §12). */
+  failedVms?: string[];
 }
 
 /** Create a draft plan (POST /plans, operator). Validation happens on submit with an error summary. */
-export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved }: PlanCreateDialogProps) {
+export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved, failedVms = [] }: PlanCreateDialogProps) {
   const titleId = useId();
   const id = (key: string) => `plan-create-${key}`;
   const providers = useProviders();
@@ -254,6 +256,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const patch = usePatchPlan(plan?.id ?? '');
   const editing = Boolean(plan);
   const saving = editing ? patch : create;
+  // SDD §12: a failed migration's rollback acts on the clouds its attempt used
+  const destinationLocked = editing && failedVms.length > 0;
+  const destinationReason =
+    failedVms.length === 1
+      ? `The failed migration of ${failedVms[0]} still needs this destination for its rollback: roll it back or cancel it first.`
+      : `The failed migrations of ${failedVms.join(', ')} still need this destination for their rollback: roll them back or cancel them first.`;
   const navigate = useNavigate();
   // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
   const canSetPolicy = hasRole(useRole(), 'approver');
@@ -612,6 +620,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 required
                 value={form.destinationId}
                 onChange={(e) => set('destinationId', e.target.value)}
+                disabled={destinationLocked}
+                hint={destinationLocked ? destinationReason : undefined}
                 error={errors.destination}
                 options={[
                   { value: '', label: 'Choose a destination…' },

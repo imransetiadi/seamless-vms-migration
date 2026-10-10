@@ -415,6 +415,7 @@ export default function PlanDetail() {
           open
           onClose={() => setEditing(false)}
           plan={p}
+          failedVms={list.filter((m) => m.phase === 'failed').map((m) => m.vm.name)}
           onSaved={() => setAnnouncement('Plan saved. It is a draft again: validate it before starting.')}
         />
       )}
