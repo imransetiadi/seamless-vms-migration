@@ -978,7 +978,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   innermost and takes no other. A retry runs its checks and its transition under the claim and
   migration locks and takes the plan's lock only after it released them, to reopen a completed plan
   (§5.1): a validation of another plan holds the claim lock through its provider calls, and a retry
-  holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. Plan documents are written by several drivers and the tick loop
+  holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. For the
+  same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
