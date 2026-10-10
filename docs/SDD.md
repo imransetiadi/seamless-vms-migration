@@ -1317,6 +1317,14 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   destructive `#DC2626`, ring `#2563EB`. Status colors are always paired with an icon and a text
   label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids).
   Tokens are CSS variables consumed by Tailwind (`bg-background`, `text-muted-foreground`, …).
+* Brand mark: one mark at every size — a slanted S drawn as one unbroken stroke whose upper half is the dark
+  theme's foreground `#F8FAFC` and lower half the accent `#22C55E` (a VM leaves its source and lands live on
+  RHOSO without a break), on a rounded tile `#1E293B` → `#0F172A` with a faint `#94A3B8` border. It keeps these
+  colours in both themes, so it reads the same on a light page and in a browser tab. One component
+  (`BrandMark`, decorative — `aria-hidden`, the product name is the text beside it) in the sidebar, the mobile
+  header and the sign-in page; `public/favicon.svg` draws the same mark and `public/apple-touch-icon.png` is it
+  at 180 px on a full-bleed tile. Each instance names its own tile gradient: the sidebar and the mobile header
+  are both in the page, one of them hidden, and a gradient defined inside a hidden element does not paint.
 * Accessibility: WCAG 2.2 AA contrast, visible focus rings, keyboard reachable actions, `aria-live`
   for progress and for the outcome of an action (a plan started, resumed, paused, saved or validated — with
   the report's counts — or its waves planned; a migration's action or strategy change), announced from a live
