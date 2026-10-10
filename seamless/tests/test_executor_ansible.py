@@ -314,6 +314,28 @@ async def test_cutover_cold_sets_stop_before_migration(env):
     assert not env.executor.supports(Strategy.storage_handover)
 
 
+async def test_a_cold_cutover_records_its_copy_as_a_full_pass(env):
+    """SDD §7.2/§5.5: the copy a cold cutover reported as progress is its full pass, so
+    bytes_transferred stays its listed passes (invariant 2) - before, every real cold migration
+    completed BYTES_MISMATCH."""
+    started = utcnow()
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, bytes_total=7 * 2**30)
+    result = await env.executor.run(StepName.CUTOVER, ctx)
+    full = result.sync_pass
+    assert full is not None and full.kind == SyncPassKind.full
+    # what the state file's 100 % stands for: the VM's used bytes
+    assert (full.bytes_changed, full.bytes_transferred) == (7 * 2**30, 7 * 2**30)
+    assert full.bytes_scanned == ctx.migration.vm.disk_bytes
+    assert started <= full.started_at <= full.ended_at
+    assert full.duration_s == (full.ended_at - full.started_at).total_seconds()
+    assert result.destination_server_id == "dst-web-01"
+    # without a byte count from validation, the VM's used bytes
+    plain, _ = ctx_for(env, strategy=Strategy.cold, name="db-01")
+    assert (await env.executor.run(StepName.CUTOVER, plain)).sync_pass.bytes_transferred == (
+        plain.migration.vm.used_bytes
+    )
+
+
 async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
     """os-migrate exports workloads by name: a same-named server of the project that is not in
     the plan must never be imported, stopped or migrated (SDD §7.2)."""

@@ -574,7 +574,27 @@ class AnsibleExecutor:
                 return StepResult(sync_pass=sync_pass, destination_server_id=server)
             return StepResult(sync_pass=sync_pass)
         if step == StepName.CUTOVER:
-            return StepResult(destination_server_id=await self._lookup_server(ctx))
+            server = await self._lookup_server(ctx)
+            if strategy != Strategy.cold:
+                return StepResult(destination_server_id=server)
+            # SDD §7.2: the copy the state file reported as progress is the cutover's full pass -
+            # the VM's used bytes, what its 100 % stands for - so bytes_transferred stays the
+            # listed passes (§5.5 invariant 2); the copy dominates the step's duration
+            ended = utcnow()
+            copied = m.bytes_total or m.vm.used_bytes
+            return StepResult(
+                sync_pass=SyncPass(
+                    number=next_pass_number(m),
+                    kind=SyncPassKind.full,
+                    started_at=started,
+                    ended_at=ended,
+                    bytes_scanned=m.vm.disk_bytes,
+                    bytes_changed=copied,
+                    bytes_transferred=copied,
+                    duration_s=(ended - started).total_seconds(),
+                ),
+                destination_server_id=server,
+            )
         # vmware_warm CBT passes: the kit does not report byte counts to the control plane
         ended = utcnow()
         number = next_pass_number(m)
