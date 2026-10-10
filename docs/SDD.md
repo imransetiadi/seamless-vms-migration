@@ -979,7 +979,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   migration locks and takes the plan's lock only after it released them, to reopen a completed plan
   (§5.1): a validation of another plan holds the claim lock through its provider calls, and a retry
   holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. For the
-  same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock. Plan documents are written by several drivers and the tick loop
+  same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock.
+  A strategy change (`set_strategy`, `PUT …/strategy`) takes the plan's lock, then the migration's, as the advisor's
+  override does (§14.6): it waits for a running validation, and the migration's strategy and the plan's
+  `strategy_overrides` entry are written together under it, so no validation undoes the change. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
