@@ -610,7 +610,7 @@ Stack commands (Compose): `C` as defined in §14.1 (pinned context, project and 
 - [ ] Progress and phase changes announced (`aria-live`); `prefers-reduced-motion` removes animation.
 - [ ] Primary actions ≥ 44 × 44 px; layouts correct at 375, 768, 1024 and 1440 px and at 200 % zoom.
 - [ ] Finalize dialog: the confirm button stays disabled until the exact VM name is typed.
-- [ ] Viewer role: mutating controls hidden or disabled; the server still answers 403 (S-01).
+- [ ] Viewer role: mutating controls stay visible and focusable but unavailable, each saying why (SDD §16); the server still answers 403 (S-01).
 - [ ] Dark and light themes legible; tokens exactly as SDD §16.
 - [ ] Screen-reader smoke test of Overview, Plan detail and Migration detail (VoiceOver or NVDA).
 
@@ -633,7 +633,7 @@ Show all, and a fact's Inventory link opens the VM searched for (ADV-02); each w
 guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
 Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
-migration detail → Approve/Cutover as approver, controls hidden for viewer; UI-05 Finalize needs the typed VM name;
+migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, are automated in `smoke.spec.ts`); UI-05 Finalize needs the typed VM name;
 UI-06 Events page appends live events; UI-07 theme toggle persists; UI-08 a 401 returns to `/login`; UI-09 SSE
 reconnect after a dropped connection resumes without duplicates; UI-10 keyboard-only run of UI-03.
 
