@@ -5,11 +5,11 @@ import pytest
 import yaml
 
 from seamless_migrate import __version__, cli
-from seamless_migrate.domain.enums import ProviderKind, ProviderRole
+from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole
 from seamless_migrate.domain.models import Plan
 from seamless_migrate.security.auth import hash_token
 from seamless_migrate.store import Store
-from tests.factories import make_provider
+from tests.factories import make_migration, make_provider, make_vm
 
 GIB = 2**30
 
@@ -93,6 +93,76 @@ def test_plan_apply_from_yaml(env, capsys):
     bad_id.write_text(yaml.safe_dump({**doc, "id": "finance plan"}))
     assert cli.main(["plan", "apply", "-f", str(bad_id)]) == 1
     assert "invalid plan id" in capsys.readouterr().err
+
+
+def _applied_plan(env, capsys):
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    path = env / "plan.yaml"
+    doc = {
+        "name": "Finance web tier",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "downtime_slo_s": 600,
+    }
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    plan_id = capsys.readouterr().out.strip().split()[-1]
+    path.write_text(yaml.safe_dump({**doc, "downtime_slo_s": 900}))
+    return store, plan_id, path
+
+
+def test_plan_apply_refuses_an_update_while_a_migration_is_in_flight(env, capsys):
+    """SDD §15/§12: an update follows PATCH /plans/{id}, with the same refusal."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    done = make_migration(
+        plan_id=plan_id, vm=make_vm(source_id="vm-1", name="web-01"), phase=Phase.completed
+    )
+    store.put("migration", done)
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert capsys.readouterr().err.strip() == (
+        "error: finalize or roll back the completed migration (web-01) before editing the plan"
+    )
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
+    done.phase = Phase.finalized
+    store.put("migration", done)
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 900
+
+
+def test_plan_apply_never_overwrites_a_change_it_did_not_see(env, capsys, monkeypatch):
+    """SDD §15: a server that starts the plan between the CLI's read and its write wins; the CLI
+    fails and asks to run it again instead of putting the plan back to draft."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    opened = cli._store
+
+    def racing_store(settings):
+        cli_store = opened(settings)
+        read = cli_store.get_versioned
+
+        def get_versioned(kind, id_, model_cls):
+            got = read(kind, id_, model_cls)
+            if kind == "plan":  # meanwhile the server starts the plan
+                started = store.get("plan", id_, Plan)
+                started.status = PlanStatus.running
+                store.put("plan", started)
+            return got
+
+        cli_store.get_versioned = get_versioned
+        return cli_store
+
+    monkeypatch.setattr(cli, "_store", racing_store)
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert capsys.readouterr().err.strip() == (
+        f"error: plan {plan_id} changed while it was being applied; run plan apply again"
+    )
+    plan = store.get("plan", plan_id, Plan)
+    assert (plan.status, plan.downtime_slo_s) == (PlanStatus.running, 600)
 
 
 def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):

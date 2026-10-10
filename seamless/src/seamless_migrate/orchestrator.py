@@ -152,6 +152,11 @@ _RELEASES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def blocks_plan_change(m: Migration) -> bool:
+    """A migration in flight or whose source VM is stopped keeps its plan as it is (SDD §12)."""
+    return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+
+
 def in_flight_refusal(busy: Iterable[Migration], before: str, limit: int = 10) -> str:
     """The 409 of an edit or re-wave while ``busy`` are in flight (SDD §12): each VM, at most
     ``limit`` per kind and how many are left out, with what releases it."""
@@ -861,7 +866,7 @@ class Orchestrator:
         return [
             m
             for m in await self.db.list("migration", Migration, plan_id=plan_id)
-            if m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+            if blocks_plan_change(m)
         ]
 
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:

@@ -253,12 +253,30 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         store.put("plan", plan, expected_version=0)
         kind, verb = "plan.created", "created"
     else:
+        from .orchestrator import blocks_plan_change, in_flight_refusal
+        from .store import ConflictError
+
+        # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
+        existing, version = store.get_versioned("plan", existing.id, Plan)
         if str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
+        busy = [
+            m
+            for m in store.list("migration", Migration, plan_id=existing.id)
+            if blocks_plan_change(m)
+        ]
+        if busy:
+            raise CliError(in_flight_refusal(busy, "editing the plan"))
         plan = Plan.model_validate(
             {**existing.model_dump(mode="json"), **spec.model_dump(mode="json"), "status": "draft"}
         )
-        store.put("plan", plan)
+        try:
+            store.put("plan", plan, expected_version=version)
+        except ConflictError:
+            # a running server changed it meanwhile (a start, a validation): never overwrite that
+            raise CliError(
+                f"plan {existing.id} changed while it was being applied; run plan apply again"
+            ) from None
         kind, verb = "plan.updated", "updated"
     asyncio.run(
         emit(
