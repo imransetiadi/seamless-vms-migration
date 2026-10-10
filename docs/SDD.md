@@ -353,7 +353,10 @@ dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transf
 (`sync_bytes_dropped` plus the listed passes), and pass numbers keep counting from the last one.
 Approvals, `cutover_requested` and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
-or estimate is approved again by a human. A VM whose migration is `cancelled` (terminal) cannot be
+or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
+`blocked` and `ready`, and one that an interrupted validation left in `validating` (a write that failed
+between its two transitions — a database error, a restart): a plan's validations run one at a time under
+its lock, so no other validation is still at work on it. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
