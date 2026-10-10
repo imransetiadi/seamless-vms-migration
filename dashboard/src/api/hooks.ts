@@ -17,6 +17,7 @@ import type {
   AdvisorRecommendation,
   AdvisorSnapshot,
   AdvisorStatus,
+  DataSentList,
   ApproveRequest,
   AutoWavesRequest,
   CancelRequest,
@@ -72,6 +73,7 @@ export const queryKeys = {
   eventTail: (query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}) => ['events', 'tail', query] as const,
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
+  dataSent: ['advisor', 'data-sent'] as const,
   recommendations: (query: RecommendationListQuery = {}) => ['advisor', 'recommendations', query] as const,
   /** Under `recommendations`, so a refresh of the list refreshes it too. */
   recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
@@ -202,6 +204,15 @@ export function useAdvisorStatus() {
     queryFn: ({ signal }) => api.get<AdvisorStatus>('/advisor/status', { signal }),
     refetchInterval: 30_000,
     retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/data-sent`: what each decision type sends to Jev (SDD §13.4, ADV-06). */
+export function useDataSent() {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.dataSent,
+    queryFn: ({ signal }) => api.get<DataSentList>('/advisor/data-sent', { signal }),
   });
 }
 

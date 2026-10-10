@@ -6,6 +6,7 @@ import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, decisionText, recommendedP
 import { formatDateTime, formatNumber, formatRelative } from '../lib/format';
 import { ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { Button } from './Button';
+import { DeploymentBadge } from './DeploymentBadge';
 import { EmptyState } from './EmptyState';
 import { Term } from './Term';
 
@@ -53,6 +54,8 @@ function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorReco
           <ModelIcon aria-hidden className="size-3.5" />
           {ADVISOR_SOURCE_LABELS[rec.model.name] ?? rec.model.name}
         </span>
+        {/* where the model that answered runs (SDD §13.4, §16) */}
+        {rec.model.name === 'jev' && <DeploymentBadge deployment={rec.model.deployment} host={rec.model.endpoint_host} />}
         {rec.legacy && (
           <span className="inline-flex items-center gap-1 rounded-sm border border-border bg-muted px-1.5 py-0.5 text-muted-foreground">
             <History aria-hidden className="size-3.5" />

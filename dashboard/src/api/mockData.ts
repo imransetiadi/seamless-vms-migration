@@ -100,7 +100,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     provider_id: input.providerId,
     model: option === null && confidence === null && input.fallback
       ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
-      : { name: 'jev', version: JEV_MODEL, deployment: 'unknown', endpoint_host: null },
+      : { name: 'jev', version: JEV_MODEL, deployment: 'remote', endpoint_host: null },
     recommendation: { option, confidence, distribution },
     input_snapshot_sha256: input.snapshotSha256,
     requested_by: input.requestedBy ?? null,

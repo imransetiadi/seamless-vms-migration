@@ -43,6 +43,7 @@ import type {
   AdvisorRecommendation,
   AdvisorSnapshot,
   AdvisorStatus,
+  DataSentItem,
   DecisionType,
   DestinationInventory,
   Estimate,
@@ -161,6 +162,58 @@ function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_po
   const ties = eligible.filter((e) => e.downtime_s - best < Math.max(60, best * 0.1));
   return ties.length >= 2 ? bySimplicity(ties) : [];
 }
+
+/**
+ * What the API's serializers send (GET /advisor/data-sent, SDD §13.4): the server generates it from its field
+ * specs; the mock repeats it for a remote model whose console stays local.
+ */
+const LOCAL_CONSOLE = 'The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off.';
+const DATA_SENT: DataSentItem[] = [
+  {
+    decision_type: 'migration_strategy',
+    tool: 'jev_decide',
+    fields: [
+      { key: 'decision', label: 'The question, naming the VM' },
+      { key: 'vm', label: 'VM name, vCPU, RAM and number of disks' },
+      { key: 'disks', label: 'Each disk: kind, size, volume type, multi-attach, encrypted, independent' },
+      { key: 'size', label: 'Provisioned and used size' },
+      { key: 'write_rate', label: 'Guest write rate, measured or assumed' },
+      { key: 'slo', label: "The plan's downtime SLO" },
+      { key: 'link', label: "The plan's link bandwidth" },
+      { key: 'findings', label: 'Pre-flight finding codes and severities' },
+      { key: 'estimates', label: 'Per strategy: downtime, pre-copy, passes and eligibility with its reasons' },
+      { key: 'priorities', label: "Minimize downtime within the plan's SLO; the simpler strategy on near ties" },
+      { key: 'candidates', label: 'The eligible strategies with their descriptions' },
+      { key: 'requirements', label: 'The two requirements every strategy must meet' },
+    ],
+    sent: true,
+    note: null,
+  },
+  {
+    decision_type: 'workload_tier',
+    tool: 'jev_classify',
+    fields: [
+      { key: 'name', label: 'VM name' },
+      { key: 'os', label: 'Guest OS' },
+      { key: 'tags', label: 'Tags' },
+      { key: 'disks', label: 'Disk sizes' },
+      { key: 'flavor', label: 'Flavor, or vCPU and RAM' },
+    ],
+    sent: true,
+    note: null,
+  },
+  {
+    decision_type: 'verification_review',
+    tool: 'jev_verify',
+    fields: [
+      { key: 'claims', label: 'The two boot claims to verify' },
+      { key: 'checks', label: 'Each verification check: name, result and detail' },
+    ],
+    sent: true,
+    note: LOCAL_CONSOLE,
+  },
+  { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
+];
 
 /** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
 function clearRequest(m: Migration): void {
@@ -981,10 +1034,15 @@ export class MockServer {
       if (id === 'status' && method === 'GET') {
         this.require(token, 'viewer', path);
         const status: AdvisorStatus = {
-          jev: { mode: 'http', available: true, last_error: null },
+          // like a compose stack: the jev sidecar forwards to the remote TypeSafe API (SDD §13.4)
+          jev: { mode: 'http', available: true, last_error: null, deployment: 'remote', endpoint_host: null, console_sent: false },
           memory: { enabled: true, available: true, last_error: 'Timed out after 5 s (recovered on retry)' },
         };
         return ok(status);
+      }
+      if (id === 'data-sent' && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok({ items: DATA_SENT });
       }
       if (id === 'policies') {
         if (!sub && method === 'GET') {

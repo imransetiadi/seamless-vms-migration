@@ -192,4 +192,27 @@ describe('Advisor page', () => {
     renderWithApp(<Advisor />, { token: 'viewer' });
     expect(await screen.findByRole('link', { name: 'Policies' })).toHaveAttribute('href', '/advisor/policies');
   });
+
+  it('says where the model runs, what each decision type sends it, and that the console stays local (SDD §13.4, ADV-06)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    const jev = await screen.findByRole('region', { name: 'Jev' });
+    expect(await within(jev).findByText('Remote')).toBeInTheDocument();
+    expect(jev).toHaveTextContent(/Console\s*Stays in this installation/);
+    const panel = await screen.findByRole('region', { name: 'Data sent to advisor' });
+    const strategy = await within(panel).findByRole('listitem', { name: 'Migration strategy' });
+    expect(strategy).toHaveTextContent('jev_decide');
+    expect(within(strategy).getByText('Guest write rate, measured or assumed')).toBeInTheDocument();
+    const console = within(panel).getByRole('listitem', { name: 'Console screening' });
+    expect(console).toHaveTextContent('Not sent');
+    expect(console).toHaveTextContent(/stays in this installation/i);
+  });
+
+  it('shows where the model ran on each recommendation Jev answered, and nothing on the rules\' (ADV-06)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const jevEntry = (await within(feed).findByText('Decision: Cold migration — below threshold (57% < 60%), default kept')).closest('li')!;
+    expect(within(jevEntry).getByText('Remote')).toBeInTheDocument();
+    const rulesEntry = within(feed).getByText('Decision: Warm migration — advisor unavailable, decided by rules').closest('li')!;
+    expect(within(rulesEntry).queryByText(/^Remote|^On-prem/)).not.toBeInTheDocument();
+  });
 });

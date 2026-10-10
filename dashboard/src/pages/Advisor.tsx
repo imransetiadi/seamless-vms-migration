@@ -1,6 +1,6 @@
 import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX, SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { useId, useMemo, useState, type FormEvent } from 'react';
+import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
 import { useAdvisorStatus, useMigrations, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
 import { ADVISOR_QUERY_MAX } from '../api/types';
@@ -11,6 +11,8 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { DataSentPanel } from '../components/DataSentPanel';
+import { DeploymentBadge } from '../components/DeploymentBadge';
 import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList, RecommendationPager } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
@@ -31,12 +33,15 @@ function ServiceCard({
   state,
   lines,
   lastError,
+  extra,
 }: {
   title: string;
   icon: typeof Bot;
   state: 'available' | 'unavailable' | 'off';
   lines: Array<[string, string]>;
   lastError?: string | null;
+  /** Beside the availability, e.g. where the model runs. */
+  extra?: ReactNode;
 }) {
   const badge =
     state === 'available'
@@ -51,7 +56,10 @@ function ServiceCard({
           <Icon aria-hidden className="size-5 text-muted-foreground" />
           {title}
         </h2>
-        <StatusBadge tone={badge.tone} icon={badge.icon} label={badge.label} size="md" />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {extra}
+          <StatusBadge tone={badge.tone} icon={badge.icon} label={badge.label} size="md" />
+        </div>
       </div>
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
         {lines.map(([k, v]) => (
@@ -153,7 +161,10 @@ export default function Advisor() {
             lines={[
               ['Mode', s.jev.mode],
               ['Used for', 'strategy ties, classification, verification, screening'],
+              // the console excerpt leaves only for an on-prem model, or when allowed (SDD §13.4)
+              ['Console', s.jev.console_sent ? 'Sent for screening' : 'Stays in this installation'],
             ]}
+            extra={<DeploymentBadge deployment={s.jev.deployment} host={s.jev.endpoint_host} />}
             lastError={s.jev.last_error}
           />
           <ServiceCard
@@ -285,6 +296,10 @@ export default function Advisor() {
             )}
           </Panel>
         </div>
+      </div>
+      {/* what each decision type sends, below the feed it explains (SDD §13.4, §16) */}
+      <div className="mt-4">
+        <DataSentPanel />
       </div>
     </>
   );

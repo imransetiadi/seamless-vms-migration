@@ -4,6 +4,7 @@ import { Link, useParams } from 'react-router-dom';
 import { useEventTail, useMigration, useRecommendation, useRecommendations, useSnapshot } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorRecommendation, Event } from '../api/types';
+import { DeploymentBadge } from '../components/DeploymentBadge';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
@@ -231,7 +232,8 @@ export default function RecommendationDetail() {
             </dd>
             <dt className="text-muted-foreground">Model</dt>
             <dd className="text-foreground">
-              {ADVISOR_SOURCE_LABELS[r.model.name] ?? r.model.name} <span className="font-mono text-xs">{r.model.version}</span>
+              {ADVISOR_SOURCE_LABELS[r.model.name] ?? r.model.name} <span className="font-mono text-xs">{r.model.version}</span>{' '}
+              {r.model.name === 'jev' && <DeploymentBadge deployment={r.model.deployment} host={r.model.endpoint_host} />}
             </dd>
             <dt className="text-muted-foreground">Decided</dt>
             <dd className="text-foreground">

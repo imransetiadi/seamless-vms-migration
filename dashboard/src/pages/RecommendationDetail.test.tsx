@@ -124,4 +124,10 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
     expect(queryClient.getQueryData(['migration', 'mig-b2c4d6e871'])).toMatchObject({ phase: 'ready' });
     expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
+
+  it('names where the model that answered runs (SDD §13.4, ADV-06)', async () => {
+    renderRec('rec-d4e6f8a09001');
+    await screen.findByText('Decision: Cold migration — below threshold (57% < 60%), default kept');
+    expect(screen.getByText('Remote')).toBeInTheDocument();
+  });
 });

@@ -22,6 +22,13 @@ const OPTION_LABELS: Record<string, string> = {
   investigate: 'Needs investigation',
 };
 
+/** Where the model that answered runs: "On-prem", "Remote: {host}", "Remote", or null when unknown (SDD §13.4, §16). */
+export function deploymentLabel(deployment: 'on_prem' | 'remote' | 'unknown', host: string | null): string | null {
+  if (deployment === 'on_prem') return 'On-prem';
+  if (deployment === 'remote') return host ? `Remote: ${host}` : 'Remote';
+  return null;
+}
+
 /** One sentence, on the word "confidence" (open question #2: Jev's own figure is kept as it is). */
 export const CONFIDENCE_DEFINITION = "Jev's calibrated confidence in its own recommendation, not the probability it gives that option.";
 

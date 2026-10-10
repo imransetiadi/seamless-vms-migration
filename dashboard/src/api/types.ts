@@ -766,9 +766,38 @@ export interface Stats {
   throughput_series: ThroughputPoint[];
 }
 
+/** Where the Jev model runs (SDD §13.4, ADV-06). */
+export type JevDeployment = 'on_prem' | 'remote';
+
 export interface AdvisorStatus {
-  jev: { mode: string; available: boolean; last_error?: string | null };
+  jev: {
+    mode: string;
+    available: boolean;
+    last_error?: string | null;
+    deployment: JevDeployment;
+    endpoint_host: string | null;
+    /** Whether the console excerpt may leave the installation for screening. */
+    console_sent: boolean;
+  };
   memory: { enabled: boolean; available: boolean; last_error?: string | null };
+}
+
+/** GET /advisor/data-sent: what each decision type sends to Jev, from the serializers' field specs (SDD §13.4). */
+export interface DataSentField {
+  key: string;
+  label: string;
+}
+
+export interface DataSentItem {
+  decision_type: DecisionType;
+  tool: string;
+  fields: DataSentField[];
+  sent: boolean;
+  note: string | null;
+}
+
+export interface DataSentList {
+  items: DataSentItem[];
 }
 
 export interface SimilarIncidentsRequest {
