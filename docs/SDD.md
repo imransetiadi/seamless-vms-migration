@@ -472,7 +472,10 @@ dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transf
 (`sync_bytes_dropped` plus the listed passes), and pass numbers keep counting from the last one.
 **Force cutover** (ADV-16): `POST /migrations/{id}/force-cutover {"reason": str}` (approver; the reason at least 10
 characters) is the only way to cut over before convergence. In `precopy` or `syncing` of a warm migration it records
-`Migration.force_cutover` — actor, time, reason, the last pass's `bytes_changed` and the estimated final downtime — and a
+`Migration.force_cutover` — actor, time, reason, the last pass's `bytes_changed` and the estimated final downtime: the
+downtime if cut over after the running pass, `final_downtime_parts` (§5.3) after a pass as long as the last one that
+ended or — in `precopy`, before any pass ended — as long as the first pass's expected duration (§9.1:
+`snapshot_s + max(used/L, scan)`, VMware `used/L`) — and a
 cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
 finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
 approval by another approver (maker-checker), the window, the cutover slots. A request alone (`POST …/cutover`) never
@@ -1901,7 +1904,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   `/health` `demo_speed`; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
   difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
-  estimated downtime and asks for the reason (§5.4) —,
+  estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
+  control plane generates) and asks for the reason (§5.4) —,
   an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
   roll back (§8.1) —, the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
