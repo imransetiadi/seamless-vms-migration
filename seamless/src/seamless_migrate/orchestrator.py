@@ -829,13 +829,27 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
-            held = await self._held_elsewhere(await self._plan(m.plan_id), {m.vm.source_id})
+            plan = await self._plan(m.plan_id)
+            held = await self._held_elsewhere(plan, {m.vm.source_id})
             if held:
                 # SDD §5.4: a rolled-back migration let its VM go; another plan may have taken it
                 raise NotAllowed(
                     f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
                     f"{self._holders(held)}; finish, roll back or cancel it there first"
                 )
+            # only a completed plan's providers can be deleted (SDD §12), and the plan may still
+            # complete before the reopen below: the new attempt needs both
+            for provider_id, role in (
+                (plan.source_provider_id, ProviderRole.source),
+                (plan.destination_provider_id, ProviderRole.destination),
+            ):
+                try:
+                    await self.db.get("provider", provider_id, Provider)
+                except NotFound:
+                    raise NotAllowed(
+                        f"{m.vm.name} cannot be retried: the plan's {role} provider "
+                        f"{provider_id!r} no longer exists; create a new plan for the VM"
+                    ) from None
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)
@@ -858,6 +872,29 @@ class Orchestrator:
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
             await self._save(m, v)
+        reopened = False
+
+        def reopen(fresh: Plan) -> bool:
+            nonlocal reopened
+            reopened = fresh.status == PlanStatus.completed  # re-evaluated on every retry
+            if not reopened:
+                return False
+            fresh.status = PlanStatus.running
+            return True
+
+        # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
+        # the plan's lock, taken only now: held across the claim wait above, it would hold up the
+        # tick; a completion that wrote before the transition is seen here, a later one sees ready
+        async with self._lock(f"plan:{m.plan_id}"):
+            plan = await self._update_plan(m.plan_id, reopen)
+            if reopened:
+                await self._emit(
+                    "plan.updated",
+                    f"{plan.name} reopened: retry of {m.vm.name}",
+                    plan_id=plan.id,
+                    actor=actor,
+                    data={"status": "running"},
+                )
         await self._emit(
             "migration.action",
             f"retry of {m.vm.name}",
@@ -1229,6 +1266,15 @@ class Orchestrator:
 
         # 4. plan completion
         if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+            await self._complete(plan)
+
+    async def _complete(self, plan: Plan) -> None:
+        # SDD §8: under the plan's lock, on the migrations re-read there — a retry that returned
+        # after the tick's snapshot keeps the plan running (SDD §5.1)
+        async with self._lock(f"plan:{plan.id}"):
+            migs = await self.db.list("migration", Migration, plan_id=plan.id)
+            if not all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+                return
             completed = False
 
             def finish(fresh: Plan) -> bool:

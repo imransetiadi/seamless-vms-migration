@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
-from seamless_migrate.domain.enums import Phase, Role, Strategy, SyncPassKind
+from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
 from seamless_migrate.domain.models import Estimate, Migration, Plan, SyncPass, utcnow
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
@@ -681,6 +681,41 @@ def test_a_failed_plan_keeps_its_providers_from_deletion(api):
     stored.status = PlanStatus.completed
     api.store.put("plan", stored)
     assert delete().status_code == 204
+
+
+async def test_a_retry_in_a_completed_plan_whose_provider_was_deleted_answers_409(tmp_path):
+    """SDD §5.1/§12: DELETE /providers/{id} is allowed once a plan has completed; a retry would
+    reopen the plan without that provider, so it answers 409 and changes nothing."""
+    store = Store(f"sqlite:///{tmp_path / 'retry.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    vms = [make_vm(source_id="vm-1", name="web-01")]
+    h = build_harness(tmp_path, store, vms, settings=settings)
+    plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = (await h.migrations(plan.id))[0]
+    m.phase = Phase.rolled_back  # its cutover failed and was rolled back, so the plan completed
+    store.put("migration", m)
+    done = store.get("plan", plan.id, Plan)
+    done.status = PlanStatus.completed
+    store.put("plan", done)
+    app = create_app(settings, orchestrator=h.orch)
+    admin = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+    operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        deleted = await c.delete("/api/v1/providers/dst-rhoso", headers=admin)
+        assert deleted.status_code == 204, deleted.text
+        refused = await c.post(f"/api/v1/migrations/{m.id}/retry", headers=operator)
+        assert refused.status_code == 409, refused.text
+        assert "provider 'dst-rhoso' no longer exists" in refused.json()["error"]["message"]
+        migration = (await c.get(f"/api/v1/migrations/{m.id}", headers=operator)).json()
+        assert migration["phase"] == "rolled_back"
+        stored = (await c.get(f"/api/v1/plans/{plan.id}", headers=operator)).json()
+        assert stored["status"] == "completed"
+    await h.orch.stop()
+    store.dispose()
 
 
 async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):

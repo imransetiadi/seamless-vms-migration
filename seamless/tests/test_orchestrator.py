@@ -28,7 +28,7 @@ from seamless_migrate.executors.base import (
     StepResult,
     TransientStepError,
 )
-from seamless_migrate.orchestrator import BadRequest, NotAllowed
+from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
 from tests.factories import make_disk, make_vm
@@ -521,6 +521,161 @@ async def test_cross_plan_refusal_says_how_many_holders_it_leaves_out(tmp_path, 
         NotAllowed, match=r"^12 VM\(s\) .*web-10 \(plan \"Finance\", ready\) and 2 more; "
     ):
         await h.orch.validate_plan(second.id, "bob")
+
+
+def _first_cutover_fails(tmp_path, store):
+    """A one-VM cold plan whose first cutover fails after stopping the source (rolled back
+    automatically, which completes the plan); later attempts succeed."""
+    settings = make_settings(tmp_path)
+    tries: list[int] = []
+
+    async def cutover(ctx):
+        tries.append(1)
+        if len(tries) == 1:
+            await ctx.mark_downtime_start()
+            raise PermanentStepError("dst volume attach failed")
+        return await executor.sim.run(StepName.CUTOVER, ctx)
+
+    executor = ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover})
+    h = build_harness(tmp_path, store, [vm(1)], executor=executor, settings=settings)
+    plan = plan_for([vm(1)], default_strategy=Strategy.cold)
+    store.put("plan", plan)
+    return h, plan, tries
+
+
+async def test_a_retry_reopens_a_plan_its_rollback_completed(tmp_path, store):
+    """SDD §5.1: a rolled-back migration is wave-complete, so its plan completes; a retry of it
+    reopens the plan, or the new attempt would wait in ready for good."""
+    h, plan, tries = _first_cutover_fails(tmp_path, store)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    retried = await h.orch.retry(mid, "alice")
+    assert retried.phase == P.ready
+    assert (await h.plan(plan.id)).status == PlanStatus.running, "the retry reopens the plan"
+    m = await h.wait_phase(mid, P.completed)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert len(tries) == 2 and m.attempts == 1
+    reopened = [
+        e
+        for e in store.events(since_seq=0, limit=1000)
+        if e.kind == "plan.updated" and e.data.get("status") == "running"
+    ]
+    assert len(reopened) == 1 and reopened[0].actor == "alice" and "web-01" in reopened[0].message
+    assert h.kinds().count("plan.completed") == 2
+
+
+async def test_a_retry_in_a_completed_plan_whose_provider_is_gone_is_refused(tmp_path, store):
+    """SDD §5.1/§12: a completed plan's providers may be deleted; reopening it without them would
+    leave a running plan that cannot run, so the retry is refused and nothing changes."""
+    h, plan, _ = _first_cutover_fails(tmp_path, store)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    store.delete("provider", DST_PROVIDER.id)
+    with pytest.raises(NotAllowed, match=f"provider {DST_PROVIDER.id!r} no longer exists"):
+        await h.orch.retry(mid, "alice")
+    await h.orch.stop()
+    assert (await h.migration(mid)).phase == P.rolled_back
+    assert (await h.plan(plan.id)).status == PlanStatus.completed
+    assert "retry" not in [e.data.get("action") for e in store.events(since_seq=0, limit=1000)]
+
+
+async def test_a_retry_after_the_ticks_snapshot_keeps_the_plan_running(tmp_path, store):
+    """SDD §8: the tick completes a plan on migrations re-read under the plan's lock — a retry
+    that returned after the tick's snapshot must not leave a completed plan with a ready VM."""
+    h, plan, tries = _first_cutover_fails(tmp_path, store)
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    tick_plan = h.orch._tick_plan
+    retried: list[Migration] = []
+
+    async def retry_after_the_snapshot(plan_, migs, counts, now):
+        if not retried and any(m.id == mid and m.phase == P.rolled_back for m in migs):
+            retried.append(await h.orch.retry(mid, "alice"))  # the snapshot still says rolled_back
+        return await tick_plan(plan_, migs, counts, now)
+
+    h.orch._tick_plan = retry_after_the_snapshot
+    await h.orch.start()
+    m = await h.wait_phase(mid, P.completed)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert retried and retried[0].phase == P.ready
+    assert len(tries) == 2 and m.attempts == 1
+    assert h.kinds().count("plan.completed") == 1, "completed once, after the retried attempt"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PlanStatus.draft,
+        PlanStatus.validated,
+        PlanStatus.running,
+        PlanStatus.paused,
+        PlanStatus.failed,
+    ],
+)
+async def test_a_retry_reopens_only_a_completed_plan(tmp_path, store, status):
+    """SDD §5.1: a plan in any other status keeps it at a retry (a paused one runs the new
+    attempt once it is started again) and no plan.updated says it reopened."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.rolled_back
+    store.put("migration", m)
+    fresh = await h.plan(plan.id)
+    fresh.status = status
+    store.put("plan", fresh)
+    assert (await h.orch.retry(m.id, "alice")).phase == P.ready
+    assert (await h.plan(plan.id)).status == status
+    assert not [e for e in store.events(since_seq=0, limit=1000) if e.kind == "plan.updated"]
+
+
+async def test_a_retry_waiting_for_the_vm_claims_leaves_its_plans_lock_free(tmp_path, store):
+    """SDD §8: a validation of another plan holds the claim lock through its provider calls; a
+    retry waiting for it must not hold its own plan's lock meanwhile, or the tick, which starts
+    that plan's steps under it, would wait too - for every plan."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.failed
+    store.put("migration", m)
+    async with h.orch._lock(VM_CLAIMS):  # another plan's validation
+        retry = asyncio.create_task(h.orch.retry(m.id, "alice"))
+        await asyncio.sleep(0.05)
+        assert not retry.done()
+        assert not h.orch.plan_lock(plan.id).locked(), "the tick's _begin would wait on it"
+    assert (await retry).phase == P.ready
+
+
+async def test_a_retry_during_the_plans_completion_reopens_it(tmp_path, store):
+    """SDD §8: the completion holds the plan's lock from its re-read to its write; a retry that
+    arrives meanwhile waits for it, then finds the plan completed and reopens it."""
+    h, plan, tries = _first_cutover_fails(tmp_path, store)
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    update_plan = h.orch._update_plan
+    retries: list[asyncio.Task] = []
+
+    async def retry_while_completing(plan_id, mutate):
+        if mutate.__name__ == "finish" and not retries:
+            retries.append(asyncio.create_task(h.orch.retry(mid, "alice")))
+            await asyncio.sleep(0.05)  # the retry runs as far as the plan's lock lets it
+        return await update_plan(plan_id, mutate)
+
+    h.orch._update_plan = retry_while_completing
+    await h.orch.start()
+    m = await h.wait_phase(mid, P.completed)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.orch.stop()
+    assert retries and (await retries[0]).phase == P.ready
+    assert len(tries) == 2 and m.attempts == 1
+    assert h.kinds().count("plan.completed") == 2
 
 
 async def test_retry_refused_while_another_plan_holds_the_vm(tmp_path, store):
