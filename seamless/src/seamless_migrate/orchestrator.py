@@ -1491,7 +1491,12 @@ class Orchestrator:
             except Exception:
                 log.warning("source watch failed for %s", m.id, exc_info=True)
                 continue
-            running = str(vm.power_state) == "running"
+            state = str(vm.power_state)
+            if state not in ("running", "stopped"):
+                # a reboot or a resize, a paused VM, an error, an unknown state: not seen
+                # stopped - the alert stays as it is (SDD §8.1)
+                continue
+            running = state == "running"
             if running == (m.source_running_at is not None):
                 continue
             async with self._lock(m.id):

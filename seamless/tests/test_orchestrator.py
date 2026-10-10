@@ -4068,6 +4068,33 @@ async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_p
     assert stopped == [(m.id, {"power_state": "stopped"})]
 
 
+async def test_the_source_watch_clears_the_alert_only_when_it_sees_the_vm_stopped(tmp_path, store):
+    """SDD §8.1 (ADV-16..20 audit, F1): a reboot or a resize (transitioning), a paused VM, an error
+    or an unknown state is not "seen stopped" - the alert stays, with the time it was first seen."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+
+    async def watch(state):
+        h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": state})
+        h.clock.advance(h.settings.source_watch_s + 1)
+        await h.orch.tick()
+        if h.orch._watch_task is not None:
+            await h.orch._watch_task  # the watch runs beside the tick (SDD §8.1)
+        return await h.by_vm(plan.id, "vm-1")
+
+    assert (await watch("transitioning")).source_running_at is None, "never seen running"
+    seen = (await watch("running")).source_running_at
+    assert seen is not None
+    for state in ("transitioning", "paused", "error", "unknown", "running"):
+        assert (await watch(state)).source_running_at == seen, state
+    assert (await watch("stopped")).source_running_at is None
+    kinds = [e.kind for e in store.events(since_seq=0, limit=100000) if e.migration_id == m.id]
+    assert [k for k in kinds if k.startswith("migration.source_")] == [
+        "migration.source_running",
+        "migration.source_stopped",
+    ]
+
+
 async def test_a_slow_source_never_holds_the_tick(tmp_path, store):
     """SDD §8.1 (advisor Phase 1 audit, A7): the tick starts the source watch and never waits for
     it - a hanging source provider delays the watch only, one watch runs at a time, and stopping
