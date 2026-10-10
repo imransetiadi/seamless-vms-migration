@@ -2683,6 +2683,34 @@ async def test_a_strategy_change_during_a_validation_waits_for_it_and_is_kept(tm
     assert under_lock == [True]
 
 
+async def test_a_change_to_a_migration_being_finalized_is_refused_before_the_plans_lock(
+    tmp_path, store
+):
+    """SDD §8: a finalize holds the migration's lock across a provider deletion; a strategy change
+    or an advisor decision sent for that completed migration is refused at once — before it takes
+    the plan's lock the tick needs — not after waiting for the finalize."""
+    from tests.test_policies import rec_for
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.completed
+    store.put("migration", m)
+    rec = rec_for(m.id).model_copy(update={"plan_id": plan.id})
+    store.put("recommendation", rec)
+    async with h.orch._lock(m.id):  # a finalize deleting the source VM
+        for change in (
+            h.orch.set_strategy(m.id, Strategy.cold, "bayu"),
+            h.orch.approve_recommendation(rec.id, "sari"),
+        ):
+            task = asyncio.create_task(change)
+            await asyncio.sleep(0.05)
+            assert task.done(), "it waits for the finalize, holding the plan's lock"
+            assert not h.orch.plan_lock(plan.id).locked()
+            with pytest.raises(NotAllowed, match="the strategy cannot change in completed"):
+                await task
+
+
 async def test_set_strategy_clears_force_window(tmp_path, store):
     """SDD §5.4: approvals, cutover_requested and a pending force_window belong to the assessment
     they were given for — a strategy change clears all three."""

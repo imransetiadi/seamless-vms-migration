@@ -226,6 +226,12 @@ OWN_FORCE = "You forced this cutover. Another approver must approve it."
 OWN_DECISION = "You requested this decision. Another approver must decide it."
 
 
+def _refuse_unchangeable(m: Migration) -> None:
+    """A strategy decision applies to pending, ready and blocked migrations only (SDD §8)."""
+    if m.phase not in REVALIDATABLE:
+        raise NotAllowed(f"the strategy cannot change in {m.phase}")
+
+
 def _clear_request(m: Migration) -> None:
     """Drop the cutover request with its requester and the window bypass granted with it (§5.4)."""
     m.cutover_requested = False
@@ -1603,7 +1609,9 @@ class Orchestrator:
 
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
-        plan_id = (await self._load(mid))[0].plan_id
+        current, _ = await self._load(mid)
+        _refuse_unchangeable(current)  # before the plan's lock (SDD §8); repeated under it
+        plan_id = current.plan_id
         # SDD §8: the plan's lock first, as the advisor's override (§14.6): a running validation
         # finishes before the change, and no validation undoes it afterwards
         async with self._lock(f"plan:{plan_id}"), self._lock(mid):
@@ -1669,6 +1677,7 @@ class Orchestrator:
         if rec.migration_id is None or rec.plan_id is None:
             raise NotAllowed(f"recommendation {rec_id} decides nothing a person can change yet")
         mid, plan_id = rec.migration_id, rec.plan_id
+        _refuse_unchangeable((await self._load(mid))[0])  # before the plan's lock (SDD §8)
         async with self._lock(f"plan:{plan_id}"), self._lock(mid):
             stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
             newest = max(stored, key=lambda r: (r.created_at, r.id))
