@@ -708,4 +708,29 @@ describe('PlanDetail', () => {
     await screen.findByRole('region', { name: 'Migrations' });
     expect(screen.queryByRole('region', { name: 'Waiting for advisor approval' })).not.toBeInTheDocument();
   });
+
+  it('lets an approver turn off Distinct approver, read-only below; the settings say who approves (SDD §16, ADV-17)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const operator = renderPlan('plan-c81d44a0', 'operator');
+    expect(await screen.findByText('Yes — an approver other than the requester must approve each cutover')).toBeInTheDocument();
+    await user.click(await actionButton(/^edit plan$/i));
+    let dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const readOnly = within(dialog).getByRole('checkbox', { name: /require a distinct approver/i });
+    expect(readOnly).toBeChecked();
+    expect(readOnly).toBeDisabled();
+    expect(readOnly).toHaveAccessibleDescription(/changing the approval policy requires the approver role/i);
+    operator.unmount();
+
+    const { server } = renderPlan('plan-c81d44a0', 'approver');
+    await user.click(await actionButton(/^edit plan$/i));
+    dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const box = within(dialog).getByRole('checkbox', { name: /require a distinct approver/i });
+    await waitFor(() => expect(box).toBeEnabled());
+    await user.click(box);
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.plans.find((p) => p.id === 'plan-c81d44a0')?.require_distinct_approver).toBe(false);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['require_distinct_approver'] });
+    expect(await screen.findByText('Yes — an approver must approve each cutover')).toBeInTheDocument();
+  });
 });

@@ -1,8 +1,8 @@
-import type { Migration, Phase, Plan, Role } from '../api/types';
+import type { Approval, Migration, Phase, Plan, Role } from '../api/types';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
-import { hasRole, PERMISSIONS } from './roles';
+import { hasRole, OWN_CUTOVER, PERMISSIONS } from './roles';
 
 export type MigrationActionKey = 'approve' | 'cutover' | 'sync' | 'rollback' | 'retry' | 'cancel' | 'finalize';
 
@@ -34,6 +34,18 @@ function isSingleShot(m: Migration): boolean {
   return !isWarmStrategy(m.strategy);
 }
 
+/** The approvals the cutover gate counts (SDD §5.4 rule 1): all but the requester's when the plan requires a distinct approver. */
+export function countedApprovals(m: Migration, plan: Plan | null | undefined): Approval[] {
+  // while the plan loads, the API's default holds: a distinct approver
+  if (plan?.require_distinct_approver !== false && m.cutover_requested_by) return m.approvals.filter((a) => a.actor !== m.cutover_requested_by);
+  return m.approvals;
+}
+
+/** Maker-checker (ADV-17): the plan wants an approval, and not from the cutover's requester. */
+function fourEyes(plan: Plan | null | undefined): boolean {
+  return Boolean(plan?.require_approval && plan.require_distinct_approver);
+}
+
 /** A requested cutover that waits for a closed window: an approver may let it cut over outside the window (SDD §5.4). */
 export function waitsOnClosedWindow(m: Migration, plan: Plan | null | undefined, now: number): boolean {
   const w = plan?.cutover_window;
@@ -41,12 +53,16 @@ export function waitsOnClosedWindow(m: Migration, plan: Plan | null | undefined,
   return now < Date.parse(w.start) || now > Date.parse(w.end);
 }
 
-function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number): Availability {
+function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number, user: string | undefined): Availability {
   const ok: Availability = { enabled: true, reason: null };
   const no = (reason: string): Availability => ({ enabled: false, reason });
   switch (key) {
     case 'approve':
-      if (APPROVAL_LASTS.has(m.phase)) return ok;
+      if (APPROVAL_LASTS.has(m.phase)) {
+        // maker-checker (SDD §5.4): the API refuses the requester's approval
+        if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(OWN_CUTOVER);
+        return ok;
+      }
       if (BEFORE_VALIDATION.has(m.phase)) return no('Validate the plan first: validation clears approvals, so approve its new assessment.');
       if (m.phase === 'cancelled') return no('A cancelled migration takes no approval.');
       return no('The cutover has started or ended: an approval no longer applies.');
@@ -97,11 +113,13 @@ export function migrationActions(
   role: Role | undefined,
   plan?: Plan | null,
   now: number = Date.now(),
+  /** The signed-in user: the cutover's requester does not approve it (SDD §5.4). */
+  user?: string,
 ): Record<MigrationActionKey, Availability> {
   const result = {} as Record<MigrationActionKey, Availability>;
   for (const key of MIGRATION_ACTION_ORDER) {
     const min = ACTION_MIN_ROLE[key];
-    result[key] = hasRole(role, min) ? phaseRule(m, key, plan, now) : { enabled: false, reason: `Requires the ${min} role.` };
+    result[key] = hasRole(role, min) ? phaseRule(m, key, plan, now, user) : { enabled: false, reason: `Requires the ${min} role.` };
   }
   return result;
 }
@@ -138,10 +156,14 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
           : { text: 'Retried: the source VM is still stopped and its downtime clock keeps running. Next: an approver starts the cutover again.', action: 'cutover' };
       }
       if (isSingleShot(m)) {
+        const stops = `the source VM stops for about ${Math.round((m.estimate?.downtime_s ?? 0) / 60)} min`;
+        if (m.cutover_requested && m.cutover_requested_by && fourEyes(plan) && countedApprovals(m, plan).length === 0) {
+          return { text: `Cutover requested by ${m.cutover_requested_by}. Next: another approver approves it; ${stops}.`, action: 'approve' };
+        }
         return m.cutover_requested
           ? { text: 'Cutover requested — waiting for the wave, the window or a free cutover slot.', action: null }
           : {
-              text: `Ready. Next: an approver starts the cutover; the source VM stops for about ${Math.round((m.estimate?.downtime_s ?? 0) / 60)} min.`,
+              text: fourEyes(plan) ? `Ready. Next: an approver requests the cutover and another approves it; ${stops}.` : `Ready. Next: an approver starts the cutover; ${stops}.`,
               action: 'cutover',
             };
       }
@@ -151,6 +173,10 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'syncing':
       return { text: 'Delta passes run until the change rate converges.', action: null };
     case 'awaiting_cutover':
+      // a request stored before ADV-17 names nobody: the wait is the gate's, as before
+      if (m.cutover_requested && m.cutover_requested_by && fourEyes(plan) && countedApprovals(m, plan).length === 0) {
+        return { text: `Cutover requested by ${m.cutover_requested_by}. Next: another approver approves it; keep-warm syncs run meanwhile.`, action: 'approve' };
+      }
       if (waitsOnClosedWindow(m, plan, now)) {
         return { text: 'Cutover requested — waiting for the cutover window; an approver can let it cut over outside the window.', action: 'cutover' };
       }
@@ -159,7 +185,9 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
         text:
           plan?.require_approval === false
             ? 'Converged. Next: request the cutover (approver); keep-warm syncs run meanwhile.'
-            : 'Converged. Next: an approver approves and starts the cutover; keep-warm syncs run meanwhile.',
+            : fourEyes(plan)
+              ? 'Converged. Next: an approver requests the cutover and another approves it; keep-warm syncs run meanwhile.'
+              : 'Converged. Next: an approver approves and starts the cutover; keep-warm syncs run meanwhile.',
         action: 'cutover',
       };
     case 'cutover':

@@ -51,6 +51,9 @@ const REASON_OF: Record<StrategyDecision, ReasonCode> = {
 
 /** The demo policy of the spec (ADV-04) for the mock's DC1 source provider (SDD §14.6). */
 export const FINANCE_POLICY_ID = 'pol-finance';
+/** The fixtures' plans were validated by the operator persona, and their cutovers requested by the admin one (ADV-17). */
+const VALIDATED_BY = 'bayu';
+const REQUESTED_BY = 'rina';
 
 export interface StrategyRecommendationInput {
   id: string;
@@ -73,6 +76,8 @@ export interface StrategyRecommendationInput {
   policyId?: string;
   /** Its threshold (default SEAMLESS_JEV_MIN_CONFIDENCE's). */
   threshold?: number;
+  /** The user whose plan validation recorded it (SDD §14.6): never the one who decides it. */
+  requestedBy?: string | null;
 }
 
 /** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
@@ -98,6 +103,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
       : { name: 'jev', version: JEV_MODEL, deployment: 'unknown', endpoint_host: null },
     recommendation: { option, confidence, distribution },
     input_snapshot_sha256: input.snapshotSha256,
+    requested_by: input.requestedBy ?? null,
     decision: {
       final_option: status === 'auto_applied' ? option : status === 'pending_approval' ? null : input.deterministic,
       status,
@@ -783,6 +789,7 @@ export function defaultPlanFields(now: number) {
     selection_policy: 'min_downtime' as const,
     downtime_slo_s: 600,
     require_approval: true,
+    require_distinct_approver: true,
     auto_cutover: false,
     cutover_window: null,
     keep_warm_interval_s: 900,
@@ -887,14 +894,14 @@ const PLAN_SPECS: PlanSpec[] = [
         rec: { option: 'warm', confidence: 0.81, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e22', vm: 'os-0a12', strategy: 'warm', phase: 'verifying', wave: 'wave-1', enteredAgo: 70, progress: 100,
         passes: [{ kind: 'full', changedGiB: 14, durationS: 131 }, { kind: 'delta', changedGiB: 0.51, durationS: 86 }, { kind: 'final', changedGiB: 0.06, durationS: 83 }],
-        downtimeStartedAgo: 250, approvals: [{ actor: 'sari', ago: 400 }], cutoverRequested: true, destination: '2f9d6b1e-77c4-4f0e-8d3a-0c5b9e7a6d12', checkpoint: 'cutover',
+        downtimeStartedAgo: 250, approvals: [{ actor: 'sari', ago: 400, comment: 'Checked the pre-flight findings with the web team' }], cutoverRequested: true, destination: '2f9d6b1e-77c4-4f0e-8d3a-0c5b9e7a6d12', checkpoint: 'cutover',
         notes: [{ kind: 'verification', source: 'jev', summary: 'Both claims verified: the guest finished booting and no filesystem errors were reported.', confidence: 0.88, data: { results: [{ claim: 'The guest operating system finished booting', verdict: 'verified' }] }, ago: 30 }],
       },
       {
         rec: { option: 'warm', confidence: 0.69, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e23', vm: 'os-0a13', strategy: 'warm', phase: 'cutover', wave: 'wave-1', enteredAgo: 95, progress: 62,
         passes: [{ kind: 'full', changedGiB: 13, durationS: 129 }, { kind: 'delta', changedGiB: 0.47, durationS: 85 }, { kind: 'final', changedGiB: 0.05, durationS: 0, open: true }],
-        downtimeStartedAgo: 95, approvals: [{ actor: 'sari', ago: 180, comment: 'Inside change window' }], cutoverRequested: true, checkpoint: 'precopy',
+        downtimeStartedAgo: 95, approvals: [{ actor: 'sari', ago: 180, comment: 'Inside the change window agreed with the owner' }], cutoverRequested: true, checkpoint: 'precopy',
       },
       {
         id: 'mig-5d7e2b4a10', vm: 'os-0d51', strategy: 'warm', phase: 'precopy', wave: 'wave-2', enteredAgo: 31 * 60, progress: 37,
@@ -1018,13 +1025,13 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-d4e6f8a090', vm: 'os-0e65', strategy: 'cold', phase: 'finalized', wave: 'wave-1', enteredAgo: 7 * D, progress: 100,
         // the Advisor spec's example (ADV-01): Jev's warm at 57% is under the 60% threshold, so cold is kept
         rec: { option: 'warm', confidence: 0.57, status: 'below_threshold', deterministic: 'cold' },
-        downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200 }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
+        downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200, comment: 'Approved in CAB-2217; the owner signed off the downtime' }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
       },
       {
         id: 'mig-d4e6f8a091', vm: 'os-0a14', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 8 * D, progress: 100,
         rec: { option: 'warm', confidence: 0.88, status: 'auto_applied', deterministic: 'cold' },
         passes: [{ kind: 'full', changedGiB: 9, durationS: 96 }, { kind: 'delta', changedGiB: 0.31, durationS: 63 }, { kind: 'final', changedGiB: 0.04, durationS: 61 }],
-        downtimeStartedAgo: 8 * D + 188, downtimeS: 188, approvals: [{ actor: 'sari', ago: 8 * D + 600 }], cutoverRequested: true, destination: '9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', checkpoint: 'verify',
+        downtimeStartedAgo: 8 * D + 188, downtimeS: 188, approvals: [{ actor: 'sari', ago: 8 * D + 600, comment: 'Backups verified this morning; cut over in the window' }], cutoverRequested: true, destination: '9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', checkpoint: 'verify',
       },
     ],
   },
@@ -1041,7 +1048,7 @@ const PLAN_SPECS: PlanSpec[] = [
     migrations: [
       {
         id: 'mig-e5f7a9b1a0', vm: 'os-0e61', strategy: 'cold', phase: 'failed', wave: 'wave-1', enteredAgo: 33 * 60, progress: 100,
-        downtimeStartedAgo: 41 * 60, approvals: [{ actor: 'sari', ago: 45 * 60 }], cutoverRequested: true, destination: '5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9', checkpoint: 'cutover', attempts: 1,
+        downtimeStartedAgo: 41 * 60, approvals: [{ actor: 'sari', ago: 45 * 60, comment: 'Agreed with the application team for this evening' }], cutoverRequested: true, destination: '5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9', checkpoint: 'cutover', attempts: 1,
         error: 'Verification failed: console pattern "login:" not matched within 600 s; tcp:22 connection refused.',
         reviewReason: 'Jev contradicted "The guest operating system finished booting" (console shows a kernel panic).',
         notes: [
@@ -1059,12 +1066,12 @@ const PLAN_SPECS: PlanSpec[] = [
       },
       {
         id: 'mig-e5f7a9b1a1', vm: 'os-0e63', strategy: 'cold', phase: 'rolling_back', wave: 'wave-1', enteredAgo: 4 * 60, progress: 40,
-        downtimeStartedAgo: 19 * 60, approvals: [{ actor: 'sari', ago: 25 * 60 }], cutoverRequested: true, checkpoint: 'cutover',
+        downtimeStartedAgo: 19 * 60, approvals: [{ actor: 'sari', ago: 25 * 60, comment: 'Change CHG-2088 approved; DBA on call for the cutover' }], cutoverRequested: true, checkpoint: 'cutover',
         error: 'Import failed: volume attach timed out on the destination conversion host.',
       },
       {
         id: 'mig-e5f7a9b1a2', vm: 'os-0e66', strategy: 'cold', phase: 'rolled_back', wave: 'wave-1', enteredAgo: 3 * H, progress: 0,
-        downtimeStartedAgo: 3 * H + 1260, downtimeS: 1260, approvals: [{ actor: 'sari', ago: 4 * H }], cutoverRequested: true, checkpoint: 'rollback', attempts: 1,
+        downtimeStartedAgo: 3 * H + 1260, downtimeS: 1260, approvals: [{ actor: 'sari', ago: 4 * H, comment: 'Approved for the maintenance window; rollback plan reviewed' }], cutoverRequested: true, checkpoint: 'rollback', attempts: 1,
         error: 'Rolled back by bayu: tcp:8080 closed after boot; application config references the old database host.',
       },
       { id: 'mig-e5f7a9b1a3', vm: 'os-0e67', strategy: 'cold', phase: 'cancelled', wave: 'wave-1', enteredAgo: 1 * D },
@@ -1209,6 +1216,7 @@ export function buildFixtures(now: number): Fixtures {
       threshold: JEV_MIN_CONFIDENCE,
       min_evidence_for_auto_apply: 0,
       require_override_reason: true,
+      require_distinct_approver: true,
       created_at: policyAt,
       updated_at: policyAt,
       updated_by: 'rina',
@@ -1318,6 +1326,9 @@ export function buildFixtures(now: number): Fixtures {
         actual_downtime_s: m.downtimeS ?? null,
         approvals: (m.approvals ?? []).map((a) => ({ actor: a.actor, at: iso(now - a.ago * 1000), comment: a.comment ?? null })),
         cutover_requested: m.cutoverRequested ?? false,
+        // maker-checker (SDD §5.4, ADV-17): requested by one person, approved by another, before the approval
+        cutover_requested_by: m.cutoverRequested ? REQUESTED_BY : null,
+        cutover_requested_at: m.cutoverRequested ? iso(now - (Math.max(...(m.approvals ?? []).map((a) => a.ago), m.enteredAgo) + 120) * 1000) : null,
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         advisor_hold: null,
@@ -1368,6 +1379,8 @@ export function buildFixtures(now: number): Fixtures {
           fallback: m.rec.fallback,
           snapshotSha256: snapshot.sha256,
           policyId: m.rec.policyId,
+          // the fixtures' validations ran as the operator (SDD §14.6): the admin may decide what waits
+          requestedBy: VALIDATED_BY,
         });
         for (const event of auditEventsOf(rec)) emit({ ts: validated, plan_id: plan.id, migration_id: m.id, ...event });
         let decided = rec;
@@ -1387,7 +1400,7 @@ export function buildFixtures(now: number): Fixtures {
       }
     }
 
-    if (plan.status !== 'draft') emit({ ts: iso(createdAt + 30 * 60_000), kind: 'plan.validated', plan_id: plan.id, migration_id: null, actor: 'rina', message: `Plan "${plan.name}" validated`, data: {} });
+    if (plan.status !== 'draft') emit({ ts: iso(createdAt + 30 * 60_000), kind: 'plan.validated', plan_id: plan.id, migration_id: null, actor: VALIDATED_BY, message: `Plan "${plan.name}" validated`, data: {} });
     if (['running', 'paused', 'completed', 'failed'].includes(plan.status))
       emit({ ts: iso(createdAt + 60 * 60_000), kind: 'plan.started', plan_id: plan.id, migration_id: null, actor: 'bayu', message: `Plan "${plan.name}" started`, data: {} });
     if (plan.status === 'paused') emit({ ts: iso(now - 20 * 60_000), kind: 'plan.paused', plan_id: plan.id, migration_id: null, actor: 'bayu', message: `Plan "${plan.name}" paused: vCenter degraded`, data: {} });

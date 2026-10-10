@@ -10,7 +10,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useId, useState } from 'react';
-import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
+import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatDuration } from '../lib/format';
@@ -72,7 +72,10 @@ export interface MigrationActionsProps {
  * destructive ones use the danger tone and Finalize requires typing the VM name.
  */
 export function MigrationActions({ migration: m, plan, role, planUnavailable = false }: MigrationActionsProps) {
-  const availability = migrationActions(m, role, plan);
+  // the cutover's requester does not approve it (maker-checker, SDD §5.4)
+  const me = useMe().data?.name;
+  const availability = migrationActions(m, role, plan, undefined, me);
+  const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   if (planUnavailable && availability.cutover.enabled) {
     availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
   }
@@ -179,7 +182,10 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
               ? 'The cutover is requested now and starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. '
               : ''}
             {early && !forcing ? 'Then the' : 'The'} source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
-            {slo ? ` against an SLO of ${slo}` : ''}. This also records your approval; the migration can be rolled back until it is finalized.
+            {slo ? ` against an SLO of ${slo}` : ''}.{' '}
+            {fourEyes
+              ? 'Your request is not an approval: another approver approves the cutover. The migration can be rolled back until it is finalized.'
+              : 'This also records your approval; the migration can be rolled back until it is finalized.'}
           </>
         }
         confirmLabel={forcing ? 'Cut over outside the window' : early ? 'Request cutover' : 'Start cutover'}

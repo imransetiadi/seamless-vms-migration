@@ -33,6 +33,8 @@ interface FormState {
   policy: SelectionPolicy;
   sloMinutes: string;
   requireApproval: boolean;
+  /** Maker-checker (SDD §5.4): the cutover's requester never counts as its approver. */
+  requireDistinctApprover: boolean;
   autoCutover: boolean;
   windowStart: string;
   windowEnd: string;
@@ -94,6 +96,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     policy: 'min_downtime',
     sloMinutes: '10',
     requireApproval: true,
+    requireDistinctApprover: true,
     autoCutover: false,
     windowStart: '',
     windowEnd: '',
@@ -169,6 +172,7 @@ function formFromPlan(plan: Plan): FormState {
     policy: plan.selection_policy,
     sloMinutes: plain(plan.downtime_slo_s / 60),
     requireApproval: plan.require_approval,
+    requireDistinctApprover: plan.require_distinct_approver,
     autoCutover: plan.auto_cutover,
     windowStart: plan.cutover_window ? toLocalInput(plan.cutover_window.start) : '',
     windowEnd: plan.cutover_window ? toLocalInput(plan.cutover_window.end) : '',
@@ -423,6 +427,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         selection_policy: f.policy,
         downtime_slo_s: Math.round(slo * 60),
         require_approval: f.requireApproval,
+        require_distinct_approver: f.requireDistinctApprover,
         auto_cutover: f.autoCutover,
         cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
         mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: projects ?? {} },
@@ -762,6 +767,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Require approval"
                 hint="An approver must approve every cutover."
                 disabled={!canSetPolicy}
+                describedBy={canSetPolicy ? undefined : id('policy-reason')}
+              />
+              <Checkbox
+                checked={form.requireDistinctApprover}
+                onChange={(v) => set('requireDistinctApprover', v)}
+                label="Require a distinct approver"
+                hint={form.requireApproval ? 'The approver who requests a cutover cannot approve it.' : 'Applies when approval is required.'}
+                disabled={!canSetPolicy || !form.requireApproval}
                 describedBy={canSetPolicy ? undefined : id('policy-reason')}
               />
               <Checkbox

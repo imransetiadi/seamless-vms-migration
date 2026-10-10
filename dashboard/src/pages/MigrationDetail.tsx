@@ -29,7 +29,7 @@ import { decidable, nonStrategyNotes } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
-import { clearedByStrategyChange } from '../lib/migrationActions';
+import { clearedByStrategyChange, countedApprovals } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
 import { can, hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
@@ -443,43 +443,64 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   );
 }
 
+function When({ at }: { at: string }) {
+  return (
+    <time dateTime={at} title={formatDateTime(at)} className="text-muted-foreground">
+      {formatRelative(at)}
+    </time>
+  );
+}
+
+/** The cutover request and the approvals in time order, saying which approval does not count (SDD §5.4, §16). */
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
+  const counted = new Set(countedApprovals(m, plan));
   // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
   const request = m.cutover_requested ? (
-    <div className="flex flex-col gap-0.5 text-xs">
-      <p className="inline-flex items-center gap-1 text-status-success">
-        <CircleCheck aria-hidden className="size-3.5 shrink-0" />
-        Cutover requested
+    <div className="flex flex-col gap-0.5 text-sm">
+      <p className="inline-flex flex-wrap items-center gap-1">
+        <CircleCheck aria-hidden className="size-3.5 shrink-0 text-status-success" />
+        {/* a request stored before ADV-17 names nobody */}
+        <strong className="font-medium text-foreground">{m.cutover_requested_by ? `Requested by ${m.cutover_requested_by}` : 'Cutover requested'}</strong>
+        {m.cutover_requested_at && <When at={m.cutover_requested_at} />}
       </p>
       {m.force_window && (
-        <p className="inline-flex items-center gap-1 text-status-warning">
+        <p className="inline-flex items-center gap-1 text-xs text-status-warning">
           <CalendarClock aria-hidden className="size-3.5 shrink-0" />
           An approver allowed it to start outside the cutover window.
         </p>
       )}
     </div>
   ) : null;
-  if (m.approvals.length === 0) {
-    return (
-      <div className="flex flex-col gap-2">
-        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
-        {request}
-      </div>
-    );
-  }
-  return (
-    <ul className="flex flex-col gap-2">
-      {m.approvals.map((a, i) => (
-        <li key={`${a.actor}-${a.at}-${i}`} className="text-sm">
-          <span className="font-medium text-foreground">{a.actor}</span>{' '}
-          <time dateTime={a.at} title={formatDateTime(a.at)} className="text-muted-foreground">
-            {formatRelative(a.at)}
-          </time>
+  const entries = [
+    ...m.approvals.map((a, i) => ({
+      key: `approval-${i}`,
+      at: a.at,
+      node: (
+        <div className="text-sm">
+          <p className="inline-flex flex-wrap items-center gap-1">
+            <strong className="font-medium text-foreground">Approved by {a.actor}</strong>
+            <When at={a.at} />
+          </p>
           {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
-        </li>
-      ))}
-      {request && <li>{request}</li>}
-    </ul>
+          {plan?.require_approval !== false && !counted.has(a) && <p className="text-xs text-status-warning">Does not count: {a.actor} requested the cutover.</p>}
+        </div>
+      ),
+    })),
+    ...(request ? [{ key: 'request', at: m.cutover_requested_at ?? '', node: request }] : []),
+  ].sort((a, b) => (a.at && b.at ? Date.parse(a.at) - Date.parse(b.at) : a.at ? -1 : 1));
+  return (
+    <div className="flex flex-col gap-2">
+      {m.approvals.length === 0 && (
+        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
+      )}
+      {entries.length > 0 && (
+        <ul className="flex flex-col gap-2">
+          {entries.map((e) => (
+            <li key={e.key}>{e.node}</li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -569,7 +590,10 @@ export default function MigrationDetail() {
               estimateS={m.estimate?.downtime_s ?? null}
             />
           </Panel>
-          <Panel title="Approvals" description={p?.require_approval ? 'An approver must approve the cutover' : undefined}>
+          <Panel
+            title="Approvals"
+            description={p?.require_approval ? (p.require_distinct_approver ? 'An approver other than the requester must approve the cutover' : 'An approver must approve the cutover') : undefined}
+          >
             <Approvals m={m} plan={p} />
           </Panel>
         </div>

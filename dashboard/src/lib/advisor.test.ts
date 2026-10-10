@@ -31,6 +31,7 @@ function rec(
       ...decision,
     },
     input_snapshot_sha256: null,
+    requested_by: null,
     legacy: false,
     legacy_text: null,
     ...extra,

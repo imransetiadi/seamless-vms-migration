@@ -30,6 +30,12 @@ function setup(token: string | null = 'admin') {
 }
 
 /** Inventory VMs of `providerId` that no migration of the fixtures uses: free for a new plan. */
+/** Maker-checker (SDD §5.4, ADV-17): an approval by someone other than the approver persona who requested the cutover. */
+async function secondApprover(server: MockServer, migrationId: string): Promise<void> {
+  const admin = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+  await admin.post(`/migrations/${migrationId}/approve`, { comment: 'Second approver: findings and window checked' });
+}
+
 function freeVms(server: MockServer, providerId: string, count: number): VMRef[] {
   const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
   const taken = new Set(server.migrations.map((m) => m.vm.source_id));
@@ -374,6 +380,7 @@ describe('mock API', () => {
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${failed.id}/cutover`, {});
+    await secondApprover(server, failed.id); // maker-checker (ADV-17): the requester's approval does not count
     server.tick();
     const again = server.migrations.find((m) => m.id === failed.id)!;
     expect(again.phase).toBe('cutover');
@@ -465,7 +472,8 @@ describe('mock API', () => {
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${m.id}/cutover`, {});
-    for (let t = 0; t < 200 && m.phase === 'cutover'; t++) server.tick();
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
+    for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
     expect(m.phase).toBe('verifying');
     expect(m.sync_passes.at(-1)).toMatchObject({ kind: 'full', bytes_transferred: m.vm.used_bytes });
     expect(m.bytes_transferred).toBe(m.vm.used_bytes);
@@ -510,6 +518,7 @@ describe('mock API', () => {
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${m.id}/cutover`, {});
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
     for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
     expect(m.phase).toBe('verifying');
     expect(m.sync_passes.map((p) => p.number)).toEqual([...kept.slice(0, plan.max_sync_passes), ...kept.slice(plan.max_sync_passes + 1), last + 1]);
@@ -1185,5 +1194,86 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
     expect(runs[0]!.rec.confidence).toBeGreaterThanOrEqual(0.5);
     expect(runs[0]!.rec.confidence).toBeLessThan(0.95);
     expect(runs[0]!.next).toBe((new MockServer({ now: () => NOW, seed: 1 }) as unknown as { rand: () => number }).rand());
+  });
+});
+
+describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
+  const ADMIN_TOKEN = 'admin';
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const OWN_CUTOVER = 'You requested this cutover. Another approver must approve it.';
+  const OWN_DECISION = 'You requested this decision. Another approver must decide it.';
+
+  it('records a cutover request without an approval, refuses the requester\'s approval and opens the gate on another approver\'s', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'storage_handover', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    await as(server, 'operator').post('/plans/plan-c81d44a0/start');
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    const requested = await as(server, 'approver').post<Migration>(`/migrations/${node.id}/cutover`, { comment: 'Window agreed with the data team' });
+    expect([requested.cutover_requested, requested.cutover_requested_by, requested.approvals]).toEqual([true, 'sari', []]);
+    expect(requested.cutover_requested_at).not.toBeNull();
+    expect(server.events.filter((e) => e.migration_id === node.id && e.kind === 'migration.action').at(-1)!.data.comment).toBe('Window agreed with the data team');
+    await expect(as(server, 'approver').post(`/migrations/${node.id}/approve`, { comment: 'mine' })).rejects.toMatchObject({ status: 409, message: OWN_CUTOVER });
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(node.phase).toBe('ready');
+    await as(server, ADMIN_TOKEN).post(`/migrations/${node.id}/approve`, { comment: 'Checked the handover findings' });
+    for (let i = 0; i < 3 && node.phase === 'ready'; i += 1) server.tick();
+    expect(node.phase).toBe('cutover');
+  });
+
+  it("does not count an approval the requester gave before requesting: the gate waits for another approver's", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'storage_handover', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    await as(server, 'operator').post('/plans/plan-c81d44a0/start');
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    await as(server, 'approver').post(`/migrations/${node.id}/approve`, { comment: 'Findings checked with the data team' });
+    await as(server, 'approver').post(`/migrations/${node.id}/cutover`, {});
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect([node.phase, node.approvals.map((a) => a.actor), node.cutover_requested_by]).toEqual(['ready', ['sari'], 'sari']);
+  });
+
+  it('treats a request as an approval, as before, when the plan needs no distinct approver', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    server.plans.find((p) => p.id === node.plan_id)!.require_distinct_approver = false;
+    const requested = await as(server, 'approver').post<Migration>(`/migrations/${node.id}/cutover`, {});
+    expect(requested.approvals.map((a) => a.actor)).toEqual(['sari']);
+  });
+
+  it('names the validating user as the requester of a decision, who then neither approves nor overrides it', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, ADMIN_TOKEN).post('/plans/plan-c81d44a0/validate');
+    const rec = server.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([rec.requested_by, rec.decision.status]).toEqual(['rina', 'pending_approval']);
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({ status: 409, message: OWN_DECISION });
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'The change window fits a cold cutover' })).rejects.toMatchObject({
+      status: 409,
+      message: OWN_DECISION,
+    });
+  });
+
+  it('defaults a policy to a distinct approver and keeps Distinct approver approver-only on a plan', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const spec = { name: 'Four eyes', scope: { provider_ids: [], plan_ids: [] }, decision_types: [], mode: 'always_require_approval', threshold: 0.6 };
+    const created = await as(server, ADMIN_TOKEN).post<{ require_distinct_approver: boolean }>('/advisor/policies', spec);
+    expect(created.require_distinct_approver).toBe(true);
+    const draft = server.plans.find((p) => p.status === 'draft')!;
+    await expect(as(server, 'operator').patch(`/plans/${draft.id}`, { require_distinct_approver: false })).rejects.toMatchObject({ status: 403 });
+    const patched = await as(server, 'approver').patch<{ require_distinct_approver: boolean }>(`/plans/${draft.id}`, { require_distinct_approver: false });
+    expect(patched.require_distinct_approver).toBe(false);
+  });
+
+  it('seeds requests and approvals by two people, with comments an operator would write', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const requested = server.migrations.filter((m) => m.cutover_requested);
+    expect(requested.length).toBeGreaterThan(3);
+    for (const m of requested) {
+      expect(m.cutover_requested_by, m.vm.name).toBeTruthy();
+      expect(m.approvals.every((a) => a.actor !== m.cutover_requested_by), m.vm.name).toBe(true);
+    }
+    for (const a of server.migrations.flatMap((m) => m.approvals)) expect((a.comment ?? '').length, a.actor).toBeGreaterThanOrEqual(15);
+    // the fixtures' validations ran as the operator: the admin persona may decide what waits
+    expect(new Set(server.recommendations.filter((r) => !r.legacy).map((r) => r.requested_by))).toEqual(new Set(['bayu']));
   });
 });

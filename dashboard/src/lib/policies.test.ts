@@ -12,6 +12,7 @@ function pol(id: string, over: Partial<AdvisorPolicy> = {}, where: { providers?:
     threshold: 0.6,
     min_evidence_for_auto_apply: 0,
     require_override_reason: true,
+    require_distinct_approver: true,
     created_at: '2026-10-10T08:00:00Z',
     updated_at: '2026-10-10T08:00:00Z',
     updated_by: 'rina',

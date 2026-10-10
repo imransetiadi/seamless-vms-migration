@@ -118,7 +118,13 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         {strategyLabel(plan.default_strategy)} · {plan.selection_policy === 'min_downtime' ? 'minimum downtime' : 'simplest meeting the SLO'}
         {overrides > 0 && <span className="block text-xs text-muted-foreground">{overrides} per-VM override(s)</span>}
       </Setting>
-      <Setting label="Require approval">{plan.require_approval ? 'Yes — an approver must approve each cutover' : 'No'}</Setting>
+      <Setting label="Require approval">
+        {plan.require_approval
+          ? plan.require_distinct_approver
+            ? 'Yes — an approver other than the requester must approve each cutover'
+            : 'Yes — an approver must approve each cutover'
+          : 'No'}
+      </Setting>
       <Setting label="Cutover trigger">{plan.auto_cutover ? 'Automatic once the gate opens' : 'On request (Cutover action)'}</Setting>
       <Setting label="Cutover window">{windowText(plan)}</Setting>
       <Setting label="Warm sync">

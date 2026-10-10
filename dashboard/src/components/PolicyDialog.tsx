@@ -30,6 +30,7 @@ interface FormState {
   threshold: string;
   minEvidence: string;
   requireReason: boolean;
+  requireDistinctApprover: boolean;
 }
 
 type FieldKey = 'name' | 'scope' | 'threshold' | 'minEvidence';
@@ -50,6 +51,7 @@ function formOf(policy: AdvisorPolicy | undefined, defaultThreshold: number): Fo
       threshold: plain(defaultThreshold * 100),
       minEvidence: '0',
       requireReason: true,
+      requireDistinctApprover: true,
     };
   }
   const { provider_ids, plan_ids } = policy.scope;
@@ -63,6 +65,7 @@ function formOf(policy: AdvisorPolicy | undefined, defaultThreshold: number): Fo
     threshold: plain(policy.threshold * 100),
     minEvidence: String(policy.min_evidence_for_auto_apply),
     requireReason: policy.require_override_reason,
+    requireDistinctApprover: policy.require_distinct_approver,
   };
 }
 
@@ -89,6 +92,7 @@ function validate(f: FormState): { errors: Errors; spec: AdvisorPolicySpec | nul
       threshold: Number((threshold / 100).toFixed(4)),
       min_evidence_for_auto_apply: minEvidence,
       require_override_reason: f.requireReason,
+      require_distinct_approver: f.requireDistinctApprover,
     },
   };
 }
@@ -318,6 +322,12 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
             hint="At least 10 characters, saved in the audit trail."
             checked={form.requireReason}
             onChange={(on) => set('requireReason', on)}
+          />
+          <Checkbox
+            label="Require a distinct approver"
+            hint="The person whose validation asked for a decision cannot approve or override it."
+            checked={form.requireDistinctApprover}
+            onChange={(on) => set('requireDistinctApprover', on)}
           />
 
           {save.error && <ErrorBanner error={save.error} title={policy ? 'The policy was not saved' : 'The policy was not created'} />}

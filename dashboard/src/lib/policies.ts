@@ -6,9 +6,16 @@ export const POLICY_MODE_LABELS: Record<PolicyMode, string> = {
   always_require_approval: 'Always asks for approval',
 };
 
-/** Strictest first: approval before auto, then the higher threshold, minimum evidence, a required reason, the lower id. */
+/** Strictest first: approval before auto, then the higher threshold, minimum evidence, a required reason, a distinct approver, the lower id. */
 function strictness(p: AdvisorPolicy): Array<number | string> {
-  return [p.mode === 'always_require_approval' ? 0 : 1, -p.threshold, -p.min_evidence_for_auto_apply, p.require_override_reason ? 0 : 1, p.id];
+  return [
+    p.mode === 'always_require_approval' ? 0 : 1,
+    -p.threshold,
+    -p.min_evidence_for_auto_apply,
+    p.require_override_reason ? 0 : 1,
+    p.require_distinct_approver ? 0 : 1,
+    p.id,
+  ];
 }
 
 function stricter(a: AdvisorPolicy, b: AdvisorPolicy): number {

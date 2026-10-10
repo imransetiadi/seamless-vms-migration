@@ -82,6 +82,8 @@ function PolicyCard({
           <dd className="num">{policy.min_evidence_for_auto_apply}</dd>
           <dt className="text-muted-foreground">Override reason</dt>
           <dd>{policy.require_override_reason ? 'Required' : 'Optional'}</dd>
+          <dt className="text-muted-foreground">Distinct approver</dt>
+          <dd>{policy.require_distinct_approver ? 'Required' : 'Not required'}</dd>
           {!builtIn && (
             <>
               <dt className="text-muted-foreground">Changed</dt>

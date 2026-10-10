@@ -12,8 +12,9 @@
  */
 import { DEFAULT_API_BASE } from './client';
 import { canTransition, hasDataPath } from '../lib/fsm';
+import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
-import { hasRole } from '../lib/roles';
+import { hasRole, OWN_CUTOVER, OWN_DECISION } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
 import { WAVE_COMPLETE_PHASES } from '../lib/waves';
@@ -161,20 +162,31 @@ function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_po
   return ties.length >= 2 ? bySimplicity(ties) : [];
 }
 
+/** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
+function clearRequest(m: Migration): void {
+  m.cutover_requested = false;
+  m.cutover_requested_by = null;
+  m.cutover_requested_at = null;
+  m.force_window = false;
+}
+
 /** The part of a policy decide() needs (SDD §14.4, §14.6). */
 interface PolicyRule {
   id: string;
   mode: AdvisorPolicy['mode'];
   threshold: number;
   require_override_reason: boolean;
+  require_distinct_approver: boolean;
 }
 
-const GLOBAL_DEFAULT: PolicyRule = { id: 'global-default', mode: 'auto_apply_above_threshold', threshold: JEV_MIN_CONFIDENCE, require_override_reason: false };
+const GLOBAL_DEFAULT: PolicyRule = { id: 'global-default', mode: 'auto_apply_above_threshold', threshold: JEV_MIN_CONFIDENCE, require_override_reason: false, require_distinct_approver: true };
 
 /** The policy in force for a plan's strategy decisions (SDD §14.6), or the built-in default. */
 function policyFor(policies: readonly AdvisorPolicy[], plan: Plan): PolicyRule {
   const winner = resolvePolicy(policies, plan.id, plan.source_provider_id, 'migration_strategy');
-  return winner ? { id: winner.id, mode: winner.mode, threshold: winner.threshold, require_override_reason: winner.require_override_reason } : GLOBAL_DEFAULT;
+  return winner
+    ? { id: winner.id, mode: winner.mode, threshold: winner.threshold, require_override_reason: winner.require_override_reason, require_distinct_approver: winner.require_distinct_approver }
+    : GLOBAL_DEFAULT;
 }
 
 /** decide() (SDD §14.4): no usable advice, a policy that asks a person, below the threshold, else applied. */
@@ -219,6 +231,7 @@ function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
         },
         decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
         input_snapshot_sha256: null,
+        requested_by: null,
         legacy: true,
         legacy_text: note.summary,
       };
@@ -257,7 +270,7 @@ function keepSyncHistory(m: Migration, keepFirst: number): void {
   m.sync_bytes_dropped += dropped.reduce((sum, p) => sum + p.bytes_transferred, 0);
 }
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
-const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
+const POLICY_FIELDS = ['require_approval', 'require_distinct_approver', 'auto_cutover', 'cutover_window'] as const;
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
@@ -519,7 +532,7 @@ export class MockServer {
   }
 
   private gateOpen(m: Migration, plan: Plan): boolean {
-    const approved = !plan.require_approval || m.approvals.length > 0;
+    const approved = !plan.require_approval || countedApprovals(m, plan).length > 0;
     const requested = plan.auto_cutover || m.cutover_requested;
     const window = plan.cutover_window;
     const now = this.now();
@@ -693,13 +706,12 @@ export class MockServer {
   /** A fresh assessment or strategy needs a fresh approval (SDD §5.4): nothing given before carries over. */
   private clearApprovals(m: Migration): void {
     m.approvals = [];
-    m.cutover_requested = false;
-    m.force_window = false;
+    clearRequest(m);
   }
 
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
     this.evaluate(m, plan);
-    const rec = this.decideStrategy(m, plan);
+    const rec = this.decideStrategy(m, plan, actor);
     // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
@@ -716,7 +728,7 @@ export class MockServer {
    * Like validate_plan (SDD §14.4): an automatic choice whose advisor scope is not empty goes to the
    * advisor, decide() takes the decision, and the migration runs its final option.
    */
-  private decideStrategy(m: Migration, plan: Plan): AdvisorRecommendation | null {
+  private decideStrategy(m: Migration, plan: Plan, actor: string): AdvisorRecommendation | null {
     const automatic = plan.default_strategy === 'auto' && !(m.vm.source_id in plan.strategy_overrides);
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy);
     const scope = advisorScope(m.estimates, plan.selection_policy);
@@ -743,6 +755,7 @@ export class MockServer {
       snapshotSha256: snapshot.sha256,
       policyId: policy.id,
       threshold: policy.threshold,
+      requestedBy: actor,
     });
     // a decision that waits keeps the deterministic choice and holds the migration (SDD §14.6)
     const final = (rec.decision.final_option ?? m.strategy) as Strategy;
@@ -1033,6 +1046,7 @@ export class MockServer {
       threshold: Number(input.threshold),
       min_evidence_for_auto_apply: input.min_evidence_for_auto_apply === undefined ? 0 : Number(input.min_evidence_for_auto_apply),
       require_override_reason: input.require_override_reason === undefined ? true : Boolean(input.require_override_reason),
+      require_distinct_approver: input.require_distinct_approver === undefined ? true : Boolean(input.require_distinct_approver),
     };
     const problems: string[] = [];
     if (!spec.name.trim() || spec.name.length > 200) problems.push('name: 1-200 characters');
@@ -1089,6 +1103,8 @@ export class MockServer {
     if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
     const plan = this.plan(m.plan_id);
     const policy = policyFor(this.policies, plan);
+    // maker-checker (SDD §14.6, ADV-17): the validating user does not decide what their validation asked
+    if (policy.require_distinct_approver && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
     const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
     if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
     if (action === 'override' && policy.require_override_reason && (reason ?? '').length < OVERRIDE_REASON_MIN) {
@@ -1385,6 +1401,8 @@ export class MockServer {
       actual_downtime_s: null,
       approvals: [],
       cutover_requested: false,
+      cutover_requested_by: null,
+      cutover_requested_at: null,
       force_window: false,
       advisor_notes: [],
       advisor_hold: null,
@@ -1527,15 +1545,22 @@ export class MockServer {
       case 'approve':
         // the API's APPROVABLE and message (SDD §5.4)
         if (!APPROVABLE.has(m.phase)) throw new HttpError(409, 'conflict', `a migration in ${m.phase} cannot be approved`);
+        // maker-checker (SDD §5.4, ADV-17): the requester never approves their own cutover
+        if (plan.require_distinct_approver && m.cutover_requested_by === me.name) throw new HttpError(409, 'conflict', OWN_CUTOVER);
         approve();
         break;
       case 'cutover': {
         // the API's CUTOVER_REQUESTABLE and message: a warm migration requested early cuts over once it converges
         if (!CUTOVER_REQUESTABLE.has(m.phase)) throw new HttpError(409, 'conflict', `cutover cannot be requested in ${m.phase}`);
-        approve();
+        // the request is an approval only without a distinct approver (SDD §5.4)
+        if (!plan.require_distinct_approver) approve();
+        if (!m.cutover_requested_by) {
+          m.cutover_requested_by = me.name;
+          m.cutover_requested_at = new Date(this.now()).toISOString();
+        }
         m.cutover_requested = true;
         m.force_window = m.force_window || Boolean(input.force_window);
-        record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window) });
+        record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window), comment });
         // only a converged warm migration or a ready single-shot one enters the cutover (SDD §5.4); an
         // early request waits for convergence
         const waiting = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
@@ -1577,8 +1602,7 @@ export class MockServer {
           m.actual_downtime_s = null;
         }
         m.error = null;
-        m.cutover_requested = false;
-        m.force_window = false;
+        clearRequest(m);
         m.progress_pct = 0;
         if (reopen) {
           plan.status = 'running';

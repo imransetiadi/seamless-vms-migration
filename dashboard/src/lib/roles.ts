@@ -20,6 +20,10 @@ export function can(role: Role | null | undefined, permission: Permission): bool
   return hasRole(role, PERMISSIONS[permission]);
 }
 
+/** Maker-checker (SDD §5.4, §14.6, ADV-17): the API's answers to a requester deciding their own request. */
+export const OWN_CUTOVER = 'You requested this cutover. Another approver must approve it.';
+export const OWN_DECISION = 'You requested this decision. Another approver must decide it.';
+
 export const ROLE_LABELS: Record<Role, string> = {
   viewer: 'Viewer',
   operator: 'Operator',

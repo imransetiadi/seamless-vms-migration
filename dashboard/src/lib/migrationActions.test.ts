@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { OWN_CUTOVER } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -166,6 +167,41 @@ describe('migrationActions rules', () => {
       expect(step.text, strategy).toBe("Ready. Next: approve or override the advisor's decision (admin); nothing starts before that.");
       expect(step.action, strategy).toBeNull();
     }
+  });
+
+  it("keeps Approve from the cutover's requester when the plan requires a distinct approver (SDD §5.4, ADV-17)", () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const requested = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: '2026-10-08T11:00:00Z', approvals: [] });
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: true }, now, 'sari').approve).toEqual({ enabled: false, reason: OWN_CUTOVER });
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: true }, now, 'rina').approve.enabled).toBe(true);
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
+    // while the plan is loading, the API's default holds: a distinct approver
+    expect(migrationActions(requested, 'approver', undefined, now, 'sari').approve.enabled).toBe(false);
+  });
+
+  it('counts the approvals the gate counts: all but the requester\'s under a distinct approver (SDD §5.4)', () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const at = '2026-10-08T11:00:00Z';
+    const m = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: at, approvals: [{ actor: 'sari', at, comment: null }, { actor: 'rina', at, comment: 'Checked' }] });
+    expect(countedApprovals(m, { ...plan, require_distinct_approver: true }).map((a) => a.actor)).toEqual(['rina']);
+    expect(countedApprovals(m, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
+    // stored before ADV-17: no requester, every approval counts
+    expect(countedApprovals({ ...m, cutover_requested_by: null }, { ...plan, require_distinct_approver: true })).toHaveLength(2);
+  });
+
+  it('says that a requested cutover waits for another approver, and that a request is not an approval (ADV-17)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const waiting = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: '2026-10-08T11:00:00Z', approvals: [] });
+    expect(nextStep(waiting, plan)).toEqual({ text: 'Cutover requested by sari. Next: another approver approves it; keep-warm syncs run meanwhile.', action: 'approve' });
+    // a request stored before ADV-17 names nobody: no 'requested by null'
+    expect(nextStep(migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: null, approvals: [] }), plan).text).not.toMatch(/null/);
+    expect(nextStep(migration('awaiting_cutover', { approvals: [] }), plan).text).toBe(
+      'Converged. Next: an approver requests the cutover and another approves it; keep-warm syncs run meanwhile.',
+    );
+    const cold = migration('ready', { approvals: [], estimate: { ...base.estimate!, downtime_s: 300 } }, 'cold');
+    expect(nextStep(cold, plan).text).toBe('Ready. Next: an approver requests the cutover and another approves it; the source VM stops for about 5 min.');
+    expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
   });
 
   it('names the next step', () => {

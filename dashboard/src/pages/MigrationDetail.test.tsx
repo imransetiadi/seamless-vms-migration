@@ -20,7 +20,7 @@ describe('MigrationDetail', () => {
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
     expect(await screen.findByText('Cutover requested')).toBeInTheDocument();
     expect(screen.getByText('An approver allowed it to start outside the cutover window.')).toBeInTheDocument();
-    expect(screen.getByText('approver-1')).toBeInTheDocument();
+    expect(screen.getByText('Approved by approver-1')).toBeInTheDocument();
   });
 
   it('shows a cutover request in a plan that needs no approval (SDD §16)', async () => {
@@ -286,5 +286,54 @@ describe('MigrationDetail', () => {
     await user.selectOptions(within(dialog).getByLabelText('Run instead'), 'cold');
     await user.click(within(dialog).getByRole('button', { name: 'Override' }));
     expect(await screen.findByText('Decision: Cold migration — overridden by rina')).toBeInTheDocument();
+  });
+
+  it('lists the cutover request and the approvals in time order, and says when an approval does not count (SDD §16, ADV-17)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!; // web-01: requested by rina, approved by sari
+    m.approvals = [...m.approvals, { actor: 'rina', at: '2026-10-08T11:59:00Z', comment: 'Approving my own request too' }];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^approvals$/i });
+    const items = within(within(panel).getByRole('list')).getAllByRole('listitem');
+    expect(items.map((li) => li.querySelector('strong')?.textContent)).toEqual(['Requested by rina', 'Approved by sari', 'Approved by rina']);
+    expect(items[1]).toHaveTextContent('Pilot approved in CAB-2291');
+    expect(items[2]).toHaveTextContent('Does not count: rina requested the cutover.');
+    expect(await within(panel).findByText(/an approver other than the requester/i)).toBeInTheDocument();
+  });
+
+  it("keeps Approve from the cutover's requester, with the reason, and lets another approver approve (SDD §5.4, ADV-17)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-5003, ready
+    m.approvals = [];
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    expect([plan.require_approval, plan.require_distinct_approver]).toEqual([true, true]);
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const group = await screen.findByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^cut over/i }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent('Your request is not an approval: another approver approves the cutover.');
+    await user.click(within(dialog).getByRole('button', { name: /start cutover|request cutover/i }));
+    await waitFor(() => expect(within(group).getByRole('button', { name: /^approve$/i })).toHaveAttribute('aria-disabled', 'true'));
+    expect(within(group).getByRole('button', { name: /^approve$/i })).toHaveAccessibleDescription('You requested this cutover. Another approver must approve it.');
+    expect(m).toMatchObject({ cutover_requested_by: 'sari', approvals: [] });
+    view.unmount();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const again = await screen.findByRole('group', { name: /migration actions/i });
+    expect(within(again).getByRole('button', { name: /^approve$/i })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it("keeps Approve and Override from the decision's requester, with the reason (SDD §14.6, ADV-17)", async () => {
+    const server = createTestServer();
+    const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;
+    const rec = server.recommendations.find((r) => r.id === db.advisor_hold)!;
+    rec.requested_by = 'rina'; // the admin persona validated the plan
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${db.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    for (const name of ['Approve', 'Override']) {
+      const button = within(group).getByRole('button', { name });
+      expect(button).toHaveAttribute('aria-disabled', 'true');
+      expect(button).toHaveAccessibleDescription('You requested this decision. Another approver must decide it.');
+    }
   });
 });

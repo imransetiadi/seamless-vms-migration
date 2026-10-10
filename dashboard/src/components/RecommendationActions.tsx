@@ -1,9 +1,10 @@
 import { Replace, ThumbsUp } from 'lucide-react';
 import { useRef, useState, type RefObject } from 'react';
-import { useDecideRecommendation, usePolicies } from '../api/hooks';
+import { useDecideRecommendation, useMe, usePolicies } from '../api/hooks';
 import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type Strategy } from '../api/types';
 import { optionLabel } from '../lib/advisor';
 import { resolvePolicy } from '../lib/policies';
+import { OWN_DECISION } from '../lib/roles';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { SelectField, TextAreaField } from './Field';
@@ -38,6 +39,9 @@ export function RecommendationActions({
   // the policy in force says whether a reason is required, as the API checks it; unknown: ask for one (SDD §14.6)
   const inForce = policies.data ? (resolvePolicy(policies.data.items, rec.plan_id, rec.provider_id, rec.decision_type) ?? policies.data.default) : undefined;
   const reasonRequired = inForce ? inForce.require_override_reason : true;
+  // maker-checker (SDD §14.6): the user whose validation asked for this decision does not decide it
+  const me = useMe().data?.name;
+  const own = Boolean(me && rec.requested_by === me && (inForce?.require_distinct_approver ?? true));
   const reasonOk = !reasonRequired || reason.trim().length >= OVERRIDE_REASON_MIN;
   // read by the dialog as it closes: empty on Cancel (focus goes back to the button), set after a decision
   const returnRef = useRef<HTMLElement | null>(null);
@@ -56,10 +60,10 @@ export function RecommendationActions({
   return (
     <>
       <div role="group" aria-label={`Decide on the recommendation for ${name}`} className="mt-2 flex flex-wrap gap-2">
-        <Button size="lg" variant="primary" icon={ThumbsUp} disabledReason={canApprove ? null : 'The recommended option is not eligible for this VM now.'} onClick={() => setOpen('approve')}>
+        <Button size="lg" variant="primary" icon={ThumbsUp} disabledReason={own ? OWN_DECISION : canApprove ? null : 'The recommended option is not eligible for this VM now.'} onClick={() => setOpen('approve')}>
           Approve
         </Button>
-        <Button size="lg" icon={Replace} disabledReason={alternatives.length ? null : 'No other option is eligible for this VM.'} onClick={() => setOpen('override')}>
+        <Button size="lg" icon={Replace} disabledReason={own ? OWN_DECISION : alternatives.length ? null : 'No other option is eligible for this VM.'} onClick={() => setOpen('override')}>
           Override
         </Button>
       </div>

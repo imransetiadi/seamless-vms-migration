@@ -119,4 +119,19 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     expect(screen.getByText('No policies yet')).toBeInTheDocument();
     expect(screen.getByText(/applies on its own from 60% confidence/)).toBeInTheDocument();
   });
+
+  it('requires a distinct approver by default, and says so on the card (ADV-17)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    expect(card(FINANCE)).toHaveTextContent(/Distinct approver\s*Required/);
+    await user.click(within(card(FINANCE)).getByRole('button', { name: `Edit ${FINANCE}` }));
+    const dialog = await screen.findByRole('dialog', { name: 'Edit policy' });
+    const box = within(dialog).getByRole('checkbox', { name: /require a distinct approver/i });
+    expect(box).toBeChecked();
+    await user.click(box);
+    await user.click(within(dialog).getByRole('button', { name: 'Save policy' }));
+    await waitFor(() => expect(server.policies[0]!.require_distinct_approver).toBe(false));
+    await waitFor(() => expect(card(FINANCE)).toHaveTextContent(/Distinct approver\s*Not required/));
+  });
 });

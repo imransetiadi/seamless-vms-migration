@@ -279,6 +279,8 @@ export interface Plan {
   selection_policy: SelectionPolicy;
   downtime_slo_s: number;
   require_approval: boolean;
+  /** Maker-checker (SDD §5.4, ADV-17): the cutover's requester never counts as its approver. */
+  require_distinct_approver: boolean;
   auto_cutover: boolean;
   cutover_window: CutoverWindow | null;
   keep_warm_interval_s: number;
@@ -391,6 +393,8 @@ export interface AdvisorRecommendation {
   decision: Decision;
   /** The redacted input the recommendation rests on, an `AdvisorSnapshot` (SDD §14.5). */
   input_snapshot_sha256: string | null;
+  /** The user whose plan validation recorded it: never the one who decides it (SDD §14.6). */
+  requested_by: string | null;
   /** A strategy note written before recommendations existed, read as one (SDD §14.4). */
   legacy: boolean;
   legacy_text: string | null;
@@ -419,6 +423,8 @@ export interface AdvisorPolicySpec {
   threshold: number;
   min_evidence_for_auto_apply: number;
   require_override_reason: boolean;
+  /** Maker-checker (ADV-17): the decision's requester neither approves nor overrides it. */
+  require_distinct_approver: boolean;
 }
 
 export interface AdvisorPolicy extends AdvisorPolicySpec {
@@ -492,6 +498,9 @@ export interface Migration {
   actual_downtime_s: number | null;
   approvals: Approval[];
   cutover_requested: boolean;
+  /** Who asked for the cutover first, and when (SDD §5.4). */
+  cutover_requested_by: string | null;
+  cutover_requested_at: Timestamp | null;
   force_window: boolean;
   advisor_notes: AdvisorNote[];
   /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
