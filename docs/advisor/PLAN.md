@@ -35,7 +35,7 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | done — e652375, 013b627, b313ce2 (`ai/snapshots.py`, `/advisor/audit`, `/advisor/recommendations/:id`; jev_decide 0.91 replace `advisor.strategy`, 0.92 dedicated audit route) |
 | PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | done — 791c259, c18699a (confidence once, rounded down; reason without numbers; `Term` tooltip; Details tab; old-notes replay test). After the review of 10 Oct the Decision line carries the comparison ("below threshold (57% < 60%), default kept"; c6f62c9 SDD and the dashboard commit after it; jev_decide 0.64) |
 | PR-5 | ADV-04 | `advisor_policy` kind, resolution (plan > source provider > global; ties → strictest), CRUD (admin), approve/override (admin, reason ≥ 10 chars when required), pending approval holds the migration, Demo policy "Finance — approval required" | done — 33f7d09 (SDD), 7054651 (API: `ai/policies.py`, `advisor_hold`, `/advisor/policies`, approve/override), the dashboard commit after it (`/advisor/policies`, Approve/Override in the feed, the plan's "Waiting for advisor approval" panel, the migration's hold banner and next step, the detail page; `lib/policies.ts` resolves like the API) |
-| PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | planned |
+| PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | done — da3ca1b, 0cb9dd3 (SDD), 05bfe22, d406720, acec272 (API: `ai/evidence.py`, eleven keys measured against the recommended option else the deterministic one, `decide()` counts what supports or opposes, incidents stored at creation, Jev's keyed reasons filtered — none today; a new policy asks for 3, the built-in default for none), d99d1e5 (dashboard: Evidence panel, list line, `?vm=` and `#findings`/`#estimates` links, mock port on the shared six-case table). jev_decide 1.0 ×5, 0.96 (placement) |
 | PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | done — 72c0bee (SDD), 67df4c3 (API: `ai/payloads.py` field specs with golden tests, `/advisor/data-sent`, the console stays local with a remote model), the dashboard commit after it (badge on the Jev card and on each recommendation, the panel; jev_decide 0.99 declared specs). `TODO(ADV-06): confirm` — default remote, endpoint host unset until configured |
 
 Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
@@ -97,7 +97,9 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    listed once). Found on the way: Needs attention had counted the requester's own approval (maker-checker).
    Follow-up (live stack, ADV-19): Edit plan's reason calls completed migrations "in flight … finish, roll back or
    cancel them first" — for a completed one, finalize or roll back is meant.
-7. Then the original order (PR-6 ADV-02 first); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
+7. PR-6 ADV-02 evidence card. Done — see the table above. Recommendations recorded before ADV-02 (the live demo's) show
+   "No evidence was recorded with this recommendation."; evidence appears with the next validation.
+8. Then the original order (after PR-6); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
    review of Phase 1.
 
 **For the owner's review (deviations from the spec's wording, each with its reason):**
