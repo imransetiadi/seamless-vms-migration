@@ -277,6 +277,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
+            downtime_model_s: float|null,   # demo: the model seconds a simulated cutover kept the source stopped (§5.2)
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             created_at: datetime, updated_at: datetime }
@@ -369,9 +370,12 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
   (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. `actual_downtime_s` = difference — in demo mode in model
-  seconds, the difference times `SEAMLESS_DEMO_SPEED`, like the passes' `duration_s` (§7.4; the downtime events
-  say the same number), so a demo's downtime compares with its estimate (ADV-16). A retry resets a
+  rollback, when the source VM is running again. `actual_downtime_s` = difference — except after a simulated
+  cutover (demo, §7.4): the simulator reports the model seconds it spent with the source stopped (the copy or final
+  sync, the conversion and the create) in `Migration.downtime_model_s`, and a verified migration's downtime is those
+  plus the plan's boot time, in the same time base as the passes' `duration_s`, so a demo's downtime compares with
+  its estimate (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED` would multiply the control plane's own
+  overhead too). A retry resets a
   closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
   the next attempt counts from that first stop and the stats report the VM's whole outage.
 
@@ -802,7 +806,7 @@ shares, or the FlexVol inside its pool search pattern.
 Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default 60). Byte counts
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
-source is stopped (ADV-16). Cutover fails with
+source is stopped, and the cutover reports `downtime_model_s` (§5.2, ADV-16). Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
 strategy.
 
