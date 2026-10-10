@@ -1440,7 +1440,9 @@ time (`credentials_updated_at`, `conversion_key_updated_at`). `SEAMLESS_SECRET_S
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
-  `seamless-secrets` volume there).
+  `seamless-secrets` volume there). The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
+  an existing one it owns to 0700 when it writes, so other local users cannot list the secret names; one
+  it does not own (a mount) keeps its mode.
 * `kubernetes` (OpenShift): a `Secret` named `seamless-{name}` in `SEAMLESS_K8S_NAMESPACE` (default:
   the pod's namespace) created or replaced through the API with the pod's ServiceAccount token
   (labels `app.kubernetes.io/managed-by: seamless-migrate`, `seamless.io/provider: {id}`); reads go
