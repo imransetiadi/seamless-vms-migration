@@ -24,6 +24,7 @@ import {
   type RecommendationPage,
   type Stats,
   type VMRef,
+  type Wave,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -411,6 +412,59 @@ describe('mock API', () => {
     const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
     expect([retried.data_issues, retried.converged_by, retried.review_required, retried.review_reason, retried.checkpoint]).toEqual([[], null, false, null, null]);
     expect(retried.downtime_model_s).toBe(600);
+  });
+
+  it('starts no held migration, on a cutover request or a tick, like the API (SDD §5.4, §14.6)', async () => {
+    const { server, client } = setup('approver');
+    const m = byPhase(server, 'ready');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    Object.assign(plan, { status: 'running', require_approval: false, auto_cutover: false, cutover_window: null, waves: [] });
+    Object.assign(m, { strategy: 'cold', wave_id: null, advisor_hold: 'rec-held-0001' });
+    await client.post(`/migrations/${m.id}/cutover`, {});
+    server.tick();
+    expect(m.phase).toBe('ready');
+    m.advisor_hold = null; // a person decided
+    server.tick();
+    expect(m.phase).toBe('cutover');
+  });
+
+  /** Two ready warm migrations of one running plan, in the waves given (ids no fixture migration carries). */
+  function waved(waves: (a: Migration, b: Migration) => Wave[]) {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => server.migrations.filter((m) => m.plan_id === p.id && m.phase === 'ready').length >= 2)!;
+    const [a, b] = server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'ready') as [Migration, Migration];
+    Object.assign(plan, { status: 'running', require_approval: false, auto_cutover: true, cutover_window: null, waves: waves(a, b) });
+    for (const m of [a, b]) Object.assign(m, { strategy: 'warm', advisor_hold: null, wave_id: plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))!.id });
+    return { server, a, b };
+  }
+
+  it('starts a migration only once the waves it depends on are complete, like the API (SDD §8)', () => {
+    const { server, a, b } = waved((a, b) => [
+      { id: 'wave-t1', name: 'Pilot', order: 1, vm_ids: [a.vm.source_id], depends_on: [], max_parallel: 5 },
+      { id: 'wave-t2', name: 'Wave 2', order: 2, vm_ids: [b.vm.source_id], depends_on: ['wave-t1'], max_parallel: 5 },
+    ]);
+    server.tick();
+    expect([a.phase, b.phase]).toEqual(['precopy', 'ready']);
+    a.phase = 'completed'; // the pilot wave is complete
+    server.tick();
+    expect(b.phase).toBe('precopy');
+    // a retry in the pilot makes it incomplete again: a migration already waiting for its cutover waits too, as the
+    // API ticks only active waves
+    Object.assign(a, { phase: 'ready', advisor_hold: 'rec-held-0002' });
+    b.phase = 'awaiting_cutover';
+    server.tick();
+    expect(b.phase).toBe('awaiting_cutover');
+    a.phase = 'completed';
+    server.tick();
+    expect(b.phase).toBe('cutover');
+  });
+
+  it("starts no more of a wave's migrations than its max_parallel, like the API (SDD §8)", () => {
+    const { server, a, b } = waved((a, b) => [
+      { id: 'wave-t1', name: 'Pilot', order: 1, vm_ids: [a.vm.source_id, b.vm.source_id], depends_on: [], max_parallel: 1 },
+    ]);
+    server.tick();
+    expect([a.phase, b.phase].sort()).toEqual(['precopy', 'ready']);
   });
 
   it('records the strategy of the attempt a retry retries, oldest first, like the API (SDD §4.2, §14.4)', async () => {

@@ -21,7 +21,7 @@ import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
-import { WAVE_COMPLETE_PHASES } from '../lib/waves';
+import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -433,6 +433,8 @@ function intParam(query: URLSearchParams, name: string, fallback: number, min: n
 
 /** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
+/** Phases in which a step runs for the migration (the API's ACTIVE_STEP_PHASES): they fill a wave's max_parallel. */
+const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
 /** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
@@ -570,8 +572,8 @@ export class MockServer {
           this.advanceTransfer(m, plan, m.phase === 'precopy' ? 1.4 : 4);
           break;
         case 'ready':
-          // like the API's _begin (SDD §5.4): a held migration starts nothing until a person decides
-          if (plan.status !== 'running' || m.advisor_hold) break;
+          // like the API's tick and _begin (SDD §5.4, §8): no held migration, only an active wave with room
+          if (plan.status !== 'running' || !this.mayBegin(m, plan)) break;
           if (SINGLE_SHOT.has(m.strategy)) {
             if (this.gateOpen(m, plan)) this.beginCutover(m, plan);
           } else {
@@ -579,7 +581,7 @@ export class MockServer {
           }
           break;
         case 'awaiting_cutover':
-          if (plan.status === 'running' && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          if (plan.status === 'running' && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
           break;
         case 'cutover':
           this.advanceCutover(m, plan);
@@ -716,6 +718,19 @@ export class MockServer {
     } else {
       this.startPass(m, 'delta');
     }
+  }
+
+  /**
+   * Like the API's tick and _begin (SDD §5.4, §8): a migration starts a step only when no advisor decision holds it
+   * and its wave is active (every wave it depends on complete) - from ready also only with room under its wave's
+   * max_parallel.
+   */
+  private mayBegin(m: Migration, plan: Plan): boolean {
+    if (m.advisor_hold || !isWaveActive(plan, m.wave_id, this.migrations)) return false;
+    const wave = m.phase === 'ready' ? plan.waves.find((w) => w.id === m.wave_id) : undefined;
+    if (!wave) return true;
+    const running = this.migrations.filter((x) => x.plan_id === plan.id && x.wave_id === wave.id && ACTIVE_STEP_PHASES.has(x.phase)).length;
+    return running < wave.max_parallel;
   }
 
   private gateOpen(m: Migration, plan: Plan): boolean {
@@ -1956,7 +1971,7 @@ export class MockServer {
         // only a converged warm migration or a ready single-shot one enters the cutover (SDD §5.4); an
         // early request waits for convergence
         const waiting = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
-        if (plan.status === 'running' && waiting && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+        if (plan.status === 'running' && waiting && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
         break;
       }
       case 'force-cutover': {
