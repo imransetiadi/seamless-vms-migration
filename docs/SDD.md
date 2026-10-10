@@ -970,7 +970,10 @@ hours (default 72, ≥ 1; the owner's open question 14, `TODO(ADV-19): confirm`)
 rollback. `Stats.completed` stays the verified ones; `awaiting_finalize` and `finalized` split it.
 
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
-in demo mode ÷ `demo_speed`) the tick asks its source provider for the source VM (`get_vm`). Seen `running`, the
+in demo mode ÷ `demo_speed`) the source watch asks its source provider for the source VM (`get_vm`). The tick only
+starts the watch, as a task of its own, one at a time, and never waits for it: a slow or hanging source provider
+(one call may take minutes) delays the next watch, never the cutover gates, the passes or the tick's heartbeat
+(`/ready`, §12); stopping the orchestrator cancels it. Seen `running`, the
 migration records `source_running_at` once and emits `migration.source_running` (data `{"power_state"}`): the VM
 writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
