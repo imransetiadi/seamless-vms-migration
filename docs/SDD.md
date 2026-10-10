@@ -476,7 +476,10 @@ characters) is the only way to cut over before convergence. In `precopy` or `syn
 cutover request (its requester the forcer when none), and emits `migration.force_cutover` (audit). The running pass
 finishes, then the migration moves to `awaiting_cutover` with `converged_by: "force"`; the gate still applies — an
 approval by another approver (maker-checker), the window, the cutover slots. A request alone (`POST …/cutover`) never
-forces: it waits for convergence.
+forces: it waits for convergence. A migration is forced once: while `force_cutover` is recorded, another Force
+cutover answers 409 ("Already forced by {user}: the cutover follows the running pass.") — a second forcer would
+take the first one's place, whose approval would then count again, and the migration would lose the first record;
+the force goes with the cutover request (a retry, a new assessment), and the next attempt may be forced anew.
 Approvals, `cutover_requested` (with its requester) and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
@@ -1319,7 +1322,7 @@ such lists again on persisted migration events.
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
-| POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy; §5.4) |
+| POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy, or when the migration is already forced; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
