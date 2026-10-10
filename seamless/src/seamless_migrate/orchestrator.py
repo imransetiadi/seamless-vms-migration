@@ -2570,7 +2570,9 @@ class Orchestrator:
                     cur.review_reason = note.data.get("review_reason")
             if result.passed:
                 now = self._now()
-                if cur.downtime_started_at is not None:
+                # SDD §5.2: a verification run again (a stop or a failed event write came before
+                # completed) keeps the end the first one recorded: the outage ended then
+                if cur.downtime_started_at is not None and cur.downtime_ended_at is None:
                     cur.downtime_ended_at = now
                     cur.actual_downtime_s = self._downtime_s(cur, now, plan)
                 cur.checkpoint = "verified"

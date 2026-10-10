@@ -2306,6 +2306,36 @@ async def test_a_failed_event_write_after_a_failure_still_rolls_the_stopped_vm_b
     ]
 
 
+async def test_a_verification_run_again_keeps_the_downtime_end_the_first_one_recorded(
+    tmp_path, store
+):
+    """SDD §5.2: when the passed verification was saved but the migration had not reached
+    completed — here its downtime_ended event fails to be written — the verification runs again
+    and keeps the end of the downtime, and the downtime, the first one recorded: the outage ended
+    then, however long the interruption took."""
+    clock = Clock()
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold}, clock=clock
+    )
+    real_emit = h.orch._emit
+    first: dict = {}
+
+    async def blip_on_the_first_end(kind, message, **kw):
+        if kind == "migration.downtime_ended" and not first:
+            m = kw["migration"]
+            first.update(end=m.downtime_ended_at, downtime=m.actual_downtime_s)
+            clock.advance(600)  # the interruption takes ten minutes
+            raise OSError("server closed the connection unexpectedly")
+        return await real_emit(kind, message, **kw)
+
+    h.orch._emit = blip_on_the_first_end
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert first, "the first verification recorded an end"
+    assert (done.downtime_ended_at, done.actual_downtime_s) == (first["end"], first["downtime"])
+
+
 async def test_failed_verification_rolls_back(tmp_path, store):
     h, plan = await setup(
         tmp_path,
