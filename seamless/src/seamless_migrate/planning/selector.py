@@ -146,16 +146,20 @@ def tie_set(estimates: Sequence[Estimate]) -> list[Strategy]:
     return sorted(ties, key=simplicity)
 
 
-def advisor_scope(estimates: Sequence[Estimate]) -> list[Strategy]:
+def advisor_scope(estimates: Sequence[Estimate], policy: str) -> list[Strategy]:
     """Strategies the advisor may choose between (SDD §9.2/§14.2); empty = no advice needed.
 
-    All eligible strategies when none meets the SLO, else the tie set when it has 2+ members.
+    All eligible strategies when none meets the SLO, else the ``min_downtime`` tie set when it has
+    2+ members. Under ``simplest_meeting_slo`` the simplest strategy meeting the SLO - the rule the
+    operator chose - has no tie, so the advisor keeps out.
     """
     eligible = [e for e in estimates if e.eligible]
     if not eligible:
         return []
     if not any(e.meets_slo for e in eligible):
         return sorted((e.strategy for e in eligible), key=simplicity)
+    if policy == "simplest_meeting_slo":
+        return []
     ties = tie_set(eligible)
     return ties if len(ties) >= 2 else []
 

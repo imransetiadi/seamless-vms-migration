@@ -151,7 +151,7 @@ class Advisor:
 
         ``note.data["applied"]`` tells the caller whether to switch to ``note.data["selected"]``.
         """
-        scope = advisor_scope(estimates)
+        scope = advisor_scope(estimates, plan.selection_policy)
         if not scope or not self.jev_enabled:
             return None
         deterministic, reason = select_strategy(vm, estimates, plan)

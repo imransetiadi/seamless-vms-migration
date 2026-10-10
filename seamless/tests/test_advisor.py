@@ -91,6 +91,31 @@ async def test_recommend_applies_only_within_tie_set_and_threshold():
     assert note.data["applied"] is True and note.data["selected"] == "storage_handover"
 
 
+async def test_the_advisor_keeps_out_of_the_simplest_meeting_slo_choice():
+    """SDD §9.2/§14.2: under simplest_meeting_slo the simplest strategy meeting the SLO is the
+    rule the operator chose and has no tie, so Jev is not consulted - even where downtimes tie
+    (cold 1000 s, warm 950 s) and Jev would pick the faster one."""
+    plan = make_plan(downtime_slo_s=1200, selection_policy="simplest_meeting_slo")
+    advisor, session = advisor_for({"decide": decide_with("warm", 0.95)})
+    assert await advisor.recommend_strategy(make_vm(), TIE, plan) is None
+    assert session.calls == []
+
+
+async def test_the_advisor_still_picks_under_simplest_meeting_slo_when_nothing_meets_it():
+    """SDD §9.2: when no eligible strategy meets the SLO, every eligible one is in scope under
+    either policy (recorded fixture: storage_handover at 0.68)."""
+    plan = make_plan(downtime_slo_s=600, selection_policy="simplest_meeting_slo")
+    slow = [
+        est(Strategy.cold, 3660, slo=600),
+        est(Strategy.warm, 1700, slo=600),
+        est(Strategy.storage_handover, 640, slo=600),
+    ]
+    advisor, _ = advisor_for()
+    note = await advisor.recommend_strategy(make_vm(), slow, plan)
+    assert note.data["scope"] == ["cold", "storage_handover", "warm"]
+    assert note.data["applied"] is True and note.data["selected"] == "storage_handover"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
