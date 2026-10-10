@@ -72,7 +72,9 @@ def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
     for pattern, replacement in _PATTERNS:
         out = pattern.sub(replacement, out)
     for name in sorted({n for n in (redact_names or []) if n}, key=len, reverse=True):
-        out = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "[vm]", out)
+        # SDD §13.4: a name stands between characters that are not letters or digits ([^\W_]),
+        # so web-01-data, web-01_root and data-web-01 lose it while web-010 (another VM) stays
+        out = re.sub(rf"(?<![^\W_]){re.escape(name)}(?![^\W_])", "[vm]", out)
     return out
 
 

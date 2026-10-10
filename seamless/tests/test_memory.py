@@ -65,6 +65,19 @@ def test_redact_names_optional():
     assert "web-01 " not in out and "db-02" not in out and "web-010" in out
 
 
+def test_redact_names_covers_names_built_from_the_vm_name():
+    """SDD §13.4 (advisor Phase 1 audit, A10): disks and ports named after the VM do not carry its
+    name out of the installation; a name inside another word stays - another VM's."""
+    text = (
+        "disk web-01-data, boot web-01_root, nic data-web-01, host web-01.lab; "
+        "web-010 and xweb-01 are other VMs"
+    )
+    assert redact(text, ["web-01"]) == (
+        "disk [vm]-data, boot [vm]_root, nic data-[vm], host [vm].lab; "
+        "web-010 and xweb-01 are other VMs"
+    )
+
+
 def captured(handler_result, seen):
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
