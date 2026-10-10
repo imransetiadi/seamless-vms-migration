@@ -1109,11 +1109,16 @@ export class MockServer {
         if (sub === 'conversion-key' && method === 'PUT') return this.setConversionKey(this.require(token, 'admin', path), provider, input);
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
-          const inUse = this.plans.some(
-            // like the API (SDD §12): only a completed plan releases its providers; a failed one can start again
-            (p) => (p.source_provider_id === id || p.destination_provider_id === id) && p.status !== 'completed',
-          );
-          if (inUse) throw new HttpError(409, 'conflict', `${provider.name} is referenced by a plan that is not finished.`);
+          const users = this.plansThatNeed(id);
+          if (users.length) {
+            const rest = users.length - 10;
+            throw new HttpError(
+              409,
+              'conflict',
+              `provider is used by plan(s) that still need it: ${users.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+                'a plan needs its providers until it completes and its VMs are finalized',
+            );
+          }
           this.providers.splice(this.providers.indexOf(provider), 1);
           this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} deleted`, data: {} });
           return { status: 204 };
@@ -1648,6 +1653,22 @@ export class MockServer {
     return ok(plan, 201);
   }
 
+  /**
+   * The plans that still need a provider, like the API (SDD §12), in creation order with why: one that has not
+   * completed (a failed one can start again), or a completed one with a migration that holds its VM — it can be
+   * rolled back until it is finalized, and its rollback needs both providers (§8.1).
+   */
+  private plansThatNeed(providerId: string): string[] {
+    const plans = this.plans
+      .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return plans.flatMap((p) => {
+      if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
+      const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
+      return n ? [`${p.id} ("${p.name}", ${n} VM${n === 1 ? '' : 's'} not finalized)`] : [];
+    });
+  }
+
   /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409), each VM with what releases it. */
   private refuseInFlight(plan: Plan, before: string): void {
     const busy = this.migrations.filter((m) => m.plan_id === plan.id && blocksPlanChange(m));
@@ -1951,6 +1972,15 @@ export class MockServer {
       case 'rollback': {
         const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
+        if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);
+        // like the API (SDD §5.1): without its providers a rollback fails, and a migration whose cutover
+        // stopped its source could then be neither rolled back, retried nor cancelled
+        const plan = this.plan(m.plan_id);
+        for (const [role, id] of [['source', plan.source_provider_id], ['destination', plan.destination_provider_id]] as const) {
+          if (!this.providers.some((p) => p.id === id)) {
+            throw new HttpError(409, 'conflict', `${m.vm.name} cannot be rolled back: the plan's ${role} provider '${id}' no longer exists`);
+          }
+        }
         this.transition(m, 'rolling_back', reason, me.name);
         m.progress_pct = 0;
         record('rollback requested', { reason });

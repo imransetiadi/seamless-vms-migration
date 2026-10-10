@@ -851,15 +851,67 @@ describe('mock API', () => {
     expect(dropped.phase).toBe('cancelled');
   });
 
-  it('keeps a provider a failed plan uses from deletion like the API; a completed plan releases it (SDD §12)', () => {
+  it('keeps a provider while a plan still needs it, like the API: until it completes and its VMs are finalized (SDD §12)', () => {
     const { server } = setup('admin');
-    for (const p of server.plans) p.status = 'completed';
     const plan = server.plans[0]!;
-    plan.status = 'failed';
     const id = plan.source_provider_id;
-    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(409);
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    const mine = server.migrations.filter((m) => users.some((p) => p.id === m.plan_id));
+    for (const m of mine) m.phase = 'finalized';
+    const remove = () => server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin');
+    const tail = 'a plan needs its providers until it completes and its VMs are finalized';
+    // a failed plan can be started again (SDD §8)
+    plan.status = 'failed';
+    expect(remove()).toMatchObject({ status: 409, body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", failed); ${tail}` } } });
+    // a completed VM can be rolled back until it is finalized, and its rollback needs the provider (SDD §8.1)
     plan.status = 'completed';
-    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(204);
+    const [first, second] = mine.filter((m) => m.plan_id === plan.id);
+    first!.phase = 'completed';
+    expect(remove()).toMatchObject({ status: 409, body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", 1 VM not finalized); ${tail}` } } });
+    second!.phase = 'failed';
+    expect(remove().body).toMatchObject({ error: { message: expect.stringContaining(`("${plan.name}", 2 VMs not finalized)`) } });
+    // in creation order, whatever the list order; ten at most, then how many more
+    const other = users.find((p) => p.id !== plan.id)!;
+    other.status = 'draft';
+    const [older, newer] = [plan, other].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    server.plans.reverse();
+    const why = (p: Plan) => (p.id === plan.id ? '2 VMs not finalized' : 'draft');
+    expect(remove().body).toMatchObject({
+      error: { message: `provider is used by plan(s) that still need it: ${older!.id} ("${older!.name}", ${why(older!)}), ${newer!.id} ("${newer!.name}", ${why(newer!)}); ${tail}` },
+    });
+    const later = Date.parse(newer!.created_at);
+    for (let i = 0; i < 9; i++) {
+      server.plans.push({ ...other, id: `plan-extra00${i}`, name: `extra ${i}`, created_at: new Date(later + (i + 1) * 1000).toISOString() });
+    }
+    const listed = (remove().body as { error: { message: string } }).error.message;
+    expect(listed).toContain('plan-extra007 ("extra 7", draft) and 1 more; ');
+    expect(listed).not.toContain('plan-extra008');
+    server.plans.splice(server.plans.findIndex((p) => p.id === 'plan-extra000'), 9);
+    other.status = 'completed';
+    // a rolled-back VM lets it go: a retry refuses when the provider is gone (SDD §5.1)
+    first!.phase = 'rolled_back';
+    second!.phase = 'cancelled';
+    expect(remove().status).toBe(204);
+  });
+
+  it('refuses a rollback whose provider no longer exists, like the API: nothing changes (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const done = byPhase(server, 'completed');
+    const plan = server.plans.find((p) => p.id === done.plan_id)!;
+    server.providers.splice(server.providers.findIndex((p) => p.id === plan.destination_provider_id), 1);
+    await expect(client.post(`/migrations/${done.id}/rollback`, { reason: 'app broken' })).rejects.toMatchObject({
+      status: 409,
+      message: `${done.vm.name} cannot be rolled back: the plan's destination provider '${plan.destination_provider_id}' no longer exists`,
+    });
+    expect(done.phase).toBe('completed');
+    // a migration that cannot roll back says so first, like the API
+    const ready = server.migrations.find((m) => m.plan_id === plan.id && m.id !== done.id)!;
+    ready.phase = 'ready';
+    await expect(client.post(`/migrations/${ready.id}/rollback`, { reason: 'x' })).rejects.toMatchObject({
+      status: 409,
+      message: `Cannot move ${ready.vm.name} from ready to rolling_back.`,
+    });
   });
 
   it('accepts approvals and cutover requests in the phases the API does (SDD §5.4)', () => {

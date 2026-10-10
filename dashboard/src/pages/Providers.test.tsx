@@ -332,6 +332,21 @@ describe('Providers page', () => {
     await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
   });
 
+  it('names the plans that still need a provider when its deletion is refused (SDD §12)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('admin');
+    const from = await screen.findByRole('region', { name: 'Migrate from' });
+    const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    await user.click(within(card).getByRole('button', { name: /^delete$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /delete rhosp 17\.1/i });
+    expect(dialog).toHaveTextContent('Plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it.');
+    await user.type(within(dialog).getByLabelText(/type rhosp17-dc1 to confirm/i), 'rhosp17-dc1');
+    await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
+    const refusal = await within(dialog).findByRole('alert');
+    expect(refusal).toHaveTextContent('plan-4f2a9c1e ("DC1 → RHOSO production rollout", running)');
+    expect(within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' })).toBeInTheDocument();
+  });
+
   it('moves the focus to the column heading once a deleted provider is gone (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('admin');
