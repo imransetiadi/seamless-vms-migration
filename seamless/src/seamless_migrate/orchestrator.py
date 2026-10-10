@@ -569,9 +569,12 @@ class Orchestrator:
         blocked = has_blocker(findings) or no_eligible
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.phase not in REVALIDATABLE:
+            # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
+            # (validations of a plan run one at a time under its lock: none is at work on it)
+            if m.phase not in REVALIDATABLE and m.phase != P.validating:
                 return m  # already in flight or finished: leave it alone
-            m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
+            if m.phase != P.validating:
+                m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
             wave = plan.wave_of(vm.source_id)
             m.vm = vm
             m.strategy = strategy

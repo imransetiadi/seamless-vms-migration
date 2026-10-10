@@ -279,6 +279,34 @@ async def test_validate_cancels_a_removed_vms_failed_migration(tmp_path, store):
     assert store.get("migration", dropped.id, Migration).phase == P.cancelled
 
 
+async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_validating(
+    tmp_path, store
+):
+    """SDD §5.4: a validation whose second write failed (a database error, a restart) left a
+    migration in validating; the next validation of the plan re-assesses it like a ready one, so
+    the plan can start and the VM is not held for good."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    transition = h.orch._transition
+    failed: list[str] = []
+
+    async def failing_transition(m, version, to, reason, actor="system", data=None):
+        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
+            failed.append(m.id)
+            raise ConnectionError("database connection lost")
+        return await transition(m, version, to, reason, actor, data)
+
+    h.orch._transition = failing_transition
+    with pytest.raises(ConnectionError):
+        await h.orch.validate_plan(plan.id, "alice")
+    stuck = await h.by_vm(plan.id, "vm-2")
+    assert stuck.phase == P.validating
+
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
+    assert (await h.migration(stuck.id)).phase == P.ready
+    assert (await h.plan(plan.id)).status == PlanStatus.validated
+
+
 async def test_validate_cleans_up_a_removed_vms_warm_data_path(tmp_path, store):
     """SDD §5.1/§5.4: validation cancels a removed VM's failed migration through cancel(), so a
     warm one that recorded passes gets the same cleanup as any cancel with a data path."""
