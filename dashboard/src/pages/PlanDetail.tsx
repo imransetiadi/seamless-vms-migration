@@ -626,6 +626,7 @@ export default function PlanDetail() {
           value={waveSize}
           onChange={(e) => setWaveSize(e.target.value)}
           error={waveSizeValid ? null : 'Enter a whole number from 1 to 1000.'}
+          liveError
           hint="A wave may exceed this to keep an application together."
         />
       </ConfirmDialog>

@@ -682,6 +682,20 @@ describe('PlanDetail', () => {
     await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-95a7e3f1')?.status).toBe('running'));
   });
 
+  it('announces the wave size error from a live region already in the dialog (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-0e9f6a17');
+    await user.click(await actionButton(/auto-plan waves/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves|replace the waves/i });
+    const regions = within(dialog).queryAllByRole('status');
+    const size = within(dialog).getByLabelText(/maximum vms per wave/i);
+    await user.clear(size);
+    await user.type(size, '0');
+    expect(size).toHaveAccessibleDescription('Enter a whole number from 1 to 1000.');
+    const error = document.getElementById(size.getAttribute('aria-describedby')!)!;
+    expect(regions).toContain(error.closest('[role="status"]'));
+  });
+
   it('says why Plan waves is unavailable while the wave size is not a whole number from 1 to 1000 (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-0e9f6a17');

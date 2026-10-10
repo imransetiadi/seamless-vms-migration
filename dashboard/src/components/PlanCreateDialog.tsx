@@ -685,22 +685,25 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 </div>
               </div>
             )}
-            {held.size > 0 && (
-              <div role="status" aria-labelledby={id('held')} className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
-                <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
-                <div className="min-w-0">
-                  <p id={id('held')} className="font-medium text-foreground">
-                    Another plan holds {held.size === 1 ? 'a selected VM' : `${held.size} selected VMs`}: validation refuses {held.size === 1 ? 'it' : 'them'}
-                  </p>
-                  <ul className="mt-1 text-muted-foreground">
-                    {[...held.values()].flat().map((holder) => (
-                      <li key={holder}>{holder}</li>
-                    ))}
-                  </ul>
-                  <p className="mt-1 text-muted-foreground">Finish, roll back or cancel the migration in that plan, or leave the VM out.</p>
+            {/* a live region already in the form: one inserted together with its text is not reliably read (SDD §16) */}
+            <div role="status" aria-labelledby={id('held')} className="empty:-mt-2">
+              {held.size > 0 && (
+                <div className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+                  <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+                  <div className="min-w-0">
+                    <p id={id('held')} className="font-medium text-foreground">
+                      Another plan holds {held.size === 1 ? 'a selected VM' : `${held.size} selected VMs`}: validation refuses {held.size === 1 ? 'it' : 'them'}
+                    </p>
+                    <ul className="mt-1 text-muted-foreground">
+                      {[...held.values()].flat().map((holder) => (
+                        <li key={holder}>{holder}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-1 text-muted-foreground">Finish, roll back or cancel the migration in that plan, or leave the VM out.</p>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </fieldset>
 
           <Fieldset legend="Strategy and downtime">

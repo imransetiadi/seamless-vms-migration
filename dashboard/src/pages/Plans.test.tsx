@@ -259,6 +259,23 @@ describe('Plans page', () => {
     expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
   });
 
+  it('announces a VM another plan holds from a live region already in the form (SDD §16)', async () => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    const checkbox = await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` });
+    const regions = within(dialog).getAllByRole('status');
+    await user.click(checkbox);
+    const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(note);
+  });
+
   it('says in the form that the providers are unavailable, with Retry, instead of empty cloud lists (SDD §16)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
