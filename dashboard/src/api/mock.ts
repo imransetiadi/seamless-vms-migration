@@ -1998,6 +1998,10 @@ export class MockServer {
             throw new HttpError(409, 'conflict', `${m.vm.name} cannot be rolled back: the plan's ${role} provider '${id}' no longer exists`);
           }
         }
+        // like the API (SDD §8.1): the rollback starts the source on purpose - a migration that completes again is
+        // watched afresh, and the power the demo set goes with it
+        m.source_running_at = null;
+        this.power.delete(m.vm.source_id);
         this.transition(m, 'rolling_back', reason, me.name);
         m.progress_pct = 0;
         record('rollback requested', { reason });

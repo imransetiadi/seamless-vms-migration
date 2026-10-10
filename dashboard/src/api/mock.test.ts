@@ -1705,6 +1705,21 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
   });
 
+  it('clears the source-running flag and the demo power at a rollback, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    await as(server, 'operator').post(`/demo/vms/${cache.vm.source_id}/power`, { state: 'on' });
+    server.tick();
+    expect(cache.source_running_at).not.toBeNull();
+    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    expect(cache.source_running_at).toBeNull();
+    // the power the demo set goes with it: completed again (a retry cut it over), the source the cutover
+    // stopped is not flagged by the old setting
+    cache.phase = 'completed';
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+  });
+
   it('powers a fake source VM on and off, and the next watch flags its completed migration', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const cache = byName(server, 'web-cache-01');
