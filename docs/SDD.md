@@ -1728,8 +1728,18 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
   Finalized, Failed — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
   showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
+* Approvals: two kinds, and every entry names its kind (ADV-20) — a **cutover approval** ("Cutover approval":
+  the plan's Require approval, `Migration.approvals`, the cutover request and the maker-checker rule
+  `counted_approvals`, §5.4) and an **advisor decision** ("Advisor decision · {decision type}": a decision
+  `pending_approval` holds its migration, `Migration.advisor_hold`, until a person with `advisor.approve` approves or
+  overrides it, §14.6). A cutover approval is pending while a migration waits at the cutover gate — `awaiting_cutover`;
+  a single-shot strategy in `ready` whose wave runs; a forced cutover during `precopy`/`syncing` — in a plan that
+  requires approval, and no approval counts; the window and the cutover slots are waits, not approvals. The
+  dashboard builds both from the routes it already reads (no approvals route).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
-  active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
+  active cutovers, and "Pending approvals": both kinds in one list, each row with its kind, the VM, its plan and
+  what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
+  ADV-20), `/plans` (New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
@@ -1750,7 +1760,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1) and no
   Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
-  `source_running_at` is set; settings summary, waves board, migrations table with
+  `source_running_at` is set; settings summary — with "Advisor policy: {name}", its mode and threshold, the policy
+  in force for `migration_strategy` (`resolve_policy`, the built-in default when none applies) linking to it on
+  `/advisor/policies` (ADV-20) —, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
   pre-flight checks, with Validate there too; "{n} database VMs have no application probe." from the
   `APP_PROBE_MISSING` findings, listing each VM with its suggested probe (§9.6) and Use suggested probe — operator, a
@@ -1798,7 +1810,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
   completed, that the retry reopens it (§5.1); the approvals list the cutover request and each approval in time
   order — "Requested by {user}", "Approved by {user}" with its comment — and say when an approval does not count
-  (the requester's own, §5.4); Approve is unavailable to the cutover's requester when the plan requires a distinct
+  (the requester's own, §5.4); each entry names its kind: "Cutover approval" for the request and each approval,
+  "Advisor decision · {decision type}" for the migration's advisor decision while it waits for approval and once a
+  person approved or overrode it, with who and when (ADV-20); Approve is unavailable to the cutover's requester when the plan requires a distinct
   approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
@@ -1845,8 +1859,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   when the policy requires a distinct approver (§14.6) — and Override opens a dialog: another eligible option and the
   reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
   "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
-  `/advisor/policies` lists the policies and the built-in default, and `advisor.policy.manage` creates, edits and
-  deletes them; the Jev card and every recommendation Jev answered show where the model runs — "On-prem",
+  `/advisor/policies` lists the policies and the built-in default — each addressable as `#policy-{id}`, which the
+  page scrolls to and focuses (ADV-20) — and `advisor.policy.manage` creates, edits and deletes them; the Jev card and every recommendation Jev answered show where the model runs — "On-prem",
   "Remote: {host}", or "Remote" until `SEAMLESS_JEV_ENDPOINT_HOST` names the host — and a "Data sent to advisor"
   panel lists, per decision type, the tool and the fields its serializer sends (`GET /advisor/data-sent`) and says
   when the console excerpt stays local (§13.4, ADV-06); the page links to
