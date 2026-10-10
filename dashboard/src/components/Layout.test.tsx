@@ -10,6 +10,14 @@ describe('Layout health notice', () => {
     expect(screen.queryByText(/control plane degraded/i)).not.toBeInTheDocument();
   });
 
+  it('shows the brand mark beside the product name, which names the link (SDD §16)', async () => {
+    renderWithApp(<Layout />, { route: '/', path: '/' });
+    await screen.findByRole('navigation', { name: /primary/i });
+    const links = screen.getAllByRole('link', { name: 'Seamless Migrate to RHOSO 18.0' });
+    expect(links.length).toBeGreaterThan(0);
+    for (const link of links) expect(link.querySelector('svg[data-brand-mark]')).toHaveAttribute('aria-hidden', 'true');
+  });
+
   it('shows the orchestrator status in the session footer', async () => {
     renderWithApp(<Layout />, { route: '/', path: '/' });
     const status = await screen.findByTestId('orchestrator-status');

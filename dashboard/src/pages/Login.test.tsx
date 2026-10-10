@@ -17,6 +17,12 @@ function renderLogin() {
 }
 
 describe('Login', () => {
+  it('shows the brand mark on the sign-in card (SDD §16)', async () => {
+    renderLogin();
+    await screen.findByLabelText('API token');
+    expect(document.querySelector('main svg[data-brand-mark]')).toHaveAttribute('aria-hidden', 'true');
+  });
+
   it('labels the token field and lets password managers fill it', async () => {
     renderLogin();
     const input = await screen.findByLabelText('API token');

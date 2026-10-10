@@ -1,4 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Seamless Migrate">
-  <rect width="32" height="32" rx="6" fill="#0F172A"/>
-  <path d="M7 11h12l-3.5-3.5M25 21H13l3.5 3.5" fill="none" stroke="#22C55E" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+  </defs>
+  <rect x=".5" y=".5" width="31" height="31" rx="8" fill="url(#tile)" stroke="#94A3B8" stroke-opacity=".3"/>
+  <g transform="translate(2.25 0) skewX(-8)" fill="none" stroke-width="3.6" stroke-linecap="round">
+    <path d="M20.713 8.602A5.2 5.2 0 1 0 16 16" stroke="#F8FAFC"/>
+    <path d="M16 16A5.2 5.2 0 1 1 11.287 23.398" stroke="#22C55E"/>
+  </g>
 </svg>

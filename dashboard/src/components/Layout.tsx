@@ -17,6 +17,7 @@ import { useHealth, useMe } from '../api/hooks';
 import { useSignOut } from '../api/session';
 import { cn } from '../lib/cn';
 import { ROLE_LABELS } from '../lib/roles';
+import { BrandMark } from './BrandMark';
 import { LiveIndicator } from './LiveIndicator';
 import { ThemeToggle } from './ThemeToggle';
 
@@ -36,26 +37,10 @@ const NAV: NavItem[] = [
   { to: '/advisor', label: 'Advisor', icon: Bot, match: (p) => p.startsWith('/advisor') },
 ];
 
-function BrandMark() {
-  return (
-    <svg viewBox="0 0 32 32" aria-hidden className="size-7 shrink-0">
-      <rect width="32" height="32" rx="6" className="fill-primary" />
-      <path
-        d="M7 11h12l-3.5-3.5M25 21H13l3.5 3.5"
-        fill="none"
-        className="stroke-accent"
-        strokeWidth="2.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
 function Brand() {
   return (
     <Link to="/" className="flex min-h-11 items-center gap-2 rounded-md">
-      <BrandMark />
+      <BrandMark className="size-7" />
       <span className="flex flex-col leading-tight">
         <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>
         <span className="text-xs text-muted-foreground">to RHOSO 18.0</span>
