@@ -1493,7 +1493,6 @@ class Orchestrator:
             log.warning("the source watch failed", exc_info=True)
 
     async def _watch_sources_once(self) -> None:
-        now = self._now()
         clients: dict[str, Any] = {}
         for m in await self.db.list("migration", Migration, phase=P.completed):
             try:
@@ -1506,6 +1505,7 @@ class Orchestrator:
             except Exception:
                 log.warning("source watch failed for %s", m.id, exc_info=True)
                 continue
+            seen = self._now()  # when the provider answered: one call may take minutes (§8.1)
             state = str(vm.power_state)
             if state not in ("running", "stopped"):
                 # a reboot or a resize, a paused VM, an error, an unknown state: not seen
@@ -1518,7 +1518,7 @@ class Orchestrator:
                 cur, v = await self._load(m.id)
                 if cur.phase != P.completed or running == (cur.source_running_at is not None):
                     continue
-                cur.source_running_at = now if running else None
+                cur.source_running_at = seen if running else None
                 await self._save(cur, v)
             if running:
                 await self._emit(

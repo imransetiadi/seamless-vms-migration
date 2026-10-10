@@ -4171,6 +4171,26 @@ async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_p
     assert stopped == [(m.id, {"power_state": "stopped"})]
 
 
+async def test_the_source_watch_records_when_the_provider_answered(tmp_path, store):
+    """SDD §8.1 (ADV-16..20 audit, F9): a source provider may take minutes per call - the alert's
+    time is when it answered that the VM runs, not when the watch began."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    get_vm = h.source.get_vm
+
+    async def slow_get_vm(vm_id):
+        h.clock.advance(600)  # the provider answers ten minutes later
+        return await get_vm(vm_id)
+
+    h.source.get_vm = slow_get_vm
+    h.clock.advance(h.settings.source_watch_s + 1)
+    began = h.orch.now()
+    await h.orch.tick()
+    await h.orch._watch_task
+    seen = (await h.by_vm(plan.id, "vm-1")).source_running_at
+    assert (seen - began).total_seconds() == pytest.approx(600, abs=1)
+
+
 async def test_the_source_watch_clears_the_alert_only_when_it_sees_the_vm_stopped(tmp_path, store):
     """SDD §8.1 (ADV-16..20 audit, F1): a reboot or a resize (transitioning), a paused VM, an error
     or an unknown state is not "seen stopped" - the alert stays, with the time it was first seen."""
