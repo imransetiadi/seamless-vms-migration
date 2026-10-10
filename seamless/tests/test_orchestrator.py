@@ -42,7 +42,13 @@ from seamless_migrate.executors.base import (
     StepResult,
     TransientStepError,
 )
-from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed, Unprocessable
+from seamless_migrate.orchestrator import (
+    VM_CLAIMS,
+    BadRequest,
+    NotAllowed,
+    Unprocessable,
+    counted_approvals,
+)
 from seamless_migrate.planning.estimator import params_for_plan
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
@@ -3103,6 +3109,58 @@ async def test_the_gate_counts_approvals_by_anyone_but_the_cutover_requester(tmp
     assert gate(off, approvals=[approval("sari")], **asked) is True
     auto = {"auto_cutover": True}
     assert gate(auto, approvals=[approval("sari")]) is True  # nobody requested
+
+
+#: the API's answer to the approver who forced a cutover approving it (SDD §5.4)
+OWN_FORCE = "You forced this cutover. Another approver must approve it."
+
+
+async def test_the_approver_who_forced_a_cutover_never_approves_it(tmp_path, store):
+    """SDD §5.4 (advisor Phase 1 audit, A2): bob requested the cutover and sari forced it - sari's
+    approval neither counts nor is accepted, before or after the force; another approver decides."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    now = h.clock()
+    forced = ForceCutover(
+        actor="sari", at=now, reason="the window closes", delta_bytes=0, estimated_downtime_s=60.0
+    )
+
+    def gate(*actors: str, distinct: bool = True) -> bool:
+        m = make_migration(
+            plan_id=plan.id,
+            phase=P.awaiting_cutover,
+            cutover_requested=True,
+            cutover_requested_by="bob",
+            force_cutover=forced,
+            approvals=[Approval(actor=a, at=now, comment=None) for a in actors],
+        )
+        return h.orch._gate(m, plan.model_copy(update={"require_distinct_approver": distinct}), now)
+
+    assert gate("sari") is False
+    assert gate("bob", "sari") is False
+    assert gate("sari", "rina") is True
+    assert gate("sari", distinct=False) is True
+    syncing = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", syncing)
+    await h.orch.approve(syncing.id, "sari", "looked fine before the force")
+    await h.orch.request_cutover(syncing.id, "bob")
+    await h.orch.force_cutover(syncing.id, "sari", "the window closes in ten minutes")
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.approve(syncing.id, "sari", "my own force")
+    assert str(refused.value) == OWN_FORCE
+    m = await h.migration(syncing.id)
+    assert [a.actor for a in m.approvals] == ["sari"]
+    assert counted_approvals(m, plan) == []
+    approved = await h.orch.approve(syncing.id, "rina", "a second pair of eyes")
+    assert [a.actor for a in counted_approvals(approved, plan)] == ["rina"]
+    # without maker-checker the forcer may approve, as the requester may (SDD §5.4)
+    free = plan.model_copy(update={"id": "plan-0000f4ee", "require_distinct_approver": False})
+    store.put("plan", free)
+    other = make_migration(plan_id=free.id, vm=vm(2), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", other)
+    await h.orch.request_cutover(other.id, "bob")
+    await h.orch.force_cutover(other.id, "sari", "the window closes in ten minutes")
+    again = await h.orch.approve(other.id, "sari", "my own force, no maker-checker here")
+    assert [a.actor for a in counted_approvals(again, free)] == ["bob", "sari", "sari"]
 
 
 async def test_validation_and_a_strategy_change_clear_the_cutover_requester(tmp_path, store):

@@ -210,6 +210,8 @@ ConvergedBy = Literal["threshold", "slo", "max_passes", "force"]
 
 #: maker-checker refusals (SDD §5.4, §14.6, ADV-17)
 OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
+#: the approver who forces a cutover is held to the requester's rule (SDD §5.4)
+OWN_FORCE = "You forced this cutover. Another approver must approve it."
 OWN_DECISION = "You requested this decision. Another approver must decide it."
 
 
@@ -223,10 +225,12 @@ def _clear_request(m: Migration) -> None:
 
 
 def counted_approvals(m: Migration, plan: Plan) -> list[Approval]:
-    """The approvals the gate counts: all, but the requester's under a distinct approver (§5.4)."""
-    if plan.require_distinct_approver and m.cutover_requested_by is not None:
-        return [a for a in m.approvals if a.actor != m.cutover_requested_by]
-    return list(m.approvals)
+    """The approvals the gate counts: all, but under a distinct approver neither the requester's
+    nor the forcer's (§5.4)."""
+    if not plan.require_distinct_approver:
+        return list(m.approvals)
+    own = {m.cutover_requested_by, m.force_cutover.actor if m.force_cutover else None}
+    return [a for a in m.approvals if a.actor not in own]
 
 
 def _fmt_bytes(n: float) -> str:
@@ -994,6 +998,9 @@ class Orchestrator:
             plan = await self._plan(m.plan_id)
             if plan.require_distinct_approver and m.cutover_requested_by == actor:
                 raise NotAllowed(OWN_CUTOVER)
+            forcer = m.force_cutover.actor if m.force_cutover is not None else None
+            if plan.require_distinct_approver and forcer == actor:
+                raise NotAllowed(OWN_FORCE)
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
             await self._save(m, v)
         await self._emit(
