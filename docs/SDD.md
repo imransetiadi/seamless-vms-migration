@@ -730,8 +730,9 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
   advance gates (§5.4), and mark plans `completed` when all migrations are in terminal-success or
   wave-complete phases with no `failed`. The tick decides on a snapshot; starting a step re-checks,
-  under the migration's lock, what the decision rested on — the phase, the gate of a cutover (§5.4)
-  and the strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
+  under the plan's lock and then the migration's, what the decision rested on — that the plan still
+  runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
+  strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
   single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged once (`prestage`, §7.2) before
   its first migration starts; when pre-staging fails the plan becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
