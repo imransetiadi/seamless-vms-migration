@@ -1735,7 +1735,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   overrides it, §14.6). A cutover approval is pending while a migration waits at the cutover gate — `awaiting_cutover`;
   a single-shot strategy in `ready` whose wave runs; a forced cutover during `precopy`/`syncing` — in a plan that
   requires approval, and no approval counts; the window and the cutover slots are waits, not approvals. The
-  dashboard builds both from the routes it already reads (no approvals route).
+  dashboard builds both from the routes it already reads (no approvals route). On the Overview a pending approval
+  is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request or a
+  closed window once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
+  is unknown (Pending approvals then says its cutover approvals are unavailable).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers, and "Pending approvals": both kinds in one list, each row with its kind, the VM, its plan and
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
