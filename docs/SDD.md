@@ -700,7 +700,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `ANSIBLE_STDOUT_CALLBACK=ansible.builtin.json` is **not** used; instead stdout lines are logged and
   progress is read by tailing the os-migrate per-workload `state_file` JSON (`{dev: pct}`) and the
   warm state file. Non-zero exit → `TransientStepError` when the output matches a transient pattern
-  (`Timeout`, `HTTP 503`, `Connection reset`), otherwise `PermanentStepError`.
+  (`Timeout`, `HTTP 503`, `Connection reset`), otherwise `PermanentStepError`. A `cold` cutover records its
+  copy as a `full` pass when it ends — the VM's used bytes (`bytes_total`, what the state file's 100 % stands
+  for) changed and transferred, its disks' size scanned, the step's duration, which the copy dominates — so
+  `bytes_transferred` stays its listed passes (§4.3, §5.5 invariant 2), as in the simulator (§7.4).
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
 * Every string value in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag
   `!unsafe` (`ansible_yaml`); mapping keys — the variable names — stay plain. Ansible templates every
