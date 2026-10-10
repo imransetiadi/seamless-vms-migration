@@ -1889,8 +1889,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable),
   `/plans/:id` (its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
-  (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1) and no
-  Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
+  (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
+  it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
+  the counts) and no Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
   `source_running_at` is set; settings summary — with "Advisor policy: {name}", its mode and threshold, the policy
   in force for `migration_strategy` (`resolve_policy`, the built-in default when none applies) linking to it on
