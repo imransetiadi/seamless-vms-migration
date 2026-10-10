@@ -60,7 +60,7 @@ export type ProviderStatus = (typeof PROVIDER_STATUSES)[number];
 export const DISK_KINDS = ['volume', 'ephemeral', 'image_root', 'vmdk'] as const;
 export type DiskKind = (typeof DISK_KINDS)[number];
 
-export const POWER_STATES = ['running', 'stopped', 'paused', 'error', 'unknown'] as const;
+export const POWER_STATES = ['running', 'stopped', 'paused', 'error', 'transitioning', 'unknown'] as const;
 export type PowerState = (typeof POWER_STATES)[number];
 
 export const SELECTION_POLICIES = ['min_downtime', 'simplest_meeting_slo'] as const;
@@ -95,7 +95,15 @@ export interface ConversionHostConfig {
   image: string | null;
   ssh_user: string;
   address: string | null;
+  /** CIDR allowed to SSH to the conversion host (Security.md SEC-03). */
+  ssh_allowed_cidr: string | null;
+  /** Secret holding the private key of an existing conversion host (VMware sources). */
+  ssh_key_secret: string | null;
 }
+
+/** Presets and display only (SDD §4.2); `kind` decides the code path. */
+export const DISTRIBUTIONS = ['openstack_community', 'kolla', 'rhosp', 'rhoso', 'vmware'] as const;
+export type Distribution = (typeof DISTRIBUTIONS)[number];
 
 export interface Provider {
   /** Regex `^[a-z0-9][a-z0-9-]{1,62}$`. */
@@ -114,6 +122,30 @@ export interface Provider {
   status: ProviderStatus;
   status_message: string | null;
   last_checked_at: Timestamp | null;
+  distribution: Distribution | null;
+  /** Server-owned: when the write-only credentials / conversion key were last stored. */
+  credentials_updated_at: Timestamp | null;
+  conversion_key_updated_at: Timestamp | null;
+}
+
+/** `POST /providers` body (status and server-owned fields are ignored by the API). */
+export type ProviderCreate = Pick<Provider, 'id' | 'name' | 'kind' | 'role' | 'endpoint' | 'cloud' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution' | 'credentials_secret'>;
+
+/** `PATCH /providers/{id}`: the editable fields (SDD §12). */
+export type ProviderPatch = Partial<Pick<Provider, 'name' | 'endpoint' | 'cloud' | 'credentials_secret' | 'region' | 'verify_tls' | 'ca_cert_path' | 'conversion_host' | 'distribution'>>;
+
+/** `PUT /providers/{id}/credentials`: write-only; never returned (SDD §13.3). */
+export interface ProviderCredentials {
+  auth_url?: string;
+  username?: string;
+  password?: string;
+  project_name?: string;
+  user_domain_name?: string;
+  project_domain_name?: string;
+  application_credential_id?: string;
+  application_credential_secret?: string;
+  interface?: 'public' | 'internal' | 'admin';
+  datacenter?: string;
 }
 
 export interface Disk {
@@ -128,6 +160,18 @@ export interface Disk {
   multiattach: boolean;
   encrypted: boolean;
   independent: boolean;
+  /** Cinder `host@backend#pool` of a volume (admin only; SDD §4.2, §7.3.1). */
+  pool?: string | null;
+}
+
+/** Derived by the control plane from `os_type` (SDD §9.5). */
+export interface GuestOS {
+  family: 'linux' | 'windows' | 'unknown';
+  distro: string | null;
+  version: string | null;
+  label: string;
+  lifecycle: 'current' | 'legacy' | 'unknown';
+  v2v: 'supported' | 'tech_preview' | 'unverified' | 'unsupported' | 'unknown';
 }
 
 export interface Nic {
@@ -160,6 +204,8 @@ export interface VMRef {
   disk_bytes: number;
   /** Derived and serialized: Σ used_gb · 2^30 when every disk has used_gb, else ⌊disk_bytes · 0.6⌋. */
   used_bytes: number;
+  /** Derived and serialized from `os_type` (SDD §9.5); absent in responses of older control planes. */
+  guest_os?: GuestOS;
 }
 
 export interface Mappings {
@@ -171,7 +217,7 @@ export interface Mappings {
 
 export interface HandoverConfig {
   enabled: boolean;
-  /** source volume_type -> RHOSO cinder host "hostgroup@backend#pool". */
+  /** source volume_type -> RHOSO cinder host "hostgroup@backend#pool", or "hostgroup@backend" to resolve the pool per volume (SDD §7.3.1). */
   backend_map: Record<string, string>;
 }
 
@@ -182,6 +228,8 @@ export interface CutoverWindow {
 
 export interface VerificationConfig {
   tcp_ports: number[];
+  /** Probed instead of `tcp_ports` for Windows guests, whose console check is skipped (SDD §7.5). */
+  windows_tcp_ports: number[];
   probe_address: 'fixed' | 'floating';
   console_success_patterns: string[];
   timeout_s: number;
@@ -219,6 +267,8 @@ export interface Plan {
   convergence_threshold_bytes: number;
   max_sync_passes: number;
   link_bps: number;
+  /** Overrides of the estimator parameters for this plan (SDD §9.1), e.g. `{scan_bps, parallel_disks}`. */
+  estimator_overrides: Record<string, number>;
   handover: HandoverConfig;
   verification: VerificationConfig;
   prestage_resources: string[];
@@ -297,8 +347,14 @@ export interface Migration {
   bytes_total: number;
   bytes_transferred: number;
   sync_passes: SyncPass[];
+  /** Bytes transferred by the passes dropped from `sync_passes` (SDD §5.4); `bytes_transferred` counts them. */
+  sync_bytes_dropped: number;
   estimate: Estimate | null;
   estimates: Estimate[];
+  /** Per-stream scan throughput measured by the last delta pass (SDD §9.1 calibration), null before it. */
+  observed_scan_bps: number | null;
+  /** Mappings matched automatically by pre-flight, e.g. the smallest fitting flavor (`MAP_FLAVOR_AUTO`). */
+  resolved_mappings: Mappings;
   findings: Finding[];
   checkpoint: string | null;
   downtime_started_at: Timestamp | null;
@@ -306,6 +362,7 @@ export interface Migration {
   actual_downtime_s: number | null;
   approvals: Approval[];
   cutover_requested: boolean;
+  force_window: boolean;
   advisor_notes: AdvisorNote[];
   review_required: boolean;
   review_reason: string | null;
@@ -343,6 +400,8 @@ export const PERSISTED_EVENT_KINDS = [
   'advisor.similar_incidents',
   'memory.lesson_saved',
   'provider.created',
+  'provider.updated',
+  'provider.credentials_updated',
   'provider.deleted',
   'provider.checked',
   'auth.denied',
@@ -408,11 +467,20 @@ export interface ApiErrorEnvelope {
   error: { code: string; message: string };
 }
 
+export interface OrchestratorHealth {
+  running: boolean;
+  /** Seconds since the last completed tick; null before the first one. */
+  last_tick_age_s: number | null;
+  ticks: number;
+  healthy: boolean;
+}
+
 export interface Health {
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
   db: 'ok' | 'error';
+  orchestrator: OrchestratorHealth;
 }
 
 export interface Me {
@@ -420,9 +488,6 @@ export interface Me {
   role: Role;
 }
 
-/** POST /providers body: a Provider (status fields are ignored by the server). */
-export type ProviderCreate = Omit<Provider, 'status' | 'status_message' | 'last_checked_at' | 'capabilities'> &
-  Partial<Pick<Provider, 'capabilities'>>;
 
 type PlanServerFields = 'id' | 'waves' | 'status' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';
@@ -456,7 +521,18 @@ export interface MigrationListQuery {
   plan_id?: string;
   phase?: Phase;
   wave_id?: string;
+  /** Page large plans: 1…5000 (default: every migration), creation order. */
+  limit?: number;
+  offset?: number;
 }
+
+/** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4). */
+export const SYNC_PASSES_LATEST = 20;
+/** Longest `comment`, `reason` or `confirm` a migration action accepts (SDD §12). */
+export const ACTION_TEXT_MAX = 2000;
+/** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
+export const PLAN_NAME_MAX = 200;
+export const PLAN_DESCRIPTION_MAX = 2000;
 
 export interface ApproveRequest {
   comment?: string;
@@ -491,6 +567,8 @@ export interface EventListQuery {
   migration_id?: string;
   /** ≤ 1000 */
   limit?: number;
+  /** The newest `limit` matching events instead of the first, still ascending (SDD §12). */
+  tail?: boolean;
 }
 
 export interface ThroughputPoint {

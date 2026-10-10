@@ -64,4 +64,9 @@ for mid, phases in by.items():
         if a and b and Phase(b) not in fsm.TRANSITIONS.get(Phase(a), ()):
             bad += 1; print("invalid order", mid, a, "->", b)
 print("migrations with phase events:", len(by), "invalid transitions:", bad)
+# DEMO-06 fails on any gap or FSM-invalid ordering (exit code of the script)
+sys.exit(1 if gaps or bad else 0)
 EOF
+status=$?
+[ "$status" = 0 ] && echo "DEMO-06 OK" || echo "DEMO-06 FAILED (gaps or invalid transitions above)"
+exit $status

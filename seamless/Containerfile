@@ -8,12 +8,16 @@
 # The built dashboard (dashboard/dist) is copied when present; build it first to include it, or
 # point DASHBOARD_DIST elsewhere: --build-arg DASHBOARD_DIST=path/to/dist
 
-ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest
+# Pinned by digest (Security.md §12): the manifest list of ubi9/python-311:latest as of 2026-10-08.
+# Dependabot (docker, /seamless) proposes digest bumps; `dnf update` below still applies errata
+# published after the pin at build time.
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/python-311:latest@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
 FROM ${BASE_IMAGE}
 
 ARG DASHBOARD_DIST=dashboard/dist
 ARG ANSIBLE_CORE_VERSION=">=2.16,<2.19"
-ARG VMWARE_KIT=os_migrate.vmware_migration_kit
+# The VMware migration kit version comes from requirements.yml (pinned: the executor's variable
+# contract with the kit is checked against that version, Security.md §9.2).
 
 LABEL org.opencontainers.image.title="seamless-migrate" \
       org.opencontainers.image.description="Seamless Migrate control plane: VM migration to RHOSO 18.0" \
@@ -45,10 +49,22 @@ COPY meta /opt/seamless/collection/meta
 COPY plugins /opt/seamless/collection/plugins
 COPY roles /opt/seamless/collection/roles
 COPY playbooks /opt/seamless/collection/playbooks
+COPY scripts/vendor-openstack-cloud.sh /opt/seamless/vendor-openstack-cloud.sh
+# The roles call openstack.cloud modules as os_migrate.os_migrate.<module> (server_action,
+# server_info, network, …): the checkout vendors them through a git submodule, the image from
+# the pinned Galaxy release (SDD §17.1).
+ARG OS_CLOUD_VERSION=2.6.0
+# openstack.cloud stays installed: the vendored modules extend its doc fragment
+# (openstack.cloud.openstack), which ansible-doc and ansible-lint resolve from there.
+RUN ansible-galaxy collection install "openstack.cloud:${OS_CLOUD_VERSION}" \
+        -p /usr/share/ansible/collections \
+ && bash /opt/seamless/vendor-openstack-cloud.sh /opt/seamless/collection \
+        /usr/share/ansible/collections/ansible_collections/openstack/cloud/plugins
 RUN ansible-galaxy collection build /opt/seamless/collection --output-path /tmp/collection \
  && ansible-galaxy collection install /tmp/collection/*.tar.gz \
         -p /usr/share/ansible/collections --force \
- && ansible-galaxy collection install "${VMWARE_KIT}" -p /usr/share/ansible/collections \
+ && ansible-galaxy collection install -r /opt/seamless/collection/requirements.yml \
+        -p /usr/share/ansible/collections \
  && rm -rf /tmp/collection /root/.ansible
 
 # pip is a build-time tool only: its vendored urllib3/msgpack/setuptools copies lag their
@@ -66,9 +82,12 @@ RUN --mount=type=bind,source=.,target=/ctx \
         cp -r "/ctx/${DASHBOARD_DIST}/." /opt/seamless/dashboard/; \
     else echo "dashboard build not found at ${DASHBOARD_DIST}; serving the API only"; fi
 
-RUN mkdir -p /var/lib/seamless \
- && chown -R 1001:0 /var/lib/seamless /opt/seamless \
- && chmod -R g=u /var/lib/seamless /opt/seamless
+# /var/lib/seamless is the default data dir; /data is the mount point the Compose stack uses
+# (a fresh named volume takes the ownership of its mount point, so the non-root user owns it).
+RUN mkdir -p /var/lib/seamless /data /var/run/secrets/seamless \
+ && chown -R 1001:0 /var/lib/seamless /data /opt/seamless /var/run/secrets/seamless \
+ && chmod -R g=u /var/lib/seamless /data /opt/seamless \
+ && chmod 0700 /var/run/secrets/seamless
 
 ENV HOME=/var/lib/seamless \
     SEAMLESS_DATA_DIR=/var/lib/seamless \
@@ -76,6 +95,7 @@ ENV HOME=/var/lib/seamless \
     SEAMLESS_PORT=8080 \
     SEAMLESS_COLLECTION_ROOT=/usr/share/ansible/collections/ansible_collections/os_migrate/os_migrate \
     SEAMLESS_DASHBOARD_DIR=/opt/seamless/dashboard \
+    SEAMLESS_LOG_JSON=true \
     ANSIBLE_HOME=/var/lib/seamless/.ansible \
     ANSIBLE_COLLECTIONS_PATH=/usr/share/ansible/collections \
     PYTHONUNBUFFERED=1

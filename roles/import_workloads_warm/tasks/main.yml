@@ -8,6 +8,18 @@
       not {{ import_workloads_warm_action }}
     quiet: true
 
+- name: Refuse to roll back every workload without an explicit confirmation
+  ansible.builtin.assert:
+    that: >-
+      (os_migrate_rollback_all | bool)
+      or os_migrate_workloads_filter != [{'regex': '.*'}]
+    fail_msg: >-
+      os_migrate_workloads_filter selects every workload: a rollback reverts every
+      cut-over workload it matches. Pass a filter such as [{regex: '^vm-name$'}],
+      or set os_migrate_rollback_all to true to roll back all of them (SDD 6.5).
+    quiet: true
+  when: import_workloads_warm_action == 'rollback'
+
 - name: Read workloads resource file
   os_migrate.os_migrate.read_resources:
     path: "{{ os_migrate_data_dir }}/workloads.yml"

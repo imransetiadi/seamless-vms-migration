@@ -22,6 +22,8 @@ import type {
   SyncPass,
   VMRef,
 } from './types';
+import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
+import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 
 export const GiB = 1024 ** 3;
 export const MiB = 1024 ** 2;
@@ -67,20 +69,58 @@ interface VmSpec {
   change_rate_mibps?: number;
 }
 
+/** Cinder pool of each mock volume type (SDD §4.2 `Disk.pool`): Ceph RBD and an ONTAP NFS export. */
+const MOCK_POOLS: Record<string, string> = {
+  'tripleo-ceph': 'overcloud@tripleo_ceph#tripleo-ceph',
+  'tripleo-ceph-ssd': 'overcloud@tripleo_ceph#tripleo-ceph-ssd',
+  'ceph-ssd': 'overcloud@tripleo_ceph#ceph-ssd',
+  'ceph-hdd': 'overcloud@tripleo_ceph#ceph-hdd',
+  'netapp-nfs': 'overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1',
+  lvm: 'lab@lvm#lvm',
+};
+
+const backend = (pool: string, family: 'rbd' | 'netapp_nfs' | 'other') => ({
+  pool,
+  vendor: family === 'netapp_nfs' ? 'NetApp' : 'Open Source',
+  protocol: family === 'netapp_nfs' ? 'nfs' : family === 'rbd' ? 'ceph' : 'iSCSI',
+  family,
+});
+
+const DC1_STORAGE = [
+  backend('overcloud@tripleo_ceph#ceph-hdd', 'rbd'),
+  backend('overcloud@tripleo_ceph#ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_ceph#tripleo-ceph', 'rbd'),
+  backend('overcloud@tripleo_ceph#tripleo-ceph-ssd', 'rbd'),
+  backend('overcloud@tripleo_netapp#192.0.2.60:/cinder_dc1', 'netapp_nfs'),
+];
+
+const PROD_STORAGE = [
+  backend('hostgroup@ceph-hdd#volumes-hdd', 'rbd'),
+  backend('hostgroup@ceph-nvme#volumes-nvme', 'rbd'),
+  backend('hostgroup@ceph-ssd#volumes-ssd', 'rbd'),
+  // the same ONTAP export, mounted through the RHOSO storage network's LIF
+  backend('hostgroup@ontap-nfs#198.51.100.60:/cinder_dc1', 'netapp_nfs'),
+];
+
 export function makeVm(spec: VmSpec): VMRef {
-  const disks: Disk[] = spec.disks.map((d, i) => ({
+  const disks: Disk[] = spec.disks.map((d, i) => {
+    const kind = d.kind ?? 'volume';
+    const volumeType = d.volume_type === undefined ? 'tripleo-ceph' : d.volume_type;
+    return {
     id: d.id ?? `${spec.id}-disk-${i}`,
     name: d.name ?? `${spec.name}-${i === 0 ? 'root' : `data${i}`}`,
     size_gb: d.size_gb,
     used_gb: d.used_gb === undefined ? null : d.used_gb,
     bootable: d.bootable ?? i === 0,
-    volume_type: d.volume_type === undefined ? 'tripleo-ceph' : d.volume_type,
+    volume_type: volumeType,
     device: d.device ?? `/dev/vd${String.fromCharCode(97 + i)}`,
-    kind: d.kind ?? 'volume',
+    kind,
     multiattach: d.multiattach ?? false,
     encrypted: d.encrypted ?? false,
     independent: d.independent ?? false,
-  }));
+    pool: d.pool !== undefined ? d.pool : kind === 'volume' && volumeType ? (MOCK_POOLS[volumeType] ?? null) : null,
+    };
+  });
   const diskBytes = disks.reduce((sum, d) => sum + d.size_gb * GiB, 0);
   const everyUsed = disks.every((d) => d.used_gb !== null);
   const usedBytes = everyUsed
@@ -112,16 +152,17 @@ export function makeVm(spec: VmSpec): VMRef {
     change_rate_bps: spec.change_rate_mibps === undefined ? null : spec.change_rate_mibps * MiB,
     disk_bytes: diskBytes,
     used_bytes: usedBytes,
+    guest_os: identifyGuestOs(spec.os_type ?? 'rhel9'),
   };
 }
 
 const OS_VMS: VmSpec[] = [
   { id: 'os-0a11', name: 'web-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 12 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-01' },
-  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
+  { id: 'os-0a12', name: 'web-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'ubuntu 22.04', disks: [{ size_gb: 40, used_gb: 14 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-02' },
   { id: 'os-0a13', name: 'web-03', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 40, used_gb: 13 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'web' }, host: 'compute-03' },
   { id: 'os-0a14', name: 'web-cache-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 30, used_gb: 9 }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'cache' } },
-  { id: 'os-0b21', name: 'api-gw-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 60, used_gb: 21 }], tags: { app: 'gateway' } },
-  { id: 'os-0b22', name: 'api-gw-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, disks: [{ size_gb: 60, used_gb: 20 }], tags: { app: 'gateway' } },
+  { id: 'os-0b21', name: 'api-gw-01', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'rocky 9.4', disks: [{ size_gb: 60, used_gb: 21 }], tags: { app: 'gateway' } },
+  { id: 'os-0b22', name: 'api-gw-02', project: 'shop', flavor: 'm1.medium', vcpus: 4, ram_mb: 8192, os_type: 'debian 12', disks: [{ size_gb: 60, used_gb: 20 }], tags: { app: 'gateway' } },
   { id: 'os-0b31', name: 'mq-broker-01', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 46, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0b32', name: 'mq-broker-02', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 15 }, { size_gb: 100, used_gb: 51, volume_type: 'tripleo-ceph-ssd' }], tags: { app: 'rabbitmq' } },
   { id: 'os-0c41', name: 'ad-dc-01', project: 'platform', flavor: 'm1.large', vcpus: 4, ram_mb: 16384, os_type: 'windows2019', disks: [{ size_gb: 80, used_gb: 38 }], nics: [{ network: 'tenant-infra', mtu: 1500 }], tags: { app: 'active-directory' } },
@@ -133,13 +174,13 @@ const OS_VMS: VmSpec[] = [
   { id: 'os-0e63', name: 'shared-disk-node-a', project: 'platform', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 40, used_gb: 12 }, { size_gb: 300, used_gb: 140, multiattach: true }], tags: { app: 'gfs-cluster' } },
   { id: 'os-0e64', name: 'app-billing-01', project: 'finance', flavor: 'm1.large', vcpus: 8, ram_mb: 16384, disks: [{ size_gb: 50, used_gb: 22 }, { size_gb: 150, used_gb: 88 }], tags: { app: 'billing' }, change_rate_mibps: 3 },
   { id: 'os-0e65', name: 'static-cdn-01', project: 'shop', flavor: 'm1.small', disks: [{ size_gb: 20, used_gb: 6, kind: 'image_root', volume_type: null }], nics: [{ network: 'tenant-web' }], tags: { app: 'shop', tier: 'static' } },
-  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', disks: [{ size_gb: 60, used_gb: 25 }], tags: { app: 'reporting' } },
-  { id: 'os-0e67', name: 'old-ftp-01', project: 'platform', flavor: 'm1.small', power_state: 'stopped', disks: [{ size_gb: 30, used_gb: 4 }], tags: { app: 'ftp' } },
+  { id: 'os-0e66', name: 'report-gen-01', project: 'finance', flavor: 'm1.medium', os_type: 'windows 2022', disks: [{ size_gb: 60, used_gb: 25, volume_type: 'netapp-nfs' }], tags: { app: 'reporting' } },
+  { id: 'os-0e67', name: 'old-ftp-01', project: 'platform', flavor: 'm1.small', power_state: 'stopped', disks: [{ size_gb: 30, used_gb: 4, volume_type: 'netapp-nfs' }], tags: { app: 'ftp' } },
   { id: 'os-0f71', name: 'analytics-node-1', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 380, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f72', name: 'analytics-node-2', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 362, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f73', name: 'analytics-node-3', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 15, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 371, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f74', name: 'analytics-db', project: 'analytics', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 17, volume_type: 'ceph-ssd' }, { size_gb: 400, used_gb: 260, volume_type: 'ceph-hdd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark', tier: 'database' }, change_rate_mibps: 6 },
-  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500 }], tags: { app: 'bastion' } },
+  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', os_type: 'ubuntu 18.04', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500 }], tags: { app: 'bastion' } },
   { id: 'os-1a02', name: 'build-runner-07', project: 'platform', flavor: 'm1.large', power_state: 'error', disks: [{ size_gb: 100 }], tags: { app: 'ci' } },
 ];
 
@@ -148,7 +189,7 @@ const VMW_VMS: VmSpec[] = [
   { id: 'vm-5002', name: 'vm-erp-db-01', project: 'erp', vcpus: 16, ram_mb: 131072, os_type: 'rhel8', cbt_enabled: true, tools_ok: true, disks: [{ size_gb: 100, used_gb: 30, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 800, used_gb: 590, kind: 'vmdk', volume_type: null, device: 'scsi0:1' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'erp', tier: 'database' }, change_rate_mibps: 10 },
   { id: 'vm-5003', name: 'vm-fileserver-01', project: 'erp', vcpus: 4, ram_mb: 16384, os_type: 'windows2019', cbt_enabled: false, tools_ok: true, disks: [{ size_gb: 100, used_gb: 40, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 1500, used_gb: 1100, kind: 'vmdk', volume_type: null, device: 'scsi0:1' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'files' } },
   { id: 'vm-5004', name: 'vm-print-01', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2016', cbt_enabled: true, tools_ok: false, disks: [{ size_gb: 60, used_gb: 22, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }, { size_gb: 20, used_gb: 3, kind: 'vmdk', volume_type: null, device: 'scsi0:1', independent: true }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'print' } },
-  { id: 'vm-5005', name: 'vm-hr-portal', project: 'erp', vcpus: 4, ram_mb: 8192, os_type: 'rhel9', cbt_enabled: true, tools_ok: true, snapshot_count: 2, disks: [{ size_gb: 80, used_gb: 31, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'hr' } },
+  { id: 'vm-5005', name: 'vm-hr-portal', project: 'erp', vcpus: 4, ram_mb: 8192, os_type: 'Ubuntu 24.04.1 LTS', cbt_enabled: true, tools_ok: true, snapshot_count: 2, disks: [{ size_gb: 80, used_gb: 31, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'hr' } },
   { id: 'vm-5006', name: 'vm-legacy-win2008', project: 'erp', vcpus: 2, ram_mb: 4096, os_type: 'windows2008', cbt_enabled: false, tools_ok: false, disks: [{ size_gb: 60, used_gb: 41, kind: 'vmdk', volume_type: null, device: 'scsi0:0' }], nics: [{ network: 'VM Network ERP', mtu: 1500 }], tags: { app: 'legacy-crm' } },
 ];
 
@@ -162,7 +203,7 @@ const LAB_VMS: VmSpec[] = [
 // -------------------------------------------------------------------------------------------
 
 function conversionHost(name: string, address: string) {
-  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address };
+  return { manage: true, name, flavor: 'm1.large', external_network: 'provider-ext', image: 'rhel-9.4-conversion', ssh_user: 'cloud-user', address, ssh_allowed_cidr: null, ssh_key_secret: null };
 }
 
 export function buildProviders(now: number): Provider[] {
@@ -173,16 +214,19 @@ export function buildProviders(now: number): Provider[] {
       kind: 'openstack',
       role: 'source',
       endpoint: 'https://overcloud.dc1.example.com:13000/v3',
-      cloud: 'rhosp17-dc1',
-      credentials_secret: null,
+      cloud: null,
+      credentials_secret: 'provider-rhosp17-dc1',
       region: 'regionOne',
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: ['tripleo-ceph', 'tripleo-ceph-ssd'] },
+      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
+      distribution: 'rhosp',
+      credentials_updated_at: iso(now - 3 * 3600_000),
+      conversion_key_updated_at: null,
     },
     {
       id: 'vcenter-hq',
@@ -191,15 +235,18 @@ export function buildProviders(now: number): Provider[] {
       role: 'source',
       endpoint: 'https://vcenter.hq.example.com/sdk',
       cloud: null,
-      credentials_secret: 'vcenter-hq',
+      credentials_secret: 'provider-vcenter-hq',
       region: 'Datacenter-HQ',
       verify_tls: true,
       ca_cert_path: null,
-      conversion_host: null,
+      conversion_host: { manage: false, name: 'conv-vddk-hq', flavor: null, external_network: null, image: null, ssh_user: 'cloud-user', address: '198.51.100.40', ssh_allowed_cidr: null, ssh_key_secret: 'provider-vcenter-hq-ssh' },
       capabilities: { version: '8.0.2', cbt: true, datastores: ['vsanDatastore', 'nfs-archive'] },
       status: 'degraded',
       status_message: 'Two ESXi hosts in maintenance mode; CBT queries are slow.',
       last_checked_at: iso(now - 11 * 60_000),
+      distribution: 'vmware',
+      credentials_updated_at: iso(now - 26 * 3600_000),
+      conversion_key_updated_at: iso(now - 26 * 3600_000),
     },
     {
       id: 'community-lab',
@@ -217,6 +264,29 @@ export function buildProviders(now: number): Provider[] {
       status: 'error',
       status_message: 'Keystone returned HTTP 503 Service Unavailable.',
       last_checked_at: iso(now - 26 * 60_000),
+      distribution: 'openstack_community',
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
+    },
+    {
+      id: 'kolla-edge',
+      name: 'Kolla Edge (Bobcat)',
+      kind: 'openstack',
+      role: 'source',
+      endpoint: 'https://kolla-vip.edge.example.com:5000/v3',
+      cloud: null,
+      credentials_secret: null,
+      region: 'RegionOne',
+      verify_tls: true,
+      ca_cert_path: '/etc/pki/seamless/kolla-root.crt',
+      conversion_host: null,
+      capabilities: {},
+      status: 'unknown',
+      status_message: null,
+      last_checked_at: null,
+      distribution: 'kolla',
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
     },
     {
       id: 'rhoso-prod',
@@ -234,11 +304,15 @@ export function buildProviders(now: number): Provider[] {
         admin: true,
         compute_microversion: '2.95',
         ovn: true,
-        volume_backends: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme'],
+        volume_backends: PROD_STORAGE.map((b) => b.pool),
+        storage_backends: PROD_STORAGE,
       },
       status: 'ok',
       status_message: 'All services healthy; OVN networking.',
       last_checked_at: iso(now - 3 * 60_000),
+      distribution: 'rhoso',
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
     },
     {
       id: 'rhoso-staging',
@@ -256,6 +330,9 @@ export function buildProviders(now: number): Provider[] {
       status: 'unknown',
       status_message: null,
       last_checked_at: null,
+      distribution: 'rhoso',
+      credentials_updated_at: null,
+      conversion_key_updated_at: null,
     },
   ];
 }
@@ -269,7 +346,7 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       { name: 'm1.large', vcpus: 8, ram_mb: 32768, disk_gb: 160, extra_specs: {} },
       { name: 'db.xlarge', vcpus: 16, ram_mb: 131072, disk_gb: 200, extra_specs: { 'hw:cpu_policy': 'dedicated' } },
     ],
-    volume_types: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme'],
+    volume_types: ['ceph-ssd', 'ceph-hdd', 'ceph-nvme', 'netapp-nfs'],
     quotas: {
       shop: { cores: 120, ram_mb: 262144, instances: 40, volumes: 80, gigabytes: 8000 },
       finance: { cores: 96, ram_mb: 393216, instances: 20, volumes: 40, gigabytes: 6000 },
@@ -373,6 +450,23 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
   };
 }
 
+/** Per-volume driver-family checks of a handover where the pools are known (SDD §9.2, §7.3.1). */
+function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Provider): string[] {
+  const families = new Map(storageBackends(source.capabilities).map((b) => [b.pool, b.family]));
+  const dst = storageBackends(destination.capabilities);
+  const reasons: string[] = [];
+  for (const disk of vm.disks) {
+    if (disk.kind !== 'volume' || !disk.pool || !families.has(disk.pool)) continue;
+    const family = families.get(disk.pool)!;
+    const target = plan.handover.backend_map[disk.volume_type ?? ''];
+    if (family !== 'other' && (!target || dst.length === 0)) continue;
+    const { error } = resolveDestination(family, splitHost(disk.pool)[1], target ?? '', dst);
+    if (error) reasons.push(`${disk.name ?? disk.id}: ${error}`);
+  }
+  return reasons;
+}
+
+
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -402,6 +496,8 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
+    handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
     result.storage_handover = handover;
   }
@@ -427,6 +523,7 @@ export function preflight(
     findings.push({ code, severity, message, remediation, strategies });
 
   if (vm.power_state === 'error') add('SRC_VM_ERROR_STATE', 'blocker', `${vm.name} is in ERROR state at the source.`, 'Repair or reset the source instance, then re-validate.');
+  if (vm.power_state === 'transitioning') add('SRC_VM_TRANSITIONAL_STATE', 'blocker', `${vm.name} has a Nova task in flight (resize, migration, rescue, rebuild or reboot).`, 'Wait until the VM is ACTIVE or SHUTOFF, then re-validate.');
   if (selectedNames.filter((n) => n === vm.name).length > 1)
     add('SRC_VM_DUPLICATE_NAME', 'blocker', `Another selected VM is also named ${vm.name}; os-migrate filters workloads by name.`, 'Rename one of the instances or split them into separate plans.');
   if (vm.disks.some((d) => d.multiattach))
@@ -449,8 +546,15 @@ export function preflight(
     add('VM_VGPU', 'blocker', 'Flavor requests a vGPU (resources:VGPU).', 'Configure mediated devices on RHOSO and map the flavor.');
   if (vm.disks.some((d) => d.encrypted))
     add('VOL_ENCRYPTED', 'warning', 'An encrypted volume is attached; its Barbican key must be re-created at RHOSO.', 'Export the secret and register it in the RHOSO Key Manager before cutover.');
-  if (vm.os_type && /^(rhel[3-6]|centos[3-6]|windows200[038])/.test(vm.os_type))
-    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${vm.os_type} is end-of-life; drivers may be missing.`, 'Verify virtio drivers in the initramfs before cutover.');
+  const guest = guestOsOf(vm);
+  if (guest.lifecycle === 'legacy')
+    add('GUEST_OS_LEGACY', 'warning', `Guest OS ${guest.label} is out of standard vendor support.`, 'It still migrates: test the application on RHOSO, check the virtio drivers and plan a longer verification.');
+  if (guest.family === 'unknown')
+    add('GUEST_OS_UNKNOWN', 'info', `The guest OS is not identified${vm.os_type ? ` (${vm.os_type})` : ''}.`, 'Set the os_distro and os_version image properties or run VMware Tools; verification uses the Linux profile meanwhile.');
+  if (sourceKind === 'vmware' && (guest.v2v === 'tech_preview' || guest.v2v === 'unverified'))
+    add('GUEST_CONVERSION_UNVERIFIED', 'warning', `Converting ${guest.label} with virt-v2v is ${guest.v2v === 'tech_preview' ? 'a Technology Preview' : 'not supported by Red Hat'}.`, 'Run a test conversion of a copy first.', ['vmware_cold', 'vmware_warm']);
+  if (sourceKind === 'vmware' && guest.v2v === 'unsupported')
+    add('GUEST_CONVERSION_UNSUPPORTED', 'warning', `virt-v2v on the RHEL 9 conversion host cannot prepare ${guest.label}.`, 'Install the virtio storage and network drivers from an older virtio-win release inside the guest and test the conversion, or migrate the VM another way.', ['vmware_cold', 'vmware_warm']);
   if (sourceKind === 'vmware') {
     if (vm.cbt_enabled === false)
       add('VMW_CBT_DISABLED', 'warning', 'Changed Block Tracking is disabled; only cold migration is possible.', 'Enable CBT (requires a power cycle) or accept a cold window.', ['vmware_warm']);
@@ -477,17 +581,19 @@ export function defaultPlanFields(now: number) {
     default_strategy: 'auto' as const,
     strategy_overrides: {},
     selection_policy: 'min_downtime' as const,
-    downtime_slo_s: 300,
+    downtime_slo_s: 600,
     require_approval: true,
     auto_cutover: false,
     cutover_window: null,
     keep_warm_interval_s: 900,
     convergence_threshold_bytes: 1073741824,
     max_sync_passes: 5,
+    estimator_overrides: {},
     link_bps: 131072000,
     handover: { enabled: false, backend_map: {} },
     verification: {
       tcp_ports: [22],
+      windows_tcp_ports: [3389],
       probe_address: 'fixed' as const,
       console_success_patterns: ['login:', 'Cloud-init v\\. .* finished', 'Reached target .*Multi-User'],
       timeout_s: 600,
@@ -642,7 +748,7 @@ const PLAN_SPECS: PlanSpec[] = [
     overrides: {
       handover: { enabled: true, backend_map: { 'ceph-ssd': 'hostgroup@ceph-ssd#volumes-ssd' } },
       cutover_window: null,
-      downtime_slo_s: 300,
+      downtime_slo_s: 600,
     },
     waves: [{ id: 'wave-1', name: 'Spark cluster', vms: ['os-0f71', 'os-0f72', 'os-0f73', 'os-0f74'], max_parallel: 4 }],
     migrations: [
@@ -700,7 +806,7 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'failed',
     createdAgo: 2 * D,
-    overrides: { verification: { tcp_ports: [22, 8080], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
+    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
     waves: [{ id: 'wave-1', name: 'Legacy', vms: ['os-0e61', 'os-0e63', 'os-0e66', 'os-0e67'], max_parallel: 2 }],
     migrations: [
       {
@@ -938,11 +1044,18 @@ export function buildFixtures(now: number): Fixtures {
         phase: m.phase,
         phase_history: history,
         progress_pct: progress,
-        bytes_total: bytesTotal,
-        bytes_transferred: Math.round((bytesTotal * progress) / 100),
-        sync_passes: syncPasses,
+        // like the API (SDD §4.2): the disk's used bytes, and every pass that ended plus the running one
+        // (a migration without passes counts its copy's progress; a storage handover copies nothing)
+        bytes_total: vm.used_bytes,
+        bytes_transferred: syncPasses.length ? syncPasses.reduce((sum, p) => sum + p.bytes_transferred, 0) : Math.round((bytesTotal * progress) / 100),
+        // like the API, only passes that ended are listed (SDD §4.2); a running one counts in bytes_transferred
+        sync_passes: syncPasses.filter((p) => p.ended_at !== null),
+        sync_bytes_dropped: 0,
         estimate: chosen,
         estimates,
+        // a delta pass calibrates the per-stream scan rate (SDD §9.1); pass 1 alone does not
+        observed_scan_bps: syncPasses.filter((p) => p.kind !== 'full' && p.ended_at !== null).length > 0 ? 545 * MiB : null,
+        resolved_mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
         findings,
         checkpoint: m.checkpoint ?? null,
         downtime_started_at: downtimeStartedAt === null ? null : iso(downtimeStartedAt),
@@ -950,6 +1063,7 @@ export function buildFixtures(now: number): Fixtures {
         actual_downtime_s: m.downtimeS ?? null,
         approvals: (m.approvals ?? []).map((a) => ({ actor: a.actor, at: iso(now - a.ago * 1000), comment: a.comment ?? null })),
         cutover_requested: m.cutoverRequested ?? false,
+        force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
@@ -996,7 +1110,16 @@ export function buildFixtures(now: number): Fixtures {
   for (const provider of providers.filter((p) => p.last_checked_at)) {
     emit({ ts: provider.last_checked_at ?? iso(now), kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
   }
-  emit({ ts: iso(now - 52 * 60_000), kind: 'auth.denied', plan_id: null, migration_id: null, actor: 'anonymous', message: 'Rejected request with an invalid bearer token', data: { path: '/api/v1/plans' } });
+  // the API's audit of a refused request (SDD §13.1); 192.0.2.10 is a documentation address (RFC 5737)
+  emit({
+    ts: iso(now - 52 * 60_000),
+    kind: 'auth.denied',
+    plan_id: null,
+    migration_id: null,
+    actor: 'unauthenticated',
+    message: 'GET /api/v1/plans: missing or invalid bearer token',
+    data: { path: '/api/v1/plans', method: 'GET', reason: 'missing or invalid bearer token', required_role: 'viewer', client: '192.0.2.10' },
+  });
   emit({ ts: iso(now - 7 * D * 1000 + 600_000), kind: 'memory.lesson_saved', plan_id: 'plan-2d5c8b93', migration_id: 'mig-d4e6f8a091', actor: 'agentmemory', message: 'Lesson saved: warm, <50G, 3 passes, estimate 3m 40s vs actual 3m 08s', data: { type: 'fact' } });
 
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));

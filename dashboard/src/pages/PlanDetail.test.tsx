@@ -1,7 +1,8 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import type { Plan } from '../api/types';
+import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import PlanDetail from './PlanDetail';
 
 function renderPlan(planId: string, token = 'operator') {
@@ -28,6 +29,18 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it('formats the estimator overrides and marks link_bps as ignored', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e');
+    if (!plan) throw new Error('fixture plan missing');
+    plan.estimator_overrides = { scan_bps: 400 * 2 ** 20, parallel_disks: 2, link_bps: 10 * 2 ** 20 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-4f2a9c1e', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    await within(settings).findByText(/scan_bps=400 MiB\/s/);
+    expect(settings).toHaveTextContent(/parallel_disks=2/);
+    expect(settings).toHaveTextContent(/link_bps=10.0 MiB\/s \(ignored: the plan link bandwidth applies\)/);
+  });
+
   it('enables only Pause for a running plan', async () => {
     renderPlan('plan-4f2a9c1e');
 
@@ -39,7 +52,7 @@ describe('PlanDetail', () => {
   });
 
   it('validates a draft plan and then allows starting it', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPlan('plan-0e9f6a17');
 
     const start = await actionButton(/^start/i);
@@ -49,6 +62,338 @@ describe('PlanDetail', () => {
     await user.click(await actionButton(/validate/i));
     expect(await screen.findByText(/validation finished/i)).toBeInTheDocument();
     expect(await actionButton(/^start/i)).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('announces the validation report from a live region already on the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-0e9f6a17');
+    const validate = await actionButton(/^validate$/i);
+    const regions = screen.getAllByRole('status');
+
+    await user.click(validate);
+    const report = await screen.findByText(/validation finished/i);
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(report.closest('[role="status"]'));
+  });
+
+  it('announces a saved plan edit (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-c81d44a0');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const regions = screen.getAllByRole('status');
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const announced = regions.find((r) => /plan saved/i.test(r.textContent ?? ''));
+    expect(announced).toHaveTextContent('Plan saved. It is a draft again: validate it before starting.');
+  });
+
+  it('says that validation creates the migrations of a new plan, with Validate there too (SDD §16)', async () => {
+    const server = createTestServer();
+    const taken = new Set(server.migrations.map((m) => m.vm.source_id));
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string }>> }).inventories;
+    const free = inventories['rhosp17-dc1']!.filter((v) => !taken.has(v.source_id)).slice(0, 2).map((v) => v.source_id);
+    const plan = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Fresh wave',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: free,
+    });
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+
+    const panel = await screen.findByRole('region', { name: /^migrations$/i });
+    expect(await within(panel).findByText(/no migrations in this plan yet/i)).toBeInTheDocument();
+    expect(panel).toHaveTextContent(/validation creates one migration per vm and runs the pre-flight checks/i);
+    // pre-flight has not run: the findings must not say it passed (SDD §16)
+    const findings = screen.getByRole('region', { name: /^findings$/i });
+    expect(findings).toHaveTextContent(/no findings yet — pre-flight runs when the plan is validated/i);
+    expect(findings).not.toHaveTextContent(/pre-flight passed/i);
+    await user.click(within(panel).getByRole('button', { name: /^validate$/i }));
+    expect(await within(panel).findByRole('table', { name: /migrations in fresh wave/i })).toBeInTheDocument();
+    expect(server.migrations.filter((m) => m.plan_id === plan.id)).toHaveLength(2);
+    // the empty table's Validate is gone with it: focus moves to the plan's Validate, never to the page (SDD §16)
+    expect(await actionButton(/^validate$/i)).toHaveFocus();
+    await waitFor(() => expect(findings).not.toHaveTextContent(/pre-flight runs when the plan is validated/i));
+  });
+
+  it('says pre-flight passed only when every VM of the plan was checked and the plan is not a draft (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    plan.vm_ids = mine.map((m) => m.vm.source_id);
+    for (const m of mine) {
+      m.findings = [];
+      m.phase = 'ready';
+      m.phase_history = [
+        { from_phase: null, to_phase: 'pending', at: '2026-10-08T10:00:00Z', reason: 'migration created', actor: 'sari' },
+        { from_phase: 'pending', to_phase: 'validating', at: '2026-10-08T10:00:01Z', reason: 'plan validation started', actor: 'sari' },
+        { from_phase: 'validating', to_phase: 'ready', at: '2026-10-08T10:00:02Z', reason: 'pre-flight passed', actor: 'sari' },
+      ];
+    }
+    const findingsText = async () => {
+      const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+      const region = await screen.findByRole('region', { name: /^findings$/i });
+      await waitFor(() => expect(region).toHaveTextContent(/no findings/i));
+      const text = region.textContent ?? '';
+      view.unmount();
+      return text;
+    };
+
+    plan.status = 'validated';
+    expect(await findingsText()).toMatch(/no findings — pre-flight passed/i);
+    // a VM added after the validation has no migration yet: nothing checked it
+    const taken = new Set(server.migrations.map((m) => m.vm.source_id));
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string }>> }).inventories;
+    const added = inventories[plan.source_provider_id]!.find((v) => !taken.has(v.source_id))!.source_id;
+    plan.vm_ids = [...plan.vm_ids, added];
+    expect(await findingsText()).toMatch(/pre-flight runs when the plan is validated/i);
+    // an edited plan is a draft again: it is validated again before it starts
+    plan.vm_ids = plan.vm_ids.filter((id) => id !== added);
+    plan.status = 'draft';
+    expect(await findingsText()).toMatch(/pre-flight runs when the plan is validated/i);
+  });
+
+  it('says which plan holds a VM when validation is refused (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === first.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const second = await createTestClient(server, 'operator').post<Plan>('/plans', {
+      name: 'Second wave',
+      source_provider_id: first.source_provider_id,
+      destination_provider_id: first.destination_provider_id,
+      vm_ids: [held.vm.source_id],
+    });
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, { route: `/plans/${second.id}`, path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/validate/i));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/the plan action failed/i);
+    expect(alert).toHaveTextContent(`${held.vm.name} (plan "${first.name}", ${held.phase})`);
+  });
+
+  it('asks before Validate clears approvals and cutover requests, and says how many (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    const first = mine[0]!;
+    for (const m of mine.slice(0, 2)) {
+      m.phase = 'ready';
+      m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+    }
+    first.cutover_requested = true;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+
+    await user.click(await actionButton(/validate/i));
+    let dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    expect(dialog).toHaveTextContent(/clears 2 approvals and 1 cutover request/i);
+    await user.click(within(dialog).getByRole('button', { name: /^cancel$/i }));
+    expect(first.approvals).toHaveLength(1);
+
+    await user.click(await actionButton(/validate/i));
+    dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    await user.click(within(dialog).getByRole('button', { name: /^validate and clear$/i }));
+    expect(await screen.findByText(/validation finished/i)).toBeInTheDocument();
+    expect(first.approvals).toEqual([]);
+    expect(first.cutover_requested).toBe(false);
+  });
+
+  it('counts the approvals on the server when Validate is clicked, not a list loaded before them (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const m = server.migrations.find((x) => x.plan_id === plan.id)!;
+    m.phase = 'ready';
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+    // an approver approves meanwhile (another tab or person): the list on screen does not show it yet
+    m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
+
+    await user.click(await actionButton(/validate/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i });
+    expect(dialog).toHaveTextContent(/clears 1 approval/i);
+    expect(m.approvals).toHaveLength(1);
+  });
+
+  it('shows its KPIs as unknown, not zero, when the statistics cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/stats'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    expect(await screen.findByText(/statistics are unavailable/i)).toBeInTheDocument();
+    const metrics = screen.getByRole('region', { name: /plan metrics/i });
+    for (const label of ['In progress', 'Completed', 'Failed']) {
+      expect(within(metrics).getByRole('group', { name: label })).toHaveTextContent(`${label}—`);
+    }
+    // the count still comes from the plan's migrations, which did load
+    const count = server.migrations.filter((m) => m.plan_id === plan.id).length;
+    expect(count).toBeGreaterThan(0);
+    await waitFor(() => expect(within(metrics).getByRole('group', { name: 'Migrations' })).toHaveTextContent(`Migrations${count}`));
+  });
+
+  it('asks anyway when the migrations cannot be counted at the click (SDD §5.4)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const handle = server.handle.bind(server);
+    let failing = false;
+    server.handle = (method, path, query, body, token) =>
+      failing && method === 'GET' && path === '/migrations'
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('table', { name: /migrations/i });
+    failing = true;
+
+    await user.click(await actionButton(/validate/i));
+    // a 5xx is retried twice with backoff before the refetch reports the error
+    const dialog = await screen.findByRole('alertdialog', { name: /validate this plan again/i }, { timeout: 8000 });
+    expect(dialog).toHaveTextContent(/clears any approvals and cutover requests/i);
+    // the list loaded before the failed refetch still stands: the waves and findings keep showing it (SDD §16)
+    expect(within(screen.getByRole('region', { name: /waves/i })).queryByText('Progress unknown')).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Findings' })).toHaveTextContent(/\d+ blockers/);
+  }, 15_000);
+
+  it('shows wave progress and findings as unknown, not empty or zero, when the migrations cannot be loaded (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    expect(plan.waves).toHaveLength(3);
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/migrations'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
+    expect(await screen.findByText(/migrations are unavailable/i)).toBeInTheDocument();
+
+    // each wave keeps what the plan says about it; its state and progress come from the migrations
+    const waves = within(screen.getByRole('region', { name: /waves/i })).getAllByRole('listitem');
+    expect(waves).toHaveLength(3);
+    for (const [i, wave] of waves.entries()) {
+      expect(wave).toHaveTextContent(plan.waves.find((w) => w.order === i + 1)!.name);
+      expect(within(wave).getByText('Unknown')).toBeInTheDocument();
+      expect(within(wave).getByText('Progress unknown')).toBeInTheDocument();
+      expect(within(wave).queryByRole('progressbar')).not.toBeInTheDocument();
+      expect(wave).not.toHaveTextContent(/Active|Waiting|Complete|0\/0/);
+    }
+    const findings = screen.getByRole('region', { name: 'Findings' });
+    expect(findings).toHaveTextContent('Unknown: the findings could not be loaded.');
+    expect(findings).not.toHaveTextContent(/0 blockers|no findings yet/i);
+  });
+
+  it('counts the migrations to start from the statistics when the list cannot be loaded, else says unknown (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const count = server.migrations.filter((m) => m.plan_id === plan.id).length;
+    expect(count).toBe(4);
+    const refused = new Set(['/migrations']);
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && refused.has(path)
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByText(/migrations are unavailable/i);
+    await waitFor(() => expect(within(screen.getByRole('region', { name: /plan metrics/i })).getByRole('group', { name: 'Migrations' })).toHaveTextContent('Migrations4'));
+
+    await user.click(await actionButton(/^start$/i));
+    expect(await screen.findByRole('alertdialog', { name: /start this plan/i })).toHaveTextContent(/\b4 migrations in 1 wave\./);
+    view.unmount();
+
+    refused.add('/stats');
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByText(/statistics are unavailable/i);
+    await screen.findByText(/migrations are unavailable/i);
+    await user.click(await actionButton(/^start$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /start this plan/i });
+    expect(dialog).toHaveTextContent(/An unknown number of migrations in 1 wave\./);
+    expect(dialog).not.toHaveTextContent(/\b0 migrations/);
+  });
+
+  it('starts a failed plan again, saying that pre-staging failed and is retried (SDD §8, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-95a7e3f1');
+    const start = await actionButton(/^start again$/i);
+    expect(start).not.toHaveAttribute('aria-disabled');
+
+    await user.click(start);
+    const dialog = await screen.findByRole('alertdialog', { name: /start this plan again/i });
+    expect(dialog).toHaveTextContent(/pre-staging failed/i);
+    expect(dialog).toHaveTextContent(/failed migrations stay failed until you retry or roll them back/i);
+    await user.click(within(dialog).getByRole('button', { name: /^start again$/i }));
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-95a7e3f1')?.status).toBe('running'));
+  });
+
+  it('says why Plan waves is unavailable while the wave size is not a whole number from 1 to 1000 (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-0e9f6a17');
+    await user.click(await actionButton(/auto-plan waves/i));
+    const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves|replace the waves/i });
+    // it warns before it runs: the plan returns to draft and is validated again, clearing approvals
+    expect(dialog).toHaveTextContent(/returns to draft/i);
+    expect(dialog).toHaveTextContent(/clears approvals and cutover requests/i);
+    const size = within(dialog).getByLabelText(/maximum vms per wave/i);
+    const confirm = within(dialog).getByRole('button', { name: /^plan waves$/i });
+    await user.clear(size);
+    await user.type(size, '1001');
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a whole number from 1 to 1000.');
+    // the API takes up to 1000 (SDD §12): a size above the old cap of 100 is fine
+    await user.clear(size);
+    await user.type(size, '500');
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.click(confirm);
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length).toBeGreaterThan(0));
+  });
+
+  it.each([
+    ['plan-c81d44a0', /^start$/i, /^start plan$/i, 'Plan started.'],
+    ['plan-7b3e0d52', /^resume$/i, /^resume plan$/i, 'Plan resumed.'],
+    ['plan-95a7e3f1', /^start again$/i, /^start again$/i, 'Plan started again.'],
+    ['plan-4f2a9c1e', /^pause$/i, /^pause plan$/i, 'Plan paused.'],
+  ])('announces the outcome of the action on %s (SDD §16)', async (planId, action, confirmLabel, message) => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan(planId);
+    await user.click(await actionButton(action));
+    const dialog = await screen.findByRole('alertdialog');
+    await user.click(within(dialog).getByRole('button', { name: confirmLabel }));
+    expect(await screen.findByText(message)).toHaveAttribute('role', 'status');
+  });
+
+  it('returns focus to the header Auto-plan waves when the empty waves board it was opened from goes (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-0e9f6a17');
+    const waves = await screen.findByRole('region', { name: /^waves$/i });
+    await user.click(within(waves).getByRole('button', { name: /auto-plan waves/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves/i });
+    await user.click(within(dialog).getByRole('button', { name: /^plan waves$/i }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+    await within(waves).findByText('Pilot');
+    expect(within(waves).queryByRole('button', { name: /auto-plan waves/i })).not.toBeInTheDocument();
+    expect(await actionButton(/auto-plan waves/i)).toHaveFocus();
+  });
+
+  it('announces how many waves were planned (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-0e9f6a17');
+    await user.click(await actionButton(/auto-plan waves/i));
+    const dialog = await screen.findByRole('alertdialog');
+    await user.click(within(dialog).getByRole('button', { name: /^plan waves$/i }));
+    await waitFor(() => expect(server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length).toBeGreaterThan(0));
+    const n = server.plans.find((p) => p.id === 'plan-0e9f6a17')!.waves.length;
+    expect(await screen.findByText(`Waves planned: ${n} wave${n === 1 ? '' : 's'}.`)).toHaveAttribute('role', 'status');
   });
 
   it('keeps every plan action disabled for viewers, with the reason', async () => {
@@ -62,7 +407,7 @@ describe('PlanDetail', () => {
   });
 
   it('pauses a running plan after confirmation', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderPlan('plan-4f2a9c1e');
 
     await user.click(await actionButton(/pause/i));
@@ -74,5 +419,245 @@ describe('PlanDetail', () => {
     expect(resume).toHaveAttribute('aria-disabled', 'true');
     expect(resume).toHaveAccessibleDescription(/1 migration is blocked/i);
     expect(await actionButton(/pause/i)).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('edits a validated plan: prefilled, only the changed field is sent, the plan returns to draft', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-c81d44a0');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    expect(within(dialog).getByLabelText(/^name/i)).toHaveValue('Shared Ceph handover — analytics');
+    expect(within(dialog).getByText(/saving returns the plan to draft/i)).toBeInTheDocument();
+    expect(within(dialog).getByRole('checkbox', { name: /hand volumes over without copying/i })).toBeChecked();
+    expect(within(dialog).getByLabelText(/^source provider/i)).toBeDisabled();
+    // the plan's own migrations hold its VMs for this plan, not against it (SDD §5.4)
+    expect(within(dialog).queryByRole('status', { name: /another plan holds/i })).not.toBeInTheDocument();
+
+    const slo = within(dialog).getByLabelText(/downtime slo/i);
+    await user.clear(slo);
+    await user.type(slo, '15');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0');
+    expect(plan?.downtime_slo_s).toBe(900);
+    expect(plan?.status).toBe('draft');
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['downtime_slo_s'] });
+  });
+
+  it('edits a plan stored with sync values the old form refused: threshold 0, 60 passes, 100 disks (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // as the API or `seamless plan apply` may store them
+    plan.convergence_threshold_bytes = 0;
+    plan.max_sync_passes = 60;
+    plan.estimator_overrides = { ...plan.estimator_overrides, parallel_disks: 100 };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    expect(within(dialog).getByLabelText(/convergence threshold/i)).toHaveValue(0);
+    expect(within(dialog).getByLabelText(/max sync passes/i)).toHaveValue(60);
+    expect(within(dialog).getByLabelText(/disks scanned in parallel/i)).toHaveValue(100);
+
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === plan.id)!;
+    expect(saved.name).toBe('Analytics, renamed');
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
+    expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
+  });
+
+  it('lists a selected VM that left the source, with Remove, so the plan can be saved without it (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const kept = [...plan.vm_ids];
+    // a VM deleted from the source after the plan was made: the inventory no longer lists it
+    plan.vm_ids = [...kept, 'os-gone-01'];
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const gone = await within(dialog).findByRole('group', { name: /a selected vm is no longer in the source/i });
+    expect(gone).toHaveTextContent('os-gone-01');
+
+    await user.click(within(gone).getByRole('button', { name: 'Remove os-gone-01 from the plan' }));
+    expect(within(dialog).queryByRole('group', { name: /no longer in the source/i })).not.toBeInTheDocument();
+    // the removed button's place: focus moves to the VMs, never to the page
+    expect(within(dialog).getByText('VMs', { selector: 'legend' }).closest('legend')).toHaveFocus();
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.plans.find((p) => p.id === plan.id)!.vm_ids).toEqual(kept);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['vm_ids'] });
+  });
+
+  it('shows an operator the approval policy read-only, with the reason (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-c81d44a0', 'operator');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    for (const name of [/require approval/i, /automatic cutover/i]) {
+      const box = within(dialog).getByRole('checkbox', { name });
+      expect(box).toBeDisabled();
+      expect(box).toHaveAccessibleDescription(/changing the approval policy requires the approver role/i);
+    }
+    for (const label of [/cutover window start/i, /cutover window end/i]) {
+      const field = within(dialog).getByLabelText(label);
+      expect(field).toBeDisabled();
+      expect(field).toHaveAccessibleDescription(/changing the cutover window requires the approver role/i);
+    }
+  });
+
+  it('lets an approver change the approval policy; only that field is sent', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-c81d44a0', 'approver');
+    const before = server.plans.find((p) => p.id === 'plan-c81d44a0')?.auto_cutover;
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const auto = within(dialog).getByRole('checkbox', { name: /automatic cutover/i });
+    await waitFor(() => expect(auto).toBeEnabled());
+    expect(auto).not.toHaveAccessibleDescription(/requires the approver role/i);
+    // the window keeps its own hint
+    expect(within(dialog).getByLabelText(/cutover window start/i)).toHaveAccessibleDescription(/local time; leave empty for any time/i);
+    await user.click(auto);
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.plans.find((p) => p.id === 'plan-c81d44a0')?.auto_cutover).toBe(!before);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['auto_cutover'] });
+  });
+
+  it('edits the guest write rate, prefilled; overrides the form does not show are kept (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.estimator_overrides = { change_rate_bps: 4 * 2 ** 20, max_aggregate_scan_bps: 800 * 2 ** 20, v2v_s: 240 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const rate = within(dialog).getByLabelText(/guest write rate/i);
+    expect(rate).toHaveValue(4);
+    expect(within(dialog).getByLabelText(/aggregate scan cap/i)).toHaveValue(800);
+    await user.clear(rate);
+    await user.type(rate, '6');
+    // a cleared field goes back to the planning default: its override is removed
+    await user.clear(within(dialog).getByLabelText(/aggregate scan cap/i));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.estimator_overrides).toEqual({ change_rate_bps: 6 * 2 ** 20, v2v_s: 240 });
+  });
+
+  it('edits the measured step times, prefilled; a cleared one goes back to the planning default (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.estimator_overrides = { shutdown_s: 30, boot_s: 90, v2v_s: 240 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    expect(within(dialog).getByLabelText(/source shutdown/i)).toHaveValue(30);
+    expect(within(dialog).getByLabelText(/^boot/i)).toHaveValue(90);
+    await user.clear(within(dialog).getByLabelText(/source shutdown/i));
+    await user.type(within(dialog).getByLabelText(/snapshot/i), '25');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.estimator_overrides).toEqual({ snapshot_s: 25, boot_s: 90, v2v_s: 240 });
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['estimator_overrides'] });
+  });
+
+  it('edits keep-warm and pre-staging, prefilled; a resource the form does not show is kept (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.keep_warm_interval_s = 600;
+    plan.prestage_resources = ['networks', 'subnets', 'flavors'];
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    let dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const keepWarm = within(dialog).getByLabelText(/^keep-warm interval/i);
+    expect(keepWarm).toHaveValue(10);
+    const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
+    expect(within(prestage).getByRole('checkbox', { name: /^networks/i })).toBeChecked();
+    expect(within(prestage).getByRole('checkbox', { name: /^routers/i })).not.toBeChecked();
+    expect(prestage).toHaveTextContent(/also pre-staged: flavors/i);
+    await user.clear(keepWarm);
+    await user.type(keepWarm, '20');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.keep_warm_interval_s).toBe(1200);
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'flavors']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['keep_warm_interval_s'] });
+
+    // turning a default on keeps the canonical order and the extra entry
+    await user.click(await actionButton(/^edit plan$/i));
+    dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.click(within(within(dialog).getByRole('group', { name: /pre-staged at the destination/i })).getByRole('checkbox', { name: /^routers/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'flavors']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['prestage_resources'] });
+  });
+
+  it('shows and removes a per-VM strategy override when editing; only the overrides are sent (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const vmId = plan.vm_ids[0]!;
+    const inventories = (server as unknown as { inventories: Record<string, Array<{ source_id: string; name: string }>> }).inventories;
+    const vmName = inventories[plan.source_provider_id]!.find((v) => v.source_id === vmId)!.name;
+    plan.strategy_overrides = { [vmId]: 'warm' };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
+    expect(await within(overrides).findByLabelText(new RegExp(`^strategy for ${vmName}$`, 'i'))).toHaveValue('warm');
+    await user.click(within(overrides).getByRole('button', { name: new RegExp(`^remove the override for ${vmName}$`, 'i') }));
+    // the removed row's button is gone: focus moves to its section, never to the page (SDD §16)
+    expect(within(overrides).getByText('Per-VM strategy', { selector: 'legend' })).toHaveFocus();
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.strategy_overrides).toEqual({});
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['strategy_overrides'] });
+  });
+
+  it('edits the verification settings, prefilled from the plan; only verification is sent', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // a pattern is a regular expression: its spaces are part of it and survive an unrelated edit
+    plan.verification.console_success_patterns = ['login: ', 'Reached target .*Multi-User'];
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    expect(within(dialog).getByLabelText(/^probe address/i)).toHaveValue(plan.verification.probe_address);
+    const timeout = within(dialog).getByLabelText(/^verification timeout/i);
+    expect(timeout).toHaveValue(plan.verification.timeout_s / 60);
+    await user.clear(timeout);
+    await user.type(timeout, '20');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.verification.timeout_s).toBe(1200);
+    expect(plan.verification.console_success_patterns).toEqual(['login: ', 'Reached target .*Multi-User']);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['verification'] });
+  });
+
+  it('explains why a plan cannot be edited', async () => {
+    renderPlan('plan-4f2a9c1e');
+    expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');
   });
 });

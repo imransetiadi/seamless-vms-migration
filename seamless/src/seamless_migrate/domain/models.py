@@ -6,12 +6,24 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import math
 import secrets
+from collections import Counter
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, computed_field
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
+from ..guest_os import GuestOS, identify
 from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
 
 GIB = 2**30
@@ -61,6 +73,17 @@ class ConversionHostConfig(_Model):
 ProviderStatus = Literal["unknown", "ok", "degraded", "error"]
 
 
+#: Presets and display only (SDD §4.2); ``kind`` decides the code path.
+Distribution = Literal["openstack_community", "kolla", "rhosp", "rhoso", "vmware"]
+DISTRIBUTION_KIND: dict[str, ProviderKind] = {
+    "openstack_community": ProviderKind.openstack,
+    "kolla": ProviderKind.openstack,
+    "rhosp": ProviderKind.openstack,
+    "rhoso": ProviderKind.rhoso,
+    "vmware": ProviderKind.vmware,
+}
+
+
 class Provider(_Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
@@ -77,6 +100,19 @@ class Provider(_Model):
     status: ProviderStatus = "unknown"
     status_message: str | None = None
     last_checked_at: UTCDateTime | None = None
+    distribution: Distribution | None = None
+    #: server-owned: when PUT …/credentials / …/conversion-key last wrote the secret store
+    credentials_updated_at: UTCDateTime | None = None
+    conversion_key_updated_at: UTCDateTime | None = None
+
+    @model_validator(mode="after")
+    def _distribution_matches_kind(self) -> Provider:
+        if self.distribution is not None and DISTRIBUTION_KIND[self.distribution] != self.kind:
+            raise ValueError(
+                f"distribution {self.distribution} belongs to kind "
+                f"{DISTRIBUTION_KIND[self.distribution]}, not {self.kind}"
+            )
+        return self
 
 
 DiskKind = Literal["volume", "ephemeral", "image_root", "vmdk"]
@@ -94,6 +130,8 @@ class Disk(_Model):
     multiattach: bool = False
     encrypted: bool = False
     independent: bool = False
+    # Cinder "host@backend#pool" of a volume (admin only); decides the handover reference (§7.3.1)
+    pool: str | None = None
 
 
 class Nic(_Model):
@@ -104,10 +142,13 @@ class Nic(_Model):
     mtu: int | None = None
 
 
-PowerState = Literal["running", "stopped", "paused", "error", "unknown"]
+PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]
 
 
 class VMRef(_Model):
+    """A source VM as inventoried (SDD §4.2). Tenant-controlled strings (name, tags, …) are
+    stored in JSON documents: PostgreSQL JSONB rejects NUL characters, so they are stripped."""
+
     source_id: str
     name: str
     project: str | None = None
@@ -124,6 +165,22 @@ class VMRef(_Model):
     cbt_enabled: bool | None = None
     snapshot_count: int = 0
     tools_ok: bool | None = None
+
+    @field_validator("name", "project", "flavor", "os_type", "host", mode="before")
+    @classmethod
+    def _strip_nul(cls, value: Any) -> Any:
+        return value.replace("\x00", "") if isinstance(value, str) else value
+
+    @field_validator("tags", "flavor_extra_specs", mode="before")
+    @classmethod
+    def _strip_nul_map(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(k).replace("\x00", ""): (v.replace("\x00", "") if isinstance(v, str) else v)
+                for k, v in value.items()
+            }
+        return value
+
     change_rate_bps: float | None = None
 
     @computed_field  # type: ignore[prop-decorator]
@@ -137,6 +194,12 @@ class VMRef(_Model):
         if all(d.used_gb is not None for d in self.disks):
             return int(sum(float(d.used_gb or 0.0) for d in self.disks) * GIB)
         return int(self.disk_bytes * USED_FALLBACK_RATIO)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def guest_os(self) -> GuestOS:
+        """Family, version, lifecycle and conversion support of the guest (SDD §9.5)."""
+        return identify(self.os_type)
 
     def root_disk(self) -> Disk | None:
         """The boot disk: first bootable disk, else the first disk."""
@@ -172,6 +235,8 @@ DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached ta
 
 class VerificationConfig(_Model):
     tcp_ports: list[int] = Field(default_factory=list)
+    # Windows guests probe these instead and skip the console check (SDD §7.5)
+    windows_tcp_ports: list[int] = Field(default_factory=list)
     probe_address: Literal["fixed", "floating"] = "fixed"
     console_success_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_CONSOLE_PATTERNS)
@@ -212,11 +277,12 @@ class PlanSpec(_Model):
     default_strategy: Strategy | Literal["auto"] = "auto"
     strategy_overrides: dict[str, Strategy] = Field(default_factory=dict)
     selection_policy: Literal["min_downtime", "simplest_meeting_slo"] = "min_downtime"
-    downtime_slo_s: int = 600
+    downtime_slo_s: int = Field(default=600, ge=1)
     require_approval: bool = True
     auto_cutover: bool = False
     cutover_window: CutoverWindow | None = None
-    keep_warm_interval_s: int = 900
+    #: at least a minute: a shorter interval would run delta passes back to back
+    keep_warm_interval_s: int = Field(default=900, ge=60)
     convergence_threshold_bytes: int = Field(default=1073741824, ge=0)
     max_sync_passes: int = Field(default=5, ge=1)
     link_bps: float = Field(default=131072000.0, gt=0)
@@ -228,6 +294,38 @@ class PlanSpec(_Model):
 
 
 PlanCreate = PlanSpec
+
+
+def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
+    """VM ids a plan lists more than once: one VM, one migration (SDD §12)."""
+    return sorted(vm_id for vm_id, count in Counter(vm_ids).items() if count > 1)
+
+
+def invalid_plan_settings(spec: PlanSpec) -> list[str]:
+    """Settings that would fail every verification or never open the cutover gate (SDD §12).
+
+    Checked on create/patch and at validation; the model itself stays permissive so that plans
+    stored before the check keep loading.
+    """
+    problems: list[str] = []
+    verification = spec.verification
+    for name in ("tcp_ports", "windows_tcp_ports"):
+        bad = [port for port in getattr(verification, name) if not 1 <= port <= 65535]
+        if bad:
+            problems.append(f"verification.{name} {bad} outside 1-65535")
+    if verification.timeout_s < 0:  # 0 checks once without polling
+        problems.append(
+            f"verification.timeout_s must not be negative (got {verification.timeout_s})"
+        )
+    window = spec.cutover_window
+    if window is not None and window.end <= window.start:
+        problems.append("cutover_window: end must be after start")
+    # the JSON parser accepts the Infinity literal, which gt=0 lets through (SDD §9.1)
+    if not math.isfinite(spec.link_bps):
+        problems.append(f"link_bps must be a finite positive number (got {spec.link_bps})")
+    return problems
+
+
 #: Fields a client may send in ``PlanCreate`` / ``PATCH /plans/{id}``.
 PLAN_EDITABLE_FIELDS = frozenset(PlanSpec.model_fields)
 
@@ -319,6 +417,8 @@ class Migration(_Model):
     bytes_total: int = 0
     bytes_transferred: int = 0
     sync_passes: list[SyncPass] = Field(default_factory=list)
+    #: bytes of the passes dropped from sync_passes (SDD §5.4); bytes_transferred still counts them
+    sync_bytes_dropped: int = 0
     estimate: Estimate | None = None
     estimates: list[Estimate] = Field(default_factory=list)
     #: per-stream scan throughput measured by the last warm pass (SDD §9.1 calibration)
@@ -332,6 +432,8 @@ class Migration(_Model):
     actual_downtime_s: float | None = None
     approvals: list[Approval] = Field(default_factory=list)
     cutover_requested: bool = False
+    #: cutover window bypass granted with the request (SDD §5.4 rule 2); persisted
+    force_window: bool = False
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
     review_required: bool = False
     review_reason: str | None = None
@@ -346,6 +448,27 @@ class Migration(_Model):
             if est.strategy == strategy:
                 return est
         return None
+
+
+#: SDD §5.4: the latest passes sync_passes keeps after the first plan.max_sync_passes
+SYNC_PASSES_LATEST = 20
+
+
+def next_pass_number(m: Migration) -> int:
+    """The number of the migration's next pass; it keeps counting after passes are dropped."""
+    return m.sync_passes[-1].number + 1 if m.sync_passes else 1
+
+
+def keep_sync_history(m: Migration, keep_first: int, keep_latest: int = SYNC_PASSES_LATEST) -> None:
+    """Drop the oldest passes between the first ``keep_first`` and the latest ``keep_latest``
+    (SDD §5.4): a long wait for the cutover runs a keep-warm pass every interval, which must not
+    grow the migration without bound. The dropped passes' bytes move to ``sync_bytes_dropped``."""
+    excess = len(m.sync_passes) - keep_first - keep_latest
+    if excess <= 0:
+        return
+    dropped = m.sync_passes[keep_first : keep_first + excess]
+    m.sync_bytes_dropped += sum(p.bytes_transferred for p in dropped)
+    del m.sync_passes[keep_first : keep_first + excess]
 
 
 class Event(_Model):

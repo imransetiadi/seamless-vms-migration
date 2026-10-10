@@ -85,6 +85,15 @@ async def test_verification_checks(listener):
         assert [c["name"] for c in res.checks if not c["ok"]] == [bad]
 
 
+async def test_verification_fails_fast_on_a_terminal_server_state():
+    """ERROR never becomes ACTIVE: no polling until the timeout, inside the downtime window."""
+    dest = Dest(status="ERROR")
+    result = await Verifier(dest, Settings(), poll_s=0.01).verify(ctx(timeout_s=600))
+    assert result.passed is False and result.evidence["attempts"] == 1
+    assert result.evidence["terminal"] is True
+    assert [c["name"] for c in result.checks if not c["ok"]] == ["server_active"]
+
+
 async def test_verification_polls_until_timeout_then_passes():
     dest = Dest(status="BUILD")
     verifier = Verifier(dest, Settings(), poll_s=0.01)
@@ -120,3 +129,93 @@ async def test_verification_without_destination_server_fails_fast():
     c.migration.destination_server_id = None
     res = await Verifier(Dest(), Settings(), poll_s=0.01).verify(c)
     assert res.passed is False and res.checks[0]["name"] == "server_active"
+
+
+async def test_verification_edge_paths(listener):
+    from seamless_migrate.providers.base import ProviderError
+    from seamless_migrate.verification import _pattern_match, _tcp_probe
+
+    # an invalid regex falls back to a plain substring match
+    assert _pattern_match(["login: ", "(unclosed"], "x (unclosed y") == "(unclosed"
+    assert _pattern_match(["(unclosed"], "nothing") is None
+    assert (
+        _pattern_match([r"Reached target .*Multi-User"], "Reached target Multi-User System")
+        is not None
+    )
+    # a closed port is reported unreachable, an open one with its connect time
+    ok, detail = await _tcp_probe("127.0.0.1", unused_port())
+    assert ok is False and "unreachable" in detail
+    ok, detail = await _tcp_probe("127.0.0.1", listener)
+    assert ok is True and "connected" in detail
+
+    # the destination provider failing to describe the server fails the verification
+    class Broken(Dest):
+        async def get_server(self, server_id):
+            raise ProviderError("HTTP 503 from nova")
+
+    settings = Settings(data_dir="/tmp/x")
+    result = await Verifier(Broken(), settings, poll_s=0.01).verify(ctx())
+    assert result.passed is False and result.failed_checks() == ["server_active"]
+    assert "HTTP 503" in result.checks[0]["detail"]
+
+    # no address of the requested kind: every TCP check fails with a clear reason
+    class NoAddress(Dest):
+        async def get_server(self, server_id):
+            return {
+                "status": "ACTIVE",
+                "ports": [{"status": "ACTIVE", "fixed_ips": [], "floating_ips": []}],
+            }
+
+    result = await Verifier(NoAddress(), settings, poll_s=0.01).verify(ctx(tcp_ports=[22]))
+    assert result.passed is False
+    tcp = next(c for c in result.checks if c["name"] == "tcp:22")
+    assert tcp["ok"] is False and "no fixed address" in tcp["detail"]
+    summary = result.summary()
+    assert summary["passed"] is False and [c["name"] for c in summary["checks"] if not c["ok"]] == [
+        "tcp:22"
+    ]
+
+
+def windows_ctx(tcp_ports=(), windows_tcp_ports=(), timeout_s=0):
+    from tests.factories import make_vm
+
+    plan = make_plan(
+        verification=VerificationConfig(
+            tcp_ports=list(tcp_ports),
+            windows_tcp_ports=list(windows_tcp_ports),
+            timeout_s=timeout_s,
+        )
+    )
+    vm = make_vm(os_type="windows2019srvNext_64Guest")
+    return SimpleNamespace(
+        plan=plan, migration=make_migration(destination_server_id="srv-9", vm=vm)
+    )
+
+
+async def test_tcp_probe_counts_an_unusable_port_as_closed():
+    """A port asyncio refuses (above 65535, negative) is a closed port, never an exception that
+    would fail the verification step and roll back a good cutover (SDD §7.5)."""
+    from seamless_migrate.verification import _tcp_probe
+
+    for port in (70000, -1):
+        ok, detail = await _tcp_probe("127.0.0.1", port)
+        assert ok is False and str(port) in detail
+
+
+async def test_verification_windows_guest_skips_console_and_probes_windows_ports(listener):
+    """SDD §7.5: Windows writes nothing to the serial console; RDP/WinRM ports replace SSH."""
+    closed = unused_port()
+    dest = Dest(console="")  # an empty serial console, as Windows leaves it
+    result = await Verifier(dest, Settings(), poll_s=0).verify(
+        windows_ctx(tcp_ports=[closed], windows_tcp_ports=[listener])
+    )
+    assert result.passed, result.checks
+    names = {c["name"]: c for c in result.checks}
+    assert f"tcp:{listener}" in names and f"tcp:{closed}" not in names
+    assert names["console"]["skipped"] is True and "Windows" in names["console"]["detail"]
+
+
+async def test_verification_windows_guest_without_ports_passes_with_a_warning():
+    result = await Verifier(Dest(console=""), Settings(), poll_s=0).verify(windows_ctx())
+    assert result.passed
+    assert any("no TCP port" in w for w in result.evidence["warnings"])

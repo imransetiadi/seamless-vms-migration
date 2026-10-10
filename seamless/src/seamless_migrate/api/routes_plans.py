@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderRole, Role
@@ -15,6 +15,8 @@ from ..domain.models import (
     PlanSpec,
     Provider,
     ValidationReport,
+    invalid_plan_settings,
+    repeated_vm_ids,
 )
 from ..events import emit
 from ..planning.estimator import invalid_estimator_overrides
@@ -37,6 +39,39 @@ async def _check_policy_fields(request: Request, fields: set[str], principal: Pr
         raise ApiError(403, "forbidden", reason)
 
 
+def _check_vm_ids(spec: PlanCreate) -> None:
+    """One VM, one migration (SDD §12): a repeated id would make two migrations cut it over."""
+    repeated = repeated_vm_ids(spec.vm_ids)
+    if repeated:
+        raise ApiError(
+            422, "validation_error", f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}"
+        )
+
+
+def _check_plan_settings(spec: PlanCreate) -> None:
+    problems = invalid_plan_settings(spec)
+    if problems:
+        raise ApiError(422, "validation_error", "; ".join(problems))
+
+
+#: SDD §12: the longest plan name and description a request may set; the stored model stays
+#: permissive so plans written before the check keep loading
+PLAN_NAME_MAX = 200
+PLAN_DESCRIPTION_MAX = 2000
+
+
+def _check_plan_texts(spec: PlanCreate) -> None:
+    problems = []
+    if len(spec.name) > PLAN_NAME_MAX:
+        problems.append(f"name: at most {PLAN_NAME_MAX} characters (got {len(spec.name)})")
+    if spec.description is not None and len(spec.description) > PLAN_DESCRIPTION_MAX:
+        problems.append(
+            f"description: at most {PLAN_DESCRIPTION_MAX} characters (got {len(spec.description)})"
+        )
+    if problems:
+        raise ApiError(422, "validation_error", "; ".join(problems))
+
+
 def _check_estimator_overrides(spec: PlanCreate) -> None:
     problems = invalid_estimator_overrides(spec.estimator_overrides)
     if problems:
@@ -50,6 +85,13 @@ def _non_default_policy_fields(body: PlanCreate) -> set[str]:
         for name in body.model_fields_set & POLICY_FIELDS
         if getattr(body, name) != PlanSpec.model_fields[name].default
     }
+
+
+def _changed_policy_fields(body: dict[str, Any], plan: Plan) -> set[str]:
+    """PATCH counterpart of :func:`_non_default_policy_fields`: policy fields whose value
+    differs from the plan's current one (re-sending the current value changes nothing)."""
+    current = plan.model_dump(mode="json", include=POLICY_FIELDS)
+    return {name for name in set(body) & POLICY_FIELDS if body[name] != current.get(name)}
 
 
 async def _check_providers(request: Request, spec: PlanCreate) -> None:
@@ -70,9 +112,15 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
 
 @router.get("/plans", response_model=list[Plan])
 async def list_plans(
-    request: Request, _: Principal = Depends(require_role(Role.viewer))
+    request: Request,
+    status: PlanStatus | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Plan]:
-    return await services(request).db.list("plan", Plan)
+    """Plans in creation order; ``status``, ``limit`` and ``offset`` run in SQL (SDD §12)."""
+    filters = {"status": status} if status is not None else {}
+    return await services(request).db.list("plan", Plan, limit=limit, offset=offset, **filters)
 
 
 @router.post("/plans", response_model=Plan, status_code=201)
@@ -81,6 +129,9 @@ async def create_plan(
 ) -> Plan:
     svc = services(request)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
+    _check_plan_texts(body)
+    _check_vm_ids(body)
+    _check_plan_settings(body)
     _check_estimator_overrides(body)
     await _check_providers(request, body)
     plan = Plan(**body.model_dump())
@@ -115,27 +166,42 @@ async def update_plan(
     unknown = sorted(set(body) - PLAN_EDITABLE_FIELDS)
     if unknown:
         raise ApiError(422, "validation_error", f"fields cannot be changed: {', '.join(unknown)}")
-    await _check_policy_fields(request, set(body), principal)
-    plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
-    if plan.status not in (PlanStatus.draft, PlanStatus.validated):
-        raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
-    try:
-        merged = PlanCreate.model_validate(
-            {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
+    # SDD §8: an edit sets the plan's status (back to draft) like validate, auto-waves, start and
+    # pause, so it runs under the plan's lock: it waits for a running validation, which would
+    # otherwise mark the edited plan validated with settings it never saw
+    async with svc.orchestrator.plan_lock(plan_id):
+        plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
+        await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
+        if plan.status not in (PlanStatus.draft, PlanStatus.validated):
+            raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
+        busy = await svc.orchestrator.in_flight(plan_id)
+        if busy:
+            raise ApiError(
+                409,
+                "conflict",
+                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
+                "before editing the plan",
+            )
+        try:
+            merged = PlanCreate.model_validate(
+                {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
+            )
+        except ValidationError as exc:
+            raise ApiError(422, "validation_error", _summarize(exc)) from None
+        _check_plan_texts(merged)
+        _check_vm_ids(merged)
+        _check_plan_settings(merged)
+        _check_estimator_overrides(merged)
+        await _check_providers(request, merged)
+        updated = Plan.model_validate(
+            {
+                **plan.model_dump(mode="json"),
+                **merged.model_dump(mode="json"),
+                "status": PlanStatus.draft,
+                "updated_at": svc.orchestrator.now(),
+            }
         )
-    except ValidationError as exc:
-        raise ApiError(422, "validation_error", _summarize(exc)) from None
-    _check_estimator_overrides(merged)
-    await _check_providers(request, merged)
-    updated = Plan.model_validate(
-        {
-            **plan.model_dump(mode="json"),
-            **merged.model_dump(mode="json"),
-            "status": PlanStatus.draft,
-            "updated_at": svc.orchestrator.now(),
-        }
-    )
-    await svc.db.put("plan", updated, expected_version=version)
+        await svc.db.put("plan", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,

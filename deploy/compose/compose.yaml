@@ -36,7 +36,8 @@ services:
   # ---------------------------------------------------------------------------------------------
   postgres:
     <<: *service-defaults
-    image: postgres:16-alpine
+    # pinned by digest (Security.md §12); Dependabot (docker, deploy/compose) proposes updates
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_DB: seamless
       POSTGRES_USER: seamless
@@ -69,7 +70,7 @@ services:
   jev:
     <<: *service-defaults
     profiles: ["ai"]
-    image: node:22-alpine
+    image: node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
     init: true
     user: node
     cap_drop:
@@ -129,6 +130,9 @@ services:
       SEAMLESS_HOST: 0.0.0.0              # inside the container; the host side is loopback-only (ports below)
       SEAMLESS_PORT: "8080"
       SEAMLESS_DATA_DIR: /data
+      # credentials entered in the dashboard (SDD 13.3): 0600 files in the seamless-secrets volume
+      SEAMLESS_SECRET_STORE: files
+      SEAMLESS_SECRETS_DIR: /var/run/secrets/seamless
       SEAMLESS_DB_URL: postgresql+psycopg://seamless:${POSTGRES_PASSWORD:?run scripts/compose-init.sh}@postgres:5432/seamless
       # demo mode (SimulatedExecutor + fake providers); `make seamless-demo` sets SEAMLESS_DEMO=true
       SEAMLESS_DEMO: ${SEAMLESS_DEMO:-false}
@@ -146,6 +150,8 @@ services:
       SEAMLESS_MAX_CONCURRENT_CUTOVERS: ${SEAMLESS_MAX_CONCURRENT_CUTOVERS:-3}
       SEAMLESS_TICK_S: ${SEAMLESS_TICK_S:-1.0}
       SEAMLESS_MAX_STEP_RETRIES: ${SEAMLESS_MAX_STEP_RETRIES:-2}
+      SEAMLESS_STEP_TIMEOUT_S: ${SEAMLESS_STEP_TIMEOUT_S:-0}
+      SEAMLESS_AUTH_LOCKOUT_PER_MINUTE: ${SEAMLESS_AUTH_LOCKOUT_PER_MINUTE:-60}
       # Jev advisor over HTTP to the sidecar (SDD 14.1); "off" when the ai profile is disabled
       SEAMLESS_JEV_MODE: ${SEAMLESS_JEV_MODE:-http}
       SEAMLESS_JEV_URL: http://jev:8080/mcp
@@ -160,11 +166,12 @@ services:
       SEAMLESS_MEMORY_REDACT_NAMES: ${SEAMLESS_MEMORY_REDACT_NAMES:-false}
       # observability (SDD 18)
       SEAMLESS_LOG_LEVEL: ${SEAMLESS_LOG_LEVEL:-INFO}
-      SEAMLESS_LOG_JSON: ${SEAMLESS_LOG_JSON:-false}
+      SEAMLESS_LOG_JSON: ${SEAMLESS_LOG_JSON:-true}
     ports:
       - "127.0.0.1:${SEAMLESS_HOST_PORT:-8080}:8080"
     volumes:
       - seamless-data:/data
+      - seamless-secrets:/var/run/secrets/seamless
       # API tokens (hashes only), read-only. Fail instead of creating a directory if the file is missing.
       - type: bind
         source: ./tokens.yaml
@@ -172,6 +179,7 @@ services:
         read_only: true
         bind:
           create_host_path: false
+          selinux: z      # relabel for SELinux hosts (RHEL/Fedora with Podman or Docker); ignored elsewhere
     networks:
       - backend
       - frontend          # outbound: cloud APIs, vCenter, conversion hosts (SSH), Jev provider, host agentmemory
@@ -198,3 +206,4 @@ networks:
 volumes:
   pgdata: {}
   seamless-data: {}
+  seamless-secrets: {}    # dashboard-entered provider credentials (0600 files); back it up like a secret

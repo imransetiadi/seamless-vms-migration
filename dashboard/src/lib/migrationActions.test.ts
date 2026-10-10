@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
-import { PHASES, type Migration, type Phase, type Strategy } from '../api/types';
-import { migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
+import { clearedByStrategyChange, clearedByValidation, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -14,17 +14,19 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   pending: ['cancel'],
   validating: [],
   blocked: ['cancel'],
-  ready: ['approve', 'cancel'],
-  precopy: ['approve', 'cancel'],
-  syncing: ['approve', 'cancel'],
+  // a warm cutover may be requested before it converged; it starts once it does (SDD §5.4, §16)
+  ready: ['approve', 'cutover', 'cancel'],
+  precopy: ['approve', 'cutover', 'cancel'],
+  syncing: ['approve', 'cutover', 'cancel'],
   awaiting_cutover: ['approve', 'cutover', 'sync', 'cancel'],
   cutover: ['rollback'],
   verifying: ['rollback'],
   completed: ['rollback', 'finalize'],
   finalized: [],
-  failed: ['rollback', 'retry', 'cancel'],
+  // an approval given ahead of a retry lasts through it (SDD §5.1, §16)
+  failed: ['approve', 'rollback', 'retry', 'cancel'],
   rolling_back: [],
-  rolled_back: ['retry'],
+  rolled_back: ['approve', 'retry'],
   cancelled: [],
 };
 
@@ -53,9 +55,19 @@ describe('migrationActions rules', () => {
 
   it('lets single-shot strategies cut over from ready (SDD §5.2)', () => {
     expect(migrationActions(migration('ready', {}, 'cold'), 'approver').cutover.enabled).toBe(true);
-    const warm = migrationActions(migration('ready', {}, 'warm'), 'approver').cutover;
-    expect(warm.enabled).toBe(false);
-    expect(warm.reason).toMatch(/converge/i);
+    // a warm migration may be requested from ready too: it cuts over once pre-copy converged
+    expect(migrationActions(migration('ready', {}, 'warm'), 'approver').cutover.enabled).toBe(true);
+  });
+
+  it('offers Approve only where an approval lasts, and says why elsewhere (SDD §16)', () => {
+    for (const phase of ['pending', 'validating', 'blocked'] as const) {
+      const approve = migrationActions(migration(phase), 'approver').approve;
+      expect(approve.enabled).toBe(false);
+      expect(approve.reason).toMatch(/validation clears approvals/i);
+    }
+    for (const phase of ['cutover', 'verifying', 'completed'] as const) {
+      expect(migrationActions(migration(phase), 'approver').approve.reason).toMatch(/cutover has started/i);
+    }
   });
 
   it('does not request a cutover twice', () => {
@@ -64,12 +76,65 @@ describe('migrationActions rules', () => {
     expect(cutover.reason).toMatch(/already requested/i);
   });
 
+  it('lets an approver force a requested cutover that waits for a closed window (SDD §5.4)', () => {
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const plan: Plan = {
+      ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+      cutover_window: { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' },
+    };
+    const requested = migration('awaiting_cutover', { cutover_requested: true, force_window: false });
+    expect(migrationActions(requested, 'approver', plan, now).cutover.enabled).toBe(true);
+    // nothing left to force: already forced, the window is open, or there is no window
+    const refused = { enabled: false, reason: expect.stringMatching(/already requested/i) };
+    expect(migrationActions({ ...requested, force_window: true }, 'approver', plan, now).cutover).toEqual(refused);
+    const open: Plan = { ...plan, cutover_window: { start: '2026-10-08T11:00:00Z', end: '2026-10-08T13:00:00Z' } };
+    expect(migrationActions(requested, 'approver', open, now).cutover).toEqual(refused);
+    expect(migrationActions(requested, 'approver', { ...plan, cutover_window: null }, now).cutover).toEqual(refused);
+    expect(migrationActions(requested, 'operator', plan, now).cutover).toEqual({ enabled: false, reason: expect.stringMatching(/approver role/i) });
+    // the next step says so, and points at the action
+    const step = nextStep(requested, plan, now);
+    expect(step.text).toMatch(/waiting for the cutover window.*an approver can let it cut over outside the window/i);
+    expect(step.action).toBe('cutover');
+    expect(nextStep(requested, open, now).action).toBeNull();
+  });
+
+  it('treats the window as closed only outside [start, end], as the API does (SDD §5.4)', () => {
+    const start = Date.parse('2026-10-09T22:00:00Z');
+    const end = Date.parse('2026-10-10T02:00:00Z');
+    const plan: Plan = {
+      ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+      cutover_window: { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' },
+    };
+    const requested = migration('awaiting_cutover', { cutover_requested: true, force_window: false });
+    const forcible = (now: number) => migrationActions(requested, 'approver', plan, now).cutover.enabled;
+    // the API's CutoverWindow.contains is start <= now <= end: both ends belong to the window
+    expect([forcible(start - 1), forcible(start), forcible(end), forcible(end + 1)]).toEqual([true, false, false, true]);
+  });
+
   it('refuses Cancel once the source VM was stopped (failed → cancelled needs no downtime)', () => {
     const stopped = migration('failed', { downtime_started_at: '2026-10-08T11:20:00Z' });
     const cancel = migrationActions(stopped, 'operator').cancel;
     expect(cancel.enabled).toBe(false);
-    expect(cancel.reason).toMatch(/roll back instead/i);
+    expect(cancel.reason).toMatch(/roll back/i);
     expect(migrationActions(stopped, 'operator').rollback.enabled).toBe(true);
+  });
+
+  it('refuses Cancel in any phase while the source VM is stopped, and says what to do (SDD §5.1)', () => {
+    const open = { downtime_started_at: '2026-10-08T11:20:00Z', downtime_ended_at: null };
+    const failed = migrationActions(migration('failed', open), 'operator').cancel;
+    expect(failed.enabled).toBe(false);
+    expect(failed.reason).toMatch(/source VM is stopped.*roll back.*retry/i);
+    // a retried cutover keeps the open clock (SDD §5.2): the way on is the cutover
+    const ready = migrationActions(migration('ready', open), 'operator').cancel;
+    expect(ready.enabled).toBe(false);
+    expect(ready.reason).toMatch(/source VM is stopped.*cut it over/i);
+    // a cutover in progress has its clock open by design: the reason stays the phase rule
+    const cutover = migrationActions(migration('cutover', open), 'operator').cancel;
+    expect(cutover.enabled).toBe(false);
+    expect(cutover.reason).toMatch(/once cutover has started/i);
+    // once the source runs again (closed clock), a cancel is possible
+    const closed = migrationActions(migration('ready', { ...open, downtime_ended_at: '2026-10-08T11:40:00Z' }), 'operator').cancel;
+    expect(closed.enabled).toBe(true);
   });
 
   it('gives viewers nothing and says which role is needed', () => {
@@ -78,11 +143,41 @@ describe('migrationActions rules', () => {
     expect(actions.cutover).toEqual({ enabled: false, reason: 'Requires the approver role.' });
   });
 
+  it('says a retried cutover still has its source stopped (SDD §5.2)', () => {
+    const open = { downtime_started_at: '2026-10-08T11:20:00Z', downtime_ended_at: null };
+    const cold = nextStep(migration('ready', { ...open, strategy: 'cold' }), null);
+    expect(cold.text).toMatch(/still stopped/i);
+    expect(cold.text).not.toMatch(/stops for about/i);
+    expect(cold.action).toBe('cutover');
+    const warm = nextStep(migration('ready', open), null);
+    expect(warm.text).toMatch(/still stopped/i);
+    expect(warm.text).not.toMatch(/source VM keeps running/i);
+  });
+
   it('names the next step', () => {
     expect(nextStep(migration('awaiting_cutover'), null).action).toBe('cutover');
     expect(nextStep(migration('completed'), null).action).toBe('finalize');
     expect(nextStep(migration('failed', { downtime_started_at: '2026-10-08T11:20:00Z' }), null).action).toBe('rollback');
     expect(nextStep(migration('precopy'), null).action).toBeNull();
     expect(nextStep(migration('precopy'), null).text).toMatch(/pre-copy/i);
+  });
+});
+
+describe('what re-validation or a strategy change clears (SDD §5.4)', () => {
+  const approval = { actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null };
+
+  it('counts approvals and cutover requests of migrations that have not started', () => {
+    const ready = migration('ready', { approvals: [approval, approval], cutover_requested: true });
+    const blocked = migration('blocked', { approvals: [approval] });
+    // an in-flight migration keeps its approvals: a re-validation does not touch it
+    const precopy = migration('precopy', { approvals: [approval], cutover_requested: true });
+    expect(clearedByValidation([ready, blocked, precopy])).toBe('3 approvals and 1 cutover request');
+    expect(clearedByValidation([precopy, migration('ready')])).toBeNull();
+  });
+
+  it('names what a strategy change clears for one migration', () => {
+    expect(clearedByStrategyChange(migration('ready', { approvals: [approval], cutover_requested: true }))).toBe('1 approval and the cutover request');
+    expect(clearedByStrategyChange(migration('ready', { cutover_requested: true }))).toBe('the cutover request');
+    expect(clearedByStrategyChange(migration('ready'))).toBeNull();
   });
 });

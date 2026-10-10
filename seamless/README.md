@@ -45,7 +45,7 @@ seamless token create --name sari --role approver   # prints the token once + to
 seamless plan apply -f plan.yaml         # PlanCreate as YAML; matched by id, else by name
 seamless plan validate PLAN_ID           # findings + estimates; exit 3 when blocked
 seamless plan start PLAN_ID
-seamless estimate -f vms.yaml --slo 300 --link-mbps 1000
+seamless estimate -f vms.yaml --slo 600 --link-mbps 1000 --scan-mibps 515   # scan rate from bench_blocksync
 seamless status --plan PLAN_ID
 ```
 

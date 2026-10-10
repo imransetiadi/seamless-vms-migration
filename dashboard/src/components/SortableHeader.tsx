@@ -21,7 +21,7 @@ export function SortableHeader<K extends string>({ label, sortKey, sort, onSort,
         type="button"
         onClick={() => onSort(sortKey)}
         className={cn(
-          'inline-flex min-h-6 cursor-pointer items-center gap-1 rounded uppercase tracking-wide transition-colors duration-200 hover:text-foreground',
+          'inline-flex min-h-6 cursor-pointer items-center gap-1 rounded-sm uppercase tracking-wide transition-colors duration-200 hover:text-foreground',
           active && 'text-foreground',
         )}
       >

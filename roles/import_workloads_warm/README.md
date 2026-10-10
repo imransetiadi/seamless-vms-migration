@@ -14,7 +14,9 @@ where `blocksync receive` compares both sides chunk by chunk (BLAKE2b-128,
 4 MiB chunks by default) and pulls only the changed chunks from
 `blocksync send` on the source conversion host, over the same SSH link the
 cold migration uses. Every pass ends with a verification of a manifest digest
-over all chunk digests.
+over all chunk digests (with `os_migrate_warm_assume_zero` the digests of
+never-read destination chunks are assumed, which is why the final pass never
+uses it).
 
 The role is used by three playbooks; `import_workloads_warm_action` selects
 the task file:
@@ -27,8 +29,17 @@ the task file:
 
 Run `export_workloads.yml` first, as for `import_workloads.yml`. Pre-copy can
 run any number of times; a cutover that already created the destination
-server is a no-op, and the cutover refuses to stop a source whose name is
-already used by a destination server it did not create.
+server is a no-op (it fails instead when that server is in `ERROR` or gone:
+roll the workload back and cut over again), and the cutover refuses to stop
+a source whose name is already used by a destination server it did not
+create.
+
+A cutover that fails after "Stop the source server" leaves the source
+`SHUTOFF` and the destination volumes in place: retry the cutover (it reuses
+the volumes) or run `rollback_workloads.yml`, which starts the source again.
+The playbooks process the filtered workloads one after another and stop at
+the first failure; the remaining workloads are untouched and can be run
+again once the failure is handled.
 
 ## Warm state file
 
@@ -57,12 +68,13 @@ and the module log to `workload_logs/{name}.log`.
 |---|---|---|
 | `os_migrate_warm_chunk_size` | `4194304` | blocksync chunk size in bytes |
 | `os_migrate_warm_workers` | `4` | read-ahead hashing threads per conversion host and disk |
-| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and the warm state |
+| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and the warm state; a volume still attached to a server other than the destination conversion host is kept and reported |
 | `os_migrate_warm_parallel_disks` | `4` | disks of a workload synchronised at the same time |
-| `os_migrate_warm_assume_zero` | `false` | skip reading destination volumes created by the first pass; only for backends that return zeros for never-written blocks (Ceph RBD, thin LVM) |
+| `os_migrate_warm_assume_zero` | `false` | skip reading destination volumes created by the first pre-copy pass; only for backends that return zeros for never-written blocks (Ceph RBD, thin LVM). Never applied to a final pass |
 | `os_migrate_workloads_preserve_volume_type` | `false` | create destination volumes with the serialized `volume_type` (rewrite it to a destination type in the workload data first) instead of the destination default; also honoured by `import_workloads` |
 | `os_migrate_warm_python_interpreter` | `python3` | Python 3.6+ on the conversion hosts (`/usr/libexec/platform-python` on RHEL 8) |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | warm state files |
+| `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | destination conversion host; the only server a rollback detaches destination volumes from |
 | `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. migrated cold): delete the only destination server named exactly like the workload |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |
 | `os_migrate_workload_cleanup_on_failure` | `true` | remove the temporary snapshot when a pass fails |
@@ -87,7 +99,8 @@ and the conversion host variables (`os_migrate_src_conversion_host_name`,
   it only the data volumes are synchronised and the destination boots from
   the image.
 * As in the cold path, destination volumes take the source volume's
-  editable parameters (the boot volume takes `boot_volume_params`) and the
+  editable parameters (the boot volume takes `boot_volume_params`) and,
+  unless `os_migrate_workloads_preserve_volume_type` is set, the
   destination's default volume type.
 
 Multi-volume pre-copy snapshots are not atomic; this is harmless because the

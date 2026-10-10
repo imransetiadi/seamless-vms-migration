@@ -6,6 +6,7 @@ from seamless_migrate.planning.preflight import (
     SourceInventory,
     fitting_flavor,
     resolve_mappings,
+    resource_demand,
     run_preflight,
 )
 from tests.factories import make_disk, make_plan, make_provider, make_vm
@@ -66,6 +67,7 @@ def only(findings, code):
 def test_catalog_is_complete():
     assert set(CATALOG) == {
         "SRC_VM_ERROR_STATE",
+        "SRC_VM_TRANSITIONAL_STATE",
         "SRC_VM_DUPLICATE_NAME",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
@@ -75,6 +77,7 @@ def test_catalog_is_complete():
         "MAP_FLAVOR_AUTO",
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
+        "DST_PROJECT_MISSING",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "VM_PCI_PASSTHROUGH",
@@ -85,6 +88,9 @@ def test_catalog_is_complete():
         "VMW_INDEPENDENT_DISK",
         "VMW_SNAPSHOTS_PRESENT",
         "VMW_TOOLS_MISSING",
+        "GUEST_OS_UNKNOWN",
+        "GUEST_CONVERSION_UNVERIFIED",
+        "GUEST_CONVERSION_UNSUPPORTED",
         "CONV_HOST_MISSING",
         "HANDOVER_BACKEND_UNMAPPED",
     }
@@ -130,6 +136,52 @@ def test_finding_src_vm_ephemeral_root():
     # a data-only ephemeral disk is not the root disk
     data_eph = make_vm(disks=[make_disk(), make_disk(id="e", kind="ephemeral", bootable=False)])
     assert all(x.code != "SRC_VM_EPHEMERAL_ROOT" for x in check(data_eph))
+
+
+def test_finding_src_vm_transitional_state():
+    vm = make_vm(power_state="transitioning")
+    f = only(check(vm), "SRC_VM_TRANSITIONAL_STATE")
+    assert f.severity == Severity.blocker and "task in flight" in f.message
+    assert all(x.code != "SRC_VM_ERROR_STATE" for x in check(vm))
+    assert all(x.code != "SRC_VM_TRANSITIONAL_STATE" for x in check(make_vm(power_state="stopped")))
+
+
+def test_finding_dst_project_missing_and_image_root_quota():
+    dst = dst_inv(
+        quotas={
+            "finance-rhoso": {
+                "cores": 100,
+                "ram_mb": 10**6,
+                "instances": 10,
+                "volumes": 10,
+                "gigabytes": 10**4,
+            },
+            "shop-rhoso": {
+                "cores": 100,
+                "ram_mb": 10**6,
+                "instances": 10,
+                "volumes": 10,
+                "gigabytes": 10**4,
+            },
+        }
+    )
+    vm = make_vm(project="finance")
+    # mapped to a project the destination does not list
+    bad = make_plan(mappings=Mappings(projects={"finance": "fin-rhoso"}))
+    f = only(check(vm, plan=bad, dst=dst), "DST_PROJECT_MISSING")
+    assert f.severity == Severity.blocker and "fin-rhoso" in f.message
+    # unmapped, no same-named project, several destination projects: nothing to charge
+    f = only(check(vm, dst=dst), "DST_PROJECT_MISSING")
+    assert "2 projects" in f.message
+    # a mapping to an existing project, or a single destination project, is fine
+    good = make_plan(mappings=Mappings(projects={"finance": "finance-rhoso"}))
+    assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm, plan=good, dst=dst))
+    assert all(x.code != "DST_PROJECT_MISSING" for x in check(vm))
+    # an image_root disk counts as a destination volume unless the plan is cold-only
+    image = make_vm(disks=[make_disk(kind="image_root", size_gb=30, volume_type=None)])
+    assert resource_demand(image, make_plan())["volumes"] == 1
+    assert resource_demand(image, make_plan(default_strategy=Strategy.warm))["gigabytes"] == 30
+    assert resource_demand(image, make_plan(default_strategy=Strategy.cold))["volumes"] == 0
 
 
 def test_finding_map_network_missing():
@@ -202,6 +254,106 @@ def test_finding_map_flavor_auto_records_resolved_mapping():
     mapped = make_plan(mappings=Mappings(flavors={"custom.4x8": "m1.large"}))
     assert all(not x.code.startswith("MAP_FLAVOR") for x in check(vm, plan=mapped, dst=dst))
     assert resolve_mappings(vm, mapped, dst) == Mappings()
+
+
+def test_mapping_targets_must_exist_in_the_destination():
+    """A mapping to a flavor, network or volume type that is not in RHOSO blocks (SDD §9.3)."""
+    vm = make_vm(
+        flavor="m1.huge",
+        vcpus=64,
+        ram_mb=262144,
+        nics=[Nic(network="db-net", mtu=9000)],
+        disks=[make_disk(volume_type="ceph-hdd")],
+    )
+    plan = make_plan(
+        mappings=Mappings(
+            flavors={"m1.huge": "m1.larg"},  # typo
+            networks={"db-net": "gone-net"},
+            volume_types={"ceph-hdd": "ceph-nvme"},
+        )
+    )
+    findings = {f.code: f for f in check(vm, plan=plan)}
+    assert "m1.larg" in findings["MAP_FLAVOR_MISSING"].message
+    assert findings["MAP_FLAVOR_MISSING"].severity == Severity.blocker
+    assert "db-net -> gone-net" in findings["MAP_NETWORK_MISSING"].message
+    assert findings["MAP_NETWORK_MISSING"].severity == Severity.blocker
+    assert "ceph-hdd -> ceph-nvme" in findings["MAP_VOLUME_TYPE_MISSING"].message
+    assert findings["MAP_VOLUME_TYPE_MISSING"].severity == Severity.blocker
+    # mappings to existing objects raise nothing
+    good = make_plan(
+        mappings=Mappings(
+            flavors={"m1.huge": "m1.large"},
+            networks={"db-net": "app-net"},
+            volume_types={"ceph-hdd": "ceph-ssd"},
+        )
+    )
+    assert all(not x.code.startswith("MAP_") for x in check(vm, plan=good))
+
+
+def test_vmware_sources_are_never_prestaged():
+    """The kit has no pre-stage step: an unmapped port group blocks instead of informing."""
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    vm = make_vm(nics=[Nic(network="VM Network")])
+    f = only(check(vm, source=vmware), "MAP_NETWORK_MISSING")
+    assert f.severity == Severity.blocker and "VMware sources are not pre-staged" in f.message
+    assert all(x.code != "MAP_NETWORK_PRESTAGED" for x in check(vm, source=vmware))
+    mapped = make_plan(mappings=Mappings(networks={"VM Network": "app-net"}))
+    assert all(not x.code.startswith("MAP_NETWORK") for x in check(vm, plan=mapped, source=vmware))
+
+
+def test_flavor_auto_match_skips_constrained_flavors_and_warns_about_hw_specs():
+    dst = dst_inv(
+        flavors=[
+            {
+                "name": "gpu.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"resources:VGPU": "1"},
+            },
+            {
+                "name": "pinned.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"aggregate_instance_extra_specs:pinned": "true"},
+            },
+            {
+                "name": "pci.small",
+                "vcpus": 4,
+                "ram_mb": 8192,
+                "disk_gb": 20,
+                "extra_specs": {"pci_passthrough:alias": "a1:1"},
+            },
+            {"name": "m2.medium", "vcpus": 4, "ram_mb": 8192, "disk_gb": 40, "extra_specs": {}},
+        ]
+    )
+    vm = make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192)
+    assert fitting_flavor(vm, dst)["name"] == "m2.medium"
+    f = only(check(vm, dst=dst), "MAP_FLAVOR_AUTO")
+    assert f.severity == Severity.info and "'m2.medium'" in f.message
+    # a source flavor with hw:* specs: the match drops them, so the finding is a warning
+    pinned = make_vm(
+        flavor="custom.4x8",
+        vcpus=4,
+        ram_mb=8192,
+        flavor_extra_specs={"hw:cpu_policy": "dedicated", "hw:mem_page_size": "large"},
+    )
+    f = only(check(pinned, dst=dst), "MAP_FLAVOR_AUTO")
+    assert f.severity == Severity.warning and "hw:cpu_policy, hw:mem_page_size" in f.message
+    # only constrained flavors fit: nothing is matched automatically
+    constrained_only = dst_inv(flavors=[dst.flavors[0], dst.flavors[2]])
+    assert fitting_flavor(vm, constrained_only) is None
+    assert only(check(vm, dst=constrained_only), "MAP_FLAVOR_MISSING")
+
+
+def test_vmware_vms_get_no_flavor_auto_finding():
+    """A VMware VM has no flavor; the kit sizes the server, so only the blocker applies."""
+    vm = make_vm(flavor=None, vcpus=4, ram_mb=8192)
+    assert all(x.code != "MAP_FLAVOR_AUTO" for x in check(vm))
+    assert resolve_mappings(vm, make_plan(), dst_inv()) == Mappings()
+    huge = make_vm(flavor=None, vcpus=64, ram_mb=262144)
+    assert only(check(huge), "MAP_FLAVOR_MISSING")
 
 
 def test_finding_map_volume_type_missing():
@@ -293,11 +445,73 @@ def test_finding_vol_encrypted():
 
 
 def test_finding_guest_os_legacy():
-    for os_type in ("rhel6", "centos-5.11", "rhel6_64Guest", "windows2008", "windows-server-2003"):
+    """Legacy = out of standard vendor support as of the catalog date (SDD §9.5)."""
+    legacy = (
+        "rhel6",
+        "centos-5.11",
+        "rhel6_64Guest",
+        "centos7",
+        "rhel7",
+        "ubuntu 18.04",
+        "debian10",
+        "sles12",
+        "windows2008",
+        "windows-server-2003",
+        "Microsoft Windows Server 2012 R2 Standard",
+    )
+    for os_type in legacy:
         f = only(check(make_vm(os_type=os_type)), "GUEST_OS_LEGACY")
         assert f.severity == Severity.warning
-    for modern in ("rhel9", "rhel-8.10", "centos7", "windows2019", "windows-server-2022", None):
-        assert all(x.code != "GUEST_OS_LEGACY" for x in check(make_vm(os_type=modern)))
+        assert f.message.startswith(f"Guest OS {make_vm(os_type=os_type).guest_os.label}")
+    modern = (
+        "rhel9",
+        "rhel-8.10",
+        "rocky 9",
+        "ubuntu 24.04",
+        "debian12",
+        "windows2019",
+        "windows-server-2022",
+        None,
+    )
+    for os_type in modern:
+        assert all(x.code != "GUEST_OS_LEGACY" for x in check(make_vm(os_type=os_type)))
+
+
+def test_finding_guest_os_unknown():
+    for os_type in (None, "", "solaris11"):
+        assert only(check(make_vm(os_type=os_type)), "GUEST_OS_UNKNOWN").severity == Severity.info
+    for known in ("rhel9", "linux", "windows"):
+        assert all(x.code != "GUEST_OS_UNKNOWN" for x in check(make_vm(os_type=known)))
+
+
+VMWARE = make_provider(id="vc", kind=ProviderKind.vmware, conversion_host=None)
+
+
+def test_finding_guest_conversion_unverified():
+    for os_type in ("ubuntu64Guest", "debian12_64Guest", "rockylinux_64Guest", "rhel6_64Guest"):
+        f = only(check(make_vm(os_type=os_type), source=VMWARE), "GUEST_CONVERSION_UNVERIFIED")
+        assert f.severity == Severity.warning
+        assert set(f.strategies) == {Strategy.vmware_cold, Strategy.vmware_warm}
+    # OpenStack guests are not converted, and supported guests need no warning
+    assert all(
+        x.code != "GUEST_CONVERSION_UNVERIFIED" for x in check(make_vm(os_type="ubuntu 22.04"))
+    )
+    supported = check(make_vm(os_type="rhel9_64Guest"), source=VMWARE)
+    assert not {x.code for x in supported} & {
+        "GUEST_CONVERSION_UNVERIFIED",
+        "GUEST_CONVERSION_UNSUPPORTED",
+    }
+
+
+def test_finding_guest_conversion_unsupported():
+    for os_type in ("windows8Server64Guest", "winLonghorn64Guest", "rhel5_64Guest"):
+        f = only(check(make_vm(os_type=os_type), source=VMWARE), "GUEST_CONVERSION_UNSUPPORTED")
+        assert f.severity == Severity.warning
+        assert "virtio" in (f.remediation or "")
+    assert all(
+        x.code != "GUEST_CONVERSION_UNSUPPORTED"
+        for x in check(make_vm(os_type="windows2008"))  # OpenStack source: no conversion
+    )
 
 
 def test_finding_vmw_cbt_disabled():
@@ -356,3 +570,20 @@ def test_finding_handover_backend_unmapped():
     assert f.severity == Severity.info and f.strategies == [Strategy.storage_handover]
     ok = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@b#p"}))
     assert check(plan=ok) == []
+
+
+def test_catalog_matches_sdd_9_3():
+    """Every finding code of SDD §9.3 is in the catalog and vice versa, with the severity the
+    table states for its row (rows only; info variants named inside a row are checked by code)."""
+    import re
+
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 9.3") : sdd.index("### 9.4")]
+    codes = set(re.findall(r"`([A-Z][A-Z0-9_]{4,})`", section))
+    assert codes == set(CATALOG)
+    for code, severity in re.findall(
+        r"^\| `([A-Z0-9_]+)` \| (blocker|warning|info)", section, re.M
+    ):
+        assert CATALOG[code].severity == severity, code

@@ -21,6 +21,7 @@ jobs:
   control-plane:
     name: control plane (py${{ matrix.python }}, SQLite + PostgreSQL)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,8 +41,8 @@ jobs:
       run:
         working-directory: seamless
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -63,9 +64,10 @@ jobs:
   collection:
     name: collection (warm path, lint, syntax)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install ansible-core and the test tools
@@ -79,12 +81,14 @@ jobs:
           ln -s "$GITHUB_WORKSPACE" "$RUNNER_TEMP/colltree/ansible_collections/os_migrate/os_migrate"
           echo "PYTHONPATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
           echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/colltree" >> "$GITHUB_ENV"
-      - name: Warm-path unit tests (blocksync, modules, playbooks with stub modules)
+      - name: Collection unit tests (all of tests/unit, including the security fixes; no skips)
         working-directory: ${{ runner.temp }}/colltree/ansible_collections/os_migrate/os_migrate
         run: |
           python plugins/module_utils/blocksync.py --help > /dev/null
-          pytest -q tests/unit/test_blocksync.py tests/unit/test_warm_migration.py \
-                    tests/unit/test_warm_destination.py tests/unit/test_warm_playbooks.py
+          # every file, not a list: SEC-01/03/05 regression tests live outside the warm path
+          pytest -q -rs tests/unit > "$RUNNER_TEMP/unit.txt" 2>&1 || { cat "$RUNNER_TEMP/unit.txt"; exit 1; }
+          tail -n 15 "$RUNNER_TEMP/unit.txt"
+          if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/unit.txt"; then echo "unexpected skipped tests"; exit 1; fi
       - name: Playbook syntax checks
         run: |
           for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
@@ -100,12 +104,13 @@ jobs:
   dashboard:
     name: dashboard (typecheck, lint, tests, build, audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           cache: npm
@@ -117,32 +122,108 @@ jobs:
       - run: npm run build
       - name: Production dependency audit (S-18)
         run: npm audit --omit=dev --audit-level=high
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dashboard-dist
           path: dashboard/dist
           retention-days: 7
 
+  dashboard-e2e:
+    name: dashboard browser smoke (Playwright, mock mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - name: Playwright smoke against the mock-mode build (real CSS pipeline)
+        run: npm run test:e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: playwright-report
+          path: dashboard/playwright-report
+          retention-days: 7
+
   security:
     name: secrets and configuration scans (S-17, S-20)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: gitleaks (tree and history)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
           GITLEAKS_ENABLE_SUMMARY: "true"
       - name: trivy config on the deployment manifests
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: config
           scan-ref: deploy
           severity: HIGH,CRITICAL
           exit-code: "1"
+
+  manifests:
+    name: OpenShift manifests (kustomize build + kubeconform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      KUBECONFORM_VERSION: v0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install kubeconform (checksum-pinned release)
+        run: |
+          curl -sSLf -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar xzf kubeconform.tar.gz -C "$HOME/.local/bin" kubeconform
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Render the OpenShift kustomization and validate against the Kubernetes 1.30 schemas
+        # Route (route.openshift.io) has no public JSON schema: kustomize parses it, kubeconform skips it
+        run: |
+          kubectl kustomize deploy/openshift > /tmp/manifests.yaml
+          kubeconform -strict -summary -skip Route -kubernetes-version 1.30.0 \
+            -schema-location default /tmp/manifests.yaml
+      - name: Render the Kubernetes overlay and validate it (no Route; every patch applied)
+        # kustomize ignores a patch whose target matches nothing: assert what each patch must produce
+        run: |
+          kubectl kustomize deploy/kubernetes > /tmp/k8s.yaml
+          kubeconform -strict -summary -kubernetes-version 1.30.0 -schema-location default /tmp/k8s.yaml
+          # `! grep` never fails a step under bash -e: refuse explicitly
+          if grep -q '^kind: Route' /tmp/k8s.yaml; then echo "a Route is left in the overlay"; exit 1; fi
+          grep -q '^kind: Ingress' /tmp/k8s.yaml
+          [ "$(grep -c 'runAsUser:' /tmp/k8s.yaml)" -eq 2 ]
+          grep -q 'k8s-app: kube-dns' /tmp/k8s.yaml
+          grep -q 'kubernetes.io/metadata.name: ingress-nginx' /tmp/k8s.yaml
+          grep -q 'cidr: 10.96.0.1/32' /tmp/k8s.yaml
+          # both egress policies except the cluster's pod and service networks, none OpenShift's
+          [ "$(grep -c -- '- 10.244.0.0/16' /tmp/k8s.yaml)" -eq 2 ]
+          if grep -q -e '10.128.0.0/14' -e '172.30.0.0/16' /tmp/k8s.yaml; then
+            echo "OpenShift networks are left in the egress policies"; exit 1
+          fi
+          grep -q 'image: quay.io/sclorg/postgresql-16-c9s@sha256:' /tmp/k8s.yaml
+      # static checks cannot see what an image writes when it starts: the PostgreSQL StatefulSet passed them
+      # and still exited 1 under readOnlyRootFilesystem (QASuite §14.5)
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: PostgreSQL under the manifests' security context (read-only root, OpenShift and overlay UIDs)
+        run: |
+          python -m pip install pyyaml
+          PYTHON=python scripts/check-readonly-runtime.sh
 
   image:
     name: container image (build, trivy, SBOM)
@@ -150,9 +231,10 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: [control-plane, dashboard]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dashboard-dist
           path: dashboard/dist
@@ -169,8 +251,15 @@ jobs:
           curl -fsS http://127.0.0.1:18080/api/v1/health | grep -q '"db":"ok"'
           docker logs smoke | tail -20
           docker rm -f smoke
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: The image under the Deployment's security context (read-only root, OpenShift and overlay UIDs)
+        run: |
+          python -m pip install pyyaml
+          SKIP_POSTGRES=1 CP_IMAGE=seamless-migrate:ci PYTHON=python scripts/check-readonly-runtime.sh
       - name: trivy image — fixable HIGH/CRITICAL must be zero (S-19)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: seamless-migrate:ci
           scanners: vuln
@@ -178,13 +267,13 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
       - name: SBOM (CycloneDX)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: seamless-migrate:ci
           scan-type: image
           format: cyclonedx
           output: sbom.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom
           path: sbom.cdx.json

@@ -17,7 +17,10 @@ htmlcov/
 # Node / dashboard
 node_modules/
 dashboard/dist/
+dashboard/dist-mock/
 dashboard/coverage/
+dashboard/playwright-report/
+dashboard/test-results/
 
 # Seamless control plane runtime data
 seamless/*.db
@@ -29,7 +32,10 @@ seamless/data/
 
 # Secrets never committed
 clouds.yaml
+clouds.yml
 secure.yaml
+# cloud credentials for the e2e and functional playbooks (make generate-auth-files, tests/func)
+tests/**/auth_*.yml
 *.pem
 *.key
 .env
@@ -53,3 +59,9 @@ deploy/compose/compose.local.yaml
 # OpenShift: real secrets rendered from deploy/openshift/secret-example.yaml
 deploy/openshift/secret.yaml
 deploy/openshift/secrets/
+
+# local check scratch (make seamless-check)
+.cache/
+
+# macOS Finder metadata (written into every folder Finder opens)
+.DS_Store

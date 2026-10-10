@@ -23,6 +23,7 @@ namespace: seamless-migrate
 resources:
   - namespace.yaml
   - serviceaccount.yaml
+  - secret-store-rbac.yaml
   - configmap.yaml
   - pvc.yaml
   - postgres-service.yaml

@@ -21,15 +21,27 @@
   ansible.builtin.set_fact:
     import_from_hypervisor_format_match: >-
       {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('file format: (\w+)', '\1') }}
+    # the exact byte count every qemu-img version prints, whatever unit it rounds to:
+    # "virtual size: 1.5 GiB (1610612736 bytes)", or "virtual size: 10G (10737418240 bytes)"
+    # before qemu 4.0
     import_from_hypervisor_size_match: >-
-      {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('virtual size: ([0-9]+) GiB', '\1') }}
+      {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('virtual size: [^(]*[(]([0-9]+) bytes[)]', '\1') }}
+
+- name: Refuse a disk whose virtual size cannot be read
+  ansible.builtin.assert:
+    that: (import_from_hypervisor_size_match | default([], true) | length) > 0
+    fail_msg: >-
+      cannot read the virtual size of {{ disk_item }} from qemu-img info; a zero-sized
+      destination volume would lose the disk
+    quiet: true
 
 - name: Set disk properties
   ansible.builtin.set_fact:
     import_from_hypervisor_disk_format: >-
       {{ import_from_hypervisor_format_match | first | trim if import_from_hypervisor_format_match else 'qcow2' }}
+    # whole GiB, rounded up: the destination volume is never smaller than the disk
     import_from_hypervisor_disk_size_gb: >-
-      {{ import_from_hypervisor_size_match | first | int if import_from_hypervisor_size_match else 0 }}
+      {{ ((import_from_hypervisor_size_match | first | int) / 1073741824) | round(0, 'ceil') | int }}
 
 - name: Display disk configuration
   ansible.builtin.debug:

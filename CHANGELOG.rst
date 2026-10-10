@@ -53,6 +53,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   to the hypervisor's migration-network IP (the role refuses the loopback
   default); exports started by 1.0.5 must be stopped by hand once.
 - The cold path's nbdkit export of source volumes is read-only.
+- ``blocksync`` recognises all-zero chunks with a byte count before hashing them
+  (about 2.5× faster on never-written regions of thin volumes; chunks with data
+  are unaffected).
 - The source of the conversion hosts' security group rules is configurable
   (``os_migrate_conversion_secgroup_remote_ip_prefix``).
 - ``os_migrate_workloads_preserve_volume_type`` (default ``false``) makes the
@@ -63,3 +66,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - Remove the unused ``sshpass`` from bindep.
 - Resource files are now written with ``os_migrate_version: 1.1.0``: re-export
   data exported with 1.0.5.
+- Warm migration (``import_workloads_warm``, ``blocksync``): ``assume_zero``
+  is never applied to a final pass; a rollback with
+  ``os_migrate_rollback_delete_dest_volumes`` keeps a destination volume that
+  is still attached to a server other than the destination conversion host
+  (``kept_volume_ids``, new ``conversion_host`` option of
+  ``import_workload_rollback``); a cutover re-run fails instead of skipping a
+  recorded destination server that is in ``ERROR`` or gone; recorded
+  destination volumes without a source device are reported.

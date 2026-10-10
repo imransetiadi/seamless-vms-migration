@@ -5,8 +5,9 @@
  */
 import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
+import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration } from './types';
+import type { Event, Migration, SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -73,8 +74,28 @@ export function useLiveEvents(listener: (event: Event) => void): void {
   useEffect(() => hub.subscribe((event) => ref.current(event)), [hub]);
 }
 
+/** A `migration.sync_pass` payload when it is a pass that ended (SDD §4.3), else null. */
+function endedPass(data: Record<string, unknown>): SyncPass | null {
+  const ok = typeof data.number === 'number' && typeof data.kind === 'string' && typeof data.ended_at === 'string' && typeof data.bytes_transferred === 'number';
+  return ok ? (data as unknown as SyncPass) : null;
+}
+
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * A stream status listener that refetches every query when the stream opens again after a drop
+ * (SDD §16): a connection that dropped before its first persisted event resumes live-only, so the
+ * gap is never replayed, and ephemeral progress never is. The first open refetches nothing.
+ */
+export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveStatus) => void {
+  let opened = false;
+  return (status) => {
+    if (status !== 'open') return;
+    if (opened) void queryClient.invalidateQueries();
+    opened = true;
+  };
 }
 
 /** Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. */
@@ -112,20 +133,36 @@ export function applyEventToCache(
   if (kind === 'migration.progress') {
     const id = event.migration_id;
     if (!id) return;
-    // Tolerant reader: `progress_pct`/`bytes_transferred` (Migration field names) or the executor's
-    // report_progress(pct, bytes_done, bytes_total) names (SDD §7.1).
-    const pct = num(event.data.progress_pct) ?? num(event.data.pct);
+    // The event carries the running step's {pct, bytes_done, bytes_total} (SDD §4.3); the migration's
+    // figures follow the API's rule (§4.2, §16): bytes_transferred is every pass that ended plus the
+    // step's bytes_done, and bytes_total stays the disk's used bytes.
+    const pct = num(event.data.pct);
     if (pct === null) {
       invalidate(['migration', id]);
       return;
     }
-    const done = num(event.data.bytes_transferred) ?? num(event.data.bytes_done);
-    const total = num(event.data.bytes_total);
+    const done = num(event.data.bytes_done);
     const patch = (m: Migration): Migration =>
-      m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done ?? m.bytes_transferred, bytes_total: total ?? m.bytes_total } : m;
+      m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done === null ? m.bytes_transferred : endedPassBytes(m) + done } : m;
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
     queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
     return;
+  }
+
+  if (kind === 'migration.sync_pass' && event.migration_id) {
+    // The event's data is the pass that ended (SDD §4.3): add it to the cached passes, so the next
+    // step's progress counts on top of it before the refetch below lands (§16).
+    const pass = endedPass(event.data);
+    const id = event.migration_id;
+    if (pass) {
+      const patch = (m: Migration): Migration => {
+        if (m.id !== id) return m;
+        const passes = [...m.sync_passes.filter((p) => p.number !== pass.number), pass].sort((a, b) => a.number - b.number);
+        return { ...m, sync_passes: passes, bytes_transferred: endedPassBytes({ ...m, sync_passes: passes }) };
+      };
+      queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
+      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+    }
   }
 
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {
@@ -141,5 +178,12 @@ export function applyEventToCache(
     invalidate(['stats']);
     return;
   }
-  if (kind.startsWith('provider.')) invalidate(['providers']);
+  if (kind.startsWith('provider.')) {
+    invalidate(['providers']);
+    // new endpoint or credentials (or a deleted provider): the cached inventory came from the old ones
+    const providerId = event.data.provider_id;
+    if (kind !== 'provider.checked' && kind !== 'provider.created' && typeof providerId === 'string') {
+      invalidate(['inventory', providerId]);
+    }
+  }
 }

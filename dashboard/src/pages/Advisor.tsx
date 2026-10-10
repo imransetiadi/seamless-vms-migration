@@ -54,7 +54,7 @@ function ServiceCard({
         ))}
       </dl>
       {lastError && (
-        <p className="break-words rounded-md border border-status-warning/40 bg-status-warning/10 px-2.5 py-1.5 text-xs text-foreground">
+        <p className="wrap-break-word rounded-md border border-status-warning/40 bg-status-warning/10 px-2.5 py-1.5 text-xs text-foreground">
           Last error: {lastError}
         </p>
       )}
@@ -76,6 +76,16 @@ export default function Advisor() {
 
   const s = status.data;
   const memoryEnabled = s?.memory.enabled ?? false;
+  // why Search is unavailable: a status still loading or not loaded is not "not enabled" (SDD §16)
+  const searchReason = !canSearch
+    ? 'Searching requires the operator role.'
+    : status.isPending
+      ? 'Checking whether agentmemory is enabled…'
+      : !s
+        ? 'The advisor status could not be loaded.'
+        : memoryEnabled
+          ? null
+          : 'agentmemory is not enabled.';
 
   const notes = useMemo<AdvisorNoteRow[]>(
     () =>
@@ -162,13 +172,13 @@ export default function Advisor() {
                 variant="primary"
                 icon={Search}
                 loading={search.isPending}
-                disabledReason={canSearch ? (memoryEnabled ? null : 'agentmemory is not enabled.') : 'Searching requires the operator role.'}
+                disabledReason={searchReason}
               >
                 Search
               </Button>
             </div>
             {touched && !query.trim() && (
-              <p id={`${queryId}-error`} className="field-error">
+              <p id={`${queryId}-error`} role="alert" className="field-error">
                 Enter a few words about the failure to search for.
               </p>
             )}
@@ -205,7 +215,7 @@ export default function Advisor() {
                       <span className="font-medium text-foreground">{hit.title}</span>
                       {typeof hit.score === 'number' && <span className="num text-xs text-muted-foreground">match {formatPct(hit.score * 100, 0)}</span>}
                     </p>
-                    <p className="mt-1 break-words text-muted-foreground">{hit.content}</p>
+                    <p className="mt-1 wrap-break-word text-muted-foreground">{hit.content}</p>
                   </li>
                 ))}
               </ol>
@@ -214,7 +224,13 @@ export default function Advisor() {
         </Panel>
 
         <Panel title="Recent advisor notes" description="Across all migrations, newest first">
-          {migrations.isPending ? <LoadingBlock rows={4} /> : <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />}
+          {migrations.isPending ? (
+            <LoadingBlock rows={4} />
+          ) : migrations.error ? (
+            <ErrorBanner error={migrations.error} title="Advisor notes are unavailable" onRetry={() => void migrations.refetch()} />
+          ) : (
+            <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />
+          )}
         </Panel>
       </div>
     </>

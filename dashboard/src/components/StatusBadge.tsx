@@ -20,7 +20,7 @@ export function StatusBadge({ tone, icon: Icon, label, title, size = 'sm', class
     <span
       title={title}
       className={cn(
-        'inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded border font-medium',
+        'inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-sm border font-medium',
         size === 'sm' ? 'px-1.5 py-0.5 text-xs' : 'px-2 py-1 text-sm',
         TONE_CLASSES[tone].badge,
         className,

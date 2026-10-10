@@ -192,10 +192,14 @@ def plan_waves(
     groups: list[tuple[str | None, list[VMRef]]] = []
     pilot: list[VMRef] = []
     remaining: list[_Unit] = []
+    # SDD §9.4: the rank of the first group that did not fit; no riskier group takes its room
+    ceiling: int | None = None
     for unit in regular:
-        if len(pilot) + len(unit.vms) <= PILOT_SIZE and len(pilot) < PILOT_SIZE:
+        if len(pilot) + len(unit.vms) <= PILOT_SIZE and (ceiling is None or unit.rank <= ceiling):
             pilot.extend(unit.vms)
         else:
+            if ceiling is None:
+                ceiling = unit.rank
             remaining.append(unit)
     if pilot:
         groups.append(("Pilot", pilot))

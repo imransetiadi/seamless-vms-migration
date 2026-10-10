@@ -103,3 +103,21 @@ async def test_sse_stream_resume_and_heartbeat(server):
 
         denied = await client.get(f"{base}/api/v1/events/stream")
         assert denied.status_code == 401
+
+
+async def test_event_stream_is_never_compressed(server):
+    """SDD §12: a client that accepts gzip gets compressed responses, but never a compressed event
+    stream — a compressor would hold live events back until its buffer fills."""
+    base, tokens, app, store = server
+    bus = app.state.services.bus
+    headers = {"Authorization": f"Bearer {tokens[Role.viewer]}", "Accept-Encoding": "gzip"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        async with client.stream("GET", f"{base}/api/v1/events/stream", headers=headers) as res:
+            assert res.status_code == 200
+            assert res.headers["content-type"].startswith("text/event-stream")
+            assert "content-encoding" not in res.headers
+            frames_task = asyncio.ensure_future(read_frames(res, 1))
+            await asyncio.sleep(0.1)
+            live = await emit(store, bus, "plan.updated", "live", plan_id="p")
+            frames = await asyncio.wait_for(frames_task, timeout=3)
+    assert parse(frames[0])["id"] == str(live.seq)

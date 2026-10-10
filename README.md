@@ -18,7 +18,7 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 |---|---|---|---|
 | `cold` | OpenStack | os-migrate stop → copy over NBD/SSH → create | the whole copy |
 | `warm` | OpenStack | snapshot pre-copy while the VM runs, then a hash-based delta pass (BLAKE2b chunks) after shutdown | the final delta **plus a device scan** (the largest disk; a VM's disks scan in parallel) |
-| `storage_handover` | OpenStack on shared Ceph | Cinder unmanage → manage, no data copy | metadata operations (minutes) |
+| `storage_handover` | OpenStack on shared Ceph or NetApp ONTAP (NFS, iSCSI, FC) | Cinder unmanage → manage, no data copy | metadata operations (minutes) |
 | `vmware_cold` / `vmware_warm` | VMware | `os_migrate.vmware_migration_kit` (full copy, or CBT passes + cutover) | full copy / final CBT delta |
 
 * **One workflow for every source:** providers, plans, waves (pilot first), pre-flight findings, downtime
@@ -29,8 +29,21 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 * **Assisted, never autonomous:** Jev may break ties between eligible strategies, classify workloads into
   risk tiers and review post-cutover evidence — always inside deterministic bounds, and everything works
   with Jev off ([SDD §14](docs/SDD.md)). agentmemory recalls similar past incidents on failures.
-* **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics, structured logs, PostgreSQL 16 as the
-  system of record ([SDD §11, §16, §18](docs/SDD.md)).
+* **One dashboard for every hypervisor:** add and edit OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1,
+  VMware vCenter and RHOSO 18.0 providers from the UI with platform presets, write-only credentials kept in the
+  platform secret store (never in the database), the conversion-host SSH key, and a one-click connection test.
+* **Every common guest OS:** RHEL 5–10, CentOS, Rocky, AlmaLinux, Oracle Linux, Ubuntu (every LTS and
+  interim release), Debian 7–14, SLES/openSUSE, Windows Server 2003–2025 and Windows 7–11 are identified,
+  shown with their support state and migrated — legacy releases get warnings with remediation, never a
+  silent block. Windows guests are verified on RDP/WinRM ports instead of the serial console, and a storage
+  handover keeps UEFI, machine-type and bus settings ([SDD §9.5](docs/SDD.md)). See *Guest OS support* below.
+* **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
+  structured JSON logs (uvicorn's access lines included), `/health` and a `/ready` probe that answers
+  503 while the database or the orchestrator loop is down, audit log export and retention
+  (`seamless events export|prune`), per-address lockout after repeated failed authentications, a
+  per-step wall-clock ceiling (`SEAMLESS_STEP_TIMEOUT_S`) so a hung playbook never holds a stopped
+  source, cleanup of the data path when a pass is cancelled, PostgreSQL 16 as the system of record
+  ([SDD §11, §12, §16, §18](docs/SDD.md)).
 
 ```
  Operators ─HTTPS─►  seamless control plane (FastAPI REST+SSE · orchestrator FSM · planner · advisor)
@@ -42,6 +55,27 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
                                           ▼                                                     ▼
                          Source: RHOSP 17.1 / OpenStack / vCenter                  RHOSO 18.0 (boots the VM)
 ```
+
+## Guest OS support
+
+OpenStack sources (RHOSP 17.1, community, Kolla) move KVM guests to KVM: every guest that boots on the source
+boots on RHOSO, because the volumes keep their boot properties. VMware sources are converted by virt-v2v on the
+RHEL 9 conversion host, which is where vendor support differs ([SDD §9.5](docs/SDD.md), Red Hat's virt-v2v
+support matrix):
+
+| Guest | From OpenStack | From VMware (virt-v2v) | Lifecycle (2026-10) |
+|---|---|---|---|
+| RHEL 7, 8, 9, 10 | migrates | supported | 8–10 current; 7 legacy |
+| RHEL / CentOS 6 | migrates | works, not supported by Red Hat — test a copy (`GUEST_CONVERSION_UNVERIFIED`) | legacy |
+| RHEL / CentOS ≤ 5 | migrates | needs virtio drivers prepared in the guest (`GUEST_CONVERSION_UNSUPPORTED`) | legacy |
+| Rocky, AlmaLinux, Oracle Linux, CentOS 7/Stream | migrates | works, not supported by Red Hat — test a copy | Rocky/Alma/Oracle 8+ current |
+| Ubuntu (all releases), Debian (all releases) | migrates | Technology Preview — test a copy | Ubuntu 22.04/24.04/26.04 and Debian 12/13 current |
+| SLES, openSUSE | migrates | works, not supported; btrfs roots are not convertible | SLES 15 current |
+| Windows Server 2016, 2019, 2022, 2025; Windows 10/11 | migrates; verified on RDP/WinRM | supported | 2016+ current |
+| Windows Server 2003, 2008, 2008 R2, 2012, 2012 R2; Windows 7/8 | migrates; verified on RDP/WinRM | needs virtio-win drivers from an older release installed first | legacy |
+
+Legacy releases are flagged (`GUEST_OS_LEGACY`), never blocked. Set `os_distro`/`os_version` image properties
+or run VMware Tools so every guest is identified (`GUEST_OS_UNKNOWN` otherwise).
 
 ## Quick start — local stack on Docker Compose (Colima profile `seamless`)
 
@@ -61,9 +95,13 @@ scripts/compose-init.sh          # prints the admin API token ONCE - store it no
 make seamless-demo               # build + start postgres, jev (if enabled) and seamless with simulated clouds
 # make seamless-up               # same stack without the demo seed (bring your own clouds.yaml)
 
-open http://127.0.0.1:8080/      # sign in at /login with the admin token
+open http://127.0.0.1:8080/      # sign in at /login with the admin token (127.0.0.1: localhost may be another program)
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
+make seamless-check              # every CI check that runs locally: tests with the 85 % coverage gate, ruff,
+                                 # collection tests, playbook syntax, ansible-lint, scans, dashboard
+cd dashboard && npx playwright install chromium && npm run test:e2e   # browser smoke of the built dashboard (mock mode)
+pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
 
 The control plane is published on `127.0.0.1:8080` only; PostgreSQL is never published; Jev (profile `ai`)
@@ -71,10 +109,29 @@ is reachable only from the control plane. The stack reaches your host's agentmem
 `http://host.docker.internal:3111`. Details, troubleshooting and the full variable list:
 [deploy/compose/README.md](deploy/compose/README.md).
 
+### Other container hosts: any Docker host, Podman
+
+The same Compose stack runs on every engine; the Make targets take the engine as a variable.
+
+```bash
+# Docker on Linux, Docker Desktop or another context instead of Colima
+make seamless-demo SEAMLESS_DOCKER_CONTEXT=default
+
+# Podman 4.7+ (Linux, or macOS/Windows with `podman machine start`): `podman compose` drives the stack,
+# with docker-compose as its provider when installed (recommended) or podman-compose
+scripts/compose-init.sh
+make seamless-demo SEAMLESS_ENGINE=podman
+make seamless-logs SEAMLESS_ENGINE=podman      make seamless-down SEAMLESS_ENGINE=podman
+```
+
+On SELinux hosts (RHEL, Fedora) the token file mount is relabelled automatically (`selinux: z`). With Podman the
+control plane reaches the host's agentmemory at `http://host.containers.internal:3111`; set
+`SEAMLESS_MEMORY_URL` in `deploy/compose/.env` accordingly.
+
 ### Without containers (control plane development)
 
 ```bash
-cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'
+cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                        # SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is set
 .venv/bin/seamless serve --demo            # http://127.0.0.1:8080 (demo mode on loopback needs no token)
 ```
@@ -93,6 +150,32 @@ oc apply -k deploy/openshift
 oc -n seamless-migrate rollout status deploy/seamless
 oc -n seamless-migrate get route seamless
 ```
+
+## Deploy on Kubernetes
+
+[`deploy/kubernetes/`](deploy/kubernetes/) is a Kustomize overlay of the OpenShift manifests for vanilla
+Kubernetes 1.28+ (EKS, AKS, GKE, RKE2, k3s, kubeadm): an Ingress replaces the Route (ingress-nginx annotations for
+the live event stream), the pods get explicit UIDs, the NetworkPolicies target CoreDNS and the ingress controller,
+and PostgreSQL uses the public `quay.io/sclorg/postgresql-16-c9s` image (same interface as the Red Hat one).
+Build and push the image with Docker or Podman, set it and the Ingress host in the overlay, create the Secrets of
+`deploy/openshift/secret-example.yaml` plus the TLS secret `seamless-tls`, then:
+
+```bash
+kubectl apply -k deploy/kubernetes
+kubectl -n seamless-migrate rollout status deploy/seamless
+kubectl -n seamless-migrate get ingress seamless
+```
+
+Credentials entered in the dashboard are stored as Kubernetes Secrets on both platforms
+(`SEAMLESS_SECRET_STORE=kubernetes`, the Role in `secret-store-rbac.yaml`). CI renders both overlays and validates
+them against the Kubernetes 1.30 schemas.
+
+| Platform | Where | Command |
+|---|---|---|
+| Docker (Colima, Docker Desktop, Linux) | `deploy/compose/` | `make seamless-up` (`SEAMLESS_DOCKER_CONTEXT=…` for other hosts) |
+| Podman 4.7+ | `deploy/compose/` | `make seamless-up SEAMLESS_ENGINE=podman` |
+| Kubernetes 1.28+ | `deploy/kubernetes/` | `kubectl apply -k deploy/kubernetes` |
+| OpenShift 4.16+ | `deploy/openshift/` | `oc apply -k deploy/openshift` |
 
 ## Documentation
 
@@ -115,7 +198,10 @@ seamless/                    control plane: src/seamless_migrate/, tests/, Conta
 dashboard/                   React 18 + Vite + TypeScript dashboard (design tokens: SDD §16)
 deploy/compose/              Docker Compose stack for the Colima profile "seamless"
 deploy/openshift/            kustomize manifests (OpenShift 4.16+)
+deploy/kubernetes/           kustomize overlay of those manifests for vanilla Kubernetes 1.28+
 scripts/compose-init.sh      generates .env and tokens.yaml for the Compose stack
+scripts/check-readonly-runtime.sh  runs the images as the manifests do (make deploy-runtime-check)
+tests/                       collection tests (unit/, sanity/, func/, perf/); demo-stack scripts (e2e/)
 docs/                        PRD, SDD, MEMORY, QASuite, Security, Performance, plans
 .mcp.json  .claude/  CLAUDE.md   agent tooling (Jev + agentmemory MCP servers, plugins, working agreement)
 ```

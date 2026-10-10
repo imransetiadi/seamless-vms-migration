@@ -286,6 +286,12 @@ def _hash_chunk(fd, index, chunk_size, size, keep_data):
     offset = index * chunk_size
     length = min(chunk_size, size - offset)
     data = _pread_full(fd, length, offset)
+    # All-zero chunks (thin volumes, never-written regions) take the cached digest instead of
+    # being hashed: counting zero bytes runs at memory speed, about twice BLAKE2b. The first
+    # 4 KiB are checked alone first so chunks with data pay almost nothing for the test.
+    head = min(length, 4096)
+    if data.count(0, 0, head) == head and data.count(0) == length:
+        return _Chunk(index, offset, length, zero_digest(length), data if keep_data else None)
     return _Chunk(index, offset, length, chunk_digest(data), data if keep_data else None)
 
 

@@ -16,9 +16,12 @@ log = logging.getLogger(__name__)
 
 REDACTED = "[REDACTED]"
 _KEYWORDS = (
-    r"password|passwd|pwd|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
+    r"password|passwd|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
     r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?"
 )
+#: A credential key may carry a prefix joined by ``_``/``-``/``.`` (``OS_PASSWORD``,
+#: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``).
+_KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
 _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # PEM blocks (keys, certificates)
     (
@@ -31,11 +34,14 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?[^\s,;'\"]+"), r"\1: " + REDACTED),
     # bare bearer tokens
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
-    # key=value / key: value / "key": "value"
+    # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD)
     (
-        re.compile(
-            r"(?i)([\"']?\b(?:" + _KEYWORDS + r")\b[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"
-        ),
+        re.compile(r"(?i)([\"']?" + _KEY + r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"),
+        r"\1" + REDACTED,
+    ),
+    # CLI form: --os-password hunter2 / --password=hunter2 / -p hunter2 is too ambiguous
+    (
+        re.compile(r"(?i)(--[a-z0-9-]*(?:password|passwd|secret|token|api-key|key)\s+)([^\s]+)"),
         r"\1" + REDACTED,
     ),
     # well-known token shapes: seamless API tokens, Keystone fernet tokens, JWTs

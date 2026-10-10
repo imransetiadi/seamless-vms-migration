@@ -64,7 +64,7 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
               <span
                 aria-hidden
                 className={cn(
-                  'relative z-[1] flex size-8 shrink-0 items-center justify-center rounded-full border bg-card transition-colors duration-200',
+                  'relative z-1 flex size-8 shrink-0 items-center justify-center rounded-full border bg-card transition-colors duration-200',
                   state === 'done' && 'border-status-success/70 text-status-success',
                   state === 'current' && cn('border-2', toneClasses.border, toneClasses.text),
                   state === 'interrupted' && cn('border-2 border-dashed', toneClasses.border, toneClasses.text),

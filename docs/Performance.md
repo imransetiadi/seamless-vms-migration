@@ -33,27 +33,27 @@ measurement, tuning, capacity planning, control-plane limits and monitoring.
 | `Δf` | final delta moved during the downtime window | — |
 
 Conventions: the model treats 1 Gbit/s as 125 MiB/s (so 10 Gbit/s is 1,250 MiB/s; the raw line rate of a 10 GbE
-port is ≈ 1,190 MiB/s), and pre-copy passes follow SDD §9.1: pass *k* + 1 runs while `Δk > convergence_threshold_bytes` and
-*k* < `max_sync_passes` — the total, including pass 1, never exceeds `max_sync_passes` (the runtime rule of
-SDD §5.3 adds an SLO-based exit). The `Estimate.passes` field of the tool is authoritative for pass counting;
-the tables below show the pre-copy passes. Percentiles use the nearest-rank rule: with 10 runs p90 is the 9th smallest value and
+port is ≈ 1,190 MiB/s), and pre-copy passes follow SDD §9.1 and the runtime rule of §5.3: pass *k* + 1 runs while
+the bytes pass *k* moved exceed `convergence_threshold_bytes` (`Δ1 = U`, so a converging migration always runs at
+least one delta pass — the first delta pass is what measures the change) and *k* < `max_sync_passes` — the total,
+including pass 1, never exceeds `max_sync_passes` (the runtime adds an SLO-based exit). The `Estimate.passes`
+field of the tool is authoritative for pass counting; the tables below show the pre-copy passes. Percentiles use the nearest-rank rule: with 10 runs p90 is the 9th smallest value and
 p95 the largest.
 
 **Configuration and calibration (SDD §9.1, PRD G2).** Every `EstimatorParams` field can be overridden per plan
-with `Plan.estimator_overrides` (unknown keys are rejected with 400; `Plan.link_bps` keeps precedence for
+with `Plan.estimator_overrides` (unknown, non-positive and plan-owned keys are rejected with 400; `Plan.link_bps` keeps precedence for
 `link_bps`). After every completed warm pass the orchestrator calibrates the migration and re-estimates it:
 `vm.change_rate_bps = bytes_changed / (pass.started_at − previous_pass.started_at)` for delta passes, and the
 observed per-stream scan rate `bytes_scanned / duration_s / min(P, V)` replaces `scan_bps` for that migration
 (`Migration.observed_scan_bps`). The estimate an approver sees therefore converges on reality after the first
 delta pass.
 
-> **Implementation check (Track B).** A *full* first pass is usually bound by moving the used data (`U/L`), not by
+> **Why delta passes only.** A *full* first pass is usually bound by moving the used data (`U/L`), not by
 > scanning, so `bytes_scanned / duration_s` of that pass underestimates `S`: for the 200 GiB worked example of
-> §4.2 it gives 202 MiB/s instead of 500, and the estimate shown before the first delta pass would be 21.4 min
-> instead of 11.3. A migration that converges after a single full pass never gets a delta pass and would keep the
-> inflated number. SDD §9.1 states "delta passes only" for the change rate, not explicitly for the scan rate —
-> the scan calibration should skip link-bound full passes (or take the maximum of the observed and the
-> configured rate). PERF-E2E-G2 reports calibrated and uncalibrated migrations separately for this reason.
+> §4.2 it gives 202 MiB/s instead of 500, and an estimate calibrated on it would show 21.4 min instead of 11.3.
+> SDD §9.1 therefore takes the scan rate from delta/final passes only (`test_first_pass_alone_does_not_calibrate`);
+> a migration that converges after a single full pass keeps the planning defaults. PERF-E2E-G2 reports
+> calibrated and uncalibrated migrations separately for this reason.
 
 ---
 
@@ -142,7 +142,7 @@ at 500 MiB/s)".
 | Strategy | Pre-copy | Downtime |
 |---|---|---|
 | `cold` | none | `shutdown + snapshot + U/L + create + boot` |
-| `warm` | `T1 = snapshot + max(U/L, scan)`; then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` while `Δk > threshold` and `k < max_passes` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
+| `warm` | `T1 = snapshot + max(U/L, scan)`, `Δ1 = U`; then `Δk = min(D, c·T(k−1))`, `Tk = snapshot + max(scan, Δk/L)` for k = 2, 3, … while `Δ(k−1) > threshold` and `k ≤ max_passes` | `shutdown + snapshot + max(scan, Δf/L) + create + boot`, `Δf = min(D, c·T_last)` |
 | `storage_handover` | none | `shutdown + V·handover_per_volume + create + boot` |
 | `vmware_cold` | none | `shutdown + U/L + v2v + create + boot` |
 | `vmware_warm` | `T1 = U/L`; `Tk = 10 + Δk/L` (same loop) | `shutdown + Δf/L + v2v_inplace + create + boot` |
@@ -191,7 +191,7 @@ Derived properties worth knowing:
 | | 1 Gbit/s (`L` = 125 MiB/s) | 10 Gbit/s (`L` = 1,250 MiB/s) |
 |---|---|---|
 | `cold` downtime | `270 + 983 s` = **1,253 s (20.9 min)** | `270 + 98 s` = **368 s (6.1 min)** |
-| `warm` pre-copy | `scan` = 410 s. `T1 = 30 + max(983, 410) = 1,013 s`; `Δ1 = 2 MiB/s × 1,013 s = 2,026 MiB > 1 GiB` ⇒ pass 2: `T2 = 30 + max(410, 16) = 440 s`; `Δ = 879 MiB ≤ 1 GiB` ⇒ stop. **2 passes, 1,453 s (24.2 min) while the VM runs** | `T1 = 30 + max(98, 410) = 440 s`; `Δ = 879 MiB ≤ 1 GiB` ⇒ stop. **1 pass, 440 s** |
+| `warm` pre-copy | `scan` = 410 s. `T1 = 30 + max(983, 410) = 1,013 s` moves `U` ⇒ pass 2 carries `Δ2 = 2 MiB/s × 1,013 s = 2,026 MiB`: `T2 = 30 + max(410, 16) = 440 s`; `2,026 MiB > 1 GiB` ⇒ pass 3 carries `Δ3 = 2 MiB/s × 440 s = 879 MiB`: `T3 = 440 s`; `879 MiB ≤ 1 GiB` ⇒ stop. **3 passes, 1,892 s (31.5 min) while the VM runs** | `T1 = 30 + max(98, 410) = 440 s` moves `U` ⇒ pass 2 carries `879 MiB` in `440 s`; `≤ 1 GiB` ⇒ stop. **2 passes, 879 s (14.7 min)** |
 | `warm` final delta | 879 MiB (moved in 7 s, hidden inside the 410 s scan) | 879 MiB (0.7 s) |
 | `warm` downtime | `60 + 30 + 410 + 60 + 120` = **680 s (11.3 min)** | **680 s (11.3 min)** — identical |
 | `storage_handover` downtime | `60 + 20 + 60 + 120` = **260 s (4.3 min)** | 260 s |
@@ -230,8 +230,8 @@ the aggregate ceiling is not reached; beyond it `scan = D / S_agg`. Set `paralle
 full-rate streams the host really sustains and the estimator stays honest: with `P` = 2, 4 × 100 GiB is estimated
 at 680 s (11.3 min).
 
-Warm pre-copy cost on 1 Gbit/s: 50 GiB → 1 pass (4.6 min); 100 GiB → 2 passes (12.6 min); 200 GiB → 2 passes
-(24.2 min); **300 GiB → 5 passes (68 min, final delta 1.26 GiB); 500 GiB → 5 passes (112 min, 2.1 GiB); 1 TiB →
+Warm pre-copy cost on 1 Gbit/s: 50 GiB → 2 passes (6.8 min); 100 GiB → 3 passes (16.5 min); 200 GiB → 3 passes
+(31.5 min); **300 GiB → 5 passes (68 min, final delta 1.26 GiB); 500 GiB → 5 passes (112 min, 2.1 GiB); 1 TiB →
 5 passes (226 min, 4.2 GiB)**. Every single disk above ≈ 235 GiB fails to converge below the 1 GiB threshold at
 the default change rate (property 3 of §4.1) — see §7.3.
 
@@ -239,8 +239,8 @@ the default change rate (property 3 of §4.1) — see §7.3.
 
 | `c` (MiB/s) | Pre-copy passes (s) | Final delta | Downtime | `Δf/L` |
 |---|---|---|---|---|
-| 0.5 | 1 013 | 507 MiB | 11.3 min | 4 s |
-| 2 | 1 013, 440 | 879 MiB | 11.3 min | 7 s |
+| 0.5 | 1 013, 440 | 220 MiB | 11.3 min | 2 s |
+| 2 | 1 013, 440, 440 | 879 MiB | 11.3 min | 7 s |
 | 10 | 1 013, 440 × 4 (never converges) | 4.3 GiB | 11.3 min | 35 s |
 | 50 | 1 013, 440 × 4 | 21.5 GiB | 11.3 min | 176 s |
 | 100 | 1 013, 840, 702, 592, 504 | 49.2 GiB | 11.3 min | 403 s |
@@ -359,28 +359,29 @@ databases sit between the extremes. Consequences:
 | End to end | lab scenarios of [QASuite.md](QASuite.md) §7 (LAB-W*, LAB-H*) | Downtime per VM profile, estimate accuracy |
 | Control plane | demo mode with a 1,000-VM plan; API load (QASuite §9, PERF-CP-*) | Tick time, API/SSE latency, DB growth |
 
-### 6.2 Results — engine benchmark (developer host, 2026-10-08)
+### 6.2 Results — engine benchmark (developer host, 2026-10-08, after the zero-chunk fast path)
 
 MiB/s scanned, from [`tests/perf/results-darwin-arm64-apple-m5.md`](../tests/perf/results-darwin-arm64-apple-m5.md):
 Darwin 27.0.0 arm64, 10 CPUs, Python 3.13.5; a 1 GiB file in the page cache with a 64 MiB hole every
-256 MiB, random 1 MiB change extents, sender and receiver on the same host through pipes (the CPU ceiling
-of read + BLAKE2b + apply, not disk or network throughput); the host carried other load (load average
-5–10), so single runs vary by ± 30 %.
+256 MiB (25 % zero chunks), random 1 MiB change extents, sender and receiver on the same host through
+pipes (the CPU ceiling of read + BLAKE2b + apply, not disk or network throughput); load average ≈ 3
+during the run. Single runs on a laptop vary by ± 30 %.
 
 | Chunk / workers | full (`--assume-zero`) | delta 1 % | delta 5 % | delta 20 % |
 |---|---|---|---|---|
-| 1 MiB / 1 | 228 | 622 | 438 | 630 |
-| 1 MiB / 4 | 511 | 1653 | 1555 | 1214 |
-| 4 MiB / 1 | 294 | 400 | 405 | 425 |
-| 4 MiB / 4 | 515 | 1118 | 728 | 557 |
-| 16 MiB / 1 | 441 | 517 | 343 | 345 |
-| 16 MiB / 4 | 494 | 472 | 472 | 407 |
+| 1 MiB / 1 | 1047 | 1388 | 1422 | 1275 |
+| 1 MiB / 4 | 1030 | 2749 | 2676 | 2064 |
+| 4 MiB / 1 | 956 | 1381 | 1239 | 636 |
+| 4 MiB / 4 | 1142 | 2878 | 2127 | 1244 |
+| 16 MiB / 1 | 1103 | 1282 | 1065 | 593 |
+| 16 MiB / 4 | 1178 | 2625 | 1238 | 935 |
 
-Reading: the default 4 MiB / 4 workers scans at 515 MiB/s on a full pass and 557–1118 MiB/s on delta passes
-on this laptop, above the 500 MiB/s planning default `S`; 1 MiB chunks hash faster here but transfer less
-per changed extent (the 4 MiB rows move 4× the bytes for the same 1 % change). These numbers are an upper
-bound for a 4 vCPU conversion host reading from Cinder: the NFR-02a acceptance below still has to be
-measured on that flavor (§6.3).
+Reading: the default 4 MiB / 4 workers scans at ≈ 1.1 GiB/s on a full pass and 1.2–2.9 GiB/s on delta
+passes here, two to three times the first measurement of the day (515 / 557–1118 MiB/s, taken on a
+host with load average 5–10 and before all-zero chunks skipped hashing — `blocksync` now recognises
+them with a byte count, 2.5× cheaper than BLAKE2b). The 20 % rows are transfer-bound (the delta is
+sent over a pipe). These numbers are an upper bound for a 4 vCPU conversion host reading from Cinder:
+the NFR-02a acceptance below still has to be measured on that flavor (§6.3).
 
 Acceptance for NFR-02a: ≥ 400 MiB/s scanned per side on a 4 vCPU conversion-host flavor with the 4 MiB / 4
 worker configuration. The same measurement decides SM-1 p95 for a single 500 GiB disk: `S` ≥ 416 MiB/s (§3.2).
@@ -485,8 +486,8 @@ is left to the operator is the plan-level starting point, so that the very first
 | Stalls after the SSH handshake, small packets fine | MTU black hole (Geneve 1442 vs 1500/9000 paths) | Align `os_migrate_*_conversion_net_mtu`, enable `net.ipv4.tcp_mtu_probing=1` |
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
-| `meets_slo` is false for the warm estimate of every disk above ≈ 15 GiB | The default `downtime_slo_s` of 300 s is below `F + scan` (270 s + 205 s for 100 GiB) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | Python-side filtering of all documents (§9) | Narrow queries, SSE-driven refresh, upgrade path in §9.3 |
+| `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
+| API slow with many migrations | `/stats` and `/metrics` validate every migration when the change stamp moved; plans and migrations are read fully by the overview | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -515,9 +516,9 @@ is left to the operator is the plan-level starting point, so that the very first
 |---|---|---|
 | `convergence_threshold_bytes` | 1 GiB | ≥ `1.2·c·(snapshot + scan)`; e.g. 10 MiB/s on 200 GiB: ≥ 5.2 GiB; **a single 500 GiB disk at 2 MiB/s: ≥ 2.5 GiB (use 3 GiB)**, which turns the five passes of the defaults (88 min at 10 Gbit/s, 112 min at 1 Gbit/s, each a full scan) into one or two with the same downtime |
 | `max_sync_passes` | 5 | `2` when pass 2 already runs at the scan floor (every later pass costs a full scan and gains nothing); `3` for VMs with a bursty writer |
-| `downtime_slo_s` | 300 | Below `F + scan` warm can never meet it (270 s + 205 s for 100 GiB) — pick the strategy (handover, cold on fast links) instead of adding passes, or state the real budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
+| `downtime_slo_s` | 600 | Below `F + scan` warm can never meet it (270 s + 205 s for 100 GiB fits; 270 s + 410 s for 200 GiB does not) — pick the strategy (handover, cold on fast links) instead of adding passes, or state the real budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
 | `link_bps` | 125 MiB/s | Per-migration share of the link (§6.4) |
-| `estimator_overrides` | `{}` | Measured `scan_bps`, `parallel_disks` and fixed costs (§6.4); the estimator's own name for the pass limit is `max_passes`, but use the plan fields above for threshold and pass count |
+| `estimator_overrides` | `{}` | Measured `scan_bps`, `parallel_disks` and fixed costs (§6.4); the plan-owned keys `convergence_threshold_bytes` and `max_passes` are rejected with 400 — use the plan fields above |
 | `keep_warm_interval_s` | 900 | Each keep-warm pass is a full device scan plus a snapshot and a temporary volume. The final delta grows only by `c × interval`, which at 2 MiB/s adds ≈ 14 GiB over two hours — and overlaps the scan — so the interval can be relaxed (≥ 4 × the pass time) for large disks; keep-warm mainly proves the path still works |
 | `selection_policy` | `min_downtime` | `simplest_meeting_slo` for predictable operations when several strategies meet the SLO |
 
@@ -527,6 +528,7 @@ is left to the operator is the plan-level starting point, so that the very first
 |---|---|---|---|
 | Ceph RBD | O(1) | O(1) copy-on-write clone (flatten is off by default) | `snapshot_s` ≈ seconds; pass time is the scan. Preferred |
 | LVM thin | O(1) | O(1) thin snapshot | similar to RBD |
+| NetApp ONTAP (NFS, iSCSI, FC) | O(1) FlexClone file/LUN clone | O(1) clone (FlexClone license required) | similar to RBD while the FlexVol has free space and snapshot reserve; without FlexClone the driver cannot clone and the warm path fails at the first pass — use cold or storage handover. Storage handover on a shared SVM is a rename (SDD §7.3.1) |
 | LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check |
 | Image-booted VMs | — | `boot_disk_copy: true` snapshots the server to Glance and builds a volume from the image **each pass** (SDD §6.1) | minutes per pass proportional to the disk; with `boot_disk_copy: false` only data volumes sync and the destination boots from the same image name — use it whenever the image exists on the destination |
 
@@ -569,9 +571,9 @@ Two fleets of 40 single-disk VMs, `c` = 2 MiB/s, waves: pilot of 3 + four waves 
 
 ### 8.3 Scale-out limits in 0.1.0
 
-One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialized attach/detach, Python-side
-list filtering (§9). Beyond ≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances
-with separate databases until 0.2.0.
+One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialized attach/detach. Beyond
+≈ 100–200 concurrent in-flight VMs, split plans across control-plane instances with separate databases until
+0.2.0.
 
 ---
 
@@ -583,10 +585,12 @@ with separate databases until 0.2.0.
   migration, so 10 active migrations produce ≤ 10 messages/s fanned out to *N* clients (500 msg/s for 50
   dashboards) — negligible. Heartbeat every 15 s keeps proxies open; resume with `?since=<seq>` replays from
   the `events` table (`limit` ≤ 1,000).
-* **Reads:** `GET /plans`, `/migrations`, `/stats` call `Store.list`, which loads **every document of the
-  kind** and filters in Python (SDD §11). At ≈ 20 KB per migration document, 1,000 migrations ≈ 20 MB per
-  request and Pydantic validation on the order of a second (planning estimate; PERF-CP-01 measures it). Prefer
-  SSE-triggered cache invalidation in the dashboard over short-interval polling.
+* **Reads:** `GET /migrations` filters and pages in SQL (expression indexes, SDD §11). `GET /stats` and
+  `GET /metrics` need every migration: they keep the last loaded list and reload it only when the store's
+  `change_stamp` (count + sum of versions, one aggregate query) moved — measured on SQLite with 1,000
+  migrations: a full load + validation 19 ms, the stamp 0.2 ms, so a 15 s Prometheus scrape or an idle
+  overview costs one aggregate query. `GET /plans` filters by `status` and pages like `/migrations`. Prefer SSE-triggered
+  cache invalidation in the dashboard over short-interval polling.
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
   Re-estimation after a completed pass (calibration, §1) is one more write per pass and a pure function.
@@ -601,7 +605,7 @@ with separate databases until 0.2.0.
 |---|---|
 | Size | 1 vCPU / 1–2 GiB, 20 GiB volume is generous (manifests: request 250 m / 512 Mi, limit 2 CPU / 1 GiB, 20 Gi PVC) |
 | Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process plus CLI/psql) |
-| Indexes in place | `documents(kind, id)` primary key; `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
+| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
 | Bloat | frequently updated documents: `ALTER TABLE documents SET (fillfactor = 70)` and an aggressive autovacuum (`autovacuum_vacuum_scale_factor = 0.05`) |
 | Retention | archive `events` older than 13 months ([MEMORY.md](MEMORY.md) §3.4); `VACUUM (ANALYZE)` after bulk deletes |
 | Backups | `pg_dump` nightly (encrypted) plus a restore drill each release; the dump of 1,000 migrations is tens of MiB |
@@ -610,9 +614,9 @@ with separate databases until 0.2.0.
 
 | Limit | Cause | Upgrade |
 |---|---|---|
-| List endpoints scale with the **total** number of documents of a kind | filters evaluated in Python (SDD §11) | 0.2.0: filter in SQL on JSONB (`data->>'plan_id'`) with an expression index `ON documents ((data->>'plan_id')) WHERE kind = 'migration'`, keyset pagination |
+| `/stats` and `/metrics` validate every migration document when the change stamp moved | one load per change; a busy fleet with thousands of migrations re-validates often | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
 | Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
-| Event table growth | append-only, no purge | partition by month, archive |
+| Event table growth | append-only; bounded by `seamless events export` and `seamless events prune` (SDD §15) on a retention schedule | partition by month for very large estates |
 
 ---
 
@@ -627,6 +631,7 @@ with separate databases until 0.2.0.
 | `seamless_downtime_seconds_sum`, `_count`, `_max` | counters / gauge | mean and worst downtime (percentiles come from `/stats`, populations from §6.4) |
 | `seamless_step_duration_seconds_sum`, `_count{step}` | counters | mean duration per step (`prestage`, `precopy`, `sync`, `cutover`, `rollback`, `finalize`) |
 | `seamless_advisor_calls_total{tool,outcome}` | counter | Jev usage and failures (label values are defined by the implementation) |
+| `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. Queries:
@@ -703,12 +708,12 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 |---|---|---|
 | Hash-scan floor (SDD §20 D1): every warm pass reads and hashes the devices on both sides | downtime ≥ `F + scan`; a single disk above ≈ 160 GiB exceeds 10 min, a single 500 GiB disk needs `S` ≥ 416 MiB/s for the 25 min p95 | **0.2.0** changed-extent tracking (FR-26): Ceph-direct `rbd diff` between pass snapshots (opt-in, needs Ceph credentials) and hypervisor-assisted libvirt checkpoints; target ≤ 5 min median independent of disk size (PRD §8) |
 | Aggregate read ceiling of a conversion host (≈ 1,190 MiB/s on 10 GbE; 2–3 full-rate streams on 4 vCPU) | `P × S` overstates the scan rate of multi-disk VMs; G1a can be missed by VMs above ≈ 380 GiB in total | calibration measures the real rate per migration; `parallel_disks`/`scan_bps` via `Plan.estimator_overrides`; conversion-host pools (below) |
-| Calibration needs a completed pass, and a delta pass for a trustworthy scan rate | the first estimate uses defaults and plan overrides; single-pass migrations are never calibrated (§1) | scan calibration from delta passes only; persist observed rates per provider pair as the next default (proposed; not in SDD §9.1) |
+| Calibration needs a completed delta pass | the first estimate uses defaults and plan overrides; single-pass migrations are never calibrated (§1; SDD §9.1 calibrates from delta/final passes only) | persist observed rates per provider pair as the next default (proposed; not in SDD §9.1) |
 | Single stream per disk and per SSH channel | WAN throughput bounded by `window/RTT` | multi-stream sync (several SSH channels per disk, chunk-range sharding); HPN-SSH |
 | Delta unit is the chunk | random-write workloads amplify the delta (§5.4) | adaptive chunk size per VM from the first pass |
 | One conversion-host pair per provider; attach/detach serialized | many small VMs are attach-bound | multiple host pairs / host pool |
 | Single replica orchestrator (D2) | no HA | **0.2.0** leader election |
-| Python-side list filtering (§9) | API cost grows with total documents | **0.2.0** SQL filters and pagination |
+| Whole-kind reads for `/stats` and `/metrics` (cached on the change stamp, §9.1) | one full load per change | **0.2.0** store-side aggregates |
 | Image-booted VMs with `boot_disk_copy: true` re-image each pass | slow passes | use `false` when the image exists on the destination |
 | No LVM-thick detection finding | surprise slow passes | add a finding from `volume_backends` |
 | Page-cache pollution on conversion hosts from full-device reads | cache churn, no correctness issue | `posix_fadvise` sequential/don't-need hints |
@@ -741,20 +746,19 @@ def scan_time(disks, p, ceiling=None):
 
 def warm(disks, U, p, ceiling=None):
     D, scan = sum(disks), scan_time(disks, p, ceiling)
-    t = [p.snapshot + max(U / p.link, scan)]; k = 1
-    while k < p.max_passes:
-        delta = min(D, p.change * t[-1])
-        if delta <= p.threshold: break
-        k += 1; t.append(p.snapshot + max(scan, delta / p.link))
+    t = [p.snapshot + max(U / p.link, scan)]; moved = U          # pass 1 moves the used data
+    while moved > p.threshold and len(t) < p.max_passes:        # SDD 5.3: another pass while the last one moved > threshold
+        moved = min(D, p.change * t[-1]); t.append(p.snapshot + max(scan, moved / p.link))
     final = min(D, p.change * t[-1])
-    return dict(scan=scan, passes=k, pass_times=t, final=final,
+    return dict(scan=scan, passes=len(t), pass_times=t, final=final,
                 down=p.shutdown + p.snapshot + max(scan, final / p.link) + p.create + p.boot)
 
 cold = lambda U, p: p.shutdown + p.snapshot + U / p.link + p.create + p.boot
 handover = lambda V, p: p.shutdown + V * p.handover_per_volume + p.create + p.boot
 
 p = P(); D = 200 * GiB; U = int(D * 0.6)
-print(warm([D], U, p)["down"], cold(U, p), handover(1, p))                   # 679.6 1253.04 260
+w = warm([D], U, p)
+print(w["down"], cold(U, p), handover(1, p), w["passes"], round(sum(w["pass_times"])))   # 679.6 1253.04 260 3 1892
 print(warm([100 * GiB], 60 * GiB, p)["down"])                                # G1a: 474.8
 print(round(warm([100 * GiB] * 4, 240 * GiB, p)["down"], 1),
       round(warm([100 * GiB] * 4, 240 * GiB, p, ceiling=1190 * MiB)["down"], 1))   # 4 x 100 GiB: 474.8 614.2
@@ -763,7 +767,9 @@ print(warm([500 * GiB], 300 * GiB, p)["down"],
 ```
 
 Cross-check the tool against the model with `seamless estimate -f vms.yaml --link-mbps 1000 --slo 600`
-(SDD §15) and the unit tests `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`,
+(SDD §15; `--link-mbps` is decimal, so 1000 Mbit/s is 119.2 MiB/s rather than the model's 125 MiB/s — the
+worked example then shows 3 passes and 1,940 s of pre-copy instead of 1,892 s, with the same 680 s downtime)
+and the unit tests `test_cold_downtime_formula`, `test_warm_converges_and_counts_passes`,
 `test_warm_scan_floor_applies`, `test_handover_downtime_independent_of_size`, `test_vmware_warm_uses_exact_delta`.
 The parallel-disk scan term, `Plan.estimator_overrides` and the per-pass calibration are covered by
 `test_warm_scan_uses_largest_disk_and_parallel_streams`, `test_sdd_worked_example`,

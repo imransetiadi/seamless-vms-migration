@@ -16,6 +16,8 @@ from .memory import MemoryClient, redact
 log = logging.getLogger(__name__)
 GIB = 2**30
 MAX_HITS = 3
+#: Longest memory hit content copied into a note/event (hits are shown, never prompted).
+HIT_CONTENT_CHARS = 1000
 
 
 def size_bucket(disk_bytes: int) -> str:
@@ -76,7 +78,11 @@ class KnowledgeService:
                     data={
                         "query": query,
                         "hits": [
-                            {"title": h.title, "content": h.content, "score": h.score}
+                            {
+                                "title": h.title[:200],
+                                "content": h.content[:HIT_CONTENT_CHARS],
+                                "score": h.score,
+                            }
                             for h in hits[:MAX_HITS]
                         ],
                     },
@@ -106,7 +112,8 @@ class KnowledgeService:
 
     async def on_completed(self, migration: Migration) -> None:
         est = migration.estimate
-        passes = len(migration.sync_passes)
+        # the last number counts every pass, also those dropped from the list (SDD §5.4)
+        passes = migration.sync_passes[-1].number if migration.sync_passes else 0
         final_delta = migration.sync_passes[-1].bytes_changed if migration.sync_passes else 0
         estimated = f"{est.downtime_s:.0f} s" if est is not None else "unknown"
         actual = (

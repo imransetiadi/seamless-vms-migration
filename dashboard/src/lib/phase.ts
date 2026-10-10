@@ -17,7 +17,7 @@ import {
   Undo2,
   Zap,
 } from 'lucide-react';
-import type { Phase, Strategy } from '../api/types';
+import type { Migration, Phase, Strategy, SyncPass } from '../api/types';
 
 /** Semantic status tones. Colour is always paired with an icon and a text label (SDD §16). */
 export const TONES = ['neutral', 'info', 'progress', 'warning', 'success', 'danger'] as const;
@@ -190,4 +190,41 @@ export function happyPath(strategy: Strategy): Phase[] {
 export function phaseSortKey(phase: Phase): number {
   const index = PHASE_ORDER.indexOf(phase);
   return index === -1 ? PHASE_ORDER.length : index;
+}
+
+/**
+ * Whether a migration's pre-flight ran: validation finished it (SDD §8, §16). Pending and validating
+ * migrations have not been checked yet, nor has one cancelled before its validation finished.
+ */
+export function preflightRan(m: Pick<Migration, 'phase' | 'phase_history'>): boolean {
+  if (m.phase === 'pending' || m.phase === 'validating') return false;
+  if (m.phase !== 'cancelled') return true;
+  return m.phase_history.some((h) => h.to_phase === 'ready' || h.to_phase === 'blocked');
+}
+
+export interface RunningStep {
+  /** `#<number> <kind>` like the convergence chart, or the step's name when it is no pass. */
+  label: string;
+  pass: { number: number; kind: SyncPass['kind'] } | null;
+}
+
+/**
+ * The step a migration is running, named from its phase and the passes that ended (SDD §4.2, §16): the
+ * API lists a pass only once it ends — precopy runs the full copy, syncing the next delta pass, cutover
+ * the final pass of a warm migration, the full copy of a cold one or the volume handover.
+ */
+export function runningStep(m: Pick<Migration, 'phase' | 'strategy' | 'sync_passes'>): RunningStep | null {
+  const number = m.sync_passes.reduce((last, p) => (p.ended_at === null ? last : Math.max(last, p.number)), 0) + 1;
+  const pass = (kind: SyncPass['kind']): RunningStep => ({ label: `#${number} ${kind}`, pass: { number, kind } });
+  switch (m.phase) {
+    case 'precopy':
+      return pass('full');
+    case 'syncing':
+      return pass('delta');
+    case 'cutover':
+      if (isWarmStrategy(m.strategy)) return pass('final');
+      return m.strategy === 'storage_handover' ? { label: 'Volume handover', pass: null } : pass('full');
+    default:
+      return null;
+  }
 }

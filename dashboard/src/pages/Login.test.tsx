@@ -26,7 +26,7 @@ describe('Login', () => {
   });
 
   it('keeps the user on the page with a clear error when the token is rejected', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
 
     await user.type(await screen.findByLabelText('API token'), 'not-a-valid-token');
@@ -38,8 +38,20 @@ describe('Login', () => {
     expect(window.sessionStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
   });
 
+  it('explains the lockout when the address made too many failed attempts', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderLogin();
+
+    await user.type(await screen.findByLabelText('API token'), 'locked');
+    await user.click(screen.getByRole('button', { name: /^sign in/i }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/too many failed sign-in attempts .* wait a minute/i);
+    expect(window.sessionStorage.getItem(TOKEN_STORAGE_KEY)).toBeNull();
+  });
+
   it('stores a valid token for this tab only and returns to the app', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
 
     await user.type(await screen.findByLabelText('API token'), 'approver');
@@ -50,7 +62,7 @@ describe('Login', () => {
   });
 
   it('asks for a token before calling the server', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderLogin();
     await user.click(await screen.findByRole('button', { name: /^sign in/i }));
     expect(within(await screen.findByRole('alert')).getByText(/paste your api token/i)).toBeInTheDocument();

@@ -32,6 +32,28 @@ class _Spec:
     image_root: bool = False
     encrypted: bool = False
     extra_specs: tuple[tuple[str, str], ...] = ()
+    netapp: bool = False  # volumes on the ONTAP NFS backend instead of Ceph
+
+
+# Cinder pools of the demo clouds: Ceph RBD and NetApp ONTAP over NFS (SDD §7.3.1, §10).
+_CEPH = {"vendor": "Open Source", "protocol": "ceph", "family": "rbd"}
+_ONTAP_NFS = {"vendor": "NetApp", "protocol": "nfs", "family": "netapp_nfs"}
+_SOURCE_POOLS = {
+    "ceph-ssd": ("overcloud@tripleo_ceph#ceph-ssd", _CEPH),
+    "ceph-hdd": ("overcloud@tripleo_ceph#hdd", _CEPH),
+    "netapp-nfs": ("overcloud@tripleo_netapp#192.0.2.50:/cinder_finance", _ONTAP_NFS),
+}
+_DESTINATION_POOLS = (
+    ("hostgroup@ceph-ssd#ssd", _CEPH),
+    ("hostgroup@ceph-hdd#hdd", _CEPH),
+    # same SVM export, mounted through the RHOSO storage network's LIF
+    ("hostgroup@ontap-nfs#198.51.100.50:/cinder_finance", _ONTAP_NFS),
+)
+
+
+def _storage_caps(pools: Any) -> dict[str, Any]:
+    backends = sorted(({"pool": name, **caps} for name, caps in pools), key=lambda b: b["pool"])
+    return {"volume_backends": [b["pool"] for b in backends], "storage_backends": backends}
 
 
 _FLAVORS = {
@@ -45,16 +67,26 @@ _FLAVORS = {
 # 24 OpenStack VMs of the "Finance apps" estate (RHOSP 17.1).
 _OPENSTACK: tuple[_Spec, ...] = (
     _Spec("web-01", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
-    _Spec("web-02", "m1.small", (20,), "rhel9", rate_mib=0.5, tags=(("app", "portal"),)),
+    _Spec("web-02", "m1.small", (20,), "ubuntu 24.04", rate_mib=0.5, tags=(("app", "portal"),)),
     _Spec("web-03", "m1.small", (40,), "rhel9", rate_mib=0.8, image_root=True),
-    _Spec("api-gw-01", "m1.medium", (30,), "rhel9", rate_mib=1.0),
-    _Spec("portal-01", "m1.small", (25,), "rhel8", rate_mib=0.6),
-    _Spec("app-01", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),)),
-    _Spec("app-02", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),)),
-    _Spec("mq-01", "m1.medium", (50,), "rhel9", rate_mib=4.0, tags=(("role", "rabbitmq"),)),
-    _Spec("mq-02", "m1.medium", (80,), "rhel9", rate_mib=6.0, tags=(("role", "kafka"),)),
+    _Spec("api-gw-01", "m1.medium", (30,), "rocky 9.4", rate_mib=1.0),
+    _Spec("portal-01", "m1.small", (25,), "debian 12", rate_mib=0.6, netapp=True),
+    _Spec(
+        "app-01", "m1.large", (60,), "rhel8", rate_mib=2.0, tags=(("role", "tomcat"),), netapp=True
+    ),
+    _Spec(
+        "app-02",
+        "m1.large",
+        (60,),
+        "almalinux 8",
+        rate_mib=2.0,
+        tags=(("role", "tomcat"),),
+        netapp=True,
+    ),
+    _Spec("mq-01", "m1.medium", (50,), "ubuntu 22.04", rate_mib=4.0, tags=(("role", "rabbitmq"),)),
+    _Spec("mq-02", "m1.medium", (80,), "debian 11", rate_mib=6.0, tags=(("role", "kafka"),)),
     _Spec("cache-01", "m1.medium", (30,), "rhel9", rate_mib=3.0, tags=(("role", "redis"),)),
-    _Spec("dns-01", "m1.small", (20,), "rhel9", rate_mib=0.2),
+    _Spec("dns-01", "m1.small", (20,), "ubuntu 20.04", rate_mib=0.2),
     _Spec(
         "win-ad-01",
         "m1.large",
@@ -64,7 +96,7 @@ _OPENSTACK: tuple[_Spec, ...] = (
         tags=(("role", "domain-controller"),),
     ),
     _Spec("monitor-01", "m1.large", (100,), "rhel9", rate_mib=3.0, tags=(("role", "prometheus"),)),
-    _Spec("bastion-01", "m1.small", (20,), "rhel9", rate_mib=0.1),
+    _Spec("bastion-01", "m1.small", (20,), "centos 7", rate_mib=0.1),
     _Spec(
         "ledger-db-01",
         "m1.xlarge",
@@ -151,16 +183,16 @@ class _VSpec:
 _VMWARE: tuple[_VSpec, ...] = (
     _VSpec("dc2-web-01", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", rate_mib=0.5),
     _VSpec("dc2-web-02", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", cbt=False),
-    _VSpec("dc2-proxy-01", 2, 4096, (30,), "rhel8_64Guest", network="DC2-DMZ"),
+    _VSpec("dc2-proxy-01", 2, 4096, (30,), "Ubuntu 22.04.4 LTS", network="DC2-DMZ"),
     _VSpec("dc2-app-01", 4, 8192, (80,), "rhel8_64Guest", rate_mib=2.0),
     _VSpec("dc2-mq-01", 4, 8192, (60,), "rhel8_64Guest", snapshots=2, rate_mib=3.0),
-    _VSpec("dc2-dc-01", 4, 8192, (80,), "windows2019srv_64Guest"),
-    _VSpec("dc2-mon-01", 4, 16384, (200,), "rhel9_64Guest", rate_mib=2.5),
+    _VSpec("dc2-dc-01", 4, 8192, (80,), "windows2019srvNext_64Guest"),
+    _VSpec("dc2-mon-01", 4, 16384, (200,), "debian12_64Guest", rate_mib=2.5),
     _VSpec("dc2-db-01", 8, 32768, (100, 400), "rhel8_64Guest", rate_mib=6.0),
     _VSpec("dc2-db-02", 8, 32768, (100, 600), "rhel8_64Guest", cbt=False, rate_mib=5.0),
-    _VSpec("dc2-file-01", 4, 8192, (60, 500), "windows2019srv_64Guest", independent=True),
+    _VSpec("dc2-file-01", 4, 8192, (60, 500), "windows8Server64Guest", independent=True),
     _VSpec("dc2-legacy-01", 2, 4096, (40,), "windows2008_64Guest", tools_ok=False, snapshots=1),
-    _VSpec("dc2-ci-01", 4, 8192, (120,), "rhel9_64Guest", cbt=False, rate_mib=4.0),
+    _VSpec("dc2-ci-01", 4, 8192, (120,), "rockylinux_64Guest", cbt=False, rate_mib=4.0),
 )
 
 
@@ -179,6 +211,9 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
         root = i == 0
         used = round(size * rng.uniform(0.25, 0.85), 1) if index % 5 != 4 else None
         kind = "image_root" if root and spec.image_root else "volume"
+        vtype = None
+        if kind == "volume":
+            vtype = "netapp-nfs" if spec.netapp else ("ceph-ssd" if root else "ceph-hdd")
         disks.append(
             Disk(
                 id=_stable_id("vol", f"{spec.name}-{i}"),
@@ -186,7 +221,8 @@ def _openstack_vm(spec: _Spec, rng: random.Random, index: int) -> VMRef:
                 size_gb=size,
                 used_gb=used,
                 bootable=root,
-                volume_type=None if kind == "image_root" else ("ceph-ssd" if root else "ceph-hdd"),
+                volume_type=vtype,
+                pool=_SOURCE_POOLS[vtype][0] if vtype else None,
                 device=f"/dev/vd{chr(ord('a') + i)}",
                 kind=kind,
                 multiattach=spec.multiattach and not root,
@@ -285,7 +321,7 @@ class FakeSourceProvider:
             "admin": True,
             "compute_microversion": "2.88",
             "ovn": True,
-            "volume_backends": ["overcloud@tripleo_ceph#ceph-ssd", "overcloud@tripleo_ceph#hdd"],
+            **_storage_caps(_SOURCE_POOLS.values()),
         }
 
     async def list_vms(self) -> list[VMRef]:
@@ -321,7 +357,7 @@ class FakeDestinationProvider:
             "admin": True,
             "compute_microversion": "2.95",
             "ovn": True,
-            "volume_backends": ["hostgroup@ceph-ssd#ssd", "hostgroup@ceph-hdd#hdd"],
+            **_storage_caps(_DESTINATION_POOLS),
         }
 
     async def inventory(self) -> DestinationInventory:
@@ -348,7 +384,7 @@ class FakeDestinationProvider:
                 "dc2-dmz": 1442,
             },
             flavors=flavors,
-            volume_types=["ceph-ssd", "ceph-hdd", "__DEFAULT__"],
+            volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
         )

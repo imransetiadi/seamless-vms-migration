@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import math
 import threading
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
@@ -11,11 +13,17 @@ from typing import Any, TypeVar
 from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
+from ..guest_os import identify
 from ..planning.preflight import DestinationInventory, SourceInventory
-from ..security.secrets import SecretNotFound, load_cloud_auth
+from ..security.secrets import SecretNotFound, openstack_cloud_entry
+from ..storage import storage_family
 from .base import ProviderError, missing_dependency
 
 log = logging.getLogger(__name__)
+
+#: openstacksdk per-request timeout and the ceiling of one provider call from the control plane
+PROVIDER_API_TIMEOUT_S = 60
+PROVIDER_CALL_TIMEOUT_S = 300.0
 T = TypeVar("T")
 
 _POWER = {
@@ -26,6 +34,17 @@ _POWER = {
     "SHELVED": "stopped",
     "SHELVED_OFFLOADED": "stopped",
     "ERROR": "error",
+    # a Nova task in flight: a stop or snapshot would fail (SDD §4.2, §9.3)
+    "BUILD": "transitioning",
+    "REBUILD": "transitioning",
+    "REBOOT": "transitioning",
+    "HARD_REBOOT": "transitioning",
+    "RESIZE": "transitioning",
+    "VERIFY_RESIZE": "transitioning",
+    "REVERT_RESIZE": "transitioning",
+    "MIGRATING": "transitioning",
+    "RESCUE": "transitioning",
+    "PASSWORD": "transitioning",
 }
 
 
@@ -41,9 +60,9 @@ def connect(provider: Provider, settings: Settings) -> Any:
     """Open an openstacksdk connection for ``provider`` (credentials from ``clouds.yaml``)."""
     openstack = _import_openstack()
     kwargs: dict[str, Any] = {"app_name": "seamless-migrate"}
-    if settings.clouds_yaml is not None and provider.cloud:
+    if provider.credentials_secret or (settings.clouds_yaml is not None and provider.cloud):
         try:
-            entry = load_cloud_auth(provider.cloud, settings)
+            entry = openstack_cloud_entry(provider, settings)
         except SecretNotFound as exc:
             raise ProviderError(f"{provider.id}: {exc}") from None
         kwargs.update(entry)
@@ -56,8 +75,12 @@ def connect(provider: Provider, settings: Settings) -> Any:
     if provider.region:
         kwargs["region_name"] = provider.region
     kwargs["verify"] = provider.verify_tls
+    if not provider.verify_tls:
+        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", provider.id)
     if provider.ca_cert_path:
         kwargs["cacert"] = provider.ca_cert_path
+    # a black-holed endpoint must not pin a worker thread forever (SDD §7)
+    kwargs["api_timeout"] = PROVIDER_API_TIMEOUT_S
     return openstack.connect(**kwargs)
 
 
@@ -108,12 +131,24 @@ class OpenStackProvider:
 
     async def _run(self, fn: Callable[..., T], *args: Any) -> T:
         try:
-            return await asyncio.to_thread(fn, *args)
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args), PROVIDER_CALL_TIMEOUT_S)
         except ProviderError:
             raise
+        except TimeoutError:
+            raise ProviderError(
+                f"{self.provider.id}: call timed out after {PROVIDER_CALL_TIMEOUT_S:g} s"
+            ) from None
         except Exception as exc:
             message = str(exc).strip() or type(exc).__name__
             raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+
+    def close(self) -> None:
+        """Close the cached connection (a replaced provider must not keep its session)."""
+        with self._lock:
+            conn, self._conn = self._conn, None
+        if conn is not None and callable(getattr(conn, "close", None)):
+            with contextlib.suppress(Exception):
+                conn.close()
 
     # -- protocol ----------------------------------------------------------------------------
     async def check(self) -> dict[str, Any]:
@@ -153,23 +188,34 @@ class OpenStackProvider:
             or "ovn" in str(_attr(a, "binary", default="")).lower()
             for a in agents
         )
-        backends: list[str] = []
+        storage: list[dict[str, Any]] = []
         if admin:
-            backends = sorted(
-                str(_attr(p, "name"))
-                for p in _try(lambda: list(conn.block_storage.backend_pools()), [])
-            )
+            for pool in _try(lambda: list(conn.block_storage.backend_pools()), []):
+                caps = _attr(pool, "capabilities", default={}) or {}
+                storage.append(
+                    {
+                        "pool": str(_attr(pool, "name")),
+                        "vendor": caps.get("vendor_name"),
+                        "protocol": caps.get("storage_protocol"),
+                        "family": storage_family(caps),
+                    }
+                )
+            storage.sort(key=lambda b: b["pool"])
         return {
             "admin": admin,
             "compute_microversion": microversion,
             "ovn": ovn,
-            "volume_backends": backends,
+            "volume_backends": [b["pool"] for b in storage],
+            "storage_backends": storage,
         }
 
     def _list_vms(self) -> list[VMRef]:
         conn = self._connection()
         ctx = _MapContext(conn)
-        return [ctx.server_to_vmref(s) for s in conn.compute.servers(details=True)]
+        servers = list(conn.compute.servers(details=True))
+        if len(servers) > 1:
+            ctx.prefetch()
+        return [ctx.server_to_vmref(s) for s in servers]
 
     def _get_vm(self, source_id: str) -> VMRef:
         conn = self._connection()
@@ -282,6 +328,24 @@ class OpenStackProvider:
         return None if server is None else str(_attr(server, "id"))
 
 
+def _os_hint(properties: Mapping[str, Any]) -> str | None:
+    """``os_distro`` + ``os_version`` of image properties, else their ``os_type``."""
+    distro = str(properties.get("os_distro") or "").strip()
+    version = str(properties.get("os_version") or "").strip()
+    if distro:
+        return f"{distro} {version}".strip()
+    return str(properties.get("os_type") or "").strip() or None
+
+
+def _best_os_type(*candidates: str | None) -> str | None:
+    """The most specific candidate: one that names a distribution, else the first one given."""
+    given = [c for c in candidates if c]
+    for candidate in given:
+        if identify(candidate).distro is not None:
+            return candidate
+    return given[0] if given else None
+
+
 class _MapContext:
     """Per-call caches used while mapping servers to :class:`VMRef`."""
 
@@ -289,6 +353,38 @@ class _MapContext:
         self.conn = conn
         self._projects: dict[str, str | None] = {}
         self._networks: dict[str, Any] = {}
+        self._images: dict[str, dict[str, Any]] = {}
+        # filled by prefetch(): one listing each instead of a call per volume and per server.
+        # None means "not prefetched" and the per-VM calls are used.
+        self._volumes: dict[str, Any] | None = None
+        self._ports: dict[str, list[Any]] | None = None
+
+    def prefetch(self) -> None:
+        """Lists the volumes and ports of the connection's scope once (inventory of many VMs).
+
+        Each listing is optional: a policy that refuses it (HTTP 403) or an old API falls back
+        to the per-VM calls, which is what a single-VM lookup always uses.
+        """
+        volumes = _try(lambda: list(self.conn.block_storage.volumes(details=True)), None)
+        if volumes is not None:
+            self._volumes = {str(_attr(v, "id")): v for v in volumes}
+        ports = _try(lambda: list(self.conn.network.ports()), None)
+        if ports is not None:
+            grouped: dict[str, list[Any]] = {}
+            for port in ports:
+                grouped.setdefault(str(_attr(port, "device_id", default="")), []).append(port)
+            self._ports = grouped
+
+    def volume(self, volume_id: str) -> Any:
+        if self._volumes is not None and volume_id in self._volumes:
+            return self._volumes[volume_id]
+        # not in the listing (e.g. a volume of another project attached by an admin)
+        return self.conn.block_storage.get_volume(volume_id)
+
+    def ports(self, server_id: str) -> list[Any]:
+        if self._ports is not None:
+            return self._ports.get(server_id, [])
+        return list(self.conn.network.ports(device_id=server_id))
 
     def project_name(self, project_id: str | None) -> str | None:
         if not project_id:
@@ -297,6 +393,19 @@ class _MapContext:
             project = _try(lambda: self.conn.identity.get_project(project_id), None)
             self._projects[project_id] = _attr(project, "name") if project is not None else None
         return self._projects[project_id]
+
+    def image_properties(self, image_id: str | None) -> dict[str, Any]:
+        """``os_distro``/``os_version``/``os_type`` of a Glance image (cached per call)."""
+        if not image_id:
+            return {}
+        if image_id not in self._images:
+            image = _try(lambda: self.conn.image.get_image(image_id), None)
+            self._images[image_id] = {
+                key: _attr(image, key)
+                for key in ("os_distro", "os_version", "os_type")
+                if image is not None and _attr(image, key)
+            }
+        return self._images[image_id]
 
     def network(self, network_id: str) -> Any:
         if network_id not in self._networks:
@@ -324,11 +433,12 @@ class _MapContext:
         image = _attr(server, "image", default={}) or {}
         image_booted = bool(_attr(image, "id"))
         root_device = _attr(server, "root_device_name", default="/dev/vda")
+        server_id = str(_attr(server, "id"))
         disks: list[Disk] = []
         if image_booted:
             disks.append(
                 Disk(
-                    id=f"{_attr(server, 'id')}-root",
+                    id=f"{server_id}-root",
                     name="root",
                     size_gb=int(disk_gb or 0),
                     bootable=True,
@@ -336,26 +446,65 @@ class _MapContext:
                     kind="image_root",
                 )
             )
-        for attachment in conn.compute.volume_attachments(server):
-            volume = conn.block_storage.get_volume(_attr(attachment, "volume_id"))
-            device = _attr(attachment, "device")
+        # flavor ephemeral (GiB) and swap (MiB) disks live on the hypervisor: they are copied
+        # like the root disk and count towards capacity and the estimate (SDD §4.2)
+        ephemeral_gb = int(_attr(flavor, "ephemeral", default=0) or 0)
+        swap_mb = int(_attr(flavor, "swap", default=0) or 0)
+        if ephemeral_gb > 0:
             disks.append(
                 Disk(
-                    id=str(_attr(volume, "id")),
-                    name=_attr(volume, "name"),
-                    size_gb=int(_attr(volume, "size", default=0)),
-                    bootable=not image_booted and device == root_device,
-                    volume_type=_attr(volume, "volume_type"),
-                    device=device,
-                    kind="volume",
-                    multiattach=_truthy(_attr(volume, "is_multiattach", "multiattach")),
-                    encrypted=_truthy(_attr(volume, "is_encrypted", "encrypted")),
+                    id=f"{server_id}-ephemeral",
+                    name="ephemeral",
+                    size_gb=ephemeral_gb,
+                    kind="ephemeral",
                 )
             )
+        if swap_mb > 0:
+            disks.append(
+                Disk(
+                    id=f"{server_id}-swap",
+                    name="swap",
+                    size_gb=math.ceil(swap_mb / 1024),
+                    kind="ephemeral",
+                )
+            )
+        volume_disks: list[tuple[Disk, bool]] = []
+        boot_meta: dict[str, Any] = {}
+        for attachment in conn.compute.volume_attachments(server):
+            volume = self.volume(str(_attr(attachment, "volume_id")))
+            device = _attr(attachment, "device")
+            disk = Disk(
+                id=str(_attr(volume, "id")),
+                name=_attr(volume, "name"),
+                size_gb=int(_attr(volume, "size", default=0)),
+                bootable=not image_booted and device == root_device,
+                volume_type=_attr(volume, "volume_type"),
+                device=device,
+                kind="volume",
+                multiattach=_truthy(_attr(volume, "is_multiattach", "multiattach")),
+                encrypted=_truthy(_attr(volume, "is_encrypted", "encrypted")),
+                pool=_attr(volume, "host"),
+            )
+            volume_disks.append((disk, _truthy(_attr(volume, "is_bootable", "bootable"))))
+            if disk.bootable or (
+                not boot_meta and _truthy(_attr(volume, "is_bootable", "bootable"))
+            ):
+                boot_meta = dict(_attr(volume, "volume_image_metadata", default={}) or {})
+        if not image_booted and volume_disks and not any(d.bootable for d, _ in volume_disks):
+            # Nova reports no root_device_name (or a device the attachment does not carry, e.g.
+            # virtio-scsi /dev/sda): fall back to Cinder's bootable flag, lowest device first
+            flagged = sorted((d for d, b in volume_disks if b), key=lambda d: d.device or "")
+            if flagged:
+                boot = flagged[0]
+                volume_disks = [
+                    (d.model_copy(update={"bootable": True}) if d is boot else d, b)
+                    for d, b in volume_disks
+                ]
+        disks.extend(d for d, _ in volume_disks)
         disks.sort(key=lambda d: (not d.bootable, d.device or ""))
 
         nics = []
-        for port in conn.network.ports(device_id=_attr(server, "id")):
+        for port in self.ports(server_id):
             network = self.network(_attr(port, "network_id"))
             nics.append(
                 Nic(
@@ -370,6 +519,13 @@ class _MapContext:
         metadata = {
             str(k): str(v) for k, v in (_attr(server, "metadata", default={}) or {}).items()
         }
+        image_props = self.image_properties(_attr(image, "id")) if image_booted else {}
+        os_type = _best_os_type(
+            metadata.get("os_type"),
+            _os_hint(metadata),
+            _os_hint(boot_meta),
+            _os_hint(image_props),
+        )
         project_id = _attr(server, "project_id")
         return VMRef(
             source_id=str(_attr(server, "id")),
@@ -381,7 +537,7 @@ class _MapContext:
             disks=disks,
             nics=nics,
             power_state=_POWER.get(str(_attr(server, "status", default="")).upper(), "unknown"),  # type: ignore[arg-type]
-            os_type=metadata.get("os_type") or metadata.get("os_distro"),
+            os_type=os_type,
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,
             flavor_extra_specs={str(k): str(v) for k, v in extra_specs.items()},

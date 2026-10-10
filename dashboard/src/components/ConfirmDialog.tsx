@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
 import { ErrorBanner } from './ErrorBanner';
 import { Button } from './Button';
 import { Modal } from './Modal';
@@ -16,8 +16,12 @@ export interface ConfirmDialogProps {
   children?: ReactNode;
   /** Additional validation owned by `children`. */
   canConfirm?: boolean;
+  /** Why Confirm is unavailable while `canConfirm` is false: the button stays focusable and says so (SDD §16). */
+  confirmReason?: string;
   pending?: boolean;
   error?: unknown;
+  /** Where focus goes on close when the control that opened the dialog may be gone (SDD §16). */
+  returnFocusRef?: RefObject<HTMLElement>;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -33,14 +37,17 @@ export function ConfirmDialog({
   requireText,
   children,
   canConfirm = true,
+  confirmReason,
   pending = false,
   error,
+  returnFocusRef,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
   const titleId = useId();
   const descriptionId = useId();
   const inputId = useId();
+  const mismatchId = useId();
   const [typed, setTyped] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -52,6 +59,15 @@ export function ConfirmDialog({
 
   const typedOk = requireText === undefined || typed === requireText;
   const ready = typedOk && canConfirm && !pending;
+  const mismatch = typed.length > 0 && !typedOk;
+  // an unavailable Confirm stays in the Tab order and says why (SDD §16); while pending it is busy instead
+  const blockedReason = pending
+    ? null
+    : !typedOk
+      ? `Type ${requireText} to confirm.`
+      : !canConfirm
+        ? (confirmReason ?? 'Complete the fields above first.')
+        : null;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -70,6 +86,7 @@ export function ConfirmDialog({
       role="alertdialog"
       dismissible={!pending}
       initialFocusRef={initialFocusRef}
+      returnFocusRef={returnFocusRef}
     >
       <form onSubmit={submit} className="flex flex-col gap-4 p-5" noValidate>
         <h2 id={titleId} className="text-lg font-semibold text-foreground">
@@ -84,7 +101,7 @@ export function ConfirmDialog({
         {requireText !== undefined && (
           <div>
             <label htmlFor={inputId} className="field-label">
-              Type <code className="rounded bg-muted px-1 py-0.5 text-foreground">{requireText}</code> to confirm
+              Type <code className="rounded-sm bg-muted px-1 py-0.5 text-foreground">{requireText}</code> to confirm
             </label>
             <input
               ref={inputRef}
@@ -95,9 +112,14 @@ export function ConfirmDialog({
               autoComplete="off"
               autoCapitalize="off"
               spellCheck={false}
-              aria-invalid={typed.length > 0 && !typedOk ? true : undefined}
+              aria-invalid={mismatch ? true : undefined}
+              aria-describedby={mismatch ? mismatchId : undefined}
             />
-            {typed.length > 0 && !typedOk && <p className="field-error">The text does not match yet.</p>}
+            {mismatch && (
+              <p id={mismatchId} className="field-error">
+                The text does not match yet.
+              </p>
+            )}
           </div>
         )}
         {error !== undefined && error !== null && <ErrorBanner error={error} title={`${confirmLabel} failed`} />}
@@ -111,7 +133,7 @@ export function ConfirmDialog({
             size="lg"
             variant={tone === 'danger' ? 'danger' : 'primary'}
             loading={pending}
-            disabled={!ready && !pending}
+            disabledReason={blockedReason}
           >
             {confirmLabel}
           </Button>

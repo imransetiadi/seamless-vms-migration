@@ -27,12 +27,12 @@ import yaml
 
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
-from ..domain.models import Mappings, Plan, Provider, SyncPass, utcnow
+from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
     SecretNotFound,
-    load_cloud_auth,
+    openstack_cloud_entry,
     remove_quietly,
     resolve,
     resolve_private_key,
@@ -54,8 +54,13 @@ TRANSIENT = re.compile(r"(?i)timeout|http 503|connection reset")
 STOP_TASK = re.compile(
     r"(?i)^TASK \[[^\]]*(?:stop the source server|perform workload stop|power[ _-]?off|shut ?down)"
 )
+#: Result lines of an Ansible task (default stdout callback).
+_RESULT_LINE = re.compile(r"^(ok|changed|failed|fatal|skipping|unreachable):")
 #: Private key for an existing conversion host (``ssh_key_secret``), written per run.
 CONVERSION_KEY_FILE = "conversion-ssh.key"
+#: Longest playbook output line read whole (a module result dict can be large); longer lines
+#: are read in pieces of this size.
+_OUTPUT_LINE_LIMIT = 2**22
 _RESOURCE = re.compile(r"^[a-z_]+$")
 ENV_PASSTHROUGH = frozenset(
     {
@@ -63,6 +68,19 @@ ENV_PASSTHROUGH = frozenset(
         "VIRTUAL_ENV", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
         "SSH_AUTH_SOCK",
+    }
+)  # fmt: skip
+#: ``ANSIBLE_*`` variables of the control plane's environment that never reach a playbook: they
+#: change what the default callback prints (the downtime clock and the failure detail parse it),
+#: write the full output elsewhere, or load an arbitrary ansible.cfg (SDD §10).
+ANSIBLE_ENV_DENIED = frozenset(
+    {
+        "ANSIBLE_VAULT_PASSWORD", "ANSIBLE_VAULT_PASSWORD_FILE", "ANSIBLE_CONFIG",
+        "ANSIBLE_VERBOSITY", "ANSIBLE_DEBUG", "ANSIBLE_LOG_PATH", "ANSIBLE_STDOUT_CALLBACK",
+        "ANSIBLE_CALLBACKS_ENABLED", "ANSIBLE_CALLBACK_WHITELIST", "ANSIBLE_CALLBACK_PLUGINS",
+        "ANSIBLE_DISPLAY_ARGS_TO_STDOUT", "ANSIBLE_DISPLAY_SKIPPED_HOSTS", "ANSIBLE_NOCOLOR",
+        "ANSIBLE_FORCE_COLOR", "ANSIBLE_HOME", "ANSIBLE_LOCAL_TEMP", "ANSIBLE_REMOTE_TEMP",
+        "ANSIBLE_RETRY_FILES_ENABLED",
     }
 )  # fmt: skip
 
@@ -223,7 +241,45 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
     if m.strategy == Strategy.cold and step == StepName.ROLLBACK:
         # the cold path records no destination server id: the rollback matches by name
         out["os_migrate_rollback_match_by_name"] = True
+    if step == StepName.ROLLBACK and ctx.options.get("delete_dest_volumes"):
+        # cleanup after a cancel: the destination volumes of the abandoned pass go too
+        out["os_migrate_rollback_delete_dest_volumes"] = True
     return out
+
+
+class _Unsafe(str):
+    """A string Ansible must read verbatim: written with the ``!unsafe`` tag."""
+
+
+class _AnsibleInputDumper(yaml.SafeDumper):
+    """``safe_dump`` that writes :class:`_Unsafe` strings as ``!unsafe`` scalars."""
+
+
+_AnsibleInputDumper.add_representer(
+    _Unsafe, lambda dumper, value: dumper.represent_scalar("!unsafe", str(value))
+)
+
+
+def _mark_unsafe(value: Any) -> Any:
+    if isinstance(value, str):
+        return _Unsafe(value)
+    if isinstance(value, dict):
+        return {key: _mark_unsafe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mark_unsafe(item) for item in value]
+    return value
+
+
+def ansible_yaml(data: Any, *, sort_keys: bool = True) -> str:
+    """YAML for the files Ansible reads (``-e @vars.yml``, ``-e @secrets.yml``, the inventory).
+
+    Ansible templates every string it reads, so a VM name (chosen by whoever runs the source VM),
+    a mapping value or a password holding ``{{ … }}`` or ``{% … %}`` would run as Jinja on the
+    control plane, where ``lookup('pipe', …)`` executes commands next to every cloud credential.
+    Every string value is written ``!unsafe`` so Ansible keeps it verbatim (SDD §7.2, Security.md
+    C1-05); mapping keys — the variable names — stay plain.
+    """
+    return yaml.dump(_mark_unsafe(data), Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
 
 
 def _inventory(conversion_host: dict[str, Any] | None = None) -> str:
@@ -239,7 +295,7 @@ def _inventory(conversion_host: dict[str, Any] | None = None) -> str:
     }
     if conversion_host:
         doc["conversion_host"] = {"hosts": conversion_host}
-    return yaml.safe_dump(doc, sort_keys=False)
+    return ansible_yaml(doc, sort_keys=False)
 
 
 def conversion_key_path(ctx: StepContext) -> Path | None:
@@ -281,7 +337,7 @@ def build_secret_vars(
             if not source.credentials_secret:
                 raise SecretNotFound(f"{source.id} has no credentials_secret")
             creds = resolve(source.credentials_secret, settings)
-            entry = load_cloud_auth(destination.cloud or "", settings)
+            entry = openstack_cloud_entry(destination, settings)
             dst_cloud = {"auth": entry["auth"]}
             for key in ("region_name", "interface", "identity_api_version", "auth_type"):
                 if entry.get(key):
@@ -298,7 +354,7 @@ def build_secret_vars(
             return out
         out = {}
         for side, provider in (("src", source), ("dst", destination)):
-            entry = load_cloud_auth(provider.cloud or "", settings)
+            entry = openstack_cloud_entry(provider, settings)
             out[f"os_migrate_{side}_auth"] = entry["auth"]
             if entry.get("auth_type"):
                 out[f"os_migrate_{side}_auth_type"] = entry["auth_type"]
@@ -424,8 +480,16 @@ class AnsibleExecutor:
         playbooks = self._playbooks(step, strategy, osm)
         if not playbooks:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
+        if step == StepName.CUTOVER:
+            await self._refuse_name_collision(ctx)
+        passes_before = 0
+        if strategy == Strategy.warm:
+            state_before = await asyncio.to_thread(
+                _read_warm_state, osm, ctx.migration.vm.source_id
+            )
+            passes_before = len((state_before or {}).get("passes") or [])
         started = utcnow()
-        await self._execute(
+        stop_skipped = await self._execute(
             rdir,
             osm,
             build_vars(step, ctx),
@@ -436,10 +500,49 @@ class AnsibleExecutor:
             ctx,
             effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
         )
-        return await self._result(step, strategy, ctx, osm, started)
+        if stop_skipped and strategy == Strategy.cold:
+            # the cold role skips every task (the stop included) when the destination already
+            # has a server with the workload's name: nothing was migrated
+            raise PermanentStepError(
+                f"import_workloads.yml skipped {ctx.migration.vm.name}: the destination already "
+                "has a server with that name and nothing was migrated; delete or rename it, "
+                "or roll the migration back"
+            )
+        return await self._result(step, strategy, ctx, osm, started, passes_before)
+
+    async def _refuse_name_collision(self, ctx: StepContext) -> None:
+        """Before the first cutover attempt, refuse a destination server that carries the VM's name.
+
+        The cold role would skip the migration (and report success), the kit would fail after
+        powering the VM off, and a later rollback by name would delete a server this migration
+        never created. A retry after a stop (``downtime_started_at`` set) or with a recorded
+        destination server is a resume, not a collision.
+        """
+        m = ctx.migration
+        if m.destination_server_id or m.downtime_started_at is not None:
+            return
+        try:
+            existing = await self.providers.get(ctx.destination).find_server(m.vm.name)
+        except ProviderError as exc:
+            # an unanswered lookup is not "no such server": refuse before anything is stopped
+            # (a duplicate name is a lookup error too)
+            raise TransientStepError(
+                f"could not check the destination for a server named {m.vm.name}: {exc}"
+            ) from exc
+        if existing:
+            raise PermanentStepError(
+                f"a server named {m.vm.name} already exists in the destination ({existing}) and "
+                "this migration did not create it; delete or rename it before the cutover"
+            )
 
     async def _result(
-        self, step: StepName, strategy: Strategy, ctx: StepContext, osm: Path, started: Any
+        self,
+        step: StepName,
+        strategy: Strategy,
+        ctx: StepContext,
+        osm: Path,
+        started: Any,
+        passes_before: int = 0,
     ) -> StepResult:
         m = ctx.migration
         if step == StepName.ROLLBACK:
@@ -448,9 +551,16 @@ class AnsibleExecutor:
             state = await asyncio.to_thread(_read_warm_state, osm, m.vm.source_id)
             if not state or not state.get("passes"):
                 raise PermanentStepError("the warm state file has no recorded pass")
+            if len(state["passes"]) <= passes_before:
+                # the role skipped the workload (prelim reported no change): re-reporting the
+                # previous pass would feed a phantom pass into convergence and the estimate
+                raise PermanentStepError(
+                    f"the playbook recorded no new pass for {m.vm.name} (the workload was "
+                    "skipped); check the destination for a same-named server"
+                )
             last = state["passes"][-1]
             sync_pass = SyncPass(
-                number=int(last.get("number") or len(m.sync_passes) + 1),
+                number=int(last.get("number") or next_pass_number(m)),
                 kind=SyncPassKind(last.get("kind") or "delta"),
                 started_at=last.get("started_at") or started,
                 ended_at=last.get("ended_at") or utcnow(),
@@ -467,7 +577,7 @@ class AnsibleExecutor:
             return StepResult(destination_server_id=await self._lookup_server(ctx))
         # vmware_warm CBT passes: the kit does not report byte counts to the control plane
         ended = utcnow()
-        number = len(m.sync_passes) + 1
+        number = next_pass_number(m)
         return StepResult(
             sync_pass=SyncPass(
                 number=number,
@@ -486,10 +596,16 @@ class AnsibleExecutor:
             return None
 
     async def _vmware_rollback(self, ctx: StepContext) -> StepResult:
-        vm = ctx.migration.vm
+        m = ctx.migration
+        vm = m.vm
         try:
             dst = self.providers.get(ctx.destination)
-            server_id = ctx.migration.destination_server_id or await dst.find_server(vm.name)
+            server_id = m.destination_server_id
+            if server_id is None and m.downtime_started_at is not None:
+                # the kit records nothing in the control plane before the cutover powers the
+                # VM off; a same-named server after that point was created by this migration
+                # (_refuse_name_collision ruled out a pre-existing one before the attempt)
+                server_id = await dst.find_server(vm.name)
             if server_id:
                 await dst.delete_server(server_id)
             await self.providers.get(ctx.source).power_on(vm.source_id)
@@ -531,7 +647,7 @@ class AnsibleExecutor:
         env = {
             k: v
             for k, v in os.environ.items()
-            if k in ENV_PASSTHROUGH or (k.startswith("ANSIBLE_") and k != "ANSIBLE_VAULT_PASSWORD")
+            if k in ENV_PASSTHROUGH or (k.startswith("ANSIBLE_") and k not in ANSIBLE_ENV_DENIED)
         }
         home = Path(self.settings.data_dir) / ".ansible"
         env.update(
@@ -539,8 +655,13 @@ class AnsibleExecutor:
                 "ANSIBLE_COLLECTIONS_PATH": self._collections_path(),
                 "ANSIBLE_HOME": str(home),
                 "ANSIBLE_LOCAL_TEMP": str(home / "tmp"),
+                # modules of the local connection run from remote_tmp, which Ansible derives from
+                # the passwd home of the UID (/opt/app-root/src in the image: not writable)
+                "ANSIBLE_REMOTE_TEMP": str(home / "tmp"),
                 "ANSIBLE_RETRY_FILES_ENABLED": "0",
                 "ANSIBLE_NOCOLOR": "1",
+                # the downtime clock reads the stop task's result line: never hide skipped hosts
+                "ANSIBLE_DISPLAY_SKIPPED_HOSTS": "True",
                 "ANSIBLE_HOST_KEY_CHECKING": env.get("ANSIBLE_HOST_KEY_CHECKING", "False"),
                 "PYTHONUNBUFFERED": "1",
             }
@@ -558,7 +679,8 @@ class AnsibleExecutor:
         playbooks: Sequence[_Playbook],
         ctx: StepContext | None,
         mappings: Mappings | None,
-    ) -> None:
+    ) -> bool:
+        """Run the playbooks; True when the source-stop task of one of them was skipped."""
         vars_path = workdir / "vars.yml"
         secrets_path = workdir / "secrets.yml"
         inventory_path = workdir / "inventory.yml"
@@ -569,10 +691,10 @@ class AnsibleExecutor:
 
         def prepare() -> None:
             osm.mkdir(parents=True, exist_ok=True, mode=0o700)
-            write_secret_file(vars_path, yaml.safe_dump(variables, sort_keys=True))
+            write_secret_file(vars_path, ansible_yaml(variables))
             write_secret_file(inventory_path, inventory)
             secret_vars = build_secret_vars(source, destination, self.settings)
-            write_secret_file(secrets_path, yaml.safe_dump(secret_vars, sort_keys=True))
+            write_secret_file(secrets_path, ansible_yaml(secret_vars))
             if key_path is not None:
                 secret = destination.conversion_host.ssh_key_secret  # type: ignore[union-attr]
                 try:
@@ -580,28 +702,53 @@ class AnsibleExecutor:
                 except SecretNotFound as exc:
                     raise PermanentStepError(f"conversion host key unavailable: {exc}") from None
 
+        stop_skipped = False
         try:
             await asyncio.to_thread(prepare)
             env = await asyncio.to_thread(self._env)
             for playbook in playbooks:
-                await self._run_playbook(
+                stop_skipped |= await self._run_playbook(
                     playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
                 )
-                if playbook.name == "export_workloads.yml" and mappings is not None:
-                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings)
+                if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
+                    planned = ctx.migration.vm.source_id if ctx is not None else None
+                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings, planned)
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
+        return stop_skipped
 
     @staticmethod
-    def _rewrite_workloads(osm: Path, mappings: Mappings) -> None:
+    def _rewrite_workloads(
+        osm: Path, mappings: Mappings | None, planned_id: str | None = None
+    ) -> None:
+        """Keep only the planned server of the export and apply the mappings (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not any(r.get("type") == SERVER_TYPE for r in doc.get("resources") or []):
+        resources = doc.get("resources") or []
+        servers = [r for r in resources if r.get("type") == SERVER_TYPE]
+        if not servers:
             raise PermanentStepError("the exported workloads.yml contains no server")
-        path.write_text(yaml.safe_dump(apply_mappings(doc, mappings), sort_keys=False))
+        if planned_id is not None:
+            # os-migrate exports by name: a same-named server of the project that is not in the
+            # plan must never be imported, stopped or migrated
+            def server_id(resource: dict[str, Any]) -> Any:
+                return (resource.get("_info") or {}).get("id")
+
+            if not any(server_id(r) == planned_id for r in servers):
+                exported = ", ".join(str(server_id(r)) for r in servers)
+                raise PermanentStepError(
+                    f"the export holds no server with the planned id {planned_id} "
+                    f"(exported: {exported})"
+                )
+            doc["resources"] = [
+                r for r in resources if r.get("type") != SERVER_TYPE or server_id(r) == planned_id
+            ]
+        if mappings is not None:
+            doc = apply_mappings(doc, mappings)
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
     def _playbook_arg(self, name: str) -> str:
         if name.endswith(".yml"):
@@ -618,9 +765,12 @@ class AnsibleExecutor:
         ctx: StepContext | None,
         osm: Path,
         env: dict[str, str],
-    ) -> None:
+    ) -> bool:
+        """Run one playbook; True when its source-stop task was seen but skipped."""
         name = playbook.name
         watch_stop = playbook.stops_source and ctx is not None
+        stop_seen_at: Any = None  # the stop task started; its result line confirms it ran
+        stop_skipped = False
         cmd = [
             self.settings.ansible_playbook,
             "-i", str(inventory),
@@ -639,7 +789,7 @@ class AnsibleExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
-                limit=2**20,
+                limit=_OUTPUT_LINE_LIMIT,
             )
         except OSError as exc:
             raise PermanentStepError(f"cannot run {self.settings.ansible_playbook}: {exc}") from exc
@@ -647,8 +797,16 @@ class AnsibleExecutor:
         lines: deque[str] = deque(maxlen=400)
         try:
             assert proc.stdout is not None
-            while True:
-                raw = await proc.stdout.readline()
+            eof = False
+            while not eof:
+                try:
+                    raw = await proc.stdout.readuntil(b"\n")
+                except asyncio.IncompleteReadError as exc:
+                    raw, eof = exc.partial, True
+                except asyncio.LimitOverrunError:
+                    # a line above the stream limit (a huge module result) is read in pieces
+                    # instead of failing the step; readline() would discard it
+                    raw = await proc.stdout.read(_OUTPUT_LINE_LIMIT)
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip()
@@ -656,10 +814,27 @@ class AnsibleExecutor:
                 if ctx is not None and line.strip():
                     await ctx.log(line[:2000])
                 if watch_stop and STOP_TASK.match(line):
-                    # SDD §7.2: the downtime clock starts when the source-stop task starts
+                    # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
-                    await ctx.mark_downtime_start()  # type: ignore[union-attr]
+                    stop_seen_at = utcnow()
+                elif stop_seen_at is not None and line.startswith("TASK ["):
+                    # …the next task began without a result that ran: the stop was skipped
+                    stop_seen_at = None
+                    stop_skipped = True
+                elif stop_seen_at is not None and _RESULT_LINE.match(line):
+                    # …but only once its result line shows it ran (a skipped task, e.g. with
+                    # data_copy: false, prints the TASK header too and stops nothing); with a
+                    # loop, keep waiting while items are skipped
+                    if not line.startswith("skipping:"):
+                        await ctx.mark_downtime_start(at=stop_seen_at)  # type: ignore[union-attr]
+                        stop_seen_at = None
+                    elif "(item=" not in line:
+                        stop_seen_at = None
+                        stop_skipped = True
             returncode = await proc.wait()
+            if stop_seen_at is not None and ctx is not None:
+                # the playbook ended without a result line for the task: assume it ran
+                await ctx.mark_downtime_start(at=stop_seen_at)
         finally:
             if tail is not None:
                 tail.cancel()
@@ -673,7 +848,13 @@ class AnsibleExecutor:
                 (ln for ln in reversed(lines) if "fatal" in ln.lower() or "error" in ln.lower()),
                 lines[-1] if lines else "",
             )
+            if ctx is None:
+                # prestage has no migration to log to: keep the tail in the service log
+                log.warning(
+                    "%s failed (exit %s); last lines:\n%s", name, returncode, output[-4000:]
+                )
             raise classify_failure(output)(f"{name} failed (exit {returncode}): {detail[:500]}")
+        return stop_skipped
 
     @staticmethod
     async def _stop_process(proc: asyncio.subprocess.Process) -> None:

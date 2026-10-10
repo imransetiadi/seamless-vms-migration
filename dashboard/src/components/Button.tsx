@@ -1,15 +1,20 @@
 import { LoaderCircle, type LucideIcon } from 'lucide-react';
-import { forwardRef, useId, type ButtonHTMLAttributes, type MouseEvent } from 'react';
+import { forwardRef, useEffect, useId, useState, type ButtonHTMLAttributes, type KeyboardEvent, type MouseEvent } from 'react';
 import { buttonClassName, type ButtonSize, type ButtonVariant } from '../lib/buttonStyles';
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  /**
+   * While its request runs the button shows a spinner, is busy and `aria-disabled`, and ignores presses;
+   * it is never natively disabled, which would drop keyboard focus to the page (SDD §16).
+   */
   loading?: boolean;
   icon?: LucideIcon;
   /**
    * When set, the button is disabled but stays focusable (`aria-disabled`) and exposes the reason
-   * to assistive technology and as a tooltip, so operators can discover why an action is unavailable.
+   * to assistive technology, as a tooltip, and in a short note under it when it is clicked or tapped
+   * (touch screens have no hover, SDD §16), so operators can discover why an action is unavailable.
    */
   disabledReason?: string | null;
 }
@@ -26,6 +31,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
     disabled,
     type = 'button',
     onClick,
+    onBlur,
+    onKeyDown,
     title,
     ...rest
   },
@@ -33,9 +40,27 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
 ) {
   const reasonId = useId();
   const softDisabled = Boolean(disabledReason);
+  // where the note about an unavailable action shows, under the button (viewport coordinates)
+  const [note, setNote] = useState<{ top: number; left: number } | null>(null);
+  useEffect(() => {
+    if (!note) return;
+    const hide = () => setNote(null);
+    const timer = window.setTimeout(hide, 4000);
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('resize', hide);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('scroll', hide, true);
+      window.removeEventListener('resize', hide);
+    };
+  }, [note]);
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     if (softDisabled || loading) {
       event.preventDefault();
+      if (softDisabled) {
+        const rect = event.currentTarget.getBoundingClientRect();
+        setNote({ top: rect.bottom + 6, left: Math.max(8, Math.min(rect.left, window.innerWidth - 296)) });
+      }
       return;
     }
     onClick?.(event);
@@ -47,11 +72,19 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       <button
         ref={ref}
         type={type}
-        disabled={disabled || (loading && !softDisabled)}
-        aria-disabled={softDisabled || undefined}
+        disabled={disabled}
+        aria-disabled={softDisabled || loading || undefined}
         aria-busy={loading || undefined}
         title={softDisabled ? (disabledReason ?? undefined) : title}
         onClick={handleClick}
+        onBlur={(event) => {
+          setNote(null);
+          onBlur?.(event);
+        }}
+        onKeyDown={(event: KeyboardEvent<HTMLButtonElement>) => {
+          if (event.key === 'Escape') setNote(null);
+          onKeyDown?.(event);
+        }}
         {...rest}
         aria-describedby={describedBy}
         className={buttonClassName(variant, size, className)}
@@ -64,7 +97,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
         {children}
       </button>
       {softDisabled && (
-        <span id={reasonId} className="sr-only">
+        <span
+          id={reasonId}
+          role={note ? 'note' : undefined}
+          className={note ? 'disabled-reason' : 'sr-only'}
+          style={note ? { top: note.top, left: note.left } : undefined}
+        >
           {disabledReason}
         </span>
       )}

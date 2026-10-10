@@ -25,16 +25,25 @@ SCRIPT = textwrap.dedent(
     from pathlib import Path
     import yaml
 
+    class Loader(yaml.SafeLoader):
+        pass  # like Ansible's loader: a !unsafe scalar is a plain (never templated) string
+
+    Loader.add_constructor("!unsafe", lambda loader, node: loader.construct_scalar(node))
+
     argv = sys.argv[1:]
-    record = {{"argv": argv, "cwd": os.getcwd(), "env_keys": sorted(os.environ)}}
+    record = {{"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
+              "env_keys": sorted(os.environ)}}
     inventory = argv[argv.index("-i") + 1]
     playbook = argv[argv.index("-i") + 2]
     files = [a[1:] for a in argv if a.startswith("@")]
     record["playbook"] = os.path.basename(playbook) if playbook.endswith(".yml") else playbook
     record["inventory"] = Path(inventory).read_text()
     merged = {{}}
+    record["raw"] = {{"inventory.yml": record["inventory"]}}
     for f in files:
-        data = yaml.safe_load(Path(f).read_text()) or {{}}
+        text = Path(f).read_text()
+        record["raw"][os.path.basename(f)] = text
+        data = yaml.load(text, Loader=Loader) or {{}}
         if os.path.basename(f) == "secrets.yml":
             record["secret_keys"] = sorted(data)
             record["secrets_mode"] = oct(stat.S_IMODE(os.stat(f).st_mode))
@@ -54,6 +63,9 @@ SCRIPT = textwrap.dedent(
     base = record["playbook"]
     print("PLAY [migrator] ****")
     print("TASK [" + base + "] ****")
+    long_line = int(os.environ.get("ANSIBLE_FAKE_LONG_LINE", "0"))
+    if long_line:
+        print("ok: [localhost] => " + "x" * long_line)
     sys.stdout.flush()
 
     if base == "export_workloads.yml":
@@ -76,6 +88,12 @@ SCRIPT = textwrap.dedent(
             "_info": {{"id": server_id}},
             "_migration_params": {{"boot_volume_params": {{"volume_type": "ceph-ssd"}}}},
         }}]}}
+        twin = os.environ.get("ANSIBLE_FAKE_TWIN_ID")
+        if twin:
+            # os-migrate exports by name: another server of the project with the same name
+            other = json.loads(json.dumps(doc["resources"][0]))
+            other["_info"]["id"] = twin
+            doc["resources"].append(other)
         (osm / "workloads.yml").write_text(yaml.safe_dump(doc))
 
     stop_task = {{
@@ -88,7 +106,8 @@ SCRIPT = textwrap.dedent(
         stop_task = "os_migrate.vmware_migration_kit.migration : Power off the VM"
     if stop_task:
         print("TASK [" + stop_task + "] ****")
-        print("ok: [localhost]")
+        skipped = os.environ.get("ANSIBLE_FAKE_STOP_SKIPPED")
+        print("skipping: [localhost]" if skipped else "ok: [localhost]")
         sys.stdout.flush()
         Path(os.environ.get("ANSIBLE_FAKE_STOP_MARK", "/dev/null")).write_text(str(time.time()))
 
@@ -110,11 +129,13 @@ SCRIPT = textwrap.dedent(
         n = len(state["passes"]) + 1
         kind = "final" if base == "import_workloads_cutover.yml" else (
             "full" if n == 1 else "delta")
-        state["passes"].append({{"number": n, "kind": kind,
-            "started_at": "2026-10-08T10:00:00Z", "ended_at": "2026-10-08T10:05:00Z",
-            "bytes_scanned": 1000, "bytes_changed": 1000 // n, "bytes_transferred": 900 // n,
-            "duration_s": 300.0 / n}})
-        if kind == "final":
+        skipped_pass = bool(os.environ.get("ANSIBLE_FAKE_SKIP_PASS"))  # the role skipped it
+        if not skipped_pass:
+            state["passes"].append({{"number": n, "kind": kind,
+                "started_at": "2026-10-08T10:00:00Z", "ended_at": "2026-10-08T10:05:00Z",
+                "bytes_scanned": 1000, "bytes_changed": 1000 // n,
+                "bytes_transferred": 900 // n, "duration_s": 300.0 / n}})
+        if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))
 
@@ -122,6 +143,12 @@ SCRIPT = textwrap.dedent(
     if failure and (os.environ.get("ANSIBLE_FAKE_FAIL_ON", base) == base):
         print("fatal: [localhost]: FAILED! => " + failure)
         sys.exit(2)
+    # a successful import/cutover created the destination server (a skipped stop means the
+    # role skipped the workload and created nothing)
+    created = os.environ.get("ANSIBLE_FAKE_CREATED")
+    if created and stop_task and not os.environ.get("ANSIBLE_FAKE_STOP_SKIPPED"):
+        with open(created, "a") as fh:
+            fh.write(name + "\\n")
     print("PLAY RECAP ****")
     """
 )

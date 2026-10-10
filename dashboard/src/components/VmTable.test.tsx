@@ -30,7 +30,7 @@ describe('VmTable', () => {
   });
 
   it('filters by free text across name, project, OS and tags', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'db-');
@@ -43,7 +43,7 @@ describe('VmTable', () => {
   });
 
   it('filters by power state, project and readiness', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.selectOptions(screen.getByLabelText('Power state'), 'stopped');
@@ -59,7 +59,7 @@ describe('VmTable', () => {
   });
 
   it('shows an empty state with a way back when nothing matches', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
 
     await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'web');
@@ -69,6 +69,20 @@ describe('VmTable', () => {
 
     await user.click(screen.getByRole('button', { name: 'Clear filters' }));
     expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
+  it('keeps the focus in the filters when Clear filters goes away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+    const search = screen.getByRole('searchbox', { name: /search vms/i });
+    // the toolbar's Clear filters
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
+    // the empty state's Clear filters
+    await user.type(search, 'no-such-vm');
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
   });
 
   it('shows readiness flags as text, including VMware CBT state', () => {
@@ -82,7 +96,7 @@ describe('VmTable', () => {
   });
 
   it('sorts by disk size with aria-sort', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
     const diskHeader = screen.getByRole('columnheader', { name: /disks/i });
 
@@ -94,7 +108,7 @@ describe('VmTable', () => {
   });
 
   it('supports selecting VMs for a plan', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     const onSelectedChange = vi.fn();
     render(
       <VmTable vms={openstackVms} providerKind="openstack" selected={new Set(['os-0a11'])} onSelectedChange={onSelectedChange} />,
@@ -107,5 +121,87 @@ describe('VmTable', () => {
     await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'db-');
     await user.click(screen.getByRole('checkbox', { name: /select all 3 shown/i }));
     expect(onSelectedChange).toHaveBeenLastCalledWith(new Set(['os-0a11', 'os-0d51', 'os-0d52', 'os-0d53']));
+  });
+
+  it('says the header checkbox selects every matching VM, also those not shown yet', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onSelectedChange = vi.fn();
+    const table = (selected: Set<string>) => (
+      <VmTable vms={openstackVms} providerKind="openstack" selected={selected} onSelectedChange={onSelectedChange} pageSize={2} />
+    );
+    const { rerender } = render(table(new Set()));
+    const total = openstackVms.length;
+    // two rows are rendered of all the VMs: the status and the checkbox say so
+    expect(bodyRows()).toHaveLength(2);
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of ${total} VMs, 0 selected`);
+    await user.click(screen.getByRole('checkbox', { name: `Select all ${total} matching VMs, 2 shown` }));
+    const chosen = onSelectedChange.mock.lastCall?.[0] as Set<string>;
+    expect(chosen.size).toBe(total);
+    rerender(table(chosen));
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of ${total} VMs, ${total} selected (${total - 2} not shown)`);
+
+    // with a filter, the counts are those of the matching VMs (three db- VMs, two of them shown)
+    await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'db-');
+    expect(screen.getByRole('status')).toHaveTextContent(`Showing 2 of 3 matching VMs (${total} in total)`);
+    expect(screen.getByRole('checkbox', { name: 'Select all 3 matching VMs, 2 shown' })).toBeInTheDocument();
+  });
+
+  it('moves focus to the table when its last Show more button goes, never to the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" pageSize={2} />);
+    let clicks = 0;
+    for (let more = screen.queryByRole('button', { name: /^show \d+ more$/i }); more; more = screen.queryByRole('button', { name: /^show \d+ more$/i })) {
+      await user.click(more);
+      clicks += 1;
+      const still = screen.queryByRole('button', { name: /^show \d+ more$/i });
+      // while the button stays, it keeps the focus; once it goes, the table takes it
+      expect(still ?? screen.getByRole('table')).toHaveFocus();
+    }
+    expect(clicks).toBeGreaterThan(1);
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
+  it('names each guest OS, flags legacy releases and filters by OS', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+    const row = (name: string) => bodyRows().find((r) => within(r).getAllByRole('rowheader')[0]?.textContent === name)!;
+    expect(row('web-02')).toHaveTextContent('Ubuntu 22.04');
+    expect(row('report-gen-01')).toHaveTextContent('Windows Server 2022');
+    // legacy releases carry the readiness hint from the catalog (SDD §9.5)
+    expect(within(row('jump-host-01')).getByTitle(/GUEST_OS_LEGACY: Ubuntu 18\.04/)).toBeInTheDocument();
+    expect(within(row('legacy-rhel6-app')).getByTitle(/GUEST_OS_LEGACY: RHEL 6/)).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    expect(rowNames().sort()).toEqual(['ad-dc-01', 'report-gen-01']);
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'legacy');
+    expect(rowNames().sort()).toEqual(['jump-host-01', 'legacy-rhel6-app']);
+  });
+
+  it('clears the guest OS filter with the other filters', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+
+    // the OS filter alone is an active filter: the way back is offered and resets it
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    expect(bodyRows()).toHaveLength(2);
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByLabelText('Guest OS')).toHaveValue('all');
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+
+    // the empty state's Clear filters resets it too, instead of leaving the table empty
+    await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
+    await user.type(screen.getByRole('searchbox', { name: /search vms/i }), 'web');
+    expect(screen.getByText('No VMs match these filters')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
+  it('warns about guests virt-v2v does not support on VMware sources', () => {
+    render(<VmTable vms={vmwareVms} providerKind="vmware" />);
+    const legacy = bodyRows().find((r) => r.textContent?.includes('vm-legacy-win2008'))!;
+    expect(within(legacy).getByTitle(/GUEST_CONVERSION_UNSUPPORTED/)).toBeInTheDocument();
+    const ubuntu = bodyRows().find((r) => r.textContent?.includes('vm-hr-portal'))!;
+    expect(ubuntu).toHaveTextContent('Ubuntu 24.04');
+    expect(within(ubuntu).getByTitle(/GUEST_CONVERSION_UNVERIFIED/)).toBeInTheDocument();
   });
 });

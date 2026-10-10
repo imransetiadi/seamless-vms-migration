@@ -1,14 +1,14 @@
-# gitleaks configuration (Security.md §12): the default rules plus paths that are
-# never secrets - git-ignored generated files and Python bytecode caches.
+# gitleaks configuration for git, staged and CI scans (Security.md §12, QASuite S-17): the default
+# rules with nothing allowlisted where a real secret could live, so a force-added .env, tokens.yaml or
+# clouds.yaml is reported (seamless/tests/test_build_context.py). Synthetic test fixtures carry an
+# inline `gitleaks:allow`; the commits that introduced them before that are fingerprinted in
+# .gitleaksignore. Working-tree scans (`gitleaks dir`) use .gitleaks-tree.toml, which also skips the
+# git-ignored secret files a checkout legitimately holds.
 [extend]
 useDefault = true
 
 [allowlist]
-description = "git-ignored local secrets files and bytecode caches"
+description = "Python bytecode caches: git-ignored copies of the test fixtures"
 paths = [
-  'deploy/compose/\.env$',
-  'deploy/compose/tokens\.yaml$',
   '__pycache__/',
-  # redaction test fixtures: fake tokens that the redactor must strip (seamless/tests/test_memory.py)
-  'seamless/tests/test_memory\.py$',
 ]

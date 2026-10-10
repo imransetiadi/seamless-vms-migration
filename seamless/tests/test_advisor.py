@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -232,6 +233,23 @@ async def test_verification_blocked_console_sets_review_required():
     verify_args = [c for c in session.calls if c[0] == "jev_verify"][0][1]
     assert [e["id"] for e in verify_args["evidence"]] == ["checks"], "console dropped"
     assert verify_args["claims"] == VERIFICATION_CLAIMS
+
+
+async def test_verification_redacts_the_console_before_screening():
+    """SDD §13.4/§14.2 (Security.md R-08): secrets never reach jev_screen either."""
+    advisor, session = advisor_for({"screen": {"recommendation": {"action": "pass"}}})
+    console = (
+        "cloud-init: OS_PASSWORD=hunter2 set\n"
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJ4IjoxfQ.c2ln\n"
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\nweb-01 login:"
+    )
+    await advisor.review_verification(make_vm(name="web-01"), result(console=console))
+    for name in ("jev_screen", "jev_verify"):
+        [args] = [c[1] for c in session.calls if c[0] == name]
+        text = json.dumps(args)
+        for canary in ("hunter2", "eyJhbGciOiJIUzI1NiJ9", "MIIEow"):
+            assert canary not in text, (name, canary)
+        assert "login:" in text
 
 
 async def test_verification_contradiction_sets_review_never_flips_pass():

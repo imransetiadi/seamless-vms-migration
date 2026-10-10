@@ -9,12 +9,14 @@ const planWith = (status: PlanStatus): Plan => ({ ...base, status });
 const ready: Migration[] = fx.migrations.filter((m) => m.plan_id === base.id);
 
 const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
-  draft: { validate: true, waves: true, start: false, pause: false },
-  validated: { validate: true, waves: true, start: true, pause: false },
-  running: { validate: false, waves: false, start: false, pause: true },
-  paused: { validate: true, waves: false, start: true, pause: false },
-  completed: { validate: false, waves: false, start: false, pause: false },
-  failed: { validate: true, waves: false, start: false, pause: false },
+  draft: { validate: true, waves: true, start: false, pause: false, edit: true },
+  validated: { validate: true, waves: true, start: true, pause: false, edit: true },
+  running: { validate: false, waves: false, start: false, pause: true, edit: false },
+  // the API plans waves on a paused plan too, returning it to draft (SDD §12)
+  paused: { validate: true, waves: true, start: true, pause: false, edit: false },
+  completed: { validate: false, waves: false, start: false, pause: false, edit: false },
+  // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
+  failed: { validate: true, waves: false, start: true, pause: false, edit: false },
 };
 
 describe('planActions', () => {
@@ -35,6 +37,25 @@ describe('planActions', () => {
     const start = planActions(planWith('validated'), 'operator', blocked).start;
     expect(start.enabled).toBe(false);
     expect(start.reason).toMatch(/1 migration is blocked/);
+  });
+
+  it('starts a failed plan again only when no migration is blocked, like a validated one (SDD §8)', () => {
+    const blocked = ready.map((m, i) => (i === 0 ? { ...m, phase: 'blocked' as const } : m));
+    const start = planActions(planWith('failed'), 'operator', blocked).start;
+    expect(start.enabled).toBe(false);
+    expect(start.reason).toMatch(/1 migration is blocked/);
+  });
+
+  it('refuses to edit or re-plan the waves while a migration is in flight, naming it (SDD §12)', () => {
+    const waiting = ready.map((m, i) => (i === 0 ? { ...m, phase: 'awaiting_cutover' as const } : m));
+    const actions = planActions(planWith('validated'), 'operator', waiting);
+    expect(actions.edit.enabled).toBe(false);
+    expect(actions.edit.reason).toContain(waiting[0]!.vm.name);
+    expect(actions.waves.enabled).toBe(false);
+    expect(actions.waves.reason).toMatch(/in flight/i);
+    // a failed migration whose source runs keeps the plan editable: fix the cause, then retry
+    const failed = ready.map((m, i) => (i === 0 ? { ...m, phase: 'failed' as const, downtime_started_at: null } : m));
+    expect(planActions(planWith('validated'), 'operator', failed).edit.enabled).toBe(true);
   });
 
   it('requires the operator role for every plan action', () => {

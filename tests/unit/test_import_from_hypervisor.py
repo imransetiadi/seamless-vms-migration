@@ -50,7 +50,8 @@ os.execvp(sys.argv[1], sys.argv[1:])
 QEMU_IMG = """#!/bin/sh
 echo "image: $2"
 echo "file format: qcow2"
-echo "virtual size: 10 GiB (10737418240 bytes)"
+# a disk file may hold the size line this qemu-img reports for it; an empty one is 10 GiB
+if [ -s "$2" ]; then cat "$2"; else echo "virtual size: 10 GiB (10737418240 bytes)"; fi
 """
 
 QEMU_NBD = """#!%(python)s
@@ -84,6 +85,12 @@ for port in sorted(os.listdir(%(listening)r)):
 
 class Hypervisor:
     def __init__(self, root):
+        # its own collection tree (os_migrate.os_migrate -> this checkout), so the tests run anywhere
+        # the other unit tests do, without the podman-built .ansible/collections farm
+        self.collections = os.path.join(root, "collections")
+        namespace = os.path.join(self.collections, "ansible_collections", "os_migrate")
+        os.makedirs(namespace)
+        os.symlink(REPO, os.path.join(namespace, "os_migrate"))
         self.root = root
         self.bin = os.path.join(root, "bin")
         self.listening = os.path.join(root, "listening")
@@ -145,7 +152,7 @@ class Hypervisor:
             HOME=home,
             ANSIBLE_HOME=os.path.join(home, ".ansible"),
             ANSIBLE_LOCAL_TEMP=os.path.join(home, "tmp"),
-            ANSIBLE_COLLECTIONS_PATH=os.path.join(REPO, ".ansible", "collections"),
+            ANSIBLE_COLLECTIONS_PATH=self.collections,
             ANSIBLE_COLLECTIONS_SCAN_SYS_PATH="false",
             ANSIBLE_NOCOLOR="1",
             ANSIBLE_RETRY_FILES_ENABLED="false",
@@ -178,8 +185,6 @@ def alive(pid):
 
 @pytest.fixture
 def hypervisor(tmp_path):
-    if not os.path.isdir(os.path.join(REPO, ".ansible", "collections")):
-        pytest.skip("needs the .ansible/collections symlink farm")
     hv = Hypervisor(str(tmp_path))
     yield hv
     subprocess.run(["pkill", "-f", str(tmp_path)], check=False)
@@ -213,8 +218,35 @@ def test_exports_are_read_only_bound_and_logged_privately(hypervisor):
         "nbd+ssh://stack@hv-test:10810",
     ]
     assert [d["device"] for d in disks] == ["/dev/vda", "/dev/vdb"]
-    assert [d["size"] for d in disks] == [10, 10]  # parsed from qemu-img info
+    assert [d["size"] for d in disks] == [10, 10]  # parsed from qemu-img info, stored as integers
+    assert [d["port"] for d in disks] == [10809, 10810]
     assert [d["bootable"] for d in disks] == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("line", "size"),
+    [
+        ("virtual size: 1.5 GiB (1610612736 bytes)", 2),
+        ("virtual size: 512 MiB (536870912 bytes)", 1),
+        ("virtual size: 10G (10737418240 bytes)", 10),  # qemu-img before 4.0
+    ],
+)
+def test_disk_size_is_the_byte_count_rounded_up_to_whole_gib(hypervisor, line, size):
+    """The destination volume is never smaller than the disk, whatever unit qemu-img prints."""
+    with open(os.path.join(hypervisor.disk_dir, "disk"), "w") as f:
+        f.write(line + "\n")
+    rc, out = hypervisor.run()
+    assert rc == 0, out
+    assert [d["size"] for d in hypervisor.nbdkit_disks()] == [size, 10]
+
+
+def test_a_disk_whose_size_cannot_be_read_fails_the_export(hypervisor):
+    with open(os.path.join(hypervisor.disk_dir, "disk"), "w") as f:
+        f.write("virtual size: unavailable\n")
+    rc, out = hypervisor.run()
+    assert rc != 0
+    assert "cannot read the virtual size" in out
+    assert hypervisor.nbdkit_disks() is None
 
 
 def test_tcp_protocol_refuses_a_loopback_export(hypervisor):

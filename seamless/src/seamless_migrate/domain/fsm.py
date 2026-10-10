@@ -40,6 +40,7 @@ class InvalidTransition(Exception):
     def __init__(self, from_phase: Phase, to_phase: Phase, detail: str | None = None) -> None:
         self.from_phase = Phase(from_phase)
         self.to_phase = Phase(to_phase)
+        self.detail = detail
         message = f"invalid transition {self.from_phase} -> {self.to_phase}"
         if detail:
             message = f"{message}: {detail}"
@@ -51,17 +52,31 @@ def is_terminal(phase: Phase | str) -> bool:
 
 
 def can_transition(migration: Migration, to: Phase | str) -> bool:
+    return refusal(migration, to) is None
+
+
+def refusal(migration: Migration, to: Phase | str) -> str | None:
+    """Why ``migration`` cannot move to ``to`` (None when it can)."""
     try:
         _check(migration, Phase(to))
-    except InvalidTransition:
-        return False
-    return True
+    except InvalidTransition as exc:
+        return exc.detail or str(exc)
+    return None
+
+
+def source_stopped(migration: Migration) -> bool:
+    """The downtime clock is open: the source VM was stopped and has not run since (SDD §5.2)."""
+    return migration.downtime_started_at is not None and migration.downtime_ended_at is None
 
 
 def _check(migration: Migration, to: Phase) -> None:
     current = Phase(migration.phase)
     if to not in TRANSITIONS[current]:
         raise InvalidTransition(current, to)
+    if to == P.cancelled and source_stopped(migration):
+        # SDD §5.1: a cancel would leave the source stopped with nothing left to restart it
+        advice = "roll back or retry" if current == P.failed else "cut it over"
+        raise InvalidTransition(current, to, f"the source VM is stopped; {advice} instead")
     if current == P.failed and to == P.cancelled and migration.downtime_started_at is not None:
         raise InvalidTransition(current, to, "the source VM was stopped; roll back instead")
 

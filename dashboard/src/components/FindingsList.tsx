@@ -62,8 +62,8 @@ export function FindingsList({ findings, emptyText = 'No findings — pre-flight
                   <span className="font-mono text-xs">{f.vmName}</span>
                 ))}
             </p>
-            <p className="break-words text-foreground">{f.message}</p>
-            {f.remediation && <p className="break-words text-muted-foreground">Fix: {f.remediation}</p>}
+            <p className="wrap-break-word text-foreground">{f.message}</p>
+            {f.remediation && <p className="wrap-break-word text-muted-foreground">Fix: {f.remediation}</p>}
             {f.strategies.length > 0 && (
               <p className="text-xs text-muted-foreground">Affects: {f.strategies.map((s) => STRATEGY_LABELS[s] ?? s).join(', ')}</p>
             )}
@@ -91,8 +91,8 @@ export function FindingGroupsList({ groups, emptyText = 'No findings — pre-fli
                 {g.items.length} VM{g.items.length === 1 ? '' : 's'}
               </span>
             </p>
-            {g.sameMessage && <p className="break-words text-foreground">{g.items[0]?.message}</p>}
-            {g.remediation && <p className="break-words text-muted-foreground">Fix: {g.remediation}</p>}
+            {g.sameMessage && <p className="wrap-break-word text-foreground">{g.items[0]?.message}</p>}
+            {g.remediation && <p className="wrap-break-word text-muted-foreground">Fix: {g.remediation}</p>}
             {g.strategies.length > 0 && (
               <p className="text-xs text-muted-foreground">Affects: {g.strategies.map((s) => STRATEGY_LABELS[s] ?? s).join(', ')}</p>
             )}
@@ -116,7 +116,7 @@ export function FindingGroupsList({ groups, emptyText = 'No findings — pre-fli
                 </summary>
                 <ul className="mt-1 flex flex-col gap-1">
                   {g.items.map((item) => (
-                    <li key={`${item.vmName}-${item.migrationId ?? ''}`} className="break-words text-xs">
+                    <li key={`${item.vmName}-${item.migrationId ?? ''}`} className="wrap-break-word text-xs">
                       <span className="font-mono">{item.vmName}</span>
                       <span className="text-muted-foreground"> — {item.message}</span>
                     </li>

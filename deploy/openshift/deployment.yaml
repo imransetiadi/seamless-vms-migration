@@ -34,7 +34,9 @@ spec:
         app.kubernetes.io/part-of: seamless-migrate
     spec:
       serviceAccountName: seamless
-      automountServiceAccountToken: false
+      # the token lets the dashboard store provider credentials as Secrets (secret-store-rbac.yaml);
+      # set false (and SEAMLESS_SECRET_STORE=files or remove it) to manage credentials outside the UI
+      automountServiceAccountToken: true
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -54,6 +56,11 @@ spec:
             - configMapRef:
                 name: seamless-config
           env:
+            # Trusted proxies for X-Forwarded-For (uvicorn FORWARDED_ALLOW_IPS): the router/ingress pod
+            # addresses, so the auth lockout and the audit log see the real client address
+            # (Security.md §12). Never "*" on a network where pods can reach the Service directly.
+            # - name: FORWARDED_ALLOW_IPS
+            #   value: "10.128.0.0/14"
             # paths of the credential files mounted below (values, not secrets)
             - name: SEAMLESS_TOKENS_FILE
               value: /etc/seamless/tokens/tokens.yaml
@@ -61,6 +68,9 @@ spec:
               value: /etc/seamless/clouds/clouds.yaml
             - name: SEAMLESS_SECRETS_DIR
               value: /var/run/secrets/seamless
+            # credentials entered in the dashboard are written as Secrets in this namespace (SDD 13.3)
+            - name: SEAMLESS_SECRET_STORE
+              value: kubernetes
             - name: SEAMLESS_DB_URL
               valueFrom:
                 secretKeyRef:
@@ -106,8 +116,8 @@ spec:
             limits:
               cpu: "4"
               memory: 4Gi
-          # SDD 17: liveness on /api/v1/health. The endpoint is public and reports "degraded" when the
-          # database is unreachable, so the generous failureThreshold avoids restart storms during a DB blip.
+          # SDD 17: liveness on /api/v1/health (always 200 while the process answers; the body reports
+          # what is degraded); the generous failureThreshold avoids restart storms during a DB blip.
           startupProbe:
             httpGet:
               path: /api/v1/health
@@ -121,9 +131,11 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6
+          # readiness on /api/v1/ready: 503 while the database or the orchestrator loop is
+          # unavailable, so the Service stops routing here until it recovers
           readinessProbe:
             httpGet:
-              path: /api/v1/health
+              path: /api/v1/ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 5
@@ -173,6 +185,8 @@ spec:
             #     path: dc2/username
             #   - key: dc2-password
             #     path: dc2/password
+            #   - key: conv-key-private-key        # ConversionHostConfig.ssh_key_secret "conv-key":
+            #     path: conv-key/private_key       # security.secrets.resolve_private_key reads <name>/private_key
             #
             # Alternative without edits to this file: put SEAMLESS_SECRET_DC2_USERNAME / SEAMLESS_SECRET_DC2_PASSWORD
             # (name upper-cased, "-" -> "_") into a Secret and add it under `envFrom` (environment variables are the

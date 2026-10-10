@@ -1,6 +1,7 @@
-import { CircleCheck, Pause, Timer, TriangleAlert } from 'lucide-react';
+import { CircleCheck, Pause, Timer } from 'lucide-react';
 import type { Timestamp } from '../api/types';
 import { cn } from '../lib/cn';
+import { SLO_ICONS, sloTone, type SloTone } from '../lib/slo';
 import { formatClock, formatDuration, secondsBetween } from '../lib/format';
 import type { Tone } from '../lib/phase';
 import { TONE_CLASSES } from '../lib/status';
@@ -31,12 +32,13 @@ export function DowntimeClock({ startedAt, endedAt, actualS, sloS = null, estima
   else if (running) state = { text: 'Running — source VM stopped', tone: 'warning', icon: Timer };
   else state = { text: 'Downtime ended', tone: 'success', icon: CircleCheck };
 
-  let slo: { text: string; tone: Tone } | null = null;
+  let slo: { text: string; tone: SloTone } | null = null;
   if (sloS && startedAt) {
     if (elapsed > sloS) slo = { text: `Over the SLO by ${formatClock(elapsed - sloS)}`, tone: 'danger' };
-    else if (running) slo = { text: `${formatClock(sloS - elapsed)} left in the SLO`, tone: elapsed > sloS * 0.8 ? 'warning' : 'success' };
+    else if (running) slo = { text: `${formatClock(sloS - elapsed)} left in the SLO`, tone: sloTone(elapsed, sloS) };
     else slo = { text: 'Within the SLO', tone: 'success' };
   }
+  const SloIcon = slo ? SLO_ICONS[slo.tone] : null;
   const pct = sloS ? Math.min(100, (elapsed / sloS) * 100) : 0;
 
   return (
@@ -71,7 +73,7 @@ export function DowntimeClock({ startedAt, endedAt, actualS, sloS = null, estima
             {estimateS !== null && <span>Estimated {formatDuration(estimateS)}</span>}
             {slo && (
               <span className={cn('inline-flex items-center gap-1 font-medium', TONE_CLASSES[slo.tone].text)}>
-                {slo.tone === 'danger' ? <TriangleAlert aria-hidden className="size-3.5" /> : <CircleCheck aria-hidden className="size-3.5" />}
+                {SloIcon && <SloIcon aria-hidden className="size-3.5" />}
                 {slo.text}
               </span>
             )}

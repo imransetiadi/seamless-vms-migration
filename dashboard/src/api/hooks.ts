@@ -29,6 +29,9 @@ import type {
   PlanCreate,
   PlanPatch,
   Provider,
+  ProviderCreate,
+  ProviderCredentials,
+  ProviderPatch,
   ProviderInventory,
   RollbackRequest,
   SimilarIncidentsRequest,
@@ -58,7 +61,7 @@ export const queryKeys = {
   plan: (id: string) => ['plans', id] as const,
   migrations: (query: MigrationListQuery = {}) => ['migrations', query] as const,
   migration: (id: string) => ['migration', id] as const,
-  eventTail: (query: Omit<EventListQuery, 'since' | 'limit'> = {}) => ['events', 'tail', query] as const,
+  eventTail: (query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}) => ['events', 'tail', query] as const,
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
 };
@@ -144,7 +147,13 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
     queryFn: ({ signal }) =>
       api.get<Migration[]>('/migrations', {
         signal,
-        query: { plan_id: query.plan_id, phase: query.phase, wave_id: query.wave_id },
+        query: {
+          plan_id: query.plan_id,
+          phase: query.phase,
+          wave_id: query.wave_id,
+          limit: query.limit,
+          offset: query.offset,
+        },
       }),
     enabled: options.enabled ?? true,
     placeholderData: options.keepPrevious ? keepPreviousData : undefined,
@@ -183,34 +192,26 @@ export function useAdvisorStatus() {
   });
 }
 
-const EVENT_PAGE = 1000;
+/** `GET /events` returns at most 1000 events per request (SDD §12). */
+const EVENT_LIMIT = 1000;
 
 /**
- * The newest `keep` persisted events. `GET /events` pages forward from `since` (SDD §12), so the
- * tail is reached by following the cursor until a short page arrives.
+ * The newest `keep` (≤ 1000) persisted events, ascending: one `GET /events?tail=true` request,
+ * however many events are persisted (SDD §12).
  */
 export async function fetchEventTail(
   api: ApiClient,
-  query: Omit<EventListQuery, 'since' | 'limit'> = {},
+  query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {},
   keep = 500,
   signal?: AbortSignal,
 ): Promise<Event[]> {
-  let since = 0;
-  let tail: Event[] = [];
-  for (let page = 0; page < 200; page += 1) {
-    const batch = await api.get<Event[]>('/events', {
-      signal,
-      query: { since, limit: EVENT_PAGE, plan_id: query.plan_id, migration_id: query.migration_id },
-    });
-    tail = tail.concat(batch).slice(-keep);
-    const last = batch.at(-1);
-    if (batch.length < EVENT_PAGE || !last) break;
-    since = last.seq;
-  }
-  return tail;
+  return api.get<Event[]>('/events', {
+    signal,
+    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id },
+  });
 }
 
-export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit'> = {}, keep = 500) {
+export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}, keep = 500) {
   const api = useApi();
   return useQuery({
     queryKey: queryKeys.eventTail(query),
@@ -239,6 +240,72 @@ export function useCheckProvider() {
       );
       invalidateAll(queryClient, [queryKeys.providers, queryKeys.inventory(provider.id)]);
     },
+  });
+}
+
+function useProviderWrite<V>(request: (api: ReturnType<typeof useApi>, vars: V) => Promise<Provider>) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: V) => request(api, vars),
+    onSuccess: (provider) => {
+      queryClient.setQueryData<Provider[]>(queryKeys.providers, (old) =>
+        old ? (old.some((p) => p.id === provider.id) ? old.map((p) => (p.id === provider.id ? provider : p)) : [...old, provider]) : old,
+      );
+      invalidateAll(queryClient, [queryKeys.providers, queryKeys.inventory(provider.id)]);
+    },
+  });
+}
+
+/** POST /providers (admin). */
+export function useCreateProvider() {
+  return useProviderWrite((api, body: ProviderCreate) => api.post<Provider>('/providers', body));
+}
+
+/** PATCH /providers/{id} (admin). */
+export function useUpdateProvider() {
+  return useProviderWrite((api, { id, patch }: { id: string; patch: ProviderPatch }) => api.patch<Provider>(`/providers/${enc(id)}`, patch));
+}
+
+/** PUT /providers/{id}/credentials (admin, write-only). */
+export function useSetProviderCredentials() {
+  return useProviderWrite((api, { id, credentials }: { id: string; credentials: ProviderCredentials }) =>
+    api.put<Provider>(`/providers/${enc(id)}/credentials`, credentials),
+  );
+}
+
+/** PUT /providers/{id}/conversion-key (admin, write-only). */
+export function useSetConversionKey() {
+  return useProviderWrite((api, { id, privateKey }: { id: string; privateKey: string }) =>
+    api.put<Provider>(`/providers/${enc(id)}/conversion-key`, { private_key: privateKey }),
+  );
+}
+
+/** The outcome of Check all: the providers checked, and every check request that failed. */
+export interface CheckAllResult {
+  checked: Provider[];
+  /** Requests that failed (5xx, 401/403, 404, 429, network): the provider's own status is unchanged. */
+  failed: { id: string; error: unknown }[];
+}
+
+/** POST /providers/{id}/check for every provider (operator), one after another. */
+export function useCheckAllProviders() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (ids: string[]): Promise<CheckAllResult> => {
+      const result: CheckAllResult = { checked: [], failed: [] };
+      for (const id of ids) {
+        try {
+          result.checked.push(await api.post<Provider>(`/providers/${enc(id)}/check`));
+        } catch (error) {
+          // one failed request must not stop the others, and is reported, never dropped (SDD §16)
+          result.failed.push({ id, error });
+        }
+      }
+      return result;
+    },
+    onSettled: () => invalidateAll(queryClient, [queryKeys.providers]),
   });
 }
 

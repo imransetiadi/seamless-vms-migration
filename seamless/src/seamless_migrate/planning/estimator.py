@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from typing import Any
@@ -52,8 +53,9 @@ def invalid_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
     """Problems with ``Plan.estimator_overrides`` (empty = valid), one message per key.
 
     Unknown keys, keys owned by plan fields (``link_bps`` is accepted but the plan's value
-    keeps precedence, SDD §9.1) and non-positive values are rejected; ``parallel_disks``
-    must be at least 1.
+    keeps precedence, SDD §9.1) and values that are not finite positive numbers are rejected —
+    NaN and infinity too, which ``value <= 0`` alone lets through; ``parallel_disks`` must be
+    at least 1.
     """
     problems = []
     for key in sorted(overrides):
@@ -62,8 +64,13 @@ def invalid_estimator_overrides(overrides: Mapping[str, Any]) -> list[str]:
             problems.append(f"{key}: unknown field")
         elif key in _PLAN_FIELD_FOR:
             problems.append(f"{key}: set the plan field {_PLAN_FIELD_FOR[key]} instead")
-        elif not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
-            problems.append(f"{key}: must be a positive number")
+        elif (
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            problems.append(f"{key}: must be a finite positive number")
         elif key == "parallel_disks" and int(value) < 1:
             problems.append(f"{key}: must be at least 1")
     return problems

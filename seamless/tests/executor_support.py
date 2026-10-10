@@ -13,13 +13,15 @@ from seamless_migrate.executors.base import StepContext
 class Recorder:
     progress: list[tuple[float, int, int]] = field(default_factory=list)
     downtime_marks: int = 0
+    downtime_at: list = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
 
     async def report_progress(self, pct: float, done: int, total: int) -> None:
         self.progress.append((pct, done, total))
 
-    async def mark_downtime_start(self) -> None:
+    async def mark_downtime_start(self, at=None) -> None:
         self.downtime_marks += 1
+        self.downtime_at.append(at)
 
     async def log(self, line: str) -> None:
         self.logs.append(line)

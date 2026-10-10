@@ -24,6 +24,7 @@ def render_metrics(
     migrations: Iterable[Migration],
     step_stats: Mapping[str, list[float]],
     advisor_calls: Mapping[tuple[str, str], int],
+    tick_stats: Mapping[str, float] | None = None,
 ) -> str:
     migrations = list(migrations)
     lines: list[str] = []
@@ -52,6 +53,15 @@ def render_metrics(
     lines.append(f"seamless_downtime_seconds_count {len(downtimes)}")
     family("seamless_downtime_seconds_max", "gauge", "Longest measured downtime.")
     lines.append(f"seamless_downtime_seconds_max {_num(max(downtimes) if downtimes else 0)}")
+
+    ticks = tick_stats or {}
+    family("seamless_tick_seconds", "summary", "Duration of orchestrator ticks.")
+    lines.append(f"seamless_tick_seconds_sum {_num(float(ticks.get('sum', 0.0)))}")
+    lines.append(f"seamless_tick_seconds_count {int(ticks.get('count', 0))}")
+    family("seamless_tick_seconds_max", "gauge", "Longest orchestrator tick since start.")
+    lines.append(f"seamless_tick_seconds_max {_num(float(ticks.get('max', 0.0)))}")
+    family("seamless_tick_slow_total", "counter", "Ticks that took more than half of tick_s.")
+    lines.append(f"seamless_tick_slow_total {int(ticks.get('slow', 0))}")
 
     family("seamless_step_duration_seconds", "summary", "Duration of executor steps.")
     for step, (total, count) in sorted(step_stats.items()):

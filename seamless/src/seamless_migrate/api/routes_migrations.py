@@ -28,8 +28,11 @@ async def list_migrations(
     plan_id: str | None = Query(default=None),
     phase: Phase | None = Query(default=None),
     wave_id: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0, le=2**63 - 1),
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Migration]:
+    """Migrations in creation order; ``limit``/``offset`` page large plans (SDD §12)."""
     filters: dict[str, Any] = {}
     if plan_id is not None:
         filters["plan_id"] = plan_id
@@ -37,7 +40,9 @@ async def list_migrations(
         filters["phase"] = phase
     if wave_id is not None:
         filters["wave_id"] = wave_id
-    return await services(request).db.list("migration", Migration, **filters)
+    return await services(request).db.list(
+        "migration", Migration, limit=limit, offset=offset, **filters
+    )
 
 
 @router.get("/migrations/{migration_id}", response_model=Migration)

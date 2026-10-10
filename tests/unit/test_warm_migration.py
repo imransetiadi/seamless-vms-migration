@@ -4,6 +4,7 @@ __metaclass__ = type
 
 import copy
 import json
+import logging
 import os
 import shlex
 import stat
@@ -623,6 +624,83 @@ def test_sync_assume_zero_only_for_new_volumes(tmp_path):
 
     assert all("--assume-zero" in argv[:argv.index("--")] for argv in first)
     assert not any("--assume-zero" in argv for argv in second)
+
+
+def test_sync_extends_the_destination_volume_when_the_source_grew(tmp_path):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    scenario.src.volumes["vol-data"].size = 15  # grown between passes
+
+    scenario.run_pass("uuid-2")
+
+    state = scenario.state()
+    assert state.dest_volumes["/dev/vdb"]["dest_id"] == data_id  # reused, not replaced
+    assert state.dest_volumes["/dev/vdb"]["size"] == 15
+    assert scenario.dst.volumes[data_id].size == 15
+    assert ("extend_volume", {"volume": data_id, "size": 15}) in scenario.dst.calls
+
+
+def test_sync_recreates_a_destination_volume_that_is_gone(tmp_path, caplog):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    old_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    del scenario.dst.volumes[old_id]  # deleted behind the migration's back
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        scenario.run_pass("uuid-2")
+
+    new_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    assert new_id != old_id and new_id in scenario.dst.volumes
+    assert "is gone, creating a new one" in caplog.text
+
+
+def test_sync_scans_in_full_after_a_failed_first_pass_even_with_assume_zero(tmp_path):
+    """The volumes created by a failed pass are partially written: the next
+    pass must not assume they read as zeros."""
+    scenario = Scenario(
+        tmp_path,
+        receive=lambda command: fake.receive_process(returncode=2, error="link dropped"),
+    )
+    scenario.snapshot("uuid-1").create()
+    with pytest.raises(RuntimeError, match="link dropped"):
+        scenario.sync("uuid-1", assume_zero=True).sync("auto")
+    scenario.snapshot("uuid-1").cleanup()
+    assert sorted(scenario.state().dest_volumes) == ["/dev/vda", "/dev/vdb"]
+    scenario.shells = fake.ShellFactory([scenario.src, scenario.dst])  # the link is back
+
+    scenario.run_pass("uuid-2", assume_zero=True)
+
+    second = receive_commands(scenario)
+    assert second and not any("--assume-zero" in argv for argv in second)
+
+
+def test_sync_final_pass_never_assumes_zero(tmp_path, caplog):
+    """A cutover without a preceding pre-copy creates the destination volumes
+    in the final pass; that pass must read them in full (no later pass
+    would catch a backend that does not return zeros)."""
+    scenario = Scenario(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        sync_pass = scenario.run_pass("uuid-1", pass_kind="final", assume_zero=True)
+
+    assert sync_pass["kind"] == "final"
+    assert not any("--assume-zero" in argv for argv in receive_commands(scenario))
+    assert "assume_zero ignored for the final pass" in caplog.text
+
+
+def test_sync_warns_about_recorded_volumes_without_a_source_device(tmp_path, caplog):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    state = scenario.state()
+    state.dest_volumes["/dev/vdz"] = dict(state.dest_volumes["/dev/vdb"], name="stale")
+    state.save()
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        scenario.run_pass("uuid-2")
+
+    assert "/dev/vdz" in caplog.text and "no source device" in caplog.text
+    assert "/dev/vdz" in scenario.state().dest_volumes  # kept for the rollback
 
 
 def test_sync_failure_detaches_and_raises(tmp_path):

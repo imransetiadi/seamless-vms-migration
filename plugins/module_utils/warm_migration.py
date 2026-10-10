@@ -675,6 +675,24 @@ class OpenstackWarmSync(_WarmVolumeBase):
         started_at = utc_now()
         started = time.monotonic()
         created = self._ensure_dest_volumes(source_map)
+        orphaned = sorted(set(self.state.dest_volumes) - set(source_map))
+        if orphaned:
+            self.log.warning(
+                "Destination volumes recorded for %s have no source device in this "
+                "pass (the source's disks changed); they stay recorded and unused "
+                "until a rollback with delete_dest_volumes",
+                ", ".join(orphaned),
+            )
+        # Never-written blocks may only be assumed zero when a later pass still
+        # scans the whole volume: the final pass is the last one, so it reads
+        # the destination in full and verifies every chunk.
+        assume_zero = bool(self.assume_zero and created and kind != "final")
+        if self.assume_zero and created and kind == "final":
+            self.log.warning(
+                "assume_zero ignored for the final pass: the new destination "
+                "volumes of %s are read in full",
+                ", ".join(sorted(created)),
+            )
         self.volume_map = {}
         for dev in sorted(source_map):
             entry = source_map[dev]
@@ -686,7 +704,7 @@ class OpenstackWarmSync(_WarmVolumeBase):
                 "name": self.state.dest_volumes[dev]["name"],
                 "size": self.state.dest_volumes[dev]["size"],
                 "bootable": self.state.dest_volumes[dev]["bootable"],
-                "assume_zero": bool(self.assume_zero and dev in created),
+                "assume_zero": bool(assume_zero and dev in created),
                 "progress": 0.0,
             }
         summaries = []
@@ -996,6 +1014,7 @@ class WarmRollback:
         match_by_name=False,
         dst_filters=None,
         timeout=DEFAULT_TIMEOUT,
+        conversion_host=None,
     ):
         self.conn = conn
         self.state = state
@@ -1003,6 +1022,9 @@ class WarmRollback:
         self.match_by_name = match_by_name
         self.dst_filters = dst_filters or {}
         self.timeout = timeout
+        # Name or id of the destination conversion host: the only other
+        # server a destination volume is ever detached from.
+        self.conversion_host = conversion_host
         self.log = logging.getLogger("osp-osp")
 
     def run(self, delete_volumes=False):
@@ -1010,14 +1032,23 @@ class WarmRollback:
             "changed": False,
             "deleted_server_id": None,
             "deleted_volume_ids": [],
+            "kept_volume_ids": [],
             "state_deleted": False,
         }
         recorded = self.state.exists()
         volume_ids = [entry["dest_id"] for _, entry in sorted(self.state.dest_volumes.items())]
+        # With a warm state its volumes are the migration's; another volume attached to the
+        # destination server (e.g. by an operator after the cutover) is kept (SDD 6.5). Without
+        # one (cold) the destination server's attachments are the migration's.
+        foreign = []
         destination = self._find_destination_server()
         if destination is not None:
             for attachment in self.conn.compute.volume_attachments(destination):
-                if attachment.volume_id not in volume_ids:
+                if attachment.volume_id in volume_ids:
+                    continue
+                if recorded:
+                    foreign.append(attachment.volume_id)
+                else:
                     volume_ids.append(attachment.volume_id)
             self.log.info("Deleting destination server %s", destination.id)
             self.conn.compute.delete_server(destination)
@@ -1030,8 +1061,13 @@ class WarmRollback:
         if not delete_volumes:
             return result
 
+        result["kept_volume_ids"].extend(foreign)
         for volume_id in volume_ids:
-            if self._delete_volume(volume_id):
+            deleted = self._delete_volume(volume_id)
+            if deleted is None:
+                result["kept_volume_ids"].append(volume_id)
+                continue
+            if deleted:
                 result["changed"] = True
                 result["deleted_volume_ids"].append(volume_id)
             for dev, entry in list(self.state.dest_volumes.items()):
@@ -1078,7 +1114,15 @@ class WarmRollback:
             )
         return candidates[0] if candidates else None
 
+    def _is_conversion_host(self, holder):
+        return self.conversion_host is not None and self.conversion_host in (
+            holder.id,
+            getattr(holder, "name", None),
+        )
+
     def _delete_volume(self, volume_id):
+        """True when deleted, False when already gone, None when kept because
+        another server than the destination conversion host still uses it."""
         volume = self.conn.get_volume_by_id(volume_id)
         if volume is None:
             return False
@@ -1088,16 +1132,27 @@ class WarmRollback:
                 return False
             if not volume.attachments:
                 break
-            # Attachments left on another server (e.g. the destination
-            # conversion host after an interrupted pass) are removed; those
-            # of the deleted destination server go away on their own.
+            # Attachments left on the destination conversion host after an
+            # interrupted pass are removed; those of the deleted destination
+            # server go away on their own. Any other holder (a shared volume
+            # attached to another server) owns data outside this migration:
+            # the volume is kept.
             for attachment in list(volume.attachments):
                 holder = self.conn.get_server_by_id(attachment["server_id"])
-                if holder is not None:
-                    self.log.info("Detaching volume %s from %s", volume_id, holder.id)
-                    self.conn.detach_volume(
-                        server=holder, volume=volume, wait=True, timeout=self.timeout
+                if holder is None:
+                    continue
+                if not self._is_conversion_host(holder):
+                    self.log.warning(
+                        "Keeping destination volume %s: it is attached to server %s, "
+                        "which is not the destination conversion host",
+                        volume_id,
+                        holder.id,
                     )
+                    return None
+                self.log.info("Detaching volume %s from %s", volume_id, holder.id)
+                self.conn.detach_volume(
+                    server=holder, volume=volume, wait=True, timeout=self.timeout
+                )
             time.sleep(1)
         else:
             raise RuntimeError("Volume %s is still attached, cannot delete it" % volume_id)

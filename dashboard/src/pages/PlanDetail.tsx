@@ -7,12 +7,13 @@ import {
   Layers,
   ListChecks,
   Pause,
+  Pencil,
   Play,
   Rows3,
   Timer,
   TriangleAlert,
 } from 'lucide-react';
-import { useId, useMemo, useState, type ReactNode } from 'react';
+import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { useMigrations, usePlan, usePlanAction, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
@@ -20,6 +21,7 @@ import { useRole } from '../api/session';
 import type { Plan, Provider, ValidationReport } from '../api/types';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { PlanCreateDialog } from '../components/PlanCreateDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
@@ -30,21 +32,24 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { PlanStatusBadge } from '../components/StatusBadge';
+import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
 import { cn } from '../lib/cn';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
+import { clearedByValidation } from '../lib/migrationActions';
+import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
-type Confirm = 'start' | 'pause' | 'waves' | null;
+type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="min-w-0">
       <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 break-words text-sm text-foreground">{children}</dd>
+      <dd className="mt-0.5 wrap-break-word text-sm text-foreground">{children}</dd>
     </div>
   );
 }
@@ -73,6 +78,14 @@ function providerLabel(provider: Provider | undefined, id: string) {
       {provider.name}
     </Link>
   );
+}
+
+/** Human value of an estimator override (SDD §9.1): rates, durations, counts; link_bps is ignored. */
+function formatOverride(key: string, value: number): string {
+  if (key === 'link_bps') return `${formatRate(value)} (ignored: the plan link bandwidth applies)`;
+  if (key.endsWith('_bps')) return formatRate(value);
+  if (key.endsWith('_s')) return formatDuration(value);
+  return String(value);
 }
 
 function windowText(plan: Plan): string {
@@ -114,11 +127,26 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
       <Setting label="Link bandwidth">
         <span className="num">{formatRate(plan.link_bps)}</span>
       </Setting>
+      {Object.keys(plan.estimator_overrides).length > 0 && (
+        <Setting label="Estimator overrides">
+          <span className="font-mono text-xs">
+            {Object.entries(plan.estimator_overrides)
+              .map(([k, v]) => `${k}=${formatOverride(k, v)}`)
+              .join(' · ')}
+          </span>
+          <span className="block text-xs text-muted-foreground">Replace the planning defaults for this plan (SDD §9.1)</span>
+        </Setting>
+      )}
       <Setting label="Storage handover">
-        {plan.handover.enabled ? `Enabled · ${Object.keys(plan.handover.backend_map).length} backend mapping(s)` : 'Disabled'}
+        {plan.handover.enabled
+          ? Object.entries(plan.handover.backend_map)
+              .map(([type, target]) => `${type} to ${target}`)
+              .join(', ') || 'Enabled, no backend mapped'
+          : 'Disabled'}
       </Setting>
       <Setting label="Verification">
-        {v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')}` : 'No TCP probes'} · {v.probe_address} IP · timeout {formatDuration(v.timeout_s)} ·
+        {v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')}` : 'No TCP probes'} ·{' '}
+        {v.windows_tcp_ports?.length ? `Windows TCP ${v.windows_tcp_ports.join(', ')}` : 'no Windows TCP probes'} · {v.probe_address} IP · timeout {formatDuration(v.timeout_s)} ·
         auto-rollback {v.auto_rollback ? 'on' : 'off'} · advisor {v.use_advisor ? 'on' : 'off'}
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
@@ -151,7 +179,6 @@ function ReportBanner({ report }: { report: ValidationReport }) {
   const ok = report.ok && blocked === 0;
   return (
     <div
-      role="status"
       className={cn(
         'mb-4 flex items-start gap-2 rounded-md border p-3 text-sm',
         ok ? 'border-status-success/40 bg-status-success/10' : 'border-status-warning/40 bg-status-warning/10',
@@ -186,6 +213,16 @@ export default function PlanDetail() {
   const [confirm, setConfirm] = useState<Confirm>(null);
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [waveSize, setWaveSize] = useState('10');
+  const [editing, setEditing] = useState(false);
+  const [clearing, setClearing] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
+  // the header's Validate and Auto-plan waves stay on the page: they take the focus when the empty
+  // state an action was started from goes away with it (SDD §16)
+  const validateRef = useRef<HTMLButtonElement>(null);
+  const wavesRef = useRef<HTMLButtonElement>(null);
+  const emptyValidateRef = useRef<HTMLButtonElement>(null);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -219,9 +256,37 @@ export default function PlanDetail() {
         after?.(result);
       },
     });
+  const validate = () =>
+    run({ action: 'validate' }, (r) => {
+      setReport(r as ValidationReport);
+      if (document.activeElement === emptyValidateRef.current) validateRef.current?.focus();
+    });
+  // a re-validation clears the approvals and cutover requests of migrations that have not started (SDD §5.4):
+  // count them on the server at the click, as a list loaded before an approval would hide it; ask anyway
+  // when they cannot be counted
+  const askOrValidate = async () => {
+    setChecking(true);
+    const latest = await migrations.refetch();
+    setChecking(false);
+    const cleared = latest.data && !latest.isError ? clearedByValidation(latest.data) : 'any approvals and cutover requests';
+    if (!cleared) {
+      validate();
+      return;
+    }
+    setClearing(cleared);
+    setConfirm('validate');
+  };
+  // "pre-flight passed" only once every VM of vm_ids has a migration whose pre-flight ran and the plan is
+  // not a draft again: an added VM has no migration before the next validation (SDD §16)
+  const checked = new Set(list.filter(preflightRan).map((m) => m.vm.source_id));
+  const preflightDone = p.status !== 'draft' && p.vm_ids.length > 0 && p.vm_ids.every((vmId) => checked.has(vmId));
   const waveSizeNumber = Number(waveSize);
-  const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 100;
+  // the API's bound (SDD §12)
+  const waveSizeValid = Number.isInteger(waveSizeNumber) && waveSizeNumber >= 1 && waveSizeNumber <= 1000;
   const s = stats.data;
+  // what is built from the migrations reads as unknown when they could not be loaded, never as empty (SDD §16)
+  const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
+  const migrationCount = migrations.data?.length ?? s?.total;
 
   return (
     <>
@@ -238,20 +303,24 @@ export default function PlanDetail() {
         }
         actions={
           <div role="group" aria-label="Plan actions" className="flex flex-wrap gap-2">
+            <Button size="lg" icon={Pencil} disabledReason={actions.edit.reason} onClick={() => setEditing(true)}>
+              Edit plan
+            </Button>
             <Button
+              ref={validateRef}
               size="lg"
               icon={ListChecks}
-              loading={pending('validate')}
+              loading={pending('validate') || checking}
               disabledReason={actions.validate.reason}
-              onClick={() => run({ action: 'validate' }, (r) => setReport(r as ValidationReport))}
+              onClick={() => void askOrValidate()}
             >
               Validate
             </Button>
-            <Button size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
+            <Button ref={wavesRef} size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
               Auto-plan waves
             </Button>
             <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
-              {p.status === 'paused' ? 'Resume' : 'Start'}
+              {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
             </Button>
             <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
               Pause
@@ -263,13 +332,27 @@ export default function PlanDetail() {
       {action.error && confirm === null && (
         <ErrorBanner error={action.error} title="The plan action failed" className="mb-4" />
       )}
-      {report && <ReportBanner report={report} />}
+      {/* a live region already on the page: one inserted together with its text is not reliably read (SDD §16) */}
+      <div role="status">{report && <ReportBanner report={report} />}</div>
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
+      {editing && (
+        <PlanCreateDialog
+          open
+          onClose={() => setEditing(false)}
+          plan={p}
+          onSaved={() => setAnnouncement('Plan saved. It is a draft again: validate it before starting.')}
+        />
+      )}
 
+      {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
+      {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
       <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
-        <KpiTile label="Migrations" value={formatNumber(s?.total ?? list.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
-        <KpiTile label="In progress" value={formatNumber(s?.in_progress ?? 0)} icon={Activity} tone="progress" />
-        <KpiTile label="Completed" value={formatNumber(s?.completed ?? 0)} icon={CircleCheck} tone="success" />
-        <KpiTile label="Failed" value={formatNumber(s?.failed ?? 0)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
+        <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
+        <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
+        <KpiTile label="Completed" value={formatNumber(s?.completed)} icon={CircleCheck} tone="success" />
+        <KpiTile label="Failed" value={formatNumber(s?.failed)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
         <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={`SLO ${formatDuration(p.downtime_slo_s)}`} />
         <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} />
       </section>
@@ -282,7 +365,7 @@ export default function PlanDetail() {
         <Panel title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">
           <WavesBoard
             plan={p}
-            migrations={list}
+            migrations={migrationsUnknown ? null : list}
             emptyAction={
               <Button icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
                 Auto-plan waves
@@ -294,32 +377,67 @@ export default function PlanDetail() {
         <Panel title="Migrations" description="Strategy, estimated downtime and pre-flight findings per VM">
           {migrations.isPending && <LoadingBlock label="Loading migrations…" rows={5} />}
           {migrations.error && <ErrorBanner error={migrations.error} title="Migrations are unavailable" onRetry={() => void migrations.refetch()} />}
-          {migrations.data && <MigrationsTable migrations={list} plan={p} caption={`Migrations in ${p.name}`} />}
+          {migrations.data && (
+            <MigrationsTable
+              migrations={list}
+              plan={p}
+              caption={`Migrations in ${p.name}`}
+              emptyDescription="Validation creates one migration per VM and runs the pre-flight checks."
+              emptyAction={
+                <Button
+                  ref={emptyValidateRef}
+                  icon={ListChecks}
+                  loading={pending('validate') || checking}
+                  disabledReason={actions.validate.reason}
+                  onClick={() => void askOrValidate()}
+                >
+                  Validate
+                </Button>
+              }
+            />
+          )}
         </Panel>
 
-        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-none">
+        <section id="plan-findings" tabIndex={-1} className="scroll-mt-20 outline-hidden">
           <Panel
             title="Findings"
-            description={`${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`}
+            description={
+              migrationsUnknown
+                ? undefined
+                : `${findings.filter((f) => f.severity === 'blocker').length} blockers, ${findings.filter((f) => f.severity === 'warning').length} warnings, ${findings.filter((f) => f.severity === 'info').length} info`
+            }
           >
-            <FindingGroupsList groups={groupFindings(findings)} />
+            {migrationsUnknown ? (
+              <Unavailable what="findings" />
+            ) : (
+              <FindingGroupsList
+                groups={groupFindings(findings)}
+                emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
+              />
+            )}
           </Panel>
         </section>
       </div>
 
       <ConfirmDialog
         open={confirm === 'start'}
-        title={p.status === 'paused' ? 'Resume this plan?' : 'Start this plan?'}
+        title={p.status === 'paused' ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
         description={
           <>
-            {list.length} migrations in {p.waves.length || 1} wave{(p.waves.length || 1) === 1 ? '' : 's'}. Warm migrations begin pre-copy while their
+            {p.status === 'failed' &&
+              'Pre-staging failed (the events say why): starting again retries it before any migration starts. Failed migrations stay failed until you retry or roll them back. '}
+            {migrationCount ?? 'An unknown number of'} migrations in {p.waves.length || 1} wave{(p.waves.length || 1) === 1 ? '' : 's'}. Warm migrations begin pre-copy while their
             source VMs keep running. {p.require_approval ? 'Every cutover still needs an approver.' : 'Cutovers do not need approval in this plan.'}
           </>
         }
-        confirmLabel={p.status === 'paused' ? 'Resume plan' : 'Start plan'}
+        confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
-        onConfirm={() => run({ action: 'start' })}
+        onConfirm={() =>
+          run({ action: 'start' }, () =>
+            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.'),
+          )
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();
@@ -332,7 +450,21 @@ export default function PlanDetail() {
         confirmLabel="Pause plan"
         pending={pending('pause')}
         error={confirm === 'pause' ? action.error : null}
-        onConfirm={() => run({ action: 'pause' })}
+        onConfirm={() => run({ action: 'pause' }, () => setAnnouncement('Plan paused.'))}
+        onCancel={() => {
+          setConfirm(null);
+          action.reset();
+        }}
+      />
+      <ConfirmDialog
+        open={confirm === 'validate'}
+        returnFocusRef={validateRef}
+        title="Validate this plan again?"
+        description={`Validating again clears ${clearing ?? 'nothing'} of the migrations that have not started: approvers approve them again after the new assessment.`}
+        confirmLabel="Validate and clear"
+        pending={pending('validate')}
+        error={confirm === 'validate' ? action.error : null}
+        onConfirm={validate}
         onCancel={() => {
           setConfirm(null);
           action.reset();
@@ -340,13 +472,20 @@ export default function PlanDetail() {
       />
       <ConfirmDialog
         open={confirm === 'waves'}
+        returnFocusRef={wavesRef}
         title={p.waves.length ? 'Replace the waves?' : 'Auto-plan waves?'}
-        description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together."
+        description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together. The plan returns to draft: validate it again before starting, which clears approvals and cutover requests."
         confirmLabel="Plan waves"
         canConfirm={waveSizeValid}
+        confirmReason="Enter a whole number from 1 to 1000."
         pending={pending('waves')}
         error={confirm === 'waves' ? action.error : null}
-        onConfirm={() => run({ action: 'waves', body: { max_wave_size: waveSizeNumber } })}
+        onConfirm={() =>
+          run({ action: 'waves', body: { max_wave_size: waveSizeNumber } }, (result) => {
+            const n = (result as Plan).waves.length;
+            setAnnouncement(`Waves planned: ${n} wave${n === 1 ? '' : 's'}.`);
+          })
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();
@@ -358,10 +497,10 @@ export default function PlanDetail() {
           type="number"
           inputMode="numeric"
           min={1}
-          max={100}
+          max={1000}
           value={waveSize}
           onChange={(e) => setWaveSize(e.target.value)}
-          error={waveSizeValid ? null : 'Enter a whole number from 1 to 100.'}
+          error={waveSizeValid ? null : 'Enter a whole number from 1 to 1000.'}
           hint="A wave may exceed this to keep an application together."
         />
       </ConfirmDialog>

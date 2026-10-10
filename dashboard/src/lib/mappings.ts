@@ -10,3 +10,10 @@ export function parseMappings(text: string): Record<string, string> | null {
   }
   return out;
 }
+
+/** The inverse of parseMappings: one "source = destination" line per entry. */
+export function formatMappings(mappings: Record<string, string>): string {
+  return Object.entries(mappings)
+    .map(([source, destination]) => `${source} = ${destination}`)
+    .join('\n');
+}

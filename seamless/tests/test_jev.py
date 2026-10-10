@@ -162,7 +162,11 @@ def test_stdio_env_whitelist():
         "TYPESAFE_API_KEY": "ts-key",
         "JEV_MCP_MODEL": "jev-1.13.0",
     }
+    knobs = dict(environ, JEV_VERCEL_ZERO_DATA_RETENTION="1", JEV_MCP_MAX_CONCURRENCY="8")
+    assert {"JEV_VERCEL_ZERO_DATA_RETENTION", "JEV_MCP_MAX_CONCURRENCY"} <= set(stdio_env(knobs))
     assert set(JEV_ENV_VARS) == {
+        "JEV_VERCEL_ZERO_DATA_RETENTION",
+        "JEV_MCP_MAX_CONCURRENCY",
         "TYPESAFE_API_KEY",
         "OPENROUTER_API_KEY",
         "JEV_PROVIDER",
@@ -194,3 +198,19 @@ async def test_http_mode_unreachable_server_is_unavailable():
     with pytest.raises(JevUnavailable):
         await client.screen(text="x", purpose="y")
     assert client.calls[("jev_screen", "error")] == 1
+
+
+def test_parse_result_rejects_camel_case_errors_and_non_objects():
+    from types import SimpleNamespace as NS
+
+    from seamless_migrate.ai.jev import JevUnavailable, parse_result
+
+    with pytest.raises(JevUnavailable, match="tool error"):
+        parse_result(NS(isError=True, content=[NS(text="Input validation error: password=x")]))
+    with pytest.raises(JevUnavailable, match="not a JSON object"):
+        parse_result(NS(content=[NS(text="[1, 2, 3]")]))
+    with pytest.raises(JevUnavailable, match="no text content"):
+        parse_result(NS(content=[NS(text=None)]))
+    with pytest.raises(JevUnavailable, match="no text content"):
+        parse_result(NS(content=[]))
+    assert parse_result(NS(content=[NS(text='{"status": "ok"}')])) == {"status": "ok"}

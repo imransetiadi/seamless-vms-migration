@@ -156,11 +156,19 @@ class FakeBlockStorage:
     def get_volume(self, volume_id):
         return self._volumes[volume_id]
 
+    def volumes(self, details=True, **_):
+        return list(self._volumes.values())
+
     def types(self):
         return [NS(name="ceph-ssd"), NS(name="ceph-hdd")]
 
     def backend_pools(self):
-        return [NS(name="hostgroup@ceph#ssd")]
+        return [
+            NS(
+                name="hostgroup@ceph#ssd",
+                capabilities={"vendor_name": "Open Source", "storage_protocol": "ceph"},
+            )
+        ]
 
 
 class FakeNetwork:
@@ -170,6 +178,8 @@ class FakeNetwork:
         self._ovn = ovn
 
     def ports(self, device_id=None, **_):
+        if device_id is None:
+            return list(self._ports)
         return [p for p in self._ports if p.device_id == device_id]
 
     def get_network(self, network_id):
@@ -327,6 +337,165 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
     assert inv.networks == {"app-net": 1442}
 
 
+def _fleet_conn(count=3):
+    """fake_conn() with `count` servers, each with two volumes and a port, and call counters."""
+    conn = fake_conn()
+    base = conn.compute.get_server("srv-1")
+    servers, volumes, ports = [], [], []
+    for i in range(count):
+        sid = f"srv-{i}"
+        servers.append(
+            NS(
+                **{**vars(base), "id": sid, "name": f"web-{i:02d}"},
+            )
+        )
+        servers[-1].attachments = [
+            NS(volume_id=f"{sid}-root", device="/dev/vda"),
+            NS(volume_id=f"{sid}-data", device="/dev/vdb"),
+        ]
+        volumes += [
+            NS(id=f"{sid}-root", name="root", size=20, is_bootable=True, volume_type="ceph-ssd"),
+            NS(id=f"{sid}-data", name="data", size=50, is_bootable=False, volume_type="ceph-hdd"),
+        ]
+        ports.append(
+            NS(
+                id=f"port-{sid}",
+                device_id=sid,
+                network_id="net-1",
+                mac_address=f"fa:16:3e:0{i}",
+                fixed_ips=[{"ip_address": f"10.0.0.{10 + i}"}],
+                binding_vnic_type="normal",
+            )
+        )
+    conn.compute = FakeCompute(servers)
+    conn.block_storage = FakeBlockStorage(volumes)
+    conn.network = FakeNetwork(ports, [NS(id="net-1", name="app-net", mtu=1442)])
+    calls = {"get_volume": 0, "volumes": 0, "ports_one": 0, "ports_all": 0}
+    get_volume, list_volumes, list_ports = (
+        conn.block_storage.get_volume,
+        conn.block_storage.volumes,
+        conn.network.ports,
+    )
+
+    def counted_get_volume(volume_id):
+        calls["get_volume"] += 1
+        return get_volume(volume_id)
+
+    def counted_volumes(**kwargs):
+        calls["volumes"] += 1
+        return list_volumes(**kwargs)
+
+    def counted_ports(device_id=None, **kwargs):
+        calls["ports_one" if device_id else "ports_all"] += 1
+        return list_ports(device_id=device_id, **kwargs)
+
+    conn.block_storage.get_volume = counted_get_volume
+    conn.block_storage.volumes = counted_volumes
+    conn.network.ports = counted_ports
+    return conn, calls
+
+
+async def test_openstack_list_vms_fetches_volumes_and_ports_in_bulk(stub_openstack):
+    conn, calls = _fleet_conn(3)
+    stub_openstack(conn)
+    vms = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [vm.name for vm in vms] == ["web-00", "web-01", "web-02"]
+    assert [[d.id for d in vm.disks] for vm in vms][1] == ["srv-1-root", "srv-1-data"]
+    assert [vm.nics[0].fixed_ips for vm in vms] == [["10.0.0.10"], ["10.0.0.11"], ["10.0.0.12"]]
+    # one listing each instead of a call per volume and per server
+    assert calls == {"get_volume": 0, "volumes": 1, "ports_one": 0, "ports_all": 1}
+
+
+async def test_openstack_list_vms_falls_back_per_vm_when_bulk_listing_is_refused(stub_openstack):
+    conn, calls = _fleet_conn(2)
+
+    def refused(**_):
+        raise RuntimeError("HTTP 403")
+
+    conn.block_storage.volumes = refused
+    real_ports = conn.network.ports
+
+    def ports(device_id=None, **kwargs):
+        if device_id is None:
+            raise RuntimeError("HTTP 403")
+        return real_ports(device_id=device_id, **kwargs)
+
+    conn.network.ports = ports
+    stub_openstack(conn)
+    vms = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [len(vm.disks) for vm in vms] == [2, 2]
+    assert [vm.nics[0].mac for vm in vms] == ["fa:16:3e:00", "fa:16:3e:01"]
+    assert calls["get_volume"] == 4 and calls["ports_one"] == 2
+
+
+async def test_openstack_flavor_ephemeral_and_swap_become_disks(stub_openstack):
+    """Flavor ephemeral (GiB) and swap (MiB) disks count towards capacity and the estimate."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.flavor = {**server.flavor, "ephemeral": 200, "swap": 2048}
+    stub_openstack(conn)
+    provider = OpenStackProvider(make_provider(), settings())
+    [vm] = await provider.list_vms()
+    by_name = {d.name: d for d in vm.disks}
+    assert by_name["ephemeral"].kind == "ephemeral" and by_name["ephemeral"].size_gb == 200
+    assert by_name["swap"].kind == "ephemeral" and by_name["swap"].size_gb == 2
+    assert vm.disk_bytes == (20 + 100 + 200 + 2) * 2**30
+    assert vm.root_disk() is not None and vm.root_disk().id == "vol-root"
+
+
+async def test_openstack_boot_volume_falls_back_to_cinder_bootable_flag(stub_openstack):
+    """Nova may report no root_device_name, or one the attachment does not carry (virtio-scsi
+    /dev/sda): the volume flagged bootable by Cinder is the boot disk then."""
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.root_device_name = None
+    server.attachments = [
+        NS(volume_id="vol-data", device="/dev/sda"),
+        NS(volume_id="vol-root", device="/dev/sdb"),
+    ]
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert [d.bootable for d in vm.disks] == [True, False]
+    assert vm.root_disk().id == "vol-root"
+
+
+async def test_openstack_tls_off_is_logged_and_calls_are_bounded(
+    stub_openstack, monkeypatch, caplog
+):
+    import logging
+    import time
+
+    from seamless_migrate.providers import openstack as osp
+
+    calls = stub_openstack(fake_conn())
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.providers.openstack"):
+        provider = OpenStackProvider(make_provider(verify_tls=False), settings())
+        await provider.list_vms()
+    assert "TLS certificate verification is disabled" in caplog.text
+    assert calls["api_timeout"] == osp.PROVIDER_API_TIMEOUT_S
+
+    monkeypatch.setattr(osp, "PROVIDER_CALL_TIMEOUT_S", 0.05)
+    slow = OpenStackProvider(
+        make_provider(), settings(), connect_fn=lambda p, s: time.sleep(0.3) or fake_conn()
+    )
+    with pytest.raises(ProviderError, match="timed out after 0.05 s"):
+        await slow.check()
+
+    closed = []
+    provider._conn = NS(close=lambda: closed.append(True))
+    provider.close()
+    assert closed == [True] and provider._conn is None
+
+
+async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
+    conn = fake_conn()
+    [server] = conn.compute._servers.values()
+    server.status = "VERIFY_RESIZE"
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.power_state == "transitioning"
+
+
 async def test_openstack_image_booted_server_gets_image_root_disk(stub_openstack):
     conn = fake_conn()
     srv = conn.compute.get_server("srv-1")
@@ -346,10 +515,61 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
         "compute_microversion": "2.95",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
+        "storage_backends": [
+            {
+                "pool": "hostgroup@ceph#ssd",
+                "vendor": "Open Source",
+                "protocol": "ceph",
+                "family": "rbd",
+            }
+        ],
     }
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["admin"] is False and caps["ovn"] is False
+
+
+async def test_openstack_check_reports_storage_backends_with_family(stub_openstack):
+    conn = fake_conn()
+    conn.block_storage.backend_pools = lambda: [
+        NS(
+            name="overcloud@ontap_nfs#192.0.2.5:/cinder_vol",
+            capabilities={"vendor_name": "NetApp", "storage_protocol": "nfs"},
+        ),
+        NS(
+            name="overcloud@ontap_iscsi#flex_a",
+            capabilities={"vendor_name": "NetApp", "storage_protocol": "iSCSI"},
+        ),
+        NS(name="overcloud@lvm#lvm", capabilities=None),
+    ]
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["volume_backends"] == [
+        "overcloud@lvm#lvm",
+        "overcloud@ontap_iscsi#flex_a",
+        "overcloud@ontap_nfs#192.0.2.5:/cinder_vol",
+    ]
+    assert [(b["pool"], b["family"]) for b in caps["storage_backends"]] == [
+        ("overcloud@lvm#lvm", "other"),
+        ("overcloud@ontap_iscsi#flex_a", "netapp_block"),
+        ("overcloud@ontap_nfs#192.0.2.5:/cinder_vol", "netapp_nfs"),
+    ]
+    assert caps["storage_backends"][1]["vendor"] == "NetApp"
+    assert caps["storage_backends"][1]["protocol"] == "iSCSI"
+    # without admin the pool listing is not attempted
+    stub_openstack(fake_conn(admin=False))
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["storage_backends"] == [] and caps["volume_backends"] == []
+
+
+async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
+    conn = fake_conn()
+    conn.block_storage.get_volume("vol-root").host = "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    root, data = vm.disks
+    assert root.pool == "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+    assert data.pool is None  # host attribute hidden from non-admin credentials
 
 
 async def test_openstack_destination_inventory(stub_openstack):
@@ -543,6 +763,67 @@ class PoweredOffVM(VirtualMachine):
         return task
 
 
+async def test_vmware_os_type_prefers_the_tools_pretty_name(tmp_path):
+    """SDD §10: VMware Tools report the exact release; the guest id only names the family."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u\n")
+    (secret_dir / "password").write_text("p\n")
+    with_tools = fake_vcenter_vm()
+    with_tools.config.guestId = "ubuntu64Guest"
+    with_tools.guest.guestDetailedData = (
+        "architecture='X86' bitness='64' distroName='Ubuntu' distroVersion='22.04' "
+        "familyName='Linux' kernelVersion='5.15.0-105-generic' prettyName='Ubuntu 22.04.4 LTS'"
+    )
+    without = fake_vcenter_vm()
+    without.name = "dc2-db-02"
+    without._moId = "vm-102"
+    without.config.instanceUuid = "5012-ef01"
+    without.config.guestId = "ubuntu64Guest"
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint="https://vcenter.dc2.example/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda *a, **kw: fake_service_instance([with_tools, without]),
+        vim=FAKE_VIM,
+    )
+    first, second = await provider.list_vms()
+    assert first.os_type == "Ubuntu 22.04.4 LTS" and first.guest_os.label == "Ubuntu 22.04"
+    assert second.os_type == "ubuntu64Guest" and second.guest_os.label == "Ubuntu"
+
+
+async def test_openstack_os_type_from_volume_or_image_properties(stub_openstack):
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.metadata = {"os_type": "linux", "app": "shop"}  # generic: the image is more specific
+    conn.block_storage.get_volume("vol-root").volume_image_metadata = {
+        "os_distro": "ubuntu",
+        "os_version": "22.04",
+        "hw_firmware_type": "uefi",
+    }
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.os_type == "ubuntu 22.04" and vm.guest_os.lifecycle == "current"
+
+    # an image-booted server: the Glance image's properties
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.metadata = {}
+    server.image = {"id": "img-1"}
+    server.attachments = []
+    conn.image = NS(
+        get_image=lambda image_id: NS(id=image_id, os_distro="windows", os_version="2022")
+    )
+    stub_openstack(conn)
+    [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
+    assert vm.os_type == "windows 2022" and vm.guest_os.label == "Windows Server 2022"
+
+
 async def test_vmware_power_on_and_inventory(tmp_path):
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"
     secret_dir.mkdir(parents=True)
@@ -575,6 +856,145 @@ async def test_vmware_power_on_and_inventory(tmp_path):
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
 
 
+async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
+    """One FindByUuid call instead of a walk over every VM in the vCenter."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM()
+    lookups: list[tuple] = []
+    walked: list[str] = []
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        content = si.RetrieveContent()
+        real_view = content.viewManager.CreateContainerView
+
+        def counted_view(folder, types, recursive):
+            walked.append(str(types))
+            return real_view(folder, types, recursive)
+
+        content.viewManager = NS(CreateContainerView=counted_view)
+        content.searchIndex = NS(
+            FindByUuid=lambda dc, uuid, is_vm, instance: (
+                lookups.append((uuid, is_vm, instance)) or (vm if uuid == "5012-abcd" else None)
+            )
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+    found = await provider.get_vm("5012-abcd")
+    assert found.source_id == "5012-abcd" and lookups == [("5012-abcd", True, True)]
+    assert not any("VirtualMachine" in t for t in walked), "no inventory walk for a lookup"
+    await provider.power_on("5012-abcd")
+    assert len(vm.tasks) == 1 and len(lookups) == 2
+    assert not any("VirtualMachine" in t for t in walked)
+    with pytest.raises(ProviderError, match="not found"):
+        await provider.get_vm("missing")  # falls back to the walk, then fails
+
+
+async def test_vmware_used_bytes_come_from_the_disk_layout(tmp_path):
+    """Thin disks: the extent files behind a disk's chain are its used space (no 60 % rule)."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = fake_vcenter_vm()
+    vm.layoutEx = NS(
+        file=[
+            NS(key=0, size=700),  # descriptor
+            NS(key=1, size=12 * GIB),  # Hard disk 1 extent
+            NS(key=2, size=3 * GIB),  # Hard disk 1 snapshot delta
+            NS(key=3, size=100 * GIB),  # Hard disk 2 extent
+        ],
+        disk=[
+            NS(key=2000, chain=[NS(fileKey=[0, 1]), NS(fileKey=[2])]),
+            NS(key=2001, chain=[NS(fileKey=[3])]),
+        ],
+    )
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+    [mapped] = await provider.list_vms()
+    by_name = {d.name: d for d in mapped.disks}
+    assert by_name["Hard disk 1"].used_gb == 15.0 and by_name["Hard disk 2"].used_gb == 100.0
+    assert mapped.used_bytes == 115 * GIB
+    # without a layout the used size stays unknown (estimator fallback)
+    plain = (await provider_for_plain(tmp_path, fake_vcenter_vm()).list_vms())[0]
+    assert all(d.used_gb is None for d in plain.disks)
+
+
+def provider_for_plain(tmp_path, vm):
+    return VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+
+
+async def test_vmware_pci_and_vgpu_devices_become_blocking_extra_specs(tmp_path):
+    """SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU key off extra specs: the provider reports the
+    VMware device classes that way."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+
+    class VirtualPCIPassthrough:
+        def __init__(self, label, vgpu=None):
+            self.key = 13000
+            self.deviceInfo = NS(label=label)
+            self.backing = NS(vgpu=vgpu)
+
+    vim = NS(
+        VirtualMachine=VirtualMachine,
+        vm=NS(
+            device=NS(
+                VirtualDisk=VirtualDisk,
+                VirtualEthernetCard=VirtualEthernetCard,
+                VirtualPCIPassthrough=VirtualPCIPassthrough,
+            )
+        ),
+    )
+    pci = fake_vcenter_vm()
+    pci.config.hardware.device.append(VirtualPCIPassthrough("PCI device 0"))
+    vgpu = fake_vcenter_vm()
+    vgpu.config.instanceUuid = "5012-vgpu"
+    vgpu.config.hardware.device.append(VirtualPCIPassthrough("PCI device 1", vgpu="grid_t4-8q"))
+
+    def provider_for(vms):
+        return VMwareProvider(
+            make_provider(
+                id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+            ),
+            settings(secrets_dir=tmp_path / "secrets"),
+            connector=lambda **_: fake_service_instance(vms),
+            vim=vim,
+        )
+
+    listed = {v.source_id: v for v in await provider_for([pci, vgpu]).list_vms()}
+    assert listed["5012-abcd"].flavor_extra_specs == {"pci_passthrough:alias": "PCI device 0"}
+    assert listed["5012-vgpu"].flavor_extra_specs == {"resources:VGPU": "1"}
+    plain = await provider_for([fake_vcenter_vm()]).list_vms()
+    assert plain[0].flavor_extra_specs == {}
+
+
 async def test_vmware_requires_credentials_secret():
     provider = VMwareProvider(
         make_provider(id="vc", kind=ProviderKind.vmware, cloud=None),
@@ -584,3 +1004,204 @@ async def test_vmware_requires_credentials_secret():
     )
     with pytest.raises(ProviderError, match="credentials_secret"):
         await provider.list_vms()
+
+
+# --------------------------------------------------------------------------------------------
+# Edge paths of the real providers (stubbed): connection setup, quota, console, lookups
+
+
+def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path):
+    from seamless_migrate.providers import openstack as osp
+
+    calls = {}
+    monkeypatch.setattr(
+        osp, "_import_openstack", lambda: NS(connect=lambda **kw: calls.update(kw) or "conn")
+    )
+    clouds = tmp_path / "clouds.yaml"
+    clouds.write_text(
+        "clouds:\n  src:\n    auth: {auth_url: 'https://src/v3', username: u, password: p}\n"
+        "    region_name: regionOne\n"
+    )
+    cfg = settings(clouds_yaml=clouds)
+    provider = make_provider(cloud="src", region="regionTwo", ca_cert_path="/etc/pki/ca.pem")
+    assert osp.connect(provider, cfg) == "conn"
+    assert calls["auth"]["username"] == "u" and calls["load_yaml_config"] is False
+    assert calls["region_name"] == "regionTwo", "Provider.region wins over clouds.yaml"
+    assert calls["cacert"] == "/etc/pki/ca.pem" and calls["verify"] is True
+    # unknown cloud in clouds.yaml -> ProviderError; no clouds.yaml -> openstacksdk's own lookup
+    with pytest.raises(ProviderError, match="clouds.yaml"):
+        osp.connect(make_provider(cloud="nope"), cfg)
+    calls.clear()
+    osp.connect(make_provider(cloud="src"), settings())
+    assert calls["cloud"] == "src" and "auth" not in calls
+    with pytest.raises(ProviderError, match="no 'cloud'"):
+        osp.connect(make_provider(cloud=None), settings())
+    assert osp._truthy("Yes") and osp._truthy(" true ") and not osp._truthy("no")
+    assert osp._truthy(1) and not osp._truthy(0)
+
+
+async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
+    from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
+
+    conn = fake_conn()
+    conn.compute.get_quota_set = lambda pid, usage=True: NS(
+        cores=20, ram=65536, instances=-1, usage={"cores": 6, "ram": 4096, "instances": 3}
+    )
+    conn.block_storage.get_quota_set = lambda pid, usage=True: NS(
+        volumes=None, gigabytes=1000, usage={"gigabytes": 1500}
+    )
+    free = OpenStackProvider._free_quota(conn)
+    assert free == {"cores": 14, "ram_mb": 61440, "instances": -1, "volumes": None, "gigabytes": 0}
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: conn)
+    inv = await provider.inventory()
+    assert inv.quotas == {"finance": free}
+
+    # console output unavailable (HTTP 409 / policy) -> None, never an error
+    def boom(server_id, length=None):
+        raise RuntimeError("HTTP 409: console log not available")
+
+    conn.compute.get_server_console_output = boom
+    assert await provider.console_log("srv-1") is None
+    conn.compute.get_server_console_output = lambda server_id, length=None: None
+    assert await provider.console_log("srv-1") is None
+
+    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited
+    waited = []
+    conn.compute.delete_server = lambda server, ignore_missing=True: conn.compute.deleted.append(
+        server.id
+    )
+    conn.compute.wait_for_delete = lambda server, wait=600: waited.append(server.id)
+    await provider.delete_server("missing")
+    assert conn.compute.deleted == []
+    await provider.delete_server("web-01")
+    assert conn.compute.deleted == ["srv-1"] and waited == ["srv-1"]
+    assert await provider.find_server("web-01") == "srv-1"
+    assert await provider.find_server("nope") is None
+
+    # project names are looked up once and tolerate identity failures
+    ctx = _MapContext(conn)
+    assert ctx.project_name(None) is None
+    assert ctx.project_name("proj-1") == "finance" and ctx.project_name("proj-1") == "finance"
+    conn.identity = NS(get_project=lambda pid: (_ for _ in ()).throw(RuntimeError("403")))
+    assert _MapContext(conn).project_name("proj-2") is None
+
+
+async def test_openstack_flavor_without_embedded_specs_is_fetched(stub_openstack):
+    conn = fake_conn()
+    server = conn.compute.get_server("srv-1")
+    server.flavor = {"id": "flv-1"}  # older Nova: no embedded vcpus/ram/disk
+    conn.compute.get_flavor = lambda flavor_id: NS(
+        id=flavor_id, name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={"hw:x": "1"}
+    )
+    stub_openstack(conn)
+    from seamless_migrate.providers.openstack import OpenStackProvider
+
+    vm = await OpenStackProvider(make_provider(cloud="src"), settings()).get_vm("srv-1")
+    assert (vm.flavor, vm.vcpus, vm.ram_mb) == ("m1.small", 2, 4096)
+    assert vm.flavor_extra_specs == {"hw:x": "1"}
+
+
+async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
+    from seamless_migrate.providers.vmware import VMwareProvider, parse_endpoint
+
+    assert parse_endpoint("vcenter.dc2.example") == ("vcenter.dc2.example", 443)
+    assert parse_endpoint("https://vcenter.dc2.example:8443/sdk") == ("vcenter.dc2.example", 8443)
+    with pytest.raises(ProviderError, match="invalid vCenter endpoint"):
+        parse_endpoint("https://")
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    base = make_provider(
+        id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+    )
+
+    # a NIC on a distributed portgroup resolves its name through the DVS view
+    class Portgroup:
+        def __init__(self, key, name):
+            self.key, self.name = key, name
+
+    vm = fake_vcenter_vm()
+    nic = vm.config.hardware.device[-1]
+    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7"))
+    vim = NS(
+        VirtualMachine=VirtualMachine,
+        vm=FAKE_VIM.vm,
+        dvs=NS(DistributedVirtualPortgroup=Portgroup),
+    )
+
+    def connector(**_):
+        objects = [vm, Portgroup("dvportgroup-7", "DC2-DMZ")]
+
+        def view_for(folder, types, recursive):
+            return NS(
+                view=[o for o in objects if isinstance(o, tuple(types))], Destroy=lambda: None
+            )
+
+        content = NS(
+            rootFolder=object(),
+            viewManager=NS(CreateContainerView=view_for),
+            about=NS(apiVersion="8.0.2.0", version="8.0.2"),
+            customFieldsManager=NS(field=[NS(key=1, name="app")]),
+        )
+        return NS(RetrieveContent=lambda: content)
+
+    provider = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=connector, vim=vim
+    )
+    [mapped] = await provider.list_vms()
+    assert mapped.nics[0].network == "DC2-DMZ"
+
+    # pyVmomi exceptions become ProviderError with the vSphere message
+    def failing(**_):
+        raise RuntimeError("Cannot complete login due to an incorrect user name or password.")
+
+    broken = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=failing, vim=vim
+    )
+    with pytest.raises(ProviderError, match="incorrect user name"):
+        await broken.check()
+
+    class Fault(Exception):
+        msg = "The session is not authenticated."
+
+    def faulting(**_):
+        raise Fault()
+
+    faulty = VMwareProvider(
+        base, settings(secrets_dir=tmp_path / "secrets"), connector=faulting, vim=vim
+    )
+    with pytest.raises(ProviderError, match="session is not authenticated"):
+        await faulty.list_vms()
+
+
+async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
+    from seamless_migrate.providers import vmware as vmw
+
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM(task_state="running")
+    clock = [0.0]
+
+    def fast_clock():  # every call advances 400 s: the 600 s deadline passes on the 2nd poll
+        clock[0] += 400.0
+        return clock[0]
+
+    # patch the provider's view of `time` only: asyncio's own clock must stay real
+    monkeypatch.setattr(vmw, "time", NS(monotonic=fast_clock, sleep=lambda s: None))
+    provider = vmw.VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=lambda **_: fake_service_instance([vm]),
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError, match="timed out"):
+        await provider.power_on("5012-abcd")

@@ -34,7 +34,16 @@ jev = ["mcp>=2.3,<3"]
 dev = [
   "pytest>=8.2",
   "pytest-asyncio>=0.24",
+  "pytest-cov>=5",
   "ruff>=0.6",
+]
+# what `make seamless-check` needs to run the collection's unit and playbook tests from this venv
+collection = [
+  "ansible-core>=2.16",
+  "ansible-lint>=24",
+  "pytest-mock>=3.12",
+  "pyyaml>=6",
+  "openstacksdk>=4.5",
 ]
 
 [project.scripts]
@@ -49,6 +58,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
   "live: talks to real external services (Jev, agentmemory); skipped unless enabled",
+  "lab: runs against the reference lab clouds (QASuite §7); skipped unless SEAMLESS_LAB_* is set",
 ]
 
 [tool.ruff]

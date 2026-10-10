@@ -1,5 +1,6 @@
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { TONE_CLASSES } from '../lib/status';
 import { DowntimeClock } from './DowntimeClock';
 
 describe('DowntimeClock', () => {
@@ -22,6 +23,15 @@ describe('DowntimeClock', () => {
     expect(timer).toHaveTextContent('1:40');
     expect(screen.getByText(/source VM stopped/i)).toBeInTheDocument();
     expect(screen.getByText(/3:20 left in the SLO/i)).toBeInTheDocument();
+  });
+
+  it('warns from 80 % of the SLO with an hourglass, not a check mark (SDD §16)', () => {
+    // 240 s of a 300 s SLO: exactly 80 %, where the warning starts
+    render(<DowntimeClock startedAt="2026-10-08T11:56:00Z" endedAt={null} actualS={null} sloS={300} />);
+    const line = screen.getByText(/left in the SLO/i);
+    expect(line).toHaveClass(TONE_CLASSES.warning.text);
+    expect(line.querySelector('.lucide-hourglass')).not.toBeNull();
+    expect(line.querySelector('.lucide-circle-check')).toBeNull();
   });
 
   it('says in words when the SLO is exceeded', () => {

@@ -7,7 +7,12 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy
 from seamless_migrate.domain.models import HandoverConfig, Mappings
 from seamless_migrate.executors.base import PermanentStepError, StepName
-from seamless_migrate.executors.handover import JOURNAL_FILE, HandoverExecutor
+from seamless_migrate.executors.handover import (
+    JOURNAL_FILE,
+    HandoverExecutor,
+    _cinder_bootable,
+    _mark_boot,
+)
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
 
@@ -22,17 +27,77 @@ class Crash(Exception):
 
 
 class FakeResponse:
+    """openstacksdk's raw Proxy calls return the response even for 4xx (raise_exc=False)."""
+
     def __init__(self, body, status=202):
         self._body = body
         self.status_code = status
+
+    @property
+    def text(self):
+        return json.dumps(self._body)
 
     def json(self):
         return self._body
 
 
+def refused(message):
+    return FakeResponse({"badRequest": {"code": 400, "message": message}}, 400)
+
+
+def _mv(version):
+    major, minor = str(version).split(".")
+    return int(major), int(minor)
+
+
+class HTTPError(Exception):
+    """What keystoneauth raises for a 4xx answer."""
+
+
+class NotFoundException(HTTPError):
+    """openstacksdk's answer to a missing resource (``openstack.exceptions.NotFoundException``)."""
+
+    status_code = 404
+
+
 class FakeCompute:
+    """Nova as verified upstream: PUT os-volume_attachments changes delete_on_termination only
+    from microversion 2.85; deleting a server deletes the volumes attached with
+    delete_on_termination=true and detaches the others."""
+
     def __init__(self, cloud):
         self.c = cloud
+        self.max_microversion = "2.88"  # Wallaby (RHOSP 17.1)
+
+    def get_endpoint_data(self):
+        return NS(max_microversion=self.max_microversion)
+
+    def _attachment_url(self, url):
+        _, servers, sid, kind, vid = url.split("/")
+        assert (servers, kind) == ("servers", "os-volume_attachments"), url
+        return self.c.servers[sid], vid
+
+    def put(self, url, json=None, microversion=None, **kw):
+        server, vid = self._attachment_url(url)
+        body = json["volumeAttachment"]
+        if "delete_on_termination" in body and (
+            microversion is None or _mv(microversion) < (2, 85)
+        ):
+            return refused("delete_on_termination needs microversion 2.85")
+        if body["volumeId"] != vid:
+            return refused("that would be a swap")
+        if vid not in server.dot:
+            return FakeResponse({"itemNotFound": {"message": "volume not attached"}}, 404)
+        self.c.record("keep" if body.get("delete_on_termination") is False else "dot", vid)
+        server.dot[vid] = body["delete_on_termination"]
+        return FakeResponse({"volumeAttachment": {"volumeId": vid}}, 202)
+
+    def get(self, url, microversion=None, **kw):
+        server, vid = self._attachment_url(url)
+        body = {"volumeId": vid}
+        if microversion and _mv(microversion) >= (2, 79):
+            body["delete_on_termination"] = server.dot[vid]
+        return FakeResponse({"volumeAttachment": body}, 200)
 
     def get_server(self, server_id):
         self.c.record("get_server", server_id)
@@ -49,13 +114,32 @@ class FakeCompute:
         return server
 
     def volume_attachments(self, server):
-        return [NS(volume_id=v, device=d) for v, d in server.attachments]
+        return [
+            NS(volume_id=v, device=d, delete_on_termination=server.dot.get(v))
+            for v, d in server.attachments
+        ]
 
     def delete_volume_attachment(self, server, volume, ignore_missing=True):
         self.c.record("detach", volume)
 
     def delete_server(self, server, ignore_missing=True):
-        self.c.record("delete_server", getattr(server, "id", server))
+        sid = getattr(server, "id", server)
+        self.c.record("delete_server", sid)
+        server = self.c.servers.pop(sid, None)
+        for port in [p for p in self.c.ports.values() if p.device_id == sid]:
+            if port.created_by_nova:
+                self.c.ports.pop(port.id)
+            else:
+                port.device_id = ""
+        for vid, _device in getattr(server, "attachments", []) or []:
+            volume = self.c.volumes.get(vid)
+            if volume is None:
+                continue  # unmanaged: Nova cannot delete what Cinder no longer knows
+            if server.dot.get(vid):
+                self.c.volumes.pop(vid)
+                self.c.deleted_by_nova.append(vid)
+            else:
+                volume.status = "available"
 
     def wait_for_delete(self, res, interval=2, wait=120):
         return res
@@ -66,9 +150,20 @@ class FakeCompute:
     def create_server(self, **params):
         self.c.record("create_server", params["name"])
         self.c.created.append(params)
+        bdm = params.get("block_device_mapping") or []
         server = NS(
-            id=f"{self.c.name}-new-{len(self.c.created)}", name=params["name"], status="ACTIVE"
+            id=f"{self.c.name}-new-{len(self.c.created)}",
+            name=params["name"],
+            status="ACTIVE",
+            attachments=[(b["uuid"], None) for b in bdm],
+            dot={b["uuid"]: b["delete_on_termination"] for b in bdm},
         )
+        for b in bdm:
+            if b["uuid"] in self.c.volumes:
+                self.c.volumes[b["uuid"]].status = "in-use"
+        for net in params.get("networks") or []:
+            if "port" in net:
+                self.c.ports[net["port"]].device_id = server.id
         self.c.servers[server.id] = server
         return server
 
@@ -78,18 +173,60 @@ class FakeBlockStorage:
         self.c = cloud
 
     def get_volume(self, volume_id):
+        if volume_id not in self.c.volumes:
+            raise NotFoundException(f"HTTP 404: volume {volume_id} not found")
         return self.c.volumes[volume_id]
 
+    def snapshots(self, details=True, **query):
+        return [
+            NS(id=f"snap-{i}", volume_id=query.get("volume_id"))
+            for i in range(getattr(self.c.volumes.get(query.get("volume_id")), "snapshots", 0))
+        ]
+
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=120):
+        if self.c.crash_wait == "status":
+            self.c.crash_wait = None
+            raise Crash("wait_for_status")
+        if getattr(res, "status", status) != status:
+            raise HTTPError(f"timeout waiting for {res.id} to be {status} (is {res.status})")
         return res
 
     def wait_for_delete(self, res, interval=2, wait=120):
+        if self.c.crash_wait == "delete":
+            self.c.crash_wait = None
+            raise Crash("wait_for_delete")
         return res
 
+    def backend_pools(self):
+        if self.c.pools is None:
+            raise RuntimeError("HTTP 403: Policy doesn't allow scheduler_extension:scheduler_stats")
+        return [NS(name=name, capabilities=caps) for name, caps in self.c.pools]
+
     def post(self, url, json=None, **kw):
+        if url.endswith("/action") and "os-set_image_metadata" in json:
+            vid = url.split("/")[2]
+            if self.c.refuse_metadata:
+                return refused("Invalid image metadata")
+            self.c.record("set_image_metadata", vid)
+            self.c.image_metadata[vid] = dict(json["os-set_image_metadata"]["metadata"])
+            return FakeResponse({"metadata": json["os-set_image_metadata"]["metadata"]}, 200)
         if url.endswith("/action") and "os-unmanage" in json:
             vid = url.split("/")[2]
+            volume = self.get_volume(vid)
+            # cinder.volume.api.API.delete(unmanage_only=True), verified on wallaby-eol and master
+            if getattr(volume, "encryption_key_id", None):
+                return refused("Unmanaging encrypted volumes is not supported.")
+            if (
+                volume.status not in ("available", "error", "error_restoring", "error_extending")
+                or getattr(volume, "snapshots", 0)
+                or getattr(volume, "group_id", None)
+            ):
+                return refused(
+                    "Invalid volume: Volume status must be available or error and must not be "
+                    "migrating, attached, belong to a group, have snapshots"
+                )
             self.c.record("unmanage", vid)
+            self.c.volumes.pop(vid)
             return FakeResponse({}, 202)
         if url == "/manageable_volumes":
             vol = json["volume"]
@@ -104,17 +241,41 @@ class FakeBlockStorage:
                 is_bootable=vol.get("bootable"),
                 host=vol["host"],
                 status="available",
+                encryption_key_id=None,
+                snapshots=0,
+                group_id=None,
             )
             return FakeResponse({"volume": {"id": new_id}}, 202)
         raise AssertionError(url)
 
 
 class FakeNetwork:
+    """Neutron: deleting a server deletes the ports Nova created for it and only unbinds the ports
+    a user created and passed in; creating a port with a MAC and fixed IPs keeps them."""
+
     def __init__(self, cloud):
         self.c = cloud
 
     def ports(self, device_id=None):
-        return [NS(network_id="net-1", fixed_ips=[{"ip_address": "10.0.0.5"}])]
+        return [p for p in self.c.ports.values() if device_id is None or p.device_id == device_id]
+
+    def get_port(self, port_id):
+        if port_id not in self.c.ports:
+            raise NotFoundException(f"HTTP 404: port {port_id} not found")
+        return self.c.ports[port_id]
+
+    def create_port(self, **attrs):
+        self.c.record("create_port", attrs.get("mac_address"))
+        port = NS(
+            id=f"{self.c.name}-port-{len(self.c.ports) + 1}",
+            network_id=attrs["network_id"],
+            mac_address=attrs.get("mac_address") or "fa:16:3e:ff:ff:ff",
+            fixed_ips=list(attrs.get("fixed_ips") or []),
+            device_id="",
+            created_by_nova=False,
+        )
+        self.c.ports[port.id] = port
+        return port
 
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
@@ -123,15 +284,26 @@ class FakeNetwork:
         return NS(id=f"{self.c.name}-net-{name}", name=name)
 
 
+CEPH = {"vendor_name": "Open Source", "storage_protocol": "ceph"}
+ONTAP_NFS = {"vendor_name": "NetApp", "storage_protocol": "nfs"}
+ONTAP_ISCSI = {"vendor_name": "NetApp", "storage_protocol": "iSCSI"}
+
+
 class FakeCloud:
-    def __init__(self, name, calls, servers=None, volumes=None, crash_on=None):
+    def __init__(self, name, calls, servers=None, volumes=None, crash_on=None, pools=()):
         self.name = name
+        self.pools = list(pools) if pools is not None else None
         self.calls = calls
         self.servers = servers or {}
         self.volumes = volumes or {}
         self.crash_on = crash_on
+        self.crash_wait = None  # "delete" or "status": crash once inside that block-storage wait
         self.created = []
         self.managed = []
+        self.ports = {}
+        self.image_metadata = {}
+        self.deleted_by_nova = []
+        self.refuse_metadata = False
         self.compute = FakeCompute(self)
         self.block_storage = FakeBlockStorage(self)
         self.network = FakeNetwork(self)
@@ -156,6 +328,7 @@ def source_cloud(calls, crash_on=None):
         security_groups=[{"name": "default"}],
         availability_zone="nova",
         attachments=[("vol-root", "/dev/vda"), ("vol-data", "/dev/vdb")],
+        dot={"vol-root": True, "vol-data": False},
     )
     volumes = {
         "vol-root": NS(
@@ -166,6 +339,9 @@ def source_cloud(calls, crash_on=None):
             is_bootable=True,
             host="overcloud@tripleo_ceph#ssd",
             status="in-use",
+            encryption_key_id=None,
+            snapshots=0,
+            group_id=None,
         ),
         "vol-data": NS(
             id="vol-data",
@@ -175,14 +351,34 @@ def source_cloud(calls, crash_on=None):
             is_bootable=False,
             host="overcloud@tripleo_ceph#hdd",
             status="in-use",
+            encryption_key_id=None,
+            snapshots=0,
+            group_id=None,
         ),
     }
-    return FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on)
+    pools = [("overcloud@tripleo_ceph#ssd", CEPH), ("overcloud@tripleo_ceph#hdd", CEPH)]
+    cloud = FakeCloud("src", calls, {"srv-1": server}, volumes, crash_on=crash_on, pools=pools)
+    cloud.ports["port-1"] = NS(
+        id="port-1",
+        network_id="net-1",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[
+            {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+            {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
+        ],
+        device_id="srv-1",
+        created_by_nova=True,
+    )
+    return cloud
 
 
-def setup(tmp_path, crash_on=None):
+def setup(tmp_path, crash_on=None, dst_crash_on=None):
     calls = []
-    clouds = {"src": source_cloud(calls, crash_on), "dst": FakeCloud("dst", calls)}
+    dst_pools = [("hostgroup@ceph-ssd#ssd", CEPH), ("hostgroup@ceph-hdd#hdd", CEPH)]
+    clouds = {
+        "src": source_cloud(calls, crash_on),
+        "dst": FakeCloud("dst", calls, pools=dst_pools, crash_on=dst_crash_on),
+    }
     settings = Settings(data_dir=tmp_path / "data")
     executor = HandoverExecutor(settings, conn_factory=lambda p: clouds[p.cloud], poll_s=0)
     plan = make_plan(
@@ -228,16 +424,20 @@ async def test_handover_cutover_order_and_bdm(tmp_path):
     assert executor.supports(Strategy.storage_handover) and not executor.supports(Strategy.warm)
     ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
     result = await executor.run(StepName.CUTOVER, ctx)
+    # SDD §7.3: keep the volumes (delete_on_termination=false, microversion 2.85), delete the
+    # server, and only then unmanage: Cinder refuses to unmanage an attached volume
     assert ops(calls) == [
         ("src", "stop_server", "srv-1"),
-        ("src", "detach", "vol-data"),
+        ("src", "keep", "vol-data"),
+        ("src", "keep", "vol-root"),
+        ("src", "delete_server", "srv-1"),
         ("src", "unmanage", "vol-data"),
         ("src", "unmanage", "vol-root"),
-        ("src", "delete_server", "srv-1"),
         ("dst", "manage", "volume-vol-data"),
         ("dst", "manage", "volume-vol-root"),
         ("dst", "create_server", "web-01"),
     ]
+    assert clouds["src"].deleted_by_nova == [], "the boot volume survived its server's deletion"
     assert rec.downtime_marks == 1
     assert result.destination_server_id == "dst-new-1"
     data_manage, root_manage = clouds["dst"].managed
@@ -255,6 +455,89 @@ async def test_handover_cutover_order_and_bdm(tmp_path):
         "vol-data",
         "vol-root",
     ]
+    # the original delete_on_termination is journaled for the rollback
+    assert [a["delete_on_termination"] for a in saved["attachments"]] == [False, True]
+
+
+async def test_handover_boots_from_the_root_device_nova_reports(tmp_path):
+    """A legacy guest on the IDE bus boots from /dev/hda, Nova's root_device_name: the recreated
+    server boots from that volume (SDD §7.3 step 2), as the inventory decides it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    server = clouds["src"].servers["srv-1"]
+    server.root_device_name = "/dev/hda"
+    server.attachments = [("vol-root", "/dev/hda"), ("vol-data", "/dev/hdb")]
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert [(a["volume_id"], a["boot"]) for a in saved["attachments"]] == [
+        ("vol-data", False),
+        ("vol-root", True),
+    ]
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_falls_back_to_the_cinder_bootable_volume(tmp_path):
+    """Nova shows no root device name and no volume is at /dev/vda: the volume Cinder marks
+    bootable is the boot volume, as in the inventory (SDD §7.3 step 2)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/vdc"),
+        ("vol-data", "/dev/vdb"),
+    ]
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_falls_back_to_the_first_disk_of_another_bus(tmp_path):
+    """No root device name, no Cinder bootable flag (a volume written by hand): a virtio-scsi
+    guest's first disk, /dev/sda, is the boot volume (SDD §7.3 step 2)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/sda"),
+        ("vol-data", "/dev/sdb"),
+    ]
+    clouds["src"].volumes["vol-root"].is_bootable = False
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+@pytest.mark.parametrize(
+    ("root", "devices", "flags", "boot"),
+    [
+        ("/dev/hda", ["/dev/hdb", "/dev/hda"], [False, False], "/dev/hda"),  # Nova's root device
+        ("/dev/vda", ["/dev/vdc", "/dev/vdb"], ["true", "true"], "/dev/vdb"),  # lowest bootable
+        ("/dev/vda", ["/dev/vdb", "/dev/vdc"], ["false", "TRUE"], "/dev/vdc"),  # flags as text
+        ("/dev/vda", ["/dev/hdb", "/dev/xvda", "/dev/hda"], [False] * 3, "/dev/hda"),  # bus order
+        ("/dev/vda", ["/dev/vdb", "/dev/vdc"], [False, None], None),  # nothing to boot from
+    ],
+)
+def test_mark_boot_follows_the_rules_of_sdd_7_3(root, devices, flags, boot):
+    attachments = [
+        {"device": d, "bootable": _cinder_bootable(NS(is_bootable=f))}
+        for d, f in zip(devices, flags, strict=True)
+    ]
+    _mark_boot(attachments, root)
+    assert [a["device"] for a in attachments if a["boot"]] == ([boot] if boot else [])
+
+
+async def test_handover_refuses_before_stop_when_no_volume_is_the_boot_volume(tmp_path):
+    """Without a boot volume the destination server cannot be created, and neither can the source
+    again on rollback: refuse while the VM still runs (SDD §7.3 step 0)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].servers["srv-1"].attachments = [
+        ("vol-root", "/dev/vdc"),
+        ("vol-data", "/dev/vdb"),
+    ]
+    clouds["src"].volumes["vol-root"].is_bootable = False
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="which volume the server boots from"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
 
 
 async def test_handover_journal_resume_skips_done_steps(tmp_path):
@@ -263,13 +546,9 @@ async def test_handover_journal_resume_skips_done_steps(tmp_path):
     with pytest.raises(PermanentStepError, match="delete the source server"):
         await executor.run(StepName.CUTOVER, ctx)
     journal = json.loads((executor.run_dir(ctx) / JOURNAL_FILE).read_text())
-    assert {
-        "stop_source",
-        "save_definition",
-        "detach:vol-data",
-        "unmanage_src:vol-data",
-        "unmanage_src:vol-root",
-    } <= set(journal["done"])
+    assert {"stop_source", "save_definition", "keep:vol-data", "keep:vol-root"} <= set(
+        journal["done"]
+    )
     assert "delete_source" not in journal["done"]
     first = list(calls)
     calls.clear()
@@ -280,6 +559,8 @@ async def test_handover_journal_resume_skips_done_steps(tmp_path):
     result = await executor2.run(StepName.CUTOVER, ctx2)
     assert ops(calls) == [
         ("src", "delete_server", "srv-1"),
+        ("src", "unmanage", "vol-data"),
+        ("src", "unmanage", "vol-root"),
         ("dst", "manage", "volume-vol-data"),
         ("dst", "manage", "volume-vol-root"),
         ("dst", "create_server", "web-01"),
@@ -307,6 +588,7 @@ async def test_handover_rollback_reverses_order(tmp_path):
         ("dst", "unmanage", "dst-vol-1"),
         ("src", "manage", "volume-dst-vol-2"),
         ("src", "manage", "volume-dst-vol-1"),
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
         ("src", "create_server", "web-01"),
     ]
     src_manage = clouds["src"].managed
@@ -317,10 +599,530 @@ async def test_handover_rollback_reverses_order(tmp_path):
     params = clouds["src"].created[0]
     assert [
         (b["boot_index"], b["delete_on_termination"]) for b in params["block_device_mapping"]
-    ] == [(0, False), (-1, False)]
+    ] == [(0, True), (-1, False)]
     # the recreated source VM has new ids; the executor reports them to the orchestrator
     assert result.details["source_running"] is True
     new_vm = result.details["vm"]
     assert new_vm["source_id"] == "src-new-1"
     assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
     assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists(), "journal archived"
+
+
+async def test_handover_rollback_with_empty_journal_is_a_noop(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="stop_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and result.details == {
+        "source_running": True,
+        "note": "nothing to roll back",
+    }
+
+
+async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
+    """Crash before the server was deleted: the volumes are still attached and managed; the
+    rollback sets the journaled delete_on_termination back and starts the source."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="delete the source server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert clouds["src"].servers["srv-1"].dot == {"vol-root": False, "vol-data": False}
+    calls.clear()
+    rb_ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    result = await executor.run(StepName.ROLLBACK, rb_ctx)
+    assert ops(calls) == [("src", "dot", "vol-root"), ("src", "start_server", "srv-1")]
+    assert clouds["src"].servers["srv-1"].dot == {"vol-root": True, "vol-data": False}
+    assert result.details == {"source_running": True}, "same ids: nothing to report"
+    assert not (executor.run_dir(rb_ctx) / JOURNAL_FILE).exists()
+
+
+async def test_handover_rollback_after_the_source_is_deleted_recreates_it(tmp_path):
+    """Crash at the first unmanage: the server is gone, both volumes still managed at the source;
+    the rollback recreates the server on the same volumes with their delete_on_termination."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "srv-1" not in clouds["src"].servers and clouds["src"].deleted_by_nova == []
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
+        ("src", "create_server", "web-01"),
+    ]
+    bdm = clouds["src"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"], b["delete_on_termination"]) for b in bdm] == [
+        ("vol-root", 0, True),
+        ("vol-data", -1, False),
+    ]
+    assert result.details["vm"]["source_id"] == "src-new-1"
+
+
+async def test_handover_journals_every_port_with_its_mac_and_addresses(tmp_path):
+    """SDD §7.3 step 2: every port with its id, MAC and every fixed IP (IPv4 and IPv6)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    [port] = saved["networks"]
+    assert (port["port_id"], port["mac_address"], port["network"]) == (
+        "port-1",
+        "fa:16:3e:00:00:01",
+        "app-net",
+    )
+    assert [ip["ip_address"] for ip in port["fixed_ips"]] == ["10.0.0.5", "fd00::5"]
+
+
+async def test_handover_rollback_recreates_nova_ports_with_their_mac_and_addresses(tmp_path):
+    """The source server is gone and Nova deleted the port it had created: the rollback recreates
+    the port with its MAC and both addresses and boots the source on it (SDD §7.3 rollback)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "port-1" not in clouds["src"].ports
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [port] = clouds["src"].ports.values()
+    assert port.mac_address == "fa:16:3e:00:00:01"
+    assert [ip["ip_address"] for ip in port.fixed_ips] == ["10.0.0.5", "fd00::5"]
+    assert clouds["src"].created[0]["networks"] == [{"port": port.id}]
+    assert port.device_id == "src-new-1"
+
+
+async def test_handover_rollback_reuses_a_port_the_user_created(tmp_path):
+    """A port created by a user survives the server's deletion, unbound: the rollback boots the
+    source on that port again instead of creating another."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    clouds["src"].ports["port-1"].created_by_nova = False
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("src", "create_port", "fa:16:3e:00:00:01") not in ops(calls)
+    assert clouds["src"].created[0]["networks"] == [{"port": "port-1"}]
+    assert clouds["src"].ports["port-1"].device_id == "src-new-1"
+
+
+async def test_handover_rollback_resume_does_not_recreate_a_port_twice(tmp_path):
+    """The rollback crashed after recreating the port: a resume boots on that port instead of
+    asking Neutron for a second one with the same MAC, which it would refuse."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_on = "create_server"
+    with pytest.raises(PermanentStepError, match="recreate the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "create_port"] == [
+        ("src", "create_port", "fa:16:3e:00:00:01")
+    ]
+    [port] = clouds["src"].ports.values()
+    assert clouds["src"].created[-1]["networks"] == [{"port": port.id}]
+
+
+async def test_handover_keeps_a_port_without_addresses(tmp_path):
+    """A port with no fixed IP is journaled too, and the destination gets a NIC on the mapped
+    network without asking for an address."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-1"].fixed_ips = []
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert [(n["port_id"], n["fixed_ips"]) for n in saved["networks"]] == [("port-1", [])]
+    assert clouds["dst"].created[0]["networks"] == [{"uuid": "dst-net-rhoso-app"}]
+
+
+async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_failing(tmp_path):
+    """The control plane died while Cinder was unmanaging the first volume: the resume knows the
+    unmanage was sent and does not trip over the volume Cinder no longer knows (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "delete"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert "vol-data" not in clouds["src"].volumes  # Cinder did unmanage it
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [op for op in ops(calls) if op[1] == "unmanage"] == [
+        ("src", "unmanage", "vol-data"),
+        ("src", "unmanage", "vol-root"),
+    ]
+
+
+async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_volume(tmp_path):
+    """The control plane died while RHOSO was managing the first volume: the resume waits for that
+    volume instead of managing the renamed object again (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "status"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "manage"] == [
+        ("dst", "manage", "volume-vol-data"),
+        ("dst", "manage", "volume-vol-root"),
+    ]
+    bdm = clouds["dst"].created[0]["block_device_mapping"]
+    assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume(tmp_path):
+    """The RHOSO volume a crashed manage created is known to the journal: the rollback unmanages
+    it and manages the source back under its name (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "status"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("dst", "unmanage", "dst-vol-1") in ops(calls)
+    assert ("src", "manage", "volume-dst-vol-1") in ops(calls)
+    assert "dst-vol-1" not in clouds["dst"].volumes
+
+
+async def test_handover_rollback_after_a_crash_while_unmanaging_finishes_it_and_manages_back(
+    tmp_path,
+):
+    """A crash while Cinder unmanaged the first source volume, then a rollback: the volume Cinder
+    forgot is managed back with the other one and the source server boots on both (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "delete"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ("src", "manage", "volume-vol-data") in ops(calls)
+    assert ("src", "unmanage", "vol-data") not in ops(calls)  # Cinder already did
+    bdm = clouds["src"].created[0]["block_device_mapping"]
+    assert len(bdm) == 2 and result.details["source_running"] is True
+
+
+async def test_handover_rollback_resume_after_a_crash_while_managing_back(tmp_path):
+    """The rollback itself crashed while the source managed a volume back: its resume waits for
+    that volume instead of managing the object again (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_wait = "status"
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "manage"] == [("src", "manage", "volume-vol-data")]
+    assert result.details["source_running"] is True
+
+
+async def test_handover_rollback_after_unmanage_manages_back_and_recreates(tmp_path):
+    """Crash at the RHOSO manage: both volumes are unmanaged at the source; the rollback manages
+    them back, recreates the server and reports the new ids."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [
+        ("src", "manage", "volume-vol-root"),
+        ("src", "manage", "volume-vol-data"),
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
+        ("src", "create_server", "web-01"),
+    ]
+    new_vm = result.details["vm"]
+    assert new_vm["source_id"] == "src-new-1"
+    assert {d["id"] for d in new_vm["disks"]} == {"src-vol-1", "src-vol-2"}
+    # a second rollback finds the archived journal gone and does nothing
+    calls.clear()
+    again = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert calls == [] and again.details["note"] == "nothing to roll back"
+
+
+@pytest.mark.parametrize(
+    ("trait", "reason"),
+    [
+        ({"encryption_key_id": "key-1"}, "encrypted"),
+        ({"snapshots": 2}, "2 snapshot"),
+        ({"group_id": "grp-1"}, "group"),
+        ({"consistency_group_id": "cg-1"}, "group"),
+    ],
+)
+async def test_handover_refuses_before_stop_when_cinder_cannot_unmanage_a_volume(
+    tmp_path, trait, reason
+):
+    """Cinder's unmanage rules (volume/api.py delete(unmanage_only=True)) are checked while the
+    VM runs: such a volume would otherwise fail after the stop."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    for key, value in trait.items():
+        setattr(clouds["src"].volumes["vol-data"], key, value)
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match=reason):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+async def test_handover_refuses_before_stop_without_compute_microversion_2_85(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].compute.max_microversion = "2.79"
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="2.85"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [] and rec.downtime_marks == 0
+
+
+# -- NetApp ONTAP (SDD §7.3.1) -------------------------------------------------------------------
+NFS_SRC = "overcloud@ontap_nfs#192.0.2.5:/cinder_vol"
+NFS_DST = "hostgroup@ontap_nfs#10.20.0.5:/cinder_vol"
+
+
+def netapp_setup(tmp_path, family="nfs", crash_on=None, dst_pools=None):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on=crash_on)
+    if family == "nfs":
+        src_pool, caps, backend = NFS_SRC, ONTAP_NFS, "hostgroup@ontap_nfs"
+        default_dst = [
+            ("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS),
+            (NFS_DST, ONTAP_NFS),
+        ]
+    else:
+        src_pool, caps, backend = (
+            "overcloud@ontap_iscsi#flex_a",
+            ONTAP_ISCSI,
+            "hostgroup@ontap_iscsi",
+        )
+        default_dst = [
+            ("hostgroup@ontap_iscsi#flex_a", ONTAP_ISCSI),
+            ("hostgroup@ontap_iscsi#flex_b", ONTAP_ISCSI),
+        ]
+    for volume in clouds["src"].volumes.values():
+        volume.host = src_pool
+    clouds["src"].pools = [(src_pool, caps), ("overcloud@tripleo_ceph#ssd", CEPH)]
+    clouds["dst"].pools = default_dst if dst_pools is None else dst_pools
+    plan = plan.model_copy(
+        update={
+            "handover": HandoverConfig(
+                enabled=True, backend_map={"ceph-ssd": backend, "ceph-hdd": backend}
+            )
+        }
+    )
+    return executor, calls, clouds, plan, mig, settings
+
+
+async def test_handover_netapp_nfs_manages_by_share_path(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    managed = [(op, arg) for cloud, op, arg in calls if cloud == "dst" and op == "manage"]
+    # the destination's own LIF address, the export the source used
+    assert managed == [
+        ("manage", "10.20.0.5:/cinder_vol/volume-vol-data"),
+        ("manage", "10.20.0.5:/cinder_vol/volume-vol-root"),
+    ]
+    assert {m["host"] for m in clouds["dst"].managed} == {NFS_DST}
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert saved["storage"]["vol-data"] == {
+        "family": "netapp_nfs",
+        "src_pool": "192.0.2.5:/cinder_vol",
+        "dst_host": NFS_DST,
+    }
+
+
+async def test_handover_netapp_block_manages_by_lun_path(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "iscsi")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    assert [arg for cloud, op, arg in calls if cloud == "dst" and op == "manage"] == [
+        "/vol/flex_a/volume-vol-data",
+        "/vol/flex_a/volume-vol-root",
+    ]
+    assert {m["host"] for m in clouds["dst"].managed} == {"hostgroup@ontap_iscsi#flex_a"}
+
+
+@pytest.mark.parametrize(
+    ("dst_pools", "reason"),
+    [
+        ([("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS)], "no pool for the export"),
+        ([("hostgroup@ontap_nfs#flex_a", ONTAP_ISCSI)], "same driver family"),
+        (None, "Cinder pools of the destination"),
+    ],
+)
+async def test_handover_refuses_before_stop_when_a_pool_cannot_be_resolved(
+    tmp_path, dst_pools, reason
+):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    clouds["dst"].pools = dst_pools
+    ctx, rec = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match=reason):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert calls == [], "nothing changed: the VM keeps running"
+    assert rec.downtime_marks == 0
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["note"] == "nothing to roll back"
+
+
+async def test_handover_rollback_netapp_manages_back_with_the_source_share(tmp_path):
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    cut = await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    mig.destination_server_id = cut.destination_server_id
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # RHOSO renamed the files to its own ids; the source mounts the export at its own address
+    assert [arg for cloud, op, arg in calls if cloud == "src" and op == "manage"] == [
+        "192.0.2.5:/cinder_vol/volume-dst-vol-2",
+        "192.0.2.5:/cinder_vol/volume-dst-vol-1",
+    ]
+    assert {m["host"] for m in clouds["src"].managed} == {NFS_SRC}
+
+
+async def test_handover_resume_of_a_definition_without_storage_stays_rbd(tmp_path):
+    """A run journaled before §7.3.1 has no `storage` in its definition: it resumes as RBD."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="delete_server")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, ctx)
+    definition = executor.run_dir(ctx) / "source-server.json"
+    legacy = json.loads(definition.read_text())
+    legacy.pop("storage")
+    definition.write_text(json.dumps(legacy))
+    clouds["src"].pools = clouds["dst"].pools = None  # not even readable any more
+    calls.clear()
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert [arg for cloud, op, arg in calls if op == "manage"] == [
+        "volume-vol-data",
+        "volume-vol-root",
+    ]
+    assert [m["host"] for m in clouds["dst"].managed] == [
+        "hostgroup@ceph-hdd#hdd",
+        "hostgroup@ceph-ssd#ssd",
+    ]
+
+
+UEFI_WINDOWS = {
+    "hw_firmware_type": "uefi",
+    "hw_machine_type": "q35",
+    "os_type": "windows",
+    "os_distro": "windows",
+    "img_hide_hypervisor_id": "true",
+    "architecture": "x86_64",
+    # Glance bookkeeping that must not be copied
+    "image_id": "0f1e2d3c",
+    "checksum": "abc",
+    "size": "21474836480",
+}
+BOOT_PROPS = {k: v for k, v in UEFI_WINDOWS.items() if k not in ("image_id", "checksum", "size")}
+
+
+async def test_handover_restores_boot_properties_on_managed_volumes(tmp_path):
+    """SDD §7.3 step 7: manage drops volume_image_metadata; a UEFI Windows guest needs it back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].volumes["vol-root"].volume_image_metadata = dict(UEFI_WINDOWS)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    assert ops(calls)[-2:] == [
+        ("dst", "set_image_metadata", "dst-vol-2"),  # the boot volume, before the server boots
+        ("dst", "create_server", "web-01"),
+    ]
+    assert clouds["dst"].image_metadata == {"dst-vol-2": BOOT_PROPS}
+
+    calls.clear()
+    mig.destination_server_id = "dst-new-1"
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    # the re-managed source volume boots the same way again
+    assert ("src", "set_image_metadata", "src-vol-1") in ops(calls)
+    assert clouds["src"].image_metadata == {"src-vol-1": BOOT_PROPS}
+
+
+async def test_handover_fails_fast_when_cinder_refuses_the_unmanage(tmp_path):
+    """A snapshot taken after the checks makes Cinder answer 400: the step fails with Cinder's
+    reason at once (openstacksdk returns 4xx answers instead of raising), and the rollback
+    recreates the deleted source server on its volumes."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    nova_delete = clouds["src"].compute.delete_server
+
+    def delete_then_snapshot(server, ignore_missing=True):
+        nova_delete(server, ignore_missing=ignore_missing)
+        clouds["src"].volumes["vol-data"].snapshots = 1
+
+    clouds["src"].compute.delete_server = delete_then_snapshot
+    executor.wait_s = 0.05
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="HTTP 400.*have snapshots"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [
+        ("src", "create_port", "fa:16:3e:00:00:01"),  # Nova deleted the port it created
+        ("src", "create_server", "web-01"),
+    ]
+    assert result.details["source_running"] is True
+
+
+async def test_handover_fails_when_rhoso_refuses_the_boot_properties(tmp_path):
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].volumes["vol-root"].volume_image_metadata = {"hw_firmware_type": "uefi"}
+    clouds["dst"].refuse_metadata = True
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="boot properties.*HTTP 400"):
+        await executor.run(StepName.CUTOVER, ctx)
+    assert all(op != "create_server" for _, op, _ in ops(calls)), "no server without its UEFI"
+
+
+async def test_handover_readiness_reports_references_without_changing_anything(tmp_path):
+    """The read-only report the lab runs first (and step 0 uses): per volume its family, pools and
+    the exact manage reference, plus every problem — no call that changes a cloud."""
+    executor, calls, clouds, plan, mig, settings = netapp_setup(tmp_path, "nfs")
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert calls == []
+    assert report["problems"] == []
+    by_id = {v["volume_id"]: v for v in report["volumes"]}
+    assert by_id["vol-root"] == {
+        "volume_id": "vol-root",
+        "volume_type": "ceph-ssd",
+        "family": "netapp_nfs",
+        "source_pool": NFS_SRC,
+        "destination_host": NFS_DST,
+        "reference": {"source-name": "10.20.0.5:/cinder_vol/volume-vol-root"},
+        "delete_on_termination": True,
+    }
+    clouds["src"].volumes["vol-data"].snapshots = 1
+    clouds["dst"].pools = [("hostgroup@ontap_nfs#10.20.0.5:/cinder_gold", ONTAP_NFS)]
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert any("no pool for the export" in p for p in report["problems"])
+    assert any("1 snapshot" in p for p in report["problems"])
+    assert calls == []
+
+
+def test_existing_server_and_write_json_helpers(tmp_path):
+    from seamless_migrate.executors.handover import _existing_server, _write_json
+
+    class ResourceNotFound(Exception):
+        pass
+
+    class Gone(Exception):
+        status_code = 404
+
+    class Boom(Exception):
+        status_code = 500
+
+    def compute(exc):
+        return NS(compute=NS(get_server=lambda sid: (_ for _ in ()).throw(exc)))
+
+    assert _existing_server(compute(ResourceNotFound("x")), "srv") is None
+    assert _existing_server(compute(Gone("x")), "srv") is None
+    with pytest.raises(Boom):
+        _existing_server(compute(Boom("x")), "srv")
+    assert _existing_server(NS(compute=NS(get_server=lambda sid: "server")), "srv") == "server"
+
+    target = tmp_path / "nested" / "journal.json"
+    _write_json(target, {"b": 1, "a": [1, 2]})
+    assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    with pytest.raises(TypeError):
+        _write_json(target, {"bad": object()})
+    assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}, "atomic: old content kept"
+    assert [p.name for p in target.parent.iterdir()] == ["journal.json"], "temp file removed"

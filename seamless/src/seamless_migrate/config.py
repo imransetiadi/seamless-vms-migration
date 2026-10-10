@@ -53,12 +53,19 @@ class Settings(BaseModel):
     cors_origins: list[str] = Field(default_factory=list)
     clouds_yaml: Path | None = None
     secrets_dir: Path = Path("/var/run/secrets/seamless")
+    #: where dashboard-entered credentials are written (SDD §13.3)
+    secret_store: Literal["files", "kubernetes"] = "files"
+    k8s_namespace: str | None = None
     ansible_playbook: str = "ansible-playbook"
     collection_root: Path = Field(default_factory=find_repo_root)
     max_concurrent_migrations: int = 10
     max_concurrent_cutovers: int = 3
     tick_s: float = 1.0
     max_step_retries: int = 2
+    #: wall-clock ceiling of one step attempt in seconds; 0 = unbounded (SDD §15.1)
+    step_timeout_s: float = 0.0
+    #: failed bearer authentications per client address per minute before 429 (0 = off)
+    auth_lockout_per_minute: int = 60
     jev_mode: JevMode = "off"
     jev_command: str = "npx -y @jkudish/jev-mcp@0.14.1"
     jev_url: str | None = None
@@ -94,6 +101,8 @@ class Settings(BaseModel):
             "TOKENS_FILE": "tokens_file",
             "CLOUDS_YAML": "clouds_yaml",
             "SECRETS_DIR": "secrets_dir",
+            "SECRET_STORE": "secret_store",
+            "K8S_NAMESPACE": "k8s_namespace",
             "ANSIBLE_PLAYBOOK": "ansible_playbook",
             "COLLECTION_ROOT": "collection_root",
             "JEV_MODE": "jev_mode",
@@ -118,6 +127,8 @@ class Settings(BaseModel):
             "MAX_CONCURRENT_CUTOVERS": ("max_concurrent_cutovers", int),
             "TICK_S": ("tick_s", float),
             "MAX_STEP_RETRIES": ("max_step_retries", int),
+            "STEP_TIMEOUT_S": ("step_timeout_s", float),
+            "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),
             "JEV_TIMEOUT_S": ("jev_timeout_s", float),
             "JEV_MIN_CONFIDENCE": ("jev_min_confidence", float),
         }

@@ -1,5 +1,5 @@
 import { SearchX } from 'lucide-react';
-import { useId, useMemo, useState } from 'react';
+import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { formatDuration, formatNumber, formatPct } from '../lib/format';
@@ -22,6 +22,9 @@ export interface MigrationsTableProps {
   /** Supplies wave names and order. */
   plan?: Plan | null;
   caption?: string;
+  /** What to say, and the action to offer, when the plan has no migrations at all (SDD §16). */
+  emptyDescription?: ReactNode;
+  emptyAction?: ReactNode;
 }
 
 function findingScore(m: Migration): number {
@@ -30,7 +33,7 @@ function findingScore(m: Migration): number {
 }
 
 /** Plan migrations with strategy, estimate and findings; text/phase/strategy/wave filters; sortable. */
-export function MigrationsTable({ migrations, plan, caption = 'Migrations' }: MigrationsTableProps) {
+export function MigrationsTable({ migrations, plan, caption = 'Migrations', emptyDescription, emptyAction }: MigrationsTableProps) {
   const searchId = useId();
   const [query, setQuery] = useState('');
   const [phase, setPhase] = useState<Phase | 'all'>('all');
@@ -84,11 +87,14 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations' }: Mi
   );
 
   const filtersActive = query !== '' || phase !== 'all' || strategy !== 'all' || wave !== 'all';
+  const searchRef = useRef<HTMLInputElement>(null);
   const clear = () => {
     setQuery('');
     setPhase('all');
     setStrategy('all');
     setWave('all');
+    // the button goes away with the filters: the search field keeps the focus (SDD §16)
+    searchRef.current?.focus();
   };
   const onSort = (key: SortKey) => setSort(nextSort(sort, key));
 
@@ -100,6 +106,7 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations' }: Mi
             Search migrations
           </label>
           <input
+            ref={searchRef}
             id={searchId}
             type="search"
             className="input"
@@ -146,7 +153,8 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations' }: Mi
         <EmptyState
           icon={SearchX}
           title={migrations.length === 0 ? 'No migrations in this plan yet' : 'No migrations match these filters'}
-          action={migrations.length > 0 ? <Button onClick={clear}>Clear filters</Button> : undefined}
+          description={migrations.length === 0 ? emptyDescription : undefined}
+          action={migrations.length > 0 ? <Button onClick={clear}>Clear filters</Button> : emptyAction}
         />
       ) : (
         <div className="table-wrap rounded-lg border border-border">

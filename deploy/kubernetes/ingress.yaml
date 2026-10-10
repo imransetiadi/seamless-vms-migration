@@ -1,0 +1,34 @@
+# HTTPS entry for the dashboard and API on Kubernetes (the OpenShift overlay uses a Route instead).
+# /api/v1/events/stream is a long-lived SSE response with a heartbeat every 15 s (SDD 12): buffering
+# is off and the read timeout is generous. Replace the host and create the TLS secret seamless-tls
+# (or let cert-manager issue it: cert-manager.io/cluster-issuer: <issuer>).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: seamless
+  labels:
+    app.kubernetes.io/name: seamless
+    app.kubernetes.io/component: control-plane
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: 2m
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - seamless.example.com
+      secretName: seamless-tls
+  rules:
+    - host: seamless.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: seamless
+                port:
+                  name: http

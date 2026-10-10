@@ -1,13 +1,15 @@
-import { Ban, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Ban, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { useEventTail, useMigration, usePlan, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
-import type { Event, Migration, Phase, Plan, Role, Strategy } from '../api/types';
+import type { Event, GuestOS, Migration, Phase, Plan, Role, Strategy, VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
 import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -23,7 +25,9 @@ import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
-import { isActivePhase, isWarmStrategy, phaseMeta } from '../lib/phase';
+import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
+import { clearedByStrategyChange } from '../lib/migrationActions';
+import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
 import { hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -54,10 +58,24 @@ function useProgressAnnouncement(m: Migration | undefined): string {
   return text;
 }
 
+/** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
+const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+
 function Alerts({ m }: { m: Migration }) {
-  const sourceStopped = m.phase === 'failed' && m.downtime_started_at && !m.downtime_ended_at;
+  const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
+  const sourceStopped = m.phase === 'failed' && clockOpen;
+  const stillStopped = clockOpen && BEFORE_CUTOVER.has(m.phase);
   return (
     <div className="flex flex-col gap-2 empty:hidden">
+      {stillStopped && (
+        <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="text-foreground">
+            <strong className="font-semibold">The source VM is still stopped</strong> since {formatDateTime(m.downtime_started_at)}: the failed
+            cutover was retried, so its downtime clock keeps running until the next cutover is verified.
+          </p>
+        </div>
+      )}
       {sourceStopped && (
         <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
@@ -70,7 +88,7 @@ function Alerts({ m }: { m: Migration }) {
       {m.error && (
         <div className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <CircleX aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
-          <p className="break-words text-foreground">
+          <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Last error:</strong> {m.error}
           </p>
         </div>
@@ -78,7 +96,7 @@ function Alerts({ m }: { m: Migration }) {
       {m.review_required && (
         <div className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
           <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
-          <p className="break-words text-foreground">
+          <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Review required.</strong> {m.review_reason ?? 'The advisor flagged this migration for a human check.'}
           </p>
         </div>
@@ -90,7 +108,10 @@ function Alerts({ m }: { m: Migration }) {
 function ProgressPanel({ m }: { m: Migration }) {
   const meta = phaseMeta(m.phase);
   const active = isActivePhase(m.phase);
-  const openPass = m.sync_passes.find((p) => p.ended_at === null);
+  const step = runningStep(m);
+  const transferredId = useId();
+  const diskId = useId();
+  const stepId = useId();
   return (
     <Panel title="Progress" description={meta.description}>
       <div className="flex flex-col gap-3">
@@ -100,15 +121,27 @@ function ProgressPanel({ m }: { m: Migration }) {
         </div>
         <ProgressBar value={m.progress_pct} label={`${m.vm.name} ${meta.label} progress`} tone={active ? 'progress' : meta.tone} />
         <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-          <dt className="text-muted-foreground">Transferred</dt>
-          <dd className="num text-right">
-            {formatBytes(m.bytes_transferred)} / {formatBytes(m.bytes_total)}
+          {/* two figures, never one over the other: every pass counts, so a warm migration transfers
+              more than its disk holds (SDD §4.2, §16) */}
+          <dt id={transferredId} className="text-muted-foreground">
+            Transferred
+          </dt>
+          <dd aria-labelledby={transferredId} className="num text-right">
+            {formatBytes(m.bytes_transferred)}
           </dd>
-          {openPass && (
+          <dt id={diskId} className="text-muted-foreground">
+            Disk used
+          </dt>
+          <dd aria-labelledby={diskId} className="num text-right">
+            {formatBytes(m.bytes_total)}
+          </dd>
+          {step && (
             <>
-              <dt className="text-muted-foreground">Current pass</dt>
-              <dd className="num text-right">
-                #{openPass.number} {openPass.kind}
+              <dt id={stepId} className="text-muted-foreground">
+                Current step
+              </dt>
+              <dd aria-labelledby={stepId} className="num text-right">
+                {step.label}
               </dd>
             </>
           )}
@@ -122,8 +155,36 @@ function ProgressPanel({ m }: { m: Migration }) {
   );
 }
 
+function hasResolvedMappings(m: Migration): boolean {
+  const rm = m.resolved_mappings;
+  return [rm.flavors, rm.networks, rm.volume_types, rm.projects].some((t) => Object.keys(t).length > 0);
+}
+
 function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   const setStrategy = useSetStrategy(m.id);
+  const migration = useMigration(m.id);
+  // a strategy change clears the migration's approvals and cutover request (SDD §5.4): count them on the
+  // server at the click, as the page may predate an approval, and ask first; ask anyway when they cannot
+  // be counted
+  const [asking, setAsking] = useState<{ strategy: Strategy; cleared: string } | null>(null);
+  const [checking, setChecking] = useState<Strategy | null>(null);
+  // the outcome, for screen readers, from a live region already on the page (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
+  const choose = (strategy: Strategy) =>
+    setStrategy.mutate(strategy, {
+      onSuccess: () => {
+        setAsking(null);
+        setAnnouncement(`${m.vm.name}: strategy set to ${strategyLabel(strategy)}.`);
+      },
+    });
+  const askOrChoose = async (strategy: Strategy) => {
+    setChecking(strategy);
+    const latest = await migration.refetch();
+    setChecking(null);
+    const cleared = latest.data && !latest.isError ? clearedByStrategyChange(latest.data) : 'any approvals and the cutover request';
+    if (cleared) setAsking({ strategy, cleared });
+    else choose(strategy);
+  };
   const canChangePhase = m.phase === 'pending' || m.phase === 'ready' || m.phase === 'blocked';
   const canChangeRole = hasRole(role, 'operator');
   const reasonFor = (strategy: Strategy, eligible: boolean): string | null => {
@@ -136,7 +197,10 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   if (m.estimates.length === 0) return <EmptyState icon={ClipboardX} title="Not estimated yet" description="Validate the plan to estimate every strategy." />;
   return (
     <div className="flex flex-col gap-2">
-      {setStrategy.error && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
+      {setStrategy.error && asking === null && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
       <div className="table-wrap rounded-md border border-border">
         <table className="data-table">
           <caption className="sr-only">Estimates per strategy</caption>
@@ -204,8 +268,8 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
                   <Button
                     size="sm"
                     disabledReason={reasonFor(e.strategy, e.eligible)}
-                    loading={setStrategy.isPending && setStrategy.variables === e.strategy}
-                    onClick={() => setStrategy.mutate(e.strategy)}
+                    loading={(setStrategy.isPending && setStrategy.variables === e.strategy) || checking === e.strategy}
+                    onClick={() => void askOrChoose(e.strategy)}
                     aria-label={`Use ${strategyLabel(e.strategy)}`}
                   >
                     Use
@@ -216,12 +280,40 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
           </tbody>
         </table>
       </div>
+      <ConfirmDialog
+        open={asking !== null}
+        title={`Change the strategy to ${asking ? strategyLabel(asking.strategy) : ''}?`}
+        description={`Changing the strategy clears ${asking?.cleared ?? 'nothing'}: approvers approve ${m.vm.name} again for the new strategy.`}
+        confirmLabel="Change and clear"
+        pending={setStrategy.isPending}
+        error={asking !== null ? setStrategy.error : null}
+        onConfirm={() => asking && choose(asking.strategy)}
+        onCancel={() => {
+          setAsking(null);
+          setStrategy.reset();
+        }}
+      />
     </div>
   );
 }
 
-function VmDetails({ m }: { m: Migration }) {
+/** How verification will judge this guest (SDD §7.5): the Windows profile or the Linux one. */
+function verificationProfile(family: GuestOS['family'], v: VerificationConfig | undefined): string {
+  if (!v) return '';
+  if (family === 'windows') {
+    return v.windows_tcp_ports?.length
+      ? `Verified on TCP ${v.windows_tcp_ports.join(', ')}, without the console check`
+      : 'Verified without a TCP probe or console check: set Windows ports in the plan';
+  }
+  const tcp = v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')} and ` : '';
+  return `Verified on ${tcp}the console log`;
+}
+
+function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const vm = m.vm;
+  const osId = useId();
+  const guest = guestOsOf(vm);
+  const vmware = m.strategy === 'vmware_cold' || m.strategy === 'vmware_warm';
   return (
     <div className="flex flex-col gap-3 text-sm">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
@@ -235,8 +327,13 @@ function VmDetails({ m }: { m: Migration }) {
         <dd>
           {vm.flavor ?? '—'} <span className="num text-muted-foreground">({vm.vcpus} vCPU, {formatBytes(vm.ram_mb * 1024 * 1024)})</span>
         </dd>
-        <dt className="text-muted-foreground">OS</dt>
-        <dd>{vm.os_type ?? '—'}</dd>
+        <dt id={osId} className="text-muted-foreground">Guest OS</dt>
+        <dd aria-labelledby={osId} title={vm.os_type ?? undefined}>
+          {guest.label}
+          {guest.lifecycle === 'legacy' && <span className="text-status-warning">, out of vendor support</span>}
+          <span className="block text-xs text-muted-foreground">{verificationProfile(guest.family, plan?.verification)}</span>
+          {vmware && guest.v2v !== 'supported' && <span className="block text-xs text-status-warning">{V2V_LABELS[guest.v2v]}</span>}
+        </dd>
         <dt className="text-muted-foreground">Power</dt>
         <dd>{vm.power_state}</dd>
         <dt className="text-muted-foreground">Size</dt>
@@ -250,7 +347,7 @@ function VmDetails({ m }: { m: Migration }) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Disks</h3>
         <ul className="flex flex-col gap-1">
           {vm.disks.map((d) => (
-            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded border border-border px-2 py-1">
+            <li key={d.id} className="flex flex-wrap items-baseline justify-between gap-x-2 rounded-sm border border-border px-2 py-1">
               <span className="font-mono text-xs">
                 {d.device ?? d.name ?? d.id} {d.bootable && <span className="text-muted-foreground">(boot)</span>}
               </span>
@@ -268,7 +365,7 @@ function VmDetails({ m }: { m: Migration }) {
         <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Networks</h3>
         <ul className="flex flex-col gap-1">
           {vm.nics.map((n, i) => (
-            <li key={`${n.network}-${i}`} className="flex flex-wrap justify-between gap-x-2 rounded border border-border px-2 py-1 text-xs">
+            <li key={`${n.network}-${i}`} className="flex flex-wrap justify-between gap-x-2 rounded-sm border border-border px-2 py-1 text-xs">
               <span className="font-mono">{n.network}</span>
               <span className="num text-muted-foreground">
                 {n.fixed_ips.join(', ') || 'no fixed IP'} · MTU {n.mtu ?? '—'} · {n.vnic_type}
@@ -282,8 +379,28 @@ function VmDetails({ m }: { m: Migration }) {
 }
 
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
+  // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
+  const request = m.cutover_requested ? (
+    <div className="flex flex-col gap-0.5 text-xs">
+      <p className="inline-flex items-center gap-1 text-status-success">
+        <CircleCheck aria-hidden className="size-3.5 shrink-0" />
+        Cutover requested
+      </p>
+      {m.force_window && (
+        <p className="inline-flex items-center gap-1 text-status-warning">
+          <CalendarClock aria-hidden className="size-3.5 shrink-0" />
+          An approver allowed it to start outside the cutover window.
+        </p>
+      )}
+    </div>
+  ) : null;
   if (m.approvals.length === 0) {
-    return <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>;
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
+        {request}
+      </div>
+    );
   }
   return (
     <ul className="flex flex-col gap-2">
@@ -293,10 +410,10 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
           <time dateTime={a.at} title={formatDateTime(a.at)} className="text-muted-foreground">
             {formatRelative(a.at)}
           </time>
-          {a.comment && <p className="break-words text-muted-foreground">“{a.comment}”</p>}
+          {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
         </li>
       ))}
-      {m.cutover_requested && <li className="text-xs text-status-success">Cutover requested</li>}
+      {request && <li>{request}</li>}
     </ul>
   );
 }
@@ -339,6 +456,8 @@ export default function MigrationDetail() {
   }
 
   const p = plan.data;
+  // SDD §16: without its plan the cutover window and approval policy are unknown
+  const planUnavailable = Boolean(plan.error) && !p;
   const warm = isWarmStrategy(m.strategy);
   const wave = p?.waves.find((w) => w.id === m.wave_id);
 
@@ -361,10 +480,13 @@ export default function MigrationDetail() {
       </p>
 
       <div className="flex flex-col gap-4">
+        {planUnavailable && (
+          <ErrorBanner error={plan.error} title="The plan of this migration is unavailable" onRetry={() => void plan.refetch()} />
+        )}
         <Alerts m={m} />
 
         <Panel title="Next step">
-          <MigrationActions migration={m} plan={p} role={role} />
+          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} />
         </Panel>
 
         <section aria-label="Lifecycle" className="card p-4">
@@ -389,13 +511,28 @@ export default function MigrationDetail() {
 
         {warm && (
           <Panel title="Sync-pass convergence" description="Bytes changed per pass; cutover becomes possible once a delta is below the threshold">
-            <SyncPassChart passes={m.sync_passes} thresholdBytes={p?.convergence_threshold_bytes ?? null} maxPasses={p?.max_sync_passes ?? null} />
+            <SyncPassChart
+              passes={m.sync_passes}
+              thresholdBytes={p?.convergence_threshold_bytes ?? null}
+              maxPasses={p?.max_sync_passes ?? null}
+              droppedBytes={m.sync_bytes_dropped}
+              running={runningStep(m)?.pass ?? null}
+            />
           </Panel>
         )}
 
         <div className="grid gap-4 xl:grid-cols-2">
           <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">
-            <FindingsList findings={m.findings} />
+            <FindingsList
+              findings={m.findings}
+              emptyText={
+                m.phase === 'validating'
+                  ? 'No findings yet — pre-flight is running.'
+                  : preflightRan(m)
+                    ? undefined
+                    : 'No findings yet — pre-flight runs when the plan is validated.'
+              }
+            />
           </Panel>
           <Panel title="Advisor notes" description="Jev, rules and agentmemory">
             <AdvisorNotes notes={m.advisor_notes} />
@@ -406,10 +543,21 @@ export default function MigrationDetail() {
           <EstimatesPanel m={m} role={role} />
         </Panel>
 
-        <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="VM">
-            <VmDetails m={m} />
-          </Panel>
+        {/* the short panels stack beside the long timeline instead of leaving half rows empty */}
+        <div className="grid items-start gap-4 xl:grid-cols-2">
+          <div className="flex min-w-0 flex-col gap-4">
+            <Panel title="Estimate inputs" description="What the downtime estimate rests on; delta passes calibrate it (SDD §9.1)">
+              <CalibrationPanel migration={m} plan={p} />
+            </Panel>
+            {hasResolvedMappings(m) && (
+              <Panel title="Resolved mappings" description="Matched automatically by pre-flight; add a plan mapping to override (SDD §9.3)">
+                <ResolvedMappings migration={m} />
+              </Panel>
+            )}
+            <Panel title="VM">
+              <VmDetails m={m} plan={p} />
+            </Panel>
+          </div>
           <Panel title="Timeline" description="Phase changes and audit events, newest first">
             {history.error && <ErrorBanner error={history.error} title="Events are unavailable" onRetry={() => void history.refetch()} />}
             <Timeline history={m.phase_history} events={events} />

@@ -43,7 +43,7 @@ describe('MigrationsTable', () => {
   });
 
   it('sorts by phase in lifecycle order', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
     const header = screen.getByRole('columnheader', { name: /^phase/i });
     await user.click(within(header).getByRole('button'));
@@ -63,7 +63,7 @@ describe('MigrationsTable', () => {
   });
 
   it('sorts by estimated downtime in both directions', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
     const expected = [...migrations]
       .sort((a, b) => (a.estimate?.downtime_s ?? Infinity) - (b.estimate?.downtime_s ?? Infinity))
@@ -78,7 +78,7 @@ describe('MigrationsTable', () => {
   });
 
   it('filters by text, phase, strategy and wave', async () => {
-    const user = userEvent.setup();
+    const user = userEvent.setup({ delay: null });
     renderTable();
 
     await user.type(screen.getByRole('searchbox', { name: /search migrations/i }), 'web');
@@ -112,5 +112,28 @@ describe('MigrationsTable', () => {
     const billing = migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
     const cell = rowFor('app-billing-01');
     expect(cell).toHaveTextContent(billing.estimate?.meets_slo ? /within SLO/ : /over SLO/);
+  });
+});
+
+
+describe('MigrationsTable without migrations', () => {
+  it('shows what the page says about an empty plan and its action (SDD §16)', () => {
+    render(
+      <MemoryRouter>
+        <MigrationsTable migrations={[]} plan={plan} emptyDescription="Validation creates them." emptyAction={<button type="button">Validate</button>} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/no migrations in this plan yet/i)).toBeInTheDocument();
+    expect(screen.getByText('Validation creates them.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Validate' })).toBeInTheDocument();
+  });
+
+  it('keeps the focus in the filters when Clear filters goes away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderTable();
+    const search = screen.getByRole('searchbox', { name: /search migrations/i });
+    await user.type(search, migrations[0]!.vm.name);
+    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(search).toHaveFocus();
   });
 });

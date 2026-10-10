@@ -29,7 +29,7 @@ VENV_DIR                  := $(CONTAINER_COLLECTION_ROOT)/.venv
 # --- Core Logic for Container Creation ---
 
 # Check if the container already exists and strip any whitespace/newlines
-CONTAINER_EXISTS = $(strip $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME)))
+CONTAINER_EXISTS = $(strip $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME) 2>/dev/null))
 
 
 # --- Dynamic Variable Setup ---
@@ -62,7 +62,7 @@ COLLECTION_INSTALL_DIR := $(COLLECTIONS_PATH)/ansible_collections/$(COLLECTION_N
 # --- Core Logic for Container Creation ---
 
 # Check if the container already exists
-CONTAINER_EXISTS = $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME))
+CONTAINER_EXISTS = $(shell $(CONTAINER_ENGINE) ps -a -q -f name=$(CONTAINER_NAME) 2>/dev/null)
 
 # Determine if we need to create a container based on cache settings and existence.
 # Default to 0 (don't create).
@@ -127,7 +127,7 @@ VENDOR_MODULE_LINK_SRC := _vendor/openstack.cloud/plugins/modules
 VENDOR_UTIL_LINK_SRC   := ../modules/_vendor/openstack.cloud/plugins/module_utils
 
 # Latest stable release:
-OS_CLOUD_VERSION   ?= 2.5.0
+OS_CLOUD_VERSION   ?= 2.6.0
 
 # List of required modules from vendor openstack.cloud collection.
 VENDORED_MODULES := auth compute_flavor compute_flavor_info floating_ip identity_domain identity_role \
@@ -338,7 +338,8 @@ generate-auth-files: install-deps install
 		source "$(VENV_DIR)/bin/activate" && \
 		pip install --root-user-action ignore -q shyaml && \
 		dnf -y install util-linux openssh-clients && \
-		./scripts/auth-from-clouds.sh --config "$(CONTAINER_COLLECTION_ROOT)/tests/clouds.yml" --src "$(SRC_CLOUD)" --dst "$(DST_CLOUD)" | tee "$(CONTAINER_COLLECTION_ROOT)/tests/auth_tenant.yml"'
+		umask 077 && ./scripts/auth-from-clouds.sh --config "$(CONTAINER_COLLECTION_ROOT)/tests/clouds.yml" --src "$(SRC_CLOUD)" --dst "$(DST_CLOUD)" > "$(CONTAINER_COLLECTION_ROOT)/tests/auth_tenant.yml" && \
+		echo "wrote tests/auth_tenant.yml (mode 0600, git-ignored; it holds cloud credentials, so it is not printed)"'
 
 
 test-e2e-tenant: install-deps install generate-auth-files
@@ -413,19 +414,45 @@ SEAMLESS_PROJECT        ?= seamless
 SEAMLESS_ENV_OWNED = POSTGRES_PASSWORD JEV_MCP_AUTH_TOKEN TYPESAFE_API_KEY COMPOSE_PROFILES SEAMLESS_JEV_MODE SEAMLESS_MEMORY_URL SEAMLESS_MEMORY_SECRET
 SEAMLESS_UNSET_ENV = $(foreach v,$(SEAMLESS_ENV_OWNED),-u $(v))
 
+# Container engine: docker (default; Colima context colima-seamless, or any Docker host with
+# SEAMLESS_DOCKER_CONTEXT=default) or podman (`podman compose`, which runs docker-compose when it is installed —
+# recommended — or podman-compose). Example: make seamless-demo SEAMLESS_ENGINE=podman
+SEAMLESS_ENGINE ?= docker
+SEAMLESS_HOST_PORT ?= 8080
+ifeq ($(SEAMLESS_ENGINE),podman)
+SEAMLESS_DOCKER       = podman
+SEAMLESS_COMPOSE_CMD  = podman compose
+# podman-compose has no --wait: the targets poll /api/v1/health instead
+SEAMLESS_UP_WAIT      =
+else
 # DOCKER_HOST would override the context, so it is unset for these commands.
 SEAMLESS_DOCKER       = env -u DOCKER_HOST DOCKER_CONTEXT=$(SEAMLESS_DOCKER_CONTEXT) docker --context $(SEAMLESS_DOCKER_CONTEXT)
-SEAMLESS_COMPOSE_BASE = $(SEAMLESS_DOCKER) compose -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
+SEAMLESS_COMPOSE_CMD  = $(SEAMLESS_DOCKER) compose
+SEAMLESS_UP_WAIT      = --wait --wait-timeout 300
+endif
+SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
+# wait until the control plane answers (both engines; Docker's --wait already covers the healthchecks)
+SEAMLESS_WAIT_HEALTH  = for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
+                        [ $$i = 150 ] && { echo "the control plane did not become healthy in 300 s: make seamless-logs"; exit 1; }; sleep 2; done
+# The stack publishes on 127.0.0.1 only, but a browser opens localhost on ::1 first: when another
+# program answers on [::1]:<port>, localhost is not this dashboard, so name the address that is.
+SEAMLESS_LOCALHOST_NOTE = if curl -gs -m 3 -o /dev/null "http://[::1]:$(SEAMLESS_HOST_PORT)/"; then \
+                            case "$$(curl -gs -m 3 "http://[::1]:$(SEAMLESS_HOST_PORT)/api/v1/health" || true)" in \
+                              *'"orchestrator"'*) ;; \
+                              *) echo "note: http://localhost:$(SEAMLESS_HOST_PORT)/ reaches another program on this machine (it answers on [::1]:$(SEAMLESS_HOST_PORT)); open http://127.0.0.1:$(SEAMLESS_HOST_PORT)/" ;; \
+                            esac; \
+                          fi
 SEAMLESS_COMPOSE      = env $(SEAMLESS_UNSET_ENV) $(SEAMLESS_COMPOSE_BASE) --env-file $(SEAMLESS_ENV_FILE)
 # parse-only placeholders for down/reset when .env is gone (nothing is started with them)
 SEAMLESS_COMPOSE_NOENV = env POSTGRES_PASSWORD=unused JEV_MCP_AUTH_TOKEN=unused $(SEAMLESS_COMPOSE_BASE)
 
 .PHONY: seamless-help seamless-colima-up seamless-check-context seamless-check-env seamless-init \
         seamless-up seamless-demo seamless-down seamless-ps seamless-logs seamless-reset \
-        seamless-test dashboard-build
+        seamless-test seamless-check dashboard-build lab-handover deploy-runtime-check
 
 seamless-help:
-	@echo "Seamless Migrate stack (Docker Compose on Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
+	@echo "Seamless Migrate stack (engine '$(SEAMLESS_ENGINE)'; Docker: Colima profile '$(SEAMLESS_COLIMA_PROFILE)', context '$(SEAMLESS_DOCKER_CONTEXT)'):"
+	@echo "  engines: SEAMLESS_ENGINE=docker (default) | podman;  any Docker host: SEAMLESS_DOCKER_CONTEXT=default"
 	@echo "  seamless-colima-up  - start the dedicated Colima profile ($(SEAMLESS_COLIMA_CPU) CPU / $(SEAMLESS_COLIMA_MEMORY) GiB / $(SEAMLESS_COLIMA_DISK) GiB) without changing your active Docker context"
 	@echo "  seamless-init       - generate deploy/compose/.env and tokens.yaml (prints the admin token once)"
 	@echo "  seamless-up         - build and start postgres, seamless (and jev when COMPOSE_PROFILES=ai)"
@@ -435,7 +462,10 @@ seamless-help:
 	@echo "  seamless-logs       - follow logs (SEAMLESS_SERVICE=seamless|postgres|jev to filter)"
 	@echo "  seamless-reset      - DELETE containers and volumes (requires CONFIRM=yes)"
 	@echo "  seamless-test       - run the control-plane test suite (cd seamless && .venv/bin/pytest -q)"
+	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
+	@echo "  seamless-check      - every CI check that runs locally: tests with the coverage gate, ruff, collection tests, playbook syntax, ansible-lint, scans, dashboard"
+	@echo "  deploy-runtime-check - run PostgreSQL (and the control-plane image, when built) the way the cluster manifests do: read-only, arbitrary UID"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
 # starts by default (--activate, default true), which would switch the developer's current Docker context:
@@ -447,8 +477,14 @@ seamless-colima-up:
 	@echo "active Docker context is still: $$(docker context show)"
 
 seamless-check-context:
+ifeq ($(SEAMLESS_ENGINE),podman)
+	@command -v podman >/dev/null 2>&1 || { echo "podman not found: https://podman.io/docs/installation"; exit 1; }
+	@podman info >/dev/null 2>&1 || { echo "podman is not reachable (macOS/Windows: podman machine start)"; exit 1; }
+	@podman compose version >/dev/null 2>&1 || { echo "podman compose needs docker-compose (recommended) or podman-compose installed"; exit 1; }
+else
 	@docker context inspect $(SEAMLESS_DOCKER_CONTEXT) >/dev/null 2>&1 || { echo "Docker context '$(SEAMLESS_DOCKER_CONTEXT)' not found. Run: make seamless-colima-up"; exit 1; }
 	@$(SEAMLESS_DOCKER) info >/dev/null 2>&1 || { echo "Colima profile '$(SEAMLESS_COLIMA_PROFILE)' is not running. Run: make seamless-colima-up"; exit 1; }
+endif
 
 seamless-check-env:
 	@[ -f "$(SEAMLESS_ENV_FILE)" ] && [ -f "$(SEAMLESS_TOKENS_FILE)" ] || { echo "Missing deploy/compose/.env or tokens.yaml. Run: make seamless-init (prints the admin token once)"; exit 1; }
@@ -457,13 +493,17 @@ seamless-init:
 	@scripts/compose-init.sh
 
 seamless-up: seamless-check-context seamless-check-env
-	$(SEAMLESS_COMPOSE) up -d --build --wait --wait-timeout 300
-	@echo "Seamless Migrate: http://$$($(SEAMLESS_COMPOSE) port seamless 8080)/   health: /api/v1/health"
+	$(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate: http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   health: /api/v1/health"
+	@$(SEAMLESS_LOCALHOST_NOTE)
 
 # Same stack with simulated providers and executor against PostgreSQL (SDD 7.4, 15.1).
 seamless-demo: seamless-check-context seamless-check-env
-	SEAMLESS_DEMO=true $(SEAMLESS_COMPOSE) up -d --build --wait --wait-timeout 300
-	@echo "Seamless Migrate (demo): http://$$($(SEAMLESS_COMPOSE) port seamless 8080)/   sign in with your admin token"
+	SEAMLESS_DEMO=true $(SEAMLESS_COMPOSE) up -d --build $(SEAMLESS_UP_WAIT)
+	@$(SEAMLESS_WAIT_HEALTH)
+	@echo "Seamless Migrate (demo): http://127.0.0.1:$(SEAMLESS_HOST_PORT)/   sign in with your admin token"
+	@$(SEAMLESS_LOCALHOST_NOTE)
 
 # --profile '*' also stops the optional jev sidecar when COMPOSE_PROFILES is empty.
 # Works without .env (placeholder values are only needed to parse the file).
@@ -480,7 +520,8 @@ seamless-ps: seamless-check-context seamless-check-env
 seamless-logs: seamless-check-context seamless-check-env
 	$(SEAMLESS_COMPOSE) --profile '*' logs -f --tail=200 $(SEAMLESS_SERVICE)
 
-# Destructive: removes the pgdata and seamless-data volumes (all plans, events and run directories).
+# Destructive: removes the pgdata, seamless-data and seamless-secrets volumes (all plans, events, run
+# directories and the provider credentials entered in the dashboard).
 seamless-reset: seamless-check-context
 	@[ "$(CONFIRM)" = "yes" ] || { echo "This DELETES the PostgreSQL and data volumes of the seamless stack. Re-run with CONFIRM=yes"; exit 1; }
 	@if [ -f "$(SEAMLESS_ENV_FILE)" ]; then \
@@ -489,10 +530,60 @@ seamless-reset: seamless-check-context
 		$(SEAMLESS_COMPOSE_NOENV) --profile '*' down --volumes --remove-orphans; \
 	fi
 
+# Storage handover against the real lab clouds (QASuite LAB-H07…H10, SDD §7.3): lists the Cinder pools by
+# driver family and prints the readiness report of SEAMLESS_LAB_HANDOVER_SERVER; with SEAMLESS_LAB_DESTRUCTIVE=1
+# it also hands that disposable server over to RHOSO and rolls it back. Variables: seamless/tests/lab/.
+lab-handover:
+	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,openstack]'"; exit 1; }
+	cd seamless && .venv/bin/pytest -m lab tests/lab/test_lab_storage_handover.py -v -s -rs
+
+# The manifests' security context at runtime (QASuite §14.5): static scans cannot see what an image writes
+# when it starts. PostgreSQL always; the control plane when its image exists locally (make seamless-demo builds it).
+SEAMLESS_CP_IMAGE ?= seamless-migrate:0.1.0
+deploy-runtime-check: seamless-check-context
+	@[ -x seamless/.venv/bin/python ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
+	DOCKER="$(SEAMLESS_DOCKER)" PYTHON=seamless/.venv/bin/python \
+	  CP_IMAGE="$$($(SEAMLESS_DOCKER) image inspect $(SEAMLESS_CP_IMAGE) >/dev/null 2>&1 && echo $(SEAMLESS_CP_IMAGE))" \
+	  scripts/check-readonly-runtime.sh
+
 # Control-plane tests (SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is exported).
 seamless-test:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -q
+
+# Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go: the
+# control-plane tests with CI's coverage gate (NFR-11), ruff, the collection's unit tests, playbook
+# syntax checks and ansible-lint (the venv's 'collection' extra), the scanners and the dashboard.
+seamless-check:
+	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
+	cd seamless && .venv/bin/pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
+	cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
+	@seamless/.venv/bin/python -c "import ansible, yaml, openstack" 2>/dev/null \
+	 || { echo "The collection tests need the 'collection' extra: cd seamless && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
+	@mkdir -p .cache/colltree/ansible_collections/os_migrate \
+	 && ln -sfn "$(CURDIR)" .cache/colltree/ansible_collections/os_migrate/os_migrate
+	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
+	  PYTHONPATH="$(CURDIR)/.cache/colltree" ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" \
+	  "$(CURDIR)/seamless/.venv/bin/python" -m pytest -q -rs tests/unit > "$(CURDIR)/.cache/unit.txt" 2>&1 \
+	  || { cat "$(CURDIR)/.cache/unit.txt"; exit 1; }; tail -n 3 "$(CURDIR)/.cache/unit.txt"; \
+	  if grep -qE '[0-9]+ skipped' "$(CURDIR)/.cache/unit.txt"; then echo "unexpected skipped collection tests"; exit 1; fi
+	cd .cache/colltree/ansible_collections/os_migrate/os_migrate && \
+	  export PATH="$(CURDIR)/seamless/.venv/bin:$$PATH" PYTHONPATH="$(CURDIR)/.cache/colltree" \
+	    ANSIBLE_COLLECTIONS_PATH="$(CURDIR)/.cache/colltree" && \
+	  for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
+	            rollback_workloads.yml import_from_hypervisor.yml; do \
+	    ansible-playbook --syntax-check -i inventory/localhost.yml "playbooks/$$pb" >/dev/null || exit 1; \
+	  done && \
+	  ansible-lint --offline roles/import_workloads_warm roles/import_from_hypervisor \
+	    playbooks/import_workloads_precopy.yml playbooks/import_workloads_cutover.yml \
+	    playbooks/rollback_workloads.yml
+	@if command -v gitleaks >/dev/null; then \
+	  gitleaks dir -c .gitleaks-tree.toml --redact --no-banner . && gitleaks git --redact --no-banner .; \
+	else echo "gitleaks not installed: skipped (S-17)"; fi
+	@if command -v actionlint >/dev/null; then actionlint; else echo "actionlint not installed: skipped"; fi
+	@if command -v shellcheck >/dev/null; then shellcheck -S warning scripts/*.sh tests/e2e/*.sh; \
+	else echo "shellcheck not installed: skipped"; fi
+	cd dashboard && npm run typecheck && npm run lint && npm test && npm run build
 
 dashboard-build:
 	@command -v npm >/dev/null 2>&1 || { echo "npm (Node 22) is required"; exit 1; }

@@ -31,6 +31,9 @@ JEV_ENV_VARS = (
     "JEV_API_KEY",
     "JEV_API_BASE_URL",
     "JEV_MCP_MODEL",
+    # the knobs Security.md §10.5/§10.6 recommend (Vercel gateway retention, load shedding)
+    "JEV_VERCEL_ZERO_DATA_RETENTION",
+    "JEV_MCP_MAX_CONCURRENCY",
 )
 BREAKER_THRESHOLD = 3
 BREAKER_OPEN_S = 300.0

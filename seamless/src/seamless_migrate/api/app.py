@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,16 +12,17 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
 from .. import __version__
 from ..ai.advisor import Advisor
 from ..ai.jev import JevClient
 from ..ai.knowledge import KnowledgeService
-from ..ai.memory import MemoryClient
+from ..ai.memory import MemoryClient, redact
 from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
@@ -44,6 +46,7 @@ _STATUS_CODES = {
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
+    413: "payload_too_large",
     422: "validation_error",
     502: "provider_error",
 }
@@ -101,7 +104,145 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ProviderError)
     async def provider_error(_: Request, exc: ProviderError) -> JSONResponse:
-        return _error(502, "provider_error", str(exc))
+        # SDK messages may carry endpoint URLs or credentials: same redaction as the orchestrator
+        return _error(502, "provider_error", redact(str(exc))[:500])
+
+    @app.exception_handler(Exception)
+    async def internal_error(request: Request, exc: Exception) -> JSONResponse:
+        # Starlette's ServerErrorMiddleware answers this one outside the headers middleware:
+        # keep the error envelope and the security headers universal (SDD §12, Security.md R-05)
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        response = _error(500, "internal_error", "internal error")
+        _apply_security_headers(response.headers, request.url.path)
+        return response
+
+
+#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts) and the
+#: Fira fonts from Google Fonts (dashboard/index.html); Swagger UI loads from jsdelivr.
+_CSP_APP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
+    "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' "
+    "data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
+#: Swagger UI boots from an inline script: it gets a per-response nonce (no 'unsafe-inline').
+_CSP_DOCS = (
+    "default-src 'self'; script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; style-src "
+    "'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: "
+    "https://fastapi.tiangolo.com; connect-src 'self'; frame-ancestors 'none'"
+)
+
+
+def _apply_security_headers(headers: Any, path: str) -> None:
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("X-Frame-Options", "DENY")
+    headers.setdefault("Referrer-Policy", "same-origin")
+    headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    headers.setdefault("Content-Security-Policy", _CSP_APP)
+
+
+#: SDD §12: the largest request body. A 5,000-VM plan with an override per VM is about 0.5 MB.
+MAX_BODY_BYTES = 1024 * 1024
+#: SDD §12: responses of 1 KiB and more are gzip-compressed when the client accepts gzip.
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 6
+
+
+class GZipExceptEventStream:
+    """Gzip responses (SDD §12), never the event stream: a compressor holds small writes back until
+    its buffer fills, which would delay live events (older Starlette versions compress
+    ``text/event-stream`` too, so the stream is routed around the compressor)."""
+
+    def __init__(self, app, stream_path: str = "/api/v1/events/stream"):
+        self.app = app
+        self.stream_path = stream_path
+        self.gzip = GZipMiddleware(app, minimum_size=GZIP_MIN_BYTES, compresslevel=GZIP_LEVEL)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == self.stream_path:
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
+
+
+class BodyLimitMiddleware:
+    """Refuse a request body over ``max_bytes`` with 413 (SDD §12, Security.md R-17).
+
+    FastAPI parses a route's body before its auth dependency runs, so without a limit an
+    unauthenticated client could make the server buffer any amount of data. A larger
+    ``Content-Length`` is answered before anything reads the body; a body without one (chunked)
+    is counted as it arrives, and the message that passes the limit never reaches the app.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[None]], max_bytes: int = MAX_BODY_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope.get("headers") or ()).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            response = _error(413, "payload_too_large", self._message())
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def counted() -> Any:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    # FastAPI re-raises an HTTPException met while reading the body: the error
+                    # handlers answer it as 413 payload_too_large
+                    raise StarletteHTTPException(413, self._message())
+            return message
+
+        await self.app(scope, counted, send)
+
+    def _message(self) -> str:
+        return f"request body larger than {self.max_bytes} bytes"
+
+
+def _install_security_headers(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        _apply_security_headers(response.headers, request.url.path)
+        return response
+
+
+def _install_api_docs(app: FastAPI, settings: Settings) -> None:
+    """``/api/openapi.json`` and ``/api/docs``: public in demo mode, viewer role otherwise."""
+    from fastapi.openapi.docs import get_swagger_ui_html
+
+    from ..domain.enums import Role
+    from .deps import require_role
+
+    async def docs_access(request: Request) -> None:
+        if not settings.demo:
+            await require_role(Role.viewer)(request)
+
+    @app.get("/api/openapi.json", include_in_schema=False)
+    async def openapi_json(request: Request) -> Any:
+        await docs_access(request)
+        return JSONResponse(app.openapi())
+
+    @app.get("/api/docs", include_in_schema=False)
+    async def swagger_ui(request: Request) -> Any:
+        await docs_access(request)
+        page = get_swagger_ui_html(openapi_url="/api/openapi.json", title="Seamless Migrate API")
+        nonce = secrets.token_urlsafe(16)
+        html = page.body.decode("utf-8").replace("<script>", f'<script nonce="{nonce}">')
+        response = HTMLResponse(html, status_code=page.status_code)
+        response.headers["Content-Security-Policy"] = _CSP_DOCS.format(nonce=nonce)
+        return response
+
+
+#: FastAPI's default documentation routes, disabled (SDD §12, Security.md R-04): the SPA fallback
+#: answers them with 404 too, so a stale link or a scanner never reads the dashboard as the API docs
+_DISABLED_DOCS = ("docs", "redoc", "openapi.json")
 
 
 def _install_spa(app: FastAPI, dist: Path) -> None:
@@ -112,7 +253,8 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa(full_path: str) -> Any:
-        if full_path == "api" or full_path.startswith("api/"):
+        first = full_path.split("/", 1)[0]
+        if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
         candidate = (root / full_path).resolve()
         if full_path and candidate.is_file() and candidate.is_relative_to(root):
@@ -192,12 +334,21 @@ def create_app(
         title="Seamless Migrate",
         version=__version__,
         lifespan=lifespan,
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
+        # the OpenAPI document and Swagger UI are served by _install_api_docs: public in demo
+        # mode, viewer-authenticated otherwise (Security.md R-04)
+        docs_url=None,
+        openapi_url=None,
         redoc_url=None,
     )
     app.state.services = svc
     _install_error_handlers(app)
+    # innermost: the compressed response still gets the security headers (SDD §12)
+    app.add_middleware(GZipExceptEventStream, stream_path=f"{API_PREFIX}/events/stream")
+    # added before the security headers middleware, which therefore wraps it: a 413 carries the
+    # R-05 headers too
+    app.add_middleware(BodyLimitMiddleware)
+    _install_security_headers(app)
+    _install_api_docs(app, settings)
     if settings.cors_origins:
         app.add_middleware(
             CORSMiddleware,

@@ -8,6 +8,9 @@ os_migrate_warm_chunk_size: 4194304  # noqa: var-naming[no-role-prefix]
 os_migrate_warm_workers: 4  # noqa: var-naming[no-role-prefix]
 # Rollback: also delete the destination volumes and the warm state.
 os_migrate_rollback_delete_dest_volumes: false  # noqa: var-naming[no-role-prefix]
+# Rollback with the catch-all workload filter (every workload of the data dir):
+# refused unless this confirms it.
+os_migrate_rollback_all: false  # noqa: var-naming[no-role-prefix]
 
 # Optional tuning.
 # Disks of one workload synchronised at the same time.
@@ -32,6 +35,7 @@ os_migrate_rollback_match_by_name: false  # noqa: var-naming[no-role-prefix]
 os_migrate_conversion_keypair_private_path: "{{ os_migrate_data_dir }}/conversion/ssh.key"  # noqa: var-naming[no-role-prefix]
 os_migrate_conversion_host_ssh_user: cloud-user  # noqa: var-naming[no-role-prefix]
 os_migrate_src_conversion_host_name: os_migrate_conv_src  # noqa: var-naming[no-role-prefix]
+os_migrate_dst_conversion_host_name: os_migrate_conv_dst  # noqa: var-naming[no-role-prefix]
 os_migrate_timeout: 1800  # noqa: var-naming[no-role-prefix]
 os_migrate_workload_cleanup_on_failure: true  # noqa: var-naming[no-role-prefix]
 os_migrate_workload_boot_volume_prefix: os-migrate-  # noqa: var-naming[no-role-prefix]

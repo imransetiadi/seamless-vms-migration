@@ -3,22 +3,18 @@ import {
   CircleCheck,
   CircleX,
   ClipboardList,
-  Gauge,
-  Layers,
-  Timer,
   TriangleAlert,
-  Zap,
   type LucideIcon,
 } from 'lucide-react';
 import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useMigrations, usePlans, useStats } from '../api/hooks';
-import type { Migration, Plan } from '../api/types';
+import type { Migration, Phase, Plan } from '../api/types';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { DowntimeSloChart } from '../components/DowntimeSloChart';
 import { SelectField } from '../components/Field';
-import { KpiTile } from '../components/KpiTile';
+import { MetricStrip } from '../components/MetricStrip';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseDistribution } from '../components/PhaseDistribution';
@@ -26,9 +22,11 @@ import { ProgressBar } from '../components/ProgressBar';
 import { LoadingBlock, Skeleton } from '../components/Skeleton';
 import { PhaseBadge, PlanStatusBadge } from '../components/StatusBadge';
 import { ThroughputChart } from '../components/ThroughputChart';
+import { Unavailable } from '../components/Unavailable';
 import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
-import { formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
+import { SLO_ICONS, sloTone } from '../lib/slo';
+import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
@@ -39,48 +37,119 @@ const ATTENTION_ICONS: Record<'danger' | 'warning' | 'info', LucideIcon> = {
   info: Activity,
 };
 
-function ActiveCutovers({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
+const BAR_CLASSES: Record<'success' | 'warning' | 'danger', string> = {
+  success: 'bg-status-success',
+  warning: 'bg-status-warning',
+  danger: 'bg-status-danger',
+};
+
+/**
+ * Down right now: in the cutover window (the stop may not be reported yet) or with an open downtime
+ * clock — a failed cutover or a rollback keeps the source stopped until it runs again (SDD §5.2).
+ */
+function isDown(m: Migration): boolean {
+  return m.phase === 'cutover' || m.phase === 'verifying' || (Boolean(m.downtime_started_at) && !m.downtime_ended_at);
+}
+
+/** What the VM is waiting for while it is down, after the strategy and plan. */
+const DOWN_DETAIL: Partial<Record<Phase, string>> = {
+  verifying: ', checking the boot on RHOSO',
+  rolling_back: ', rolling back, restarting the source VM',
+  failed: ', failed with the source stopped: roll back or retry',
+};
+
+/**
+ * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
+ * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
+ */
+function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
   const active = migrations
-    .filter((m) => m.phase === 'cutover' || m.phase === 'verifying')
+    .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
+  const waiting = migrations.filter((m) => m.phase === 'awaiting_cutover').length;
   const now = useNow(1000, active.length > 0);
 
   return (
-    <Panel title="Active cutovers" description="Source VM stopped — the downtime clock is running">
+    <Panel
+      title="Downtime now"
+      description={
+        active.length
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.`
+          : 'VMs whose source is stopped appear here with a running clock.'
+      }
+    >
       {active.length === 0 ? (
-        <EmptyState icon={Zap} title="No cutover in progress" description="Migrations enter cutover once approved, inside their window." />
+        <div className="flex flex-col items-start gap-1 py-2">
+          <p className="text-base font-medium text-foreground">No VM is down right now.</p>
+          <p className="text-sm text-muted-foreground">
+            {waiting > 0
+              ? `${waiting} migration${waiting === 1 ? ' has' : 's have'} converged and wait${waiting === 1 ? 's' : ''} for the cutover.`
+              : 'Cutovers start once approved, inside their window.'}
+          </p>
+        </div>
       ) : (
-        <ul className="-my-2 divide-y divide-border">
+        <ul className="-my-1 divide-y divide-border">
           {active.map((m) => {
             const plan = plans.get(m.plan_id);
             const slo = plan?.downtime_slo_s ?? null;
-            const elapsed = secondsBetween(m.downtime_started_at, now);
-            const over = slo !== null && elapsed !== null && elapsed > slo;
+            const elapsed = secondsBetween(m.downtime_started_at, now) ?? 0;
+            // the migration page's rule, with an icon beside the warning and the breach (SDD §16)
+            const tone = slo ? sloTone(elapsed, slo) : 'success';
+            const ToneIcon = SLO_ICONS[tone];
+            const scale = slo ? Math.max(slo, elapsed) : 1;
+            const left = slo !== null ? slo - elapsed : null;
             return (
-              <li key={m.id} className="grid gap-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                <div className="flex min-w-0 flex-col gap-1.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Link to={`/migrations/${m.id}`} className="font-mono font-semibold text-foreground underline-offset-4 hover:underline">
-                      {m.vm.name}
-                    </Link>
-                    <PhaseBadge phase={m.phase} />
-                    <span className="text-xs text-muted-foreground">
+              <li key={m.id} className="flex flex-col gap-2.5 py-3">
+                <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-1">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Link to={`/migrations/${m.id}`} className="font-mono text-base font-semibold text-foreground underline-offset-4 hover:underline">
+                        {m.vm.name}
+                      </Link>
+                      <PhaseBadge phase={m.phase} />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
                       {strategyLabel(m.strategy)}
-                      {plan ? ` · ${plan.name}` : ''}
-                    </span>
+                      {plan ? ` in ${plan.name}` : ''}
+                      {m.phase === 'cutover' ? `, final copy ${formatPct(m.progress_pct)}` : (DOWN_DETAIL[m.phase] ?? ', source VM stopped')}
+                    </p>
                   </div>
-                  <ProgressBar value={m.progress_pct} label={`${m.vm.name} ${m.phase} progress`} size="sm" />
-                </div>
-                <div className="flex items-baseline gap-3 sm:flex-col sm:items-end sm:gap-0">
-                  <span className="text-xs text-muted-foreground">Downtime</span>
-                  <span className={cn('num text-xl font-semibold', over ? 'text-status-danger' : 'text-foreground')}>{formatClock(elapsed)}</span>
-                  {slo !== null && (
-                    <span className={cn('inline-flex items-center gap-1 text-xs', over ? 'text-status-danger' : 'text-muted-foreground')}>
-                      {over && <TriangleAlert aria-hidden className="size-3.5" />}
-                      {over ? 'Over' : 'SLO'} {formatDuration(slo)}
+                  <p className="flex items-baseline gap-2">
+                    <span className="sr-only">Downtime </span>
+                    <span className={cn('num text-4xl font-semibold leading-none tracking-tight', tone === 'success' ? 'text-foreground' : TONE_CLASSES[tone].text)}>
+                      {formatClock(elapsed)}
                     </span>
-                  )}
+                    {slo !== null && <span className="num text-sm text-muted-foreground">of {formatClock(slo)}</span>}
+                  </p>
                 </div>
+                {slo !== null && (
+                  <div className="flex flex-col gap-1">
+                    <div
+                      role="meter"
+                      aria-label={`${m.vm.name} downtime against the SLO`}
+                      aria-valuemin={0}
+                      aria-valuemax={slo}
+                      aria-valuenow={Math.min(elapsed, slo)}
+                      aria-valuetext={`${formatClock(elapsed)} of ${formatClock(slo)}`}
+                      className="relative h-2 overflow-hidden rounded-full bg-muted"
+                    >
+                      <div
+                        className={cn('h-full rounded-full transition-[width] duration-700 ease-linear motion-reduce:transition-none', BAR_CLASSES[tone])}
+                        style={{ width: `${Math.min(100, (elapsed / scale) * 100)}%` }}
+                      />
+                      {elapsed > slo && (
+                        <span aria-hidden className="absolute inset-y-0 w-0.5 bg-foreground" style={{ left: `${(slo / scale) * 100}%` }} />
+                      )}
+                    </div>
+                    <p className={cn('flex items-center gap-1 text-xs', tone === 'success' ? 'text-muted-foreground' : TONE_CLASSES[tone].text)}>
+                      {tone !== 'success' && <ToneIcon aria-hidden className="size-3.5" />}
+                      {/* the countdown reads as a clock, the SLO as a duration, like the migration page (SDD §16) */}
+                      {left !== null && left >= 0
+                        ? `${formatClock(left)} left in the ${formatDuration(slo)} SLO`
+                        : `Over the SLO by ${formatClock(-(left ?? 0))}`}
+                    </p>
+                  </div>
+                )}
               </li>
             );
           })}
@@ -115,7 +184,7 @@ function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans:
                       </Link>
                       <PhaseBadge phase={item.migration.phase} />
                     </div>
-                    <p className="mt-0.5 break-words text-sm text-foreground">{item.reason}</p>
+                    <p className="mt-0.5 wrap-break-word text-sm text-foreground">{item.reason}</p>
                     <p className="text-xs text-muted-foreground">Next: {item.nextAction}</p>
                   </div>
                 </li>
@@ -124,7 +193,7 @@ function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans:
           </ul>
           {items.length > shown.length && (
             <p className="mt-3 text-xs text-muted-foreground">
-              {items.length - shown.length} more — see the <Link to="/plans" className="underline underline-offset-4">plans</Link>.
+              {items.length - shown.length} more in the <Link to="/plans" className="underline underline-offset-4">plans</Link>.
             </p>
           )}
         </>
@@ -133,32 +202,36 @@ function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans:
   );
 }
 
-function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migration[] }) {
+/** Completion per plan; `migrations` is null when they could not be loaded (progress unknown, SDD §16). */
+function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migration[] | null }) {
   if (plans.length === 0) {
     return <EmptyState icon={ClipboardList} title="No plans yet" description="Create a plan to start migrating." />;
   }
   return (
-    <ul className="-my-2 divide-y divide-border">
+    // -mt-px hides the top rule of the first row in every column
+    <div className="-my-2 overflow-hidden">
+    <ul className="-mt-px grid gap-x-8 md:grid-cols-2 2xl:grid-cols-3">
       {plans.map((plan) => {
-        const mine = migrations.filter((m) => m.plan_id === plan.id);
+        const mine = migrations?.filter((m) => m.plan_id === plan.id) ?? [];
         const done = mine.filter((m) => ['completed', 'finalized'].includes(m.phase)).length;
         const pct = mine.length ? (done / mine.length) * 100 : 0;
         return (
-          <li key={plan.id} className="flex flex-col gap-1.5 py-2.5">
+          <li key={plan.id} className="flex min-w-0 flex-col gap-1.5 border-t border-border py-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <Link to={`/plans/${plan.id}`} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">
                 {plan.name}
               </Link>
               <PlanStatusBadge status={plan.status} />
             </div>
-            <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />
+            {migrations && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">
-              {done}/{mine.length} done · SLO {formatDuration(plan.downtime_slo_s)}
+              {migrations ? `${done} of ${mine.length} done` : 'Progress unknown'}, downtime SLO {formatDuration(plan.downtime_slo_s)}
             </p>
           </li>
         );
       })}
     </ul>
+    </div>
   );
 }
 
@@ -178,6 +251,10 @@ export default function Overview() {
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;
+  // a failed load with nothing cached is unknown, never an empty state or a zero (SDD §16)
+  const plansUnknown = Boolean(plansQuery.error) && !plansQuery.data;
+  const statsUnknown = Boolean(stats.error) && !s;
+  const migrationsUnknown = Boolean(migrationsQuery.error) && !migrationsQuery.data;
 
   const setPlan = (value: string) => {
     const next = new URLSearchParams(params);
@@ -202,65 +279,91 @@ export default function Overview() {
         }
       />
 
+      {plansQuery.error && <ErrorBanner error={plansQuery.error} title="Plans are unavailable" onRetry={() => void plansQuery.refetch()} className="mb-4" />}
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
 
-      <section aria-label="Key metrics" className={cn('grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6', stats.isPlaceholderData && 'opacity-60')}>
-        {!s ? (
-          Array.from({ length: 6 }, (_, i) => <Skeleton key={i} className="h-[92px]" />)
+      {!s ? (
+        statsUnknown ? (
+          <MetricStrip
+            label="Key metrics"
+            metrics={['Migrations', 'In progress', 'Completed', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
+          />
         ) : (
-          <>
-            <KpiTile label="Migrations" value={formatNumber(s.total)} icon={Layers} hint={`${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}`} />
-            <KpiTile label="In progress" value={formatNumber(s.in_progress)} icon={Activity} tone="progress" hint="validating, copying, cutting over" />
-            <KpiTile label="Completed" value={formatNumber(s.completed)} icon={CircleCheck} tone="success" hint={s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined} />
-            <KpiTile label="Failed" value={formatNumber(s.failed)} icon={CircleX} tone={s.failed > 0 ? 'danger' : 'neutral'} hint={s.failed > 0 ? 'needs retry, rollback or cancel' : 'none'} />
-            <KpiTile
-              label="Avg downtime"
-              value={formatDuration(s.avg_downtime_s)}
-              icon={Timer}
-              hint={`p95 ${formatDuration(s.p95_downtime_s)} · max ${formatDuration(s.max_downtime_s)}`}
-            />
-            <KpiTile label="SLO compliance" value={formatPct(s.slo_compliance_pct)} icon={Gauge} hint="verified cutovers within their plan SLO" />
-          </>
-        )}
-      </section>
+          <Skeleton className="h-[86px]" />
+        )
+      ) : (
+        <MetricStrip
+          label="Key metrics"
+          className={cn(stats.isPlaceholderData && 'opacity-60')}
+          metrics={[
+            { label: 'Migrations', value: formatNumber(s.total), hint: `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
+            { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
+            { label: 'Completed', value: formatNumber(s.completed), hint: s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined },
+            { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
+            { label: 'Average downtime', value: formatDuration(s.avg_downtime_s), hint: `p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}` },
+            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: 'verified cutovers within their plan SLO' },
+          ]}
+        />
+      )}
 
       {migrationsQuery.error && <ErrorBanner error={migrationsQuery.error} title="Migrations are unavailable" onRetry={() => void migrationsQuery.refetch()} className="mt-4" />}
 
-      <div className="mt-4 grid items-start gap-4 xl:grid-cols-2">
+      {/* DOM order is the phone order: live clocks, then the human actions, then the history.
+          On wide screens the actions take the right column beside both downtime panels. */}
+      <div className="mt-4 grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] xl:grid-rows-[auto_1fr]">
         {migrationsQuery.isPending ? (
-          <>
-            <LoadingBlock label="Loading active cutovers…" />
-            <LoadingBlock label="Loading items that need attention…" />
-          </>
+          <LoadingBlock label="Loading the downtime clocks…" />
+        ) : migrationsUnknown ? (
+          <Panel title="Downtime now" description="VMs whose source is stopped appear here with a running clock.">
+            <Unavailable what="migrations" />
+          </Panel>
         ) : (
-          <>
-            <ActiveCutovers migrations={migrations} plans={plansById} />
-            <NeedsAttention migrations={migrations} plans={plansById} />
-          </>
+          <DowntimeNow migrations={migrations} plans={plansById} />
         )}
+        <div className="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-1">
+          {migrationsQuery.isPending ? (
+            <LoadingBlock label="Loading items that need attention…" />
+          ) : migrationsUnknown ? (
+            <Panel title="Needs attention" description="The next human action, most urgent first">
+              <Unavailable what="migrations" />
+            </Panel>
+          ) : (
+            <NeedsAttention migrations={migrations} plans={plansById} />
+          )}
+        </div>
+        <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
+          {s ? (
+            <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+          ) : statsUnknown ? (
+            <Unavailable what="statistics" />
+          ) : (
+            <Skeleton className="h-40" />
+          )}
+        </Panel>
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
         <Panel
           title="Throughput"
-          description={s ? `Last 60 minutes · ${formatBytes(s.bytes_transferred)} transferred in total` : 'Last 60 minutes'}
+          description={s ? `Last 60 minutes, ${formatBytes(s.bytes_transferred)} transferred in total` : 'Last 60 minutes'}
           className="xl:col-span-2"
         >
-          {s ? <ThroughputChart series={s.throughput_series} /> : <Skeleton className="h-56" />}
+          {s ? <ThroughputChart series={s.throughput_series} /> : statsUnknown ? <Unavailable what="statistics" /> : <Skeleton className="h-56" />}
         </Panel>
         <Panel title="Phase distribution" description={s ? `${formatNumber(s.total)} migrations by phase` : undefined}>
-          {s ? <PhaseDistribution byPhase={s.by_phase} /> : <LoadingBlock rows={6} />}
+          {s ? <PhaseDistribution byPhase={s.by_phase} /> : statsUnknown ? <Unavailable what="statistics" /> : <LoadingBlock rows={6} />}
         </Panel>
       </div>
 
-      <div className="mt-4 grid items-start gap-4 xl:grid-cols-2">
-        <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
-          {s ? <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} /> : <Skeleton className="h-40" />}
-        </Panel>
-        <Panel title="Plans" description="Completion per plan">
-          {plansQuery.isPending ? <LoadingBlock rows={4} /> : <PlanProgress plans={scopedPlans} migrations={migrations} />}
-        </Panel>
-      </div>
+      <Panel title="Plans" description="Completion per plan" className="mt-4">
+        {plansQuery.isPending || migrationsQuery.isPending ? (
+          <LoadingBlock rows={4} />
+        ) : plansUnknown ? (
+          <Unavailable what="plans" />
+        ) : (
+          <PlanProgress plans={scopedPlans} migrations={migrationsUnknown ? null : migrations} />
+        )}
+      </Panel>
     </>
   );
 }

@@ -68,7 +68,16 @@
     match_by_name: "{{ os_migrate_rollback_match_by_name | bool }}"
     dst_filters: "{{ os_migrate_dst_filters }}"
     timeout: "{{ os_migrate_timeout }}"
+    conversion_host: "{{ os_migrate_dst_conversion_host_name }}"
   register: import_workloads_warm_rollback
+
+- name: Report destination volumes kept because another server uses them
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ item['params']['name'] }}: destination volume(s)
+      {{ import_workloads_warm_rollback.kept_volume_ids | join(', ') }} are attached to
+      another server and were kept.
+  when: import_workloads_warm_rollback.kept_volume_ids | default([]) | length > 0
 
 - name: Start the source server
   os_migrate.os_migrate.server_action:

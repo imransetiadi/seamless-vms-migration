@@ -2,6 +2,7 @@ import {
   Activity,
   ArrowRightLeft,
   Bot,
+  Download,
   BrainCircuit,
   CircleX,
   ClipboardList,
@@ -20,7 +21,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
@@ -96,7 +97,10 @@ function byNewest(a: Item, b: Item): number {
 export default function Events() {
   usePageTitle('Events');
   const searchId = useId();
-  const history = useEventTail();
+  // the plan filter lives in the address like Overview's (SDD §16): its history comes from the API
+  const [params, setParams] = useSearchParams();
+  const planId = params.get('plan') ?? '';
+  const history = useEventTail(planId ? { plan_id: planId } : {});
   const plans = usePlans();
   const [live, setLive] = useState<Item[]>([]);
   const [held, setHeld] = useState<Item[]>([]);
@@ -107,6 +111,7 @@ export default function Events() {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState(PAGE);
   const counter = useRef(0);
+  const listRef = useRef<HTMLOListElement>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const progressRef = useRef(showProgress);
@@ -146,12 +151,36 @@ export default function Events() {
     const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
     const q = query.trim().toLowerCase();
     return items.filter(({ event }) => {
+      if (planId && event.plan_id !== planId) return false;
       if (!match(event.kind)) return false;
       if (event.seq === 0 && !showProgress) return false;
       if (!q) return true;
       return [event.message, event.kind, event.actor, event.plan_id ?? '', event.migration_id ?? ''].some((v) => v.toLowerCase().includes(q));
     });
-  }, [items, category, query, showProgress]);
+  }, [items, category, query, showProgress, planId]);
+  // a failed history load with nothing cached: the trail is unknown, not empty (SDD §16)
+  const historyUnknown = Boolean(history.error) && !history.data;
+  // the shown audit events (SDD §16): the page as shown, without progress updates (never persisted)
+  const shownAudit = useMemo(() => filtered.slice(0, limit).filter(({ event }) => event.seq > 0), [filtered, limit]);
+  const downloadReason = shownAudit.length
+    ? null
+    : historyUnknown
+      ? 'The audit trail could not be loaded.'
+      : filtered.length
+        ? 'Only progress updates are shown; they are not part of the audit trail.'
+        : 'No events match the filters.';
+
+  /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
+  const download = () => {
+    const events = shownAudit.map(({ event }) => event).sort((a, b) => a.seq - b.seq);
+    const blob = new Blob(events.map((event) => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `seamless-events-${new Date().toISOString().slice(0, 19).replace(/:/g, '')}.jsonl`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   const resume = () => {
     setLive((l) => [...l, ...held].slice(-MAX_LIVE));
@@ -171,15 +200,25 @@ export default function Events() {
         title="Events"
         description="The audit trail of every plan, migration, advisor and provider action, followed live."
         actions={
-          paused ? (
-            <Button size="lg" variant="primary" icon={Play} onClick={resume}>
-              Resume ({held.length} new)
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="lg"
+              icon={Download}
+              onClick={download}
+              disabledReason={downloadReason}
+            >
+              Download shown events
             </Button>
-          ) : (
-            <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
-              Pause live updates
-            </Button>
-          )
+            {paused ? (
+              <Button size="lg" variant="primary" icon={Play} onClick={resume}>
+                Resume ({held.length} new)
+              </Button>
+            ) : (
+              <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
+                Pause live updates
+              </Button>
+            )}
+          </div>
         }
       />
 
@@ -210,6 +249,24 @@ export default function Events() {
           }}
           options={CATEGORIES.map((c) => ({ value: c.value, label: c.label }))}
         />
+        <SelectField
+          label="Plan"
+          className="md:w-60"
+          value={planId}
+          onChange={(e) => {
+            const next = new URLSearchParams(params);
+            if (e.target.value) next.set('plan', e.target.value);
+            else next.delete('plan');
+            setParams(next, { replace: true });
+            setLimit(PAGE);
+          }}
+          options={[
+            { value: '', label: 'All plans' },
+            ...(plans.data ?? []).map((p) => ({ value: p.id, label: p.name })),
+            // a plan in the address that the list does not hold (not loaded, or gone) stays chosen
+            ...(planId && !(plans.data ?? []).some((p) => p.id === planId) ? [{ value: planId, label: planId }] : []),
+          ]}
+        />
         <label className="flex min-h-11 cursor-pointer items-center gap-2 text-sm text-foreground md:mb-0.5">
           <input type="checkbox" className="size-4 cursor-pointer accent-accent" checked={showProgress} onChange={(e) => setShowProgress(e.target.checked)} />
           Show progress updates
@@ -225,12 +282,13 @@ export default function Events() {
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
-      {!history.isPending && filtered.length === 0 && (
+      {/* "No events match" only once the trail is known: a failed load is not an empty trail (SDD §16) */}
+      {history.data && filtered.length === 0 && (
         <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
       )}
 
       {filtered.length > 0 && (
-        <ol aria-label="Events, newest first" className="card divide-y divide-border">
+        <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
           {filtered.slice(0, limit).map(({ key, event }) => {
             const meta = kindMeta(event.kind);
             return (
@@ -244,7 +302,7 @@ export default function Events() {
                   <code className="break-all text-foreground">{event.kind}</code>
                 </span>
                 <div className="min-w-0">
-                  <p className="break-words text-sm text-foreground">{event.message || '—'}</p>
+                  <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
                   <p className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
                     <span>by {event.actor}</span>
                     {event.plan_id && (
@@ -267,7 +325,15 @@ export default function Events() {
       )}
       {filtered.length > limit && (
         <div className="mt-3">
-          <Button onClick={() => setLimit((n) => n + PAGE)}>Show {Math.min(PAGE, filtered.length - limit)} older events</Button>
+          <Button
+            onClick={() => {
+              // the last page removes this button: focus moves to the list, never to the page (SDD §16)
+              if (filtered.length <= limit + PAGE) listRef.current?.focus();
+              setLimit((n) => n + PAGE);
+            }}
+          >
+            Show {Math.min(PAGE, filtered.length - limit)} older events
+          </Button>
         </div>
       )}
     </>

@@ -44,6 +44,12 @@ documents = sa.Table(
     sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
 )
 
+#: Top-level JSON fields the list filters push into SQL (SDD §11); each gets an expression
+#: index on ``(kind, field)`` so a plan's migrations or a phase are found without a full scan.
+INDEXED_FIELDS = ("plan_id", "phase", "wave_id", "status", "role")
+for _field in INDEXED_FIELDS:
+    sa.Index(f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string())
+
 events = sa.Table(
     "events",
     metadata,
@@ -104,6 +110,32 @@ def build_engine(url: str) -> Engine:
     return sa.create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=5)
 
 
+def _as_strings(wanted: Any) -> list[str] | None:
+    """``wanted`` as a list of strings when every member is a string (or string enum)."""
+    members = (
+        list(wanted)
+        if isinstance(wanted, Collection) and not isinstance(wanted, str | bytes)
+        else [wanted]
+    )
+    out: list[str] = []
+    for member in members:
+        if isinstance(member, Enum):
+            member = member.value
+        if not isinstance(member, str):
+            return None
+        out.append(member)
+    return out
+
+
+def _sql_filter(name: str, wanted: Any) -> Any:
+    """A WHERE clause on the JSON field ``name`` for string filters, else ``None``."""
+    values = _as_strings(wanted)
+    if not values or not name.isidentifier():
+        return None
+    column = documents.c.data[name].as_string()
+    return column == values[0] if len(values) == 1 else column.in_(values)
+
+
 def _matches(value: Any, wanted: Any) -> bool:
     if isinstance(wanted, Enum):
         wanted = wanted.value
@@ -122,6 +154,11 @@ class Store:
     # -- lifecycle ---------------------------------------------------------------------------
     def create_schema(self) -> None:
         metadata.create_all(self.engine, checkfirst=True)
+        # create_all skips the indexes of tables that already exist, and expression indexes
+        # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
+        with self.engine.begin() as conn:
+            for index in documents.indexes:
+                conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
         self.engine.dispose()
@@ -211,22 +248,61 @@ class Store:
     def get(self, kind: str, id_: str, model_cls: type[M]) -> M:
         return self.get_versioned(kind, id_, model_cls)[0]
 
-    def list(self, kind: str, model_cls: type[M], **filters: Any) -> list[M]:
-        """Documents of ``kind``; ``filters`` compare top-level JSON fields (in Python).
-
-        A filter value that is a list/tuple/set matches any of its members.
-        """
+    def change_stamp(self, kind: str) -> tuple[int, int]:
+        """``(count, sum of versions)`` of the documents of ``kind``: changes whenever one is
+        inserted, updated or deleted, at the cost of one index scan instead of loading and
+        validating every document (``/stats`` and ``/metrics`` cache on it)."""
+        query = sa.select(
+            sa.func.count(documents.c.id), sa.func.coalesce(sa.func.sum(documents.c.version), 0)
+        ).where(documents.c.kind == kind)
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(documents.c.data)
-                .where(documents.c.kind == kind)
-                .order_by(documents.c.created_at, documents.c.id)
-            ).all()
+            count, versions = conn.execute(query).one()
+        return int(count), int(versions)
+
+    def list(
+        self,
+        kind: str,
+        model_cls: type[M],
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        **filters: Any,
+    ) -> list[M]:
+        """Documents of ``kind`` in creation order; ``filters`` compare top-level JSON fields.
+
+        String filters are evaluated in SQL (see ``INDEXED_FIELDS``), the others in Python;
+        a filter value that is a list/tuple/set matches any of its members. ``limit`` and
+        ``offset`` page the result; they are applied in SQL when every filter could be pushed
+        down, otherwise after the Python filtering.
+        """
+        query = (
+            sa.select(documents.c.data)
+            .where(documents.c.kind == kind)
+            .order_by(documents.c.created_at, documents.c.id)
+        )
+        all_pushed = True
+        for name, wanted in filters.items():
+            clause = _sql_filter(name, wanted)
+            if clause is None:
+                all_pushed = False
+            else:
+                query = query.where(clause)
+        page_in_sql = all_pushed and (limit is not None or offset)
+        if page_in_sql:
+            query = query.offset(max(0, int(offset)))
+            if limit is not None:
+                query = query.limit(max(0, int(limit)))
+        with self.engine.connect() as conn:
+            rows = conn.execute(query).all()
         out: list[M] = []
         for row in rows:
             data = row.data
+            # the Python check stays authoritative (non-string values, dialect quirks)
             if all(_matches(data.get(name), wanted) for name, wanted in filters.items()):
                 out.append(model_cls.model_validate(data))
+        if not page_in_sql and (limit is not None or offset):
+            start = max(0, int(offset))
+            out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
         return out
 
     def delete(self, kind: str, id_: str) -> None:
@@ -262,7 +338,10 @@ class Store:
         migration_id: str | None = None,
         limit: int = 500,
         kinds: Iterable[str] | None = None,
+        tail: bool = False,
     ) -> list[Event]:
+        """Matching events after ``since_seq`` in ascending ``seq``: the first ``limit`` of them,
+        or with ``tail`` the newest ``limit`` (SDD §12)."""
         query = sa.select(events).where(events.c.seq > since_seq)
         if plan_id is not None:
             query = query.where(events.c.plan_id == plan_id)
@@ -270,9 +349,12 @@ class Store:
             query = query.where(events.c.migration_id == migration_id)
         if kinds is not None:
             query = query.where(events.c.kind.in_(list(kinds)))
-        query = query.order_by(events.c.seq).limit(max(0, int(limit)))
+        order = events.c.seq.desc() if tail else events.c.seq
+        query = query.order_by(order).limit(max(0, int(limit)))
         with self.engine.connect() as conn:
             rows = conn.execute(query).mappings().all()
+        if tail:
+            rows = rows[::-1]
         return [
             Event(
                 seq=row["seq"],
@@ -286,6 +368,19 @@ class Store:
             )
             for row in rows
         ]
+
+    def delete_events_before(self, before: datetime) -> int:
+        """Delete events with ``ts < before`` (audit retention, Security.md §12); returns the count.
+
+        Export them first (``seamless events export``): the sequence numbers are never reused,
+        so SSE clients resuming with ``since`` keep working after a prune.
+        """
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)
+        before = before.astimezone(UTC)  # SQLite stores UTC wall time without an offset
+        with self.engine.begin() as conn:
+            result = conn.execute(events.delete().where(events.c.ts < before))
+        return int(result.rowcount or 0)
 
     def max_seq(self) -> int:
         with self.engine.connect() as conn:
@@ -308,8 +403,21 @@ class AsyncStore:
     async def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
         return await asyncio.to_thread(self.sync.get_versioned, kind, id_, model_cls)
 
-    async def list(self, kind: str, model_cls: type[M], **filters: Any) -> list[M]:
-        return await asyncio.to_thread(lambda: self.sync.list(kind, model_cls, **filters))
+    async def change_stamp(self, kind: str) -> tuple[int, int]:
+        return await asyncio.to_thread(self.sync.change_stamp, kind)
+
+    async def list(
+        self,
+        kind: str,
+        model_cls: type[M],
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        **filters: Any,
+    ) -> list[M]:
+        return await asyncio.to_thread(
+            lambda: self.sync.list(kind, model_cls, limit=limit, offset=offset, **filters)
+        )
 
     async def delete(self, kind: str, id_: str) -> None:
         await asyncio.to_thread(self.sync.delete, kind, id_)
@@ -319,6 +427,9 @@ class AsyncStore:
 
     async def events(self, **kwargs: Any) -> list[Event]:
         return await asyncio.to_thread(lambda: self.sync.events(**kwargs))
+
+    async def delete_events_before(self, before: datetime) -> int:
+        return await asyncio.to_thread(self.sync.delete_events_before, before)
 
     async def max_seq(self) -> int:
         return await asyncio.to_thread(self.sync.max_seq)

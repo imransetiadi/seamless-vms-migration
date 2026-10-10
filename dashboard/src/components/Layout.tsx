@@ -92,6 +92,50 @@ function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
   );
 }
 
+/**
+ * Shown above every page while GET /health is degraded or unreachable (SDD §12). The live
+ * region is always mounted so screen readers announce the text when it appears.
+ */
+function HealthNotice() {
+  const health = useHealth();
+  let tone: 'danger' | 'warning' | null = null;
+  let text = '';
+  if (health.isError) {
+    tone = 'warning';
+    text = 'The control plane is not answering health checks; the data below may be stale.';
+  } else if (health.data && health.data.status === 'degraded') {
+    const h = health.data;
+    const reasons: string[] = [];
+    if (h.db !== 'ok') reasons.push('the database is unreachable');
+    if (h.orchestrator && !h.orchestrator.healthy) {
+      const age = h.orchestrator.last_tick_age_s;
+      reasons.push(
+        !h.orchestrator.running
+          ? 'the orchestrator loop is not running'
+          : age === null
+            ? 'the orchestrator loop is unhealthy before its first tick'
+            : `the orchestrator loop is unhealthy (last tick ${Math.round(age)} s ago)`,
+      );
+    }
+    tone = 'danger';
+    text = `Control plane degraded: ${reasons.length ? reasons.join('; ') : 'see the service logs'}. Migrations do not advance until this is resolved.`;
+  }
+  return (
+    <p
+      role="status"
+      aria-live="polite"
+      data-testid="health-notice"
+      className={cn(
+        tone === null && 'sr-only',
+        tone === 'danger' && 'mb-4 rounded-md border border-status-danger/50 bg-status-danger/10 px-3 py-2 text-sm text-foreground',
+        tone === 'warning' && 'mb-4 rounded-md border border-status-warning/50 bg-status-warning/10 px-3 py-2 text-sm text-foreground',
+      )}
+    >
+      {text}
+    </p>
+  );
+}
+
 function SessionFooter() {
   const me = useMe();
   const health = useHealth();
@@ -102,9 +146,21 @@ function SessionFooter() {
       <div className="flex items-center justify-between gap-2 px-1">
         <LiveIndicator />
         {health.data?.demo && (
-          <span className="rounded border border-status-info/40 px-1.5 py-0.5 text-xs text-status-info">Demo</span>
+          <span className="rounded-sm border border-status-info/40 px-1.5 py-0.5 text-xs text-status-info">Demo</span>
         )}
       </div>
+      {health.data?.orchestrator && (
+        <p className="px-1 text-xs text-muted-foreground" data-testid="orchestrator-status">
+          Orchestrator{' '}
+          {health.data.orchestrator.healthy
+            ? health.data.orchestrator.last_tick_age_s === null
+              ? 'starting'
+              : `running · last tick ${Math.round(health.data.orchestrator.last_tick_age_s)} s ago`
+            : health.data.orchestrator.running
+              ? 'stalled'
+              : 'stopped'}
+        </p>
+      )}
       {me.data && (
         <p className="px-1 text-sm">
           <span className="block truncate font-medium text-foreground">{me.data.name}</span>
@@ -169,7 +225,7 @@ export function Layout() {
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur lg:hidden">
+        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm lg:hidden">
           <button
             type="button"
             onClick={() => setMenuOpen((open) => !open)}
@@ -201,8 +257,9 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-none md:px-6 md:py-6"
+          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
         >
+          <HealthNotice />
           <Outlet />
         </main>
       </div>

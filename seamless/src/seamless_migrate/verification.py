@@ -17,13 +17,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .ai.memory import redact
 from .config import Settings
 from .providers.base import ProviderError
 
 log = logging.getLogger(__name__)
+#: Nova states no amount of polling leaves (SDD §7.5): the verification fails at once.
+TERMINAL_STATES = frozenset({"ERROR", "DELETED", "SOFT_DELETED"})
 TCP_TIMEOUT_S = 5.0
 CONSOLE_LINES = 200
 CONSOLE_WARNING = "console log unavailable; console check skipped"
+WINDOWS_CONSOLE = "Windows writes no boot messages to the serial console; console check skipped"
+WINDOWS_NO_PORTS = "no TCP port probed for this Windows guest: set windows_tcp_ports (e.g. 3389)"
 
 
 @dataclass
@@ -45,7 +50,8 @@ class VerificationResult:
 
 
 def _check(name: str, ok: bool, detail: str, skipped: bool = False) -> dict[str, Any]:
-    out: dict[str, Any] = {"name": name, "ok": ok, "detail": detail}
+    # a detail may quote a provider's error: it reaches events any viewer reads (SDD §12, §13.3)
+    out: dict[str, Any] = {"name": name, "ok": ok, "detail": redact(detail)}
     if skipped:
         out["skipped"] = True
     return out
@@ -55,7 +61,8 @@ async def _tcp_probe(host: str, port: int) -> tuple[bool, str]:
     started = time.monotonic()
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), TCP_TIMEOUT_S)
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, ValueError, OverflowError) as exc:
+        # a port asyncio refuses (above 65535, negative) is closed, never an error (SDD §7.5)
         return False, f"{host}:{port} unreachable ({type(exc).__name__})"
     writer.close()
     try:
@@ -102,7 +109,7 @@ class Verifier:
             attempt += 1
             result = await self._attempt(ctx)
             result.evidence["attempts"] = attempt
-            if result.passed or self._clock() >= deadline:
+            if result.passed or result.evidence.get("terminal") or self._clock() >= deadline:
                 return result
             await self._sleep(min(self.poll_s, max(0.0, deadline - self._clock())))
 
@@ -122,29 +129,50 @@ class Verifier:
         checks = []
         status = str(server.get("status") or "UNKNOWN")
         checks.append(_check("server_active", status == "ACTIVE", f"status {status}"))
+        if status.upper() in TERMINAL_STATES:
+            # polling cannot turn an ERROR/DELETED server ACTIVE: fail fast, inside the window
+            evidence["terminal"] = True
         ports = list(server.get("ports") or [])
         up = [p for p in ports if p.get("status") == "ACTIVE"]
         checks.append(
-            _check("ports_up", len(up) == len(ports), f"{len(up)}/{len(ports)} ports ACTIVE")
+            _check(
+                "ports_up",
+                len(up) == len(ports),
+                f"{len(up)}/{len(ports)} ports ACTIVE" if ports else "no ports on the server",
+            )
         )
+
+        # the guest family picks the profile (SDD §7.5)
+        vm = getattr(ctx.migration, "vm", None)
+        windows = vm is not None and vm.guest_os.family == "windows"
+        probe_ports = list(cfg.windows_tcp_ports if windows else cfg.tcp_ports)
+        warnings: list[str] = []
+        if windows and not probe_ports:
+            warnings.append(WINDOWS_NO_PORTS)
 
         key = "floating_ips" if cfg.probe_address == "floating" else "fixed_ips"
         address = next((ip for p in ports for ip in (p.get(key) or []) if ip), None)
-        for port in cfg.tcp_ports:
+        for port in probe_ports:
             if address is None:
                 checks.append(_check(f"tcp:{port}", False, f"no {cfg.probe_address} address"))
                 continue
             ok, detail = await self._probe(address, int(port))
             checks.append(_check(f"tcp:{port}", ok, detail))
 
-        try:
-            console = await self.dst.console_log(server_id, CONSOLE_LINES)
-        except ProviderError:
-            console = None
-        if console is None:
-            checks.append(_check("console", True, CONSOLE_WARNING, skipped=True))
-            evidence["warnings"] = [CONSOLE_WARNING]
+        console: Any = None
+        if windows:
+            checks.append(_check("console", True, WINDOWS_CONSOLE, skipped=True))
         else:
+            try:
+                console = await self.dst.console_log(server_id, CONSOLE_LINES)
+            except ProviderError:
+                console = None
+            if console is None:
+                checks.append(_check("console", True, CONSOLE_WARNING, skipped=True))
+                warnings.append(CONSOLE_WARNING)
+        if warnings:
+            evidence["warnings"] = warnings
+        if console is not None:
             excerpt = "\n".join(str(console).splitlines()[-CONSOLE_LINES:])
             evidence["console"] = excerpt
             matched = _pattern_match(list(cfg.console_success_patterns), excerpt)

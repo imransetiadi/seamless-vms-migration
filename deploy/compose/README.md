@@ -37,7 +37,8 @@ Then open <http://127.0.0.1:8080/> and sign in at `/login` with the admin token,
 
 ```bash
 export TOKEN='smg_...'                                   # the token printed by compose-init.sh
-curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok","version":...,"demo":...,"db":"ok"}
+curl -fsS http://127.0.0.1:8080/api/v1/health            # {"status":"ok",...,"db":"ok","orchestrator":{"running":true,...}}
+curl -fsS http://127.0.0.1:8080/api/v1/ready             # same body; HTTP 503 while the DB or the orchestrator loop is down
 curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/me
 curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/stream    # live SSE
 ```
@@ -54,6 +55,20 @@ curl -N   -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/events/
 
 After `--force`, recreate the stack so the control plane reloads the files: `make seamless-down seamless-up`.
 
+## Other engines and hosts
+
+| Engine | How | Notes |
+|---|---|---|
+| Docker via Colima (default) | `make seamless-up` | context `colima-seamless`; your active context is never changed |
+| Any Docker host | `make seamless-up SEAMLESS_DOCKER_CONTEXT=default` | Docker Desktop, Docker Engine on Linux, a remote context |
+| Podman 4.7+ | `make seamless-up SEAMLESS_ENGINE=podman` | `podman compose` with docker-compose as provider (recommended) or podman-compose; the targets poll `/api/v1/health` instead of `--wait` |
+
+Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podman`, `make seamless-down …`).
+With Podman, the host is `host.containers.internal` (set `SEAMLESS_MEMORY_URL` in `.env` for agentmemory);
+rootless Podman keeps the named volumes in your user's storage. On SELinux hosts the token mount is
+relabelled (`selinux: z`). If you changed `SEAMLESS_HOST_PORT` in `.env`, pass it to make too so the health
+wait polls the right port.
+
 ## Make targets
 
 | Target | What it does |
@@ -66,6 +81,7 @@ After `--force`, recreate the stack so the control plane reloads the files: `mak
 | `seamless-ps` / `seamless-logs` | status / follow logs (`SEAMLESS_SERVICE=seamless` to filter) |
 | `seamless-reset` | **deletes** containers and volumes; needs `CONFIRM=yes` |
 | `seamless-test` | `cd seamless && .venv/bin/pytest -q` (export `SEAMLESS_TEST_PG_URL` to include PostgreSQL) |
+| `seamless-check` | the full local gate: control-plane tests + ruff, collection tests + lint, dashboard typecheck/lint/tests/build |
 | `dashboard-build` | `cd dashboard && npm ci && npm run build` |
 
 Variables: `SEAMLESS_COLIMA_PROFILE` (default `seamless`), `SEAMLESS_COLIMA_CPU/MEMORY/DISK`,
@@ -76,18 +92,19 @@ Variables: `SEAMLESS_COLIMA_PROFILE` (default `seamless`), `SEAMLESS_COLIMA_CPU/
 
 `.env` (generated; edit only the toggles) holds `POSTGRES_PASSWORD`, `JEV_MCP_AUTH_TOKEN`, optionally
 `TYPESAFE_API_KEY`, `COMPOSE_PROFILES`, `SEAMLESS_JEV_MODE`, `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`.
-Any variable of [SDD §15.1](../../docs/SDD.md) can be overridden from `.env` or the shell; the ones the
+Only the variables the Compose file wires under `environment:` reach the container (there is no `env_file`); every one of them can be overridden from `.env` or the shell. The
 Compose file wires explicitly:
 
 | Variable | Default here | Meaning |
 |---|---|---|
 | `SEAMLESS_DEMO`, `_DEMO_SPEED`, `_DEMO_SEED`, `_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
+| `SEAMLESS_MAX_CONCURRENT_MIGRATIONS` / `_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES`, `SEAMLESS_STEP_TIMEOUT_S`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `10`, `3`, `1.0`, `2`, `0` (no step ceiling), `60` | orchestrator / auth lockout |
 | `SEAMLESS_JEV_MODE` | `http` (`off` when no key at init) | Jev advisor (SDD §14.1); URL `http://jev:8080/mcp` is fixed |
 | `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `20`, `0.6` | advisor bounds |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET` | host agentmemory, none | passed through only when defined; delete the line to disable memory |
 | `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | `seamless-migrate`, `false` | memory project id / privacy ([MEMORY.md](../../docs/MEMORY.md) §3) |
-| `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `false` | misc |
+| `SEAMLESS_SECRET_STORE`, `SEAMLESS_SECRETS_DIR` | `files`, `/var/run/secrets/seamless` | provider credentials and conversion-host keys entered in the dashboard (Providers → Add or Edit): 0600 files in the `seamless-secrets` volume — back it up like a secret; `make seamless-reset` deletes it |
+| `SEAMLESS_CORS_ORIGINS`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | empty, `false`, `INFO`, `true` | misc (JSON logs for forwarders, SDD §15.1) |
 | `SEAMLESS_HOST_PORT`, `SEAMLESS_VERSION` | `8080`, `0.1.0` | published loopback port, image tag |
 
 Authentication is always on (`SEAMLESS_AUTH_DISABLED=false`): the process listens on `0.0.0.0` inside the
@@ -140,8 +157,11 @@ application credentials ([Security.md](../../docs/Security.md) §7).
 
 ## Data, backup, reset
 
-* Volumes: `seamless_pgdata` (system of record: plans, migrations, events) and `seamless_seamless-data`
-  (run directories). `make seamless-down` keeps them; `make seamless-reset CONFIRM=yes` deletes them.
+* Volumes: `seamless_pgdata` (system of record: plans, migrations, events), `seamless_seamless-data`
+  (run directories) and `seamless_seamless-secrets` (provider credentials and conversion-host keys entered
+  in the dashboard, 0600 files). `make seamless-down` keeps them; `make seamless-reset CONFIRM=yes` deletes
+  them. Back up the secrets volume like a secret, separately from the database dump, or re-enter the
+  credentials after a restore.
 * Switching between demo and real use: reset first — demo seeds fake providers and plans into the database.
 * Every PostgreSQL connection needs a password, also inside the container; the container's own
   `POSTGRES_PASSWORD` is used so the secret never appears on a command line. The `initdb` options only apply
@@ -166,10 +186,11 @@ application credentials ([Security.md](../../docs/Security.md) §7).
 | `POSTGRES_PASSWORD is not set` | run `scripts/compose-init.sh` (or `make seamless-init`) |
 | `bind source path does not exist: …/tokens.yaml` | `.env`/`tokens.yaml` missing: run the init script (Compose never creates a directory in its place) |
 | `password authentication failed for user "seamless"` | `.env` password differs from the one the `pgdata` volume was initialized with (or a stray `POSTGRES_PASSWORD` in your shell when you ran `docker compose` yourself — see Precedence). Restore the old `.env`, or `make seamless-reset CONFIRM=yes` and init again |
-| `Permission denied: '/data/...'` | the image must own `/data` for its non-root user (Containerfile); one-off fix: `docker --context colima-seamless run --rm -v seamless_seamless-data:/data busybox chown -R <uid>:0 /data` |
+| `Permission denied: '/data/...'` | the image creates `/data` owned by its non-root user (UID 1001, Containerfile), so a volume created by a current image is writable; a volume first mounted by an older image keeps root ownership — one-off fix: `docker --context colima-seamless run --rm -v seamless_seamless-data:/data busybox chown -R 1001:0 /data` |
 | `jev` unhealthy for ~1 min after first start | `npx` downloads the pinned package; wait for `start_period` (90 s) and check `make seamless-logs SEAMLESS_SERVICE=jev` |
 | Memory calls fail from the container | `docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.internal:3111/agentmemory/livez`; start the host agentmemory, or delete `SEAMLESS_MEMORY_URL` from `.env` |
 | Port 8080 already in use | set `SEAMLESS_HOST_PORT=8081` in `.env` |
+| `http://localhost:8080/` shows another app (or its 404) although the stack is healthy | the stack listens on `127.0.0.1` only and a browser opens `localhost` on `::1` first, where another program answers (`lsof -nP -iTCP:8080 -sTCP:LISTEN`); `make seamless-up`/`seamless-demo` print a note then. Open `http://127.0.0.1:8080/`, stop that program, or set `SEAMLESS_HOST_PORT` |
 | `exec: "python3": executable file not found` in the health check | the image must provide `python3` on `PATH` (UBI Python base does) |
 
 ## Security notes

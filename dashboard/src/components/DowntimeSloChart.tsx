@@ -79,12 +79,12 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
       <figcaption className="text-sm text-muted-foreground">{summary}</figcaption>
       <ul aria-label="Legend" className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
         <li className="flex items-center gap-1.5">
-          <span aria-hidden className="size-2.5 rounded-sm" style={{ background: colors.series1 }} />
+          <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.series1 }} />
           <CircleCheck aria-hidden className="size-3.5 text-status-success" />
           Within SLO
         </li>
         <li className="flex items-center gap-1.5">
-          <span aria-hidden className="size-2.5 rounded-sm" style={{ background: colors.danger }} />
+          <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.danger }} />
           <TriangleAlert aria-hidden className="size-3.5 text-status-danger" />
           Over SLO
         </li>

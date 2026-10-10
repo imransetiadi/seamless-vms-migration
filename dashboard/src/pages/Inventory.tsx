@@ -15,6 +15,9 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
+
+/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
+const GIB = 1024 ** 3;
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -23,6 +26,7 @@ import type { NewPlanState } from './Plans';
 function DestinationInventoryView({ inventory }: { inventory: DestinationInventory }) {
   const networks = Object.entries(inventory.networks);
   const quotas = Object.entries(inventory.quotas);
+  const projects = [...inventory.projects].sort((a, b) => a.localeCompare(b));
   return (
     <div className="grid gap-4 xl:grid-cols-2">
       <Panel title="Networks" description="Name and MTU (Geneve tenant networks are typically 1442)">
@@ -84,7 +88,7 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                     </th>
                     <td className="num text-right">{f.vcpus}</td>
                     <td className="num text-right">{formatBytes(f.ram_mb * 1024 * 1024)}</td>
-                    <td className="num text-right">{f.disk_gb} GB</td>
+                    <td className="num text-right">{formatBytes(f.disk_gb * GIB)}</td>
                     <td className="text-xs text-muted-foreground">
                       {Object.entries(f.extra_specs)
                         .map(([k, v]) => `${k}=${v}`)
@@ -103,8 +107,21 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {inventory.volume_types.map((t) => (
-              <li key={t} className="rounded border border-border px-2 py-0.5 font-mono text-xs">
+              <li key={t} className="rounded-sm border border-border px-2 py-0.5 font-mono text-xs">
                 {t}
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
+      <Panel title="Projects" description="The names plan project mappings point to; pre-flight blocks a VM whose project is not here (DST_PROJECT_MISSING)">
+        {projects.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No projects reported.</p>
+        ) : (
+          <ul className="flex flex-wrap gap-1.5">
+            {projects.map((name) => (
+              <li key={name} className="rounded-sm border border-border px-2 py-0.5 font-mono text-xs">
+                {name}
               </li>
             ))}
           </ul>
@@ -145,7 +162,7 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                     <td className="num text-right">{formatBytes(q.ram_mb * 1024 * 1024)}</td>
                     <td className="num text-right">{formatNumber(q.instances)}</td>
                     <td className="num text-right">{formatNumber(q.volumes)}</td>
-                    <td className="num text-right">{formatNumber(q.gigabytes)} GB</td>
+                    <td className="num text-right">{formatBytes(q.gigabytes * GIB)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -170,7 +187,9 @@ export default function Inventory() {
   const role = useRole();
   const [selected, setSelected] = useState<{ providerId: string; ids: Set<string> }>({ providerId: '', ids: new Set() });
   const provider = providers.data?.find((p) => p.id === providerId);
-  const canPlan = hasRole(role, 'operator') && provider?.role === 'source';
+  // planning starts from a source; viewers see the action unavailable, with the reason (SDD §16)
+  const isSource = provider?.role === 'source';
+  const canPlan = hasRole(role, 'operator') && isSource;
   const selection = selected.providerId === providerId ? selected.ids : new Set<string>();
 
   if (!providerId) {
@@ -211,10 +230,12 @@ export default function Inventory() {
         }
       />
 
+      {/* the inventory shows with its provider: while that is loading or failed, say so (SDD §16) */}
+      {providers.error && <ErrorBanner error={providers.error} title="Providers are unavailable" onRetry={() => void providers.refetch()} />}
       {providers.data && !provider && (
         <EmptyState icon={Server} title={`Provider ${providerId} does not exist`} description="Pick another provider above." />
       )}
-      {inventory.isPending && provider && <LoadingBlock label="Reading inventory…" rows={6} />}
+      {(providers.isPending || (inventory.isPending && provider)) && <LoadingBlock label="Reading inventory…" rows={6} />}
       {inventory.error && (
         <ErrorBanner error={inventory.error} title={`Cannot read the inventory of ${provider?.name ?? providerId}`} onRetry={() => void inventory.refetch()} />
       )}
@@ -223,20 +244,20 @@ export default function Inventory() {
           <EmptyState icon={HardDrive} title="No VMs found" description="The provider reported an empty inventory." />
         ) : (
           <div className="flex flex-col gap-3">
-            {canPlan && (
+            {isSource && (
               <div className="flex flex-wrap items-center gap-2">
                 <Button
                   variant="primary"
                   size="lg"
                   icon={ClipboardPlus}
-                  disabledReason={selection.size === 0 ? 'Select VMs in the table first.' : null}
+                  disabledReason={!canPlan ? 'Creating a plan requires the operator role.' : selection.size === 0 ? 'Select VMs in the table first.' : null}
                   onClick={() =>
                     navigate('/plans', { state: { newPlan: { sourceId: provider.id, vmIds: [...selection] } } satisfies NewPlanState })
                   }
                 >
                   Create plan{selection.size ? ` with ${selection.size} VM${selection.size === 1 ? '' : 's'}` : ''}
                 </Button>
-                <span className="text-xs text-muted-foreground">Select VMs below to start a plan with them.</span>
+                {canPlan && <span className="text-xs text-muted-foreground">Select VMs below to start a plan with them.</span>}
               </div>
             )}
             <VmTable

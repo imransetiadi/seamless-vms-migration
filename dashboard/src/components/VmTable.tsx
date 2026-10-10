@@ -1,15 +1,6 @@
-import {
-  CircleCheck,
-  CircleHelp,
-  CircleX,
-  Pause,
-  Power,
-  PowerOff,
-  SearchX,
-  type LucideIcon,
-} from 'lucide-react';
+import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { POWER_STATES, type PowerState, type ProviderKind, type VMRef } from '../api/types';
+import { POWER_STATES, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatBytes, formatNumber } from '../lib/format';
 import type { Tone } from '../lib/phase';
@@ -21,12 +12,14 @@ import { EmptyState } from './EmptyState';
 import { SelectField } from './Field';
 import { SortableHeader } from './SortableHeader';
 import { StatusBadge } from './StatusBadge';
+import { guestOsOf } from '../lib/guestOs';
 
 const POWER_META: Record<PowerState, { label: string; tone: Tone; icon: LucideIcon }> = {
   running: { label: 'Running', tone: 'success', icon: Power },
   stopped: { label: 'Stopped', tone: 'neutral', icon: PowerOff },
   paused: { label: 'Paused', tone: 'warning', icon: Pause },
   error: { label: 'Error', tone: 'danger', icon: CircleX },
+  transitioning: { label: 'Task in flight', tone: 'warning', icon: RefreshCw },
   unknown: { label: 'Unknown', tone: 'neutral', icon: CircleHelp },
 };
 
@@ -35,11 +28,14 @@ const READINESS_ORDER: Record<ReadinessLevel, number> = { blocker: 0, attention:
 type SortKey = 'name' | 'project' | 'power' | 'cpu' | 'disk' | 'used' | 'readiness';
 type ReadinessFilter = 'all' | ReadinessLevel;
 
+type OsFilter = 'all' | 'linux' | 'windows' | 'legacy' | 'unknown';
+
 interface Row {
   vm: VMRef;
   flags: ReadinessFlag[];
   level: ReadinessLevel;
   haystack: string;
+  guest: GuestOS;
 }
 
 export interface VmTableProps {
@@ -82,20 +78,24 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [power, setPower] = useState<PowerState | 'all'>('all');
   const [readiness, setReadiness] = useState<ReadinessFilter>('all');
   const [project, setProject] = useState('all');
+  const [os, setOs] = useState<OsFilter>('all');
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const tableRef = useRef<HTMLTableElement>(null);
   const selectable = Boolean(selected && onSelectedChange);
 
   const rows = useMemo<Row[]>(
     () =>
       vms.map((vm) => {
         const flags = readinessFlags(vm, providerKind);
-        const haystack = [vm.name, vm.project, vm.os_type, vm.flavor, vm.host, ...Object.entries(vm.tags).flat()]
+        const guest = guestOsOf(vm);
+        const haystack = [vm.name, vm.project, vm.os_type, guest.label, vm.flavor, vm.host, ...Object.entries(vm.tags).flat()]
           .filter(Boolean)
           .join(' ')
           .toLowerCase();
-        return { vm, flags, level: readinessLevel(flags), haystack };
+        return { vm, flags, level: readinessLevel(flags), haystack, guest };
       }),
     [vms, providerKind],
   );
@@ -107,15 +107,16 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return rows.filter(({ vm, level, haystack }) => {
+    return rows.filter(({ vm, level, haystack, guest }) => {
       if (power !== 'all' && vm.power_state !== power) return false;
+      if (os === 'legacy' ? guest.lifecycle !== 'legacy' : os !== 'all' && guest.family !== os) return false;
       if (project !== 'all' && vm.project !== project) return false;
       if (readiness === 'ready' && level !== 'ready') return false;
       if (readiness === 'attention' && level === 'ready') return false;
       if (readiness === 'blocker' && level !== 'blocker') return false;
       return !q || haystack.includes(q);
     });
-  }, [rows, query, power, project, readiness]);
+  }, [rows, query, power, project, readiness, os]);
 
   const sorted = useMemo(
     () =>
@@ -141,7 +142,16 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   );
 
   const visible = sorted.slice(0, limit);
-  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all';
+  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all';
+  // the header checkbox acts on every matching VM, also the rows not rendered yet: the labels say so
+  const allMatchingShown = visible.length === filtered.length;
+  const visibleIds = new Set(visible.map((r) => r.vm.source_id));
+  const notShownSelected = selectable ? [...(selected ?? [])].filter((id) => !visibleIds.has(id)).length : 0;
+  const showing = allMatchingShown
+    ? `Showing ${formatNumber(filtered.length)} of ${formatNumber(vms.length)} VMs`
+    : filtered.length === vms.length
+      ? `Showing ${formatNumber(visible.length)} of ${formatNumber(vms.length)} VMs`
+      : `Showing ${formatNumber(visible.length)} of ${formatNumber(filtered.length)} matching VMs (${formatNumber(vms.length)} in total)`;
   const shownSelected = selectable ? filtered.filter((r) => selected?.has(r.vm.source_id)).length : 0;
   const allShownSelected = filtered.length > 0 && shownSelected === filtered.length;
 
@@ -154,6 +164,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setPower('all');
     setReadiness('all');
     setProject('all');
+    setOs('all');
+    // the button goes away with the filters: the search field keeps the focus (SDD §16)
+    searchRef.current?.focus();
   };
 
   const toggle = (id: string) => {
@@ -182,6 +195,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             Search VMs
           </label>
           <input
+            ref={searchRef}
             id={searchId}
             type="search"
             className="input"
@@ -212,6 +226,19 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             { value: 'blocker', label: 'Blocked' },
           ]}
         />
+        <SelectField
+          label="Guest OS"
+          className="md:w-40"
+          value={os}
+          onChange={(e) => setOs(e.target.value as OsFilter)}
+          options={[
+            { value: 'all', label: 'All' },
+            { value: 'linux', label: 'Linux' },
+            { value: 'windows', label: 'Windows' },
+            { value: 'legacy', label: 'Legacy releases' },
+            { value: 'unknown', label: 'Not identified' },
+          ]}
+        />
         {projects.length > 1 && (
           <SelectField
             label="Project"
@@ -229,8 +256,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
       </div>
 
       <p role="status" className="text-xs text-muted-foreground">
-        Showing {formatNumber(filtered.length)} of {formatNumber(vms.length)} VMs
+        {showing}
         {selectable && `, ${formatNumber(selected?.size ?? 0)} selected`}
+        {notShownSelected > 0 && ` (${formatNumber(notShownSelected)} not shown)`}
       </p>
 
       {filtered.length === 0 ? (
@@ -242,7 +270,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
         />
       ) : (
         <div className="table-wrap rounded-lg border border-border">
-          <table className="data-table">
+          <table ref={tableRef} tabIndex={-1} className="data-table outline-hidden">
             <caption className="sr-only">{caption}</caption>
             <thead>
               <tr>
@@ -252,7 +280,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                       ref={selectAllRef}
                       type="checkbox"
                       className="size-4 cursor-pointer accent-accent"
-                      aria-label={`Select all ${filtered.length} shown`}
+                      aria-label={
+                        allMatchingShown ? `Select all ${filtered.length} shown` : `Select all ${filtered.length} matching VMs, ${visible.length} shown`
+                      }
                       checked={allShownSelected}
                       onChange={toggleAllShown}
                     />
@@ -317,7 +347,9 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                       {formatBytes(vm.disk_bytes)}
                     </td>
                     <td className="num hidden whitespace-nowrap text-right md:table-cell">{formatBytes(vm.used_bytes)}</td>
-                    <td className="hidden text-muted-foreground lg:table-cell">{vm.os_type ?? '—'}</td>
+                    <td className="hidden text-muted-foreground lg:table-cell" title={vm.os_type ?? undefined}>
+                      {guestOsOf(vm).label}
+                    </td>
                   </tr>
                 );
               })}
@@ -328,7 +360,15 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
       {sorted.length > visible.length && (
         <div>
-          <Button onClick={() => setLimit((n) => n + pageSize)}>Show {Math.min(pageSize, sorted.length - visible.length)} more</Button>
+          <Button
+            onClick={() => {
+              // the last page removes this button: focus moves to the table, never to the page (SDD §16)
+              if (sorted.length <= limit + pageSize) tableRef.current?.focus();
+              setLimit((n) => n + pageSize);
+            }}
+          >
+            Show {Math.min(pageSize, sorted.length - visible.length)} more
+          </Button>
         </div>
       )}
     </div>

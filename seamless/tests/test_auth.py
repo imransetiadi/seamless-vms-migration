@@ -47,6 +47,7 @@ def test_token_store_from_file(tmp_path):
         "tokens:\n  - {name: x, role: admin, sha256: nothex}\n",
         "tokens: nope\n",
         "tokens:\n  - {role: admin, sha256: " + "a" * 64 + "}\n",
+        "tokens:\n  - {name: " + "n" * 129 + ", role: admin, sha256: " + "a" * 64 + "}\n",
     ],
 )
 def test_token_store_rejects_bad_files(tmp_path, content):

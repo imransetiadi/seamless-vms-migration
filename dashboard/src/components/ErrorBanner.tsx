@@ -21,7 +21,7 @@ export function ErrorBanner({ error, title = 'Something went wrong', onRetry, cl
       <CircleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
       <div className="min-w-0 flex-1">
         <p className="font-medium text-foreground">{title}</p>
-        <p className="break-words text-muted-foreground">
+        <p className="wrap-break-word text-muted-foreground">
           {errorMessage(error)}
           {code && <code className="ml-1 text-xs">[{code}]</code>}
         </p>

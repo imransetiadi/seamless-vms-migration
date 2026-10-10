@@ -44,6 +44,8 @@ def test_kind_catalog_matches_sdd():
         "advisor.similar_incidents",
         "memory.lesson_saved",
         "provider.created",
+        "provider.updated",
+        "provider.credentials_updated",
         "provider.deleted",
         "provider.checked",
         "auth.denied",
@@ -139,3 +141,27 @@ async def test_slow_subscriber_recovers_persisted_events(store: Store):
     assert [e.message for e in rest] == [f"burst-{i}" for i in range(5)]
     await agen.aclose()
     assert bus.subscriber_count == 0
+
+
+def test_event_kinds_match_sdd_4_3_and_the_dashboard():
+    """events.py, SDD §4.3 and the dashboard's kind lists name the same event kinds."""
+    import re
+
+    from seamless_migrate.config import find_repo_root
+    from seamless_migrate.events import EPHEMERAL_KINDS, PERSISTED_KINDS
+
+    root = find_repo_root()
+    sdd = (root / "docs" / "SDD.md").read_text(encoding="utf-8")
+    section = sdd[sdd.index("### 4.3") : sdd.index("\n## 5", sdd.index("### 4.3"))]
+    persisted_doc = set(re.findall(r"`([a-z_]+\.[a-z_]+)`", section.split("Ephemeral")[0]))
+    ephemeral_doc = set(re.findall(r"`([a-z_.]+)`", section.split("Ephemeral")[1]))
+    assert persisted_doc == set(PERSISTED_KINDS)
+    assert ephemeral_doc == set(EPHEMERAL_KINDS)
+    types_ts = (root / "dashboard" / "src" / "api" / "types.ts").read_text(encoding="utf-8")
+    persisted_ui = set(
+        re.findall(
+            r"'([a-z_.]+)'", types_ts[types_ts.index("PERSISTED_EVENT_KINDS") :].split("]")[0]
+        )
+    )
+    assert persisted_ui == set(PERSISTED_KINDS)
+    assert set(EPHEMERAL_KINDS) <= set(re.findall(r"'([a-z_.]+)'", types_ts))

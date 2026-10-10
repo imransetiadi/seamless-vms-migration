@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from .. import __version__
@@ -30,13 +30,30 @@ router = APIRouter(tags=["misc"])
 
 @router.get("/health", response_model=Health)
 async def health(request: Request) -> Health:
+    """Liveness: always 200 while the process answers; the body says what is degraded."""
+    return await _health(request)
+
+
+@router.get("/ready", response_model=Health)
+async def ready(request: Request, response: Response) -> Health:
+    """Readiness: the same body as ``/health`` with HTTP 503 while degraded, so Kubernetes
+    stops routing to a replica whose database or orchestrator loop is unavailable."""
+    body = await _health(request)
+    if body.status != "ok":
+        response.status_code = 503
+    return body
+
+
+async def _health(request: Request) -> Health:
     svc = services(request)
     db_ok = await asyncio.to_thread(svc.store.ping)
+    orchestrator = svc.orchestrator.health()
     return Health(
-        status="ok" if db_ok else "degraded",
+        status="ok" if db_ok and orchestrator["healthy"] else "degraded",
         version=__version__,
         demo=svc.settings.demo,
         db="ok" if db_ok else "error",
+        orchestrator=orchestrator,
     )
 
 
@@ -52,9 +69,10 @@ async def stats(
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> Stats:
     svc = services(request)
-    filters = {"plan_id": plan_id} if plan_id else {}
-    migrations = await svc.db.list("migration", Migration, **filters)
-    plans = {p.id: p for p in await svc.db.list("plan", Plan)}
+    migrations = await svc.all_documents("migration", Migration)
+    if plan_id:
+        migrations = [m for m in migrations if m.plan_id == plan_id]
+    plans = {p.id: p for p in await svc.all_documents("plan", Plan)}
     return compute_stats(migrations, plans, svc.orchestrator.now())
 
 
@@ -97,6 +115,11 @@ async def similar_incidents(
 @router.get("/metrics", response_class=PlainTextResponse)
 async def metrics(request: Request, _: Principal | None = Depends(metrics_access)) -> str:
     svc = services(request)
-    migrations = await svc.db.list("migration", Migration)
-    text = render_metrics(migrations, svc.orchestrator.step_stats, advisor_calls(svc.jev))
+    migrations = await svc.all_documents("migration", Migration)
+    text = render_metrics(
+        migrations,
+        svc.orchestrator.step_stats,
+        advisor_calls(svc.jev),
+        svc.orchestrator.tick_stats,
+    )
     return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")

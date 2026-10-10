@@ -21,6 +21,8 @@ check() { # METHOD PATH MIN_ROLE
 }
 check GET  /me viewer;                         check GET  /providers viewer
 check POST /providers admin;                   check DELETE /providers/nope admin
+check PATCH /providers/nope admin;             check PUT  /providers/nope/credentials admin
+check PUT  /providers/nope/conversion-key admin
 check POST /providers/nope/check operator;     check GET  /plans viewer
 check POST /plans operator;                    check PATCH /plans/nope operator
 check POST /plans/nope/validate operator;      check POST /plans/nope/start operator

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import re
 import ssl
 import time
 from collections.abc import Callable, Iterable
@@ -15,11 +17,24 @@ from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
 from ..security.secrets import SecretNotFound, resolve
 from .base import ProviderError, missing_dependency
+from .openstack import PROVIDER_CALL_TIMEOUT_S
+
+log = logging.getLogger(__name__)
 
 GIB = 2**30
 _POWER = {"poweredOn": "running", "poweredOff": "stopped", "suspended": "paused"}
 
 Connector = Callable[..., Any]
+
+
+_PRETTY_NAME = re.compile(r"prettyName='([^']+)'")
+
+
+def _tools_os_name(guest: Any) -> str | None:
+    """The exact release VMware Tools report (``guestDetailedData`` prettyName), if any."""
+    detailed = str(getattr(guest, "guestDetailedData", "") or "")
+    match = _PRETTY_NAME.search(detailed)
+    return match.group(1).strip() or None if match else None
 
 
 def _import_pyvmomi() -> tuple[Any, Any, Any]:
@@ -35,6 +50,8 @@ def default_connector(
     host: str, port: int, user: str, pwd: str, verify: bool, ca_cert: str | None
 ) -> Any:
     smart_connect, _, _ = _import_pyvmomi()
+    if not verify:
+        log.warning("%s: TLS certificate verification is disabled (verify_tls=false)", host)
     if verify:
         context = ssl.create_default_context(cafile=ca_cert) if ca_cert else None
         if context is not None:
@@ -57,6 +74,27 @@ def _count_snapshots(nodes: Iterable[Any] | None) -> int:
     return total
 
 
+def _disk_usage(vm: Any) -> dict[int, int]:
+    """Bytes each virtual disk really occupies on its datastore (``vm.layoutEx``): the sum of
+    the extent files behind the disk's chain, which is the used space of a thin disk. Without
+    the layout the estimator falls back to its 60 % rule (SDD §4.2)."""
+    layout = getattr(vm, "layoutEx", None)
+    files = {
+        int(getattr(f, "key", -1)): int(getattr(f, "size", 0) or 0)
+        for f in (getattr(layout, "file", None) or [])
+    }
+    out: dict[int, int] = {}
+    for disk in getattr(layout, "disk", None) or []:
+        keys = [
+            int(k)
+            for chain in (getattr(disk, "chain", None) or [])
+            for k in (getattr(chain, "fileKey", None) or [])
+        ]
+        if keys:
+            out[int(getattr(disk, "key", -1))] = sum(files.get(k, 0) for k in keys)
+    return out
+
+
 def map_vm(
     vm: Any,
     vim: Any,
@@ -72,16 +110,19 @@ def map_vm(
     disk_cls = vim.vm.device.VirtualDisk
     nic_cls = vim.vm.device.VirtualEthernetCard
 
+    used_by_key = _disk_usage(vm)
     disks: list[Disk] = []
     for dev in sorted((d for d in devices if isinstance(d, disk_cls)), key=lambda d: d.key):
         size_bytes = getattr(dev, "capacityInBytes", None) or int(dev.capacityInKB) * 1024
         backing = getattr(dev, "backing", None)
         mode = str(getattr(backing, "diskMode", "") or "")
+        used = used_by_key.get(int(dev.key))
         disks.append(
             Disk(
                 id=str(getattr(backing, "uuid", None) or f"{source_id}:{dev.key}"),
                 name=getattr(getattr(dev, "deviceInfo", None), "label", None),
                 size_gb=math.ceil(size_bytes / GIB),
+                used_gb=None if used is None else round(min(used, size_bytes) / GIB, 3),
                 bootable=not disks,
                 device=getattr(getattr(dev, "deviceInfo", None), "label", None),
                 kind="vmdk",
@@ -110,6 +151,21 @@ def map_vm(
             Nic(network=str(network), mac=mac or None, fixed_ips=guest_ips.get(mac.lower(), []))
         )
 
+    # PCI passthrough and vGPU (shared PCI) devices: expressed as the flavor extra specs the
+    # pre-flight catalog keys off (SDD §9.3 VM_PCI_PASSTHROUGH / VM_VGPU)
+    extra_specs: dict[str, str] = {}
+    pci_cls = getattr(getattr(vim, "vm", None), "device", None)
+    pci_cls = getattr(pci_cls, "VirtualPCIPassthrough", None)
+    for dev in devices if pci_cls is not None else []:
+        if not isinstance(dev, pci_cls):
+            continue
+        backing = getattr(dev, "backing", None)
+        label = str(getattr(getattr(dev, "deviceInfo", None), "label", "") or "PCI device")
+        if getattr(backing, "vgpu", None):
+            extra_specs["resources:VGPU"] = "1"
+        else:
+            extra_specs["pci_passthrough:alias"] = label
+
     runtime = getattr(vm, "runtime", None)
     host = getattr(getattr(runtime, "host", None), "name", None)
     snapshot = getattr(vm, "snapshot", None)
@@ -128,9 +184,10 @@ def map_vm(
         disks=disks,
         nics=nics,
         power_state=_POWER.get(str(getattr(runtime, "powerState", "")), "unknown"),  # type: ignore[arg-type]
-        os_type=getattr(config, "guestId", None),
+        os_type=_tools_os_name(guest) or getattr(config, "guestId", None),
         host=str(host) if host else None,
         tags=tags,
+        flavor_extra_specs=extra_specs,
         cbt_enabled=bool(getattr(config, "changeTrackingEnabled", False)),
         snapshot_count=_count_snapshots(getattr(snapshot, "rootSnapshotList", None)),
         tools_ok=str(getattr(guest, "toolsRunningStatus", "")) == "guestToolsRunning",
@@ -193,12 +250,28 @@ class VMwareProvider:
                 self._disconnect(si)
 
         try:
-            return await asyncio.to_thread(work)
+            return await asyncio.wait_for(asyncio.to_thread(work), PROVIDER_CALL_TIMEOUT_S)
         except ProviderError:
             raise
+        except TimeoutError:
+            raise ProviderError(
+                f"{self.provider.id}: call timed out after {PROVIDER_CALL_TIMEOUT_S:g} s"
+            ) from None
         except Exception as exc:
             message = str(getattr(exc, "msg", "") or exc).strip() or type(exc).__name__
             raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+
+    @staticmethod
+    def _find_by_uuid(content: Any, source_id: str) -> Any:
+        """One SOAP call instead of a walk over every VM (``instanceUuid`` lookup)."""
+        index = getattr(content, "searchIndex", None)
+        find = getattr(index, "FindByUuid", None)
+        if not callable(find):
+            return None
+        try:
+            return find(None, source_id, True, True)
+        except Exception:
+            return None
 
     @staticmethod
     def _objects(content: Any, vim: Any, type_name: str) -> list[Any]:
@@ -211,7 +284,8 @@ class VMwareProvider:
         finally:
             view.Destroy()
 
-    def _vms(self, content: Any, vim: Any) -> list[VMRef]:
+    def _context(self, content: Any, vim: Any) -> tuple[dict[str, str], dict[Any, str]]:
+        """Custom-field names and DVS portgroup names used while mapping VMs."""
         fields = {
             f.key: f.name
             for f in (getattr(getattr(content, "customFieldsManager", None), "field", None) or [])
@@ -226,6 +300,10 @@ class VMwareProvider:
                 portgroups = {pg.key: pg.name for pg in view.view if hasattr(pg, "key")}
             finally:
                 view.Destroy()
+        return fields, portgroups
+
+    def _vms(self, content: Any, vim: Any) -> list[VMRef]:
+        fields, portgroups = self._context(content, vim)
         out = []
         for vm in self._objects(content, vim, "VirtualMachine"):
             config = getattr(vm, "config", None)
@@ -257,7 +335,17 @@ class VMwareProvider:
         return await self._run(self._vms)
 
     async def get_vm(self, source_id: str) -> VMRef:
-        for vm in await self.list_vms():
+        def work(content: Any, vim: Any) -> VMRef | None:
+            vm = self._find_by_uuid(content, source_id)
+            if vm is None or getattr(vm, "config", None) is None:
+                return None
+            fields, portgroups = self._context(content, vim)
+            return map_vm(vm, vim, portgroups, fields)
+
+        found = await self._run(work)
+        if found is not None:
+            return found
+        for vm in await self.list_vms():  # moId-addressed or index-less setups
             if vm.source_id == source_id:
                 return vm
         raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
@@ -266,7 +354,11 @@ class VMwareProvider:
         """Power the source VM on again (rollback of VMware strategies)."""
 
         def work(content: Any, vim: Any) -> None:
-            for vm in self._objects(content, vim, "VirtualMachine"):
+            direct = self._find_by_uuid(content, source_id)
+            candidates = (
+                [direct] if direct is not None else self._objects(content, vim, "VirtualMachine")
+            )
+            for vm in candidates:
                 config = getattr(vm, "config", None)
                 uuid = getattr(config, "instanceUuid", None) or getattr(vm, "_moId", None)
                 if uuid != source_id:

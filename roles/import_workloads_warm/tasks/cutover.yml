@@ -17,12 +17,39 @@
           {{ (import_workloads_warm_state_file.content | b64decode | from_json)
              if 'content' in import_workloads_warm_state_file else {} }}
 
-    - name: Report a workload that was already cut over
-      ansible.builtin.debug:
-        msg: >-
-          {{ item['params']['name'] }}: destination server
-          {{ import_workloads_warm_state.destination_server_id }} was already created.
+    # A recorded destination server that failed to boot (ERROR) must not pass
+    # as "already cut over": the source is shut off and nothing serves.
+    - name: Check the recorded destination server
       when: import_workloads_warm_state.destination_server_id | default(none) is not none
+      block:
+        - name: Look up the recorded destination server
+          os_migrate.os_migrate.server_info:
+            cloud: dst
+            server: "{{ import_workloads_warm_state.destination_server_id }}"
+            validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+            ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+            client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+            client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+          register: import_workloads_warm_destination
+
+        - name: Refuse to treat a failed destination server as cut over
+          ansible.builtin.fail:
+            msg: >-
+              {{ item['params']['name'] }}: the recorded destination server
+              {{ import_workloads_warm_state.destination_server_id }}
+              {{ 'was not found' if import_workloads_warm_destination.servers | length == 0
+                 else 'is in ' ~ (import_workloads_warm_destination.servers | first).status }}.
+              Run rollback_workloads.yml (it deletes the server and starts the source
+              again) and cut the workload over once more.
+          when: >-
+            import_workloads_warm_destination.servers | length == 0
+            or (import_workloads_warm_destination.servers | first).status | upper == 'ERROR'
+
+        - name: Report a workload that was already cut over
+          ansible.builtin.debug:
+            msg: >-
+              {{ item['params']['name'] }}: destination server
+              {{ import_workloads_warm_state.destination_server_id }} was already created.
 
     - name: Cut over the workload
       when: import_workloads_warm_state.destination_server_id | default(none) is none

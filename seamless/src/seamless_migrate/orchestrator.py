@@ -52,6 +52,10 @@ from .domain.models import (
     ValidationItem,
     ValidationReport,
     VMRef,
+    invalid_plan_settings,
+    keep_sync_history,
+    next_pass_number,
+    repeated_vm_ids,
     utcnow,
 )
 from .events import EventBus, emit
@@ -74,7 +78,7 @@ from .planning.preflight import has_blocker, resolve_mappings, run_preflight
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError
-from .store import AsyncStore, NotFound, Store
+from .store import AsyncStore, ConflictError, NotFound, Store
 from .verification import VerificationResult, Verifier
 
 log = logging.getLogger(__name__)
@@ -96,6 +100,18 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
+#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4)
+REMOVABLE = REVALIDATABLE | {P.failed}
+#: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
+RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
+#: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
+#: it is taken after a plan lock and before a migration lock
+VM_CLAIMS = "vm-claims"
+#: a migration in one of these depends on the plan's providers, mappings and strategy as they were
+#: when it started: the plan is not edited or re-waved meanwhile (SDD §12)
+IN_FLIGHT_PHASES = frozenset(
+    {P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.rolling_back, P.completed}
+)
 
 
 class OrchestratorError(Exception):
@@ -161,10 +177,13 @@ class Orchestrator:
         )
         self._locks: dict[str, asyncio.Lock] = {}
         self._drivers: dict[str, asyncio.Task[None]] = {}
+        #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
+        self._driver_crashes: dict[str, tuple[int, float]] = {}
         self._steps: dict[str, asyncio.Task[Any]] = {}
-        self._force_window: set[str] = set()
         self._prestage_done: set[str] = set()
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
+        #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
+        self._cleanups: dict[str, asyncio.Task[None]] = {}
         self._wave_events_seen: dict[str, set[tuple[str, str]]] = {}
         self._progress_at: dict[str, float] = {}
         self._tick_task: asyncio.Task[None] | None = None
@@ -172,9 +191,24 @@ class Orchestrator:
         self._stopping = False
         #: step -> [sum_seconds, count] for seamless_step_duration_seconds
         self.step_stats: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
+        #: tick timing (seconds): count, sum, last, max, slow (over half of tick_s)
+        self.tick_stats: dict[str, float] = {
+            "count": 0,
+            "sum": 0.0,
+            "last": 0.0,
+            "max": 0.0,
+            "slow": 0,
+        }
+        self._last_tick_at: float | None = None
+        self._tick_errors = 0
+        self._started = False
 
     # ------------------------------------------------------------------------------------------
     # plumbing
+    def plan_lock(self, plan_id: str) -> asyncio.Lock:
+        """The plan's lock (SDD §8): an edit through the API takes it, like the status writers."""
+        return self._lock(f"plan:{plan_id}")
+
     def _lock(self, mid: str) -> asyncio.Lock:
         lock = self._locks.get(mid)
         if lock is None:
@@ -202,6 +236,26 @@ class Orchestrator:
     async def _save_plan(self, plan: Plan) -> None:
         plan.updated_at = self._now()
         await self.db.put("plan", plan)
+
+    async def _update_plan(self, plan_id: str, mutate: Callable[[Plan], bool | None]) -> Plan:
+        """Read-modify-write ``plan`` under optimistic concurrency.
+
+        Several drivers and the tick loop touch the same plan concurrently (ids rewritten by a
+        rollback, status changes, strategy overrides): ``mutate`` runs on the freshest copy and
+        the write is retried when another writer got in between. ``mutate`` returns ``False``
+        to leave the plan untouched.
+        """
+        for _ in range(8):
+            plan, version = await self.db.get_versioned("plan", plan_id, Plan)
+            if mutate(plan) is False:
+                return plan
+            plan.updated_at = self._now()
+            try:
+                await self.db.put("plan", plan, expected_version=version)
+                return plan
+            except ConflictError:
+                continue
+        raise RuntimeError(f"plan {plan_id} changed too often to update it")
 
     async def _provider(self, provider_id: str, role: ProviderRole) -> Provider:
         try:
@@ -258,16 +312,20 @@ class Orchestrator:
     # ------------------------------------------------------------------------------------------
     # providers
     async def check_provider(self, provider_id: str, actor: str = "system") -> Provider:
-        provider = await self.db.get("provider", provider_id, Provider)
-        impl = self.providers.get(provider)
-        try:
-            caps = await impl.check()
-            update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
-        except ProviderError as exc:
-            update = {"status": "error", "status_message": redact(str(exc))[:500]}
-        update["last_checked_at"] = self._now()
-        updated = provider.model_copy(update=update)
-        await self.db.put("provider", updated)
+        # one check per provider at a time (SDD §8): a validation's check and a manual Check would
+        # otherwise collide on the versioned write below; the innermost lock, it takes no other
+        async with self._lock(f"provider:{provider_id}"):
+            # versioned write: a provider deleted or edited while the check ran is not re-inserted
+            provider, version = await self.db.get_versioned("provider", provider_id, Provider)
+            impl = self.providers.get(provider)
+            try:
+                caps = await impl.check()
+                update = {"capabilities": dict(caps), "status": "ok", "status_message": None}
+            except ProviderError as exc:
+                update = {"status": "error", "status_message": redact(str(exc))[:500]}
+            update["last_checked_at"] = self._now()
+            updated = provider.model_copy(update=update)
+            await self.db.put("provider", updated, expected_version=version)
         await self._emit(
             "provider.checked",
             f"provider {provider.id}: {updated.status}",
@@ -292,20 +350,57 @@ class Orchestrator:
             try:
                 vms.append(await impl.get_vm(vm_id))
             except ProviderError as exc:
-                raise BadRequest(f"VM {vm_id!r}: {exc}") from None
+                # still a provider error: the API answers 502 with the redacted message (SDD §12),
+                # never a 400 carrying the SDK's raw text
+                raise ProviderError(f"VM {vm_id!r}: {exc}") from None
         return vms
 
     # ------------------------------------------------------------------------------------------
     # planning actions
+    async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> dict[str, list[str]]:
+        """The VMs of ``vm_ids`` that migrations of other plans with the same source provider hold
+        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", phase)``
+        once per holder — plans validated before the rule may hold a VM several times."""
+        others = {
+            other.id: other
+            for other in await self.db.list("plan", Plan)
+            if other.id != plan.id and other.source_provider_id == plan.source_provider_id
+        }
+        if not others or not vm_ids:
+            return {}
+        held: dict[str, set[str]] = {}
+        for m in await self.db.list("migration", Migration, plan_id=list(others)):
+            if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM:
+                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
+                held.setdefault(m.vm.source_id, set()).add(holder)
+        return {vm_id: sorted(holders) for vm_id, holders in held.items()}
+
+    @staticmethod
+    def _holders(held: dict[str, list[str]], limit: int = 10) -> str:
+        """At most ``limit`` holders from :meth:`_held_elsewhere`, and how many are left out."""
+        entries = sorted(holder for holders in held.values() for holder in holders)
+        rest = len(entries) - limit
+        return ", ".join(entries[:limit]) + (f" and {rest} more" if rest > 0 else "")
+
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
-        # one validation per plan at a time: concurrent runs would create duplicate migrations
-        async with self._lock(f"plan:{plan_id}"):
+        # one validation per plan at a time: concurrent runs would create duplicate migrations;
+        # and one claim of VMs at a time across plans (SDD §5.4)
+        async with self._lock(f"plan:{plan_id}"), self._lock(VM_CLAIMS):
             return await self._validate_plan(plan_id, actor)
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
+        repeated = repeated_vm_ids(plan.vm_ids)
+        if repeated:
+            # SDD §5.4: two migrations of one VM would both cut it over
+            raise BadRequest(f"vm_ids lists a VM more than once: {', '.join(repeated[:10])}")
+        problems = invalid_plan_settings(plan)
+        if problems:
+            # SDD §12: a port outside 1-65535 fails every verification, a backwards window never
+            # opens the gate
+            raise BadRequest("; ".join(problems))
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
         destination = await self._provider(plan.destination_provider_id, ProviderRole.destination)
         src_impl = self.providers.get(source)
@@ -316,11 +411,50 @@ class Orchestrator:
             src_inv = await src_impl.inventory()
             dst_inv = await dst_impl.inventory()
         except ProviderError as exc:
-            raise BadRequest(f"inventory failed: {exc}") from None
+            raise ProviderError(f"inventory failed: {exc}") from None  # 502, redacted (SDD §12)
         vms = await self._vms(plan, src_impl)
         existing = {
             m.vm.source_id: m for m in await self.db.list("migration", Migration, plan_id=plan.id)
         }
+        cancelled = sorted(
+            m.vm.name for vm in vms if (m := existing.get(vm.source_id)) and m.phase == P.cancelled
+        )
+        if cancelled:
+            # cancelled is terminal (SDD §5.1): the plan cannot carry the VM any further
+            raise BadRequest(
+                f"{len(cancelled)} VM(s) have a cancelled migration: {', '.join(cancelled[:10])}; "
+                "remove them from vm_ids or create a new plan for them"
+            )
+        selected = set(plan.vm_ids)
+        # the removed VMs' migrations cancelled below (SDD §5.4) — a failed one too, or it would
+        # hold its VM and keep the plan from completing
+        removed = [
+            m for vm_id, m in existing.items() if vm_id not in selected and m.phase in REMOVABLE
+        ]
+        stopped = sorted(m.vm.name for m in removed if fsm.source_stopped(m))
+        if stopped:
+            # SDD §5.1 refuses those cancels while a source is stopped: refuse before any change
+            raise NotAllowed(
+                f"{', '.join(stopped[:10])}: the source VM is stopped after a failed cutover; keep "
+                "the VM in the plan until it is cut over or rolled back"
+            )
+        restarted = sorted(
+            m.vm.name for m in removed if m.phase == P.failed and m.downtime_started_at is not None
+        )
+        if restarted:
+            # a failed migration whose cutover stopped the source is rolled back, never cancelled
+            raise NotAllowed(
+                f"{', '.join(restarted[:10])}: the source VM was stopped by a failed cutover; keep "
+                "the VM in the plan until it is rolled back"
+            )
+        held = await self._held_elsewhere(plan, selected)
+        if held:
+            # SDD §5.4: two plans would both stop the source and cut it over
+            raise NotAllowed(
+                f"{len(held)} VM(s) already have a migration in another plan: "
+                f"{self._holders(held)}; finish, roll back or cancel it there, or remove the VM "
+                "from vm_ids"
+            )
         params = params_for_plan(plan)
         items: list[ValidationItem] = []
         for vm in vms:
@@ -364,13 +498,13 @@ class Orchestrator:
                     estimates=migration.estimates,
                 )
             )
-        selected = set(plan.vm_ids)
-        for vm_id, stale in existing.items():
-            if vm_id not in selected and stale.phase in REVALIDATABLE:
-                await self.cancel(stale.id, actor, "removed from the plan")
-        plan = await self._plan(plan_id)
-        plan.status = PlanStatus.validated
-        await self._save_plan(plan)
+        for stale in removed:
+            await self.cancel(stale.id, actor, "removed from the plan")
+
+        def mark_validated(fresh: Plan) -> None:
+            fresh.status = PlanStatus.validated
+
+        plan = await self._update_plan(plan_id, mark_validated)
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
         await self._emit(
@@ -433,9 +567,12 @@ class Orchestrator:
         blocked = has_blocker(findings) or no_eligible
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.phase not in REVALIDATABLE:
+            # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
+            # (validations of a plan run one at a time under its lock: none is at work on it)
+            if m.phase not in REVALIDATABLE and m.phase != P.validating:
                 return m  # already in flight or finished: leave it alone
-            m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
+            if m.phase != P.validating:
+                m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
             wave = plan.wave_of(vm.source_id)
             m.vm = vm
             m.strategy = strategy
@@ -448,6 +585,11 @@ class Orchestrator:
             # keep one strategy note per validation (the latest)
             m.advisor_notes = [n for n in m.advisor_notes if n.kind != "strategy"] + notes
             m.error = None
+            # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
+            # this validation carries over to the new strategy, findings and estimate
+            m.approvals = []
+            m.cutover_requested = False
+            m.force_window = False
             if no_eligible:
                 details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
                 m.error = f"no eligible strategy ({details})"[:1000]
@@ -470,10 +612,30 @@ class Orchestrator:
             )
         return m
 
+    async def in_flight(self, plan_id: str) -> list[str]:
+        """VM names of the plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
+        return sorted(
+            m.vm.name
+            for m in await self.db.list("migration", Migration, plan_id=plan_id)
+            if m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+        )
+
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
+        # status changes serialize on the plan's lock (SDD §8): a start waits instead of being
+        # turned back into a draft
+        async with self._lock(f"plan:{plan_id}"):
+            return await self._auto_waves(plan_id, max_wave_size, actor)
+
+    async def _auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):
             raise NotAllowed(f"waves cannot change while the plan is {plan.status}")
+        busy = await self.in_flight(plan.id)
+        if busy:
+            raise NotAllowed(
+                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
+                "before re-planning the waves"
+            )
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
@@ -488,9 +650,15 @@ class Orchestrator:
                 summary=f"Classified {len(vms)} VM(s) with the heuristic",
                 data={"tiers": dict(tiers)},
             )
-        plan.waves = plan_waves(vms, tiers, max_wave_size)
-        plan.status = PlanStatus.draft
-        await self._save_plan(plan)
+        waves = plan_waves(vms, tiers, max_wave_size)
+
+        def set_waves(fresh: Plan) -> None:
+            if fresh.status not in (PlanStatus.draft, PlanStatus.validated, PlanStatus.paused):
+                raise NotAllowed(f"waves cannot change while the plan is {fresh.status}")
+            fresh.waves = waves
+            fresh.status = PlanStatus.draft
+
+        plan = await self._update_plan(plan.id, set_waves)
         await self._emit(
             "advisor.classification",
             note.summary,
@@ -508,6 +676,10 @@ class Orchestrator:
         return plan
 
     async def start_plan(self, plan_id: str, actor: str) -> Plan:
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: after a validation or auto-waves
+            return await self._start_plan(plan_id, actor)
+
+    async def _start_plan(self, plan_id: str, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.running:
             return plan
@@ -519,20 +691,50 @@ class Orchestrator:
         blocked = [m.vm.name for m in migrations if m.phase == P.blocked]
         if blocked:
             raise NotAllowed(f"{len(blocked)} migration(s) are blocked: {', '.join(blocked[:10])}")
-        plan.status = PlanStatus.running
-        await self._save_plan(plan)
+        if plan.waves:
+            wave_ids = {w.id for w in plan.waves}
+            stray = [
+                m.vm.name
+                for m in migrations
+                if m.phase not in fsm.WAVE_COMPLETE_PHASES
+                and (m.wave_id is None or m.wave_id not in wave_ids)
+            ]
+            if stray:
+                # a VM added after the waves were planned would otherwise start at once,
+                # outside every wave's order and max_parallel (SDD §9.4)
+                raise NotAllowed(
+                    f"{len(stray)} migration(s) belong to no wave: {', '.join(stray[:10])}; "
+                    "re-run the automatic wave planning or add them to a wave"
+                )
+
+        def start(fresh: Plan) -> None:
+            if fresh.status not in (PlanStatus.validated, PlanStatus.paused, PlanStatus.failed):
+                raise NotAllowed(f"a {fresh.status} plan cannot be started; validate it first")
+            fresh.status = PlanStatus.running
+
+        plan = await self._update_plan(plan.id, start)
         await self._emit("plan.started", f"{plan.name} started", plan_id=plan.id, actor=actor)
         self.wake()
         return plan
 
     async def pause_plan(self, plan_id: str, actor: str) -> Plan:
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: status changes serialize
+            return await self._pause_plan(plan_id, actor)
+
+    async def _pause_plan(self, plan_id: str, actor: str) -> Plan:
         plan = await self._plan(plan_id)
         if plan.status == PlanStatus.paused:
             return plan
         if plan.status != PlanStatus.running:
             raise NotAllowed(f"only running plans can be paused (plan is {plan.status})")
-        plan.status = PlanStatus.paused
-        await self._save_plan(plan)
+
+        def pause(fresh: Plan) -> bool:
+            if fresh.status != PlanStatus.running:
+                return False
+            fresh.status = PlanStatus.paused
+            return True
+
+        plan = await self._update_plan(plan.id, pause)
         await self._emit("plan.paused", f"{plan.name} paused", plan_id=plan.id, actor=actor)
         return plan
 
@@ -564,9 +766,8 @@ class Orchestrator:
                 raise NotAllowed(f"cutover cannot be requested in {m.phase}")
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
             m.cutover_requested = True
+            m.force_window = m.force_window or force_window
             await self._save(m, v)
-            if force_window:
-                self._force_window.add(mid)
         await self._emit(
             "migration.approved",
             f"{m.vm.name} approved by {actor}",
@@ -624,28 +825,39 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
-        async with self._lock(mid):
+        async with self._lock(VM_CLAIMS), self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
+            held = await self._held_elsewhere(await self._plan(m.plan_id), {m.vm.source_id})
+            if held:
+                # SDD §5.4: a rolled-back migration let its VM go; another plan may have taken it
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
+                    f"{self._holders(held)}; finish, roll back or cancel it there first"
+                )
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)
                 m.attempts += 1
             m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
             m.error = None
+            # a new attempt is requested anew: the window bypass granted with the old request goes
+            # with it, approvals stay (SDD §5.1, §5.4)
             m.cutover_requested = False
+            m.force_window = False
             m.checkpoint = None
             m.progress_pct = 0
             m.review_required = False
             m.review_reason = None
-            # the downtime clock belongs to the attempt: the source runs again after a
-            # rollback, so the next cutover starts a fresh clock
-            m.downtime_started_at = None
-            m.downtime_ended_at = None
-            m.actual_downtime_s = None
+            # the downtime clock belongs to the outage (SDD §5.2): a closed clock — verified boot,
+            # or the source running again after a rollback — starts afresh; an open one means the
+            # source has not run since it stopped, so the next cutover counts from that first stop
+            if not fsm.source_stopped(m):
+                m.downtime_started_at = None
+                m.downtime_ended_at = None
+                m.actual_downtime_s = None
             await self._save(m, v)
-        self._force_window.discard(mid)
         await self._emit(
             "migration.action",
             f"retry of {m.vm.name}",
@@ -659,15 +871,23 @@ class Orchestrator:
     async def cancel(self, mid: str, actor: str, reason: str | None = None) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if not fsm.can_transition(m, P.cancelled):
-                raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
+            why = fsm.refusal(m, P.cancelled)
+            if why is not None:
+                if P.cancelled not in fsm.TRANSITIONS[m.phase]:
+                    raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
+                raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
+            previous = m.phase
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-        self._force_window.discard(mid)
+            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
+            # the retries, §8) or has just finished unrecorded; with the passes a migration
+            # recorded, that data path left snapshots, temporary and destination volumes behind,
+            # and `cancelled` is terminal: no later action could remove them
+            data_path = previous in (P.precopy, P.syncing) or bool(m.sync_passes)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -675,8 +895,63 @@ class Orchestrator:
             actor=actor,
             data={"action": "cancel", "reason": reason},
         )
+        if data_path and not self._stopping:
+            # the rollback step removes them (a cancel never leaves the source stopped, §5.1)
+            self._cleanups[mid] = asyncio.create_task(
+                self._cleanup_after_cancel(m, step, actor), name=f"cleanup:{mid}"
+            )
         self.wake()
         return m
+
+    async def _cleanup_after_cancel(
+        self, m: Migration, step: asyncio.Task[Any] | None, actor: str
+    ) -> None:
+        try:
+            if step is not None:
+                # the executor kills the playbook and removes its secret files; the step's own
+                # outcome does not matter, but a stop() cancelling this task is not swallowed
+                await asyncio.wait({step})
+            try:
+                plan = await self._plan(m.plan_id)
+                source = await self.db.get("provider", plan.source_provider_id, Provider)
+                destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+                ctx = self._context(
+                    m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
+                )
+                await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._emit(
+                    "migration.error",
+                    f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
+                    "rollback_workloads.yml for the workload to remove its temporary resources",
+                    migration=m,
+                    data={"step": "cleanup", "error_class": type(exc).__name__},
+                )
+                return
+            await self._emit(
+                "migration.action",
+                f"{m.vm.name}: temporary resources of the cancelled migration removed",
+                migration=m,
+                actor=actor,
+                data={"action": "cleanup"},
+            )
+        except asyncio.CancelledError:
+            # a shutdown interrupted the cleanup: its outcome is still recorded (SDD §5.1)
+            with contextlib.suppress(Exception):
+                await self._emit(
+                    "migration.error",
+                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; run "
+                    "rollback_workloads.yml for the workload to remove its temporary resources",
+                    migration=m,
+                    data={"step": "cleanup", "error_class": "CancelledError"},
+                )
+            raise
+        finally:
+            # tracked until it has finished, its outcome event included: whoever waits for the
+            # cleanup (or cancels it, as stop() does) never finds it gone before its outcome
+            self._cleanups.pop(m.id, None)
 
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""
@@ -729,10 +1004,16 @@ class Orchestrator:
                 raise BadRequest(f"strategy {strategy} is not eligible: {'; '.join(est.reasons)}")
             m.strategy = strategy
             m.estimate = est
+            m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
+            m.cutover_requested = False
+            m.force_window = False
             await self._save(m, v)
-        plan = await self._plan(m.plan_id)
-        plan.strategy_overrides[m.vm.source_id] = strategy
-        await self._save_plan(plan)
+        source_id = m.vm.source_id
+
+        def override(plan: Plan) -> None:
+            plan.strategy_overrides[source_id] = strategy
+
+        plan = await self._update_plan(m.plan_id, override)
         await self._emit(
             "migration.action",
             f"{m.vm.name}: strategy set to {strategy}",
@@ -762,6 +1043,7 @@ class Orchestrator:
             if any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history):
                 self._prestage_done.add(m.plan_id)  # work started: resources were pre-staged
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
+        self._started = True
 
     async def stop(self) -> None:
         self._stopping = True
@@ -772,6 +1054,7 @@ class Orchestrator:
                 *self._drivers.values(),
                 *self._prestage_tasks.values(),
                 *self._steps.values(),
+                *self._cleanups.values(),
             )
             if t
         ]
@@ -779,28 +1062,75 @@ class Orchestrator:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tick_task = None
+        self._started = False
         self._drivers.clear()
         self._steps.clear()
         self._prestage_tasks.clear()
+        self._cleanups.clear()
 
     async def _loop(self) -> None:
         assert self._wake is not None
         while not self._stopping:
+            started = time.monotonic()
+            self._last_tick_at = started  # heartbeat: the loop is alive even during a long tick
             try:
                 await self.tick()
+                self._tick_errors = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._tick_errors += 1
                 log.exception("orchestrator tick failed")
+            self._record_tick(time.monotonic() - started)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self.settings.tick_s)
             self._wake.clear()
 
+    def health(self) -> dict[str, Any]:
+        """Liveness of the tick loop for ``GET /health`` (readiness probes, SDD §12).
+
+        ``running`` is true while the loop task is alive; ``last_tick_age_s`` is the time since
+        the last completed tick (None before the first one); ``healthy`` is false when the loop
+        is dead after ``start()`` or has not ticked for five tick intervals.
+        """
+        task = self._tick_task
+        running = task is not None and not task.done()
+        age = None if self._last_tick_at is None else time.monotonic() - self._last_tick_at
+        # a tick heartbeats when it starts and when it ends: a long tick is not a dead loop
+        stale = age is not None and age > max(5 * self.settings.tick_s, 30.0)
+        failing = self._tick_errors >= 3  # the loop runs but every tick raises
+        return {
+            "running": running,
+            "last_tick_age_s": None if age is None else round(age, 3),
+            "ticks": int(self.tick_stats["count"]),
+            "healthy": (running and not stale and not failing)
+            or (not self._started and not running),
+        }
+
+    def _record_tick(self, seconds: float) -> None:
+        """Tick timing for ``GET /metrics`` (QASuite PERF-CP-02: p95 below half of tick_s)."""
+        stats = self.tick_stats
+        self._last_tick_at = time.monotonic()
+        stats["count"] += 1
+        stats["sum"] += seconds
+        stats["last"] = seconds
+        stats["max"] = max(stats["max"], seconds)
+        budget = self.settings.tick_s / 2
+        if seconds > budget:
+            stats["slow"] += 1
+            log.warning("orchestrator tick took %.3f s (budget %.3f s)", seconds, budget)
+
     async def tick(self) -> None:
-        plans = [p for p in await self.db.list("plan", Plan) if p.status == PlanStatus.running]
+        await self._resume_orphans()
+        all_plans = await self.db.list("plan", Plan)
+        plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
             return
-        migrations = await self.db.list("migration", Migration)
+        # only the migrations of plans that can still have work: running ones, plus paused and
+        # re-validated ones whose in-flight steps still count against the concurrency limits
+        live = (PlanStatus.running, PlanStatus.paused, PlanStatus.validated)
+        active = [p.id for p in all_plans if p.status in live]
+        migrations = await self.db.list("migration", Migration, plan_id=active)
         by_plan: dict[str, list[Migration]] = defaultdict(list)
         for m in migrations:
             by_plan[m.plan_id].append(m)
@@ -816,7 +1146,7 @@ class Orchestrator:
         if plan.require_approval and not m.approvals:
             return False
         window = plan.cutover_window
-        if window is not None and m.id not in self._force_window and not window.contains(now):
+        if window is not None and not m.force_window and not window.contains(now):
             return False
         return plan.auto_cutover or m.cutover_requested
 
@@ -860,19 +1190,19 @@ class Orchestrator:
             )
             if not waiting or not self._gate(m, plan, now):
                 continue
-            gate_open.add(m.id)
             if counts["cutover"] >= self.settings.max_concurrent_cutovers:
-                continue
+                continue  # waits for a cutover slot: keep-warm passes go on meanwhile
             if counts["steps"] >= limit_steps or (m.phase == P.ready and not wave_room(m)):
                 continue
             if await self._begin(
                 m.id, {P.ready, P.awaiting_cutover}, P.cutover, "cutover gate open"
             ):
+                gate_open.add(m.id)
                 counts["cutover"] += 1
                 counts["steps"] += 1
                 in_flight[m.wave_id] += 1
 
-        # 2. keep-warm delta passes while waiting for the gate
+        # 2. keep-warm delta passes while waiting for the gate (or for a cutover slot)
         for m in ordered:
             if m.phase != P.awaiting_cutover or m.id in gate_open or not m.sync_passes:
                 continue
@@ -899,10 +1229,18 @@ class Orchestrator:
 
         # 4. plan completion
         if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
-            fresh = await self._plan(plan.id)
-            if fresh.status == PlanStatus.running:
+            completed = False
+
+            def finish(fresh: Plan) -> bool:
+                nonlocal completed
+                completed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                if not completed:
+                    return False
                 fresh.status = PlanStatus.completed
-                await self._save_plan(fresh)
+                return True
+
+            await self._update_plan(plan.id, finish)
+            if completed:
                 done = sum(1 for m in migs if m.phase in fsm.SUCCESS_PHASES)
                 await self._emit(
                     "plan.completed",
@@ -912,9 +1250,25 @@ class Orchestrator:
                 )
 
     async def _begin(self, mid: str, allowed: set[Phase], to: Phase, reason: str) -> bool:
-        async with self._lock(mid):
+        plan_id = (await self._load(mid))[0].plan_id
+        # SDD §8: under the plan's lock (then the migration's, the documented order), so a pause
+        # that returned starts nothing the tick chose on its snapshot
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+            if (await self._plan(plan_id)).status != PlanStatus.running:
+                return False
             m, v = await self._load(mid)
             if m.phase not in allowed:
+                return False
+            # the tick chose it for its strategy on its snapshot; set_strategy under this lock may
+            # have changed it since: a pre-copy is a warm migration's, a cutover from ready a
+            # single-shot one's (SDD §8)
+            if to == P.precopy and m.strategy not in WARM_STRATEGIES:
+                return False
+            if to == P.cutover and m.phase == P.ready and m.strategy not in SINGLE_SHOT_STRATEGIES:
+                return False
+            if to == P.cutover and not self._gate(m, await self._plan(m.plan_id), self._now()):
+                # the tick saw the gate open on its snapshot; an action under this lock (e.g.
+                # set_strategy clearing the approvals) may have closed it since (SDD §5.4)
                 return False
             await self._transition(m, v, to, reason)
         self._launch(mid)
@@ -971,9 +1325,11 @@ class Orchestrator:
             raise
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
-            fresh = await self._plan(plan.id)
-            fresh.status = PlanStatus.failed
-            await self._save_plan(fresh)
+
+            def fail(fresh: Plan) -> None:
+                fresh.status = PlanStatus.failed
+
+            await self._update_plan(plan.id, fail)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: pre-staging failed",
@@ -985,6 +1341,40 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # migration driver
+    async def _resume_orphans(self) -> None:
+        """SDD §8: drive again a migration in a resumable phase whose driver task died — after a
+        backoff while it keeps crashing, and never while its step task still runs."""
+        now = time.monotonic()
+        resumable = await self.db.list("migration", Migration, phase=list(fsm.RESUMABLE_PHASES))
+        for m in resumable:
+            driver, step = self._drivers.get(m.id), self._steps.get(m.id)
+            if (driver is not None and not driver.done()) or (step is not None and not step.done()):
+                continue
+            crashes, at = self._driver_crashes.get(m.id, (0, 0.0))
+            if crashes and now - at < min(300.0, 2**crashes * self.settings.tick_s):
+                continue
+            self._launch(m.id)
+
+    async def _report_driver_crash(self, mid: str, exc: Exception, crashes: int) -> None:
+        """Best effort: the store may be what failed."""
+        message = redact(str(exc)).strip() or type(exc).__name__
+        try:
+            m, _ = await self._load(mid)
+            await self._emit(
+                "migration.error",
+                f"{m.vm.name}: the migration driver stopped unexpectedly ({type(exc).__name__}); "
+                "it resumes from its checkpoint",
+                migration=m,
+                data={
+                    "step": "driver",
+                    "error_class": type(exc).__name__,
+                    "message": message[:1000],
+                    "crashes": crashes,
+                },
+            )
+        except Exception:
+            log.exception("could not report the crash of the driver of %s", mid)
+
     def _launch(self, mid: str) -> None:
         if self._stopping:
             return
@@ -1006,14 +1396,18 @@ class Orchestrator:
                 m, _ = await self._load(mid)
                 handler = handlers.get(m.phase)
                 if handler is None:
+                    self._driver_crashes.pop(mid, None)
                     return
                 await handler(m)
         except asyncio.CancelledError:
             raise
         except NotFound:
             return
-        except Exception:
+        except Exception as exc:
             log.exception("driver of %s crashed", mid)
+            crashes = self._driver_crashes.get(mid, (0, 0.0))[0] + 1
+            self._driver_crashes[mid] = (crashes, time.monotonic())
+            await self._report_driver_crash(mid, exc, crashes)
         finally:
             if self._drivers.get(mid) is asyncio.current_task():
                 del self._drivers[mid]
@@ -1033,9 +1427,9 @@ class Orchestrator:
         async def report_progress(pct: float, done: int, total: int) -> None:
             await self._on_progress(mid, phase, pct, done, total, persist=not locked)
 
-        async def mark_downtime_start() -> None:
+        async def mark_downtime_start(at: datetime | None = None) -> None:
             if not locked:
-                await self._mark_downtime(mid)
+                await self._mark_downtime(mid, at)
 
         async def log_line(line: str) -> None:
             await self._emit(
@@ -1068,8 +1462,10 @@ class Orchestrator:
                 if cur.phase != phase:
                     return
                 cur.progress_pct = round(float(pct), 2)
-                cur.bytes_transferred = sum(p.bytes_transferred for p in cur.sync_passes) + int(
-                    done
+                cur.bytes_transferred = (
+                    cur.sync_bytes_dropped
+                    + sum(p.bytes_transferred for p in cur.sync_passes)
+                    + int(done)
                 )
                 await self._save(cur, v)
                 m = cur
@@ -1089,12 +1485,12 @@ class Orchestrator:
             },
         )
 
-    async def _mark_downtime(self, mid: str) -> None:
+    async def _mark_downtime(self, mid: str, at: datetime | None = None) -> None:
         async with self._lock(mid):
             m, v = await self._load(mid)
             if m.downtime_started_at is not None:
                 return
-            m.downtime_started_at = self._now()
+            m.downtime_started_at = at or self._now()
             await self._save(m, v)
         await self._emit(
             "migration.downtime_started",
@@ -1109,22 +1505,38 @@ class Orchestrator:
         step: StepName | str,
         runner: Callable[[StepContext], Awaitable[Any]] | None = None,
     ) -> Any:
-        """Run ``step`` as a cancellable task with transient retries; ``None`` if cancelled."""
+        """Run ``step`` as a cancellable task with transient retries; ``None`` if cancelled or once
+        the migration left the step's phase."""
         plan = await self._plan(m.plan_id)
         source = await self.db.get("provider", plan.source_provider_id, Provider)
         destination = await self.db.get("provider", plan.destination_provider_id, Provider)
         executor = self.executors.for_strategy(m.strategy)
-        current = m
         attempt = 0
         loop = asyncio.get_running_loop()
         while True:
-            ctx = self._context(current, plan, source, destination)
-            work = runner(ctx) if runner is not None else executor.run(step, ctx)
-            task = asyncio.create_task(work, name=f"{step}:{m.id}")
-            self._steps[m.id] = task
+            async with self._lock(m.id):
+                # SDD §8: an attempt starts under the migration's lock and only while the
+                # migration is still in the step's phase, so a cancel either finds it running
+                # or ends the retries (and cleans up after the failed attempt, §5.1)
+                current, _ = await self._load(m.id)
+                if current.phase != m.phase:
+                    return None
+                ctx = self._context(current, plan, source, destination)
+                work = runner(ctx) if runner is not None else executor.run(step, ctx)
+                task = asyncio.create_task(work, name=f"{step}:{m.id}")
+                self._steps[m.id] = task
             started = loop.time()
+            timeout = self.settings.step_timeout_s or None
+            timed_out = False
             try:
-                await asyncio.wait({task})
+                done, _ = await asyncio.wait({task}, timeout=timeout)
+                if not done:
+                    # SDD §15.1: the attempt exceeded its wall-clock ceiling — cancel it (the
+                    # executor kills the playbook) and fail it like any other permanent error
+                    timed_out = True
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
             except asyncio.CancelledError:
                 task.cancel()
                 with contextlib.suppress(BaseException):
@@ -1136,6 +1548,10 @@ class Orchestrator:
             stats = self.step_stats[str(step)]
             stats[0] += loop.time() - started
             stats[1] += 1
+            if timed_out:
+                raise PermanentStepError(
+                    f"{step} exceeded the step timeout of {self.settings.step_timeout_s:g} s"
+                )
             if task.cancelled():
                 return None
             exc = task.exception()
@@ -1154,9 +1570,6 @@ class Orchestrator:
                     persist=False,
                 )
                 await self._sleep(delay)
-                current, _ = await self._load(m.id)
-                if current.phase != m.phase:
-                    return None
                 continue
             raise exc
 
@@ -1193,9 +1606,14 @@ class Orchestrator:
     async def _record_pass(
         self, cur: Migration, v: int, sync_pass: SyncPass, plan: Plan | None = None
     ) -> tuple[Migration, int]:
-        numbered = sync_pass.model_copy(update={"number": len(cur.sync_passes) + 1})
+        numbered = sync_pass.model_copy(update={"number": next_pass_number(cur)})
         cur.sync_passes.append(numbered)
-        cur.bytes_transferred = sum(p.bytes_transferred for p in cur.sync_passes)
+        if plan is not None:
+            # SDD §5.4: a long wait's keep-warm passes must not grow the migration without bound
+            keep_sync_history(cur, plan.max_sync_passes)
+        cur.bytes_transferred = cur.sync_bytes_dropped + sum(
+            p.bytes_transferred for p in cur.sync_passes
+        )
         if plan is not None:
             self._calibrate(cur, plan, numbered)
         v = await self._save(cur, v)
@@ -1210,7 +1628,8 @@ class Orchestrator:
 
     def _converged(self, m: Migration, plan: Plan) -> tuple[bool, str]:
         last = m.sync_passes[-1]
-        if last.bytes_changed <= plan.convergence_threshold_bytes:
+        counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
+        if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
             return True, f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
         final = estimate_final_downtime(
             m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
@@ -1222,6 +1641,8 @@ class Orchestrator:
         return False, (
             f"another delta pass: changed {_fmt_bytes(last.bytes_changed)}, "
             f"estimated downtime {final:.0f} s"
+            if counted
+            else f"another CBT pass: estimated downtime {final:.0f} s"
         )
 
     async def _do_pass(self, m: Migration) -> None:
@@ -1242,14 +1663,14 @@ class Orchestrator:
                 return
             now = self._now()
             sync_pass = result.sync_pass or SyncPass(
-                number=len(cur.sync_passes) + 1,
+                number=next_pass_number(cur),
                 kind=SyncPassKind.full if not cur.sync_passes else SyncPassKind.delta,
                 started_at=now,
                 ended_at=now,
                 duration_s=0.0,
             )
             cur.progress_pct = 100.0
-            cur.checkpoint = f"{step}:{len(cur.sync_passes) + 1}"
+            cur.checkpoint = f"{step}:{next_pass_number(cur)}"
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
             converged, why = self._converged(cur, plan)
             if converged:
@@ -1314,7 +1735,9 @@ class Orchestrator:
         if result is None:
             return
         note: AdvisorNote | None = None
-        if plan.verification.use_advisor and self.advisor is not None:
+        # SDD §14.2: the advisor may flag a *passed* verification; a failed one carries
+        # provider error text (endpoints) the review cannot change and must not ship
+        if plan.verification.use_advisor and self.advisor is not None and result.passed:
             try:
                 note = await self.advisor.review_verification(m.vm, result)
             except Exception:
@@ -1419,13 +1842,14 @@ class Orchestrator:
         self.wake()
 
     async def _replace_vm_id(self, plan_id: str, old: str, new: str) -> None:
-        plan = await self._plan(plan_id)
-        plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
-        for wave in plan.waves:
-            wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
-        if old in plan.strategy_overrides:
-            plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
-        await self._save_plan(plan)
+        def rewrite(plan: Plan) -> None:
+            plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
+            for wave in plan.waves:
+                wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
+            if old in plan.strategy_overrides:
+                plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
+
+        plan = await self._update_plan(plan_id, rewrite)
         await self._emit(
             "plan.updated",
             f"{plan.name}: source VM {old} is now {new}",

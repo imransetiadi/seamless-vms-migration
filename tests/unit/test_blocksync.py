@@ -730,3 +730,177 @@ def test_digests_are_fips_tolerant(monkeypatch):
         assert blocksync.manifest_digest([expected_chunk] * 3) == expected_manifest
     assert any("usedforsecurity" not in kwargs for kwargs in seen)
     assert any(kwargs.get("usedforsecurity") is False for kwargs in seen)
+
+
+def _mutate(data, rng, pattern, chunk_size):
+    """Return a mutated copy of ``data``: random extents, whole chunks, or sparse zero runs."""
+    out = bytearray(data)
+    size = len(out)
+    if size == 0:
+        return bytes(out)
+    if pattern == "extents":
+        for _ in range(rng.randint(1, 8)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 4)))
+            out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
+    elif pattern == "chunks":
+        chunks = max(1, (size + chunk_size - 1) // chunk_size)
+        for index in rng.sample(range(chunks), k=max(1, chunks // 3)):
+            start = index * chunk_size
+            length = min(chunk_size, size - start)
+            out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
+    elif pattern == "zero-runs":
+        for _ in range(rng.randint(1, 4)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 3)))
+            out[start : start + length] = b"\0" * length
+    elif pattern == "tail":
+        length = min(size, rng.randint(1, 4097))
+        out[size - length :] = rand_bytes(length, 7)  # same length: the device size is unchanged
+    assert len(out) == size
+    return bytes(out)
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_randomized_engine_fuzz(tmp_path, seed):
+    """QASuite D-02: random sizes (0 and 1 byte included), chunk sizes, mutation patterns and
+    zero ratios; sender and receiver run as subprocesses; the destination must end
+    byte-identical to the source on every iteration, with a self-consistent summary."""
+    rng = random.Random(1000 + seed)
+    chunk_size = rng.choice([4096, 65536, 131072, 1 * MIB, 4 * MIB])
+    size = rng.choice([0, 1, chunk_size - 1, chunk_size, chunk_size + 1, rng.randint(0, 6 * MIB)])
+    workers = rng.choice([1, 2, 4])
+    zero_ratio = rng.choice([0.0, 0.3, 0.9])
+    # the source: random data with zero runs sprinkled in according to the zero ratio
+    source = bytearray(rand_bytes(size, seed))
+    if size and zero_ratio:
+        for _ in range(int(zero_ratio * 6)):
+            start = rng.randrange(size)
+            length = min(size - start, rng.randint(1, max(1, size // 2)))
+            source[start : start + length] = b"\0" * length
+    source = bytes(source)
+    pattern = rng.choice(["extents", "chunks", "zero-runs", "tail", "identical"])
+    destination = source if pattern == "identical" else _mutate(source, rng, pattern, chunk_size)
+    src = write(tmp_path / "src", source)
+    dst = write(tmp_path / "dst", destination)
+
+    rc, summary, err = receive(dst, src, chunk_size=chunk_size, workers=workers)
+
+    assert rc == 0, err
+    assert read(dst) == source, "destination differs from the source (seed %d)" % seed
+    expected_chunks = (size + chunk_size - 1) // chunk_size
+    assert summary["ok"] is True and summary["chunks"] == expected_chunks
+    assert summary["bytes_scanned"] == size
+    assert 0 <= summary["chunks_changed"] <= expected_chunks
+    assert summary["bytes_transferred"] <= summary["bytes_changed"] <= size
+    if pattern == "identical":
+        assert summary["chunks_changed"] == 0 and summary["bytes_transferred"] == 0
+
+    # a second pass over now-identical devices moves nothing and leaves the data untouched
+    rc, again, err = receive(dst, src, chunk_size=chunk_size, workers=workers)
+    assert rc == 0, err
+    assert again["chunks_changed"] == 0 and again["bytes_transferred"] == 0
+    assert read(dst) == source
+
+
+def test_hash_chunk_zero_fast_path_matches_hashing(tmp_path):
+    """All-zero chunks take the cached zero digest; a chunk whose first 4 KiB are zero but
+    which has data later is hashed normally (the prefix check is only a cheap filter)."""
+    chunk = 64 * 1024
+    zero = b"\0" * chunk
+    late = b"\0" * 8192 + b"\x01" + b"\0" * (chunk - 8193)
+    early = b"\x01" + b"\0" * (chunk - 1)
+    tail = b"\0" * 100  # a short last chunk, all zero
+    path = write(tmp_path / "dev", zero + late + early + tail)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = 3 * chunk + 100
+        chunks = [blocksync._hash_chunk(fd, i, chunk, size, False) for i in range(4)]
+    finally:
+        os.close(fd)
+    assert chunks[0].digest == blocksync.zero_digest(chunk) == blocksync.chunk_digest(zero)
+    assert chunks[1].digest == blocksync.chunk_digest(late) != blocksync.zero_digest(chunk)
+    assert chunks[2].digest == blocksync.chunk_digest(early)
+    assert chunks[3].length == 100 and chunks[3].digest == blocksync.zero_digest(100)
+
+
+# --- protocol guards on the receiver ---------------------------------------------------------
+# A scripted sender speaks protocol v1 and breaks it in exactly one place. Every violation must
+# end in ProtocolError (exit 3); the ones caught before a write must leave the destination as it
+# was (data integrity, QASuite D-series; test review COLL-5).
+
+FAKE_SENDER = r'''
+import struct, sys
+sys.path.insert(0, sys.argv[2])
+import blocksync as b
+scenario, chunk, size = sys.argv[1], int(sys.argv[3]), int(sys.argv[4])
+count = b.chunk_count(size, chunk)
+out, inp = sys.stdout.buffer, sys.stdin.buffer
+magic, version = b.PROTOCOL_MAGIC, b.PROTOCOL_VERSION
+if scenario == "bad_magic":
+    magic = b"XXXX"
+if scenario == "bad_version":
+    version = 2
+out.write(b._HELLO.pack(magic, version, chunk, size)); out.flush()
+if scenario in ("bad_magic", "bad_version"):
+    sys.exit(0)
+theirs = [b._read_exact(inp, b.DIGEST_SIZE) for _ in range(count)]
+payload = b"\x5a" * chunk
+def frame(offset, length, data=True):
+    out.write((b.FRAME_DATA if data else b.FRAME_ZERO) + b._FRAME_HEADER.pack(offset, length))
+    if data:
+        out.write(payload[:length])
+changed = transferred = 0
+if scenario == "misaligned":
+    frame(1, chunk)
+elif scenario == "beyond":
+    frame(count * chunk, chunk)
+elif scenario == "wrong_length":
+    frame(0, chunk - 1)
+elif scenario == "unknown_type":
+    out.write(b"Q" + b._FRAME_HEADER.pack(0, chunk))
+elif scenario == "out_of_order":
+    frame(chunk, chunk); frame(0, chunk)
+elif scenario == "end_mismatch":
+    changed = 1
+elif scenario == "lying_manifest":
+    pass
+manifest = b.manifest_digest(theirs)
+if scenario == "lying_manifest":
+    manifest = bytes(16)
+out.write(b.FRAME_END + b._END.pack(count, changed, transferred, manifest))
+if scenario == "trailing":
+    out.write(b"!")
+out.flush()
+'''
+
+
+@pytest.mark.parametrize(
+    "scenario, message, untouched",
+    [
+        ("bad_magic", "bad protocol magic", True),
+        ("bad_version", "unsupported protocol version 2", True),
+        ("misaligned", "not chunk aligned", True),
+        ("beyond", "beyond the source size", True),
+        ("wrong_length", "has length", True),
+        ("unknown_type", "unknown frame type", True),
+        ("out_of_order", "out of order", False),
+        ("end_mismatch", "end frame mismatch", True),
+        ("lying_manifest", "manifest digest mismatch", True),
+        ("trailing", "unexpected data after the end frame", True),
+    ],
+)
+def test_receiver_rejects_protocol_violations(tmp_path, scenario, message, untouched):
+    module_dir = os.path.dirname(blocksync.__file__)
+    fake = tmp_path / "fake_sender.py"
+    fake.write_text(FAKE_SENDER)
+    original = rand_bytes(4 * CHUNK, 77)
+    dst = write(tmp_path / "dst", original)
+    sender = [PYTHON, str(fake), scenario, module_dir, str(CHUNK), str(4 * CHUNK)]
+
+    with pytest.raises(blocksync.ProtocolError, match=message) as caught:
+        blocksync.run_receiver(str(dst), CHUNK, 1, sender)
+
+    assert caught.value.exit_code == blocksync.EXIT_PROTOCOL
+    if untouched:
+        assert read(dst) == original, "a rejected frame must not reach the destination"
