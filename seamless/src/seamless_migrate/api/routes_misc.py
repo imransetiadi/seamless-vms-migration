@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from .. import __version__
+from ..ai.payloads import console_allowed, data_sent
 from ..ai.recommendations import LEGACY_PREFIX, legacy_by_id, listing
 from ..domain.enums import DecisionType, Role
 from ..domain.models import AdvisorRecommendation, AdvisorSnapshot, Migration, Plan
@@ -18,6 +19,7 @@ from ..store import NotFound
 from .deps import metrics_access, require_role, services
 from .schemas import (
     AdvisorStatus,
+    DataSentList,
     Health,
     Hit,
     JevStatus,
@@ -85,10 +87,16 @@ async def advisor_status(
 ) -> AdvisorStatus:
     svc = services(request)
     jev = svc.jev
+    # where the model runs and whether the console excerpt may go there (SDD §13.4, ADV-06)
+    where = {
+        "deployment": svc.settings.jev_deployment,
+        "endpoint_host": svc.settings.jev_endpoint_host,
+        "console_sent": jev is not None and jev.enabled and console_allowed(svc.settings),
+    }
     jev_status = (
-        JevStatus(**jev.status())
+        JevStatus(**jev.status(), **where)
         if jev is not None
-        else JevStatus(mode=svc.settings.jev_mode, available=False, last_error=None)
+        else JevStatus(mode=svc.settings.jev_mode, available=False, last_error=None, **where)
     )
     memory = svc.memory
     if memory is None:
@@ -98,6 +106,14 @@ async def advisor_status(
             await memory.health()
         memory_status = MemoryStatus(**memory.status())
     return AdvisorStatus(jev=jev_status, memory=memory_status)
+
+
+@router.get("/advisor/data-sent", response_model=DataSentList)
+async def advisor_data_sent(
+    request: Request, _: Principal = Depends(require_role(Role.viewer))
+) -> DataSentList:
+    """What each decision type sends to Jev, from the serializers' field specs (SDD §13.4)."""
+    return DataSentList.model_validate({"items": data_sent(services(request).settings)})
 
 
 @router.get("/advisor/recommendations", response_model=RecommendationPage)

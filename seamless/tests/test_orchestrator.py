@@ -3088,3 +3088,36 @@ async def test_a_policy_without_a_distinct_approver_lets_the_requester_decide(tm
     [rec] = _recommendations(store)
     approved = await h.orch.approve_recommendation(rec.id, "rina")
     assert approved.decision.status == DecisionStatus.approved
+
+
+# -- ADV-06: where the model runs (SDD §4, §13.4) ---------------------------------------------
+
+
+async def test_a_recommendation_jev_answered_names_where_the_model_runs(tmp_path, store):
+    advisor, _ = _tie_advisor("warm", 0.9)
+    settings = make_settings(
+        tmp_path, jev_deployment="on_prem", jev_endpoint_host="jev.dc1.example.internal"
+    )
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor, settings=settings
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert (rec.model.name, rec.model.deployment, rec.model.endpoint_host) == (
+        "jev",
+        "on_prem",
+        "jev.dc1.example.internal",
+    )
+
+
+async def test_a_recommendation_without_jev_names_no_deployment(tmp_path, store):
+    """The rules decided locally: no model location to show (SDD §4)."""
+    advisor = Advisor(None, make_settings(tmp_path))
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    for rec in _recommendations(store):
+        assert (rec.model.name, rec.model.deployment, rec.model.endpoint_host) == (
+            "rules",
+            "unknown",
+            None,
+        )

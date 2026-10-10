@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 JevMode = Literal["off", "stdio", "http"]
+#: where the Jev model runs (SDD §13.4, ADV-06)
+JevDeployment = Literal["on_prem", "remote"]
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off", ""}
@@ -72,6 +74,11 @@ class Settings(BaseModel):
     jev_token: str | None = Field(default=None, repr=False)
     jev_timeout_s: float = 20.0
     jev_min_confidence: float = 0.6
+    #: where the model runs and the host shown on its badge; with a remote model the console
+    #: excerpt stays local unless console_screening_send_to_remote (SDD §13.4, ADV-06)
+    jev_deployment: JevDeployment = "remote"
+    jev_endpoint_host: str | None = None
+    console_screening_send_to_remote: bool = False
     memory_url: str | None = None
     memory_secret: str | None = Field(default=None, repr=False)
     memory_project: str = "seamless-migrate"
@@ -109,6 +116,8 @@ class Settings(BaseModel):
             "JEV_COMMAND": "jev_command",
             "JEV_URL": "jev_url",
             "JEV_TOKEN": "jev_token",
+            "JEV_DEPLOYMENT": "jev_deployment",
+            "JEV_ENDPOINT_HOST": "jev_endpoint_host",
             "MEMORY_URL": "memory_url",
             "MEMORY_SECRET": "memory_secret",
             "MEMORY_PROJECT": "memory_project",
@@ -142,6 +151,7 @@ class Settings(BaseModel):
             "MEMORY_REDACT_NAMES": "memory_redact_names",
             "METRICS_PUBLIC": "metrics_public",
             "LOG_JSON": "log_json",
+            "CONSOLE_SCREENING_SEND_TO_REMOTE": "console_screening_send_to_remote",
         }
         for env_name, field in bool_fields.items():
             value = get(env_name)
@@ -152,6 +162,8 @@ class Settings(BaseModel):
             values["cors_origins"] = _csv(cors)
         if "jev_mode" in values:
             values["jev_mode"] = str(values["jev_mode"]).lower()
+        if "jev_deployment" in values:
+            values["jev_deployment"] = str(values["jev_deployment"]).lower()
 
         dashboard = get("DASHBOARD_DIR")
         if dashboard is not None and dashboard.lower() != "auto":

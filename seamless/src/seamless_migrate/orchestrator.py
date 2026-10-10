@@ -718,6 +718,9 @@ class Orchestrator:
             model=AdvisorModelInfo(
                 name="jev" if answered else "rules",
                 version=(advice.model_version or "unknown") if answered else "rules",
+                # where the model that answered runs (SDD §4, §13.4); the rules ran here
+                deployment=self.settings.jev_deployment if answered else "unknown",
+                endpoint_host=self.settings.jev_endpoint_host if answered else None,
             ),
             recommendation=RecommendedOption(
                 option=advice.option,

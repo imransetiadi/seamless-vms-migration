@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import Role, Strategy
+from ..domain.enums import DecisionType, Role, Strategy
 from ..domain.models import (
     AdvisorPolicy,
     AdvisorRecommendation,
@@ -131,6 +131,10 @@ class JevStatus(BaseModel):
     mode: str
     available: bool
     last_error: str | None = None
+    #: where the model runs, and whether the console excerpt may go there (SDD §13.4, ADV-06)
+    deployment: Literal["on_prem", "remote"] = "remote"
+    endpoint_host: str | None = None
+    console_sent: bool = False
 
 
 class MemoryStatus(BaseModel):
@@ -142,6 +146,25 @@ class MemoryStatus(BaseModel):
 class AdvisorStatus(BaseModel):
     jev: JevStatus
     memory: MemoryStatus
+
+
+class DataSentField(BaseModel):
+    key: str
+    label: str
+
+
+class DataSentItem(BaseModel):
+    """What one decision type sends to Jev, from the serializers' field specs (SDD §13.4)."""
+
+    decision_type: DecisionType
+    tool: str
+    fields: list[DataSentField]
+    sent: bool
+    note: str | None = None
+
+
+class DataSentList(BaseModel):
+    items: list[DataSentItem]
 
 
 class ErrorBody(BaseModel):

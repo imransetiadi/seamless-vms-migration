@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from seamless_migrate.config import Settings
 
 
@@ -21,6 +23,12 @@ def test_settings_defaults_match_sdd():
     assert s.jev_command == "npx -y @jkudish/jev-mcp@0.14.1"
     assert (s.jev_url, s.jev_token) == (None, None)
     assert (s.jev_timeout_s, s.jev_min_confidence) == (20.0, 0.6)
+    # ADV-06 (SDD §13.4): remote by default, so the console excerpt stays local by default
+    assert (s.jev_deployment, s.jev_endpoint_host, s.console_screening_send_to_remote) == (
+        "remote",
+        None,
+        False,
+    )
     assert (s.memory_url, s.memory_secret) == (None, None)
     assert s.memory_project == "seamless-migrate"
     assert s.memory_redact_names is False
@@ -90,3 +98,20 @@ def test_every_setting_is_documented_in_sdd_15_1():
     assert read - documented == set(), "read but not documented in SDD §15.1"
     assert documented - read == set(), "documented in SDD §15.1 but never read"
     assert len(read) >= 30
+
+
+def test_settings_read_where_the_model_runs_and_whether_the_console_may_go_there():
+    s = Settings.from_env(
+        {
+            "SEAMLESS_JEV_DEPLOYMENT": "ON_PREM",
+            "SEAMLESS_JEV_ENDPOINT_HOST": " jev.dc1.example.internal ",
+            "SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE": "true",
+        }
+    )
+    assert (s.jev_deployment, s.jev_endpoint_host, s.console_screening_send_to_remote) == (
+        "on_prem",
+        "jev.dc1.example.internal",
+        True,
+    )
+    with pytest.raises(ValueError):
+        Settings.from_env({"SEAMLESS_JEV_DEPLOYMENT": "somewhere"})

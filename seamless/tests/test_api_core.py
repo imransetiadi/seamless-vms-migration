@@ -350,9 +350,27 @@ def test_stats_shape(api):
 def test_advisor_status_and_similar_incidents_without_memory(api):
     status = api.get("/api/v1/advisor/status").json()
     assert status == {
-        "jev": {"mode": "off", "available": False, "last_error": None},
+        "jev": {
+            "mode": "off",
+            "available": False,
+            "last_error": None,
+            # ADV-06 (SDD §13.4): where the model runs, and whether the console may go there
+            "deployment": "remote",
+            "endpoint_host": None,
+            "console_sent": False,
+        },
         "memory": {"enabled": False, "available": False, "last_error": None},
     }
+    sent = api.get("/api/v1/advisor/data-sent").json()["items"]
+    assert [(i["decision_type"], i["tool"]) for i in sent] == [
+        ("migration_strategy", "jev_decide"),
+        ("workload_tier", "jev_classify"),
+        ("verification_review", "jev_verify"),
+        ("console_screening", "jev_screen"),
+    ]
+    assert all(i["sent"] is False for i in sent), "Jev is off: nothing is sent"
+    keys = [f["key"] for f in sent[0]["fields"]]
+    assert "estimates" in keys and all(f["label"] for f in sent[0]["fields"])
     res = api.post("/api/v1/advisor/similar-incidents", Role.operator, json={"query": "x"})
     assert res.status_code == 200 and res.json() == {"hits": []}
 
@@ -624,3 +642,37 @@ async def test_body_limit_counts_streamed_chunks():
         await BodyLimitMiddleware(inner, max_bytes=10)(scope, receive, send)
     assert refused.value.status_code == 413
     assert seen == [4, 4]  # the third chunk (12 > 10 bytes) never reached the app
+
+
+@pytest.mark.parametrize(
+    ("where", "console"),
+    [
+        ({}, False),  # remote by default: the console excerpt stays local (SDD §13.4)
+        ({"jev_deployment": "on_prem", "jev_endpoint_host": "jev.dc1.example.internal"}, True),
+        ({"console_screening_send_to_remote": True}, True),
+    ],
+)
+def test_the_advisor_says_where_its_model_runs_and_what_it_receives(tmp_path, where, console):
+    """ADV-06: with Jev on, the status names the deployment and the console's fate; the data-sent
+    listing agrees."""
+    settings, tokens = api_settings(
+        tmp_path, jev_mode="http", jev_url="http://jev.invalid:8080/mcp", **where
+    )
+    store = Store(f"sqlite:///{tmp_path / 'where.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        api = Api(client, store, settings, tokens)
+        jev = api.get("/api/v1/advisor/status").json()["jev"]
+        assert (jev["deployment"], jev["endpoint_host"], jev["console_sent"]) == (
+            where.get("jev_deployment", "remote"),
+            where.get("jev_endpoint_host"),
+            console,
+        )
+        items = {
+            i["decision_type"]: i for i in api.get("/api/v1/advisor/data-sent").json()["items"]
+        }
+        assert items["migration_strategy"]["sent"] is True
+        assert items["console_screening"]["sent"] is console
+        verify_keys = [f["key"] for f in items["verification_review"]["fields"]]
+        assert ("console" in verify_keys) is console
+    store.dispose()

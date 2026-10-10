@@ -17,6 +17,7 @@ from ..domain.enums import Strategy
 from ..domain.models import AdvisorNote, Estimate, Finding, Plan, VMRef
 from ..planning.selector import advisor_scope, select_strategy
 from ..planning.waves import TIERS, heuristic_tier
+from . import payloads
 from .decision import Advice
 from .jev import JevClient, JevUnavailable
 from .redaction import redact
@@ -82,7 +83,7 @@ SCREEN_PURPOSE = (
     "Interpret a guest console log to decide whether the VM booted successfully after migration"
 )
 INJECTION_REASON = "console output contained instructions aimed at an AI agent"
-CONSOLE_EXCERPT_CHARS = 6000
+CONSOLE_EXCERPT_CHARS = payloads.CONSOLE_EXCERPT_CHARS
 
 
 def _gib(n: int) -> str:
@@ -112,33 +113,8 @@ class Advisor:
     def _strategy_evidence(
         self, vm: VMRef, estimates: Sequence[Estimate], plan: Plan, findings: Sequence[Finding]
     ) -> str:
-        disks = "; ".join(
-            f"{d.kind} {d.size_gb} GiB"
-            + (f" type {d.volume_type}" if d.volume_type else "")
-            + (" multi-attach" if d.multiattach else "")
-            + (" encrypted" if d.encrypted else "")
-            + (" independent" if d.independent else "")
-            for d in vm.disks
-        )
-        rate = (
-            f"{vm.change_rate_bps / MIB:.1f} MiB/s measured"
-            if vm.change_rate_bps is not None
-            else "unknown (default 2 MiB/s assumed)"
-        )
-        est_text = "; ".join(
-            f"{e.strategy}: downtime {e.downtime_s:.0f} s, pre-copy {e.precopy_s:.0f} s over "
-            f"{e.passes} pass(es), "
-            + ("eligible" if e.eligible else f"INELIGIBLE ({'; '.join(e.reasons)})")
-            for e in estimates
-        )
-        finding_text = ", ".join(f"{f.code} ({f.severity})" for f in findings) or "none"
-        text = (
-            f"VM {vm.name}: {vm.vcpus} vCPU, {vm.ram_mb} MB RAM, {len(vm.disks)} disk(s) "
-            f"[{disks}], provisioned {_gib(vm.disk_bytes)}, used {_gib(vm.used_bytes)}. "
-            f"Guest write rate {rate}. Downtime SLO {plan.downtime_slo_s} s. "
-            f"Link {plan.link_bps / MIB:.0f} MiB/s. Findings: {finding_text}. "
-            f"Estimates: {est_text}."
-        )
+        # rendered from the declared field specs (SDD §13.4, ADV-06): nothing else is sent
+        text = payloads.render_strategy(payloads.StrategyInput(vm, estimates, plan, findings))
         return self._redact(text, [vm.name])
 
     async def recommend_strategy(
@@ -163,7 +139,7 @@ class Advisor:
         if len(candidates) < 2:
             return None  # nothing to decide: jev_decide needs at least two candidates
         # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
-        request: dict[str, Any] = {
+        arguments: dict[str, Any] = {
             "decision": self._redact(
                 f"Which migration strategy should be used for VM {vm.name} moving to RHOSO 18.0?",
                 [vm.name],
@@ -176,8 +152,10 @@ class Advisor:
             ),
             "candidates": candidates,
             "requirements": list(STRATEGY_REQUIREMENTS),
-            "escalate_on_contradiction": True,
         }
+        # exactly the declared arguments (SDD §13.4): GET /advisor/data-sent lists them
+        request = {key: arguments[key] for key in payloads.STRATEGY_REQUEST_FIELDS}
+        request["escalate_on_contradiction"] = True
         base: dict[str, Any] = {
             "scope": tuple(s.value for s in scope),
             "options": tuple(c["id"] for c in candidates),
@@ -216,13 +194,8 @@ class Advisor:
 
     # -- classification ----------------------------------------------------------------------
     def _describe_vm(self, vm: VMRef) -> str:
-        tags = ",".join(f"{k}:{v}" for k, v in sorted(vm.tags.items()))
-        disks = "+".join(f"{d.size_gb}GiB" for d in vm.disks) or "none"
-        text = (
-            f"name={vm.name} os={vm.os_type or 'unknown'} tags={tags or 'none'} disks={disks} "
-            f"flavor={vm.flavor or f'{vm.vcpus}vcpu/{vm.ram_mb}MB'}"
-        )
-        return self._redact(text, [vm.name])
+        # rendered from the declared field specs (SDD §13.4, ADV-06)
+        return self._redact(payloads.render_workload(vm), [vm.name])
 
     async def classify_workloads(self, vms: Sequence[VMRef]) -> tuple[dict[str, str], AdvisorNote]:
         tiers = {vm.source_id: heuristic_tier(vm) for vm in vms}
@@ -294,7 +267,9 @@ class Advisor:
         review_reason: str | None = None
         screen: dict[str, Any] = {}
         console = (result.evidence or {}).get("console")
-        if console:
+        # with a remote model the excerpt stays in this installation unless allowed (SDD §13.4)
+        console_sent = bool(console) and payloads.console_allowed(self.settings)
+        if console_sent:
             # SDD §13.4/§14.2: the excerpt is redacted before it is screened — it is the one
             # place raw guest text leaves the control plane
             excerpt = self._redact(str(console)[-CONSOLE_EXCERPT_CHARS:], [vm.name])
@@ -330,6 +305,7 @@ class Advisor:
                     "screen": screen,
                     "results": [],
                     "passed": bool(result.passed),
+                    "console_sent": console_sent,
                 },
             )
         for item in results:
@@ -345,6 +321,11 @@ class Advisor:
             if review_required
             else f"Boot claims {verdicts}; no review needed"
         )
+        if console and not console_sent:
+            summary += (
+                ". The console excerpt stayed in this installation (remote advisor): "
+                "screened by the verification's own console patterns only"
+            )
         return AdvisorNote(
             kind="verification",
             source="jev",
@@ -359,5 +340,6 @@ class Advisor:
                     for i in results
                 ],
                 "passed": bool(result.passed),
+                "console_sent": console_sent,
             },
         )
