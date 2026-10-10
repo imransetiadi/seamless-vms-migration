@@ -181,6 +181,26 @@ async def test_retry_after_rollback_counts_an_attempt(tmp_path, store):
     assert stored.actual_downtime_s is None
 
 
+async def test_a_retry_clears_the_earlier_attempts_data_issues_and_convergence_rule(
+    tmp_path, store
+):
+    """SDD §5.1 (ADV-16..20 audit, F7): what an attempt found about itself - the invariants it
+    broke, the rule that ended its passes - goes with it; the new attempt records its own."""
+    from seamless_migrate.domain.models import Migration
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.phase = P.rolled_back
+    m.data_issues = ["DOWNTIME_BELOW_FINAL_SYNC: 0 s of downtime around a 100 s final sync"]
+    m.converged_by = "slo"
+    store.put("migration", m)
+    again = await h.orch.retry(m.id, "alice")
+    stored = store.get("migration", m.id, Migration)
+    for retried in (again, stored):
+        assert (retried.phase, retried.data_issues, retried.converged_by) == (P.ready, [], None)
+
+
 async def test_retry_after_failed_cutover_keeps_clock_and_refuses_cancel(tmp_path, store):
     """SDD §5.1/§5.2: a cutover failed with the source stopped (no automatic rollback). A retry
     keeps the open downtime clock — the next attempt's downtime counts from the first stop — and

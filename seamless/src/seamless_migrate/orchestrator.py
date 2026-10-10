@@ -1200,6 +1200,10 @@ class Orchestrator:
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)
             _clear_request(m)
+            # what the earlier attempt found about itself goes with it: the new attempt records
+            # its own (SDD §5.1, §5.3, §5.5)
+            m.data_issues = []
+            m.converged_by = None
             m.checkpoint = None
             m.progress_pct = 0
             m.review_required = False
