@@ -25,6 +25,8 @@ const ROUTES: Array<[string, string]> = [
   ['/events', 'Events'],
   ['/advisor', 'Advisor'],
   ['/advisor/audit', 'Advisor audit'],
+  ['/advisor/policies', 'Advisor policies'],
+  ['/plans/plan-c81d44a0', 'Shared Ceph handover — analytics'],
   ['/advisor/recommendations/rec-d4e6f8a09001', 'Migration strategy: static-cdn-01'],
   ['/login', 'Sign in'],
 ];
@@ -56,7 +58,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'RecommendationDetail', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
@@ -81,6 +83,30 @@ describe('axe-core: no WCAG violations', () => {
     await settled();
     await user.click(screen.getByRole('tab', { name: 'Input' }));
     await screen.findByText(/matches its SHA-256/i);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the policy dialog with validation errors (ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/advisor/policies');
+    await screen.findByRole('heading', { level: 1, name: 'Advisor policies' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: 'New policy' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New policy' });
+    await user.selectOptions(within(dialog).getByLabelText('Applies to'), 'providers');
+    await user.click(within(dialog).getByRole('button', { name: 'Create policy' }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the override dialog of a decision that waits (ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/migrations/mig-b2c4d6e871');
+    await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
+    await settled();
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    await screen.findByRole('alertdialog', { name: 'Override the recommendation for analytics-node-2?' });
     expect(await violations()).toEqual([]);
   }, 30_000);
 

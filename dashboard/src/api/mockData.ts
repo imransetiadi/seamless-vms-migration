@@ -6,6 +6,7 @@
  */
 import type {
   AdvisorNote,
+  AdvisorPolicy,
   AdvisorRecommendation,
   AdvisorSnapshot,
   DestinationInventory,
@@ -38,14 +39,18 @@ export const GLOBAL_DEFAULT_POLICY = 'global-default';
 /** What Jev reports as its model in a jev_decide answer. */
 export const JEV_MODEL = 'jev-1.13.0';
 
-/** The decisions the engine takes on a strategy recommendation until policies exist (SDD §14.4). */
-export type StrategyDecision = 'auto_applied' | 'below_threshold' | 'fallback_rules';
+/** The decisions validation takes on a strategy recommendation (SDD §14.4, §14.6). */
+export type StrategyDecision = 'auto_applied' | 'below_threshold' | 'fallback_rules' | 'pending_approval';
 
 const REASON_OF: Record<StrategyDecision, ReasonCode> = {
   auto_applied: 'ABOVE_THRESHOLD_AUTO_APPLY',
   below_threshold: 'BELOW_THRESHOLD_DEFAULT_KEPT',
   fallback_rules: 'ADVISOR_UNAVAILABLE_FALLBACK',
+  pending_approval: 'POLICY_REQUIRES_APPROVAL',
 };
+
+/** The demo policy of the spec (ADV-04) for the mock's DC1 source provider (SDD §14.6). */
+export const FINANCE_POLICY_ID = 'pol-finance';
 
 export interface StrategyRecommendationInput {
   id: string;
@@ -64,6 +69,10 @@ export interface StrategyRecommendationInput {
   fallback?: string;
   /** The input snapshot the recommendation rests on (SDD §14.5). */
   snapshotSha256: string | null;
+  /** The policy that decided (default the built-in global default, SDD §14.6). */
+  policyId?: string;
+  /** Its threshold (default SEAMLESS_JEV_MIN_CONFIDENCE's). */
+  threshold?: number;
 }
 
 /** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
@@ -75,6 +84,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
       ? {}
       : Object.fromEntries([[option, confidence], ...others.map((o) => [o, Math.round(((1 - confidence) / others.length) * 100) / 100])]);
   const byPolicy = status !== 'fallback_rules';
+  const policyId = input.policyId ?? GLOBAL_DEFAULT_POLICY;
   return {
     id: input.id,
     created_at: input.at,
@@ -89,13 +99,13 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     recommendation: { option, confidence, distribution },
     input_snapshot_sha256: input.snapshotSha256,
     decision: {
-      final_option: status === 'auto_applied' ? option : input.deterministic,
+      final_option: status === 'auto_applied' ? option : status === 'pending_approval' ? null : input.deterministic,
       status,
       reason_code: REASON_OF[status],
       reason_text: status === 'fallback_rules' ? (input.fallback ?? null) : null,
-      actor: byPolicy ? { kind: 'policy', id: GLOBAL_DEFAULT_POLICY } : { kind: 'system', id: 'fallback' },
-      policy_id: byPolicy ? GLOBAL_DEFAULT_POLICY : null,
-      threshold_used: byPolicy ? JEV_MIN_CONFIDENCE : null,
+      actor: byPolicy ? { kind: 'policy', id: policyId } : { kind: 'system', id: 'fallback' },
+      policy_id: byPolicy ? policyId : null,
+      threshold_used: byPolicy ? (input.threshold ?? JEV_MIN_CONFIDENCE) : null,
       decided_at: input.at,
     },
     legacy: false,
@@ -103,11 +113,49 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
   };
 }
 
-/** The audit events the API emits for a recorded recommendation: created, then its decision (SDD §14.5). */
-export function auditEventsOf(rec: AdvisorRecommendation): Array<Pick<Event, 'kind' | 'message' | 'actor' | 'data'>> {
-  const { option, confidence } = rec.recommendation;
+type AuditEvent = Pick<Event, 'kind' | 'message' | 'actor' | 'data'>;
+
+function stateOf(d: AdvisorRecommendation['decision']) {
+  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used };
+}
+
+/** The event of the status a decision took, with what it replaced (SDD §14.5). */
+export function decisionEventOf(rec: AdvisorRecommendation, before: AdvisorRecommendation['decision'] | null): AuditEvent {
   const d = rec.decision;
   const actor = `${d.actor.kind}:${d.actor.id}`;
+  return {
+    kind: d.status === 'fallback_rules' ? 'decision.fallback' : `decision.${d.status}`,
+    message: `${rec.subject.name}: decision ${d.final_option ?? 'pending'} (${d.status}) by ${actor}`,
+    actor,
+    data: { target_id: rec.id, model_version: rec.model.version, before: before ? stateOf(before) : null, after: stateOf(d) },
+  };
+}
+
+/** A person's decision on a recommendation: approve its option or override it with another (SDD §14.6). */
+export function humanDecision(
+  rec: AdvisorRecommendation,
+  action: { kind: 'approve'; user: string } | { kind: 'override'; user: string; option: string; reason: string | null },
+  at: string,
+): AdvisorRecommendation {
+  const approve = action.kind === 'approve';
+  return {
+    ...rec,
+    decision: {
+      final_option: approve ? rec.recommendation.option : action.option,
+      status: approve ? 'approved' : 'overridden',
+      reason_code: approve ? 'APPROVED_BY_USER' : 'OVERRIDDEN_BY_USER',
+      reason_text: approve ? null : action.reason,
+      actor: { kind: 'user', id: action.user },
+      policy_id: rec.decision.policy_id ?? GLOBAL_DEFAULT_POLICY,
+      threshold_used: null,
+      decided_at: at,
+    },
+  };
+}
+
+/** The audit events the API emits for a recorded recommendation: created, then its decision (SDD §14.5). */
+export function auditEventsOf(rec: AdvisorRecommendation): AuditEvent[] {
+  const { option, confidence } = rec.recommendation;
   return [
     {
       kind: 'recommendation.created',
@@ -123,17 +171,7 @@ export function auditEventsOf(rec: AdvisorRecommendation): Array<Pick<Event, 'ki
         snapshot_sha256: rec.input_snapshot_sha256,
       },
     },
-    {
-      kind: d.status === 'fallback_rules' ? 'decision.fallback' : `decision.${d.status}`,
-      message: `${rec.subject.name}: decision ${d.final_option ?? 'pending'} (${d.status}) by ${actor}`,
-      actor,
-      data: {
-        target_id: rec.id,
-        model_version: rec.model.version,
-        before: null,
-        after: { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used },
-      },
-    },
+    decisionEventOf(rec, null),
   ];
 }
 
@@ -786,8 +824,16 @@ interface MigrationSpec {
   error?: string | null;
   reviewReason?: string | null;
   notes?: Array<Omit<AdvisorNote, 'created_at'> & { ago: number }>;
-  /** The strategy recommendation recorded when the migration was validated (SDD §14.4). */
-  rec?: { option: Strategy | null; confidence: number | null; status: StrategyDecision; deterministic: Strategy; fallback?: string };
+  /** The strategy recommendation recorded when the migration was validated (SDD §14.4), and what a person decided later (§14.6). */
+  rec?: {
+    option: Strategy | null;
+    confidence: number | null;
+    status: StrategyDecision;
+    deterministic: Strategy;
+    fallback?: string;
+    policyId?: string;
+    then?: { kind: 'approve'; user: string; after: number } | { kind: 'override'; user: string; option: Strategy; reason: string; after: number };
+  };
   attempts?: number;
   destination?: string | null;
   checkpoint?: string | null;
@@ -870,6 +916,11 @@ const PLAN_SPECS: PlanSpec[] = [
       {
         id: 'mig-5d7e2b4a13', vm: 'os-0c41', strategy: 'cold', phase: 'ready', wave: 'wave-2', enteredAgo: 2 * H,
         checkpoint: null,
+        // applied automatically, then overridden by a person with a reason (ADV-04)
+        rec: {
+          option: 'warm', confidence: 0.83, status: 'auto_applied', deterministic: 'cold',
+          then: { kind: 'override', user: 'bayu', option: 'cold', reason: 'Domain controllers move cold: the AD replication window was rehearsed that way', after: 40 * 60 },
+        },
         notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: os_type windows2019 and tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
       },
       { id: 'mig-7a9b1c3d40', vm: 'os-0b22', strategy: 'cold', phase: 'validating', wave: 'wave-3', enteredAgo: 6 },
@@ -896,7 +947,11 @@ const PLAN_SPECS: PlanSpec[] = [
         passes: [{ kind: 'full', changedGiB: 64, durationS: 520 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
       },
-      { id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H },
+      {
+        id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H,
+        // below the threshold, then approved by a person: the recommended option runs
+        rec: { option: 'vmware_warm', confidence: 0.55, status: 'below_threshold', deterministic: 'vmware_cold', then: { kind: 'approve', user: 'sari', after: 20 * 60 } },
+      },
       {
         id: 'mig-9e4f6a8b52', vm: 'vm-5002', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-2', enteredAgo: 5 * H,
         approvals: [{ actor: 'sari', ago: 4 * H, comment: 'Pre-approved for the Saturday window' }],
@@ -924,7 +979,11 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-b2c4d6e870', vm: 'os-0f71', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H,
         notes: [{ kind: 'strategy', source: 'jev', summary: 'Storage handover recommended: metadata-only cutover (≈ 4 min) regardless of the 540 GiB of disks.', confidence: 0.71, data: { selected: 'storage_handover', applied: true, deterministic: 'storage_handover', candidates: ['storage_handover', 'warm'], probabilities: { storage_handover: 0.71, warm: 0.29 } }, ago: 3 * H }],
       },
-      { id: 'mig-b2c4d6e871', vm: 'os-0f72', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
+      {
+        id: 'mig-b2c4d6e871', vm: 'os-0f72', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H,
+        // the Finance policy asks a person first: the migration waits (ADV-04)
+        rec: { option: 'storage_handover', confidence: 0.86, status: 'pending_approval', deterministic: 'storage_handover', policyId: FINANCE_POLICY_ID },
+      },
       { id: 'mig-b2c4d6e872', vm: 'os-0f73', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
       { id: 'mig-b2c4d6e873', vm: 'os-0f74', strategy: 'warm', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
     ],
@@ -1126,6 +1185,8 @@ export interface Fixtures {
   recommendations: AdvisorRecommendation[];
   /** Redacted advisor inputs (document kind `advisor_snapshot`, SDD §14.5). */
   snapshots: AdvisorSnapshot[];
+  /** Stored advisor policies (document kind `advisor_policy`, SDD §14.6). */
+  policies: AdvisorPolicy[];
   events: Event[];
 }
 
@@ -1137,6 +1198,23 @@ export function buildFixtures(now: number): Fixtures {
   const recommendations: AdvisorRecommendation[] = [];
   const snapshots: AdvisorSnapshot[] = [];
   const pending: Array<Omit<Event, 'seq'>> = [];
+  const policyAt = iso(now - 4 * D * 1000);
+  const policies: AdvisorPolicy[] = [
+    {
+      id: FINANCE_POLICY_ID,
+      name: 'Finance — approval required',
+      scope: { provider_ids: ['rhosp17-dc1'], plan_ids: [] },
+      decision_types: ['migration_strategy'],
+      mode: 'always_require_approval',
+      threshold: JEV_MIN_CONFIDENCE,
+      min_evidence_for_auto_apply: 0,
+      require_override_reason: true,
+      created_at: policyAt,
+      updated_at: policyAt,
+      updated_by: 'rina',
+    },
+  ];
+  pending.push({ ts: policyAt, kind: 'policy.created', plan_id: null, migration_id: null, actor: 'user:rina', message: 'advisor policy pol-finance created', data: { target_id: FINANCE_POLICY_ID, before: null, after: policies[0] } });
   const emit = (e: Omit<Event, 'seq'>) => pending.push(e);
 
   for (const spec of PLAN_SPECS) {
@@ -1242,6 +1320,7 @@ export function buildFixtures(now: number): Fixtures {
         cutover_requested: m.cutoverRequested ?? false,
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
+        advisor_hold: null,
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,
@@ -1288,9 +1367,19 @@ export function buildFixtures(now: number): Fixtures {
           deterministic: m.rec.deterministic,
           fallback: m.rec.fallback,
           snapshotSha256: snapshot.sha256,
+          policyId: m.rec.policyId,
         });
-        recommendations.push(rec);
         for (const event of auditEventsOf(rec)) emit({ ts: validated, plan_id: plan.id, migration_id: m.id, ...event });
+        let decided = rec;
+        const then = m.rec.then;
+        if (then) {
+          const at = iso(Date.parse(validated) + then.after * 1000);
+          decided = humanDecision(rec, then.kind === 'approve' ? then : { ...then, reason: then.reason }, at);
+          emit({ ts: at, plan_id: plan.id, migration_id: m.id, ...decisionEventOf(decided, rec.decision) });
+          if (then.kind === 'override') plan.strategy_overrides = { ...plan.strategy_overrides, [vm.source_id]: then.option };
+        }
+        recommendations.push(decided);
+        if (decided.decision.status === 'pending_approval') migration.advisor_hold = decided.id;
       }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;
@@ -1322,5 +1411,5 @@ export function buildFixtures(now: number): Fixtures {
 
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
-  return { providers, inventories, plans, migrations, recommendations, snapshots, events };
+  return { providers, inventories, plans, migrations, recommendations, snapshots, policies, events };
 }

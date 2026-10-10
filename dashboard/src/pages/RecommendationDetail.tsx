@@ -1,17 +1,21 @@
 import { History, ShieldAlert, ShieldCheck } from 'lucide-react';
+import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { useEventTail, useRecommendation, useSnapshot } from '../api/hooks';
+import { useEventTail, useMigration, useRecommendation, useRecommendations, useSnapshot } from '../api/hooks';
+import { useRole } from '../api/session';
 import type { AdvisorRecommendation, Event } from '../api/types';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
+import { RecommendationActions } from '../components/RecommendationActions';
 import { DecisionLine, RecommendedLine } from '../components/Recommendations';
 import { Tabs } from '../components/Tabs';
-import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, distributionRows, formatConfidence, optionLabel } from '../lib/advisor';
+import { CONFIDENCE_DEFINITION, decidable, DECISION_TYPE_LABELS, distributionRows, formatConfidence, optionLabel } from '../lib/advisor';
 import { auditActionLabel } from '../lib/audit';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { formatDateTime, formatPct } from '../lib/format';
+import { can } from '../lib/roles';
 import { ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -157,6 +161,25 @@ function InputTab({ rec }: { rec: AdvisorRecommendation }) {
   );
 }
 
+/** Approve and Override, for `advisor.approve`, while the migration's newest recommendation can still change it (SDD §14.6). */
+function DetailActions({ rec }: { rec: AdvisorRecommendation }) {
+  const role = useRole();
+  const allowed = can(role, 'advisor.approve') && !rec.legacy && rec.migration_id !== null;
+  const migration = useMigration(allowed ? (rec.migration_id ?? undefined) : undefined);
+  const newest = useRecommendations({ migration_id: rec.migration_id ?? undefined, limit: 5 }, { enabled: allowed });
+  const [decided, setDecided] = useState('');
+  return (
+    <>
+      <p role="status" aria-live="polite" className="sr-only">
+        {decided}
+      </p>
+      {allowed && decidable(rec, migration.data, newest.data?.items.find((r) => !r.legacy)?.id) && (
+        <RecommendationActions rec={rec} migration={migration.data} onDecided={setDecided} />
+      )}
+    </>
+  );
+}
+
 /** One recommendation: what was recommended and decided, its audit events and its input (SDD §14.5, §16). */
 export default function RecommendationDetail() {
   const { recId } = useParams();
@@ -193,6 +216,7 @@ export default function RecommendationDetail() {
           <RecommendedLine rec={r} className="text-sm text-muted-foreground" />
           <DecisionLine rec={r} className="mt-0.5 text-sm font-medium text-foreground" />
           {d.reason_text && <p className="mt-0.5 text-xs text-muted-foreground">{d.reason_text}</p>}
+          <DetailActions rec={r} />
           {r.legacy && r.legacy_text && <p className="mt-2 border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {r.legacy_text}</p>}
           <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
             <dt className="text-muted-foreground">VM</dt>

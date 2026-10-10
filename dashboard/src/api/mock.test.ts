@@ -887,10 +887,10 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
     expect(legacy.every((r) => r.id.startsWith('rec-legacy-') && r.decision.actor.id === 'legacy')).toBe(true);
   });
 
-  it('seeds each decision the engine takes today, and the spec example: 57% under a 60% threshold keeps cold', async () => {
+  it('seeds every decision status, and the spec example: 57% under a 60% threshold keeps cold', async () => {
     const { client } = setup('viewer');
     const stored = (await list(client)).items.filter((r) => !r.legacy);
-    expect(new Set(stored.map((r) => r.decision.status))).toEqual(new Set(['auto_applied', 'below_threshold', 'fallback_rules']));
+    expect(new Set(stored.map((r) => r.decision.status))).toEqual(new Set(['auto_applied', 'below_threshold', 'fallback_rules', 'pending_approval', 'approved', 'overridden']));
     const kept = stored.find((r) => r.decision.status === 'below_threshold')!;
     expect([kept.recommendation.option, kept.recommendation.confidence, kept.decision.threshold_used, kept.decision.final_option]).toEqual(['warm', 0.57, 0.6, 'cold']);
     const fallback = stored.find((r) => r.decision.status === 'fallback_rules')!;
@@ -905,7 +905,12 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
       if (!seen || seen.created_at < r.created_at) newest.set(r.migration_id!, r);
     }
     expect(newest.size).toBeGreaterThan(0);
-    for (const [id, r] of newest) expect(server.migrations.find((m) => m.id === id)?.strategy, id).toBe(r.decision.final_option);
+    for (const [id, r] of newest) {
+      const m = server.migrations.find((x) => x.id === id)!;
+      // a decision that waits has no final option yet: the migration keeps the deterministic choice and is held
+      if (r.decision.final_option === null) expect([r.decision.status, m.advisor_hold], id).toEqual(['pending_approval', r.id]);
+      else expect(m.strategy, id).toBe(r.decision.final_option);
+    }
   });
 
   it('filters by migration, plan and decision type, and pages with limit and offset', async () => {
@@ -954,11 +959,15 @@ describe('mock audit trail, like the API (SDD §14.5)', () => {
     expect(audit.map((e) => e.seq)).toEqual([...audit.map((e) => e.seq)].sort((a, b) => a - b));
   });
 
-  it('seeds one recommendation.created and exactly one decision event per stored recommendation', () => {
+  it('seeds one recommendation.created and one decision event per status a decision took', () => {
     const server = new MockServer({ now: () => NOW });
     for (const rec of server.recommendations) {
-      const mine = server.events.filter((e) => e.data.target_id === rec.id);
-      expect(mine.map((e) => e.kind), rec.id).toEqual(['recommendation.created', rec.decision.status === 'fallback_rules' ? 'decision.fallback' : `decision.${rec.decision.status}`]);
+      const mine = server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind);
+      const current = rec.decision.status === 'fallback_rules' ? 'decision.fallback' : `decision.${rec.decision.status}`;
+      expect(mine[0], rec.id).toBe('recommendation.created');
+      expect(mine.at(-1), rec.id).toBe(current);
+      // a person's decision follows the validation's: two decision events, else one
+      expect(mine.length, rec.id).toBe(['approved', 'overridden'].includes(rec.decision.status) ? 3 : 2);
       expect(server.snapshots.has(rec.input_snapshot_sha256!), rec.id).toBe(true);
     }
   });
@@ -973,10 +982,114 @@ describe('mock audit trail, like the API (SDD §14.5)', () => {
   });
 });
 
+describe('mock advisor policies, approval and override, like the API (SDD §14.6)', () => {
+  const ADMIN = 'admin';
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const recOf = (server: MockServer, vm: string) => server.recommendations.filter((r) => r.subject.name === vm).at(-1)!;
+
+  it('seeds the Finance policy and decisions that wait, were approved and were overridden', () => {
+    const server = new MockServer({ now: () => NOW });
+    expect(server.policies.map((p) => [p.name, p.mode, p.scope.provider_ids, p.require_override_reason])).toEqual([
+      ['Finance — approval required', 'always_require_approval', ['rhosp17-dc1'], true],
+    ]);
+    const waiting = recOf(server, 'analytics-node-2');
+    expect([waiting.decision.status, waiting.decision.final_option, waiting.decision.policy_id]).toEqual(['pending_approval', null, 'pol-finance']);
+    expect(server.migrations.find((m) => m.vm.name === 'analytics-node-2')!.advisor_hold).toBe(waiting.id);
+    const approved = recOf(server, 'vm-hr-portal');
+    expect([approved.decision.status, approved.decision.final_option, approved.decision.actor]).toEqual(['approved', 'vmware_warm', { kind: 'user', id: 'sari' }]);
+    expect(server.events.filter((e) => e.data.target_id === approved.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.below_threshold', 'decision.approved']);
+    const overridden = recOf(server, 'ad-dc-01');
+    expect([overridden.decision.status, overridden.decision.final_option, (overridden.decision.reason_text?.length ?? 0) >= 10]).toEqual(['overridden', 'cold', true]);
+    expect(server.plans.find((p) => p.id === 'plan-4f2a9c1e')!.strategy_overrides).toMatchObject({ 'os-0c41': 'cold' });
+    const policyCreated = server.events.filter((e) => e.kind === 'policy.created');
+    expect(policyCreated.map((e) => [e.actor, e.data.target_id])).toEqual([['user:rina', 'pol-finance']]);
+  });
+
+  it('decides under the Finance policy: the decision waits and holds the migration, whatever the confidence', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'cold', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const rec = recOf(server, 'analytics-db');
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.reason_code]).toEqual(['pending_approval', null, 'POLICY_REQUIRES_APPROVAL']);
+    expect([db.advisor_hold, db.strategy]).toEqual([rec.id, 'warm']);
+    expect(server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.pending_approval']);
+  });
+
+  it('starts a held migration only once a human decides: approve, then the run goes on', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    await as(server, 'operator').post(`/plans/${plan.id}/start`);
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(db.phase).toBe('ready');
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${recOf(server, 'analytics-db').id}/approve`, {});
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.actor.id]).toEqual(['approved', 'warm', 'rina']);
+    expect(db.advisor_hold).toBeNull();
+    server.tick();
+    expect(db.phase).toBe('precopy');
+  });
+
+  it('runs an overridden option, keeps it in the plan and needs the reason the policy asks for', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const id = recOf(server, 'analytics-db').id;
+    const url = `/advisor/recommendations/${id}/override`;
+    for (const reason of [undefined, '', 'too short', ' '.repeat(12)]) {
+      await expect(as(server, ADMIN).post(url, { option: 'cold', reason }), String(reason)).rejects.toMatchObject({ status: 422 });
+    }
+    await expect(as(server, ADMIN).post(url, { option: 'storage_handover', reason: 'No shared Ceph between the clouds' })).rejects.toMatchObject({ status: 422 });
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(url, { option: 'cold', reason: 'The change window fits a cold cutover' });
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.reason_text]).toEqual(['overridden', 'cold', 'The change window fits a cold cutover']);
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    expect([db.strategy, db.advisor_hold]).toEqual(['cold', null]);
+    expect(server.plans.find((p) => p.id === 'plan-c81d44a0')!.strategy_overrides).toMatchObject({ [db.vm.source_id]: 'cold' });
+    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({ kind: 'decision.overridden', actor: 'user:rina', data: { before: { status: 'pending_approval' } } });
+  });
+
+  it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    const id = held.advisor_hold!;
+    for (const token of ['viewer', 'operator', 'approver']) {
+      await expect(as(server, token).post(`/advisor/recommendations/${id}/approve`, {})).rejects.toMatchObject({ status: 403 });
+    }
+    await expect(as(server, 'operator').put(`/migrations/${held.id}/strategy`, { strategy: 'warm' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining('waits for approval') });
+    await expect(as(server, ADMIN).post('/advisor/recommendations/rec-legacy-mig-b2c4d6e870-0/approve', {})).rejects.toMatchObject({ status: 409 });
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${recOf(server, 'web-01').id}/approve`, {})).rejects.toMatchObject({ status: 409 });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate'); // a newer recommendation for analytics-db
+    const older = server.recommendations.filter((r) => r.subject.name === 'analytics-db');
+    expect(older.length).toBeGreaterThan(0);
+  });
+
+  it('lists the policies with the built-in default and audits every change by advisor.policy.manage', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const list = await as(server, 'viewer').get<{ items: unknown[]; default: { id: string; mode: string; threshold: number } }>('/advisor/policies');
+    expect([list.items.length, list.default.id, list.default.mode, list.default.threshold]).toEqual([1, 'global-default', 'auto_apply_above_threshold', 0.6]);
+    const spec = { name: 'Analytics — stricter', scope: { provider_ids: [], plan_ids: ['plan-c81d44a0'] }, decision_types: ['migration_strategy'], mode: 'auto_apply_above_threshold', threshold: 0.8, min_evidence_for_auto_apply: 0, require_override_reason: false };
+    await expect(as(server, 'approver').post('/advisor/policies', spec)).rejects.toMatchObject({ status: 403 });
+    for (const bad of [{ scope: { provider_ids: ['rhosp17-dc1'], plan_ids: ['plan-c81d44a0'] } }, { scope: { provider_ids: ['nope'], plan_ids: [] } }, { threshold: 1.5 }, { name: '' }]) {
+      await expect(as(server, ADMIN).post('/advisor/policies', { ...spec, ...bad }), JSON.stringify(bad)).rejects.toMatchObject({ status: 422 });
+    }
+    const created = await as(server, ADMIN).post<{ id: string }>('/advisor/policies', spec);
+    await as(server, ADMIN).put(`/advisor/policies/${created.id}`, { ...spec, threshold: 0.85 });
+    await as(server, ADMIN).delete(`/advisor/policies/${created.id}`);
+    await expect(as(server, ADMIN).delete(`/advisor/policies/${created.id}`)).rejects.toMatchObject({ status: 404 });
+    expect(server.events.filter((e) => e.data.target_id === created.id).map((e) => [e.kind, e.actor])).toEqual([
+      ['policy.created', 'user:rina'],
+      ['policy.updated', 'user:rina'],
+      ['policy.deleted', 'user:rina'],
+    ]);
+  });
+});
+
 describe('mock validation decides like the API (SDD §14.4)', () => {
   function validating(advice: { option: string | null; confidence: number | null }) {
     const advise = vi.fn(() => advice);
     const server = new MockServer({ now: () => NOW, seed: 1, advise });
+    server.policies.length = 0; // these run under the built-in global default (SDD §14.6)
     const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
     // the analytics plan: analytics-db ties cold and warm (nothing meets the SLO), the handover nodes do not
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

@@ -682,4 +682,30 @@ describe('PlanDetail', () => {
     renderPlan('plan-4f2a9c1e');
     expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');
   });
+
+  it('lists the migrations waiting for advisor approval and keeps the panel, focused, after the last decision (SDD §14.6, §16, ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-c81d44a0', 'admin');
+    const panel = await screen.findByRole('region', { name: 'Waiting for advisor approval' });
+    expect(await within(panel).findByRole('link', { name: 'analytics-node-2' })).toHaveAttribute('href', '/migrations/mig-b2c4d6e871');
+    expect(await within(panel).findByText('Decision: Waiting for approval — policy pol-finance requires approval')).toBeInTheDocument();
+    expect(panel).toHaveTextContent('Recommended: Storage handover · 86% confidence (threshold 60%)');
+    await user.click(within(panel).getByRole('button', { name: 'Approve' }));
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Approve Storage handover for analytics-node-2?' })).getByRole('button', { name: 'Approve' }));
+    expect(await within(panel).findByText('Nothing waits for approval any more.')).toBeInTheDocument();
+    expect(within(panel).getByText('Waiting for advisor approval')).toHaveFocus();
+    expect(screen.getByText('Approved: analytics-node-2 runs Storage handover.')).toBeInTheDocument();
+    expect(server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!.advisor_hold).toBeNull();
+  });
+
+  it('shows the waiting migrations without the actions below advisor.approve, and no panel when nothing waits', async () => {
+    const { unmount } = renderPlan('plan-c81d44a0', 'operator');
+    const panel = await screen.findByRole('region', { name: 'Waiting for advisor approval' });
+    await within(panel).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    expect(within(panel).queryByRole('button', { name: /approve|override/i })).not.toBeInTheDocument();
+    unmount();
+    renderPlan('plan-4f2a9c1e', 'admin');
+    await screen.findByRole('region', { name: 'Migrations' });
+    expect(screen.queryByRole('region', { name: 'Waiting for advisor approval' })).not.toBeInTheDocument();
+  });
 });

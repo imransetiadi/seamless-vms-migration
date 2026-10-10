@@ -1,4 +1,4 @@
-import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX } from 'lucide-react';
+import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX, SlidersHorizontal } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { useId, useMemo, useState, type FormEvent } from 'react';
 import { useAdvisorStatus, useMigrations, useRecommendations, useSimilarIncidents } from '../api/hooks';
@@ -11,13 +11,14 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList, RecommendationPager } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
 import { nonStrategyNotes } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
 import { formatPct } from '../lib/format';
-import { hasRole } from '../lib/roles';
+import { can, hasRole } from '../lib/roles';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const SUGGESTIONS = ['kernel panic after import', 'warm sync does not converge', 'volume type not mapped', 'MTU after cutover'];
@@ -96,6 +97,9 @@ export default function Advisor() {
           ? null
           : 'agentmemory is not enabled.';
 
+  // a decision that waits for a person is decided in the feed (SDD §14.6): the held migration knows it
+  const byId = useMemo(() => new Map((migrations.data ?? []).map((m) => [m.id, m])), [migrations.data]);
+  const [decided, setDecided] = useState('');
   const notes = useMemo<AdvisorNoteRow[]>(
     () =>
       (migrations.data ?? [])
@@ -122,12 +126,21 @@ export default function Advisor() {
         title="Advisor"
         description="Jev gives bounded, evidence-based judgments (strategy ties, workload tiers, verification review, console screening); agentmemory recalls what happened in past migrations. Both are optional and advisory."
         actions={
-          <Link to="/advisor/audit" className={buttonClassName('secondary', 'md')}>
-            <ScrollText aria-hidden className="size-4 shrink-0" />
-            Audit trail
-          </Link>
+          <>
+            <Link to="/advisor/policies" className={buttonClassName('secondary', 'md')}>
+              <SlidersHorizontal aria-hidden className="size-4 shrink-0" />
+              Policies
+            </Link>
+            <Link to="/advisor/audit" className={buttonClassName('secondary', 'md')}>
+              <ScrollText aria-hidden className="size-4 shrink-0" />
+              Audit trail
+            </Link>
+          </>
         }
       />
+      <p role="status" aria-live="polite" className="sr-only">
+        {decided}
+      </p>
 
       {status.isPending && <LoadingBlock label="Checking advisor services…" rows={2} />}
       {status.error && <ErrorBanner error={status.error} title="Advisor status is unavailable" onRetry={() => void status.refetch()} />}
@@ -164,7 +177,16 @@ export default function Advisor() {
             <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
           ) : (
             <>
-              <RecommendationList items={recommendations.data.items} emptyText="No recommendations yet." />
+              <RecommendationList
+                items={recommendations.data.items}
+                emptyText="No recommendations yet."
+                actionsFor={(rec, focusAfterRef) => {
+                  const m = rec.migration_id ? byId.get(rec.migration_id) : undefined;
+                  return can(role, 'advisor.approve') && m && m.advisor_hold === rec.id ? (
+                    <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                  ) : null;
+                }}
+              />
               <RecommendationPager offset={recommendations.data.offset} limit={FEED_PAGE} total={recommendations.data.total} onChange={setFeedOffset} />
             </>
           )}

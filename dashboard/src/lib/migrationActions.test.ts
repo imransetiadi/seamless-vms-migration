@@ -160,6 +160,14 @@ describe('migrationActions rules', () => {
     expect(warm.text).not.toMatch(/source VM keeps running/i);
   });
 
+  it('names the advisor decision as the next step while it waits for approval: nothing starts meanwhile (SDD §5.4, §14.6)', () => {
+    for (const strategy of ['cold', 'warm', 'storage_handover'] as const) {
+      const step = nextStep(migration('ready', { strategy, advisor_hold: 'rec-000000000001' }), null);
+      expect(step.text, strategy).toBe("Ready. Next: approve or override the advisor's decision (admin); nothing starts before that.");
+      expect(step.action, strategy).toBeNull();
+    }
+  });
+
   it('names the next step', () => {
     expect(nextStep(migration('awaiting_cutover'), null).action).toBe('cutover');
     expect(nextStep(migration('completed'), null).action).toBe('finalize');

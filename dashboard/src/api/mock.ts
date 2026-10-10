@@ -12,6 +12,7 @@
  */
 import { DEFAULT_API_BASE } from './client';
 import { canTransition, hasDataPath } from '../lib/fsm';
+import { resolvePolicy } from '../lib/policies';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
@@ -28,12 +29,16 @@ import {
   preflight,
   prng,
   auditEventsOf,
+  decisionEventOf,
+  humanDecision,
   strategyRecommendation,
   strategySnapshot,
   type StrategyDecision,
 } from './mockData';
 import type {
   Health,
+  AdvisorPolicy,
+  AdvisorPolicySpec,
   AdvisorRecommendation,
   AdvisorSnapshot,
   AdvisorStatus,
@@ -62,7 +67,9 @@ import {
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
   DECISION_TYPES,
+  OVERRIDE_REASON_MIN,
   PHASES,
+  POLICY_MODES,
   PLAN_DESCRIPTION_MAX,
   PLAN_NAME_MAX,
   RECOMMENDATION_LIMIT_DEFAULT,
@@ -154,13 +161,30 @@ function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_po
   return ties.length >= 2 ? bySimplicity(ties) : [];
 }
 
-/** decide() under the global default policy (SDD §14.4): no usable advice, below the threshold, else applied. */
-function decided(advice: SimulatedAdvice, scope: readonly Strategy[]): { status: StrategyDecision; fallback?: string } {
+/** The part of a policy decide() needs (SDD §14.4, §14.6). */
+interface PolicyRule {
+  id: string;
+  mode: AdvisorPolicy['mode'];
+  threshold: number;
+  require_override_reason: boolean;
+}
+
+const GLOBAL_DEFAULT: PolicyRule = { id: 'global-default', mode: 'auto_apply_above_threshold', threshold: JEV_MIN_CONFIDENCE, require_override_reason: false };
+
+/** The policy in force for a plan's strategy decisions (SDD §14.6), or the built-in default. */
+function policyFor(policies: readonly AdvisorPolicy[], plan: Plan): PolicyRule {
+  const winner = resolvePolicy(policies, plan.id, plan.source_provider_id, 'migration_strategy');
+  return winner ? { id: winner.id, mode: winner.mode, threshold: winner.threshold, require_override_reason: winner.require_override_reason } : GLOBAL_DEFAULT;
+}
+
+/** decide() (SDD §14.4): no usable advice, a policy that asks a person, below the threshold, else applied. */
+function decided(advice: SimulatedAdvice, scope: readonly Strategy[], policy: PolicyRule): { status: StrategyDecision; fallback?: string } {
   if (advice.option === null) return { status: 'fallback_rules', fallback: 'advisor unavailable: Jev gave no answer' };
   if (!scope.includes(advice.option as Strategy)) {
     return { status: 'fallback_rules', fallback: `${advice.option} is not among the options it may choose (${scope.join(', ')})` };
   }
-  if (advice.confidence === null || advice.confidence < JEV_MIN_CONFIDENCE) return { status: 'below_threshold' };
+  if (policy.mode === 'always_require_approval') return { status: 'pending_approval' };
+  if (advice.confidence === null || advice.confidence < policy.threshold) return { status: 'below_threshold' };
   return { status: 'auto_applied' };
 }
 
@@ -262,6 +286,8 @@ export class MockServer {
   readonly recommendations: AdvisorRecommendation[];
   /** Redacted advisor inputs by SHA-256, written once (SDD §14.5). */
   readonly snapshots: Map<string, AdvisorSnapshot>;
+  /** Stored advisor policies (SDD §14.6). */
+  readonly policies: AdvisorPolicy[];
   readonly events: Event[];
   private seq: number;
   private readonly advise: NonNullable<MockServerOptions['advise']>;
@@ -286,6 +312,7 @@ export class MockServer {
     this.migrations = fixtures.migrations;
     this.recommendations = fixtures.recommendations;
     this.snapshots = new Map(fixtures.snapshots.map((snapshot) => [snapshot.sha256, snapshot]));
+    this.policies = fixtures.policies;
     this.events = fixtures.events;
     this.seq = this.events.at(-1)?.seq ?? 0;
     this.advise = options.advise ?? simulatedAdvice;
@@ -343,7 +370,13 @@ export class MockServer {
           this.advanceTransfer(m, plan, m.phase === 'precopy' ? 1.4 : 4);
           break;
         case 'ready':
-          if (plan.status === 'running' && SINGLE_SHOT.has(m.strategy) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          // like the API's _begin (SDD §5.4): a held migration starts nothing until a person decides
+          if (plan.status !== 'running' || m.advisor_hold) break;
+          if (SINGLE_SHOT.has(m.strategy)) {
+            if (this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          } else {
+            this.transition(m, 'precopy', 'pre-copy started', 'orchestrator');
+          }
           break;
         case 'awaiting_cutover':
           if (plan.status === 'running' && this.gateOpen(m, plan)) this.beginCutover(m, plan);
@@ -667,6 +700,8 @@ export class MockServer {
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
     this.evaluate(m, plan);
     const rec = this.decideStrategy(m, plan);
+    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
+    m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
@@ -687,7 +722,8 @@ export class MockServer {
     const scope = advisorScope(m.estimates, plan.selection_policy);
     if (!automatic || !scope.length || eligible.length < 2) return null;
     const advice = this.advise(m.vm, scope, m.estimates);
-    const { status, fallback } = decided(advice, scope);
+    const policy = policyFor(this.policies, plan);
+    const { status, fallback } = decided(advice, scope, policy);
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
     // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
@@ -705,8 +741,11 @@ export class MockServer {
       deterministic: m.strategy,
       fallback,
       snapshotSha256: snapshot.sha256,
+      policyId: policy.id,
+      threshold: policy.threshold,
     });
-    const final = rec.decision.final_option as Strategy;
+    // a decision that waits keeps the deterministic choice and holds the migration (SDD §14.6)
+    const final = (rec.decision.final_option ?? m.strategy) as Strategy;
     m.strategy = final;
     m.estimate = m.estimates.find((e) => e.strategy === final) ?? null;
     return rec;
@@ -934,6 +973,19 @@ export class MockServer {
         };
         return ok(status);
       }
+      if (id === 'policies') {
+        if (!sub && method === 'GET') {
+          this.require(token, 'viewer', path);
+          const builtin: AdvisorPolicy = { ...GLOBAL_DEFAULT, name: 'Global default', scope: { provider_ids: [], plan_ids: [] }, decision_types: [], min_evidence_for_auto_apply: 0, created_at: '1970-01-01T00:00:00Z', updated_at: '1970-01-01T00:00:00Z', updated_by: 'system' };
+          return ok({ items: this.policies, default: builtin });
+        }
+        if (!sub && method === 'POST') return this.createPolicy(this.require(token, 'admin', path), input);
+        if (sub && method === 'PUT') return this.replacePolicy(this.require(token, 'admin', path), sub, input);
+        if (sub && method === 'DELETE') return this.deletePolicy(this.require(token, 'admin', path), sub);
+      }
+      if (id === 'recommendations' && sub && (subsub === 'approve' || subsub === 'override') && method === 'POST') {
+        return this.decideRecommendation(this.require(token, 'admin', path), sub, subsub, input);
+      }
       if (id === 'snapshots' && sub !== undefined && method === 'GET') {
         this.require(token, 'viewer', path);
         if (!/^[0-9a-f]{64}$/.test(sub)) throw new HttpError(422, 'validation_error', "sha256: String should match pattern '^[0-9a-f]{64}$'");
@@ -968,6 +1020,113 @@ export class MockServer {
   // ---------------------------------------------------------------------------------------
   // Route handlers
   // ---------------------------------------------------------------------------------------
+
+  /** A policy as the API accepts it (SDD §12, §14.6): 422 otherwise. */
+  private policySpec(input: Record<string, unknown>): AdvisorPolicySpec {
+    const scope = (typeof input.scope === 'object' && input.scope !== null ? input.scope : {}) as Record<string, unknown>;
+    const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
+    const spec: AdvisorPolicySpec = {
+      name: typeof input.name === 'string' ? input.name : '',
+      scope: { provider_ids: list(scope.provider_ids), plan_ids: list(scope.plan_ids) },
+      decision_types: list(input.decision_types) as AdvisorPolicySpec['decision_types'],
+      mode: input.mode as AdvisorPolicySpec['mode'],
+      threshold: Number(input.threshold),
+      min_evidence_for_auto_apply: input.min_evidence_for_auto_apply === undefined ? 0 : Number(input.min_evidence_for_auto_apply),
+      require_override_reason: input.require_override_reason === undefined ? true : Boolean(input.require_override_reason),
+    };
+    const problems: string[] = [];
+    if (!spec.name.trim() || spec.name.length > 200) problems.push('name: 1-200 characters');
+    if (!POLICY_MODES.includes(spec.mode)) problems.push(`mode: one of ${POLICY_MODES.join(', ')}`);
+    if (!Number.isFinite(spec.threshold) || spec.threshold < 0 || spec.threshold > 1) problems.push('threshold: 0 to 1');
+    if (!Number.isInteger(spec.min_evidence_for_auto_apply) || spec.min_evidence_for_auto_apply < 0 || spec.min_evidence_for_auto_apply > 100) problems.push('min_evidence_for_auto_apply: 0 to 100');
+    if (spec.decision_types.some((t) => !DECISION_TYPES.includes(t))) problems.push('decision_types: unknown type');
+    if (spec.scope.provider_ids.length && spec.scope.plan_ids.length) problems.push('a policy scopes either providers or plans, not both');
+    const unknown = [...spec.scope.provider_ids.filter((id) => !this.providers.some((p) => p.id === id)), ...spec.scope.plan_ids.filter((id) => !this.plans.some((p) => p.id === id))];
+    if (unknown.length) problems.push(`unknown provider or plan: ${unknown.join(', ')}`);
+    if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+    return spec;
+  }
+
+  private auditPolicy(me: Me, kind: string, id: string, before: AdvisorPolicy | null, after: AdvisorPolicy | null): void {
+    this.emit({ kind, plan_id: null, migration_id: null, actor: `user:${me.name}`, message: `advisor policy ${id} ${kind.replace('policy.', '')}`, data: { target_id: id, before, after } });
+  }
+
+  private createPolicy(me: Me, input: Record<string, unknown>): MockResponse {
+    const at = new Date(this.now()).toISOString();
+    const policy: AdvisorPolicy = { ...this.policySpec(input), id: `pol-${hex(this.rand, 12)}`, created_at: at, updated_at: at, updated_by: me.name };
+    this.policies.push(policy);
+    this.auditPolicy(me, 'policy.created', policy.id, null, policy);
+    return ok(policy, 201);
+  }
+
+  private replacePolicy(me: Me, id: string, input: Record<string, unknown>): MockResponse {
+    const index = this.policies.findIndex((p) => p.id === id);
+    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    const before = this.policies[index]!;
+    const after: AdvisorPolicy = { ...this.policySpec(input), id, created_at: before.created_at, updated_at: new Date(this.now()).toISOString(), updated_by: me.name };
+    this.policies[index] = after;
+    this.auditPolicy(me, 'policy.updated', id, before, after);
+    return ok(after);
+  }
+
+  private deletePolicy(me: Me, id: string): MockResponse {
+    const index = this.policies.findIndex((p) => p.id === id);
+    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    const [before] = this.policies.splice(index, 1);
+    this.auditPolicy(me, 'policy.deleted', id, before!, null);
+    return { status: 204 };
+  }
+
+  /** Approve or override an advisor decision, like the API (SDD §14.6). */
+  private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
+    if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
+    const index = this.recommendations.findIndex((r) => r.id === recId);
+    if (index < 0) throw new HttpError(404, 'not_found', `recommendation ${recId} not found`);
+    const rec = this.recommendations[index]!;
+    const m = this.migrations.find((x) => x.id === rec.migration_id);
+    if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
+    const newest = this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a));
+    if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
+    const plan = this.plan(m.plan_id);
+    const policy = policyFor(this.policies, plan);
+    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
+    if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
+    if (action === 'override' && policy.require_override_reason && (reason ?? '').length < OVERRIDE_REASON_MIN) {
+      throw new HttpError(422, 'validation_error', `policy ${policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
+    }
+    if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
+    const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
+    const at = new Date(this.now()).toISOString();
+    let decided: AdvisorRecommendation;
+    if (action === 'approve') {
+      const recommended = rec.recommendation.option;
+      if (recommended === null || !eligible.includes(recommended)) {
+        throw new HttpError(409, 'conflict', `nothing to approve: ${recommended ?? 'no option'} is not an eligible option`);
+      }
+      decided = humanDecision(rec, { kind: 'approve', user: me.name }, at);
+    } else {
+      const option = String(input.option ?? '');
+      if (!eligible.includes(option)) throw new HttpError(422, 'validation_error', `${option} is not an eligible option`);
+      decided = humanDecision(rec, { kind: 'override', user: me.name, option, reason }, at);
+    }
+    decided.decision.policy_id = policy.id;
+    this.recommendations[index] = decided;
+    const final = decided.decision.final_option as Strategy;
+    const changed = final !== m.strategy;
+    m.strategy = final;
+    m.estimate = m.estimates.find((e) => e.strategy === final) ?? null;
+    m.advisor_hold = null;
+    if (changed) this.clearApprovals(m);
+    m.updated_at = at;
+    if (action === 'override') {
+      plan.strategy_overrides = { ...plan.strategy_overrides, [m.vm.source_id]: final };
+      plan.updated_at = at;
+      this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name}: strategy override for ${m.vm.name}`, data: { strategy_overrides: { [m.vm.source_id]: final } } });
+    }
+    this.emit({ plan_id: plan.id, migration_id: m.id, ...decisionEventOf(decided, rec.decision) });
+    if (changed) this.emit({ kind: 'migration.action', plan_id: plan.id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: strategy set to ${final} by the advisor decision`, data: { action: 'strategy', strategy: final } });
+    return ok(decided);
+  }
 
   /** Stored and legacy recommendations, newest first (SDD §12, §14.4). */
   private allRecommendations(): AdvisorRecommendation[] {
@@ -1228,6 +1387,7 @@ export class MockServer {
       cutover_requested: false,
       force_window: false,
       advisor_notes: [],
+      advisor_hold: null,
       review_required: false,
       review_reason: null,
       destination_server_id: null,
@@ -1309,7 +1469,7 @@ export class MockServer {
     }
     plan.status = 'running';
     plan.updated_at = new Date(this.now()).toISOString();
-    for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {
+    for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && !x.advisor_hold && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {
       this.transition(m, 'precopy', 'wave started', 'orchestrator');
     }
     this.emit({ kind: 'plan.started', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" started`, data: {} });
@@ -1328,6 +1488,9 @@ export class MockServer {
     const strategy = input.strategy as Strategy;
     if (!STRATEGIES.includes(strategy)) throw new HttpError(422, 'validation_error', 'Unknown strategy.');
     if (!['pending', 'ready', 'blocked'].includes(m.phase)) throw new HttpError(409, 'conflict', `Strategy can only change in pending, ready or blocked (now ${m.phase}).`);
+    if (m.advisor_hold) {
+      throw new HttpError(409, 'conflict', `the advisor's decision (${m.advisor_hold}) waits for approval: approve or override it (advisor.approve)`);
+    }
     const est: Estimate | undefined = m.estimates.find((e) => e.strategy === strategy);
     if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
     m.strategy = strategy;

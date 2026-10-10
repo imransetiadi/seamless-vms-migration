@@ -4,7 +4,7 @@
  * The control plane's `decide()` takes every decision; this module only puts it into words. It never
  * compares a confidence with a threshold: what a decision says comes from its status and reason code.
  */
-import type { AdvisorNote, AdvisorRecommendation, DecisionType } from '../api/types';
+import type { AdvisorNote, AdvisorRecommendation, DecisionType, Migration } from '../api/types';
 import { formatPct } from './format';
 
 /**
@@ -118,4 +118,12 @@ export function distributionRows(rec: AdvisorRecommendation): Array<{ option: st
 /** Strategy notes are listed as (legacy) recommendations (SDD §14.4), so note lists leave them out. */
 export function nonStrategyNotes<T extends Pick<AdvisorNote, 'kind'>>(notes: T[]): T[] {
   return notes.filter((n) => n.kind !== 'strategy');
+}
+
+/** Phases in which a migration's strategy can still change (SDD §14.6). */
+const CHANGEABLE = new Set(['pending', 'blocked', 'ready']);
+
+/** Whether a person may decide on `rec` now: the newest recommendation of a migration that has not started (SDD §14.6). */
+export function decidable(rec: AdvisorRecommendation, migration: Migration | undefined, newestId: string | undefined): migration is Migration {
+  return !rec.legacy && rec.decision_type === 'migration_strategy' && migration !== undefined && CHANGEABLE.has(migration.phase) && newestId === rec.id;
 }

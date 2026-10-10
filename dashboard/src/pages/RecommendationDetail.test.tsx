@@ -1,7 +1,8 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
+import { strategyRecommendation } from '../api/mockData';
 import { createTestServer, renderWithApp } from '../test/utils';
 import RecommendationDetail from './RecommendationDetail';
 
@@ -87,5 +88,40 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
   it('says when the recommendation does not exist', async () => {
     renderRec('rec-000000000000');
     expect(await screen.findByText(/recommendation could not be loaded/i)).toBeInTheDocument();
+  });
+
+  it('offers Approve and Override while the recommendation can still change its migration, to advisor.approve (SDD §14.6, ADV-04)', async () => {
+    const server = createTestServer();
+    const id = server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!.advisor_hold!;
+    const admin = renderWithApp(<RecommendationDetail />, { route: `/advisor/recommendations/${id}`, path: '/advisor/recommendations/:recId', token: 'admin', server });
+    expect(await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' })).toBeInTheDocument();
+    admin.unmount();
+    renderRec(id, server);
+    await screen.findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
+  });
+
+  it('offers no action on a recommendation whose migration has started', async () => {
+    const { queryClient } = renderWithApp(<RecommendationDetail />, { route: '/advisor/recommendations/rec-d4e6f8a09001', path: '/advisor/recommendations/:recId', token: 'admin' });
+    await screen.findByText('Decision: Cold migration — below threshold, default kept');
+    // absent once the migration and its newest recommendations are loaded, not merely before
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    expect(queryClient.getQueryData(['migration', 'mig-d4e6f8a090'])).toMatchObject({ phase: 'finalized' });
+    expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
+  });
+
+  it('offers no action on a recommendation a newer one replaced (SDD §14.6)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!;
+    const older = m.advisor_hold!;
+    server.recommendations.push(
+      strategyRecommendation({ id: 'rec-b2c4d6e87199', at: '2026-10-08T11:59:00Z', migration: m, providerId: 'rhosp17-dc1', option: 'warm', confidence: 0.9, options: ['cold', 'warm', 'storage_handover'], status: 'pending_approval', deterministic: 'storage_handover', snapshotSha256: null, policyId: 'pol-finance' }),
+    );
+    m.advisor_hold = 'rec-b2c4d6e87199';
+    const { queryClient } = renderWithApp(<RecommendationDetail />, { route: `/advisor/recommendations/${older}`, path: '/advisor/recommendations/:recId', token: 'admin', server });
+    await screen.findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    expect(queryClient.getQueryData(['migration', 'mig-b2c4d6e871'])).toMatchObject({ phase: 'ready' });
+    expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
 });

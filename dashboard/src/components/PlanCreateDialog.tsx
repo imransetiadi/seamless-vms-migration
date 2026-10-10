@@ -4,7 +4,6 @@ import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
-import { cn } from '../lib/cn';
 import { heldElsewhere } from '../lib/holds';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
@@ -12,6 +11,7 @@ import { stable } from '../lib/stable';
 import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
+import { Checkbox } from './Checkbox';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
 import { Modal } from './Modal';
@@ -203,35 +203,6 @@ function formFromPlan(plan: Plan): FormState {
 function strategiesFor(kind: ProviderKind | undefined): Strategy[] {
   if (kind === 'vmware') return ['vmware_cold', 'vmware_warm'];
   return ['cold', 'warm', 'storage_handover'];
-}
-
-interface CheckboxProps {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-  hint?: string;
-  disabled?: boolean;
-  /** Id of the text that says why the box is disabled. */
-  describedBy?: string;
-}
-
-function Checkbox({ checked, onChange, label, hint, disabled = false, describedBy }: CheckboxProps) {
-  return (
-    <label className={cn('flex min-h-11 items-start gap-2.5 py-1', disabled ? 'cursor-not-allowed' : 'cursor-pointer')}>
-      <input
-        type="checkbox"
-        className="mt-1 size-4 shrink-0 cursor-pointer accent-accent disabled:cursor-not-allowed disabled:opacity-50"
-        checked={checked}
-        disabled={disabled}
-        aria-describedby={describedBy}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <span className={cn('text-sm text-foreground', disabled && 'opacity-70')}>
-        {label}
-        {hint && <span className="block text-xs text-muted-foreground">{hint}</span>}
-      </span>
-    </label>
-  );
 }
 
 /** `aria-describedby` for a field shown read-only; nothing otherwise, so the field keeps its own hint and error. */

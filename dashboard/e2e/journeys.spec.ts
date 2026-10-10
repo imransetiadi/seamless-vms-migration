@@ -95,3 +95,24 @@ test('storage handover on NetApp NFS names the RHOSO pool each volume type lands
   await expect(page).toHaveURL(/\/plans\/plan-/);
   await expect(page.getByRole('heading', { level: 1, name: 'NetApp handover' })).toBeVisible();
 });
+
+test('an admin approves a decision the Finance policy holds; the audit trail names who approved it (ADV-04)', async ({ page }) => {
+  await signIn(page);
+  await page.goto('/plans/plan-c81d44a0');
+  const panel = page.getByRole('region', { name: 'Waiting for advisor approval' });
+  await expect(panel.getByRole('link', { name: 'analytics-node-2', exact: true })).toBeVisible();
+  await panel.getByRole('button', { name: 'Approve' }).click();
+  await page.getByRole('alertdialog', { name: 'Approve Storage handover for analytics-node-2?' }).getByRole('button', { name: 'Approve' }).click();
+  await expect(panel.getByText('Nothing waits for approval any more.')).toBeVisible();
+  await expect(panel.getByText('Waiting for advisor approval')).toBeFocused();
+
+  // in-app navigation keeps the in-browser mock state that a page load would reset
+  await page.getByRole('link', { name: 'Advisor', exact: true }).click();
+  await page.getByRole('link', { name: 'Audit trail' }).click();
+  const approved = page
+    .getByRole('row')
+    .filter({ hasText: 'Decision: approved' })
+    .filter({ hasText: 'user:rina' })
+    .filter({ has: page.getByRole('link', { name: 'analytics-node-2', exact: true }) });
+  await expect(approved).toHaveCount(1);
+});

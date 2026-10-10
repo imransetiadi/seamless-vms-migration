@@ -19,6 +19,7 @@ import { ApiError } from '../api/client';
 import { useMigrations, usePlan, usePlanAction, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { Plan, Provider, ValidationReport } from '../api/types';
+import { AdvisorApprovals } from '../components/AdvisorApprovals';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PlanCreateDialog } from '../components/PlanCreateDialog';
@@ -358,6 +359,8 @@ export default function PlanDetail() {
       </section>
 
       <div className="flex flex-col gap-4">
+        <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
+
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
           <SettingsSummary plan={p} providers={providers.data ?? []} />
         </Panel>

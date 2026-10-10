@@ -131,6 +131,8 @@ export default function AdvisorAudit() {
               <tbody>
                 {shown.map((e) => {
                   const target = text(e.data.target_id);
+                  // a policy change names the policy (SDD §14.5); the policies page lists it
+                  const policyName = text((e.data.after as { name?: unknown } | null)?.name) || text((e.data.before as { name?: unknown } | null)?.name);
                   return (
                     <tr key={e.seq}>
                       <td className="whitespace-nowrap">
@@ -139,7 +141,11 @@ export default function AdvisorAudit() {
                       <td>{auditActionLabel(e.kind)}</td>
                       <td className="font-mono text-xs">{e.actor}</td>
                       <td>
-                        {target ? (
+                        {target && e.kind.startsWith('policy.') ? (
+                          <Link to="/advisor/policies" className="underline underline-offset-4">
+                            {policyName || target}
+                          </Link>
+                        ) : target ? (
                           <Link to={`/advisor/recommendations/${encodeURIComponent(target)}`} className="font-mono underline underline-offset-4">
                             {names.get(target) || target}
                           </Link>

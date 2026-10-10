@@ -232,4 +232,59 @@ describe('MigrationDetail', () => {
     const advisor = await screen.findByRole('region', { name: /^advisor$/i });
     expect(await within(advisor).findByText('No advisor recommendations or notes for this migration.')).toBeInTheDocument();
   });
+
+  it('shows that the migration waits for advisor approval, to everyone, and the actions only to advisor.approve (SDD §14.6, ADV-04)', async () => {
+    const { server } = renderMigration('mig-b2c4d6e871');
+    const hold = await screen.findByText(/^Waiting for advisor approval\./);
+    const recId = server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!.advisor_hold!;
+    expect(within(hold.closest('[role="status"]') as HTMLElement).getByRole('link', { name: 'See the recommendation' })).toHaveAttribute(
+      'href',
+      `/advisor/recommendations/${recId}`,
+    );
+    const advisor = await screen.findByRole('region', { name: /^advisor$/i });
+    await within(advisor).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    expect(within(advisor).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
+  });
+
+  it('overrides the decision with the reason the policy asks for, then runs the chosen option (SDD §14.6, ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<MigrationDetail />, { route: '/migrations/mig-b2c4d6e871', path: '/migrations/:migrationId', token: 'admin' });
+    const advisor = await screen.findByRole('region', { name: /^advisor$/i });
+    const group = await within(advisor).findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Override the recommendation for analytics-node-2?' });
+    // another eligible option: running the recommended one is approving it
+    expect(within(within(dialog).getByLabelText('Run instead')).getAllByRole('option').map((o) => o.textContent)).toEqual(['Cold migration', 'Warm migration']);
+    await user.selectOptions(within(dialog).getByLabelText('Run instead'), 'cold');
+    const reason = within(dialog).getByLabelText(/^Reason/);
+    // the Finance policy asks for a reason of at least 10 characters
+    expect(reason).toBeRequired();
+    await user.type(reason, 'too short');
+    const confirm = within(dialog).getByRole('button', { name: 'Override' });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a reason of at least 10 characters.');
+    await user.click(confirm);
+    expect(server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!.advisor_hold).not.toBeNull();
+    await user.type(reason, ': the window fits a cold cutover');
+    await user.click(confirm);
+    expect(await within(advisor).findByText('Decision: Cold migration — overridden by rina')).toBeInTheDocument();
+    expect(within(advisor).getByText('too short: the window fits a cold cutover')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/^Waiting for advisor approval\./)).not.toBeInTheDocument());
+    expect(server.migrations.find((m) => m.id === 'mig-b2c4d6e871')).toMatchObject({ strategy: 'cold', advisor_hold: null });
+    expect(within(advisor).getByText('Overridden: analytics-node-2 runs Cold migration.')).toBeInTheDocument();
+  });
+
+  it('asks for no reason when the policy in force does not (SDD §14.6)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    server.policies[0]!.require_override_reason = false;
+    renderWithApp(<MigrationDetail />, { route: '/migrations/mig-b2c4d6e871', path: '/migrations/:migrationId', token: 'admin', server });
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Override the recommendation for analytics-node-2?' });
+    expect(within(dialog).getByLabelText('Reason (optional)')).not.toBeRequired();
+    await user.selectOptions(within(dialog).getByLabelText('Run instead'), 'cold');
+    await user.click(within(dialog).getByRole('button', { name: 'Override' }));
+    expect(await screen.findByText('Decision: Cold migration — overridden by rina')).toBeInTheDocument();
+  });
 });

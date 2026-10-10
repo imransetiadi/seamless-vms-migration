@@ -165,11 +165,19 @@ export function applyEventToCache(
     }
   }
 
+  if (kind.startsWith('policy.')) {
+    // a policy change (SDD §14.5, §14.6): the policies page and the audit lists
+    invalidate(['advisor', 'policies']);
+    invalidate(['events', 'tail']);
+    return;
+  }
   if (kind.startsWith('recommendation.') || kind.startsWith('decision.')) {
     // an audit event (SDD §14.5): the feed, a recommendation's detail and the audit lists
     invalidate(['advisor', 'recommendations']);
     invalidate(['events', 'tail']);
     if (event.migration_id) invalidate(['migration', event.migration_id]);
+    // a decision sets or clears a hold the plan page lists (SDD §14.6), even when the strategy stays
+    if (kind.startsWith('decision.')) invalidate(['migrations']);
     return;
   }
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {

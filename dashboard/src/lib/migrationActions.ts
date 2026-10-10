@@ -2,7 +2,7 @@ import type { Migration, Phase, Plan, Role } from '../api/types';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
-import { hasRole } from './roles';
+import { hasRole, PERMISSIONS } from './roles';
 
 export type MigrationActionKey = 'approve' | 'cutover' | 'sync' | 'rollback' | 'retry' | 'cancel' | 'finalize';
 
@@ -121,6 +121,13 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'blocked':
       return { text: 'Blocked. Next: fix the blocker findings, then re-validate the plan (operator).', action: null };
     case 'ready':
+      if (m.advisor_hold) {
+        // neither its pre-copy nor its cutover starts before a person decides (SDD §5.4, §14.6)
+        return {
+          text: `Ready. Next: approve or override the advisor's decision (${PERMISSIONS['advisor.approve']}); nothing starts before that.`,
+          action: null,
+        };
+      }
       if (sourceStopped(m)) {
         // a retried cutover (SDD §5.2): the source has been down since the failed attempt
         if (!isSingleShot(m)) {

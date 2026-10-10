@@ -9,6 +9,9 @@ const ACTION_LABELS: Record<AuditEventKind, string> = {
   'decision.overridden': 'Decision: overridden',
   'decision.below_threshold': 'Decision: below threshold, default kept',
   'decision.fallback': 'Decision: fell back to the rules',
+  'policy.created': 'Policy created',
+  'policy.updated': 'Policy changed',
+  'policy.deleted': 'Policy deleted',
 };
 
 export function auditActionLabel(kind: string): string {

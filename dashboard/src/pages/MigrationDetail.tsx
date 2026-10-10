@@ -1,4 +1,4 @@
-import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
@@ -19,18 +19,19 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseStepper } from '../components/PhaseStepper';
 import { ProgressBar } from '../components/ProgressBar';
+import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { PhaseBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
-import { nonStrategyNotes } from '../lib/advisor';
+import { decidable, nonStrategyNotes } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
-import { hasRole } from '../lib/roles';
+import { can, hasRole } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -92,6 +93,18 @@ function Alerts({ m }: { m: Migration }) {
           <CircleX aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
           <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Last error:</strong> {m.error}
+          </p>
+        </div>
+      )}
+      {m.advisor_hold && (
+        <div role="status" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <Hourglass aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <p className="wrap-break-word text-foreground">
+            <strong className="font-semibold">Waiting for advisor approval.</strong> The migration starts once a person approves or overrides the
+            advisor&apos;s decision.{' '}
+            <Link to={`/advisor/recommendations/${encodeURIComponent(m.advisor_hold)}`} className="underline underline-offset-4">
+              See the recommendation
+            </Link>
           </p>
         </div>
       )}
@@ -314,6 +327,8 @@ function verificationProfile(family: GuestOS['family'], v: VerificationConfig | 
 /** This migration's recommendations, listed like the Advisor feed, and its other notes (SDD §14.4, §16). */
 function MigrationAdvisor({ m }: { m: Migration }) {
   const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
+  const role = useRole();
+  const [decided, setDecided] = useState('');
   const notes = nonStrategyNotes(m.advisor_notes);
   if (recommendations.isPending) return <LoadingBlock rows={3} />;
   const page = recommendations.data;
@@ -322,6 +337,9 @@ function MigrationAdvisor({ m }: { m: Migration }) {
   }
   return (
     <div className="flex flex-col gap-4">
+      <p role="status" aria-live="polite" className="sr-only">
+        {decided}
+      </p>
       {recommendations.error ? (
         <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
       ) : (
@@ -329,7 +347,15 @@ function MigrationAdvisor({ m }: { m: Migration }) {
         page.items.length > 0 && (
           <div>
             <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Recommendations</h3>
-            <RecommendationList items={page.items} showSubject={false} />
+            <RecommendationList
+              items={page.items}
+              showSubject={false}
+              actionsFor={(rec, focusAfterRef) =>
+                can(role, 'advisor.approve') && decidable(rec, m, page.items.find((r) => !r.legacy)?.id) ? (
+                  <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                ) : null
+              }
+            />
             {page.total > page.items.length && (
               <p className="mt-2 text-xs text-muted-foreground">
                 The newest {page.items.length} of {page.total} are shown.

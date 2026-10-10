@@ -30,7 +30,7 @@ describe('advisor audit export (SDD §14.5, ADV-05)', () => {
   it('names every audit action in words', () => {
     for (const kind of AUDIT_EVENT_KINDS) {
       expect(auditActionLabel(kind), kind).not.toBe(kind);
-      expect(auditActionLabel(kind), kind).toMatch(/^(Recommendation|Decision)/);
+      expect(auditActionLabel(kind), kind).toMatch(/^(Recommendation|Decision|Policy)/);
     }
     expect(auditActionLabel('plan.updated')).toBe('plan.updated');
   });

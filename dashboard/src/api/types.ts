@@ -396,6 +396,53 @@ export interface AdvisorRecommendation {
   legacy_text: string | null;
 }
 
+/** Where a policy applies: plans or source providers; neither = everywhere (SDD §14.6). */
+export interface PolicyScope {
+  provider_ids: string[];
+  plan_ids: string[];
+}
+
+export const POLICY_MODES = ['auto_apply_above_threshold', 'always_require_approval'] as const;
+export type PolicyMode = (typeof POLICY_MODES)[number];
+/** A policy name is 1–200 characters and its minimum evidence 0..100 (SDD §4). */
+export const POLICY_NAME_MAX = 200;
+export const POLICY_MIN_EVIDENCE_MAX = 100;
+
+/** A policy as it is written: POST and PUT /advisor/policies (SDD §12, §14.6). */
+export interface AdvisorPolicySpec {
+  name: string;
+  scope: PolicyScope;
+  /** None = every decision type. */
+  decision_types: DecisionType[];
+  mode: PolicyMode;
+  /** 0..1 */
+  threshold: number;
+  min_evidence_for_auto_apply: number;
+  require_override_reason: boolean;
+}
+
+export interface AdvisorPolicy extends AdvisorPolicySpec {
+  id: string;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  updated_by: string;
+}
+
+/** GET /advisor/policies: the stored policies and the built-in default, read-only (SDD §12). */
+export interface PolicyList {
+  items: AdvisorPolicy[];
+  default: AdvisorPolicy;
+}
+
+/** POST /advisor/recommendations/{id}/override (SDD §12, §14.6). */
+export interface OverrideRequest {
+  option: Strategy;
+  reason?: string | null;
+}
+
+/** The shortest override reason a policy that requires one accepts (SDD §14.6). */
+export const OVERRIDE_REASON_MIN = 10;
+
 /** A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5). */
 export interface AdvisorSnapshot {
   sha256: string;
@@ -447,6 +494,8 @@ export interface Migration {
   cutover_requested: boolean;
   force_window: boolean;
   advisor_notes: AdvisorNote[];
+  /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
+  advisor_hold: string | null;
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;
@@ -511,6 +560,9 @@ export const AUDIT_EVENT_KINDS = [
   'decision.overridden',
   'decision.below_threshold',
   'decision.fallback',
+  'policy.created',
+  'policy.updated',
+  'policy.deleted',
 ] as const;
 export type AuditEventKind = (typeof AUDIT_EVENT_KINDS)[number];
 

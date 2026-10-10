@@ -12,6 +12,8 @@ import {
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
 import type {
+  AdvisorPolicy,
+  AdvisorPolicySpec,
   AdvisorRecommendation,
   AdvisorSnapshot,
   AdvisorStatus,
@@ -30,6 +32,8 @@ import type {
   Plan,
   PlanCreate,
   PlanPatch,
+  PolicyList,
+  OverrideRequest,
   Provider,
   ProviderCreate,
   ProviderCredentials,
@@ -72,6 +76,7 @@ export const queryKeys = {
   /** Under `recommendations`, so a refresh of the list refreshes it too. */
   recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
   snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
+  policies: ['advisor', 'policies'] as const,
 };
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
@@ -229,6 +234,16 @@ export function useRecommendation(recId: string | undefined) {
     queryKey: queryKeys.recommendation(recId ?? ''),
     queryFn: ({ signal }) => api.get<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId ?? '')}`, { signal }),
     enabled: Boolean(recId),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/policies`: the stored policies and the built-in default (SDD §12, §14.6). */
+export function usePolicies() {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.policies,
+    queryFn: ({ signal }) => api.get<PolicyList>('/advisor/policies', { signal }),
     retry: noRetryOnClientErrors,
   });
 }
@@ -458,6 +473,41 @@ export function useSetStrategy(migrationId: string) {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
       invalidateAll(queryClient, [['migrations']]);
     },
+  });
+}
+
+/** POST or PUT `/advisor/policies` (`advisor.policy.manage`, SDD §12, §14.6). */
+export function useSavePolicy() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, spec }: { id?: string; spec: AdvisorPolicySpec }) =>
+      id ? api.put<AdvisorPolicy>(`/advisor/policies/${enc(id)}`, spec) : api.post<AdvisorPolicy>('/advisor/policies', spec),
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.policies, ['events', 'tail']]),
+  });
+}
+
+/** DELETE `/advisor/policies/{id}` (`advisor.policy.manage`). */
+export function useDeletePolicy() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete(`/advisor/policies/${enc(id)}`),
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.policies, ['events', 'tail']]),
+  });
+}
+
+export type RecommendationDecisionRequest = { action: 'approve' } | { action: 'override'; body: OverrideRequest };
+
+/** Approve or override an advisor decision (`advisor.approve`, SDD §14.6). */
+export function useDecideRecommendation(recId: string) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: RecommendationDecisionRequest) =>
+      api.post<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId)}/${request.action}`, request.action === 'override' ? request.body : {}),
+    // the decision changes the migration's strategy and hold, an override the plan's overrides too
+    onSuccess: () => invalidateAll(queryClient, [['advisor', 'recommendations'], ['migrations'], ['migration'], ['plans'], ['events', 'tail']]),
   });
 }
 

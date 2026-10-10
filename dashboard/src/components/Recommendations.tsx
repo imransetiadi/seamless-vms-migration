@@ -1,4 +1,5 @@
 import { Bot, ChevronLeft, ChevronRight, History, ListChecks, type LucideIcon } from 'lucide-react';
+import { useRef, type ReactNode, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import type { AdvisorRecommendation } from '../api/types';
 import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, decisionText, recommendedParts } from '../lib/advisor';
@@ -36,9 +37,14 @@ export function DecisionLine({ rec, className }: { rec: AdvisorRecommendation; c
   return <p className={className}>Decision: {decisionText(rec)}</p>;
 }
 
+/** The actions for one entry; `focusAfterRef` is where focus goes after a decision that removes them (SDD §16). */
+export type ActionsFor = (rec: AdvisorRecommendation, focusAfterRef: RefObject<HTMLElement>) => ReactNode;
+
 /** What the advisor recommended, then what was decided: the line the migration runs (SDD §16). Untrusted text renders as plain text. */
-function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; showSubject: boolean }) {
+function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorRecommendation; showSubject: boolean; actionsFor?: ActionsFor }) {
   const ModelIcon = MODEL_ICON[rec.model.name] ?? Bot;
+  // the entry stays when its actions go: focus moves here after a decision (SDD §16)
+  const detailsRef = useRef<HTMLAnchorElement>(null);
   return (
     <li className="py-2.5">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
@@ -64,7 +70,7 @@ function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; 
         <time dateTime={rec.created_at} title={formatDateTime(rec.created_at)} className="text-muted-foreground">
           {formatRelative(rec.created_at)}
         </time>
-        <Link to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
+        <Link ref={detailsRef} to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
           Details<span className="sr-only"> for {rec.subject.name}</span>
         </Link>
       </div>
@@ -74,6 +80,7 @@ function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; 
       {rec.legacy && rec.legacy_text && (
         <p className="mt-1.5 wrap-break-word border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {rec.legacy_text}</p>
       )}
+      {actionsFor?.(rec, detailsRef)}
     </li>
   );
 }
@@ -83,17 +90,20 @@ export function RecommendationList({
   items,
   showSubject = true,
   emptyText = 'No recommendations yet.',
+  actionsFor,
 }: {
   items: AdvisorRecommendation[];
   /** Name and link the VM of each entry (off on the migration's own page). */
   showSubject?: boolean;
   emptyText?: string;
+  /** Approve and Override for an entry a person may decide on (SDD §14.6), else nothing. */
+  actionsFor?: ActionsFor;
 }) {
   if (items.length === 0) return <EmptyState icon={Bot} title={emptyText} />;
   return (
     <ul className="-my-2 divide-y divide-border">
       {items.map((rec) => (
-        <RecommendationItem key={rec.id} rec={rec} showSubject={showSubject} />
+        <RecommendationItem key={rec.id} rec={rec} showSubject={showSubject} actionsFor={actionsFor} />
       ))}
     </ul>
   );

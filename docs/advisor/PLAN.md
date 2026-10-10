@@ -33,12 +33,25 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 | PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | done — 22a318d, 9719b27, 7331687, 7b5cbdc, ab29332, d8f2fb0, eec70db |
 | PR-2 | ADV-06 core | one redaction gateway every Jev call and memory write passes; fixture test (password, bearer, PEM, clouds.yaml `auth`) | done — 4cf3f31, ed99de7 (`ai/redaction.py`, jev_decide 0.99 over keeping it in the agentmemory client) |
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | done — e652375, 013b627, b313ce2 (`ai/snapshots.py`, `/advisor/audit`, `/advisor/recommendations/:id`; jev_decide 0.91 replace `advisor.strategy`, 0.92 dedicated audit route) |
-| PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | done — 791c259 and the feat commit after it (confidence once, rounded down; reason without numbers; `Term` tooltip; Details tab; old-notes replay test) |
-| PR-5 | ADV-04 | `advisor_policy` kind, resolution (plan tag > provider > environment > global; ties → strictest), CRUD (admin), approve/override (admin, reason ≥ 10 chars when required), pending approval holds the migration, Demo policy "Finance — approval required" | planned |
+| PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | done — 791c259, c18699a (confidence once, rounded down; reason without numbers; `Term` tooltip; Details tab; old-notes replay test). The review of 10 Oct asks for the threshold value in the Decision line ("57% < 60%"): see the post-review order below |
+| PR-5 | ADV-04 | `advisor_policy` kind, resolution (plan > source provider > global; ties → strictest), CRUD (admin), approve/override (admin, reason ≥ 10 chars when required), pending approval holds the migration, Demo policy "Finance — approval required" | done — 33f7d09 (SDD), 7054651 (API: `ai/policies.py`, `advisor_hold`, `/advisor/policies`, approve/override), the dashboard commit after it (`/advisor/policies`, Approve/Override in the feed, the plan's "Waiting for advisor approval" panel, the migration's hold banner and next step, the detail page; `lib/policies.ts` resolves like the API) |
 | PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | planned |
 | PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | planned |
 
 Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
+
+**Order after the owner's review of 10 October 2026** (`docs/Seamless Migrate — Advisor Improvement Spec
+(PHASE-2).md`, the owner's file, untracked like the first one; it adds Phase 1b, ADV-16 … ADV-21):
+
+1. ADV-16 — investigate the cutover numbers of dc2-db-01 and report; **no engine change before the owner approves**.
+2. ADV-17 — maker-checker for approvals (a requester never approves their own request; no break-glass).
+3. Rest of Phase 1 — the threshold value in the Decision line (ADV-03), approve/override and the Finance policy
+   visible on the demo stack (ADV-04, PR-5), the deployment badge and "Data sent to advisor" (ADV-06, PR-7); then
+   a new demo for the owner.
+4. ADV-18 application-level verification, 5. ADV-19 plan status and the finalize queue, 6. ADV-20 the two kinds
+   of approval.
+7. Then the original order (PR-6 ADV-02 first); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
+   review of Phase 1.
 
 **For the owner's review (deviations from the spec's wording, each with its reason):**
 
@@ -50,6 +63,11 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
   contradictory "60% (threshold 60%)" next to "below threshold".
 * `decision.pending_approval` is an audit event kind too (ADV-05's list omits it, its acceptance criterion needs
   it).
+* Policy scopes (ADV-04) are plans and source providers: the product has no plan tags or environments, so the
+  spec's "plan tag > provider > environment > global" reads "plan > source provider > global". `TODO(ADV-04): confirm`.
+* Approve and Override (ADV-04) need `advisor.approve`, mapped to admin like `advisor.policy.manage`
+  (`TODO(ADV-04): confirm`; `approver` is the alternative). Override offers the other eligible options: running
+  the recommended one is approving it.
 
 ## PR-1 (ADV-01) — acceptance
 

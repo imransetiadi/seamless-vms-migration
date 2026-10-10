@@ -153,6 +153,27 @@ describe('applyEventToCache', () => {
     }
   });
 
+  it("refreshes the migrations lists on a decision: approving clears a hold another viewer's plan page shows (SDD §14.6)", () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 47, kind: 'decision.approved' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+    invalidate.mockClear();
+    // a recommendation alone holds nothing: its decision event follows it
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 48, kind: 'recommendation.created' }, invalidate);
+    expect(invalidate).not.toHaveBeenCalledWith(['migrations']);
+  });
+
+  it('refreshes the policies and the audit lists on a policy change (SDD §14.6)', () => {
+    for (const kind of ['policy.created', 'policy.updated', 'policy.deleted']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({ target_id: 'pol-000000000001' }), seq: 49, kind, migration_id: null, plan_id: null }, invalidate);
+      expect(invalidate.mock.calls.map(([key]) => key), kind).toEqual([
+        ['advisor', 'policies'],
+        ['events', 'tail'],
+      ]);
+    }
+  });
+
   it('refreshes the recommendations when an advisor event says one was recorded, and only then (SDD §14.4)', () => {
     const { queryClient, invalidate } = setup();
     applyEventToCache(queryClient, { ...progressEvent({ recommendation_id: 'rec-000000000001' }), seq: 44, kind: 'advisor.strategy' }, invalidate);

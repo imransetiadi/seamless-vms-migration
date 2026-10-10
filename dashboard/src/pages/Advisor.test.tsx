@@ -159,4 +159,36 @@ describe('Advisor page', () => {
     expect(within(feed).getByRole('link', { name: 'Details for static-cdn-01' })).toHaveAttribute('href', '/advisor/recommendations/rec-d4e6f8a09001');
     expect(within(feed).getByRole('link', { name: 'Details for analytics-node-1' })).toHaveAttribute('href', '/advisor/recommendations/rec-legacy-mig-b2c4d6e870-0');
   });
+
+  it('offers Approve and Override on the decision that waits, and focus stays on its entry once it is decided (SDD §14.6, §16, ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Advisor />, { token: 'admin' });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const waiting = await within(feed).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    const entry = waiting.closest('li')!;
+    // only the decision that waits: the others were taken
+    expect(within(feed).getAllByRole('group', { name: /^Decide on the recommendation for/ })).toEqual([
+      within(entry).getByRole('group', { name: 'Decide on the recommendation for analytics-node-2' }),
+    ]);
+    await user.click(within(entry).getByRole('button', { name: 'Approve' }));
+    const confirm = await screen.findByRole('alertdialog', { name: 'Approve Storage handover for analytics-node-2?' });
+    await user.click(within(confirm).getByRole('button', { name: 'Approve' }));
+    expect(await within(feed).findByText('Decision: Storage handover — approved by rina')).toBeInTheDocument();
+    expect(within(feed).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
+    expect(within(feed).getByRole('link', { name: 'Details for analytics-node-2' })).toHaveFocus();
+    expect(screen.getByText('Approved: analytics-node-2 runs Storage handover.')).toHaveAttribute('role', 'status');
+  });
+
+  it('shows neither Approve nor Override without advisor.approve', async () => {
+    renderWithApp(<Advisor />, { token: 'approver' });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    expect(within(feed).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
+    expect(within(feed).queryByRole('button', { name: /approve|override/i })).not.toBeInTheDocument();
+  });
+
+  it('links to the advisor policies (SDD §16, ADV-04)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    expect(await screen.findByRole('link', { name: 'Policies' })).toHaveAttribute('href', '/advisor/policies');
+  });
 });
