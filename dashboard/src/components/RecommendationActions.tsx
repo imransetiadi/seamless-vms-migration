@@ -38,10 +38,11 @@ export function RecommendationActions({
   const [reason, setReason] = useState('');
   // the policy in force says whether a reason is required, as the API checks it; unknown: ask for one (SDD §14.6)
   const inForce = policies.data ? (resolvePolicy(policies.data.items, rec.plan_id, rec.provider_id, rec.decision_type) ?? policies.data.default) : undefined;
-  const reasonRequired = inForce ? inForce.require_override_reason : true;
+  // the rules the decision recorded win: a policy changed since does not rewrite it (SDD §14.6)
+  const reasonRequired = rec.decision.require_override_reason ?? (inForce ? inForce.require_override_reason : true);
   // maker-checker (SDD §14.6): the user whose validation asked for this decision does not decide it
   const me = useMe().data?.name;
-  const own = Boolean(me && rec.requested_by === me && (inForce?.require_distinct_approver ?? true));
+  const own = Boolean(me && rec.requested_by === me && (rec.decision.require_distinct_approver ?? inForce?.require_distinct_approver ?? true));
   const reasonOk = !reasonRequired || reason.trim().length >= OVERRIDE_REASON_MIN;
   // read by the dialog as it closes: empty on Cancel (focus goes back to the button), set after a decision
   const returnRef = useRef<HTMLElement | null>(null);

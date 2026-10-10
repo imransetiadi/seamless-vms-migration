@@ -1359,6 +1359,35 @@ describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
     expect(requested.approvals.map((a) => a.actor)).toEqual(['sari']);
   });
 
+  it('keeps the rules of the policy that took a decision when the policy is relaxed later, like the API (SDD §14.6)', async () => {
+    const relax = (server: MockServer) => {
+      for (const p of server.policies) Object.assign(p, { require_distinct_approver: false, require_override_reason: false });
+    };
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, ADMIN_TOKEN).post('/plans/plan-c81d44a0/validate');
+    const rec = server.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([rec.requested_by, rec.decision.require_distinct_approver, rec.decision.require_override_reason]).toEqual(['rina', true, true]);
+    relax(server);
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({ status: 409, message: OWN_DECISION });
+    // validated by another user: the override still needs its reason
+    const other = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(other, 'operator').post('/plans/plan-c81d44a0/validate');
+    const held = other.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    relax(other);
+    await expect(as(other, ADMIN_TOKEN).post(`/advisor/recommendations/${held.id}/override`, { option: 'cold' })).rejects.toMatchObject({ status: 422 });
+    const overridden = await as(other, ADMIN_TOKEN).post<AdvisorRecommendation>(`/advisor/recommendations/${held.id}/override`, {
+      option: 'cold',
+      reason: 'The change window fits a cold cutover',
+    });
+    // the rules go on with a person's decision
+    expect([overridden.decision.require_distinct_approver, overridden.decision.require_override_reason]).toEqual([true, true]);
+    // the fallback took no policy's decision: it records no rules, so the policy in force applies
+    const unavailable = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: null, confidence: null }) });
+    await as(unavailable, 'operator').post('/plans/plan-c81d44a0/validate');
+    const fallback = unavailable.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([fallback.decision.status, fallback.decision.require_distinct_approver, fallback.decision.require_override_reason]).toEqual(['fallback_rules', null, null]);
+  });
+
   it('names the validating user as the requester of a decision, who then neither approves nor overrides it', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
     await as(server, ADMIN_TOKEN).post('/plans/plan-c81d44a0/validate');

@@ -99,6 +99,8 @@ export interface StrategyRecommendationInput {
   requestedBy?: string | null;
   /** Why a decision waits when it is not the policy's mode: too little evidence (SDD §14.4, ADV-02). */
   reasonCode?: ReasonCode;
+  /** The deciding policy's rules for a person's decision (SDD §14.6); none: the policy in force applies, as for data recorded before. */
+  rules?: { require_distinct_approver: boolean; require_override_reason: boolean };
   /** The option the evidence is measured against, and the evidence (ADV-02). */
   evidenceOption?: string | null;
   evidence?: EvidenceItem[];
@@ -138,6 +140,8 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
       policy_id: byPolicy ? policyId : null,
       threshold_used: byPolicy ? (input.threshold ?? JEV_MIN_CONFIDENCE) : null,
       decided_at: input.at,
+      require_distinct_approver: byPolicy && input.rules ? input.rules.require_distinct_approver : null,
+      require_override_reason: byPolicy && input.rules ? input.rules.require_override_reason : null,
     },
     legacy: false,
     legacy_text: null,

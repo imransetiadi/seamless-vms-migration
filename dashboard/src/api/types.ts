@@ -432,6 +432,9 @@ export interface Decision {
   policy_id: string | null;
   threshold_used: number | null;
   decided_at: Timestamp;
+  /** The deciding policy's rules for a person's approve or override, as they were then (SDD §14.6); null: the policy in force applies. */
+  require_distinct_approver?: boolean | null;
+  require_override_reason?: boolean | null;
 }
 
 export interface AdvisorSubject {

@@ -348,6 +348,41 @@ describe('MigrationDetail', () => {
     }
   });
 
+  it('holds a decision to the rules its policy recorded, even after the policy was relaxed (SDD §14.6)', async () => {
+    const server = createTestServer();
+    const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;
+    const rec = server.recommendations.find((r) => r.id === db.advisor_hold)!;
+    rec.requested_by = 'rina'; // the admin persona validated the plan
+    rec.decision = { ...rec.decision, require_distinct_approver: true, require_override_reason: true };
+    for (const p of server.policies) Object.assign(p, { require_distinct_approver: false, require_override_reason: false });
+    const { queryClient } = renderWithApp(<MigrationDetail />, { route: `/migrations/${db.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    // the relaxed policies have loaded: what shows now is what they would allow
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    for (const name of ['Approve', 'Override']) {
+      const button = within(group).getByRole('button', { name });
+      expect(button).toHaveAttribute('aria-disabled', 'true');
+      expect(button).toHaveAccessibleDescription('You requested this decision. Another approver must decide it.');
+    }
+  });
+
+  it('asks for the override reason the decision\'s policy required, even after the policy was relaxed (SDD §14.6)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;
+    const rec = server.recommendations.find((r) => r.id === db.advisor_hold)!;
+    rec.requested_by = 'bayu'; // another user validated the plan
+    rec.decision = { ...rec.decision, require_distinct_approver: true, require_override_reason: true };
+    for (const p of server.policies) Object.assign(p, { require_distinct_approver: false, require_override_reason: false });
+    const { queryClient } = renderWithApp(<MigrationDetail />, { route: `/migrations/${db.id}`, path: '/migrations/:migrationId', token: 'admin', server });
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(within(dialog).getByLabelText(/^Reason/)).toBeRequired();
+    expect(within(dialog).queryByLabelText('Reason (optional)')).not.toBeInTheDocument();
+  });
+
   it("keeps Approve and Override while the plan sets the VM's strategy, and Approve from an approved decision, with the reason (SDD §14.6)", async () => {
     const server = createTestServer();
     const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;

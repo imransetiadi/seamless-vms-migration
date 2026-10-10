@@ -995,6 +995,7 @@ export class MockServer {
       snapshotSha256: snapshot.sha256,
       policyId: policy.id,
       threshold: policy.threshold,
+      rules: { require_distinct_approver: policy.require_distinct_approver, require_override_reason: policy.require_override_reason },
       requestedBy: actor,
       reasonCode: reason,
       evidenceOption,
@@ -1344,12 +1345,16 @@ export class MockServer {
     if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
     const plan = this.plan(m.plan_id);
     const policy = policyFor(this.policies, plan);
+    // like the API (SDD §14.6): the rules of the policy that took the decision, as they were then; the policy in
+    // force only for a decision that recorded none
+    const distinct = rec.decision.require_distinct_approver ?? policy.require_distinct_approver;
+    const reasonRequired = rec.decision.require_override_reason ?? policy.require_override_reason;
     // maker-checker (SDD §14.6, ADV-17): the validating user does not decide what their validation asked
-    if (policy.require_distinct_approver && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
+    if (distinct && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
     const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
     if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
-    if (action === 'override' && policy.require_override_reason && (reason ?? '').length < OVERRIDE_REASON_MIN) {
-      throw new HttpError(422, 'validation_error', `policy ${policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
+    if (action === 'override' && reasonRequired && (reason ?? '').length < OVERRIDE_REASON_MIN) {
+      throw new HttpError(422, 'validation_error', `policy ${rec.decision.policy_id ?? policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
     }
     if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
     // like the API (SDD §14.6): the plan's own choice stands over the newest recommendation, and an approved
@@ -1372,6 +1377,9 @@ export class MockServer {
       decided = humanDecision(rec, { kind: 'override', user: me.name, option, reason }, at);
     }
     decided.decision.policy_id = policy.id;
+    // the rules go on with a person's decision: a later one follows them too (SDD §14.6)
+    decided.decision.require_distinct_approver = distinct;
+    decided.decision.require_override_reason = reasonRequired;
     this.recommendations[index] = decided;
     const final = decided.decision.final_option as Strategy;
     const changed = final !== m.strategy;
