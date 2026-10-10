@@ -1,4 +1,5 @@
 import copy
+import logging
 import os
 import re
 import subprocess
@@ -564,6 +565,21 @@ async def test_transient_vs_permanent_failure(env, monkeypatch):
     with pytest.raises(PermanentStepError, match="flavor"):
         await env.executor.run(StepName.CUTOVER, ctx)
     assert not (run_dir(env) / "secrets.yml").exists()
+
+
+async def test_a_failed_prestage_logs_a_redacted_tail(env, monkeypatch, caplog):
+    """SDD §13.4: a failed pre-stage has no migration to log to, so the service log keeps its
+    output's last 4000 characters — redacted over the last 4000 + 16384 first, so a PEM block
+    whose BEGIN line lies before the kept part is still found."""
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 5000 + "-----END RSA PRIVATE KEY-----"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "key rejected: ' + pem + '"}')
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["networks"])
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.executors.ansible"):
+        with pytest.raises(PermanentStepError):
+            await env.executor.prestage(plan, SRC, DST)
+    [record] = [r for r in caplog.records if "last lines" in r.getMessage()]
+    tail = record.getMessage().split("last lines:\n", 1)[1]
+    assert "[REDACTED PEM]" in tail and "KKKK" not in tail and len(tail) <= 4000
 
 
 async def test_prestage_runs_resources_in_order(env):

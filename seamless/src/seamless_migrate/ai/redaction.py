@@ -89,6 +89,12 @@ def redact_cut(text: str, limit: int, redact_names: Sequence[str] | None = None)
     return redact(str(text)[: limit + CUT_MARGIN], redact_names)[:limit]
 
 
+def redact_tail(text: str, limit: int, redact_names: Sequence[str] | None = None) -> str:
+    """``redact`` the last ``limit`` + CUT_MARGIN characters, then keep the last ``limit``
+    (SDD §13.4): keeping the end first could drop the BEGIN line of a PEM block it ends in."""
+    return redact(str(text)[-(limit + CUT_MARGIN) :], redact_names)[-limit:]
+
+
 def redact_payload(value: Any, redact_names: Sequence[str] | None = None) -> Any:
     """``redact`` every string of a JSON-like value; a credential key's whole value is removed."""
     if isinstance(value, str):

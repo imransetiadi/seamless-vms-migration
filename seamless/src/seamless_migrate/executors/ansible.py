@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from ..ai.redaction import redact_cut
+from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
 from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
@@ -878,7 +878,10 @@ class AnsibleExecutor:
             if ctx is None:
                 # prestage has no migration to log to: keep the tail in the service log
                 log.warning(
-                    "%s failed (exit %s); last lines:\n%s", name, returncode, output[-4000:]
+                    "%s failed (exit %s); last lines:\n%s",
+                    name,
+                    returncode,
+                    redact_tail(output, 4000),
                 )
             raise classify_failure(output)(
                 f"{name} failed (exit {returncode}): {redact_cut(detail, 500)}"

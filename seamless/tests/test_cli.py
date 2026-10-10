@@ -317,6 +317,43 @@ def test_json_logging_covers_uvicorn_loggers(env, capsys, monkeypatch):
     assert not logging.getLogger("uvicorn.access").handlers  # routed through the root handler
 
 
+@pytest.mark.parametrize("log_json", [False, True])
+def test_the_service_log_is_redacted(env, capsys, log_json):
+    """SDD §13.4 (Security.md C2-02): every service-log record passes through redact — a message,
+    and the chained exception a traceback prints under the ProviderError raised from it, which the
+    provider redacted only in its own text; a JSON line stays valid JSON."""
+    import json as _json
+    import logging
+
+    from seamless_migrate.config import Settings
+    from seamless_migrate.providers.base import ProviderError
+
+    cli.configure_logging(Settings(data_dir=env / "data", log_json=log_json, log_level="INFO"))
+    log = logging.getLogger("seamless_migrate.orchestrator")
+    sdk_error = "Unauthorized: POST https://svc:" + "Sup3rS3cretPw" + "@keystone.example:5000/v3"
+    try:
+        log.warning('vcenter refused password="Hunter2xyz"')
+        try:
+            try:
+                raise RuntimeError(sdk_error)
+            except RuntimeError as exc:
+                raise ProviderError("src-osp: Unauthorized") from exc
+        except ProviderError:
+            log.warning("source watch failed for %s", "mig-1", exc_info=True)
+    finally:
+        logging.getLogger().handlers[:] = []
+    err = capsys.readouterr().err
+    assert "Hunter2xyz" not in err and "Sup3r" not in err
+    assert "source watch failed for mig-1" in err and "https://[REDACTED]@keystone.example" in err
+    if log_json:
+        records = [_json.loads(ln) for ln in err.splitlines() if ln.strip()]
+        assert [r["message"] for r in records] == [
+            "vcenter refused password=[REDACTED]",
+            "source watch failed for mig-1",
+        ]
+        assert "RuntimeError: Unauthorized: POST https://[REDACTED]@" in records[1]["exc"]
+
+
 def test_events_export_and_prune(env, capsys, tmp_path):
     import json
     from datetime import UTC, datetime, timedelta

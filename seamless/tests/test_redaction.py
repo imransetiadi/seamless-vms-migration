@@ -10,7 +10,14 @@ import pytest
 from seamless_migrate.ai import redaction
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.memory import MemoryClient
-from seamless_migrate.ai.redaction import CUT_MARGIN, REDACTED, redact, redact_cut, redact_payload
+from seamless_migrate.ai.redaction import (
+    CUT_MARGIN,
+    REDACTED,
+    redact,
+    redact_cut,
+    redact_payload,
+    redact_tail,
+)
 from seamless_migrate.config import Settings
 from tests.jev_fakes import session_factory
 
@@ -123,6 +130,24 @@ def test_redact_cut_redacts_no_more_than_the_cut_and_its_margin(monkeypatch):
         redaction, "redact", lambda text, *a: seen.append(len(text)) or real(text, *a)
     )
     assert redaction.redact_cut("y" * 10**6, 500) == "y" * 500
+    assert seen == [500 + CUT_MARGIN]
+
+
+def test_redact_tail_finds_a_secret_whose_start_the_cut_drops(monkeypatch):
+    """SDD §13.4: keeping a text's last characters drops the BEGIN line of a PEM block that starts
+    before them; redact_tail redacts the kept part and CUT_MARGIN characters before it, then keeps
+    the last limit characters — at a bounded cost whatever the text's length."""
+    text = "head " + PEM_KEY + " the playbook's last words"
+    assert "KKKK" in redact(text[-500:])
+    tail = redact_tail(text, 500)
+    assert tail == "head [REDACTED PEM] the playbook's last words"
+    assert redact_tail("x" * 900 + text, 30) == "PEM] the playbook's last words"
+    seen: list[int] = []
+    real = redaction.redact
+    monkeypatch.setattr(
+        redaction, "redact", lambda text, *a: seen.append(len(text)) or real(text, *a)
+    )
+    assert redaction.redact_tail("y" * 10**6, 500) == "y" * 500
     assert seen == [500 + CUT_MARGIN]
 
 

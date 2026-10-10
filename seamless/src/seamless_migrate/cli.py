@@ -17,6 +17,7 @@ import yaml
 from pydantic import ValidationError
 
 from . import __version__
+from .ai.redaction import redact
 from .config import Settings
 from .domain.enums import ProviderKind, Role, Strategy, strategies_for
 from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
@@ -52,16 +53,25 @@ def _gib(n: int) -> str:
     return f"{n / 2**30:.1f}"
 
 
+class _RedactingFormatter(logging.Formatter):
+    """A plain service-log line leaves through redact, its traceback included: the chained
+    exceptions carry what an SDK printed (SDD §13.4)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            # redacted before serialization: redacting the JSON line could break its quoting
+            "message": redact(record.getMessage()),
         }
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = redact(self.formatException(record.exc_info))
         return json.dumps(payload)
 
 
@@ -70,7 +80,7 @@ def configure_logging(settings: Settings) -> None:
     if settings.log_json:
         handler.setFormatter(_JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(_RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(settings.log_level.upper())
