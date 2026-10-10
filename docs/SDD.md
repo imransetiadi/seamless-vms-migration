@@ -1334,7 +1334,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   warning icon) past 100 % — so a VM never reads differently on the two pages, and the warning is never
   colour alone; the time left or over reads as a clock (m:ss) on both, the SLO itself as a duration.
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
-  active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs, strategy and selection policy, per-VM
+  active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
+  source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
   approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
