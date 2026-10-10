@@ -279,9 +279,9 @@ def build_strategy_evidence(
         "cutover_window",
         "Cutover window",
         f"{window.start.isoformat()}/{window.end.isoformat()}" if window else None,
-        f"{window.start:%Y-%m-%d %H:%M} – {window.end:%Y-%m-%d %H:%M} UTC"
+        f"Cutover window: {window.start:%Y-%m-%d %H:%M} – {window.end:%Y-%m-%d %H:%M} UTC"
         if window
-        else "Any time",
+        else "Cutover window: any time",
         "context",
         30,
         "plan",
@@ -291,7 +291,7 @@ def build_strategy_evidence(
         "source_kind",
         "Source platform",
         kind.value,
-        PROVIDER_LABELS.get(kind.value, kind.value),
+        f"Source platform: {PROVIDER_LABELS.get(kind.value, kind.value)}",
         "context",
         20,
         "provider",

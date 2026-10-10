@@ -215,7 +215,7 @@
         "key": "cutover_window",
         "label": "Cutover window",
         "value": "2026-10-11T22:00:00+00:00/2026-10-12T02:30:00+00:00",
-        "display": "2026-10-11 22:00 – 2026-10-12 02:30 UTC",
+        "display": "Cutover window: 2026-10-11 22:00 – 2026-10-12 02:30 UTC",
         "effect": "context",
         "weight": 30,
         "source": {
@@ -227,7 +227,7 @@
         "key": "source_kind",
         "label": "Source platform",
         "value": "vmware",
-        "display": "VMware vSphere",
+        "display": "Source platform: VMware vSphere",
         "effect": "context",
         "weight": 20,
         "source": {
@@ -439,7 +439,7 @@
         "key": "cutover_window",
         "label": "Cutover window",
         "value": null,
-        "display": "Any time",
+        "display": "Cutover window: any time",
         "effect": "context",
         "weight": 30,
         "source": {
@@ -451,7 +451,7 @@
         "key": "source_kind",
         "label": "Source platform",
         "value": "vmware",
-        "display": "VMware vSphere",
+        "display": "Source platform: VMware vSphere",
         "effect": "context",
         "weight": 20,
         "source": {
@@ -669,7 +669,7 @@
         "key": "cutover_window",
         "label": "Cutover window",
         "value": null,
-        "display": "Any time",
+        "display": "Cutover window: any time",
         "effect": "context",
         "weight": 30,
         "source": {
@@ -681,7 +681,7 @@
         "key": "source_kind",
         "label": "Source platform",
         "value": "openstack",
-        "display": "OpenStack",
+        "display": "Source platform: OpenStack",
         "effect": "context",
         "weight": 20,
         "source": {
@@ -870,7 +870,7 @@
         "key": "cutover_window",
         "label": "Cutover window",
         "value": null,
-        "display": "Any time",
+        "display": "Cutover window: any time",
         "effect": "context",
         "weight": 30,
         "source": {
@@ -882,7 +882,7 @@
         "key": "source_kind",
         "label": "Source platform",
         "value": "openstack",
-        "display": "OpenStack",
+        "display": "Source platform: OpenStack",
         "effect": "context",
         "weight": 20,
         "source": {
@@ -1055,7 +1055,7 @@
         "key": "cutover_window",
         "label": "Cutover window",
         "value": null,
-        "display": "Any time",
+        "display": "Cutover window: any time",
         "effect": "context",
         "weight": 30,
         "source": {
@@ -1067,7 +1067,7 @@
         "key": "source_kind",
         "label": "Source platform",
         "value": "openstack",
-        "display": "OpenStack",
+        "display": "Source platform: OpenStack",
         "effect": "context",
         "weight": 20,
         "source": {

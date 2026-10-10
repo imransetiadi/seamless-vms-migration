@@ -124,7 +124,8 @@ def test_each_fact_supports_opposes_or_gives_context_against_the_option():
     assert displays["disk_total"] == "150 GiB provisioned, 50.0 GiB used"
     assert displays["disk_count"] == "2 disks"
     assert displays["write_rate"] == "Guest write rate 4.0 MiB/s, measured"
-    assert displays["source_kind"] == "VMware vSphere"
+    assert displays["source_kind"] == "Source platform: VMware vSphere"
+    assert displays["cutover_window"] == "Cutover window: 2026-10-11 22:00 – 2026-10-12 02:00 UTC"
     # five facts bear on the decision; context does not count
     assert evidence_count(items) == 5
 
@@ -193,7 +194,10 @@ def test_an_unknown_fact_is_left_out():
     )
     assert "cbt" not in osp
     # a plan without a window is open any time: a known fact
-    assert (osp["cutover_window"].value, osp["cutover_window"].display) == (None, "Any time")
+    assert (osp["cutover_window"].value, osp["cutover_window"].display) == (
+        None,
+        "Cutover window: any time",
+    )
 
 
 def test_preflight_findings_that_apply_to_the_option_oppose_it():
