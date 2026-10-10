@@ -194,6 +194,13 @@ class VerificationFailed(PermanentStepError):
     pass
 
 
+def _add_model_s(m: Migration, details: dict[str, Any]) -> None:
+    """Add the model seconds a simulated step kept the source stopped (demo, SDD §5.2)."""
+    model_s = details.get("downtime_model_s")
+    if isinstance(model_s, int | float):
+        m.downtime_model_s = (m.downtime_model_s or 0.0) + float(model_s)
+
+
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     """When ``m`` last entered ``phase`` (None when it never did)."""
     for change in reversed(m.phase_history):
@@ -1196,14 +1203,15 @@ class Orchestrator:
             m.progress_pct = 0
             m.review_required = False
             m.review_reason = None
-            m.downtime_model_s = None  # the next cutover reports its own (SDD §5.2)
             # the downtime clock belongs to the outage (SDD §5.2): a closed clock — verified boot,
             # or the source running again after a rollback — starts afresh; an open one means the
             # source has not run since it stopped, so the next cutover counts from that first stop
+            # (in demo mode its model seconds add to those the clock kept)
             if not fsm.source_stopped(m):
                 m.downtime_started_at = None
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
+                m.downtime_model_s = None
             await self._save(m, v)
         reopened = False
 
@@ -2349,6 +2357,16 @@ class Orchestrator:
         assert m.downtime_started_at is not None
         return (ended - m.downtime_started_at).total_seconds()
 
+    def _rollback_downtime_s(self, m: Migration, ended: datetime, plan: Plan) -> float:
+        """The downtime a rollback ends (SDD §5.2): wall time, or - in demo mode - the model
+        seconds the simulated steps reported, plus the plan's boot time when the cutover had
+        finished (the destination booted for its verification)."""
+        if m.downtime_model_s is not None:
+            booted = m.checkpoint == "cutover"
+            return m.downtime_model_s + (self._params(m, plan).boot_s if booted else 0.0)
+        assert m.downtime_started_at is not None
+        return (ended - m.downtime_started_at).total_seconds()
+
     async def _do_pass(self, m: Migration) -> None:
         step = StepName.PRECOPY if m.phase == P.precopy else StepName.SYNC
         try:
@@ -2406,9 +2424,9 @@ class Orchestrator:
             if result.sync_pass is not None:
                 cur, v = await self._record_pass(cur, v, result.sync_pass, plan)
             cur.destination_server_id = result.destination_server_id or cur.destination_server_id
-            model_s = result.details.get("downtime_model_s")
-            # a simulated cutover counts its downtime in model seconds (SDD §5.2, ADV-16)
-            cur.downtime_model_s = float(model_s) if isinstance(model_s, int | float) else None
+            # a simulated cutover counts its downtime in model seconds, added to those an open
+            # clock kept from an earlier attempt (SDD §5.2, ADV-16)
+            _add_model_s(cur, result.details)
             cur.checkpoint = "cutover"
             cur.progress_pct = 100.0
             if cur.downtime_started_at is None:
@@ -2536,6 +2554,7 @@ class Orchestrator:
             return
         if result is None:
             return
+        plan = await self._plan(m.plan_id)
         vm = result.details.get("vm")
         recreated = VMRef.model_validate(vm) if isinstance(vm, dict) else None
         if recreated is not None and recreated.source_id != m.vm.source_id:
@@ -2553,11 +2572,12 @@ class Orchestrator:
             )
             if recreated is not None:
                 cur.vm = recreated
-            ended = cur.downtime_started_at is not None and cur.downtime_ended_at is None
+            ended = fsm.source_stopped(cur)
             if ended:
                 now = self._now()
                 cur.downtime_ended_at = now
-                cur.actual_downtime_s = (now - cur.downtime_started_at).total_seconds()
+                _add_model_s(cur, result.details)
+                cur.actual_downtime_s = self._rollback_downtime_s(cur, now, plan)
             cur.destination_server_id = None
             cur.checkpoint = "rolled_back"
             v = await self._save(cur, v)
@@ -2617,6 +2637,9 @@ class Orchestrator:
             if cur.phase != expected:
                 return  # an operator action moved the migration meanwhile
             cur.error = f"{step}: {message}"[:1000]
+            if isinstance(exc, PermanentStepError) and fsm.source_stopped(cur):
+                # the model seconds a failed simulated step kept the source stopped (SDD §5.2)
+                _add_model_s(cur, exc.details)
             cur, v = await self._transition(
                 cur, v, P.failed, f"{step} failed: {message[:200]}", data=data
             )

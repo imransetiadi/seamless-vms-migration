@@ -3525,6 +3525,160 @@ async def test_a_simulated_downtime_counts_model_seconds(tmp_path, store):
     assert done.actual_downtime_s > wall, "the simulator compresses wall time"
 
 
+async def test_a_simulated_rollback_counts_model_seconds(tmp_path, store):
+    """SDD §5.2 (the ADV-16 follow-up): a rollback after a simulated cutover failed ends the
+    downtime in model seconds - the cutover's up to the failure and the rollback's own 90 s - not
+    in the wall seconds the demo compresses, which dropped the clock from minutes to seconds."""
+    settings = make_settings(tmp_path)
+
+    async def failing(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("attach timed out", details={"downtime_model_s": 600.0})
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=ScriptedExecutor(settings, hooks={StepName.CUTOVER: failing}), settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert (m.downtime_model_s, m.actual_downtime_s) == (690.0, 690.0)
+    assert (m.downtime_ended_at - m.downtime_started_at).total_seconds() < 690.0
+    events = h.store.events(since_seq=0, limit=1000)
+    [ended] = [e for e in events if e.kind == "migration.downtime_ended"]
+    assert ended.data == {"actual_downtime_s": 690.0}
+
+
+async def test_a_rollback_no_step_reported_model_seconds_for_keeps_wall_time(tmp_path, store):
+    """SDD §5.2: a real executor reports no model seconds - its rollback ends the downtime in
+    wall seconds, as before."""
+    settings = make_settings(tmp_path)
+
+    async def failing(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("dst volume attach failed")
+
+    async def rollback(ctx):
+        return StepResult(details={"source_running": True})
+
+    hooks = {StepName.CUTOVER: failing, StepName.ROLLBACK: rollback}
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=ScriptedExecutor(settings, hooks=hooks), settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    wall = (m.downtime_ended_at - m.downtime_started_at).total_seconds()
+    assert (m.downtime_model_s, m.actual_downtime_s) == (None, wall)
+
+
+async def test_a_simulated_rollback_after_its_cutover_finished_counts_the_boot_too(tmp_path, store):
+    """SDD §5.2: the destination booted for its verification before the rollback, so the boot
+    time counts too, as it does for a verified migration."""
+    settings = make_settings(tmp_path)
+
+    async def cutover(ctx):
+        await ctx.mark_downtime_start()
+        return StepResult(destination_server_id="dst-1", details={"downtime_model_s": 500.0})
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(timeout_s=0, tcp_ports=[]),
+        },
+        executor=ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover}), settings=settings,
+    )  # fmt: skip
+    h.destination.status = "ERROR"
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert h.history(m)[-4:] == [P.verifying, P.failed, P.rolling_back, P.rolled_back]
+    boot = params_for_plan(plan).boot_s
+    assert m.actual_downtime_s == pytest.approx(500.0 + boot + 90.0)
+
+
+async def test_a_retry_with_the_source_still_stopped_keeps_its_model_seconds(tmp_path, store):
+    """SDD §5.2: a cutover that failed without an automatic rollback leaves the clock open; the
+    retry keeps it and, in demo mode, its model seconds - the next attempt's add to them."""
+    settings = make_settings(tmp_path)
+    calls = 0
+
+    async def cutover(ctx):
+        nonlocal calls
+        calls += 1
+        await ctx.mark_downtime_start()
+        if calls == 1:
+            raise PermanentStepError("attach timed out", details={"downtime_model_s": 600.0})
+        return StepResult(destination_server_id="dst-1", details={"downtime_model_s": 400.0})
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(auto_rollback=False),
+        },
+        executor=ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover}), settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    failed = await h.wait_phase(mid, P.failed)
+    assert failed.downtime_model_s == 600.0
+    assert (await h.orch.retry(mid, "bayu")).downtime_model_s == 600.0
+    done = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert done.downtime_model_s == 1000.0
+    assert done.actual_downtime_s == pytest.approx(1000.0 + params_for_plan(plan).boot_s)
+
+
+async def test_a_retry_after_a_rollback_starts_its_model_seconds_afresh(tmp_path, store):
+    """SDD §5.2: the source ran again after the rollback, so the clock closed - the next attempt's
+    downtime counts its own model seconds, not the rolled-back attempt's."""
+    settings = make_settings(tmp_path)
+    calls = 0
+
+    async def cutover(ctx):
+        nonlocal calls
+        calls += 1
+        await ctx.mark_downtime_start()
+        if calls == 1:
+            raise PermanentStepError("attach timed out", details={"downtime_model_s": 600.0})
+        return StepResult(destination_server_id="dst-1", details={"downtime_model_s": 400.0})
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover}), settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    assert (await h.wait_phase(mid, P.rolled_back)).actual_downtime_s == 690.0
+    assert (await h.orch.retry(mid, "bayu")).downtime_model_s is None
+    done = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert done.downtime_model_s == 400.0
+    assert done.actual_downtime_s == pytest.approx(400.0 + params_for_plan(plan).boot_s)
+
+
+async def test_model_seconds_count_only_while_the_source_is_stopped(tmp_path, store):
+    """SDD §5.2: the model seconds add up while the clock is open - a step that failed before the
+    source stopped adds nothing to a downtime."""
+    settings = make_settings(tmp_path)
+
+    async def failing_precopy(ctx):
+        raise PermanentStepError("snapshot quota exceeded", details={"downtime_model_s": 50.0})
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=ScriptedExecutor(settings, hooks={StepName.PRECOPY: failing_precopy}),
+        settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    await h.orch.stop()
+    assert (m.downtime_started_at, m.downtime_model_s) == (None, None)
+
+
 # -- ADV-16 P4: Force cutover (SDD §5.4) ------------------------------------------------------
 
 

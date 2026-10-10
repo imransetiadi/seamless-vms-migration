@@ -4,6 +4,7 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
 from seamless_migrate.executors.base import PermanentStepError, StepName
 from seamless_migrate.executors.simulated import SimulatedExecutor
+from seamless_migrate.planning.estimator import params_for_plan
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
 
@@ -96,6 +97,27 @@ async def test_simulated_failure_rate_seeded():
     m = mig(Strategy.cold, mid="mig-retry00001", attempts=1)
     ctx, _ = make_ctx(make_plan(), m, SRC, DST, never)
     await SimulatedExecutor(never).run(StepName.CUTOVER, ctx)
+
+
+async def test_a_simulated_step_reports_the_model_seconds_it_kept_the_source_stopped():
+    """SDD §5.2/§7.4: a failed cutover reports its model seconds up to the failure, in its
+    PermanentStepError's details; the rollback reports its own 90 s."""
+    never = Settings(demo=True, demo_speed=1e9, demo_failure_rate=0.0)
+    always = Settings(demo=True, demo_speed=1e9, demo_failure_rate=1.0)
+    ctx, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
+    whole = (await SimulatedExecutor(never).run(StepName.CUTOVER, ctx)).details
+    copy = whole["downtime_model_s"] - params_for_plan(make_plan()).create_s
+    ctx, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, always)
+    with pytest.raises(PermanentStepError) as failed:
+        await SimulatedExecutor(always).run(StepName.CUTOVER, ctx)
+    # the same seeded copy, failed half-way through and before the create
+    assert failed.value.details == {"downtime_model_s": pytest.approx(copy / 2)}
+    rb, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
+    assert (await SimulatedExecutor(never).run(StepName.ROLLBACK, rb)).details == {
+        "source_running": True,
+        "downtime_model_s": 90.0,
+    }
+    assert PermanentStepError("no details").details == {}
 
 
 async def test_simulated_time_is_compressed_by_demo_speed():

@@ -24,6 +24,8 @@ Sleep = Callable[[float], Awaitable[None]]
 JITTER = 0.1
 PROGRESS_TICK_WALL_S = 0.5
 MAX_PROGRESS_TICKS = 40
+#: model seconds a simulated rollback takes, the source starting again at its end
+ROLLBACK_MODEL_S = 90.0
 
 
 class SimulatedExecutor:
@@ -79,9 +81,13 @@ class SimulatedExecutor:
         if step == StepName.CUTOVER:
             return await self._cutover(ctx)
         if step == StepName.ROLLBACK:
-            await self._elapse(ctx, 90.0, 0)
+            await self._elapse(ctx, ROLLBACK_MODEL_S, 0)
             await self._source_power(ctx, on=True)
-            return StepResult(details={"source_running": True})
+            # the model seconds the rollback kept the source stopped: the downtime counts them
+            # (SDD §5.2)
+            return StepResult(
+                details={"source_running": True, "downtime_model_s": ROLLBACK_MODEL_S}
+            )
         if step == StepName.FINALIZE:
             return StepResult(details={"finalized": True})
         await self.prestage(ctx.plan, ctx.source, ctx.destination)
@@ -165,11 +171,14 @@ class SimulatedExecutor:
 
         # A failure, if drawn, happens part-way through the copy (the source is already down).
         fails = rng.random() < self.settings.demo_failure_rate
-        await self._elapse(ctx, copy_s * (0.5 if fails else 1.0), int(changed))
+        copied_s = copy_s * (0.5 if fails else 1.0)
+        await self._elapse(ctx, copied_s, int(changed))
         if fails:
+            # the model seconds the source stayed down up to the failure (SDD §5.2)
             raise PermanentStepError(
                 "simulated cutover failure: destination volume attach timed out on the "
-                "conversion host"
+                "conversion host",
+                details={"downtime_model_s": copied_s},
             )
         if kind is not None:
             sync_pass = SyncPass(
