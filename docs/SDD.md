@@ -253,7 +253,9 @@ RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only
                     distribution: dict[str, float] = {} }       # raw probabilities, shown only in Details
 
 Decision { final_option: str|null, status: DecisionStatus, reason_code: ReasonCode, reason_text: str|null,
-           actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime }
+           actor: AdvisorActor, policy_id: str|null, threshold_used: float|null, decided_at: datetime,
+           require_distinct_approver: bool|null = null, require_override_reason: bool|null = null }
+                                                    # the deciding policy's rules for a person's decision (§14.6)
 
 AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type: DecisionType,
                         subject: { kind: "vm"|"plan"|"wave", id: str, name: str },
@@ -1599,7 +1601,8 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
      `default_option`);
   5. fewer evidence items than the policy's minimum → `pending_approval` (`INSUFFICIENT_EVIDENCE`, final null);
   6. otherwise `auto_applied` (`ABOVE_THRESHOLD_AUTO_APPLY`, final = the recommended option).
-  Rules 3–6 record `actor = policy:<id>`, `policy_id` and `threshold_used`. Until stored policies exist the
+  Rules 3–6 record `actor = policy:<id>`, `policy_id`, `threshold_used` and the policy's
+  `require_distinct_approver` and `require_override_reason`. Until stored policies exist the
   global default applies: id `global-default`, auto-apply above `SEAMLESS_JEV_MIN_CONFIDENCE`, minimum
   evidence 0 — so behaviour is unchanged.
 * A strategy recommendation is created by `validate_plan` for every automatic choice (plan default `auto`,
@@ -1681,6 +1684,10 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
   decision. Another approver must decide it." A legacy entry or one without a requester has no such restriction.
+  The rules of the policy that decided the recommendation hold for it, as they were then: a person's approve or
+  override follows the `require_distinct_approver` and `require_override_reason` its decision recorded, whatever
+  the policy says later (a policy change applies from the next validation and never rewrites a decision); a
+  decision that recorded none (the fallback, or one stored before) follows the policy in force.
 * **Policies** are created, replaced and deleted by `advisor.policy.manage` (§12), each change audited (§14.5);
   a change applies from the next validation and never rewrites a decision.
 * **Demo**: the server seeds "Finance — approval required" for the finance source provider
