@@ -1661,7 +1661,9 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   policies keep their minimum and the built-in default keeps 0, so a deployment without policies decides as before.
 * **Hold**: validation decides with the policy in force; a `pending_approval` decision sets
   `migration.advisor_hold` to the recommendation id (§5.4: no start meanwhile). A later validation that records
-  another decision for the migration replaces the hold or clears it.
+  another decision for the migration replaces the hold or clears it, and a cancel clears it — the cancel action
+  or a validation's cancel of a VM that left the plan: a cancelled migration takes no decision. The dashboard
+  shows a hold as waiting only while the migration is `pending`, `blocked` or `ready`, where it can be decided.
 * **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
   migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
   be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
