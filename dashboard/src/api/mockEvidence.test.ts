@@ -12,7 +12,7 @@ interface Case {
   estimates: Estimate[];
   findings: Finding[];
   option: Strategy;
-  earlier: { id: string; strategy: Strategy; attempts: number } | null;
+  earlier: { id: string; strategy: Strategy; attempts: number; attempt_strategies: Strategy[] } | null;
   migration_id: string;
   expected: EvidenceItem[];
 }

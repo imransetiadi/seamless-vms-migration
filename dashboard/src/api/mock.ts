@@ -940,8 +940,8 @@ export class MockServer {
   }
 
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
-    // the attempts so far, with the strategy they ran: evaluate() chooses anew (SDD §14.4, ADV-02)
-    const earlier = m.attempts > 0 ? { id: m.id, strategy: m.strategy, attempts: m.attempts } : null;
+    // the attempts so far, with the strategies they ran: evaluate() chooses anew (SDD §14.4, ADV-02)
+    const earlier = m.attempts > 0 ? { id: m.id, attempts: m.attempts, attempt_strategies: [...m.attempt_strategies] } : null;
     this.evaluate(m, plan);
     const rec = this.decideStrategy(m, plan, actor, earlier);
     // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
@@ -964,7 +964,7 @@ export class MockServer {
     m: Migration,
     plan: Plan,
     actor: string,
-    earlier: Pick<Migration, 'id' | 'strategy' | 'attempts'> | null,
+    earlier: Pick<Migration, 'id' | 'attempts' | 'attempt_strategies'> | null,
   ): AdvisorRecommendation | null {
     const automatic = plan.default_strategy === 'auto' && !(m.vm.source_id in plan.strategy_overrides);
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy);
@@ -1795,6 +1795,7 @@ export class MockServer {
       destination_server_id: null,
       error: null,
       attempts: 0,
+      attempt_strategies: [],
       created_at: created,
       updated_at: created,
     };
@@ -2023,6 +2024,8 @@ export class MockServer {
         const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
+        // the strategy of the attempt being retried: the evidence names it, even after a later validation chose another (SDD §14.4)
+        m.attempt_strategies = [...m.attempt_strategies, m.strategy];
         if (!m.downtime_started_at || m.downtime_ended_at) {
           // a closed clock starts afresh; an open one means the source is still stopped (SDD §5.2)
           m.downtime_started_at = null;

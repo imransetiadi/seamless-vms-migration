@@ -1451,6 +1451,8 @@ export function buildFixtures(now: number): Fixtures {
         destination_server_id: m.destination ?? null,
         error: m.error ?? null,
         attempts: m.attempts ?? 0,
+        // a fixture's earlier attempts ran its strategy (SDD §14.4)
+        attempt_strategies: Array<Strategy>(m.attempts ?? 0).fill(m.strategy),
         created_at: iso(migCreatedAt),
         updated_at: iso(enteredAt),
       };

@@ -642,6 +642,8 @@ export interface Migration {
   destination_server_id: string | null;
   error: string | null;
   attempts: number;
+  /** Each retried attempt's strategy, oldest first: the evidence names them (SDD §4.2, §14.4). */
+  attempt_strategies: Strategy[];
   created_at: Timestamp;
   updated_at: Timestamp;
 }

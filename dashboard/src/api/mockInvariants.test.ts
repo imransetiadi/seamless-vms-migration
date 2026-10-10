@@ -79,6 +79,13 @@ describe('mock data holds together like the API (SDD §5.5, ADV-16)', () => {
     }
   });
 
+  it('names the strategy of each earlier attempt, as a retry records it (SDD §4.2, §14.4)', () => {
+    const retried = fx.migrations.filter((m) => m.attempts > 0);
+    expect(retried.length).toBeGreaterThan(0);
+    for (const m of retried) expect(m.attempt_strategies, m.id).toEqual(Array<Migration['strategy']>(m.attempts).fill(m.strategy));
+    for (const m of fx.migrations.filter((x) => x.attempts === 0)) expect(m.attempt_strategies, m.id).toEqual([]);
+  });
+
   it("every estimate's parts add up to its downtime, in the API's keys", () => {
     for (const m of fx.migrations) {
       for (const e of m.estimates) {

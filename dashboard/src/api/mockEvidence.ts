@@ -48,7 +48,7 @@ export function buildStrategyEvidence(
   estimates: readonly Estimate[],
   findings: readonly Finding[],
   option: string,
-  earlier: Pick<Migration, 'id' | 'strategy' | 'attempts'> | null,
+  earlier: Pick<Migration, 'id' | 'attempts' | 'attempt_strategies'> | null,
   migrationId: string,
 ): EvidenceItem[] {
   const items: EvidenceItem[] = [];
@@ -74,12 +74,16 @@ export function buildStrategyEvidence(
   }
   if (earlier && earlier.attempts > 0) {
     const n = earlier.attempts;
+    // the strategies those attempts used, as each retry recorded them - not the migration's strategy now,
+    // which a later validation may have changed; data recorded before names none
+    const tried: string[] = [...new Set(earlier.attempt_strategies)];
+    const used = tried.length ? ` with ${tried.map((s) => optionLabel(s)).join(', ')}` : '';
     add(
       'earlier_runs',
       'Earlier attempts',
       n,
-      `${n} earlier ${plural(n, 'attempt', 'attempts')} with ${optionLabel(earlier.strategy)}`,
-      earlier.strategy === option ? 'opposes' : 'context',
+      `${n} earlier ${plural(n, 'attempt', 'attempts')}${used}`,
+      tried.includes(option) ? 'opposes' : 'context',
       85,
       'run',
       earlier.id,

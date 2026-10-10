@@ -390,6 +390,15 @@ describe('mock API', () => {
     expect(again.downtime_started_at).toBe(stoppedAt);
   });
 
+  it('records the strategy of the attempt a retry retries, oldest first, like the API (SDD §4.2, §14.4)', async () => {
+    const { server, client } = setup('operator');
+    const failed = byPhase(server, 'failed');
+    expect([failed.strategy, failed.attempts]).toEqual(['cold', 1]);
+    failed.attempt_strategies = ['warm']; // its first attempt ran warm
+    const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
+    expect([retried.attempts, retried.attempt_strategies]).toEqual([2, ['warm', 'cold']]);
+  });
+
   it('counts bytes over every pass while migrations run and reports the running step in progress events, like the API (SDD §4.2, §4.3)', () => {
     const { server } = setup('operator');
     for (const plan of server.plans) plan.cutover_window = null;
@@ -1829,8 +1838,10 @@ describe('mock evidence, like the API (SDD §14.4, ADV-02)', () => {
 
   it('counts the attempts a VM made before, with the strategy they ran', async () => {
     const { server, client, plan, db, before } = validating({ option: 'warm', confidence: 0.8 });
+    // SDD §14.4: the attempts' own strategies, not the migration's now - a validation set it to cold after two warm attempts
     db.attempts = 2;
-    db.strategy = 'warm';
+    db.attempt_strategies = ['warm', 'warm'];
+    db.strategy = 'cold';
     await client.post(`/plans/${plan.id}/validate`);
     const [rec] = server.recommendations.slice(before);
     const earlier = rec!.evidence.find((i) => i.key === 'earlier_runs')!;
