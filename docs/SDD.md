@@ -1018,8 +1018,10 @@ outside demo mode) sets a fake source VM's power state, so the alert shows on th
 (approver; `confirm` must equal the wave's name, or the plan's name without `wave_id`, 400 otherwise) finalizes every
 `completed` migration of the wave or the plan with one approval: each one as `POST …/finalize` does it (its
 `migration.phase` and `migration.action` events, with the approver as actor), and one `plan.finalized` event whose
-data names the finalized VMs and the skipped ones with why (a migration that left `completed` meanwhile). It
-answers `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
+data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, or
+whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
+`completed` for a later finalize, and one VM's error never stops the others. It answers
+`{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
 
 ---
 
