@@ -2475,6 +2475,39 @@ async def test_a_person_may_still_approve_an_auto_applied_decision(tmp_path, sto
     assert approved.decision.status == DecisionStatus.approved
 
 
+async def test_an_override_reaches_the_plan_before_a_waiting_validation_reads_it(tmp_path, store):
+    """SDD §14.6: the override is written into the plan under the plan's lock, so a validation
+    that waited for the lock honours it - it neither asks the advisor again nor holds the
+    migration on a new recommendation no one could decide (the plan pins the VM)."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    put = h.orch.db.put
+
+    async def slow_plan_put(kind, model, expected_version=None):
+        if kind == "plan":
+            await asyncio.sleep(0.1)  # the override's plan write takes a moment
+        return await put(kind, model, expected_version)
+
+    h.orch.db.put = slow_plan_put
+    overriding = asyncio.create_task(
+        h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "rina")
+    )
+    while not h.orch.plan_lock(plan.id).locked():  # the override holds the plan's lock
+        await asyncio.sleep(0.001)
+    validating = asyncio.create_task(h.orch.validate_plan(plan.id, "bob"))
+    await overriding
+    await validating
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.advisor_hold, m.strategy) == (None, Strategy.cold)
+    assert (await h.plan(plan.id)).strategy_overrides == {"vm-1": Strategy.cold}
+    assert [r.id for r in _recommendations(store)] == [rec.id]
+
+
 async def test_a_cancel_clears_the_advisor_hold(tmp_path, store):
     """SDD §14.6 (advisor Phase 1 audit, A5): a cancelled migration takes no decision - the cancel
     action and a validation's cancel of a VM that left the plan both clear the hold, or Pending

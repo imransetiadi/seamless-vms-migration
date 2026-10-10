@@ -1643,13 +1643,16 @@ class Orchestrator:
                 m.approvals = []
                 _clear_request(m)
             await self._save(m, v)
+            if isinstance(action, Override):
+                source_id = m.vm.source_id
+
+                def keep(fresh: Plan) -> None:
+                    fresh.strategy_overrides[source_id] = final
+
+                # SDD §14.6: under the plan's lock, with the decision - a validation waiting for
+                # the lock honours the override instead of asking the advisor again
+                plan = await self._update_plan(plan_id, keep)
         if isinstance(action, Override):
-            source_id = m.vm.source_id
-
-            def keep(fresh: Plan) -> None:
-                fresh.strategy_overrides[source_id] = final
-
-            plan = await self._update_plan(plan_id, keep)
             await self._emit(
                 "plan.updated",
                 f"{plan.name}: strategy override for {m.vm.name}",
