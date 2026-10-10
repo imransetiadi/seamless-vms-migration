@@ -16,6 +16,7 @@ import { Link, Outlet, useLocation } from 'react-router-dom';
 import { useHealth, useMe } from '../api/hooks';
 import { useSignOut } from '../api/session';
 import { cn } from '../lib/cn';
+import { keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
 import { BrandMark } from './BrandMark';
 import { LiveIndicator } from './LiveIndicator';
@@ -179,7 +180,7 @@ function SessionFooter() {
 
 /** App shell: skip link, sidebar navigation (≥1024 px) or a disclosure menu, and the main region. */
 export function Layout() {
-  const { pathname, hash } = useLocation();
+  const { pathname, hash, state } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const lastPath = useRef(pathname);
@@ -194,11 +195,14 @@ export function Layout() {
     setMenuOpen(false);
     if (lastPath.current === pathname) return;
     lastPath.current = pathname;
+    // a control that switches the view in place (the inventory's Provider select) keeps the focus: moving it on
+    // each choice would be a change of context on input (WCAG 3.2.2, SDD §16)
+    if (keepsFocus(state)) return;
     const target = hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
     if (target && document.activeElement === target) return;
     mainRef.current?.focus({ preventScroll: true });
     window.scrollTo(0, 0);
-  }, [pathname, hash]);
+  }, [pathname, hash, state]);
 
   return (
     <div className="min-h-dvh lg:grid lg:grid-cols-[15rem_minmax(0,1fr)]">

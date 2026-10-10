@@ -1,8 +1,14 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { Route, Routes, useNavigationType } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
+import { Layout } from '../components/Layout';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Inventory from './Inventory';
+
+function NavigationType() {
+  return <output data-testid="navigation-type">{useNavigationType()}</output>;
+}
 
 const REFUSED = { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
 
@@ -15,6 +21,36 @@ describe('Inventory', () => {
     const rows = within(table).getAllByRole('row').slice(1);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toHaveTextContent('web-cache-01');
+  });
+
+  it('keeps focus on the Provider select while it switches the inventory, and replaces the address (WCAG 3.2.2, SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(
+      <Routes>
+        <Route
+          element={
+            <>
+              <Layout />
+              <NavigationType />
+            </>
+          }
+        >
+          <Route path="/inventory/:providerId" element={<Inventory />} />
+          <Route path="/events" element={<p>Events</p>} />
+        </Route>
+      </Routes>,
+      { route: '/inventory/rhosp17-dc1' },
+    );
+    const select = await screen.findByRole('combobox', { name: 'Provider' });
+    await screen.findByRole('table', { name: /^VMs on RHOSP 17.1 — DC1/ });
+    select.focus();
+    await user.selectOptions(select, 'vcenter-hq');
+    await screen.findByRole('table', { name: /^VMs on vCenter HQ/ });
+    expect(select).toHaveFocus();
+    expect(screen.getByTestId('navigation-type')).toHaveTextContent('REPLACE');
+    // any other navigation still moves focus to the page's main region, for screen readers to read the new page
+    await user.click(screen.getAllByRole('link', { name: 'Events' })[0]!);
+    expect(screen.getByRole('main')).toHaveFocus();
   });
 
   it('names a failed provider load with Retry instead of showing a blank page (SDD §16)', async () => {

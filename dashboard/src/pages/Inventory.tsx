@@ -15,6 +15,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
+import { KEEP_FOCUS } from '../lib/navigation';
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -231,7 +232,8 @@ export default function Inventory() {
             label="Provider"
             className="w-full sm:w-80"
             value={providerId}
-            onChange={(e) => navigate(`/inventory/${e.target.value}`)}
+            // switches the inventory in place: focus stays here and the address is replaced (WCAG 3.2.2, SDD §16)
+            onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
             options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerLabel(p) }))}
           />
         }
