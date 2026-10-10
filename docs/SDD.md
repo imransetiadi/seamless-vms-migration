@@ -977,7 +977,8 @@ starts the watch, as a task of its own, one at a time, and never waits for it: a
 migration records `source_running_at` once and emits `migration.source_running` (data `{"power_state"}`): the VM
 writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
-the timeline records it. A VM
+the timeline records it. A rollback clears `source_running_at`: it starts the source on purpose, and a migration that
+completes again is watched afresh (in demo mode the rollback also drops the power the demo set). A VM
 the provider no longer has (a storage handover rebuilt it, a finalize deleted it) and a provider error are skipped
 (logged), never a failure. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
