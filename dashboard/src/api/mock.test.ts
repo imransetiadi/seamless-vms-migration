@@ -378,7 +378,9 @@ describe('mock API', () => {
     expect(retried.downtime_started_at).toBe(stoppedAt);
     await expect(client.post(`/migrations/${failed.id}/cancel`, {})).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/source VM is stopped/) });
 
-    // the next cutover counts from the first stop
+    // the next cutover counts from the first stop, and the clock does not start again (like the API)
+    const started = () => server.events.filter((e) => e.migration_id === failed.id && e.kind === 'migration.downtime_started').length;
+    const startedBefore = started();
     const plan = server.plans.find((p) => p.id === failed.plan_id)!;
     plan.status = 'running';
     plan.cutover_window = null;
@@ -389,6 +391,25 @@ describe('mock API', () => {
     const again = server.migrations.find((m) => m.id === failed.id)!;
     expect(again.phase).toBe('cutover');
     expect(again.downtime_started_at).toBe(stoppedAt);
+    expect(started()).toBe(startedBefore);
+  });
+
+  it('clears what the earlier attempt found about itself at a retry, and keeps an open clock with its model seconds, like the API (SDD §5.1, §5.2)', async () => {
+    const { server, client } = setup('operator');
+    const failed = byPhase(server, 'failed');
+    // the failed fixture stopped its source: its clock is open
+    expect([failed.downtime_started_at !== null, failed.downtime_ended_at]).toEqual([true, null]);
+    Object.assign(failed, {
+      data_issues: ['DOWNTIME_BELOW_FINAL_SYNC: 0 s of downtime around a 100 s final sync'],
+      converged_by: 'slo',
+      review_required: true,
+      review_reason: 'application probe unreachable from the control plane: 10.0.0.5:80',
+      checkpoint: 'cutover',
+      downtime_model_s: 600,
+    });
+    const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
+    expect([retried.data_issues, retried.converged_by, retried.review_required, retried.review_reason, retried.checkpoint]).toEqual([[], null, false, null, null]);
+    expect(retried.downtime_model_s).toBe(600);
   });
 
   it('records the strategy of the attempt a retry retries, oldest first, like the API (SDD §4.2, §14.4)', async () => {

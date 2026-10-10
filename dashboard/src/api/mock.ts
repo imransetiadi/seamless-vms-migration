@@ -731,13 +731,13 @@ export class MockServer {
   private beginCutover(m: Migration, plan: Plan): void {
     this.transition(m, 'cutover', 'cutover gate satisfied', 'orchestrator');
     if (!m.downtime_started_at || m.downtime_ended_at) {
-      // a retried cutover keeps the clock of the first stop (SDD §5.2)
+      // a retried cutover keeps the clock of the first stop (SDD §5.2): the clock starts only here
       m.downtime_started_at = new Date(this.now()).toISOString();
       m.downtime_ended_at = null;
       m.actual_downtime_s = null;
+      this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
     }
     m.progress_pct = 0;
-    this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
     // a cold copy is recorded as a full pass, as the API's executors record it
     if (m.strategy === 'warm' || m.strategy === 'vmware_warm') this.startPass(m, 'final');
     else if (m.strategy === 'cold' || m.strategy === 'vmware_cold') this.startPass(m, 'full');
@@ -2029,15 +2029,21 @@ export class MockServer {
         // the strategy of the attempt being retried: the evidence names it, even after a later validation chose another (SDD §14.4)
         m.attempt_strategies = [...m.attempt_strategies, m.strategy];
         if (!m.downtime_started_at || m.downtime_ended_at) {
-          // a closed clock starts afresh; an open one means the source is still stopped (SDD §5.2)
+          // a closed clock starts afresh, with the model seconds the next cutover reports; an open one means the
+          // source is still stopped, and keeps its model seconds (SDD §5.2)
           m.downtime_started_at = null;
           m.downtime_ended_at = null;
           m.actual_downtime_s = null;
+          m.downtime_model_s = null;
         }
         m.error = null;
         clearRequest(m);
-        // the next cutover reports its own (SDD §5.2)
-        m.downtime_model_s = null;
+        // like the API's retry (SDD §5.1): what the earlier attempt found about itself goes with it
+        m.data_issues = [];
+        m.converged_by = null;
+        m.review_required = false;
+        m.review_reason = null;
+        m.checkpoint = null;
         m.progress_pct = 0;
         if (reopen) {
           plan.status = 'running';
