@@ -743,9 +743,11 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   runs (a pause that returned starts nothing more), the phase, the gate of a cutover (§5.4) and the
   strategy: a pre-copy starts only for a warm strategy and a cutover from `ready` only for a
   single-shot one, since `set_strategy` may have changed it meanwhile. A running plan is pre-staged once (`prestage`, §7.2) before
-  its first migration starts; when pre-staging fails the plan becomes `failed` (event `plan.updated`,
+  its first migration starts; when pre-staging fails a plan that still runs becomes `failed` (event `plan.updated`,
   "pre-staging failed"), and `start_plan` accepts a `failed` plan as it does a `validated` or `paused`
-  one, pre-staging it again.
+  one, pre-staging it again. A plan paused, validated again or edited while pre-staging ran keeps its status:
+  the failure is recorded (the same event, without a status) and pre-staging runs again at its next start —
+  a late failure must not turn an edited draft into a `failed` plan that `start_plan` accepts unvalidated.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
   migration after **every** state change, emits events, and records `checkpoint` (last completed
   step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed, and
@@ -773,7 +775,7 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
   validate, auto-waves, start, pause, an edit (`PATCH /plans/{id}`, which returns the plan to
-  draft), the tick's completion and a retry that reopens a completed plan (§5.1) — run under the plan's lock and re-check the status on the fresh copy before they write it,
+  draft), the tick's completion, a retry that reopens a completed plan (§5.1) and a pre-staging failure — run under the plan's lock and re-check the status on the fresh copy before they write it,
   so none writes over another's change (auto-waves never turns a plan started meanwhile back into a
   draft, validation never marks a started plan `validated`, and an edit waits for a running validation:
   a plan edited during a validation ends up `draft`, never `validated` with settings no validation saw).
