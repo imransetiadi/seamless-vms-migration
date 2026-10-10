@@ -932,6 +932,16 @@ async def test_a_huge_output_line_does_not_fail_the_step(env, monkeypatch):
     assert any(line.startswith("ok: [localhost] => xxx") for line in rec.logs)
 
 
+async def test_output_lines_reach_the_log_whole(env, monkeypatch):
+    """SDD §4, §7.1: the executor hands every output line to ``StepContext.log`` whole — the
+    orchestrator redacts it before the cut to 2000 characters, so a cut here first could split a
+    secret (a PEM block) before redaction sees its end."""
+    monkeypatch.setenv("ANSIBLE_FAKE_LONG_LINE", "5000")
+    ctx, rec = ctx_for(env, strategy=Strategy.warm)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert "ok: [localhost] => " + "x" * 5000 in rec.logs
+
+
 async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkeypatch):
     for key in (
         "ANSIBLE_VERBOSITY",

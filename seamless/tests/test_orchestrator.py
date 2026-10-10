@@ -11,6 +11,7 @@ from seamless_migrate.ai.advisor import Advisor
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
 from seamless_migrate.ai.memory import MemoryClient
+from seamless_migrate.ai.redaction import redact
 from seamless_migrate.ai.snapshots import canonical_json
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
@@ -1873,6 +1874,65 @@ async def test_failed_cutover_auto_rolls_back(tmp_path, store):
     assert m.downtime_started_at and m.downtime_ended_at and m.actual_downtime_s is not None
     assert [s for _, s in executor.calls] == [StepName.CUTOVER, StepName.ROLLBACK]
     assert "migration.error" in h.kinds()
+
+
+async def test_step_output_lines_are_redacted_before_they_are_cut(tmp_path, store, monkeypatch):
+    """SDD §4, §13.4 (Security.md C2-02): a step's output line reaches the migration.log
+    subscribers through redact — its first 2000 + 16384 characters, then the cut to 2000 — so a
+    password a task prints without no_log, a bearer token and a PEM block whose end lies beyond
+    the cut never reach a viewer, while the rest of the line still does; a line of megabytes is
+    redacted no further than the window."""
+    settings = make_settings(tmp_path)
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 2500 + "-----END RSA PRIVATE KEY-----"
+    lines = [
+        'fatal: [localhost]: FAILED! => {"msg": "login refused", "password": "Hunter2xyz"}',
+        "GET /v3/auth/projects Authorization: Bearer abc.def.ghi",
+        "deploy key: " + pem,
+        "huge result: " + "x" * 2**22,
+    ]
+    redacted: list[int] = []
+
+    def measured_redact(text, *args, **kwargs):
+        if text.startswith("huge result: "):
+            redacted.append(len(text))
+        return redact(text, *args, **kwargs)
+
+    monkeypatch.setattr("seamless_migrate.orchestrator.redact", measured_redact)
+
+    async def chatty_precopy(ctx):
+        for line in lines:
+            await ctx.log(line)
+        return await executor.sim.run(StepName.PRECOPY, ctx)
+
+    executor = ScriptedExecutor(settings, hooks={StepName.PRECOPY: chatty_precopy})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    published: list[str] = []
+    publish = h.bus.publish
+
+    def recording_publish(event, persist):
+        if event.kind == "migration.log":
+            published.append(event.message)
+        publish(event, persist)
+
+    h.bus.publish = recording_publish
+    await run_plan(h, plan)
+    await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    shown = [m for m in published if m.startswith(("fatal:", "GET /v3", "deploy key:", "huge"))]
+    assert len(shown) == 4, published
+    assert all(len(m) <= 2000 for m in shown)
+    assert not any(s in m for m in shown for s in ("Hunter2xyz", "abc.def.ghi", "KKKKKKKK"))
+    assert shown[0].startswith('fatal: [localhost]: FAILED! => {"msg": "login refused"')
+    assert shown[2] == "deploy key: [REDACTED PEM]"
+    assert shown[3] == ("huge result: " + "x" * 2000)[:2000]
+    assert redacted == [2000 + 16384]
 
 
 async def test_failed_verification_rolls_back(tmp_path, store):

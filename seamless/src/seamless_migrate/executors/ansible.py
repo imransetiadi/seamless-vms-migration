@@ -838,7 +838,7 @@ class AnsibleExecutor:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 lines.append(line)
                 if ctx is not None and line.strip():
-                    await ctx.log(line[:2000])
+                    await ctx.log(line)  # whole: the orchestrator redacts, then cuts (SDD §4)
                 if watch_stop and STOP_TASK.match(line):
                     # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False

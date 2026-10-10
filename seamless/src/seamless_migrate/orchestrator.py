@@ -107,6 +107,11 @@ log = logging.getLogger(__name__)
 P = Phase
 
 PROGRESS_MIN_INTERVAL_S = 1.0
+#: a migration.log line is cut to this many characters (SDD §4) ...
+LOG_LINE_CHARS = 2000
+#: ... after this many more were redacted with it: a secret the cut splits is still found, and a
+#: line of megabytes costs the event loop no more than this window
+LOG_REDACT_MARGIN = 16384
 APPROVABLE = frozenset(
     {
         P.pending,
@@ -2131,9 +2136,8 @@ class Orchestrator:
                 await self._mark_downtime(mid, at)
 
         async def log_line(line: str) -> None:
-            await self._emit(
-                "migration.log", line[:2000], plan_id=m.plan_id, persist=False, migration=m
-            )
+            text = redact(line[: LOG_LINE_CHARS + LOG_REDACT_MARGIN])[:LOG_LINE_CHARS]
+            await self._emit("migration.log", text, plan_id=m.plan_id, persist=False, migration=m)
 
         return StepContext(
             plan=plan,
