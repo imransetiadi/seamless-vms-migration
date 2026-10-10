@@ -951,7 +951,8 @@ class DestinationProvider(Protocol):
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str]}`;
 `DestinationInventory {networks: dict[str, int|None], flavors: list[{name, vcpus, ram_mb, disk_gb,
 extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
-gigabytes}] (free amounts), projects: list[str]}`.
+gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
+list[str]}`.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
@@ -1394,7 +1395,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
   `/inventory/:providerId`
   (a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
-  a destination: networks with MTU, flavors, volume types, free quota per project and the project names that plan
+  a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
+  Unlimited and an unreported one Not reported, never a number) and the project names that plan
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
