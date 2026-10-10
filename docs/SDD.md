@@ -1878,7 +1878,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
   plan's heading, while Cancel returns focus to the button) or while its request runs (a busy button stays focusable,
   `aria-busy` and `aria-disabled`, and ignores further presses), `prefers-reduced-motion` honoured,
-  44×44 px minimum targets for primary actions. An
+  44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
+  over it — so Tab never hides the focused control under them (WCAG 2.4.11). An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover).
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
