@@ -264,22 +264,28 @@ def _mark_unsafe(value: Any) -> Any:
     if isinstance(value, str):
         return _Unsafe(value)
     if isinstance(value, dict):
-        return {key: _mark_unsafe(item) for key, item in value.items()}
+        return {
+            (_Unsafe(key) if isinstance(key, str) else key): _mark_unsafe(item)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_mark_unsafe(item) for item in value]
     return value
 
 
-def ansible_yaml(data: Any, *, sort_keys: bool = True) -> str:
+def ansible_yaml(data: dict[str, Any], *, sort_keys: bool = True) -> str:
     """YAML for the files Ansible reads (``-e @vars.yml``, ``-e @secrets.yml``, the inventory).
 
     Ansible templates every string it reads, so a VM name (chosen by whoever runs the source VM),
     a mapping value or a password holding ``{{ … }}`` or ``{% … %}`` would run as Jinja on the
     control plane, where ``lookup('pipe', …)`` executes commands next to every cloud credential.
-    Every string value is written ``!unsafe`` so Ansible keeps it verbatim (SDD §7.2, Security.md
-    C1-05); mapping keys — the variable names — stay plain.
+    Every string — every value, and every key of a nested mapping, which ``dict2items`` turns into
+    a value (a source network's name keys ``network_map``) — is written ``!unsafe`` so Ansible
+    keeps it verbatim (SDD §7.2, Security.md C1-05); only the top-level keys, the variable names
+    (the inventory's group names), stay plain.
     """
-    return yaml.dump(_mark_unsafe(data), Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
+    marked = {key: _mark_unsafe(value) for key, value in data.items()}
+    return yaml.dump(marked, Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
 
 
 def _inventory(conversion_host: dict[str, Any] | None = None) -> str:

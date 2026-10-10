@@ -140,8 +140,8 @@ def env(tmp_path, monkeypatch):
     return SimpleNamespace(settings=settings, log=log, executor=executor, registry=registry)
 
 
-def ctx_for(env, strategy=Strategy.warm, source=SRC, name="web-01", **mig_kw):
-    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+def ctx_for(env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, **mig_kw):
+    plan = make_plan(id="plan-00c0ffee", mappings=mappings)
     vm = make_vm(source_id="srv-1", name=name)
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
     return make_ctx(plan, mig, source, DST, env.settings)
@@ -377,14 +377,17 @@ NEVER_TEMPLATED = {
 JINJA_NAME = "{{ lookup('pipe', 'id') }}{% if true %}-x{% endif %}"
 
 
-def value_scalars(node):
-    """The scalar nodes in value position (mapping values, sequence items) of a YAML node."""
+def data_scalars(node, nested=False):
+    """The scalar nodes of a YAML document that hold data: every value, and every key of a nested
+    mapping (``dict2items`` turns a key into a value); the top-level keys are the variable names."""
     if isinstance(node, yaml.MappingNode):
-        for _key, value in node.value:
-            yield from value_scalars(value)
+        for key, value in node.value:
+            if nested:
+                yield from data_scalars(key, True)
+            yield from data_scalars(value, True)
     elif isinstance(node, yaml.SequenceNode):
         for item in node.value:
-            yield from value_scalars(item)
+            yield from data_scalars(item, True)
     elif isinstance(node, yaml.ScalarNode):
         yield node
 
@@ -396,44 +399,62 @@ async def test_generated_ansible_input_is_never_templated(env, strategy, source)
     """Security.md C1-05, SDD §7.2: Ansible templates every string it reads, so a VM name (chosen
     by whoever runs the source VM), a mapping value or a password holding Jinja would run on the
     control plane (``lookup('pipe', …)``). Every string in vars.yml, secrets.yml and the
-    inventory is written ``!unsafe``, and the playbook still receives it unchanged."""
-    ctx, _ = ctx_for(env, strategy=strategy, source=source, name=JINJA_NAME)
+    inventory — the values and the keys of nested mappings, such as a source network's name in
+    ``network_map`` — is written ``!unsafe``, and the playbook still receives it unchanged."""
+    networks = {**MAPPINGS.networks, JINJA_NAME: "rhoso-app"}
+    mappings = MAPPINGS.model_copy(update={"networks": networks})
+    ctx, _ = ctx_for(env, strategy=strategy, source=source, name=JINJA_NAME, mappings=mappings)
     await env.executor.run(StepName.PRECOPY, ctx)
     calls = read_log(env.log)
     assert calls
     for call in calls:
         assert {"vars.yml", "secrets.yml", "inventory.yml"} <= set(call["raw"])
         for name, text in call["raw"].items():
-            for node in value_scalars(yaml.compose(text)):
+            root = yaml.compose(text)
+            # only the top-level keys stay plain: variable names (group names), never data
+            for key, _ in root.value:
+                assert key.tag == "tag:yaml.org,2002:str", (call["playbook"], name, key.value)
+                assert key.value.isidentifier(), (call["playbook"], name, key.value)
+            for node in data_scalars(root):
                 assert node.tag in NEVER_TEMPLATED, (call["playbook"], name, node.value)
     if strategy is Strategy.vmware_warm:
         assert calls[-1]["vars"]["vms_list"] == [JINJA_NAME]
+        assert calls[-1]["vars"]["network_map"] == networks
     else:
         [query] = calls[-1]["vars"]["os_migrate_workloads_filter"]
         assert re.search(query["regex"], JINJA_NAME)
 
 
 def test_ansible_reads_generated_input_verbatim(tmp_path):
-    """The real ``ansible-playbook`` keeps a Jinja VM name and password literal instead of running
-    them, and the run still works: modules execute through the ``!unsafe`` connection variables of
-    the executor's inventory and receive the nested secrets unchanged."""
+    """The real ``ansible-playbook`` keeps a Jinja VM name, network name and password literal
+    instead of running them — a network name keys ``network_map``, and ``dict2items`` makes that
+    key a value — and the run still works: modules execute through the ``!unsafe`` connection
+    variables of the executor's inventory, its host variables resolve, and the nested secrets
+    arrive unchanged."""
     playbook_bin = Path(sys.executable).with_name("ansible-playbook")
     if not playbook_bin.exists():
         pytest.skip("ansible-core is not installed (the collection extra)")
     marker = "INJECTED-BY-VM-NAME"
     name = "{{ lookup('pipe', 'echo " + marker + "') }}"
     (tmp_path / "vars.yml").write_text(
-        ansible_yaml({"vms_list": [name], "network_map": {"a": name}})
+        ansible_yaml({"vms_list": [name], "network_map": {"a": name, name: "rhoso-app"}})
     )
     (tmp_path / "secrets.yml").write_text(
         ansible_yaml({"os_migrate_src_auth": {"username": "svc", "password": name + "%{x}"}})
     )
-    # the executor's own inventory: local connection and interpreter are !unsafe strings
-    (tmp_path / "inventory.yml").write_text(build_inventory_doc())
+    # the executor's own inventory: local connection and interpreter are !unsafe strings, and so
+    # are the keys below the group names (a conversion host, its variables)
+    conversion = {"conv.example.invalid": {"ansible_ssh_user": "cloud-user"}}
+    (tmp_path / "inventory.yml").write_text(build_inventory_doc(conversion))
     (tmp_path / "play.yml").write_text(
         "- hosts: migrator\n  gather_facts: false\n  tasks:\n"
         "    - ansible.builtin.debug:\n"
         '        msg: "name={{ vms_list[0] }} net={{ network_map.a }}"\n'
+        "    - ansible.builtin.debug:\n"
+        '        msg: "src={{ item.key }} dst={{ item.value }}"\n'
+        '      loop: "{{ network_map | dict2items }}"\n'
+        "    - ansible.builtin.debug:\n"
+        "        msg: \"user={{ hostvars[groups['conversion_host'][0]].ansible_ssh_user }}\"\n"
         "    - ansible.builtin.debug:\n"
         '        msg: "pw={{ os_migrate_src_auth.password }}"\n'
         "    - ansible.builtin.ping:\n"
@@ -466,9 +487,11 @@ def test_ansible_reads_generated_input_verbatim(tmp_path):
     )
     assert run.returncode == 0, run.stdout + run.stderr
     assert f"name={name} net={name}" in run.stdout
+    assert f"src={name} dst=rhoso-app" in run.stdout
+    assert "user=cloud-user" in run.stdout
     assert marker not in run.stdout.replace(name, "")
     assert f"pw={name}%{{x}}" in run.stdout
-    assert "ok=4" in run.stdout and "failed=0" in run.stdout
+    assert "ok=6" in run.stdout and "failed=0" in run.stdout
 
 
 async def test_vmware_warm_flags(env):
