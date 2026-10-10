@@ -725,11 +725,14 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   for) changed and transferred, its disks' size scanned, the step's duration, which the copy dominates — so
   `bytes_transferred` stays its listed passes (§4.3, §5.5 invariant 2), as in the simulator (§7.4).
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
-* Every string value in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag
-  `!unsafe` (`ansible_yaml`); mapping keys — the variable names — stay plain. Ansible templates every
-  string it reads, so a VM name (chosen by whoever runs the source VM), a mapping value or a password
-  holding `{{ … }}` or `{% … %}` would otherwise run as Jinja on the control plane
-  (`lookup('pipe', …)` executes commands next to every cloud credential; Security.md R-16).
+* Every string in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag `!unsafe`
+  (`ansible_yaml`): every value and every key of a nested mapping (a source network's name keys
+  `network_map`); only the top-level keys — the variable names, the inventory's group names — stay
+  plain. Ansible templates every string it reads, and a key turns into a value as soon as a playbook
+  makes items of its map (`dict2items`), so a VM name (chosen by whoever runs the source VM), a source
+  network name, a mapping value or a password holding `{{ … }}` or `{% … %}` would otherwise run as
+  Jinja on the control plane (`lookup('pipe', …)` executes commands next to every cloud credential;
+  Security.md R-16).
 * Downtime clock for Ansible-driven cutovers: the executor calls `mark_downtime_start(at=…)` with the
   time the playbook output showed the source-stop task starting, once the task's result line confirms
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
