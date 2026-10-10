@@ -50,6 +50,11 @@ export function countedApprovals(m: Migration, plan: Plan | null | undefined): A
   return own.size ? m.approvals.filter((a) => !own.has(a.actor)) : m.approvals;
 }
 
+/** Why `actor`'s approval does not count (SDD §5.4, §16): they forced the cutover, or requested it. */
+export function uncountedReason(m: Migration, actor: string): string {
+  return m.force_cutover?.actor === actor ? 'forced the cutover' : 'requested the cutover';
+}
+
 /** Maker-checker (ADV-17): the plan wants an approval, and not from the cutover's requester. */
 function fourEyes(plan: Plan | null | undefined): boolean {
   return Boolean(plan?.require_approval && plan.require_distinct_approver);

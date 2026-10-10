@@ -312,6 +312,18 @@ describe('MigrationDetail', () => {
     expect(await within(panel).findByText(/an approver other than the requester/i)).toBeInTheDocument();
   });
 
+  it('says an approval does not count because its approver forced the cutover (SDD §5.4, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!; // web-01: requested by rina, approved by sari
+    // sari, who approved, then forced the cutover: her approval no longer counts, and not because she requested it
+    m.force_cutover = { actor: 'sari', at: '2026-10-08T11:59:30Z', reason: 'the delta never converges on this VM', delta_bytes: 0, estimated_downtime_s: 600 };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^approvals$/i });
+    const items = within(within(panel).getByRole('list')).getAllByRole('listitem');
+    const sari = items.find((li) => li.querySelector('strong')?.textContent === 'Approved by sari')!;
+    expect(sari).toHaveTextContent('Does not count: sari forced the cutover.');
+  });
+
   it("keeps Approve from the cutover's requester, with the reason, and lets another approver approve (SDD §5.4, ADV-17)", async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

@@ -33,7 +33,7 @@ import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
-import { clearedByStrategyChange, countedApprovals } from '../lib/migrationActions';
+import { clearedByStrategyChange, countedApprovals, uncountedReason } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
 import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
@@ -542,7 +542,7 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
             <When at={a.at} />
           </p>
           {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
-          {plan?.require_approval !== false && !counted.has(a) && <p className="text-xs text-status-warning">Does not count: {a.actor} requested the cutover.</p>}
+          {plan?.require_approval !== false && !counted.has(a) && <p className="text-xs text-status-warning">Does not count: {a.actor} {uncountedReason(m, a.actor)}.</p>}
         </div>
       ),
     })),

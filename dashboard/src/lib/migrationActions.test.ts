@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, uncountedReason, type MigrationActionKey } from './migrationActions';
 import { OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
@@ -209,6 +209,10 @@ describe('migrationActions rules', () => {
     expect(migrationActions(forced, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
     expect(countedApprovals(forced, distinct).map((a) => a.actor)).toEqual(['rina']);
     expect(countedApprovals(forced, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
+    // why an approval does not count (SDD §5.4, §16): the forcer forced it, the requester requested it, and a forcer
+    // who also requested it (the force is the request when none was made) forced it
+    expect([uncountedReason(forced, 'sari'), uncountedReason(forced, 'bob')]).toEqual(['forced the cutover', 'requested the cutover']);
+    expect(uncountedReason({ ...forced, cutover_requested_by: 'sari' }, 'sari')).toBe('forced the cutover');
   });
 
   it('says that a requested cutover waits for another approver, and that a request is not an approval (ADV-17)', () => {
