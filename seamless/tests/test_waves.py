@@ -62,6 +62,34 @@ def test_pilot_wave_first():
     assert all(w.max_parallel == 5 for w in waves)
 
 
+def test_pilot_never_takes_a_riskier_vm_than_one_it_left_out():
+    """SDD §9.4: the pilot holds the lowest-risk VMs. App groups are taken whole in risk order; when
+    one does not fit, a smaller but riskier one never takes its place (the pilot then holds fewer
+    than 3 VMs), while one of the same risk still may."""
+    blog = [
+        vm("blog-1", "blog-web-01", 10, app="blog"),
+        vm("blog-2", "blog-web-02", 10, app="blog"),
+    ]
+    shop = [
+        vm("shop-1", "shop-web-01", 20, app="shop"),
+        vm("shop-2", "shop-web-02", 20, app="shop"),
+    ]
+    dbs = [vm("db", "orders-postgres-01", 30), vm("db2", "billing-mysql-01", 40)]
+    tiers = {v.source_id: heuristic_tier(v) for v in [*blog, *shop, *dbs]}
+    assert {tiers[v.source_id] for v in dbs} == {"stateful_database"}
+    assert {tiers[v.source_id] for v in [*blog, *shop]} == {"stateless_web"}
+
+    waves = plan_waves([*blog, *shop, *dbs], tiers, max_wave_size=10)
+    assert waves[0].name == "Pilot" and waves[0].vm_ids == ["blog-1", "blog-2"]
+    assert waves[1].vm_ids == ["shop-1", "shop-2", "db", "db2"]
+
+    # a web VM as low-risk as the app group left out may still fill the room
+    cms = vm("cms", "cms-web-01", 50)
+    waves = plan_waves([*blog, *shop, *dbs, cms], {**tiers, "cms": heuristic_tier(cms)})
+    assert waves[0].vm_ids == ["blog-1", "blog-2", "cms"]
+    assert waves[1].vm_ids == ["shop-1", "shop-2", "db", "db2"]
+
+
 def test_waves_chunked_by_size_and_chained():
     vms = [vm(f"w{i}", f"web-{i:02d}", 10 + i) for i in range(10)]
     tiers = {v.source_id: "stateless_web" for v in vms}
