@@ -7,6 +7,7 @@ import contextlib
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
@@ -314,6 +315,9 @@ class OpenStackProvider:
         return str(output) if output is not None else None
 
     def _delete_server(self, server_id: str) -> None:
+        # the wait ends within the call's bound: past it the call reports a timeout while the
+        # deletion goes on (SDD §8.1)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
         conn = self._connection()
         server = conn.compute.find_server(server_id, ignore_missing=True)
         if server is None:
@@ -321,7 +325,7 @@ class OpenStackProvider:
         conn.compute.delete_server(server, ignore_missing=True)
         wait = getattr(conn.compute, "wait_for_delete", None)
         if wait is not None:
-            wait(server, wait=600)
+            wait(server, wait=max(1, int(deadline - time.monotonic())))
 
     def _find_server(self, name: str) -> str | None:
         conn = self._connection()

@@ -1086,6 +1086,7 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
+    from seamless_migrate.providers import openstack as osp
     from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
 
     conn = fake_conn()
@@ -1113,16 +1114,20 @@ async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
     conn.compute.get_server_console_output = lambda server_id, length=None: None
     assert await provider.console_log("srv-1") is None
 
-    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited
+    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited,
+    # within the call's bound: a wait past it would report a timeout while the deletion goes on
+    # (SDD §8.1)
     waited = []
     conn.compute.delete_server = lambda server, ignore_missing=True: conn.compute.deleted.append(
         server.id
     )
-    conn.compute.wait_for_delete = lambda server, wait=600: waited.append(server.id)
+    conn.compute.wait_for_delete = lambda server, wait=600: waited.append((server.id, wait))
     await provider.delete_server("missing")
     assert conn.compute.deleted == []
     await provider.delete_server("web-01")
-    assert conn.compute.deleted == ["srv-1"] and waited == ["srv-1"]
+    [(server_id, wait)] = waited
+    assert conn.compute.deleted == ["srv-1"] and server_id == "srv-1"
+    assert 0 < wait < osp.PROVIDER_CALL_TIMEOUT_S
     assert await provider.find_server("web-01") == "srv-1"
     assert await provider.find_server("nope") is None
 

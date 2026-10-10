@@ -1148,6 +1148,9 @@ class Orchestrator:
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.rolling_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be rolled back")
+            if m.phase == P.completed and m.checkpoint == "finalizing":
+                # SDD §8.1: the rollback would delete the destination server and find no source
+                raise NotAllowed("the finalize began deleting the source VM: finalize it again")
             # SDD §5.1: without its providers the rollback fails, and a migration whose cutover
             # stopped its source could then be neither rolled back, retried nor cancelled
             missing = await self._missing_provider(await self._plan(m.plan_id))
@@ -1371,6 +1374,11 @@ class Orchestrator:
             source = await self.db.get("provider", plan.source_provider_id, Provider)
             destination = await self.db.get("provider", plan.destination_provider_id, Provider)
             executor = self.executors.for_strategy(m.strategy)
+            if delete_source:
+                # SDD §8.1: from here the source may be gone, even if the step fails — a failed
+                # finalize is finalized again, never rolled back
+                m.checkpoint = "finalizing"
+                v = await self._save(m, v)
             ctx = self._context(
                 m, plan, source, destination, options={"delete_source": delete_source}, locked=True
             )

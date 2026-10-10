@@ -4167,6 +4167,61 @@ async def test_finalize_plan_finalizes_a_wave_with_one_approval_and_audits_each_
         await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
 
 
+async def test_a_failed_finalize_that_began_deleting_the_source_cannot_be_rolled_back(
+    tmp_path, store
+):
+    """SDD §8.1: a finalize that deletes the source records checkpoint "finalizing" before its
+    step. When the step fails — a deletion that timed out may still finish — the migration stays
+    in the finalize queue to be finalized again, and a rollback answers 409: it would delete the
+    destination server and find no source to start. A finalize that keeps the source changes
+    nothing a rollback needs."""
+    settings = make_settings(tmp_path)
+    failed_once: set[str] = set()
+
+    async def finalize(ctx):
+        vm_id = ctx.migration.vm.source_id
+        if vm_id not in failed_once:
+            failed_once.add(vm_id)
+            raise TransientStepError("finalize: src-osp: call timed out after 300 s")
+        return StepResult(details={"source_deleted": bool(ctx.options.get("delete_source"))})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.FINALIZE: finalize})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1), vm(2)],
+        {"default_strategy": Strategy.cold},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m1, m2 = [await h.by_vm(plan.id, v) for v in ("vm-1", "vm-2")]
+    for m in (m1, m2):
+        await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m1.id, "rina", delete_source=True, confirm=m1.vm.name)
+    stuck = await h.migration(m1.id)
+    assert (stuck.phase, stuck.checkpoint) == (P.completed, "finalizing")
+    with pytest.raises(
+        NotAllowed, match="the finalize began deleting the source VM: finalize it again"
+    ):
+        await h.orch.rollback(m1.id, "bayu", "revert to the source")
+    assert (await h.migration(m1.id)).phase == P.completed
+    done = await h.orch.finalize(m1.id, "rina", delete_source=True, confirm=m1.vm.name)
+    assert (done.phase, done.checkpoint) == (P.finalized, "finalized")
+
+    # a failed finalize that keeps the source leaves the rollback to the operator
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m2.id, "rina", delete_source=False, confirm=m2.vm.name)
+    kept = await h.migration(m2.id)
+    assert kept.phase == P.completed and kept.checkpoint != "finalizing"
+    rolled = await h.orch.rollback(m2.id, "bayu", "revert to the source")
+    assert rolled.phase == P.rolling_back
+    await h.orch.stop()
+
+
 async def test_finalize_plan_skips_a_vm_whose_finalize_raised_any_error(tmp_path, store, caplog):
     """SDD §8.1: an unexpected error in one VM's finalize — a provider error, an OSError — skips
     that VM with its redacted reason instead of aborting the approval: the VMs after it are still
