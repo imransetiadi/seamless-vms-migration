@@ -900,37 +900,40 @@ class Orchestrator:
     async def _cleanup_after_cancel(
         self, m: Migration, step: asyncio.Task[Any] | None, actor: str
     ) -> None:
-        if step is not None:
-            with contextlib.suppress(BaseException):
-                await step  # the executor kills the playbook and removes its secret files
         try:
-            plan = await self._plan(m.plan_id)
-            source = await self.db.get("provider", plan.source_provider_id, Provider)
-            destination = await self.db.get("provider", plan.destination_provider_id, Provider)
-            ctx = self._context(
-                m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
-            )
-            await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+            if step is not None:
+                with contextlib.suppress(BaseException):
+                    await step  # the executor kills the playbook and removes its secret files
+            try:
+                plan = await self._plan(m.plan_id)
+                source = await self.db.get("provider", plan.source_provider_id, Provider)
+                destination = await self.db.get("provider", plan.destination_provider_id, Provider)
+                ctx = self._context(
+                    m, plan, source, destination, options={"delete_dest_volumes": True}, locked=True
+                )
+                await self.executors.for_strategy(m.strategy).run(StepName.ROLLBACK, ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._emit(
+                    "migration.error",
+                    f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
+                    "rollback_workloads.yml for the workload to remove its temporary resources",
+                    migration=m,
+                    data={"step": "cleanup", "error_class": type(exc).__name__},
+                )
+                return
             await self._emit(
-                "migration.error",
-                f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
-                "rollback_workloads.yml for the workload to remove its temporary resources",
+                "migration.action",
+                f"{m.vm.name}: temporary resources of the cancelled migration removed",
                 migration=m,
-                data={"step": "cleanup", "error_class": type(exc).__name__},
+                actor=actor,
+                data={"action": "cleanup"},
             )
-            return
         finally:
+            # tracked until it has finished, its outcome event included: whoever waits for the
+            # cleanup (or cancels it, as stop() does) never finds it gone before its outcome
             self._cleanups.pop(m.id, None)
-        await self._emit(
-            "migration.action",
-            f"{m.vm.name}: temporary resources of the cancelled migration removed",
-            migration=m,
-            actor=actor,
-            data={"action": "cleanup"},
-        )
 
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""

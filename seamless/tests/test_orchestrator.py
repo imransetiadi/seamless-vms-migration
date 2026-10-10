@@ -1177,6 +1177,40 @@ async def test_cancel_with_recorded_passes_cleans_up_the_warm_data_path(tmp_path
     await h.orch.stop()
 
 
+async def test_a_cleanup_stays_tracked_until_its_outcome_is_recorded(tmp_path, store):
+    """The cleanup after a cancel leaves _cleanups only once it has finished, its outcome event
+    included, however slowly the event store answers: whoever waits for it (stop() cancels what it
+    tracks) never sees it gone while the outcome is still unrecorded."""
+    settings = make_settings(tmp_path)
+
+    async def rollback(ctx):
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "require_approval": True},
+        executor=executor,
+        settings=settings,
+    )
+    emit = h.orch._emit
+
+    async def slow_outcome(kind, message, **kw):
+        if kind == "migration.action" and (kw.get("data") or {}).get("action") == "cleanup":
+            await asyncio.sleep(0.05)  # several polls of _settled
+        return await emit(kind, message, **kw)
+
+    h.orch._emit = slow_outcome
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    await h.orch.cancel(m.id, "rina", "descoped")
+    assert await _settled(h, m.id) == ["cancel", "cleanup"]
+    assert m.id not in h.orch._cleanups, "a finished cleanup is no longer tracked"
+    await h.orch.stop()
+
+
 async def test_cancel_without_a_data_path_runs_no_cleanup(tmp_path, store):
     """SDD §5.1: a warm migration that never ran a pass (validated, its plan not started) left
     nothing behind: its cancel runs no rollback step."""
