@@ -219,8 +219,12 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        probe_overrides: dict[str, list[AppProbe]] = {},   # per VM (source id): replaces verification.app_probes; [] = none (§7.5, ADV-18)
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
                                         "security_groups","security_group_rules"],
+       finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
+       derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
        created_at: datetime, updated_at: datetime }
+
+DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
@@ -291,6 +295,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             downtime_model_s: float|null,   # demo: the model seconds a simulated cutover kept the source stopped (§5.2)
             verification: VerificationRecord|null,   # the last verification: checks and probe results (§7.5, ADV-18)
             suggested_probes: list[AppProbe] = [],   # the rules' suggestion at validation; inactive until added to the plan (§9.6)
+            source_running_at: datetime|null,   # completed, not finalized: when its source VM was seen running again (§8.1)
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             created_at: datetime, updated_at: datetime }
@@ -309,7 +314,8 @@ passes that ended: a pass is recorded when it ends, and the running step is name
 Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `plan.paused`,
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
-`migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5),
+`migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5), `migration.source_running`,
+`plan.finalized` (§8.1),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
@@ -916,6 +922,44 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   draft, validation never marks a started plan `validated`, and an edit waits for a running validation:
   a plan edited during a validation ends up `draft`, never `validated` with settings no validation saw).
 
+### 8.1 Plan status and the finalize queue (ADV-19)
+
+`Plan.status` stays the lifecycle the orchestrator drives (above). What every view shows is
+`derive_plan_status(plan, migrations) -> DerivedPlanStatus`, returned as `Plan.derived_status` by every plan
+route and never stored — a re-validation of a finished plan stores `validated` although its migrations completed
+(seen on the demo after 10 October), and a stored status cannot tell a finished plan from a finalized one. Over the
+migrations that are not `cancelled`, in this order:
+
+1. a `draft` plan is `draft` (an edited plan is validated again);
+2. no migration: the stored status;
+3. a migration in `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying` or `rolling_back` (at work): `paused` when the stored status is `paused`, else `running`;
+4. a `running` or `paused` plan with a migration still to start (`pending`, `ready`, `blocked`, `validating`):
+   the stored status;
+5. a `failed` migration: `failed`;
+6. every migration `completed`, `finalized` or `rolled_back`: `completed` while one is `completed` (awaiting
+   finalize), else `finalized` when one is `finalized`, else `completed` (all rolled back: nothing to finalize);
+7. otherwise the stored status.
+
+The **finalize queue** is the plan's `completed` migrations: verified on RHOSO, the source VM still there until
+finalize. Each one's time in `completed` counts from its last transition into it; past `plan.finalize_warning_h`
+hours (default 72, ≥ 1; the owner's open question 14, `TODO(ADV-19): confirm`) it is flagged for finalize or
+rollback. `Stats.completed` stays the verified ones; `awaiting_finalize` and `finalized` split it.
+
+**Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
+in demo mode ÷ `demo_speed`) the tick asks its source provider for the source VM (`get_vm`). Seen `running`, the
+migration records `source_running_at` once and emits `migration.source_running` (data `{"power_state"}`): the VM
+writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears. A VM
+the provider no longer has (a storage handover rebuilt it, a finalize deleted it) and a provider error are skipped
+(logged), never a failure. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
+outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
+
+**Bulk finalize.** `POST /plans/{id}/finalize {"wave_id": str|null, "confirm": str, "delete_source": bool = false}`
+(approver; `confirm` must equal the wave's name, or the plan's name without `wave_id`, 400 otherwise) finalizes every
+`completed` migration of the wave or the plan with one approval: each one as `POST …/finalize` does it (its
+`migration.phase` and `migration.action` events, with the approver as actor), and one `plan.finalized` event whose
+data names the finalized VMs and the skipped ones with why (a migration that left `completed` meanwhile). It
+answers `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
+
 ---
 
 ## 9. Planning
@@ -1235,6 +1279,8 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
+| POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
+| POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
 | GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
@@ -1275,6 +1321,7 @@ Stats { total: int, by_phase: dict[Phase,int], completed: int, failed: int, in_p
         bytes_transferred: int, avg_downtime_s: float|null, p95_downtime_s: float|null,
         max_downtime_s: float|null, slo_compliance_pct: float|null,
         data_inconsistent: int = 0,   # completed migrations with data_issues, left out of the downtime figures (§5.5)
+        awaiting_finalize: int = 0, finalized: int = 0,   # `completed` = these two: verified, and finalized (§8.1, ADV-19)
         downtime_by_strategy: dict[Strategy, float],
         throughput_series: [{ "ts": datetime, "bps": float }]   # last 60 one-minute buckets
 }
@@ -1620,6 +1667,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
 | `SEAMLESS_ANSIBLE_PLAYBOOK`, `SEAMLESS_COLLECTION_ROOT` | `ansible-playbook`, repo root | executors |
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
+| `SEAMLESS_SOURCE_WATCH_S` | `300` | how often a completed migration's source VM is checked for running again (§8.1; ÷ `demo_speed` in demo mode) |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
 | `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
@@ -1675,6 +1723,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   below 80 % of the plan's downtime SLO, a warning (amber, hourglass icon) from 80 %, a breach (red,
   warning icon) past 100 % — so a VM never reads differently on the two pages, and the warning is never
   colour alone; the time left or over reads as a clock (m:ss) on both, the SLO itself as a duration.
+* Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
+  Finalized, Failed — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
+  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers), `/plans` (New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
@@ -1682,7 +1733,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
   approval policy and window, network/flavor/volume-type/project mappings, sync settings — link bandwidth,
   convergence threshold (0 or more), maximum passes (1 or more) and the keep-warm interval (at least a minute, §5.4) —
-  estimator overrides (scan rate per disk stream, disks scanned in parallel (1 or more), guest write rate
+  the finalize reminder (`finalize_warning_h`, hours, 1 or more), estimator overrides (scan rate per disk stream, disks scanned in parallel (1 or more), guest write rate
   `change_rate_bps`, aggregate scan cap
   `max_aggregate_scan_bps`, and the measured step times in seconds — source shutdown, snapshot, volume create and
   destination boot: `shutdown_s`, `snapshot_s`, `create_s`, `boot_s` (Performance.md §6.4) — §9.1; other overrides
@@ -1693,7 +1744,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable),
-  `/plans/:id` (settings summary, waves board, migrations table with
+  `/plans/:id` (its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
+  (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1) and no
+  Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
+  in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
+  `source_running_at` is set; settings summary, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
   pre-flight checks, with Validate there too; "{n} database VMs have no application probe." from the
   `APP_PROBE_MISSING` findings, listing each VM with its suggested probe (§9.6) and Use suggested probe — operator, a
@@ -1728,6 +1783,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime and asks for the reason (§5.4) —,
+  an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
+  roll back (§8.1) —, the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
+  demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
+  the alert can be shown,
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
   plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
