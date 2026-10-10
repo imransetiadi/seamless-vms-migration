@@ -321,6 +321,21 @@ describe('mock API', () => {
     expect(plan.status).toBe('validated');
   });
 
+  it('keeps a requested cutover waiting for a closed window unless an approver bypasses it, like the API (SDD §5.4)', async () => {
+    const { server, client } = setup('approver');
+    const m = server.migrations.find((x) => x.vm.name === 'ad-dc-01')!; // cold, ready, in a running plan
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.require_approval = false;
+    plan.auto_cutover = false;
+    plan.cutover_window = { start: new Date(NOW + 3_600_000).toISOString(), end: new Date(NOW + 7_200_000).toISOString() };
+    await client.post(`/migrations/${m.id}/cutover`, {});
+    server.tick();
+    expect(m.phase).toBe('ready'); // requested, but its window opens in an hour
+    await client.post(`/migrations/${m.id}/cutover`, { force_window: true });
+    server.tick();
+    expect(m.phase).toBe('cutover');
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');

@@ -368,7 +368,8 @@ export class MockServer {
     const requested = plan.auto_cutover || m.cutover_requested;
     const window = plan.cutover_window;
     const now = this.now();
-    const inWindow = !window || (now >= Date.parse(window.start) && now <= Date.parse(window.end)) || m.cutover_requested;
+    // like the API (SDD §5.4): only an approver's force_window lets a requested cutover start outside the window
+    const inWindow = !window || (now >= Date.parse(window.start) && now <= Date.parse(window.end)) || m.force_window;
     const cutovers = this.migrations.filter((x) => x.phase === 'cutover').length;
     return approved && requested && inWindow && cutovers < 3;
   }
