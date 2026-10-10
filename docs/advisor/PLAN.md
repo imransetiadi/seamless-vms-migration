@@ -30,7 +30,7 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 
 | PR | Item | Scope here | Status |
 |---|---|---|---|
-| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | in progress |
+| PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | done — 22a318d, 9719b27, 7331687, 7b5cbdc, ab29332, d8f2fb0, eec70db |
 | PR-2 | ADV-06 core | one redaction gateway every Jev call and memory write passes; fixture test (password, bearer, PEM, clouds.yaml `auth`) | planned |
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | planned |
 | PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | planned |
@@ -39,3 +39,20 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 | PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | planned |
 
 Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
+
+## PR-1 (ADV-01) — acceptance
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| 0.57 under a 0.60 threshold reads "Recommended: Warm" and "Decision: Cold — below threshold"; nothing says Warm was selected | met | `lib/advisor.test.ts`, `pages/Advisor.test.tsx` (static-cdn-01 in demo mode); on the demo stack web-02's old note now reads "Decision: Cold — below threshold (57% confidence)" |
+| The engine reads `decision.final_option`, not the recommendation's option (end-to-end in Demo mode) | met | `test_the_engine_runs_the_decision_not_the_recommendation`; the mock's validation tests; `tests/e2e/smoke-demo.sh` "the migration runs its newest decision" on the demo stack |
+| No threshold comparison in UI components | met | `lib/advisor.ts` words the decision from its status and reason code; a test feeds contradictory numbers and gets the decision's wording |
+| `decide()` unit tests cover every `ReasonCode` | met | `seamless/tests/test_decision.py` |
+| Notes before and after the data migration are the same; it can be rolled back | met (D5) | nothing is migrated: legacy entries are read from the notes (`test_api_advisor.py` one-to-one test) |
+
+Decisions taken with Jev during PR-1: the dashboard mock simulates Jev and takes the decision at validation like
+the API (`jev_decide` 1.0 over static fixtures or a rules-only mock). Found and fixed on the way: a re-validation
+recorded recommendations for migrations it leaves alone (7b5cbdc, ab29332). The server demo seed records whatever
+Jev decides (auto-applied or below threshold); the dashboard mock seeds the three statuses the engine takes today
+(`auto_applied`, `below_threshold`, `fallback_rules`) and one legacy note; `pending_approval`, `approved` and
+`overridden` arrive with PR-5.
