@@ -44,6 +44,10 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
 (PHASE-2).md`, the owner's file, untracked like the first one; it adds Phase 1b, ADV-16 … ADV-21):
 
 1. ADV-16 — investigate the cutover numbers of dc2-db-01 and report; **no engine change before the owner approves**.
+   Reported in [ADV-16-investigation.md](ADV-16-investigation.md): the numbers come from the demo simulator's time
+   compression (model seconds next to wall-clock timestamps), a chart that reads the final sync as a delta, and the
+   SDD §5.3 SLO rule the owner's invariant 3 leaves out; the real VMware warm cutover records no final pass.
+   Proposals P1–P7 wait for the owner.
 2. ADV-17 — maker-checker for approvals (a requester never approves their own request; no break-glass).
 3. Rest of Phase 1 — the threshold value in the Decision line (ADV-03), approve/override and the Finance policy
    visible on the demo stack (ADV-04, PR-5), the deployment badge and "Data sent to advisor" (ADV-06, PR-7); then
