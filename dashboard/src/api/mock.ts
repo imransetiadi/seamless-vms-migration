@@ -1736,7 +1736,8 @@ export class MockServer {
 
   /**
    * The VMs of `vmIds` that migrations of other plans with the same source hold (SDD §5.4), by source
-   * id: `name (plan "…", phase)` once per holder — plans validated before the rule may hold a VM twice.
+   * id: `name (plan "…", plan-id, phase)` once per holding plan, like the API — plans validated before the rule may
+   * hold a VM twice, and plan names need not be unique.
    */
   private heldElsewhere(plan: Plan, vmIds: readonly string[]): Map<string, string[]> {
     const others = new Map(this.plans.filter((p) => p.id !== plan.id && p.source_provider_id === plan.source_provider_id).map((p) => [p.id, p]));
@@ -1744,7 +1745,7 @@ export class MockServer {
     for (const m of this.migrations) {
       if (!others.has(m.plan_id) || !vmIds.includes(m.vm.source_id) || RELEASES_VM.has(m.phase)) continue;
       const holders = held.get(m.vm.source_id) ?? new Set<string>();
-      holders.add(`${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.phase})`);
+      holders.add(`${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.plan_id}, ${m.phase})`);
       held.set(m.vm.source_id, holders);
     }
     return new Map([...held].map(([id, holders]) => [id, [...holders].sort()]));

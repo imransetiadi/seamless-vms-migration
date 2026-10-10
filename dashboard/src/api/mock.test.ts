@@ -649,7 +649,7 @@ describe('mock API', () => {
     await expect(client.post(`/plans/${second.id}/validate`)).rejects.toMatchObject({
       status: 409,
       code: 'conflict',
-      message: expect.stringContaining(`${held.vm.name} (plan "${first.name}", ${held.phase})`),
+      message: expect.stringContaining(`${held.vm.name} (plan "${first.name}", ${first.id}, ${held.phase})`),
     });
     // a rolled-back migration lets its VM go; its retry would take it back
     held.phase = 'rolled_back';
@@ -747,9 +747,12 @@ describe('mock API', () => {
       vm_ids: mine.map((m) => m.vm.source_id),
     });
     const [a, b] = mine.map((m) => m.vm.name).sort();
+    // the two plans share a name: each is named by its id too (SDD §5.4)
+    const [p, q] = [first.id, legacy.id].sort();
+    const named = (vm: string) => `${vm} (plan "${first.name}", ${p}, ready), ${vm} (plan "${first.name}", ${q}, ready)`;
     await expect(client.post(`/plans/${third.id}/validate`)).rejects.toMatchObject({
       status: 409,
-      message: `2 VM(s) already have a migration in another plan: ${a} (plan "${first.name}", ready), ${b} (plan "${first.name}", ready); finish, roll back or cancel it there, or remove the VM from vm_ids`,
+      message: `2 VM(s) already have a migration in another plan: ${named(a!)}, ${named(b!)}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
     });
   });
 

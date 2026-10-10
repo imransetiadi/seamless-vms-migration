@@ -245,7 +245,7 @@ describe('Plans page', () => {
     await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
 
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
-    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
   });
 
   it('says in the form that the providers are unavailable, with Retry, instead of empty cloud lists (SDD §16)', async () => {
@@ -302,7 +302,7 @@ describe('Plans page', () => {
     server.handle = handle;
     await user.click(within(alert).getByRole('button', { name: /retry/i }));
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
-    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
   });
 

@@ -5,8 +5,8 @@ export const RELEASES_VM: ReadonlySet<Phase> = new Set<Phase>(['cancelled', 'fin
 
 /**
  * The VMs of `vmIds` that migrations of other plans with the source provider `sourceId` hold (SDD §5.4),
- * by source id: `name (plan "…", phase)` once per holder, the API's wording. `planId` is the plan being
- * edited, whose own migrations do not count.
+ * by source id: `name (plan "…", plan-id, phase)` once per holding plan, the API's wording (plan names need not
+ * be unique: the id tells two plans apart). `planId` is the plan being edited, whose own migrations do not count.
  */
 export function heldElsewhere(
   vmIds: Iterable<string>,
@@ -22,7 +22,7 @@ export function heldElsewhere(
     const other = others.get(m.plan_id);
     if (!other || !wanted.has(m.vm.source_id) || RELEASES_VM.has(m.phase)) continue;
     const holders = held.get(m.vm.source_id) ?? new Set<string>();
-    holders.add(`${m.vm.name} (plan "${other.name}", ${m.phase})`);
+    holders.add(`${m.vm.name} (plan "${other.name}", ${other.id}, ${m.phase})`);
     held.set(m.vm.source_id, holders);
   }
   return new Map([...held].sort(([a], [b]) => a.localeCompare(b)).map(([vmId, holders]) => [vmId, [...holders].sort()]));

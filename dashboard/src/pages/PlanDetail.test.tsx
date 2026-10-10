@@ -176,7 +176,7 @@ describe('PlanDetail', () => {
     await user.click(await actionButton(/validate/i));
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(/the plan action failed/i);
-    expect(alert).toHaveTextContent(`${held.vm.name} (plan "${first.name}", ${held.phase})`);
+    expect(alert).toHaveTextContent(`${held.vm.name} (plan "${first.name}", ${first.id}, ${held.phase})`);
   });
 
   it('asks before Validate clears approvals and cutover requests, and says how many (SDD §5.4, §16)', async () => {
