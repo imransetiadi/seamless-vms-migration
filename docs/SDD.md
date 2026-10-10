@@ -261,7 +261,17 @@ AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type
                         model: AdvisorModelInfo, recommendation: RecommendedOption, decision: Decision,
                         input_snapshot_sha256: str|null,                                     # §14.5
                         requested_by: str|null,       # the user whose plan validation recorded it (§14.6)
-                        legacy: bool = false, legacy_text: str|null }                        # §14.4
+                        legacy: bool = false, legacy_text: str|null,                         # §14.4
+                        evidence_option: str|null,    # the option every effect is measured against (§14.4)
+                        evidence: list[EvidenceItem] = [],             # what was known when it was recorded
+                        similar_incidents: list[SimilarIncident] = [], # at most 3, from agentmemory (§14.3)
+                        reasons: list[AdvisorReason] = [] }            # Jev's reasons that name an evidence key
+
+EvidenceItem { key: str, label: str, value: str|int|float|bool|null, display: str,
+               effect: "supports"|"opposes"|"context", weight: int (0..100),   # relevance: the card shows the heaviest
+               source: { kind: "inventory"|"preflight"|"estimate"|"plan"|"provider"|"run", ref_id: str (non-empty) } }
+SimilarIncident { title: str, content: str, score: float|null }   # content at most 1000 characters
+AdvisorReason { key: str, text: str }                              # key: an evidence item's key (§14.4)
 
 AdvisorSnapshot { sha256: str (the id), created_at: datetime, payload: dict }   # §14.5, write-once
 
@@ -269,7 +279,8 @@ AdvisorPolicy { id: str ("pol-…"), name: str (1–200),
                 scope: { provider_ids: list[str] = [], plan_ids: list[str] = [] },  # at most one set; none = global (§14.6)
                 decision_types: list[DecisionType] = [],                            # none = every type
                 mode: "auto_apply_above_threshold"|"always_require_approval", threshold: float (0..1),
-                min_evidence_for_auto_apply: int (0..100) = 0, require_override_reason: bool = true,
+                min_evidence_for_auto_apply: int (0..100) = 3,   # the built-in default keeps 0 (§14.6, ADV-02)
+                require_override_reason: bool = true,
                 require_distinct_approver: bool = true,   # the decision's requester never decides it (§14.6)
                 created_at: datetime, updated_at: datetime, updated_by: str }
 
@@ -1537,6 +1548,33 @@ All memory failures are logged and swallowed (never fail a migration).
 An advisor recommendation and the decision taken on it are stored apart, as an `AdvisorRecommendation`
 document (kind `recommendation`, §4.2); the engine reads only the decision.
 
+* **Evidence** (`ai/evidence.py`, ADV-02). A strategy recommendation carries its evidence, built by deterministic
+  code from what validation already holds — never asked of the model — and stored with it, so it reads as it was
+  when recorded. `build_strategy_evidence(vm, plan, provider_kind, estimates, findings, option, earlier)` measures
+  every effect against `evidence_option`: the advisor's recommended option, or the deterministic choice when it
+  gave none (Jev off, an escape hatch). Each key appears at most once; a fact that is unknown is left out:
+
+  | key | value | effect | weight | source |
+  |---|---|---|---|---|
+  | `downtime_estimate` | the option's estimated downtime (s) against the SLO | supports when it meets the SLO, else opposes | 100 | `estimate`, the migration |
+  | `cbt` | `vm.cbt_enabled` (VMware sources, when reported) | `vmware_warm`: supports when true, else opposes; other options: context | 90 | `inventory`, the VM |
+  | `earlier_runs` | the migration's `attempts` (when any) | opposes when the option is the strategy that failed before, else context | 85 | `run`, the migration |
+  | `mappings` | the `MAP_*` findings that apply to the option | supports when there are none, else opposes | 80 | `preflight`, the migration |
+  | `findings` | the other blocker and warning findings that apply to the option | supports when there are none, else opposes | 75 | `preflight`, the migration |
+  | `guest_os` | `guest_os.label` and its virt-v2v support | VMware options: supports when `supported`, opposes when `unsupported` or `unverified`, else context; others: context | 70 | `inventory`, the VM |
+  | `disk_total` | `vm.disk_bytes` | context | 60 | `inventory`, the VM |
+  | `disk_count` | the number of disks | context | 50 | `inventory`, the VM |
+  | `write_rate` | `vm.change_rate_bps` (measured only) | context | 40 | `inventory`, the VM |
+  | `cutover_window` | the plan's cutover window | context | 30 | `plan`, the plan |
+  | `source_kind` | the source provider's kind | context | 20 | `provider`, the provider |
+
+  The evidence count `decide` receives is the number of items that support or oppose (context does not count), so
+  a policy's `min_evidence_for_auto_apply` means "the decision rests on that many facts". Validation also searches
+  agentmemory once (`MemoryClient.search(f"{option} {os_type or 'unknown OS'} {size bucket}", limit=3)`, §14.3) and stores the
+  hits as `similar_incidents`; a memory failure stores none and never fails the validation. Jev's `jev_decide`
+  answer carries no reasons today; when it does (`recommendation.reasons` or `reasons`: `{key|evidence, text}`),
+  only those naming one of the recommendation's evidence keys are kept, and each one naming an unknown key is
+  dropped and logged (warning). The data sent to Jev stays as declared (§13.4).
 * `decide(recommendation, policy, evidence_count, default_option, *, action=None) -> Decision` — `policy` is the
   one in force (§14.6) — is the only
   place a decision is made (the dashboard never compares a confidence with a threshold). In order:
@@ -1608,8 +1646,8 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   then the higher threshold, the higher minimum evidence, a required override reason, a required distinct approver,
   the lower id. (The
   spec's plan tags and environments do not exist in this product: plans and providers stand in for them,
-  `TODO(ADV-04): confirm`.) Until evidence exists (ADV-02) the evidence count is 0, so stored policies default
-  to a minimum of 0.
+  `TODO(ADV-04): confirm`.) A new policy asks for 3 evidence items by default (ADV-02, the owner's spec); stored
+  policies keep their minimum and the built-in default keeps 0, so a deployment without policies decides as before.
 * **Hold**: validation decides with the policy in force; a `pending_approval` decision sets
   `migration.advisor_hold` to the recommendation id (§5.4: no start meanwhile). A later validation that records
   another decision for the migration replaces the hold or clears it.
@@ -1783,7 +1821,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
   with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
-  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (phase
+  migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
+  and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
+  loaded, ADV-02; phase
   stepper, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
   pass 1; in `syncing` the next delta pass; in `cutover` the final pass of a warm migration, the full copy of a cold
   one or the volume handover — and its percentage, and the bytes transferred over all passes and the disk's used
@@ -1834,6 +1874,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
   `/inventory/:providerId`
   (a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  `?vm={source id}` opens it searching for that VM, ADV-02;
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
@@ -1855,7 +1896,15 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   VMware warm migration (CBT) — CBT only where the strategy uses it, §9.2 —, Needs your input, Needs
   investigation; `none` reads "no clear option" in the lines and "Other" only in Details. A legacy entry shows
   a "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
-  way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Details" with
+  way (§14.4), each with one line on its evidence — "Evidence: {n} support, {m} oppose", and "Limited evidence"
+  when the decision's reason is `INSUFFICIENT_EVIDENCE` (ADV-02); each entry links to its detail
+  `/advisor/recommendations/:id` (the two lines; an "Evidence" panel under them — "Evidence for {option}", the six
+  heaviest items, those that support or oppose first, the rest behind "Show all ({n})", each with its effect as
+  icon and text (Supports, Opposes, Context), its label and value, and a link to its source: the VM on
+  `/inventory/:providerId?vm={source id}`, the migration's findings or estimates (`/migrations/:id#findings`,
+  `#estimates`), the migration, the plan or the providers; "Limited evidence" with the count when the decision
+  says so; "Similar past incidents", at most 3, each with its match; Jev's reasons by the item they name, ADV-02;
+  tab "Details" with
   the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
   its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`) offers
   Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
