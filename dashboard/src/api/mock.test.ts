@@ -1770,6 +1770,20 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect(cache.source_running_at).toBeNull();
   });
 
+  it('leaves the closed downtime clock of a completed migration it rolls back alone, like the API (SDD §5.2)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    // completed: verification closed its clock
+    const { actual_downtime_s: actual, downtime_ended_at: endedAt } = cache;
+    expect([cache.phase, endedAt !== null]).toEqual(['completed', true]);
+    const ended = () => server.events.filter((e) => e.migration_id === cache.id && e.kind === 'migration.downtime_ended').length;
+    const before = ended();
+    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    for (let i = 0; i < 40 && cache.phase !== 'rolled_back'; i++) server.tick();
+    expect(cache.phase).toBe('rolled_back');
+    expect([cache.actual_downtime_s, cache.downtime_ended_at, ended()]).toEqual([actual, endedAt, before]);
+  });
+
   it('powers a fake source VM on and off, and the next watch flags its completed migration', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const cache = byName(server, 'web-cache-01');

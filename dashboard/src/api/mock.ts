@@ -859,7 +859,9 @@ export class MockServer {
   }
 
   private endDowntime(m: Migration): void {
-    if (!m.downtime_started_at) return;
+    // only an open clock ends: a completed migration's verification closed its clock, which its rollback leaves
+    // alone, like the API (SDD §5.2)
+    if (!m.downtime_started_at || m.downtime_ended_at) return;
     const now = this.now();
     m.downtime_ended_at = new Date(now).toISOString();
     m.actual_downtime_s = Math.round((now - Date.parse(m.downtime_started_at)) / 100) / 10;
