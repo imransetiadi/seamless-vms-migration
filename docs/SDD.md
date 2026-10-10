@@ -1200,10 +1200,30 @@ and optional `datacenter`. Deleting a provider deletes the secrets the store man
 
 ### 13.4 AI data minimization
 
-Payloads sent to Jev and agentmemory pass through `ai.memory.redact(text)` (removes passwords,
-tokens, `Authorization` headers, PEM blocks, credentials in URLs; optionally VM names when
-`SEAMLESS_MEMORY_REDACT_NAMES`). Guest console output is untrusted: it is screened with
-`jev_screen` (when Jev is available) before any LLM-facing use and is never sent to agentmemory.
+One redaction layer, `ai/redaction.py`, stands between the control plane and the AI services:
+`JevClient.call` passes every argument of every tool call through `redact_payload` (§14.1) and
+`MemoryClient` every request body (§14.3); no other module calls Jev or agentmemory.
+`redact(text, names=None)` removes:
+
+* passwords and secrets in key/value pairs — `key=value`, `key: value`, JSON `"key": "value"`, the key
+  possibly prefixed (`OS_PASSWORD`, `vcenter_password`, `auth.password`) — and in CLI flags
+  (`--os-password x`);
+* `Authorization` headers and bearer tokens;
+* API keys: named ones (`api_key`, `TYPESAFE_API_KEY=`), AWS access key ids, GitHub tokens, `sk-` keys
+  and Slack tokens;
+* OpenStack tokens: Keystone fernet tokens and `X-Auth-Token`/`X-Subject-Token` headers;
+* PEM blocks;
+* credentials in connection strings: `scheme://user:password@host` (a password with `@` too) and
+  `Password=…;`;
+* the `auth` section of a `clouds.yaml`, in YAML or JSON;
+* seamless API tokens (`smg_…`) and JWTs;
+* VM names (as `[vm]`) when `names` are given — the advisor and agentmemory give them when
+  `SEAMLESS_MEMORY_REDACT_NAMES`.
+
+`redact_payload(value, names=None)` applies `redact` to every string of a JSON-like value and replaces
+the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) whatever its type. Guest
+console output is untrusted: it is screened with `jev_screen` (when Jev is available) before any
+LLM-facing use and is never sent to agentmemory.
 
 ---
 
@@ -1216,7 +1236,8 @@ tokens, `Authorization` headers, PEM blocks, credentials in URLs; optionally VM 
 `TYPESAFE_API_KEY` or the other provider keys documented by jev-mcp); `http` mode connects to
 `SEAMLESS_JEV_URL` (streamable HTTP, e.g. `http://jev-mcp:8080/mcp`) with
 `Authorization: Bearer SEAMLESS_JEV_TOKEN`. Each call: `await session.call_tool(name, arguments)`,
-parse `content[0].text` as JSON, timeout `SEAMLESS_JEV_TIMEOUT_S` (default 20). A circuit breaker
+parse `content[0].text` as JSON, timeout `SEAMLESS_JEV_TIMEOUT_S` (default 20); `call` redacts the
+arguments first (`redact_payload`, §13.4). A circuit breaker
 opens after 3 consecutive failures for 300 s. Errors raise `JevUnavailable`. Mode `off` (default)
 never spawns anything.
 
@@ -1283,7 +1304,9 @@ files=[]) -> bool` → `POST {url}/agentmemory/remember` body `{content, type, c
 project}`; `search(query, limit=5) -> list[MemoryHit]` → `POST {url}/agentmemory/smart-search`
 body `{query, limit, project}`; parses hits tolerantly from `results|memories|items` lists, using
 `content|narrative|title` for text. Header `Authorization: Bearer <secret>` when a secret is set.
-`health() -> bool` → `GET {url}/agentmemory/livez`. Disabled when `SEAMLESS_MEMORY_URL` is unset.
+`health() -> bool` → `GET {url}/agentmemory/livez`. Every body is redacted before it is sent
+(`redact_payload`, §13.4; VM names too when `SEAMLESS_MEMORY_REDACT_NAMES`). Disabled when
+`SEAMLESS_MEMORY_URL` is unset.
 
 `KnowledgeService`:
 * `on_failure(migration, step, error)` → `search(f"{strategy} {step} {error_class}: {msg[:200]}")`,
