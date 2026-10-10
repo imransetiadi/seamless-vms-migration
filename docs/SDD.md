@@ -1620,14 +1620,19 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
-  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence (threshold
-  <threshold>%)" and "Decision: <final option> — <why>" (applied automatically by policy <policy>; below
-  threshold, default kept; advisor unavailable, decided by rules; no usable recommendation, decided by rules;
-  …), never the word "Selected". The confidence appears once, as a whole percent rounded down (never shown
-  equal to a threshold it missed; 0..1 values only in the API), followed by the threshold the decision used
-  when it used one; the word "confidence" carries its one-sentence definition (Jev's calibrated confidence in
-  its own recommendation, not the probability it gives that option) on hover and focus; the why never repeats
-  a number. Options read as labels: Cold migration, Warm migration, Storage handover, VMware cold migration,
+  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence" and "Decision:
+  <final option> — <why>" (applied automatically by policy <policy>; below threshold, default kept; advisor
+  unavailable, decided by rules; no usable recommendation, decided by rules; …), never the word "Selected". A
+  decision taken against the threshold ends its why with that comparison — "below threshold (57% < 60%), default
+  kept", "applied automatically by policy global-default (83% ≥ 60%)", "too little evidence to apply it
+  automatically (83% ≥ 60%)" (the owner's review of 10 October 2026) — its sign taken from the decision's reason
+  code, never from comparing numbers in the dashboard; a decision a policy takes before any comparison (approval
+  required) shows its threshold on the Recommended line instead, "(threshold 60%)", so every entry with a
+  `threshold_used` shows it once. The confidence keeps one format: a whole percent rounded down (0..1 values only in
+  the API), or rounded down to the threshold's own decimals when the threshold is not a whole percent, so a
+  comparison never reads against its sign; the word "confidence" carries its one-sentence definition (Jev's
+  calibrated confidence in its own recommendation, not the probability it gives that option) on hover and focus.
+  Options read as labels: Cold migration, Warm migration, Storage handover, VMware cold migration,
   VMware warm migration (CBT) — CBT only where the strategy uses it, §9.2 —, Needs your input, Needs
   investigation; `none` reads "no clear option" in the lines and "Other" only in Details. A legacy entry shows
   a "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
