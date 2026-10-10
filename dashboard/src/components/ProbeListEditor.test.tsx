@@ -51,6 +51,16 @@ describe('ProbeListEditor (SDD §7.5, §16, ADV-18)', () => {
     expect(parsed().problems[0]).toBe('Probe 1: use a port from 1 to 65535.');
   });
 
+  it('moves focus to the list legend when Remove probe takes its probe away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<Harness initial={[{ kind: 'tcp', port: '5432', path: '/', expectStatus: '' }, { kind: 'tcp', port: '6432', path: '/', expectStatus: '' }]} />);
+    const group = screen.getByRole('group', { name: 'Application probes' });
+    const remove = within(group).getByRole('button', { name: 'Remove probe 2' });
+    await user.click(remove);
+    expect(remove).not.toBeInTheDocument();
+    expect(within(group).getByText('Application probes', { selector: 'legend' })).toHaveFocus();
+  });
+
   it('stops at ten probes, saying why', async () => {
     const user = userEvent.setup({ delay: null });
     const ten = Array.from({ length: 10 }, (_, i): ProbeDraft => ({ kind: 'tcp', port: String(1000 + i), path: '/', expectStatus: '' }));

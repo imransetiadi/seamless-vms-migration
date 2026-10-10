@@ -278,6 +278,10 @@ export default function PlanDetail() {
   const validateRef = useRef<HTMLButtonElement>(null);
   const wavesRef = useRef<HTMLButtonElement>(null);
   const emptyValidateRef = useRef<HTMLButtonElement>(null);
+  // the plan's heading takes the focus when an action takes its button with it — Start, Resume, Finalize — read
+  // by the dialog as it closes: empty on Cancel, so focus goes back to the button (SDD §16)
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const afterActionRef = useRef<HTMLElement | null>(null);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -349,12 +353,21 @@ export default function PlanDetail() {
   const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
   const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
   const startShown = p.status !== 'running' && !ended;
+  const askStart = () => {
+    afterActionRef.current = null;
+    setConfirm('start');
+  };
+  const askFinalize = (scope: FinalizeScope) => {
+    afterActionRef.current = null;
+    setFinalizing(scope);
+  };
   const overdue = finalizeQueue(list).filter((m) => isOverdue(m, p.finalize_warning_h)).length;
 
   return (
     <>
       <PageHeader
         title={p.name}
+        titleRef={headingRef}
         breadcrumbs={[{ label: 'Plans', to: '/plans' }, { label: p.name }]}
         description={p.description ?? undefined}
         meta={
@@ -383,12 +396,12 @@ export default function PlanDetail() {
               Auto-plan waves
             </Button>
             {p.derived_status === 'completed' ? (
-              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => setFinalizing({ wave: null })}>
+              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
                 Finalize all
               </Button>
             ) : (
               startShown && (
-                <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
+                <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={askStart}>
                   {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
                 </Button>
               )
@@ -442,8 +455,16 @@ export default function PlanDetail() {
 
       <div className="flex flex-col gap-4">
         <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
-        {notFinalized.length > 0 && <FinalizeSkippedNotice skipped={notFinalized} onDismiss={() => setNotFinalized([])} />}
-        <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={setFinalizing} />
+        {notFinalized.length > 0 && (
+          <FinalizeSkippedNotice
+            skipped={notFinalized}
+            onDismiss={() => {
+              setNotFinalized([]);
+              headingRef.current?.focus();
+            }}
+          />
+        )}
+        <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
@@ -521,10 +542,13 @@ export default function PlanDetail() {
         confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
+        returnFocusRef={afterActionRef}
         onConfirm={() =>
-          run({ action: 'start' }, () =>
-            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.'),
-          )
+          run({ action: 'start' }, () => {
+            // a started plan runs: Start goes, Pause is its action
+            afterActionRef.current = headingRef.current;
+            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.');
+          })
         }
         onCancel={() => {
           setConfirm(null);
@@ -535,8 +559,11 @@ export default function PlanDetail() {
         plan={p}
         migrations={list}
         scope={finalizing}
+        returnFocusRef={afterActionRef}
         onClose={() => setFinalizing(null)}
         onDone={(result) => {
+          // Finalize all and Finalize wave go once their VMs are finalized
+          afterActionRef.current = headingRef.current;
           setAnnouncement(finalizedText(result));
           setNotFinalized(skippedVms(result, list));
         }}

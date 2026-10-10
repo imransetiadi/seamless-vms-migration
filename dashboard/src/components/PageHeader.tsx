@@ -1,5 +1,5 @@
 import { ChevronRight } from 'lucide-react';
-import type { ReactNode } from 'react';
+import type { ReactNode, RefObject } from 'react';
 import { Link } from 'react-router-dom';
 
 export interface Crumb {
@@ -13,9 +13,11 @@ export interface PageHeaderProps {
   actions?: ReactNode;
   breadcrumbs?: Crumb[];
   meta?: ReactNode;
+  /** Makes the title a focus target, for an action that takes the focused control with it (SDD §16). */
+  titleRef?: RefObject<HTMLHeadingElement>;
 }
 
-export function PageHeader({ title, description, actions, breadcrumbs, meta }: PageHeaderProps) {
+export function PageHeader({ title, description, actions, breadcrumbs, meta, titleRef }: PageHeaderProps) {
   return (
     <header className="mb-4 flex flex-col gap-3 md:mb-6">
       {breadcrumbs && breadcrumbs.length > 0 && (
@@ -40,7 +42,13 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta }: P
       )}
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
-          <h1 className="wrap-break-word text-xl font-semibold text-foreground md:text-2xl">{title}</h1>
+          <h1
+            ref={titleRef}
+            tabIndex={titleRef ? -1 : undefined}
+            className="wrap-break-word text-xl font-semibold text-foreground outline-hidden md:text-2xl"
+          >
+            {title}
+          </h1>
           {description && <div className="mt-1 max-w-3xl text-sm text-muted-foreground">{description}</div>}
           {meta && <div className="mt-2 flex flex-wrap items-center gap-2">{meta}</div>}
         </div>

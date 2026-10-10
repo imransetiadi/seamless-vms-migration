@@ -1,5 +1,5 @@
 import { AlarmClock, BadgeCheck, Power, TriangleAlert } from 'lucide-react';
-import { useId, useState } from 'react';
+import { useId, useState, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { useFinalizePlan } from '../api/hooks';
 import type { Migration, Plan, PlanFinalizeResult, Wave } from '../api/types';
@@ -125,6 +125,8 @@ export interface FinalizePlanDialogProps {
   onClose: () => void;
   /** The outcome: the page announces the counts and lists the VMs it skipped (SDD §16). */
   onDone: (result: PlanFinalizeResult) => void;
+  /** Where focus goes on close when the Finalize button that opened the dialog goes with the finalize (SDD §16). */
+  returnFocusRef?: RefObject<HTMLElement>;
 }
 
 /** The VMs a bulk finalize skipped, each with the reason the API gave, until dismissed (SDD §8.1, §16). */
@@ -153,7 +155,7 @@ export function FinalizeSkippedNotice({ skipped, onDismiss }: { skipped: Skipped
 }
 
 /** Finalize a wave or the plan with one approval, typing its name (`POST /plans/{id}/finalize`, SDD §8.1). */
-export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone }: FinalizePlanDialogProps) {
+export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone, returnFocusRef }: FinalizePlanDialogProps) {
   const finalize = useFinalizePlan(plan.id);
   const [deleteSource, setDeleteSource] = useState(false);
   const deleteId = useId();
@@ -179,6 +181,7 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone }:
       }
       confirmLabel={wave ? 'Finalize wave' : 'Finalize all'}
       requireText={name}
+      returnFocusRef={returnFocusRef}
       pending={finalize.isPending}
       error={scope ? finalize.error : null}
       onConfirm={() =>

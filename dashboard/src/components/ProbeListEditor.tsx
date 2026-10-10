@@ -1,5 +1,5 @@
 import { CircleAlert, Plus, Trash2 } from 'lucide-react';
-import { useId } from 'react';
+import { useId, useRef } from 'react';
 import { MAX_PROBES_PER_VM, PROBE_KINDS, type ProbeKind } from '../api/types';
 import { NEW_PROBE, type ProbeDraft } from '../lib/probes';
 import { Button } from './Button';
@@ -34,11 +34,14 @@ export function ProbeListEditor({
 }: ProbeListEditorProps) {
   const hintId = useId();
   const errorId = useId();
+  const legendRef = useRef<HTMLLegendElement>(null);
   const set = (index: number, patch: Partial<ProbeDraft>) => onChange(drafts.map((d, i) => (i === index ? { ...d, ...patch } : d)));
   const full = drafts.length >= MAX_PROBES_PER_VM;
   return (
     <fieldset id={id} tabIndex={id ? -1 : undefined} className="flex min-w-0 flex-col gap-2" aria-describedby={[hint ? hintId : '', error ? errorId : ''].filter(Boolean).join(' ') || undefined}>
-      <legend className="field-label">{legend}</legend>
+      <legend ref={legendRef} tabIndex={-1} className="field-label outline-hidden">
+        {legend}
+      </legend>
       {hint && (
         <p id={hintId} className="-mt-1 text-xs text-muted-foreground">
           {hint}
@@ -88,7 +91,11 @@ export function ProbeListEditor({
                   icon={Trash2}
                   aria-label={`Remove probe ${n}`}
                   className="col-start-6 row-start-1 justify-self-end @2xl:col-start-auto @2xl:row-start-auto"
-                  onClick={() => onChange(drafts.filter((_, j) => j !== i))}
+                  onClick={() => {
+                    onChange(drafts.filter((_, j) => j !== i));
+                    // the row and its Remove button go: focus moves to the list's legend, never to the page (SDD §16)
+                    legendRef.current?.focus();
+                  }}
                 />
               </li>
             );

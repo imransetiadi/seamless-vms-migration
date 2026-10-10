@@ -414,6 +414,111 @@ describe('PlanDetail', () => {
     expect(await within(actions).findByRole('button', { name: 'Resume' })).toBeInTheDocument();
   });
 
+  it.each([
+    ['plan-c81d44a0', 'Start', 'Start this plan?', 'Start plan'],
+    ['plan-7b3e0d52', 'Resume', 'Resume this plan?', 'Resume plan'],
+  ])('moves focus to the plan heading when %s goes with the action (%s), and back to the button on Cancel (SDD §16)', async (planId, label, title, confirmLabel) => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan(planId);
+    const name = server.plans.find((p) => p.id === planId)!.name;
+    const button = await actionButton(new RegExp(`^${label}$`));
+    await user.click(button);
+    await user.click(within(await screen.findByRole('alertdialog', { name: title })).getByRole('button', { name: 'Cancel' }));
+    expect(button).toHaveFocus();
+
+    await user.click(button);
+    await user.click(within(await screen.findByRole('alertdialog', { name: title })).getByRole('button', { name: confirmLabel }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+    expect(button).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name })).toHaveFocus();
+  });
+
+  it('moves focus to the plan heading after Finalize all and Finalize wave, whose buttons go once the VMs are finalized (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const all = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${all.id}`, path: '/plans/:planId', token: 'approver', server });
+    await user.click(within(await screen.findByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    let dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${all.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${all.name} to confirm`), all.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize all' }));
+    await waitFor(() => expect(within(screen.getByRole('group', { name: /plan actions/i })).queryByRole('button', { name: 'Finalize all' })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { level: 1, name: all.name })).toHaveFocus();
+    view.unmount();
+
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    await user.click(within(queue).getByRole('button', { name: `Finalize wave ${wave.name}` }));
+    dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${wave.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${wave.name} to confirm`), wave.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize wave' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: `Finalize wave ${wave.name}` })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { level: 1, name: plan.name })).toHaveFocus();
+  });
+
+  it('returns focus to the button on a later Cancel once an action took it to the plan heading (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^start$/i));
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Start this plan?' })).getByRole('button', { name: 'Start plan' }));
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: plan.name })).toHaveFocus());
+    await user.click(await actionButton(/^pause$/i));
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Pause this plan?' })).getByRole('button', { name: 'Pause plan' }));
+    const resume = await actionButton(/^resume$/i);
+    await waitFor(() => expect(resume).not.toHaveAttribute('aria-disabled'));
+    await user.click(resume);
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Resume this plan?' })).getByRole('button', { name: 'Cancel' }));
+    expect(resume).toHaveFocus();
+    view.unmount();
+
+    const rollout = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    const other = server.migrations.find((m) => m.plan_id === rollout.id && m.wave_id && m.wave_id !== web01.wave_id && m.phase === 'syncing')!;
+    other.phase = 'completed';
+    other.phase_history = [
+      ...other.phase_history,
+      { from_phase: 'verifying', to_phase: 'completed', at: new Date(Date.now() - 3_600_000).toISOString(), reason: 'verification passed', actor: 'orchestrator' },
+    ];
+    const [first, second] = [web01.wave_id, other.wave_id].map((id) => rollout.waves.find((w) => w.id === id)!);
+    renderWithApp(<PlanDetail />, { route: `/plans/${rollout.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    await user.click(within(queue).getByRole('button', { name: `Finalize wave ${first!.name}` }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${first!.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${first!.name} to confirm`), first!.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize wave' }));
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: rollout.name })).toHaveFocus());
+    const next = await within(queue).findByRole('button', { name: `Finalize wave ${second!.name}` });
+    await user.click(next);
+    await user.click(within(await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${second!.name}?` })).getByRole('button', { name: 'Cancel' }));
+    expect(next).toHaveFocus();
+  });
+
+  it('moves focus to the plan heading when Dismiss takes the not-finalized notice away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const internals = server as unknown as { migrationAction: (...args: unknown[]) => unknown };
+    const real = internals.migrationAction.bind(server);
+    internals.migrationAction = (me, m, action, input) => {
+      if (action === 'finalize') throw new Error('source cleanup failed: HTTP 409');
+      return real(me, m, action, input);
+    };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    await user.click(within(await screen.findByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${plan.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${plan.name} to confirm`), plan.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize all' }));
+    const notice = await screen.findByRole('region', { name: 'Not finalized' });
+    await user.click(within(notice).getByRole('button', { name: 'Dismiss' }));
+    expect(notice).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: plan.name })).toHaveFocus();
+  });
+
   it('names the advisor policy in force beside the cutover approval, with its mode, threshold and a link (SDD §16, ADV-20)', async () => {
     const view = renderPlan('plan-c81d44a0', 'viewer');
     let settings = await screen.findByRole('region', { name: 'Settings' });
