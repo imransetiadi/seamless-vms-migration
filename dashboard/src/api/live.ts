@@ -166,6 +166,8 @@ export function applyEventToCache(
   }
 
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {
+    // advisor.strategy announces a recorded recommendation (SDD §14.4)
+    if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);
     invalidate(['migrations']);
     invalidate(['stats']);
     if (event.migration_id) invalidate(['migration', event.migration_id]);

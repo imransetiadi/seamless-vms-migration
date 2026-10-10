@@ -33,6 +33,8 @@ import type {
   ProviderCredentials,
   ProviderPatch,
   ProviderInventory,
+  RecommendationListQuery,
+  RecommendationPage,
   RollbackRequest,
   SimilarIncidentsRequest,
   SimilarIncidentsResponse,
@@ -64,6 +66,7 @@ export const queryKeys = {
   eventTail: (query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}) => ['events', 'tail', query] as const,
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
+  recommendations: (query: RecommendationListQuery = {}) => ['advisor', 'recommendations', query] as const,
 };
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
@@ -188,6 +191,28 @@ export function useAdvisorStatus() {
     queryKey: queryKeys.advisorStatus,
     queryFn: ({ signal }) => api.get<AdvisorStatus>('/advisor/status', { signal }),
     refetchInterval: 30_000,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/recommendations`: stored and legacy recommendations, newest first (SDD §12, §14.4). */
+export function useRecommendations(query: RecommendationListQuery = {}, options: ListOptions = {}) {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.recommendations(query),
+    queryFn: ({ signal }) =>
+      api.get<RecommendationPage>('/advisor/recommendations', {
+        signal,
+        query: {
+          migration_id: query.migration_id,
+          plan_id: query.plan_id,
+          decision_type: query.decision_type,
+          limit: query.limit,
+          offset: query.offset,
+        },
+      }),
+    enabled: options.enabled ?? true,
+    placeholderData: options.keepPrevious ? keepPreviousData : undefined,
     retry: noRetryOnClientErrors,
   });
 }
@@ -362,9 +387,11 @@ export function usePlanAction(planId: string) {
           return api.post<Plan>(`${base}/waves/auto`, request.body ?? {});
       }
     },
-    onSuccess: (result) => {
+    onSuccess: (result, request) => {
       if ('waves' in result) queryClient.setQueryData(queryKeys.plan(planId), result);
       invalidateAll(queryClient, [queryKeys.plans, ['migrations'], ['stats'], ['events']]);
+      // a validation records a recommendation for every automatic choice it hands the advisor (SDD §14.4)
+      if (request.action === 'validate') invalidateAll(queryClient, [['advisor', 'recommendations']]);
     },
   });
 }

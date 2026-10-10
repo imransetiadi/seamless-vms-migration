@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
 import { createMockFetch, MockServer } from './mock';
 import { streamEvents } from './stream';
@@ -10,10 +10,12 @@ import {
   PROVIDER_STATUSES,
   SEVERITIES,
   STRATEGIES,
+  type AdvisorRecommendation,
   type Event,
   type Migration,
   type Plan,
   type Provider,
+  type RecommendationPage,
   type VMRef,
 } from './types';
 
@@ -863,5 +865,168 @@ describe('mock API', () => {
       expect(result.status).toBe(200);
       expect(plan.status).toBe('draft');
     }
+  });
+});
+
+describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => {
+  const list = (client: ApiClient, query: Record<string, string | number | undefined> = {}) => client.get<RecommendationPage>('/advisor/recommendations', { query });
+
+  it('lists stored and legacy recommendations newest first, a legacy entry for each strategy note', async () => {
+    const { server, client } = setup('viewer');
+    const page = await list(client);
+    expect([page.offset, page.limit, page.total]).toEqual([0, 50, page.items.length]);
+    const order = page.items.map((r) => `${r.created_at} ${r.id}`);
+    expect(order).toEqual([...order].sort().reverse());
+    const strategyNotes = server.migrations.flatMap((m) => m.advisor_notes.filter((n) => n.kind === 'strategy'));
+    const legacy = page.items.filter((r) => r.legacy);
+    expect(strategyNotes.length).toBeGreaterThan(0);
+    expect(legacy.map((r) => r.legacy_text)).toEqual(expect.arrayContaining(strategyNotes.map((n) => n.summary)));
+    expect(legacy).toHaveLength(strategyNotes.length);
+    expect(legacy.every((r) => r.id.startsWith('rec-legacy-') && r.decision.actor.id === 'legacy')).toBe(true);
+  });
+
+  it('seeds each decision the engine takes today, and the spec example: 57% under a 60% threshold keeps cold', async () => {
+    const { client } = setup('viewer');
+    const stored = (await list(client)).items.filter((r) => !r.legacy);
+    expect(new Set(stored.map((r) => r.decision.status))).toEqual(new Set(['auto_applied', 'below_threshold', 'fallback_rules']));
+    const kept = stored.find((r) => r.decision.status === 'below_threshold')!;
+    expect([kept.recommendation.option, kept.recommendation.confidence, kept.decision.threshold_used, kept.decision.final_option]).toEqual(['warm', 0.57, 0.6, 'cold']);
+    const fallback = stored.find((r) => r.decision.status === 'fallback_rules')!;
+    expect([fallback.model.name, fallback.recommendation.option, fallback.decision.actor]).toEqual(['rules', null, { kind: 'system', id: 'fallback' }]);
+  });
+
+  it('runs every fixture migration on the final option of its newest decision', () => {
+    const server = new MockServer({ now: () => NOW });
+    const newest = new Map<string, AdvisorRecommendation>();
+    for (const r of server.recommendations) {
+      const seen = newest.get(r.migration_id!);
+      if (!seen || seen.created_at < r.created_at) newest.set(r.migration_id!, r);
+    }
+    expect(newest.size).toBeGreaterThan(0);
+    for (const [id, r] of newest) expect(server.migrations.find((m) => m.id === id)?.strategy, id).toBe(r.decision.final_option);
+  });
+
+  it('filters by migration, plan and decision type, and pages with limit and offset', async () => {
+    const { client } = setup('viewer');
+    const all = await list(client, { limit: 200 });
+    const target = all.items.find((r) => !r.legacy)!;
+    const mine = await list(client, { migration_id: target.migration_id! });
+    expect(mine.items.length).toBeGreaterThan(0);
+    expect(mine.items.every((r) => r.migration_id === target.migration_id)).toBe(true);
+    expect((await list(client, { plan_id: target.plan_id! })).total).toBe(all.items.filter((r) => r.plan_id === target.plan_id).length);
+    expect(await list(client, { decision_type: 'workload_tier' })).toMatchObject({ items: [], total: 0 });
+    const second = await list(client, { limit: 2, offset: 2 });
+    expect(second.items.map((r) => r.id)).toEqual(all.items.slice(2, 4).map((r) => r.id));
+    expect(second).toMatchObject({ total: all.total, offset: 2, limit: 2 });
+  });
+
+  it('refuses a limit outside 1-200, a negative offset and an unknown decision type with 422', async () => {
+    const { client } = setup('viewer');
+    for (const query of [{ limit: 0 }, { limit: 201 }, { limit: 'many' }, { offset: -1 }, { offset: 1.5 }, { decision_type: 'strategy' }]) {
+      await expect(list(client, query), JSON.stringify(query)).rejects.toMatchObject({ status: 422, code: 'validation_error' });
+    }
+  });
+
+  it('gets one recommendation by id, a legacy one too, and answers 404 for an unknown id', async () => {
+    const { client } = setup('viewer');
+    const { items } = await list(client, { limit: 200 });
+    for (const r of [items.find((x) => !x.legacy)!, items.find((x) => x.legacy)!]) {
+      expect(await client.get<AdvisorRecommendation>(`/advisor/recommendations/${r.id}`)).toEqual(r);
+    }
+    await expect(client.get('/advisor/recommendations/rec-000000000000')).rejects.toMatchObject({ status: 404 });
+    await expect(client.get('/advisor/recommendations/rec-legacy-mig-b2c4d6e870-9')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('asks for a token, like the API', async () => {
+    const { client } = setup('nobody');
+    await expect(list(client)).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe('mock validation decides like the API (SDD §14.4)', () => {
+  function validating(advice: { option: string | null; confidence: number | null }) {
+    const advise = vi.fn(() => advice);
+    const server = new MockServer({ now: () => NOW, seed: 1, advise });
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    // the analytics plan: analytics-db ties cold and warm (nothing meets the SLO), the handover nodes do not
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    return { server, client, plan, db, advise, before: server.recommendations.length };
+  }
+
+  it('records the decision on an automatic choice between strategies, and the migration runs its final option', async () => {
+    const { server, client, plan, db, advise, before } = validating({ option: 'cold', confidence: 0.8 });
+    expect(db.strategy).toBe('warm');
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(advise).toHaveBeenCalledTimes(1);
+    const [rec, ...more] = server.recommendations.slice(before);
+    expect(more).toEqual([]);
+    expect(rec).toMatchObject({
+      decision_type: 'migration_strategy',
+      subject: { kind: 'vm', id: db.vm.source_id, name: 'analytics-db' },
+      plan_id: plan.id,
+      migration_id: db.id,
+      provider_id: plan.source_provider_id,
+      model: { name: 'jev' },
+      recommendation: { option: 'cold', confidence: 0.8 },
+      decision: { final_option: 'cold', status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
+    });
+    expect(db.strategy).toBe('cold');
+    expect(server.events.filter((e) => e.kind === 'advisor.strategy').at(-1)).toMatchObject({
+      migration_id: db.id,
+      data: { recommendation_id: rec!.id, option: 'cold', confidence: 0.8, final_option: 'cold', status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY' },
+    });
+  });
+
+  it('keeps the deterministic choice when the confidence is below the threshold', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'cold', confidence: 0.57 });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.recommendations.slice(before).map((r) => [r.recommendation.option, r.decision.status, r.decision.final_option])).toEqual([['cold', 'below_threshold', 'warm']]);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it('falls back to the rules when the advisor gives no answer', async () => {
+    const { server, client, plan, db, before } = validating({ option: null, confidence: null });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect([rec!.model.name, rec!.decision.status, rec!.decision.final_option, rec!.decision.actor.id]).toEqual(['rules', 'fallback_rules', 'warm', 'fallback']);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it.each([
+    ['an option outside the scope', 'storage_handover'],
+    ['an escape hatch', 'ask_user'],
+  ])('falls back to the rules on %s, which is no usable answer', async (_, option) => {
+    const { server, client, plan, db, before } = validating({ option, confidence: 0.9 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect([rec!.model.name, rec!.decision.status, rec!.decision.final_option]).toEqual(['jev', 'fallback_rules', 'warm']);
+    expect(rec!.decision.reason_text).toContain(option);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it('asks nothing when the plan or an override makes the choice', async () => {
+    const { server, client, plan, advise, before } = validating({ option: 'cold', confidence: 0.9 });
+    plan.default_strategy = 'warm';
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(advise).not.toHaveBeenCalled();
+    expect(server.recommendations).toHaveLength(before);
+  });
+
+  it('simulates the advisor the same way every time, without drawing from the seeded random stream', async () => {
+    const runs = await Promise.all(
+      [1, 2].map(async () => {
+        const server = new MockServer({ now: () => NOW, seed: 1 });
+        const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+        const before = server.recommendations.length;
+        await client.post('/plans/plan-c81d44a0/validate');
+        const [rec] = server.recommendations.slice(before);
+        return { rec: rec!.recommendation, next: (server as unknown as { rand: () => number }).rand() };
+      }),
+    );
+    expect(runs[0]).toEqual(runs[1]);
+    expect(runs[0]!.rec.confidence).toBeGreaterThanOrEqual(0.5);
+    expect(runs[0]!.rec.confidence).toBeLessThan(0.95);
+    expect(runs[0]!.next).toBe((new MockServer({ now: () => NOW, seed: 1 }) as unknown as { rand: () => number }).rand());
   });
 });

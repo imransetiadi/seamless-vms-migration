@@ -214,4 +214,22 @@ describe('MigrationDetail', () => {
     // a live region inserted together with its text is not reliably read
     expect(regions).toContain(announced.closest('[role="status"]'));
   });
+
+  it("lists the migration's recommendations: what was recommended and what was decided (SDD §16, ADV-01)", async () => {
+    renderMigration('mig-5d7e2b4a10');
+    const advisor = await screen.findByRole('region', { name: /^advisor$/i });
+    const decision = await within(advisor).findByText('Decision: Warm — applied automatically by policy global-default');
+    expect(decision.closest('li')).toHaveTextContent('Recommended: Warm · 67% confidence');
+    // the entries are this migration's: no link to itself
+    expect(within(advisor).queryByRole('link', { name: 'db-pg-01' })).not.toBeInTheDocument();
+    const estimates = screen.getByRole('region', { name: /^estimates$/i });
+    expect(within(estimates).getByRole('rowheader', { name: /warm/i })).toHaveTextContent(/in use/i);
+    expect(document.body).not.toHaveTextContent(/selected/i);
+  });
+
+  it('says a migration with no advisor output has none, in one place', async () => {
+    renderMigration('mig-7a9b1c3d41');
+    const advisor = await screen.findByRole('region', { name: /^advisor$/i });
+    expect(await within(advisor).findByText('No advisor recommendations or notes for this migration.')).toBeInTheDocument();
+  });
 });

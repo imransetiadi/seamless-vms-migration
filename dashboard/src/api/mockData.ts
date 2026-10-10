@@ -6,6 +6,7 @@
  */
 import type {
   AdvisorNote,
+  AdvisorRecommendation,
   DestinationInventory,
   Disk,
   Estimate,
@@ -18,6 +19,7 @@ import type {
   Plan,
   Provider,
   ProviderKind,
+  ReasonCode,
   Strategy,
   SyncPass,
   VMRef,
@@ -27,6 +29,85 @@ import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 
 export const GiB = 1024 ** 3;
 export const MiB = 1024 ** 2;
+
+/** `SEAMLESS_JEV_MIN_CONFIDENCE`'s default: the global default policy's threshold (SDD §14.4). */
+export const JEV_MIN_CONFIDENCE = 0.6;
+export const GLOBAL_DEFAULT_POLICY = 'global-default';
+/** What Jev reports as its model in a jev_decide answer. */
+export const JEV_MODEL = 'jev-1.13.0';
+
+/** The decisions the engine takes on a strategy recommendation until policies exist (SDD §14.4). */
+export type StrategyDecision = 'auto_applied' | 'below_threshold' | 'fallback_rules';
+
+const REASON_OF: Record<StrategyDecision, ReasonCode> = {
+  auto_applied: 'ABOVE_THRESHOLD_AUTO_APPLY',
+  below_threshold: 'BELOW_THRESHOLD_DEFAULT_KEPT',
+  fallback_rules: 'ADVISOR_UNAVAILABLE_FALLBACK',
+};
+
+export interface StrategyRecommendationInput {
+  id: string;
+  at: string;
+  migration: Pick<Migration, 'id' | 'plan_id' | 'vm'>;
+  providerId: string;
+  /** What Jev recommended; null with `fallback` when it gave no answer. */
+  option: string | null;
+  confidence: number | null;
+  /** The options Jev was offered: the confidence it did not give the option is spread over the others. */
+  options: readonly string[];
+  status: StrategyDecision;
+  /** The deterministic choice, which the decision keeps unless the advice is applied. */
+  deterministic: Strategy;
+  /** Why there was no usable advice (fallback). */
+  fallback?: string;
+}
+
+/** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
+export function strategyRecommendation(input: StrategyRecommendationInput): AdvisorRecommendation {
+  const { option, confidence, status } = input;
+  const others = input.options.filter((o) => o !== option);
+  const distribution: Record<string, number> =
+    option === null || confidence === null
+      ? {}
+      : Object.fromEntries([[option, confidence], ...others.map((o) => [o, Math.round(((1 - confidence) / others.length) * 100) / 100])]);
+  const byPolicy = status !== 'fallback_rules';
+  return {
+    id: input.id,
+    created_at: input.at,
+    decision_type: 'migration_strategy',
+    subject: { kind: 'vm', id: input.migration.vm.source_id, name: input.migration.vm.name },
+    plan_id: input.migration.plan_id,
+    migration_id: input.migration.id,
+    provider_id: input.providerId,
+    model: option === null && confidence === null && input.fallback
+      ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
+      : { name: 'jev', version: JEV_MODEL, deployment: 'unknown', endpoint_host: null },
+    recommendation: { option, confidence, distribution },
+    decision: {
+      final_option: status === 'auto_applied' ? option : input.deterministic,
+      status,
+      reason_code: REASON_OF[status],
+      reason_text: status === 'fallback_rules' ? (input.fallback ?? null) : null,
+      actor: byPolicy ? { kind: 'policy', id: GLOBAL_DEFAULT_POLICY } : { kind: 'system', id: 'fallback' },
+      policy_id: byPolicy ? GLOBAL_DEFAULT_POLICY : null,
+      threshold_used: byPolicy ? JEV_MIN_CONFIDENCE : null,
+      decided_at: input.at,
+    },
+    legacy: false,
+    legacy_text: null,
+  };
+}
+
+/** The `advisor.strategy` event the API emits for a recorded recommendation (SDD §4.3, §14.4). */
+export function strategyEventOf(rec: AdvisorRecommendation): Pick<Event, 'kind' | 'message' | 'data'> {
+  const { option, confidence } = rec.recommendation;
+  const { final_option: final, status, reason_code } = rec.decision;
+  return {
+    kind: 'advisor.strategy',
+    message: `${rec.subject.name}: recommended ${option ?? 'nothing'} (${confidence === null ? 'no confidence' : `${Math.round(confidence * 100)}%`}); decision ${final ?? 'pending'} (${status})`,
+    data: { recommendation_id: rec.id, option, confidence, final_option: final, status, reason_code },
+  };
+}
 
 export function iso(ms: number): string {
   return new Date(Math.round(ms / 1000) * 1000).toISOString().replace('.000Z', 'Z');
@@ -624,6 +705,8 @@ interface MigrationSpec {
   error?: string | null;
   reviewReason?: string | null;
   notes?: Array<Omit<AdvisorNote, 'created_at'> & { ago: number }>;
+  /** The strategy recommendation recorded when the migration was validated (SDD §14.4). */
+  rec?: { option: Strategy | null; confidence: number | null; status: StrategyDecision; deterministic: Strategy; fallback?: string };
   attempts?: number;
   destination?: string | null;
   checkpoint?: string | null;
@@ -666,6 +749,7 @@ const PLAN_SPECS: PlanSpec[] = [
     ],
     migrations: [
       {
+        rec: { option: 'warm', confidence: 0.74, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e21', vm: 'os-0a11', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 2 * H, progress: 100,
         passes: [{ kind: 'full', changedGiB: 12, durationS: 128 }, { kind: 'delta', changedGiB: 0.42, durationS: 84 }, { kind: 'final', changedGiB: 0.05, durationS: 81 }],
         downtimeStartedAgo: 2 * H + 212, downtimeS: 212, approvals: [{ actor: 'sari', ago: 2 * H + 300, comment: 'Pilot approved in CAB-2291' }], cutoverRequested: true,
@@ -673,12 +757,14 @@ const PLAN_SPECS: PlanSpec[] = [
         notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as stateless_web: name matches ^web- and tag tier=web.', confidence: null, data: { tier: 'stateless_web' }, ago: 3 * D }],
       },
       {
+        rec: { option: 'warm', confidence: 0.81, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e22', vm: 'os-0a12', strategy: 'warm', phase: 'verifying', wave: 'wave-1', enteredAgo: 70, progress: 100,
         passes: [{ kind: 'full', changedGiB: 14, durationS: 131 }, { kind: 'delta', changedGiB: 0.51, durationS: 86 }, { kind: 'final', changedGiB: 0.06, durationS: 83 }],
         downtimeStartedAgo: 250, approvals: [{ actor: 'sari', ago: 400 }], cutoverRequested: true, destination: '2f9d6b1e-77c4-4f0e-8d3a-0c5b9e7a6d12', checkpoint: 'cutover',
         notes: [{ kind: 'verification', source: 'jev', summary: 'Both claims verified: the guest finished booting and no filesystem errors were reported.', confidence: 0.88, data: { results: [{ claim: 'The guest operating system finished booting', verdict: 'verified' }] }, ago: 30 }],
       },
       {
+        rec: { option: 'warm', confidence: 0.69, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e23', vm: 'os-0a13', strategy: 'warm', phase: 'cutover', wave: 'wave-1', enteredAgo: 95, progress: 62,
         passes: [{ kind: 'full', changedGiB: 13, durationS: 129 }, { kind: 'delta', changedGiB: 0.47, durationS: 85 }, { kind: 'final', changedGiB: 0.05, durationS: 0, open: true }],
         downtimeStartedAgo: 95, approvals: [{ actor: 'sari', ago: 180, comment: 'Inside change window' }], cutoverRequested: true, checkpoint: 'precopy',
@@ -686,10 +772,11 @@ const PLAN_SPECS: PlanSpec[] = [
       {
         id: 'mig-5d7e2b4a10', vm: 'os-0d51', strategy: 'warm', phase: 'precopy', wave: 'wave-2', enteredAgo: 31 * 60, progress: 37,
         passes: [{ kind: 'full', changedGiB: 0, durationS: 0, open: true }], checkpoint: 'prestage',
-        notes: [{ kind: 'strategy', source: 'jev', summary: 'Warm recommended over cold: estimated downtime 4m 12s vs 1h 01m; storage handover not eligible (no shared Ceph).', confidence: 0.67, data: { selected: 'warm', candidates: ['cold', 'warm'], probabilities: { warm: 0.67, cold: 0.33 } }, ago: 2 * H }],
+        rec: { option: 'warm', confidence: 0.67, status: 'auto_applied', deterministic: 'warm' },
       },
       {
         id: 'mig-5d7e2b4a11', vm: 'os-0d52', strategy: 'warm', phase: 'syncing', wave: 'wave-2', enteredAgo: 14 * 60, progress: 48,
+        rec: { option: null, confidence: null, status: 'fallback_rules', deterministic: 'warm', fallback: 'advisor unavailable: jev_decide timed out after 20 s' },
         passes: [{ kind: 'full', changedGiB: 316, durationS: 2590 }, { kind: 'delta', changedGiB: 12.6, durationS: 1132 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
       },
@@ -754,7 +841,7 @@ const PLAN_SPECS: PlanSpec[] = [
     migrations: [
       {
         id: 'mig-b2c4d6e870', vm: 'os-0f71', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H,
-        notes: [{ kind: 'strategy', source: 'jev', summary: 'Storage handover recommended: metadata-only cutover (≈ 4 min) regardless of the 540 GiB of disks.', confidence: 0.71, data: { selected: 'storage_handover', candidates: ['storage_handover', 'warm'], probabilities: { storage_handover: 0.71, warm: 0.29 } }, ago: 3 * H }],
+        notes: [{ kind: 'strategy', source: 'jev', summary: 'Storage handover recommended: metadata-only cutover (≈ 4 min) regardless of the 540 GiB of disks.', confidence: 0.71, data: { selected: 'storage_handover', applied: true, deterministic: 'storage_handover', candidates: ['storage_handover', 'warm'], probabilities: { storage_handover: 0.71, warm: 0.29 } }, ago: 3 * H }],
       },
       { id: 'mig-b2c4d6e871', vm: 'os-0f72', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
       { id: 'mig-b2c4d6e872', vm: 'os-0f73', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
@@ -789,10 +876,13 @@ const PLAN_SPECS: PlanSpec[] = [
     migrations: [
       {
         id: 'mig-d4e6f8a090', vm: 'os-0e65', strategy: 'cold', phase: 'finalized', wave: 'wave-1', enteredAgo: 7 * D, progress: 100,
+        // the Advisor spec's example (ADV-01): Jev's warm at 57% is under the 60% threshold, so cold is kept
+        rec: { option: 'warm', confidence: 0.57, status: 'below_threshold', deterministic: 'cold' },
         downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200 }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
       },
       {
         id: 'mig-d4e6f8a091', vm: 'os-0a14', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 8 * D, progress: 100,
+        rec: { option: 'warm', confidence: 0.88, status: 'auto_applied', deterministic: 'cold' },
         passes: [{ kind: 'full', changedGiB: 9, durationS: 96 }, { kind: 'delta', changedGiB: 0.31, durationS: 63 }, { kind: 'final', changedGiB: 0.04, durationS: 61 }],
         downtimeStartedAgo: 8 * D + 188, downtimeS: 188, approvals: [{ actor: 'sari', ago: 8 * D + 600 }], cutoverRequested: true, destination: '9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', checkpoint: 'verify',
       },
@@ -951,6 +1041,8 @@ export interface Fixtures {
   inventories: Record<string, VMRef[] | DestinationInventory>;
   plans: Plan[];
   migrations: Migration[];
+  /** Stored recommendations (document kind `recommendation`, SDD §14.4). */
+  recommendations: AdvisorRecommendation[];
   events: Event[];
 }
 
@@ -959,6 +1051,7 @@ export function buildFixtures(now: number): Fixtures {
   const inventories = buildInventories();
   const plans: Plan[] = [];
   const migrations: Migration[] = [];
+  const recommendations: AdvisorRecommendation[] = [];
   const pending: Array<Omit<Event, 'seq'>> = [];
   const emit = (e: Omit<Event, 'seq'>) => pending.push(e);
 
@@ -1094,6 +1187,24 @@ export function buildFixtures(now: number): Fixtures {
       if (migration.error) {
         emit({ ts: iso(enteredAt - 1000), kind: 'migration.error', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${vm.name}: ${migration.error}`, data: {} });
       }
+      if (m.rec) {
+        // recorded when the validation ended (SDD §14.4)
+        const validated = history.find((c) => c.from_phase === 'validating')?.at ?? iso(migCreatedAt);
+        const rec = strategyRecommendation({
+          id: `rec-${m.id.slice(4)}01`,
+          at: validated,
+          migration,
+          providerId: plan.source_provider_id,
+          option: m.rec.option,
+          confidence: m.rec.confidence,
+          options: estimates.filter((e) => e.eligible).map((e) => e.strategy),
+          status: m.rec.status,
+          deterministic: m.rec.deterministic,
+          fallback: m.rec.fallback,
+        });
+        recommendations.push(rec);
+        emit({ ts: validated, plan_id: plan.id, migration_id: m.id, actor: 'advisor', ...strategyEventOf(rec) });
+      }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;
         emit({ ts: note.created_at, kind, plan_id: plan.id, migration_id: m.id, actor: note.source === 'memory' ? 'agentmemory' : 'advisor', message: `${vm.name}: ${note.summary}`, data: { source: note.source, confidence: note.confidence } });
@@ -1124,5 +1235,5 @@ export function buildFixtures(now: number): Fixtures {
 
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
-  return { providers, inventories, plans, migrations, events };
+  return { providers, inventories, plans, migrations, recommendations, events };
 }

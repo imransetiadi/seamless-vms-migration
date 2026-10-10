@@ -142,6 +142,17 @@ describe('applyEventToCache', () => {
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 43, kind: 'provider.checked', migration_id: null, plan_id: null }, invalidate);
     expect(invalidate).toHaveBeenCalledWith(['providers']);
   });
+
+  it('refreshes the recommendations when an advisor event says one was recorded, and only then (SDD §14.4)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ recommendation_id: 'rec-000000000001' }), seq: 44, kind: 'advisor.strategy' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['advisor', 'recommendations']);
+    expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
+
+    invalidate.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 45, kind: 'migration.phase' }, invalidate);
+    expect(invalidate).not.toHaveBeenCalledWith(['advisor', 'recommendations']);
+  });
 });
 
 describe('applyEventToCache for providers', () => {

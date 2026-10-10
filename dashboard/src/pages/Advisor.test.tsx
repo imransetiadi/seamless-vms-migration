@@ -1,6 +1,7 @@
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { strategyRecommendation } from '../api/mockData';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Advisor from './Advisor';
 
@@ -76,5 +77,73 @@ describe('Advisor page', () => {
     await waitFor(() => expect(search).not.toHaveAttribute('aria-disabled'));
     await user.click(search);
     expect(await screen.findByRole('alert')).toHaveTextContent('Enter a few words about the failure to search for.');
+  });
+
+  it('shows what the advisor recommended and what was decided, never which option was "selected" (SDD §16, ADV-01)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const kept = await within(feed).findByText('Decision: Cold — below threshold (57% < 60%)');
+    const entry = kept.closest('li')!;
+    expect(entry).toHaveTextContent('Recommended: Warm · 57% confidence');
+    expect(within(entry).getByRole('link', { name: 'static-cdn-01' })).toHaveAttribute('href', '/migrations/mig-d4e6f8a090');
+    expect(within(feed).getAllByText('Decision: Warm — applied automatically by policy global-default').length).toBeGreaterThan(1);
+    expect(within(feed).getByText('Decision: Warm — advisor unavailable, decided by rules')).toBeInTheDocument();
+    await screen.findByRole('region', { name: 'Recent advisor notes' });
+    expect(document.body).not.toHaveTextContent(/selected/i);
+  });
+
+  it('lists a strategy note of an earlier version as a Legacy recommendation with its original text, not as a note (SDD §14.4)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const original = await within(feed).findByText(/^Original note: Storage handover recommended/);
+    const entry = original.closest('li')!;
+    expect(within(entry).getByText('Legacy')).toBeInTheDocument();
+    expect(entry).toHaveTextContent('Decision: Storage handover — applied automatically');
+    const notes = await screen.findByRole('region', { name: 'Recent advisor notes' });
+    await within(notes).findByText(/Classified as stateless_web/);
+    expect(within(notes).queryByText(/Storage handover recommended/)).not.toBeInTheDocument();
+  });
+
+  it('pages through the recommendations twenty at a time', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    for (let i = 0; i < 25; i += 1) {
+      server.recommendations.push(
+        strategyRecommendation({
+          id: `rec-a0000000${String(i).padStart(4, '0')}`,
+          at: new Date(Date.parse('2026-09-01T00:00:00Z') + i * 60_000).toISOString(),
+          migration: m,
+          providerId: 'rhosp17-dc1',
+          option: 'warm',
+          confidence: 0.9,
+          options: ['cold', 'warm'],
+          status: 'auto_applied',
+          deterministic: 'warm',
+        }),
+      );
+    }
+    renderWithApp(<Advisor />, { token: 'viewer', server });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const total = server.recommendations.length + 1; // and the legacy note
+    expect(await within(feed).findByText(`1–20 of ${total}`)).toBeInTheDocument();
+    expect(within(feed).getAllByText(/^Decision: /)).toHaveLength(20);
+    expect(within(feed).getByRole('button', { name: /previous/i })).toHaveAttribute('aria-disabled', 'true');
+    await user.click(within(feed).getByRole('button', { name: /next/i }));
+    expect(await within(feed).findByText(`21–${total} of ${total}`)).toBeInTheDocument();
+    expect(within(feed).getAllByText(/^Decision: /)).toHaveLength(total - 20);
+    expect(within(feed).getByRole('button', { name: /next/i })).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('says the recommendations could not be loaded instead of that there are none', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/advisor/recommendations'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Advisor />, { token: 'viewer', server });
+    expect(await screen.findByText(/recommendations are unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByText('No recommendations yet.')).not.toBeInTheDocument();
   });
 });

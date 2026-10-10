@@ -1,11 +1,11 @@
-import { Ban, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useEventTail, useMigration, usePlan, useSetStrategy } from '../api/hooks';
+import { useEventTail, useMigration, usePlan, useRecommendations, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
-import type { Event, GuestOS, Migration, Phase, Plan, Role, Strategy, VerificationConfig } from '../api/types';
+import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Role, type Strategy, type VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -19,10 +19,12 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseStepper } from '../components/PhaseStepper';
 import { ProgressBar } from '../components/ProgressBar';
+import { RecommendationList } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { PhaseBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
+import { nonStrategyNotes } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
@@ -228,7 +230,7 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
               <tr key={e.strategy} className={cn(e.strategy === m.strategy && 'bg-accent/5')}>
                 <th scope="row" className="whitespace-nowrap" title={STRATEGY_DESCRIPTIONS[e.strategy]}>
                   {strategyLabel(e.strategy)}
-                  {e.strategy === m.strategy && <span className="block text-xs font-normal text-status-success">selected</span>}
+                  {e.strategy === m.strategy && <span className="block text-xs font-normal text-status-success">in use</span>}
                 </th>
                 <td>
                   {e.eligible ? (
@@ -307,6 +309,43 @@ function verificationProfile(family: GuestOS['family'], v: VerificationConfig | 
   }
   const tcp = v.tcp_ports.length ? `TCP ${v.tcp_ports.join(', ')} and ` : '';
   return `Verified on ${tcp}the console log`;
+}
+
+/** This migration's recommendations, listed like the Advisor feed, and its other notes (SDD §14.4, §16). */
+function MigrationAdvisor({ m }: { m: Migration }) {
+  const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
+  const notes = nonStrategyNotes(m.advisor_notes);
+  if (recommendations.isPending) return <LoadingBlock rows={3} />;
+  const page = recommendations.data;
+  if (page && page.items.length === 0 && notes.length === 0) {
+    return <EmptyState icon={Bot} title="No advisor recommendations or notes for this migration." />;
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      {recommendations.error ? (
+        <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
+      ) : (
+        page &&
+        page.items.length > 0 && (
+          <div>
+            <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Recommendations</h3>
+            <RecommendationList items={page.items} showSubject={false} />
+            {page.total > page.items.length && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                The newest {page.items.length} of {page.total} are shown.
+              </p>
+            )}
+          </div>
+        )
+      )}
+      {notes.length > 0 && (
+        <div>
+          <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Notes</h3>
+          <AdvisorNotes notes={notes} />
+        </div>
+      )}
+    </div>
+  );
 }
 
 function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
@@ -534,8 +573,8 @@ export default function MigrationDetail() {
               }
             />
           </Panel>
-          <Panel title="Advisor notes" description="Jev, rules and agentmemory">
-            <AdvisorNotes notes={m.advisor_notes} />
+          <Panel title="Advisor" description="What the advisor recommended, what was decided, and its notes">
+            <MigrationAdvisor m={m} />
           </Panel>
         </div>
 

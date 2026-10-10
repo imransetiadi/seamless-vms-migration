@@ -72,6 +72,24 @@ export type AdvisorNoteKind = (typeof ADVISOR_NOTE_KINDS)[number];
 export const ADVISOR_NOTE_SOURCES = ['jev', 'rules', 'memory'] as const;
 export type AdvisorNoteSource = (typeof ADVISOR_NOTE_SOURCES)[number];
 
+/** What an advisor recommendation decides (SDD §4.1, §14.4). */
+export const DECISION_TYPES = ['migration_strategy', 'workload_tier', 'verification_review', 'console_screening'] as const;
+export type DecisionType = (typeof DECISION_TYPES)[number];
+
+export const DECISION_STATUSES = ['auto_applied', 'pending_approval', 'approved', 'overridden', 'below_threshold', 'fallback_rules'] as const;
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+
+export const REASON_CODES = [
+  'ABOVE_THRESHOLD_AUTO_APPLY',
+  'POLICY_REQUIRES_APPROVAL',
+  'INSUFFICIENT_EVIDENCE',
+  'APPROVED_BY_USER',
+  'OVERRIDDEN_BY_USER',
+  'BELOW_THRESHOLD_DEFAULT_KEPT',
+  'ADVISOR_UNAVAILABLE_FALLBACK',
+] as const;
+export type ReasonCode = (typeof REASON_CODES)[number];
+
 /** Workload tiers used by the wave planner and advisor classification (SDD §9.4). */
 export const WORKLOAD_TIERS = [
   'stateless_web',
@@ -318,6 +336,62 @@ export interface AdvisorNote {
   confidence: number | null;
   data: Record<string, unknown>;
   created_at: Timestamp;
+}
+
+/** Who took a decision: `policy:<id>`, `user:<name>` or `system:fallback` (SDD §14.4). */
+export interface AdvisorActor {
+  kind: 'policy' | 'user' | 'system';
+  id: string;
+}
+
+export interface AdvisorModelInfo {
+  name: 'jev' | 'rules';
+  version: string;
+  deployment: 'on_prem' | 'remote' | 'unknown';
+  endpoint_host: string | null;
+}
+
+export interface RecommendedOption {
+  option: string | null;
+  /** 0..1 — the only number the control plane compares with a threshold; the dashboard never does (SDD §14.4). */
+  confidence: number | null;
+  /** Raw probabilities per option, shown only in Details. */
+  distribution: Record<string, number>;
+}
+
+export interface Decision {
+  final_option: string | null;
+  status: DecisionStatus;
+  reason_code: ReasonCode;
+  reason_text: string | null;
+  actor: AdvisorActor;
+  policy_id: string | null;
+  threshold_used: number | null;
+  decided_at: Timestamp;
+}
+
+export interface AdvisorSubject {
+  kind: 'vm' | 'plan' | 'wave';
+  id: string;
+  name: string;
+}
+
+/** A recommendation and the decision taken on it, stored apart (SDD §4.2, §14.4). The engine runs only the decision. */
+export interface AdvisorRecommendation {
+  id: string;
+  created_at: Timestamp;
+  decision_type: DecisionType;
+  subject: AdvisorSubject;
+  plan_id: string | null;
+  migration_id: string | null;
+  /** The plan's source provider. */
+  provider_id: string | null;
+  model: AdvisorModelInfo;
+  recommendation: RecommendedOption;
+  decision: Decision;
+  /** A strategy note written before recommendations existed, read as one (SDD §14.4). */
+  legacy: boolean;
+  legacy_text: string | null;
 }
 
 export interface Approval {
@@ -615,6 +689,27 @@ export interface SimilarIncidentHit {
 
 export interface SimilarIncidentsResponse {
   hits: SimilarIncidentHit[];
+}
+
+/** Query of `GET /advisor/recommendations` (SDD §12). */
+export interface RecommendationListQuery {
+  migration_id?: string;
+  plan_id?: string;
+  decision_type?: DecisionType;
+  limit?: number;
+  offset?: number;
+}
+
+/** Bounds and default of the `limit` `GET /advisor/recommendations` accepts (SDD §12). */
+export const RECOMMENDATION_LIMIT_MAX = 200;
+export const RECOMMENDATION_LIMIT_DEFAULT = 50;
+
+/** `GET /advisor/recommendations`: newest first, stored and legacy entries together (SDD §12, §14.4). */
+export interface RecommendationPage {
+  items: AdvisorRecommendation[];
+  total: number;
+  offset: number;
+  limit: number;
 }
 
 /** Migration actions exposed as `POST /migrations/{id}/<action>` (SDD §12). */

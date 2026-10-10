@@ -1,6 +1,6 @@
 import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, Search, SearchX } from 'lucide-react';
 import { useId, useMemo, useState, type FormEvent } from 'react';
-import { useAdvisorStatus, useMigrations, useSimilarIncidents } from '../api/hooks';
+import { useAdvisorStatus, useMigrations, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
 import { ADVISOR_QUERY_MAX } from '../api/types';
 import { AdvisorNotes, type AdvisorNoteRow } from '../components/AdvisorNotes';
@@ -10,13 +10,17 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { SelectField } from '../components/Field';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
+import { RecommendationList, RecommendationPager } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
+import { nonStrategyNotes } from '../lib/advisor';
 import { formatPct } from '../lib/format';
 import { hasRole } from '../lib/roles';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const SUGGESTIONS = ['kernel panic after import', 'warm sync does not converge', 'volume type not mapped', 'MTU after cutover'];
+/** Recommendations per page of the feed. */
+const FEED_PAGE = 20;
 
 function ServiceCard({
   title,
@@ -74,6 +78,8 @@ export default function Advisor() {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState('5');
   const [touched, setTouched] = useState(false);
+  const [feedOffset, setFeedOffset] = useState(0);
+  const recommendations = useRecommendations({ limit: FEED_PAGE, offset: feedOffset }, { keepPrevious: true });
 
   const s = status.data;
   const memoryEnabled = s?.memory.enabled ?? false;
@@ -91,7 +97,7 @@ export default function Advisor() {
   const notes = useMemo<AdvisorNoteRow[]>(
     () =>
       (migrations.data ?? [])
-        .flatMap((m) => m.advisor_notes.map((n) => ({ ...n, vmName: m.vm.name, migrationId: m.id })))
+        .flatMap((m) => nonStrategyNotes(m.advisor_notes).map((n) => ({ ...n, vmName: m.vm.name, migrationId: m.id })))
         .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
         .slice(0, 20),
     [migrations.data],
@@ -143,97 +149,112 @@ export default function Advisor() {
       )}
 
       <div className="grid items-start gap-4 xl:grid-cols-2">
-        <Panel title="Similar incidents" description="Search agentmemory for past failures and their fixes">
-          <form onSubmit={submit} className="flex flex-col gap-3" noValidate>
-            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem_auto] sm:items-end">
-              <div className="min-w-0">
-                <label htmlFor={queryId} className="field-label">
-                  Describe the problem
-                </label>
-                <input
-                  id={queryId}
-                  type="search"
-                  className="input"
-                  placeholder="e.g. warm sync does not converge on PostgreSQL"
-                  maxLength={ADVISOR_QUERY_MAX}
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  aria-invalid={touched && !query.trim() ? true : undefined}
-                  aria-describedby={touched && !query.trim() ? `${queryId}-error` : undefined}
-                />
-              </div>
-              <SelectField
-                label="Results"
-                value={limit}
-                onChange={(e) => setLimit(e.target.value)}
-                options={['3', '5', '10'].map((v) => ({ value: v, label: v }))}
-              />
-              <Button
-                type="submit"
-                size="lg"
-                variant="primary"
-                icon={Search}
-                loading={search.isPending}
-                disabledReason={searchReason}
-              >
-                Search
-              </Button>
-            </div>
-            {touched && !query.trim() && (
-              <p id={`${queryId}-error`} role="alert" className="field-error">
-                Enter a few words about the failure to search for.
-              </p>
-            )}
-            {canSearch && memoryEnabled && (
-              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span>Try:</span>
-                {SUGGESTIONS.map((text) => (
-                  <button
-                    key={text}
-                    type="button"
-                    onClick={() => {
-                      setQuery(text);
-                      run(text);
-                    }}
-                    className="min-h-8 cursor-pointer rounded-full border border-border px-2.5 text-foreground transition-colors duration-200 hover:bg-muted"
-                  >
-                    {text}
-                  </button>
-                ))}
-              </div>
-            )}
-          </form>
-          <p role="status" className="sr-only">
-            {search.data ? `${search.data.hits.length} similar incident${search.data.hits.length === 1 ? '' : 's'} found.` : ''}
-          </p>
-          <div className="mt-4">
-            {search.error && <ErrorBanner error={search.error} title="The search failed" />}
-            {search.data && search.data.hits.length === 0 && <EmptyState icon={SearchX} title="No similar incidents found" />}
-            {search.data && search.data.hits.length > 0 && (
-              <ol aria-label="Similar incidents" className="flex flex-col gap-2">
-                {search.data.hits.map((hit, i) => (
-                  <li key={`${hit.title}-${i}`} className="rounded-md border border-border p-3 text-sm">
-                    <p className="flex flex-wrap items-baseline justify-between gap-2">
-                      <span className="font-medium text-foreground">{hit.title}</span>
-                      {typeof hit.score === 'number' && <span className="num text-xs text-muted-foreground">match {formatPct(hit.score * 100, 0)}</span>}
-                    </p>
-                    <p className="mt-1 wrap-break-word text-muted-foreground">{hit.content}</p>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </div>
-        </Panel>
-
-        <Panel title="Recent advisor notes" description="Across all migrations, newest first">
-          {migrations.isPending ? (
+        <Panel title="Recommendations" description="What the advisor recommended and what was decided, newest first. Migrations run the decision.">
+          {recommendations.isPending ? (
             <LoadingBlock rows={4} />
-          ) : migrations.error ? (
-            <ErrorBanner error={migrations.error} title="Advisor notes are unavailable" onRetry={() => void migrations.refetch()} />
+          ) : recommendations.error ? (
+            <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
           ) : (
-            <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />
+            <>
+              <RecommendationList items={recommendations.data.items} emptyText="No recommendations yet." />
+              <RecommendationPager offset={recommendations.data.offset} limit={FEED_PAGE} total={recommendations.data.total} onChange={setFeedOffset} />
+            </>
           )}
         </Panel>
+
+        <div className="flex min-w-0 flex-col gap-4">
+          <Panel title="Similar incidents" description="Search agentmemory for past failures and their fixes">
+            <form onSubmit={submit} className="flex flex-col gap-3" noValidate>
+              <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem_auto] sm:items-end">
+                <div className="min-w-0">
+                  <label htmlFor={queryId} className="field-label">
+                    Describe the problem
+                  </label>
+                  <input
+                    id={queryId}
+                    type="search"
+                    className="input"
+                    placeholder="e.g. warm sync does not converge on PostgreSQL"
+                    maxLength={ADVISOR_QUERY_MAX}
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    aria-invalid={touched && !query.trim() ? true : undefined}
+                    aria-describedby={touched && !query.trim() ? `${queryId}-error` : undefined}
+                  />
+                </div>
+                <SelectField
+                  label="Results"
+                  value={limit}
+                  onChange={(e) => setLimit(e.target.value)}
+                  options={['3', '5', '10'].map((v) => ({ value: v, label: v }))}
+                />
+                <Button
+                  type="submit"
+                  size="lg"
+                  variant="primary"
+                  icon={Search}
+                  loading={search.isPending}
+                  disabledReason={searchReason}
+                >
+                  Search
+                </Button>
+              </div>
+              {touched && !query.trim() && (
+                <p id={`${queryId}-error`} role="alert" className="field-error">
+                  Enter a few words about the failure to search for.
+                </p>
+              )}
+              {canSearch && memoryEnabled && (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>Try:</span>
+                  {SUGGESTIONS.map((text) => (
+                    <button
+                      key={text}
+                      type="button"
+                      onClick={() => {
+                        setQuery(text);
+                        run(text);
+                      }}
+                      className="min-h-8 cursor-pointer rounded-full border border-border px-2.5 text-foreground transition-colors duration-200 hover:bg-muted"
+                    >
+                      {text}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </form>
+            <p role="status" className="sr-only">
+              {search.data ? `${search.data.hits.length} similar incident${search.data.hits.length === 1 ? '' : 's'} found.` : ''}
+            </p>
+            <div className="mt-4">
+              {search.error && <ErrorBanner error={search.error} title="The search failed" />}
+              {search.data && search.data.hits.length === 0 && <EmptyState icon={SearchX} title="No similar incidents found" />}
+              {search.data && search.data.hits.length > 0 && (
+                <ol aria-label="Similar incidents" className="flex flex-col gap-2">
+                  {search.data.hits.map((hit, i) => (
+                    <li key={`${hit.title}-${i}`} className="rounded-md border border-border p-3 text-sm">
+                      <p className="flex flex-wrap items-baseline justify-between gap-2">
+                        <span className="font-medium text-foreground">{hit.title}</span>
+                        {typeof hit.score === 'number' && <span className="num text-xs text-muted-foreground">match {formatPct(hit.score * 100, 0)}</span>}
+                      </p>
+                      <p className="mt-1 wrap-break-word text-muted-foreground">{hit.content}</p>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </Panel>
+
+          <Panel title="Recent advisor notes" description="Classification, verification, screening and similar incidents across all migrations, newest first">
+            {migrations.isPending ? (
+              <LoadingBlock rows={4} />
+            ) : migrations.error ? (
+              <ErrorBanner error={migrations.error} title="Advisor notes are unavailable" onRetry={() => void migrations.refetch()} />
+            ) : (
+              <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />
+            )}
+          </Panel>
+        </div>
       </div>
     </>
   );

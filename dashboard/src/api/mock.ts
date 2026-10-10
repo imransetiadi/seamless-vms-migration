@@ -23,13 +23,19 @@ import {
   estimate,
   GiB,
   iso,
+  JEV_MIN_CONFIDENCE,
   MiB,
   preflight,
   prng,
+  strategyEventOf,
+  strategyRecommendation,
+  type StrategyDecision,
 } from './mockData';
 import type {
   Health,
+  AdvisorRecommendation,
   AdvisorStatus,
+  DecisionType,
   DestinationInventory,
   Estimate,
   Event,
@@ -39,6 +45,7 @@ import type {
   Plan,
   PlanCreate,
   Provider,
+  RecommendationPage,
   Role,
   Stats,
   Strategy,
@@ -47,7 +54,19 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { ACTION_TEXT_MAX, ADVISOR_LIMIT_MAX, ADVISOR_QUERY_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES, SYNC_PASSES_LATEST } from './types';
+import {
+  ACTION_TEXT_MAX,
+  ADVISOR_LIMIT_MAX,
+  ADVISOR_QUERY_MAX,
+  DECISION_TYPES,
+  PHASES,
+  PLAN_DESCRIPTION_MAX,
+  PLAN_NAME_MAX,
+  RECOMMENDATION_LIMIT_DEFAULT,
+  RECOMMENDATION_LIMIT_MAX,
+  STRATEGIES,
+  SYNC_PASSES_LATEST,
+} from './types';
 
 interface MockResponse {
   status: number;
@@ -96,6 +115,97 @@ function percentile(sorted: number[], p: number): number | null {
 export interface MockServerOptions {
   now?: () => number;
   seed?: number;
+  /**
+   * The advisor's answer on an automatic choice between the strategies of `scope` (jev_decide in the
+   * API, SDD §14.2); a null option and confidence is no answer. Defaults to `simulatedAdvice`.
+   */
+  advise?: (vm: VMRef, scope: readonly Strategy[], estimates: readonly Estimate[]) => SimulatedAdvice;
+}
+
+export interface SimulatedAdvice {
+  option: string | null;
+  confidence: number | null;
+}
+
+/**
+ * Demo mode's stand-in for Jev: the scope's shortest downtime at a confidence of 0.50-0.94 that
+ * depends on the VM alone, so it is the same every time and never draws from the seeded stream.
+ */
+export function simulatedAdvice(vm: VMRef, scope: readonly Strategy[], estimates: readonly Estimate[]): SimulatedAdvice {
+  let hash = 2166136261; // FNV-1a over the VM id
+  for (const char of vm.source_id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0;
+  const downtime = (s: Strategy) => estimates.find((e) => e.strategy === s)?.downtime_s ?? Infinity;
+  const option = [...scope].sort((a, b) => downtime(a) - downtime(b))[0] ?? null;
+  return { option, confidence: 0.5 + (hash % 45) / 100 };
+}
+
+/** selector.advisor_scope (SDD §9.2, §14.2): the strategies the advisor may choose between; empty = no advice. */
+function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_policy']): Strategy[] {
+  const eligible = estimates.filter((e) => e.eligible);
+  if (!eligible.length) return [];
+  const bySimplicity = (list: Estimate[]) => list.map((e) => e.strategy).sort((a, b) => SIMPLICITY[a] - SIMPLICITY[b]);
+  if (!eligible.some((e) => e.meets_slo)) return bySimplicity(eligible);
+  if (policy === 'simplest_meeting_slo') return [];
+  const best = Math.min(...eligible.map((e) => e.downtime_s));
+  const ties = eligible.filter((e) => e.downtime_s - best < Math.max(60, best * 0.1));
+  return ties.length >= 2 ? bySimplicity(ties) : [];
+}
+
+/** decide() under the global default policy (SDD §14.4): no usable advice, below the threshold, else applied. */
+function decided(advice: SimulatedAdvice, scope: readonly Strategy[]): { status: StrategyDecision; fallback?: string } {
+  if (advice.option === null) return { status: 'fallback_rules', fallback: 'advisor unavailable: Jev gave no answer' };
+  if (!scope.includes(advice.option as Strategy)) {
+    return { status: 'fallback_rules', fallback: `${advice.option} is not among the options it may choose (${scope.join(', ')})` };
+  }
+  if (advice.confidence === null || advice.confidence < JEV_MIN_CONFIDENCE) return { status: 'below_threshold' };
+  return { status: 'auto_applied' };
+}
+
+/** Strategy notes of earlier versions read as recommendations, like the API's listing: nothing is copied (SDD §14.4). */
+function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
+  return m.advisor_notes
+    .filter((note) => note.kind === 'strategy')
+    .map((note, index): AdvisorRecommendation => {
+      const data = note.data;
+      const option = typeof data.selected === 'string' ? data.selected : null;
+      const deterministic = typeof data.deterministic === 'string' ? data.deterministic : null;
+      const probabilities = typeof data.probabilities === 'object' && data.probabilities !== null ? (data.probabilities as Record<string, unknown>) : {};
+      const [status, reason_code, final_option] =
+        data.applied === true && option !== null
+          ? (['auto_applied', 'ABOVE_THRESHOLD_AUTO_APPLY', option] as const)
+          : note.source === 'rules'
+            ? (['fallback_rules', 'ADVISOR_UNAVAILABLE_FALLBACK', deterministic] as const)
+            : (['below_threshold', 'BELOW_THRESHOLD_DEFAULT_KEPT', deterministic] as const);
+      return {
+        id: `rec-legacy-${m.id}-${index}`,
+        created_at: note.created_at,
+        decision_type: 'migration_strategy',
+        subject: { kind: 'vm', id: m.vm.source_id, name: m.vm.name },
+        plan_id: m.plan_id,
+        migration_id: m.id,
+        provider_id: null,
+        model: note.source === 'jev' ? { name: 'jev', version: 'unknown', deployment: 'unknown', endpoint_host: null } : { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null },
+        recommendation: {
+          option,
+          confidence: note.confidence,
+          distribution: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
+        },
+        decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
+        legacy: true,
+        legacy_text: note.summary,
+      };
+    });
+}
+
+/** An integer query parameter the API validates (422 outside `min`..`max`, SDD §12). */
+function intParam(query: URLSearchParams, name: string, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  const raw = query.get(name);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  if (!/^-?\d+$/.test(raw.trim()) || value < min || value > max) {
+    throw new HttpError(422, 'validation_error', `${name}: must be an integer from ${min}${max < Number.MAX_SAFE_INTEGER ? ` to ${max}` : ''}.`);
+  }
+  return value;
 }
 
 /** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
@@ -144,8 +254,11 @@ export class MockServer {
   readonly inventories: Record<string, VMRef[] | DestinationInventory>;
   readonly plans: Plan[];
   readonly migrations: Migration[];
+  /** Stored recommendations; strategy notes of earlier versions are listed beside them (SDD §14.4). */
+  readonly recommendations: AdvisorRecommendation[];
   readonly events: Event[];
   private seq: number;
+  private readonly advise: NonNullable<MockServerOptions['advise']>;
   private readonly listeners = new Set<(event: Event) => void>();
   private readonly rand: () => number;
   private readonly now: () => number;
@@ -165,8 +278,10 @@ export class MockServer {
     this.inventories = fixtures.inventories;
     this.plans = fixtures.plans;
     this.migrations = fixtures.migrations;
+    this.recommendations = fixtures.recommendations;
     this.events = fixtures.events;
     this.seq = this.events.at(-1)?.seq ?? 0;
+    this.advise = options.advise ?? simulatedAdvice;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -544,9 +659,45 @@ export class MockServer {
 
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
     this.evaluate(m, plan);
+    const rec = this.decideStrategy(m, plan);
     this.clearApprovals(m);
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
+    if (rec) {
+      this.recommendations.push(rec);
+      this.emit({ plan_id: plan.id, migration_id: m.id, actor: 'advisor', ...strategyEventOf(rec) });
+    }
+  }
+
+  /**
+   * Like validate_plan (SDD §14.4): an automatic choice whose advisor scope is not empty goes to the
+   * advisor, decide() takes the decision, and the migration runs its final option.
+   */
+  private decideStrategy(m: Migration, plan: Plan): AdvisorRecommendation | null {
+    const automatic = plan.default_strategy === 'auto' && !(m.vm.source_id in plan.strategy_overrides);
+    const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy);
+    const scope = advisorScope(m.estimates, plan.selection_policy);
+    if (!automatic || !scope.length || eligible.length < 2) return null;
+    const advice = this.advise(m.vm, scope, m.estimates);
+    const { status, fallback } = decided(advice, scope);
+    const at = new Date(this.now()).toISOString();
+    const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
+    const rec = strategyRecommendation({
+      id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,
+      at,
+      migration: m,
+      providerId: plan.source_provider_id,
+      option: advice.option,
+      confidence: advice.confidence,
+      options: eligible,
+      status,
+      deterministic: m.strategy,
+      fallback,
+    });
+    const final = rec.decision.final_option as Strategy;
+    m.strategy = final;
+    m.estimate = m.estimates.find((e) => e.strategy === final) ?? null;
+    return rec;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -765,6 +916,10 @@ export class MockServer {
         };
         return ok(status);
       }
+      if (id === 'recommendations' && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok(sub === undefined ? this.listRecommendations(query) : this.recommendation(sub));
+      }
       if (id === 'similar-incidents' && method === 'POST') {
         this.require(token, 'operator', path);
         // like the API (SDD §12): a query of 1-2000 characters, 1-20 results
@@ -788,6 +943,33 @@ export class MockServer {
   // ---------------------------------------------------------------------------------------
   // Route handlers
   // ---------------------------------------------------------------------------------------
+
+  /** Stored and legacy recommendations, newest first (SDD §12, §14.4). */
+  private allRecommendations(): AdvisorRecommendation[] {
+    const items = [...this.recommendations, ...this.migrations.flatMap(legacyRecommendations)];
+    return items.sort((a, b) => (a.created_at === b.created_at ? (a.id < b.id ? 1 : -1) : a.created_at < b.created_at ? 1 : -1));
+  }
+
+  private listRecommendations(query: URLSearchParams): RecommendationPage {
+    const limit = intParam(query, 'limit', RECOMMENDATION_LIMIT_DEFAULT, 1, RECOMMENDATION_LIMIT_MAX);
+    const offset = intParam(query, 'offset', 0, 0);
+    const type = query.get('decision_type');
+    if (type !== null && !DECISION_TYPES.includes(type as DecisionType)) {
+      throw new HttpError(422, 'validation_error', `decision_type: Input should be ${DECISION_TYPES.map((t) => `'${t}'`).join(', ')}.`);
+    }
+    const migrationId = query.get('migration_id');
+    const planId = query.get('plan_id');
+    const items = this.allRecommendations().filter(
+      (r) => (migrationId === null || r.migration_id === migrationId) && (planId === null || r.plan_id === planId) && (type === null || r.decision_type === type),
+    );
+    return { items: items.slice(offset, offset + limit), total: items.length, offset, limit };
+  }
+
+  private recommendation(id: string): AdvisorRecommendation {
+    const found = this.allRecommendations().find((r) => r.id === id);
+    if (!found) throw new HttpError(404, 'not_found', `recommendation ${id} not found`);
+    return found;
+  }
 
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
