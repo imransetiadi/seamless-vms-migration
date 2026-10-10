@@ -1696,7 +1696,10 @@ seamless events prune (--before ISO | --older-than-days N) --confirm        # au
 seamless version
 ```
 
-`plan apply` accepts the `PlanCreate` schema in YAML. Commands operating on the store use the same
+`plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
+same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
+settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
+refuse. Commands operating on the store use the same
 settings as `serve` (they open the DB directly; a running server sees changes on its next tick). An
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
 the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
