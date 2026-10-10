@@ -308,6 +308,19 @@ describe('mock API', () => {
     expect(server.events.slice(before).filter((e) => e.kind === 'plan.updated')).toEqual([]);
   });
 
+  it('refuses to start a waved plan while a migration belongs to no wave, like the API (SDD §9.4)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'validated' && p.waves.length > 0)!;
+    const [added, replanned] = server.migrations.filter((m) => m.plan_id === plan.id && !['completed', 'finalized', 'cancelled', 'rolled_back'].includes(m.phase));
+    added!.wave_id = null; // a VM added after the waves were planned
+    replanned!.wave_id = 'wave-gone'; // its wave was planned away
+    await expect(client.post(`/plans/${plan.id}/start`)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(`2 migration(s) belong to no wave: ${added!.vm.name}, ${replanned!.vm.name}`),
+    });
+    expect(plan.status).toBe('validated');
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');

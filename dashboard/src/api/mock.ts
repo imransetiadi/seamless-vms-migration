@@ -15,6 +15,7 @@ import { canTransition, hasDataPath } from '../lib/fsm';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
+import { WAVE_COMPLETE_PHASES } from '../lib/waves';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -1083,6 +1084,14 @@ export class MockServer {
     if (!['validated', 'paused', 'failed'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated, paused or failed plans can start (this plan is ${plan.status}).`);
     const blocked = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked');
     if (blocked.length) throw new HttpError(409, 'conflict', `${blocked.length} migration(s) are blocked: ${blocked.map((m) => m.vm.name).join(', ')}.`);
+    if (plan.waves.length) {
+      // like the API (SDD §9.4): a VM added after the waves were planned would start outside every wave's order
+      const waveIds = new Set(plan.waves.map((w) => w.id));
+      const stray = this.migrations.filter((m) => m.plan_id === plan.id && !WAVE_COMPLETE_PHASES.has(m.phase) && !(m.wave_id && waveIds.has(m.wave_id)));
+      if (stray.length) {
+        throw new HttpError(409, 'conflict', `${stray.length} migration(s) belong to no wave: ${stray.slice(0, 10).map((m) => m.vm.name).join(', ')}; re-run the automatic wave planning or add them to a wave`);
+      }
+    }
     plan.status = 'running';
     plan.updated_at = new Date(this.now()).toISOString();
     for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {

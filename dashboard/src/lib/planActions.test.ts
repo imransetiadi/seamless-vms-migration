@@ -39,6 +39,31 @@ describe('planActions', () => {
     expect(start.reason).toMatch(/1 migration is blocked/);
   });
 
+  it('refuses to start a waved plan while an unfinished migration belongs to no wave, naming it (SDD §9.4)', () => {
+    const plan: Plan = { ...planWith('validated'), waves: [{ ...base.waves[0]!, id: 'wave-a' }] };
+    const [one, two, three] = fx.migrations.slice(0, 3).map((m) => ({ ...m, plan_id: plan.id, phase: 'ready' as const }));
+    const migrations: Migration[] = [
+      { ...one!, wave_id: 'wave-a' },
+      { ...two!, wave_id: null, vm: { ...two!.vm, name: 'web-09' } }, // added after the waves were planned
+      { ...three!, wave_id: 'wave-gone', vm: { ...three!.vm, name: 'web-10' } }, // its wave was planned away
+    ];
+    const start = planActions(plan, 'operator', migrations).start;
+    expect(start.enabled).toBe(false);
+    expect(start.reason).toBe('2 migrations belong to no wave: web-09, web-10 — plan the waves again or add them to a wave.');
+  });
+
+  it('starts a waved plan whose migrations outside every wave have finished, and a plan without waves', () => {
+    const plan: Plan = { ...planWith('validated'), waves: [{ ...base.waves[0]!, id: 'wave-a' }] };
+    const [one, two] = fx.migrations.slice(0, 2).map((m) => ({ ...m, plan_id: plan.id }));
+    const finished: Migration[] = [
+      { ...one!, wave_id: 'wave-a', phase: 'ready' },
+      { ...two!, wave_id: null, phase: 'cancelled' },
+    ];
+    expect(planActions(plan, 'operator', finished).start.enabled).toBe(true);
+    const unwaved: Migration[] = [{ ...one!, wave_id: null, phase: 'ready' }];
+    expect(planActions({ ...plan, waves: [] }, 'operator', unwaved).start.enabled).toBe(true);
+  });
+
   it('starts a failed plan again only when no migration is blocked, like a validated one (SDD §8)', () => {
     const blocked = ready.map((m, i) => (i === 0 ? { ...m, phase: 'blocked' as const } : m));
     const start = planActions(planWith('failed'), 'operator', blocked).start;

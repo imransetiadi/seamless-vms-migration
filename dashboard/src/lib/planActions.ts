@@ -1,5 +1,6 @@
 import type { Migration, Phase, Plan, Role } from '../api/types';
 import { hasRole } from './roles';
+import { WAVE_COMPLETE_PHASES } from './waves';
 
 export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit';
 
@@ -11,14 +12,20 @@ export interface Availability {
 
 const ROLE_REASON = 'Requires the operator role.';
 
-/**
- * Plan actions (SDD §12: all need `operator`). Status rules: PATCH-like actions (auto waves) only in
- * draft/validated; validate anything that is not running or completed; start validated or paused
- * plans (the API answers 409 while a migration is blocked); pause running plans.
- */
 /** Phases in which a migration depends on the plan's providers, mappings and strategy (SDD §12). */
 const IN_FLIGHT: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
 
+/** Up to three names, then how many more. */
+function names(list: string[]): string {
+  return `${list.slice(0, 3).join(', ')}${list.length > 3 ? ` and ${list.length - 3} more` : ''}`;
+}
+
+/**
+ * Plan actions (SDD §12: all need `operator`). Status rules: PATCH-like actions (auto waves) only in
+ * draft/validated; validate anything that is not running or completed; start validated or paused
+ * plans (the API answers 409 while a migration is blocked or, in a plan with waves, belongs to no wave);
+ * pause running plans.
+ */
 export function planActions(plan: Plan, role: Role | undefined, migrations: Migration[]): Record<PlanActionKey, Availability> {
   const allowed = hasRole(role, 'operator');
   const gate = (ok: boolean, reason: string): Availability => {
@@ -31,9 +38,15 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
   const inFlight = migrations
     .filter((m) => m.plan_id === plan.id && (IN_FLIGHT.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at)))
     .map((m) => m.vm.name);
-  const busy = inFlight.length
-    ? `Migrations in flight: ${inFlight.slice(0, 3).join(', ')}${inFlight.length > 3 ? ` and ${inFlight.length - 3} more` : ''} — finish, roll back or cancel them first.`
-    : null;
+  const busy = inFlight.length ? `Migrations in flight: ${names(inFlight)} — finish, roll back or cancel them first.` : null;
+  // SDD §9.4: start_plan refuses a plan with waves while a migration that has not finished belongs to
+  // no wave — a VM added after the waves were planned would start outside every wave's order
+  const waveIds = new Set(plan.waves.map((w) => w.id));
+  const stray = plan.waves.length
+    ? migrations
+        .filter((m) => m.plan_id === plan.id && !WAVE_COMPLETE_PHASES.has(m.phase) && !(m.wave_id && waveIds.has(m.wave_id)))
+        .map((m) => m.vm.name)
+    : [];
 
   const start = (): Availability => {
     switch (status) {
@@ -47,6 +60,13 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
       default:
         if (blocked > 0) {
           return gate(false, `${blocked} migration${blocked === 1 ? ' is' : 's are'} blocked — fix the findings and re-validate.`);
+        }
+        if (stray.length > 0) {
+          const one = stray.length === 1;
+          return gate(
+            false,
+            `${stray.length} migration${one ? ' belongs' : 's belong'} to no wave: ${names(stray)} — plan the waves again or add ${one ? 'it' : 'them'} to a wave.`,
+          );
         }
         return gate(true, '');
     }
