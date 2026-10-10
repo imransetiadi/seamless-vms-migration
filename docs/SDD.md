@@ -1486,7 +1486,13 @@ provider error messages and every `migration.log` line (§4). Where it cuts such
 over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
 — a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
 line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
-SDK's error message at 500, an HTTP error body in the handover executor at 300.
+SDK's error message at 500, an HTTP error body in the handover executor at 300. The service log too:
+the root handler's formatter (`cli.configure_logging`) passes every record through `redact` — the
+whole line in plain mode; in JSON mode the message and the exception text before they are serialized,
+as redacting a serialized line could break its quoting — so neither a message nor the chained
+exceptions a traceback prints (an SDK's error under the `ProviderError` raised from it) carry a
+secret that `redact` recognizes. A failed pre-stage's output, logged there for want of a migration,
+keeps its last 4000 characters after its last 4000 + 16384 were redacted (`redact_tail`).
 
 `redact_payload(value, names=None)` applies `redact` to every string of a JSON-like value and replaces
 the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) whatever its type. Guest
