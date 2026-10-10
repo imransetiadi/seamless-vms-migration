@@ -765,7 +765,10 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   retries (§5.4); one lock per provider id serializes provider checks, so a validation and a manual
   `POST /providers/{id}/check` do not collide on the provider's versioned write (a provider edited or
   deleted during a check still refuses it). Order: plan, claim, migration; the provider lock is
-  innermost and takes no other. Plan documents are written by several drivers and the tick loop
+  innermost and takes no other. A retry runs its checks and its transition under the claim and
+  migration locks and takes the plan's lock only after it released them, to reopen a completed plan
+  (§5.1): a validation of another plan holds the claim lock through its provider calls, and a retry
+  holding its plan's lock while it waits would hold up the tick, which starts that plan's steps under it. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
