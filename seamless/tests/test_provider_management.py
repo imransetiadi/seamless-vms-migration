@@ -131,6 +131,94 @@ def test_patch_is_refused_while_a_running_plan_uses_the_provider(api):
     assert patch(api, "/api/v1/providers/src-osp", {"name": "x"}).status_code == 200
 
 
+def test_credentials_written_while_a_check_updates_the_provider_are_recorded(api, monkeypatch):
+    """SDD §13.3: a provider check finishing while the credentials are written bumps the
+    provider's version; the route retries its versioned write, so the change is recorded —
+    credentials_updated_at and one provider.credentials_updated event — and the provider returns
+    to unknown: that check tested the old credentials. A 409 here would leave a replaced secret
+    unaudited."""
+    write = FileSecretStore.write
+    checks: list[str] = []
+
+    def write_while_a_check_finishes(self, name, values, labels):
+        write(self, name, values, labels)
+        if not checks:
+            checks.append(name)
+            provider = api.store.get("provider", "src-osp", Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+
+    monkeypatch.setattr(FileSecretStore, "write", write_while_a_check_finishes)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    stored = api.store.get("provider", "src-osp", Provider)
+    assert (stored.credentials_secret, stored.status) == ("provider-src-osp", "unknown")
+    assert stored.credentials_updated_at is not None
+    recorded = [
+        e for e in api.store.events(since_seq=0) if e.kind == "provider.credentials_updated"
+    ]
+    assert [e.data["secret"] for e in recorded] == ["provider-src-osp"]
+
+    # a check that finishes between the route's read of the provider and its write: the
+    # versioned write conflicts and is retried on the fresh copy
+    from seamless_migrate.store import AsyncStore
+
+    db_put = AsyncStore.put
+    raced: list[int] = []
+
+    async def put_after_a_check(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None and not raced:
+            raced.append(expected_version)
+            provider = api.store.get("provider", model.id, Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", put_after_a_check)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-2", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    assert (
+        raced and (api.settings.secrets_dir / "provider-src-osp" / "password").read_text() == "pw-2"
+    )
+    monkeypatch.setattr(AsyncStore, "put", db_put)
+
+    checks.clear()
+    key = "-----BEGIN OPENSSH PRIVATE KEY-----\nkey-material\n-----END OPENSSH PRIVATE KEY-----"
+    res = put(api, "/api/v1/providers/dst-rhoso/conversion-key", {"private_key": key})
+    assert res.status_code == 200, res.text
+    stored = api.store.get("provider", "dst-rhoso", Provider)
+    assert stored.conversion_key_updated_at is not None
+    assert stored.conversion_host is not None
+    assert stored.conversion_host.ssh_key_secret == "provider-dst-rhoso-ssh"
+
+
+def test_credentials_of_a_provider_deleted_meanwhile_answer_404_and_leave_no_secret(
+    api, monkeypatch
+):
+    """SDD §13.3: a provider deleted while its credentials are written answers 404, and the
+    secret just written is removed again — no secret outlives its provider."""
+    write = FileSecretStore.write
+
+    def write_while_the_provider_is_deleted(self, name, values, labels):
+        write(self, name, values, labels)
+        api.store.delete("provider", "src-osp")
+
+    monkeypatch.setattr(FileSecretStore, "write", write_while_the_provider_is_deleted)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 404, res.text
+    assert not (api.settings.secrets_dir / "provider-src-osp").exists()
+
+
 def test_openstack_credentials_are_write_only(api, caplog):
     secret = "s3cr3t-Keystone-pw"
     with caplog.at_level(logging.DEBUG):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request, Response
@@ -21,7 +22,7 @@ from ..security.secret_store import (
     credentials_secret_name,
     secret_store,
 )
-from ..store import ConflictError
+from ..store import ConflictError, NotFound
 from .deps import ApiError, require_role, services
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
@@ -179,6 +180,34 @@ async def _store_secret(
         raise ApiError(503, "unavailable", f"secret store: {exc}") from None
 
 
+async def _record_secret(
+    request: Request, provider_id: str, name: str, update: Callable[[Provider], dict[str, Any]]
+) -> Provider:
+    """The provider records a secret already in the store (SDD §13.3): a versioned write, retried
+    when a check or another write changed the provider meanwhile (they touch other fields) — the
+    update is derived from the fresh copy each time, so no concurrent change is lost — and so a
+    written secret is always recorded; a provider deleted meanwhile answers 404 and the secret
+    goes again."""
+    svc = services(request)
+    for _ in range(5):
+        try:
+            provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+        except NotFound:
+            store = secret_store(svc.settings)
+            try:
+                await asyncio.to_thread(store.delete, name)
+            except SecretStoreError:
+                log.warning("secret %s of a deleted provider could not be removed", name)
+            raise
+        updated = provider.model_copy(update={**update(provider), **_SERVER_OWNED})
+        try:
+            await svc.db.put("provider", updated, expected_version=version)
+        except ConflictError:
+            continue
+        return updated
+    raise ApiError(409, "conflict", f"provider {provider_id!r} kept changing; try again")
+
+
 @router.put("/providers/{provider_id}/credentials", response_model=Provider)
 async def set_provider_credentials(
     provider_id: str,
@@ -188,14 +217,16 @@ async def set_provider_credentials(
 ) -> Provider:
     """Write-only (SDD §12/§13.3): the values go to the secret store, never to the database."""
     svc = services(request)
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+    provider = await svc.db.get("provider", provider_id, Provider)
     values = _credential_values(provider, body)
     name = credentials_secret_name(provider_id)
     await _store_secret(request, name, values, provider_id)
-    updated = provider.model_copy(
-        update={"credentials_secret": name, "credentials_updated_at": utcnow(), **_SERVER_OWNED}
+    updated = await _record_secret(
+        request,
+        provider_id,
+        name,
+        lambda _: {"credentials_secret": name, "credentials_updated_at": utcnow()},
     )
-    await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,
@@ -216,23 +247,23 @@ async def set_conversion_key(
 ) -> Provider:
     """Write-only SSH private key of an existing conversion host (SDD §12/§13.3)."""
     svc = services(request)
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+    await svc.db.get("provider", provider_id, Provider)  # 404 before anything is written
     key = body.private_key.strip()
     if "PRIVATE KEY-----" not in key or not key.startswith("-----BEGIN"):
         raise ApiError(422, "validation_error", "private_key must be an OpenSSH or PEM private key")
     name = conversion_key_secret_name(provider_id)
     await _store_secret(request, name, {"private_key": key + "\n"}, provider_id)
-    host = (provider.conversion_host or ConversionHostConfig()).model_copy(
-        update={"ssh_key_secret": name}
-    )
-    updated = provider.model_copy(
-        update={
-            "conversion_host": host,
+    updated = await _record_secret(
+        request,
+        provider_id,
+        name,
+        lambda fresh: {
+            "conversion_host": (fresh.conversion_host or ConversionHostConfig()).model_copy(
+                update={"ssh_key_secret": name}
+            ),
             "conversion_key_updated_at": utcnow(),
-            **_SERVER_OWNED,
-        }
+        },
     )
-    await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,
