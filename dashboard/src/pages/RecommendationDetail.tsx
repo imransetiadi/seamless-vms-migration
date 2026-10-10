@@ -6,8 +6,9 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
+import { DecisionLine, RecommendedLine } from '../components/Recommendations';
 import { Tabs } from '../components/Tabs';
-import { DECISION_TYPE_LABELS, decisionText, optionLabel, recommendedText } from '../lib/advisor';
+import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, distributionRows, formatConfidence, optionLabel } from '../lib/advisor';
 import { auditActionLabel } from '../lib/audit';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { formatDateTime, formatPct } from '../lib/format';
@@ -27,7 +28,7 @@ function change(e: Event): string {
   if (e.kind === 'recommendation.created') {
     const option = text(e.data.option);
     const confidence = typeof e.data.confidence === 'number' ? e.data.confidence : null;
-    return option ? `${optionLabel(option)} recommended${confidence !== null ? ` at ${formatPct(confidence * 100, 0)}` : ''}` : 'Nothing recommended';
+    return option ? `${optionLabel(option)} recommended${confidence !== null ? ` at ${formatConfidence(confidence)}` : ''}` : 'Nothing recommended';
   }
   const state = (value: unknown) => {
     const s = record(value);
@@ -35,6 +36,42 @@ function change(e: Event): string {
     return final ? optionLabel(final) : s.status === 'pending_approval' ? 'Waiting for approval' : 'The default';
   };
   return e.data.before ? `${state(e.data.before)} → ${state(e.data.after)}` : state(e.data.after);
+}
+
+/** The full distribution, highest first, with what confidence means (ADV-03). */
+function DetailsTab({ rec }: { rec: AdvisorRecommendation }) {
+  const rows = distributionRows(rec);
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="max-w-prose text-sm text-muted-foreground">
+        <span className="font-medium text-foreground">Confidence</span> means {CONFIDENCE_DEFINITION} The probabilities below are what Jev gave each
+        option.
+      </p>
+      {rows.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{rec.recommendation.option === null ? 'The advisor gave no answer, so there is no distribution.' : 'No distribution was recorded.'}</p>
+      ) : (
+        <div className="table-wrap rounded-md border border-border">
+          <table className="data-table">
+            <caption className="sr-only">Probability Jev gave each option, highest first</caption>
+            <thead>
+              <tr>
+                <th scope="col">Option</th>
+                <th scope="col">Probability</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.option}>
+                  <td>{row.label}</td>
+                  <td className="num">{row.pct}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
@@ -153,8 +190,8 @@ export default function RecommendationDetail() {
       />
       <div className="flex flex-col gap-4">
         <Panel title="Recommendation and decision" description="The migration runs the decision, not the recommendation">
-          <p className="text-sm text-muted-foreground">Recommended: {recommendedText(r)}</p>
-          <p className="mt-0.5 text-sm font-medium text-foreground">Decision: {decisionText(r)}</p>
+          <RecommendedLine rec={r} className="text-sm text-muted-foreground" />
+          <DecisionLine rec={r} className="mt-0.5 text-sm font-medium text-foreground" />
           {d.reason_text && <p className="mt-0.5 text-xs text-muted-foreground">{d.reason_text}</p>}
           {r.legacy && r.legacy_text && <p className="mt-2 border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {r.legacy_text}</p>}
           <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
@@ -185,10 +222,11 @@ export default function RecommendationDetail() {
             <dd className="font-mono text-xs break-all text-foreground">{r.id}</dd>
           </dl>
         </Panel>
-        <Panel title="Records" description="The audit events and the input this recommendation rests on">
+        <Panel title="Records" description="The full distribution, the audit events and the input this recommendation rests on">
           <Tabs
             label="Recommendation records"
             tabs={[
+              { id: 'details', label: 'Details', content: <DetailsTab rec={r} /> },
               { id: 'audit', label: 'Audit', content: <AuditTab rec={r} /> },
               { id: 'input', label: 'Input', content: <InputTab rec={r} /> },
             ]}

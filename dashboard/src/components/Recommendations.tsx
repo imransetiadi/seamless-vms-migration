@@ -1,13 +1,40 @@
 import { Bot, ChevronLeft, ChevronRight, History, ListChecks, type LucideIcon } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { AdvisorRecommendation } from '../api/types';
-import { DECISION_TYPE_LABELS, decisionText, recommendedText } from '../lib/advisor';
+import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, decisionText, recommendedParts } from '../lib/advisor';
 import { formatDateTime, formatNumber, formatRelative } from '../lib/format';
 import { ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
+import { Term } from './Term';
 
 const MODEL_ICON: Record<AdvisorRecommendation['model']['name'], LucideIcon> = { jev: Bot, rules: ListChecks };
+
+/** "Recommended: Warm migration · 57% confidence (threshold 60%)": the confidence once, the word explained (ADV-03). */
+export function RecommendedLine({ rec, className }: { rec: AdvisorRecommendation; className?: string }) {
+  const parts = recommendedParts(rec);
+  const answered = rec.recommendation.option !== null;
+  return (
+    <p className={className}>
+      Recommended: {parts.option}
+      {answered &&
+        (parts.confidence === null ? (
+          ' · no confidence given'
+        ) : (
+          <>
+            {' · '}
+            {parts.confidence} <Term definition={CONFIDENCE_DEFINITION}>confidence</Term>
+          </>
+        ))}
+      {answered && parts.threshold !== null && ` (threshold ${parts.threshold})`}
+    </p>
+  );
+}
+
+/** "Decision: Cold migration — below threshold, default kept": what the migration runs, and why. */
+export function DecisionLine({ rec, className }: { rec: AdvisorRecommendation; className?: string }) {
+  return <p className={className}>Decision: {decisionText(rec)}</p>;
+}
 
 /** What the advisor recommended, then what was decided: the line the migration runs (SDD §16). Untrusted text renders as plain text. */
 function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; showSubject: boolean }) {
@@ -41,8 +68,8 @@ function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; 
           Details<span className="sr-only"> for {rec.subject.name}</span>
         </Link>
       </div>
-      <p className="mt-1 wrap-break-word text-sm text-muted-foreground">Recommended: {recommendedText(rec)}</p>
-      <p className="mt-0.5 wrap-break-word text-sm font-medium text-foreground">Decision: {decisionText(rec)}</p>
+      <RecommendedLine rec={rec} className="mt-1 wrap-break-word text-sm text-muted-foreground" />
+      <DecisionLine rec={rec} className="mt-0.5 wrap-break-word text-sm font-medium text-foreground" />
       {rec.decision.reason_text && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{rec.decision.reason_text}</p>}
       {rec.legacy && rec.legacy_text && (
         <p className="mt-1.5 wrap-break-word border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {rec.legacy_text}</p>

@@ -218,8 +218,8 @@ describe('MigrationDetail', () => {
   it("lists the migration's recommendations: what was recommended and what was decided (SDD §16, ADV-01)", async () => {
     renderMigration('mig-5d7e2b4a10');
     const advisor = await screen.findByRole('region', { name: /^advisor$/i });
-    const decision = await within(advisor).findByText('Decision: Warm — applied automatically by policy global-default');
-    expect(decision.closest('li')).toHaveTextContent('Recommended: Warm · 67% confidence');
+    const decision = await within(advisor).findByText('Decision: Warm migration — applied automatically by policy global-default');
+    expect(decision.closest('li')).toHaveTextContent('Recommended: Warm migration · 67% confidence (threshold 60%)');
     // the entries are this migration's: no link to itself
     expect(within(advisor).queryByRole('link', { name: 'db-pg-01' })).not.toBeInTheDocument();
     const estimates = screen.getByRole('region', { name: /^estimates$/i });

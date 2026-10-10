@@ -82,12 +82,14 @@ describe('Advisor page', () => {
   it('shows what the advisor recommended and what was decided, never which option was "selected" (SDD §16, ADV-01)', async () => {
     renderWithApp(<Advisor />, { token: 'viewer' });
     const feed = await screen.findByRole('region', { name: 'Recommendations' });
-    const kept = await within(feed).findByText('Decision: Cold — below threshold (57% < 60%)');
+    const kept = await within(feed).findByText('Decision: Cold migration — below threshold, default kept');
     const entry = kept.closest('li')!;
-    expect(entry).toHaveTextContent('Recommended: Warm · 57% confidence');
+    expect(entry).toHaveTextContent('Recommended: Warm migration · 57% confidence (threshold 60%)');
     expect(within(entry).getByRole('link', { name: 'static-cdn-01' })).toHaveAttribute('href', '/migrations/mig-d4e6f8a090');
-    expect(within(feed).getAllByText('Decision: Warm — applied automatically by policy global-default').length).toBeGreaterThan(1);
-    expect(within(feed).getByText('Decision: Warm — advisor unavailable, decided by rules')).toBeInTheDocument();
+    expect(within(feed).getAllByText('Decision: Warm migration — applied automatically by policy global-default').length).toBeGreaterThan(1);
+    expect(within(feed).getByText('Decision: Warm migration — advisor unavailable, decided by rules')).toBeInTheDocument();
+    // ADV-03: the word confidence explains itself
+    expect(within(entry).getByText('confidence')).toHaveAccessibleDescription(/calibrated confidence in its own recommendation/);
     await screen.findByRole('region', { name: 'Recent advisor notes' });
     expect(document.body).not.toHaveTextContent(/selected/i);
   });
@@ -99,6 +101,7 @@ describe('Advisor page', () => {
     const entry = original.closest('li')!;
     expect(within(entry).getByText('Legacy')).toBeInTheDocument();
     expect(entry).toHaveTextContent('Decision: Storage handover — applied automatically');
+    expect(entry).toHaveTextContent('Recommended: Storage handover · 71% confidence');
     const notes = await screen.findByRole('region', { name: 'Recent advisor notes' });
     await within(notes).findByText(/Classified as stateless_web/);
     expect(within(notes).queryByText(/Storage handover recommended/)).not.toBeInTheDocument();
@@ -152,7 +155,7 @@ describe('Advisor page', () => {
     renderWithApp(<Advisor />, { token: 'viewer' });
     expect(await screen.findByRole('link', { name: /audit trail/i })).toHaveAttribute('href', '/advisor/audit');
     const feed = await screen.findByRole('region', { name: 'Recommendations' });
-    await within(feed).findByText('Decision: Cold — below threshold (57% < 60%)');
+    await within(feed).findByText('Decision: Cold migration — below threshold, default kept');
     expect(within(feed).getByRole('link', { name: 'Details for static-cdn-01' })).toHaveAttribute('href', '/advisor/recommendations/rec-d4e6f8a09001');
     expect(within(feed).getByRole('link', { name: 'Details for analytics-node-1' })).toHaveAttribute('href', '/advisor/recommendations/rec-legacy-mig-b2c4d6e870-0');
   });

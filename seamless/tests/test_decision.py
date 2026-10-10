@@ -195,3 +195,56 @@ def test_the_global_default_policy_keeps_todays_behaviour():
         decide(advice(confidence=0.65), policy, 0, "cold", now=NOW).status
         == DecisionStatus.auto_applied
     )
+
+
+def _old_applied(data: dict, confidence: float | None, threshold: float) -> bool:
+    """The inline rule of the advisor before ADV-01 (9719b27, ai/advisor.py)."""
+    selected, status = data.get("selected"), data.get("status")
+    confident = isinstance(confidence, int | float) and float(confidence) >= threshold
+    in_scope = isinstance(selected, str) and selected in data["scope"]
+    return bool(
+        in_scope
+        and confident
+        and not data.get("escaped")
+        and status not in ("escalate", "invalid_response")
+    )
+
+
+#: Strategy notes as the advisor wrote them before ADV-01: (data, confidence).
+OLD_NOTES = [
+    ({"selected": "warm", "status": "ok"}, 0.65),
+    ({"selected": "warm", "status": "ok"}, 0.57),
+    ({"selected": "warm", "status": None}, 0.6),
+    ({"selected": "ask_user", "status": "ok", "escaped": True}, 0.8),
+    ({"selected": "warm", "status": "escalate"}, 0.9),
+    ({"selected": "warm", "status": "invalid_response"}, 0.9),
+    ({"selected": "storage_handover", "status": "ok"}, 0.9),
+    ({"selected": None, "status": "ok"}, None),
+    ({"selected": "warm", "status": "ok"}, None),
+    ({"selected": "cold", "status": "ok"}, 0.99),
+]
+
+
+@pytest.mark.parametrize(("data", "confidence"), OLD_NOTES)
+def test_decide_replays_the_decisions_of_old_strategy_notes(data, confidence):
+    """ADV-03 regression: the inputs of notes written before decide() existed produce the same
+    decisions now - the strategy the old rule ran, and auto-apply exactly when it applied."""
+    note = {**data, "scope": ["cold", "warm"], "deterministic": "cold"}
+    threshold = Settings().jev_min_confidence
+    applied = _old_applied(note, confidence, threshold)
+    replayed = decide(
+        Advice(
+            option=note["selected"],
+            confidence=confidence,
+            scope=tuple(note["scope"]),
+            options=("cold", "warm", "storage_handover"),
+            status=note["status"],
+            escaped=bool(note.get("escaped")),
+        ),
+        default_policy(Settings()),
+        0,
+        note["deterministic"],
+        now=NOW,
+    )
+    assert replayed.final_option == (note["selected"] if applied else note["deterministic"])
+    assert (replayed.status == DecisionStatus.auto_applied) == applied

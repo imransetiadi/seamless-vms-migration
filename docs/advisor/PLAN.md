@@ -33,12 +33,23 @@ Phase 1 — trust. **Stop after PR-7 for the owner's review (demo of Phase 1 in 
 | PR-1 | ADV-01 | `recommendation` kind and model, pure `decide()` with every `ReasonCode`, strategy recommendations written at validation, `migration.strategy` from `decision.final_option`, legacy adapter in the listing, feed from the new route, notes show "Recommended … / Decision …" (no "Selected"). Labels keep the SDD's strategy names ("Warm", not "Warm migration (CBT)": OpenStack warm uses snapshot deltas, only VMware warm uses CBT) — `TODO(ADV-03): confirm` | done — 22a318d, 9719b27, 7331687, 7b5cbdc, ab29332, d8f2fb0, eec70db |
 | PR-2 | ADV-06 core | one redaction gateway every Jev call and memory write passes; fixture test (password, bearer, PEM, clouds.yaml `auth`) | done — 4cf3f31, ed99de7 (`ai/redaction.py`, jev_decide 0.99 over keeping it in the agentmemory client) |
 | PR-3 | ADV-05 | audit event kinds, snapshots with SHA-256, Audit tab, audit page with filters, CSV/JSON export | done — e652375, 013b627, b313ce2 (`ai/snapshots.py`, `/advisor/audit`, `/advisor/recommendations/:id`; jev_decide 0.91 replace `advisor.strategy`, 0.92 dedicated audit route) |
-| PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | planned |
+| PR-4 | ADV-03 | one confidence ("57% (threshold 60%)"), threshold from settings in `decision.threshold_used`, Details panel with option labels, tooltip | done — 791c259 and the feat commit after it (confidence once, rounded down; reason without numbers; `Term` tooltip; Details tab; old-notes replay test) |
 | PR-5 | ADV-04 | `advisor_policy` kind, resolution (plan tag > provider > environment > global; ties → strictest), CRUD (admin), approve/override (admin, reason ≥ 10 chars when required), pending approval holds the migration, Demo policy "Finance — approval required" | planned |
 | PR-6 | ADV-02 | deterministic evidence builder with sources, evidence card (3–6 + Show all, Supports/Opposes with icons), similar incidents (≤ 3), "Limited evidence" → `pending_approval` | planned |
 | PR-7 | ADV-06 UI | deployment badge (`SEAMLESS_JEV_DEPLOYMENT`, endpoint host), "Data sent to advisor" panel from the serializers, console screening `send_to_remote` setting | planned |
 
 Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
+
+**For the owner's review (deviations from the spec's wording, each with its reason):**
+
+* Option labels (ADV-03): the spec's table is used — "Cold migration", "Needs your input", "Needs investigation",
+  `none` as "Other" in Details only — except that "(CBT)" is kept for VMware warm only: the OpenStack warm
+  strategy pre-copies snapshots and scans the whole device, so "Warm migration (CBT)" would be untrue for it
+  (jev_decide 0.99). `none` reads "no clear option" in a note's lines. `TODO(ADV-03): confirm`.
+* The confidence is shown rounded down to a whole percent, so 0.595 reads "59% (threshold 60%)" rather than a
+  contradictory "60% (threshold 60%)" next to "below threshold".
+* `decision.pending_approval` is an audit event kind too (ADV-05's list omits it, its acceptance criterion needs
+  it).
 
 ## PR-1 (ADV-01) — acceptance
 
