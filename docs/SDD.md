@@ -391,7 +391,8 @@ and no timeout ever applies the advice.
 
 `POST /migrations/{id}/cutover` (approver) sets `cutover_requested` with `cutover_requested_by` and
 `cutover_requested_at` — the first request's user and time; a repeated request keeps them — and, only when the plan
-does not require a distinct approver, records an approval too. With `plan.require_distinct_approver` (default true;
+does not require a distinct approver, records an approval too (otherwise the request's comment goes with its
+`migration.action` event, `data.comment`). With `plan.require_distinct_approver` (default true;
 maker-checker, ADV-17) the requester's approval never counts: `POST …/approve` by the requester answers 409 "You
 requested this cutover. Another approver must approve it.", and an approval the requester gave before requesting
 stays in the history without counting. There is no self-approval for emergencies (break-glass is off,
