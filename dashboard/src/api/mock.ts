@@ -13,6 +13,7 @@
 import { DEFAULT_API_BASE } from './client';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
+import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { probesFor } from '../lib/probes';
@@ -1647,14 +1648,10 @@ export class MockServer {
     return ok(plan, 201);
   }
 
-  /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409). */
-  private refuseInFlight(plan: Plan, what: string): void {
-    const inFlight = new Set(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
-    const busy = this.migrations
-      .filter((m) => m.plan_id === plan.id && (inFlight.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at)))
-      .map((m) => m.vm.name)
-      .sort();
-    if (busy.length) throw new HttpError(409, 'conflict', `migrations in flight: ${busy.slice(0, 10).join(', ')}; finish, roll back or cancel them before ${what}`);
+  /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409), each VM with what releases it. */
+  private refuseInFlight(plan: Plan, before: string): void {
+    const busy = this.migrations.filter((m) => m.plan_id === plan.id && blocksPlanChange(m));
+    if (busy.length) throw new HttpError(409, 'conflict', inFlightRefusal(busy, before));
   }
 
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {

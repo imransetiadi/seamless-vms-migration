@@ -536,6 +536,14 @@ describe('mock API', () => {
     waiting.phase = 'awaiting_cutover';
     await expect(client.patch(`/plans/${plan.id}`, { description: 'move' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining(waiting.vm.name) });
     await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({ status: 409 });
+    // each VM with what releases it, in the API's words: a completed one is finalized or rolled back
+    waiting.phase = 'completed';
+    const finalize = `finalize or roll back the completed migration (${waiting.vm.name})`;
+    await expect(client.patch(`/plans/${plan.id}`, { description: 'move' })).rejects.toMatchObject({ status: 409, message: `${finalize} before editing the plan` });
+    await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({
+      status: 409,
+      message: `${finalize} before re-planning the waves`,
+    });
   });
 
   it('lets only an approver change the approval policy of a plan (SDD §12)', async () => {

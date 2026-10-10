@@ -1,4 +1,5 @@
-import type { Migration, Phase, Plan, Role } from '../api/types';
+import type { Migration, Plan, Role } from '../api/types';
+import { blocksPlanChange, releaseGroups } from './inFlight';
 import { hasRole } from './roles';
 import { WAVE_COMPLETE_PHASES } from './waves';
 
@@ -11,9 +12,6 @@ export interface Availability {
 }
 
 const ROLE_REASON = 'Requires the operator role.';
-
-/** Phases in which a migration depends on the plan's providers, mappings and strategy (SDD §12). */
-const IN_FLIGHT: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
 
 /** Up to three names, then how many more. */
 function names(list: string[]): string {
@@ -34,11 +32,12 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
   };
   const status = plan.status;
   const blocked = migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked').length;
-  // SDD §12: a migration in flight depends on the plan as it was — no edit, no re-planned waves meanwhile
-  const inFlight = migrations
-    .filter((m) => m.plan_id === plan.id && (IN_FLIGHT.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at)))
-    .map((m) => m.vm.name);
-  const busy = inFlight.length ? `Migrations in flight: ${names(inFlight)} — finish, roll back or cancel them first.` : null;
+  // SDD §12: a migration in flight depends on the plan as it was — no edit, no re-planned waves meanwhile;
+  // each VM is named with what releases it (a completed one is finalized or rolled back, never cancelled)
+  const groups = releaseGroups(migrations.filter((m) => m.plan_id === plan.id && blocksPlanChange(m)));
+  const busy = groups.length
+    ? groups.map((g) => `${g.action[0]!.toUpperCase()}${g.action.slice(1)} ${g.what} first: ${names(g.names)}.`).join(' ')
+    : null;
   // SDD §9.4: start_plan refuses a plan with waves while a migration that has not finished belongs to
   // no wave — a VM added after the waves were planned would start outside every wave's order
   const waveIds = new Set(plan.waves.map((w) => w.id));

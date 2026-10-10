@@ -84,6 +84,31 @@ describe('planActions', () => {
     expect(planActions(planWith('validated'), 'operator', failed).edit.enabled).toBe(true);
   });
 
+  it('says what releases each migration that keeps the plan from changing (SDD §12)', () => {
+    const named = (m: Migration, i: number, phase: Migration['phase'], stopped = false): Migration => ({
+      ...m,
+      vm: { ...m.vm, name: `vm-${String(i).padStart(2, '0')}` },
+      phase,
+      downtime_started_at: stopped ? '2026-10-10T12:00:00Z' : null,
+      downtime_ended_at: null,
+    });
+    // a completed migration is finished and cannot be cancelled: finalize or roll back (SDD §8.1)
+    const done = Array.from({ length: 5 }, (_, i) => named(ready[0]!, 5 - i, 'completed'));
+    const actions = planActions(planWith('validated'), 'operator', done);
+    expect(actions.edit.reason).toBe('Finalize or roll back the completed migrations first: vm-01, vm-02, vm-03 and 2 more.');
+    expect(actions.waves.reason).toBe(actions.edit.reason);
+    // most urgent first: a failed cutover that stopped the source, then the ones in flight
+    const mixed = [named(ready[0]!, 3, 'completed'), named(ready[0]!, 2, 'syncing'), named(ready[0]!, 1, 'failed', true)];
+    expect(planActions(planWith('validated'), 'operator', mixed).edit.reason).toBe(
+      'Roll back or retry the failed migration whose source VM is stopped first: vm-01. ' +
+        'Finish, roll back or cancel the migration in flight first: vm-02. ' +
+        'Finalize or roll back the completed migration first: vm-03.',
+    );
+    // another plan's migrations leave this plan alone
+    const elsewhere = { ...named(ready[0]!, 4, 'completed'), plan_id: 'plan-other001' };
+    expect(planActions(planWith('validated'), 'operator', [...ready, elsewhere]).edit).toEqual({ enabled: true, reason: null });
+  });
+
   it('offers Start to no plan whose migrations all ended, whatever its stored status says (SDD §8.1, §16, ADV-19)', () => {
     const done = ready.map((m) => ({ ...m, phase: 'completed' as const }));
     // a re-validated finished plan: stored validated, derived completed
