@@ -1220,7 +1220,8 @@ export class MockServer {
         const status: AdvisorStatus = {
           // like a compose stack: the jev sidecar forwards to the remote TypeSafe API (SDD §13.4)
           jev: { mode: 'http', available: true, last_error: null, deployment: 'remote', endpoint_host: null, console_sent: false },
-          memory: { enabled: true, available: true, last_error: 'Timed out after 5 s (recovered on retry)' },
+          // like the API (SDD §14.3): an answered call clears the last error
+          memory: { enabled: true, available: true, last_error: null },
         };
         return ok(status);
       }

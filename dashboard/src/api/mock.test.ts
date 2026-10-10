@@ -14,6 +14,7 @@ import {
   STRATEGIES,
   type AdvisorPolicy,
   type AdvisorRecommendation,
+  type AdvisorStatus,
   type Event,
   type Migration,
   type Plan,
@@ -1721,6 +1722,13 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     const classify = items.find((i) => i.decision_type === 'workload_tier')!;
     expect(classify.fields.map((f) => f.key)).toEqual(['id', 'name', 'os', 'tags', 'disks', 'flavor']);
     expect(classify.fields[0]!.label).toContain("not the VM's id");
+  });
+
+  it('reports an advisor status the API can produce: an available service carries no last error (SDD §14.3)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const status = server.handle('GET', '/advisor/status', new URLSearchParams(), undefined, 'viewer').body as AdvisorStatus;
+    // the API clears last_error with each answered call: an error sits only beside "unavailable"
+    for (const service of [status.jev, status.memory]) expect([service.available, service.last_error]).toEqual([true, null]);
   });
 
   it('clears the source-running flag and the demo power at a rollback, like the API (SDD §8.1)', async () => {

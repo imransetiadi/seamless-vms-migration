@@ -61,6 +61,21 @@ describe('Advisor page', () => {
     await waitFor(() => expect(search).toHaveAccessibleDescription('agentmemory is not enabled.'));
   });
 
+  it('names what happened when agentmemory failed, as the API words it', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      const result = handle(method, path, query, body, token);
+      if (method !== 'GET' || path !== '/advisor/status') return result;
+      const status = result.body as { memory: Record<string, unknown> };
+      return { ...result, body: { ...status, memory: { enabled: true, available: false, last_error: 'search timed out after 5 s' } } };
+    };
+    renderWithApp(<Advisor />, { token: 'operator', server });
+    const card = await screen.findByRole('region', { name: 'agentmemory' });
+    expect(within(card).getByText('Unavailable')).toBeInTheDocument();
+    expect(within(card).getByText('Last error: search timed out after 5 s')).toBeInTheDocument();
+  });
+
   it('keeps the search within the bounds the API accepts: 2000 characters, 1 to 20 results (SDD §12, §16)', async () => {
     renderWithApp(<Advisor />, { token: 'operator' });
     expect(await screen.findByLabelText('Describe the problem')).toHaveAttribute('maxlength', '2000');
