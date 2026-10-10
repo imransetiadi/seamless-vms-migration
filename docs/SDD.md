@@ -381,7 +381,9 @@ After each pass, the migration moves to `awaiting_cutover` when **any** of these
 `last_pass.bytes_changed <= plan.convergence_threshold_bytes`, or
 `estimate_final_downtime(last pass) <= plan.downtime_slo_s`, or `passes >= plan.max_sync_passes`.
 Otherwise another delta pass runs. The rule that moved the migration is recorded in `Migration.converged_by`
-(`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4). The owner kept the SLO rule after the
+(`threshold`, `slo`, `max_passes`, or `force` for a Force cutover, §5.4), and its estimate becomes the one that rule
+used — the final-downtime estimate with its parts (a final pass does not recalibrate it), so the Downtime panel compares
+the actual downtime with the estimate the gate saw. The owner kept the SLO rule after the
 review of 10 October 2026 (ADV-16 P1): it lets a large VM cut over within its SLO without delta passes that would
 not shorten its downtime.
 
@@ -462,7 +464,9 @@ Every migration is checked, real and demo:
 3. `CUTOVER_NOT_CONVERGED` — a warm migration converged by its recorded rule: `threshold` (the last pass before the
    cutover changed at most `convergence_threshold_bytes`), `max_passes`, `slo` (the estimate recorded then fitted the
    SLO) or `force` (a recorded Force cutover).
-4. `DOWNTIME_BELOW_FINAL_SYNC` — `actual_downtime_s` is at least the final pass's bytes over `plan.link_bps`.
+4. `DOWNTIME_BELOW_FINAL_SYNC` — `actual_downtime_s` is at least the final pass's `duration_s`: the final sync happens
+   while the source is down. (Its measured duration, not its bytes over `plan.link_bps`: a real link faster than the
+   plan assumes would be flagged; in demo mode the duration is the bytes over the link plus the conversion.)
 5. `ESTIMATE_PARTS_MISMATCH` — the estimate's `downtime_parts` add up to its `downtime_s`.
 
 The real VMware warm cutover does not record its final CBT sync yet (`TODO(ADV-16): P6`, needs the lab): outside demo
