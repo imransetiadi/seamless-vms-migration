@@ -793,6 +793,12 @@ describe('mock API', () => {
     ).rejects.toMatchObject({ status: 400, code: 'bad_request' });
     const result = await client.post<Migration>(`/migrations/${completed.id}/finalize`, { confirm: completed.vm.name });
     expect(result.phase).toBe('finalized');
+    // like the API (SDD §12): the phase is checked first - a migration that is not completed answers 409, whatever its name
+    const ready = byPhase(server, 'ready');
+    await expect(client.post(`/migrations/${ready.id}/finalize`, { confirm: 'wrong' })).rejects.toMatchObject({
+      status: 409,
+      message: 'only completed migrations can be finalized (ready)',
+    });
   });
 
   it('refuses to start a plan with blocked migrations', async () => {

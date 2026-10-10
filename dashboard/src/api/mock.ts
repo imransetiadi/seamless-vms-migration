@@ -2079,6 +2079,8 @@ export class MockServer {
         break;
       }
       case 'finalize': {
+        // like the API (SDD §12): the phase first, then the typed name
+        if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
         m.checkpoint = 'finalize';
