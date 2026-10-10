@@ -1223,7 +1223,8 @@ class Orchestrator:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)
                 m.attempts += 1
-            m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
+            # everything below is saved in the same write as the move to ready (SDD §5.1): a crash
+            # never leaves a ready migration with the earlier attempt's request and bypass
             # the strategy of the attempt being retried: the evidence names it (SDD §14.4), even
             # after a later validation chose another
             m.attempt_strategies = [*m.attempt_strategies, m.strategy]
@@ -1248,7 +1249,7 @@ class Orchestrator:
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
                 m.downtime_model_s = None
-            await self._save(m, v)
+            m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
         reopened = False
 
         def reopen(fresh: Plan) -> bool:

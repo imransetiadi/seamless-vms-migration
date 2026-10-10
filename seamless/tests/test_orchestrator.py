@@ -255,6 +255,50 @@ async def test_retry_clears_the_cutover_request_and_its_window_bypass(tmp_path, 
     assert [a.actor for a in stored.approvals] == ["ana"]
 
 
+async def test_a_retry_never_writes_a_ready_migration_that_carries_the_old_request(tmp_path, store):
+    """SDD §5.1: everything a retry clears is saved in the same write as the move to ready. A
+    write that left a ready migration with the earlier attempt's request, its requester and the
+    window bypass — the last write before a crash or a store error — would let the next tick cut
+    it over outside its window without a new request."""
+    from seamless_migrate.domain.models import ForceCutover
+
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    m.cutover_requested = True
+    m.cutover_requested_by = "sari"
+    m.force_window = True
+    m.force_cutover = ForceCutover(
+        actor="rina",
+        at=h.orch.now(),
+        reason="the window closes",
+        delta_bytes=2**30,
+        estimated_downtime_s=320.0,
+    )
+    m.error = "cutover: conversion host unreachable"
+    m.phase = P.failed
+    store.put("migration", m)
+    written: list[Migration] = []
+    save = h.orch._save
+
+    async def recording_save(doc, version):
+        if doc.id == m.id:
+            written.append(doc.model_copy(deep=True))
+        return await save(doc, version)
+
+    h.orch._save = recording_save
+    again = await h.orch.retry(m.id, "bayu")
+    assert again.phase == P.ready
+    assert [w.phase for w in written] == [P.ready]  # one write
+    [ready] = written
+    assert (ready.cutover_requested, ready.cutover_requested_by, ready.force_window) == (
+        False,
+        None,
+        False,
+    )
+    assert (ready.force_cutover, ready.error) == (None, None)
+
+
 def _park_vms(h, monkeypatch):
     """Make the orchestrator's next source inventory reads wait until released."""
     entered, release = asyncio.Event(), asyncio.Event()
