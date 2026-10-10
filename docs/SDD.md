@@ -377,7 +377,9 @@ bypass never carries over to it — while approvals stay (the assessment did not
 `completed` plan (a plan completes with a rolled-back migration, which is wave-complete, §8) reopens the plan:
 under the plan's lock it becomes `running` again (event `plan.updated`, data `{"status": "running"}`), so
 the tick runs the new attempt through the usual gate (§5.4); the providers of a completed plan may be
-deleted (§12), so such a retry is refused (409) when one of them no longer exists. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
+deleted once none of its migrations holds its VM (§12), so such a retry is refused (409) when one of them no longer
+exists, and so is a rollback (409, the migration stays as it is): without its providers a rollback fails, and a
+migration whose cutover stopped its source could then be neither rolled back, retried nor cancelled. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
 no further attempt starts. Whenever the migration has a data path — it was cancelled in `precopy` or
 `syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it recorded
@@ -1271,7 +1273,7 @@ such lists again on persisted migration events.
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -1288,7 +1290,7 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
-| POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` |
+| POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
