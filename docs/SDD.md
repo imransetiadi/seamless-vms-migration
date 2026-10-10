@@ -1871,8 +1871,10 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   the report's counts — or its waves planned; a migration's action or strategy change), announced from a live
   region already on the page (a region inserted together with its text is not reliably read),
   a form error announced when it appears (not only shown next to its field), focus that never drops to the
-  page when the focused control goes away (Clear filters → the search field, a dialog's next step → its
-  heading, a deleted item → its list's heading) or while its request runs (a busy button stays focusable,
+  page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
+  heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
+  goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
+  plan's heading, while Cancel returns focus to the button) or while its request runs (a busy button stays focusable,
   `aria-busy` and `aria-disabled`, and ignores further presses), `prefers-reduced-motion` honoured,
   44×44 px minimum targets for primary actions. An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
