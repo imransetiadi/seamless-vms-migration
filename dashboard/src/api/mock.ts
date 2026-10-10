@@ -43,6 +43,7 @@ import type {
   AdvisorRecommendation,
   AdvisorSnapshot,
   AdvisorStatus,
+  ConvergedBy,
   DataSentItem,
   DecisionType,
   DestinationInventory,
@@ -69,6 +70,7 @@ import {
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
   DECISION_TYPES,
+  FORCE_REASON_MIN,
   OVERRIDE_REASON_MIN,
   PHASES,
   POLICY_MODES,
@@ -101,6 +103,8 @@ const SINGLE_SHOT: ReadonlySet<Strategy> = new Set(['cold', 'storage_handover', 
 /** orchestrator.APPROVABLE and CUTOVER_REQUESTABLE (SDD §5.4). */
 const APPROVABLE: ReadonlySet<Phase> = new Set(['pending', 'validating', 'blocked', 'ready', 'precopy', 'syncing', 'awaiting_cutover', 'failed', 'rolled_back']);
 const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+/** orchestrator.FORCEABLE (SDD §5.4, ADV-16). */
+const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 const SIMPLICITY: Record<Strategy, number> = { cold: 0, storage_handover: 1, warm: 2, vmware_cold: 0, vmware_warm: 1 };
 const MAX_EVENTS = 5000;
 
@@ -221,6 +225,33 @@ function clearRequest(m: Migration): void {
   m.cutover_requested_by = null;
   m.cutover_requested_at = null;
   m.force_window = false;
+  // a Force cutover belongs to the request too (ADV-16)
+  m.force_cutover = null;
+}
+
+/** The phase-history reason of a rule, like the API's _converged (SDD §5.3). */
+function convergedReason(m: Migration, plan: Plan, rule: ConvergedBy): string {
+  switch (rule) {
+    case 'force':
+      return `Force cutover by ${m.force_cutover?.actor ?? 'an approver'}: ${m.force_cutover?.reason ?? ''}`;
+    case 'threshold':
+      return 'converged: last pass below the threshold';
+    case 'slo':
+      return 'converged: the estimated downtime fits the SLO';
+    case 'max_passes':
+      return `max_sync_passes (${plan.max_sync_passes}) reached`;
+  }
+}
+
+/**
+ * The rule that ends the passes after `pass`, in the API's order (SDD §5.3, §5.4): a Force cutover, the
+ * threshold (not for CBT passes), the pass limit. The mock leaves out the SLO rule: its passes run in
+ * seconds, which would converge every VM after its full copy and leave the chart without deltas.
+ */
+function convergedBy(m: Migration, plan: Plan, pass: SyncPass): ConvergedBy | null {
+  if (m.force_cutover) return 'force';
+  if (m.strategy !== 'vmware_warm' && pass.bytes_changed <= plan.convergence_threshold_bytes) return 'threshold';
+  return m.sync_passes.length >= plan.max_sync_passes ? 'max_passes' : null;
 }
 
 /** The part of a policy decide() needs (SDD §14.4, §14.6). */
@@ -341,6 +372,8 @@ export class MockServer {
     status: 'ok',
     version: '0.1.0-mock',
     demo: true,
+    // the simulation's model time is its wall time: passes, downtimes and clocks share one base (ADV-16)
+    demo_speed: 1,
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
   };
@@ -570,15 +603,15 @@ export class MockServer {
       data: { ...pass },
     });
     m.checkpoint = m.phase === 'precopy' ? 'precopy' : 'sync';
-    if (m.phase === 'precopy') {
+    const rule = convergedBy(m, plan, pass);
+    if (rule) {
+      // like the API's _converge (SDD §5.3): the rule is recorded, from pre-copy too
+      m.converged_by = rule;
+      m.progress_pct = 100;
+      this.transition(m, 'awaiting_cutover', convergedReason(m, plan, rule), 'orchestrator');
+    } else if (m.phase === 'precopy') {
       this.transition(m, 'syncing', 'pass 1 complete; delta passes until convergence', 'orchestrator');
       this.startPass(m, 'delta');
-      return;
-    }
-    const converged = pass.bytes_changed <= plan.convergence_threshold_bytes || m.sync_passes.length >= plan.max_sync_passes;
-    if (converged) {
-      m.progress_pct = 100;
-      this.transition(m, 'awaiting_cutover', 'converged: last delta below the threshold', 'orchestrator');
     } else {
       this.startPass(m, 'delta');
     }
@@ -654,6 +687,8 @@ export class MockServer {
       this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { ...pass } });
     }
     m.destination_server_id = `${hex(this.rand, 8)}-${hex(this.rand, 4)}-4${hex(this.rand, 3)}-a${hex(this.rand, 3)}-${hex(this.rand, 12)}`;
+    // like the simulated executor (SDD §5.2): the seconds the source stayed stopped for the step, here at wall speed
+    if (m.downtime_started_at) m.downtime_model_s = Math.round((this.now() - Date.parse(m.downtime_started_at)) / 100) / 10;
     m.checkpoint = 'cutover';
     this.transition(m, 'verifying', 'destination server created', 'orchestrator');
   }
@@ -1000,7 +1035,7 @@ export class MockServer {
         return this.setStrategy(me, this.migration(id), input);
       }
       if (id && sub && method === 'POST') {
-        const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'finalize' ? 'approver' : 'operator';
+        const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'force-cutover' || sub === 'finalize' ? 'approver' : 'operator';
         const me = this.require(token, min, path);
         return this.migrationAction(me, this.migration(id), sub, input);
       }
@@ -1464,6 +1499,10 @@ export class MockServer {
       force_window: false,
       advisor_notes: [],
       advisor_hold: null,
+      converged_by: null,
+      force_cutover: null,
+      data_issues: [],
+      downtime_model_s: null,
       review_required: false,
       review_reason: null,
       destination_server_id: null,
@@ -1625,6 +1664,34 @@ export class MockServer {
         if (plan.status === 'running' && waiting && this.gateOpen(m, plan)) this.beginCutover(m, plan);
         break;
       }
+      case 'force-cutover': {
+        // the API's ForceCutoverRequest and force_cutover (SDD §5.4, §12, ADV-16)
+        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+        if (reason.length < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
+        if (!FORCEABLE.has(m.phase) || SINGLE_SHOT.has(m.strategy)) {
+          throw new HttpError(409, 'conflict', `a Force cutover applies to a warm migration in pre-copy or syncing, not to ${m.strategy} in ${m.phase}`);
+        }
+        const last = m.sync_passes.filter((p) => p.ended_at !== null).at(-1);
+        const at = new Date(this.now()).toISOString();
+        const force = { actor: me.name, at, reason, delta_bytes: last?.bytes_changed ?? 0, estimated_downtime_s: m.estimate?.downtime_s ?? 0 };
+        m.force_cutover = force;
+        // a request too, under maker-checker like POST …/cutover (SDD §5.4, ADV-17)
+        if (!plan.require_distinct_approver) m.approvals.push({ actor: me.name, at, comment: reason });
+        if (!m.cutover_requested_by) {
+          m.cutover_requested_by = me.name;
+          m.cutover_requested_at = at;
+        }
+        m.cutover_requested = true;
+        this.emit({
+          kind: 'migration.force_cutover',
+          plan_id: m.plan_id,
+          migration_id: m.id,
+          actor: me.name,
+          message: `cutover of ${m.vm.name} forced by ${me.name}: ${reason}`,
+          data: { reason, delta_bytes: force.delta_bytes, estimated_downtime_s: force.estimated_downtime_s },
+        });
+        break;
+      }
       case 'sync':
         if (m.phase !== 'awaiting_cutover') throw new HttpError(409, 'conflict', 'A delta sync can only be requested while awaiting cutover.');
         this.transition(m, 'syncing', 'keep-warm sync requested', me.name);
@@ -1661,6 +1728,8 @@ export class MockServer {
         }
         m.error = null;
         clearRequest(m);
+        // the next cutover reports its own (SDD §5.2)
+        m.downtime_model_s = null;
         m.progress_pct = 0;
         if (reopen) {
           plan.status = 'running';
@@ -1728,7 +1797,9 @@ export class MockServer {
     const mine = this.migrations.filter((m) => !planId || m.plan_id === planId);
     const byPhase: Partial<Record<Phase, number>> = {};
     for (const m of mine) byPhase[m.phase] = (byPhase[m.phase] ?? 0) + 1;
-    const downtimes = mine.filter((m) => m.actual_downtime_s !== null && m.downtime_ended_at !== null);
+    // like the API (SDD §5.5): verified downtimes only, and a migration whose numbers do not hold is counted, not measured
+    const done = mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized');
+    const downtimes = done.filter((m) => m.actual_downtime_s !== null && m.data_issues.length === 0);
     const values = downtimes.map((m) => m.actual_downtime_s ?? 0).sort((a, b) => a - b);
     const sloOf = (m: Migration) => this.plans.find((p) => p.id === m.plan_id)?.downtime_slo_s ?? 600;
     const byStrategy: Partial<Record<Strategy, number>> = {};
@@ -1756,6 +1827,7 @@ export class MockServer {
       p95_downtime_s: percentile(values, 95),
       max_downtime_s: values.length ? (values.at(-1) ?? null) : null,
       slo_compliance_pct: downtimes.length ? Math.round((downtimes.filter((m) => (m.actual_downtime_s ?? 0) <= sloOf(m)).length / downtimes.length) * 1000) / 10 : null,
+      data_inconsistent: done.filter((m) => m.data_issues.length > 0).length,
       downtime_by_strategy: byStrategy,
       throughput_series: series,
     };

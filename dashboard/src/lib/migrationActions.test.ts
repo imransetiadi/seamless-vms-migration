@@ -6,6 +6,7 @@ import { OWN_CUTOVER } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+const FORCED = { actor: 'rina', at: '2026-10-08T11:00:00Z', reason: 'The change window closes in 20 minutes', delta_bytes: 2 ** 30, estimated_downtime_s: 320 };
 
 function migration(phase: Phase, overrides: Partial<Migration> = {}, strategy: Strategy = 'warm'): Migration {
   return { ...base, phase, strategy, cutover_requested: false, downtime_started_at: null, downtime_ended_at: null, ...overrides };
@@ -17,8 +18,9 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   blocked: ['cancel'],
   // a warm cutover may be requested before it converged; it starts once it does (SDD §5.4, §16)
   ready: ['approve', 'cutover', 'cancel'],
-  precopy: ['approve', 'cutover', 'cancel'],
-  syncing: ['approve', 'cutover', 'cancel'],
+  // a Force cutover skips convergence while the passes run (SDD §5.4, ADV-16)
+  precopy: ['approve', 'cutover', 'force-cutover', 'cancel'],
+  syncing: ['approve', 'cutover', 'force-cutover', 'cancel'],
   awaiting_cutover: ['approve', 'cutover', 'sync', 'cancel'],
   cutover: ['rollback'],
   verifying: ['rollback'],
@@ -202,6 +204,32 @@ describe('migrationActions rules', () => {
     const cold = migration('ready', { approvals: [], estimate: { ...base.estimate!, downtime_s: 300 } }, 'cold');
     expect(nextStep(cold, plan).text).toBe('Ready. Next: an approver requests the cutover and another approves it; the source VM stops for about 5 min.');
     expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
+  });
+
+  it('offers Force cutover to an approver while the passes of a warm migration run, and says why elsewhere (SDD §5.4, ADV-16)', () => {
+    expect(migrationActions(migration('syncing'), 'approver')['force-cutover']).toEqual({ enabled: true, reason: null });
+    expect(migrationActions(migration('precopy'), 'approver')['force-cutover'].enabled).toBe(true);
+    expect(migrationActions(migration('syncing'), 'operator')['force-cutover']).toEqual({ enabled: false, reason: 'Requires the approver role.' });
+    for (const phase of ['ready', 'awaiting_cutover', 'cutover', 'completed'] as const) {
+      expect(migrationActions(migration(phase), 'approver')['force-cutover'], phase).toEqual({
+        enabled: false,
+        reason: 'A Force cutover skips convergence: it applies while pre-copy or delta passes run.',
+      });
+    }
+    expect(migrationActions(migration('ready', {}, 'cold'), 'approver')['force-cutover']).toEqual({ enabled: false, reason: 'Only a warm migration has passes to skip.' });
+    const forced = migration('syncing', { force_cutover: FORCED });
+    expect(migrationActions(forced, 'approver')['force-cutover']).toEqual({ enabled: false, reason: 'Already forced by rina: the cutover follows the running pass.' });
+  });
+
+  it('says a forced cutover follows the running pass, and who approves it (SDD §5.4, ADV-16, ADV-17)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const forced = migration('syncing', { force_cutover: FORCED, cutover_requested: true, cutover_requested_by: 'rina', cutover_requested_at: FORCED.at, approvals: [] });
+    expect(nextStep(forced, plan)).toEqual({ text: 'Cutover forced by rina. Next: another approver approves it; it starts after the running pass.', action: 'approve' });
+    const approved = { ...forced, approvals: [{ actor: 'sari', at: FORCED.at, comment: null }] };
+    expect(nextStep(approved, plan)).toEqual({ text: 'Cutover forced by rina: it starts after the running pass, once the window and a free cutover slot allow.', action: null });
+    expect(nextStep({ ...forced, phase: 'precopy' }, { ...plan, require_approval: false }).text).toBe(
+      'Cutover forced by rina: it starts after the running pass, once the window and a free cutover slot allow.',
+    );
   });
 
   it('names the next step', () => {

@@ -1,7 +1,9 @@
 import { CircleCheck, Pause, Timer } from 'lucide-react';
-import type { Timestamp } from '../api/types';
+import { Fragment, useId } from 'react';
+import { DOWNTIME_PARTS, type DowntimePart, type Estimate, type Strategy, type Timestamp } from '../api/types';
 import { cn } from '../lib/cn';
 import { SLO_ICONS, sloTone, type SloTone } from '../lib/slo';
+import { demoTimeText, speedOf } from '../lib/stats';
 import { formatClock, formatDuration, secondsBetween } from '../lib/format';
 import type { Tone } from '../lib/phase';
 import { TONE_CLASSES } from '../lib/status';
@@ -15,17 +17,65 @@ export interface DowntimeClockProps {
   actualS: number | null;
   sloS?: number | null;
   estimateS?: number | null;
+  /** The estimate's parts (SDD §4, ADV-16): listed under it, those of zero seconds left out. */
+  parts?: Estimate['downtime_parts'];
+  /** Names the copy part: the final sync of a warm strategy, the volume handover, or the copy. */
+  strategy?: Strategy;
+  /** `GET /health` `demo_speed`: in demo mode the clock runs in model time, as the passes do (SDD §16, ADV-16). */
+  demoSpeed?: number | null;
   className?: string;
+}
+
+const PART_LABELS: Record<DowntimePart, string> = {
+  shutdown_s: 'Shutdown',
+  copy_s: 'Copy',
+  conversion_s: 'Conversion',
+  create_s: 'Create',
+  boot_s: 'Boot',
+};
+
+function partLabel(part: DowntimePart, strategy: Strategy | undefined): string {
+  if (part !== 'copy_s') return PART_LABELS[part];
+  if (strategy === 'warm' || strategy === 'vmware_warm') return 'Final sync';
+  return strategy === 'storage_handover' ? 'Volume handover' : PART_LABELS.copy_s;
+}
+
+/** The actual downtime against the estimate, in words; under a second apart reads as estimated. */
+function comparisonText(actualS: number, estimateS: number): string {
+  const diff = actualS - estimateS;
+  const verdict = Math.abs(diff) < 1 ? 'as estimated' : `${formatDuration(Math.abs(diff))} ${diff > 0 ? 'over' : 'under'} the estimate`;
+  return `Actual ${formatDuration(actualS)}: ${verdict}.`;
 }
 
 /**
  * Downtime as a running clock from `downtime_started_at` (role=timer, not a live region, so it does
  * not chatter), frozen at the actual downtime once it ended, always compared with the SLO in words.
+ * In demo mode it runs in model time, the time base of the passes and the actual downtime (ADV-16);
+ * below it, the estimate's parts and, once it ended, the actual downtime against the estimate.
  */
-export function DowntimeClock({ startedAt, endedAt, actualS, sloS = null, estimateS = null, className }: DowntimeClockProps) {
+export function DowntimeClock({
+  startedAt,
+  endedAt,
+  actualS,
+  sloS = null,
+  estimateS = null,
+  parts = {},
+  strategy,
+  demoSpeed = null,
+  className,
+}: DowntimeClockProps) {
   const running = Boolean(startedAt) && !endedAt;
-  const now = useNow(1000, running);
-  const elapsed = !startedAt ? 0 : endedAt ? (actualS ?? secondsBetween(startedAt, endedAt) ?? 0) : (secondsBetween(startedAt, now) ?? 0);
+  const speed = speedOf(demoSpeed);
+  // a fast demo clock moves in smaller steps
+  const now = useNow(speed > 1 ? 250 : 1000, running);
+  const elapsed = !startedAt
+    ? 0
+    : endedAt
+      ? (actualS ?? (secondsBetween(startedAt, endedAt) ?? 0) * speed)
+      : (secondsBetween(startedAt, now) ?? 0) * speed;
+  const id = useId();
+  const shownParts = DOWNTIME_PARTS.filter((part) => (parts[part] ?? 0) > 0);
+  const demoNote = startedAt ? demoTimeText(speed) : null;
 
   let state: { text: string; tone: Tone; icon: typeof Timer };
   if (!startedAt) state = { text: 'Not started — the source VM is running', tone: 'neutral', icon: Pause };
@@ -82,6 +132,22 @@ export function DowntimeClock({ startedAt, endedAt, actualS, sloS = null, estima
       ) : (
         estimateS !== null && <p className="text-xs text-muted-foreground">Estimated {formatDuration(estimateS)}</p>
       )}
+      {shownParts.length > 0 && (
+        <dl aria-label="Estimated downtime, by part" className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-0.5 border-l-2 border-border pl-2.5 text-xs">
+          {shownParts.map((part) => (
+            <Fragment key={part}>
+              <dt id={`${id}-${part}`} className="text-muted-foreground">
+                {partLabel(part, strategy)}
+              </dt>
+              <dd aria-labelledby={`${id}-${part}`} className="num text-right text-foreground">
+                {formatDuration(parts[part])}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+      {endedAt && actualS !== null && estimateS !== null && <p className="text-xs text-foreground">{comparisonText(actualS, estimateS)}</p>}
+      {demoNote && <p className="text-xs text-muted-foreground">{demoNote}</p>}
     </div>
   );
 }

@@ -41,6 +41,7 @@ import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, f
 import { clearedByValidation } from '../lib/migrationActions';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
+import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -360,8 +361,9 @@ export default function PlanDetail() {
         <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
         <KpiTile label="Completed" value={formatNumber(s?.completed)} icon={CircleCheck} tone="success" />
         <KpiTile label="Failed" value={formatNumber(s?.failed)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
-        <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={`SLO ${formatDuration(p.downtime_slo_s)}`} />
-        <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} />
+        {/* a migration whose numbers do not hold is counted, not measured (SDD §5.5) */}
+        <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={[`SLO ${formatDuration(p.downtime_slo_s)}`, leftOutText(s)].filter(Boolean).join('; ')} />
+        <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} hint={leftOutText(s) ?? undefined} />
       </section>
 
       <div className="flex flex-col gap-4">

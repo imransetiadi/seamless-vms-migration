@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Migration, Role } from '../api/types';
+import { formatDuration } from '../lib/format';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { MigrationActions } from './MigrationActions';
 
@@ -46,6 +47,74 @@ describe('MigrationActions', () => {
     await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
+  });
+
+  it('forces the cutover of a warm migration before it converged, with a reason (SDD §5.4, ADV-16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, server, migration } = setup('db-mysql-02', 'approver');
+    expect(migration).toMatchObject({ phase: 'syncing', strategy: 'warm' });
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    expect(dialog).toHaveTextContent('The last pass (pass 2) changed 12.6 GiB.');
+    // forcing a VM whose estimate misses the SLO says so (db-mysql-02: about 24 min against 15)
+    expect(migration.estimate!.downtime_s).toBeGreaterThan(plan.downtime_slo_s);
+    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(migration.estimate!.downtime_s)}, over the SLO of ${formatDuration(plan.downtime_slo_s)}.`);
+    // maker-checker still applies (SDD §5.4, ADV-17)
+    expect(dialog).toHaveTextContent('Another approver still approves the cutover');
+    const confirm = within(dialog).getByRole('button', { name: /^force cutover$/i });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a reason of at least 10 characters.');
+    const reason = within(dialog).getByRole('textbox', { name: /reason/i });
+    await user.type(reason, 'Too short');
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await user.clear(reason);
+    await user.type(reason, 'The change window closes in 20 minutes');
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+
+    await user.click(confirm);
+    await waitFor(() =>
+      expect(server.migrations.find((m) => m.id === migration.id)?.force_cutover).toMatchObject({
+        actor: 'sari',
+        reason: 'The change window closes in 20 minutes',
+        delta_bytes: Math.round(12.6 * 2 ** 30),
+      }),
+    );
+    expect(server.events.at(-1)).toMatchObject({ kind: 'migration.force_cutover', actor: 'sari' });
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+  });
+
+  it('says the full copy is still running when a pre-copy is forced', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.id === 'mig-5d7e2b4a10')!;
+    expect(migration).toMatchObject({ phase: 'precopy', sync_passes: [] });
+    // an estimate within the SLO
+    migration.estimate = { ...migration.estimate!, downtime_s: 600 };
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^force cutover$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Force the cutover of ${migration.vm.name}?` });
+    expect(dialog).toHaveTextContent('The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile.');
+    expect(plan?.downtime_slo_s).toBe(900);
+    expect(dialog).toHaveTextContent('The estimated downtime is 10m 00s against an SLO of 15m 00s.');
+    expect(dialog).not.toHaveTextContent(/last pass/i);
+  });
+
+  it('offers Force cutover only for warm migrations, and says why it is unavailable once they converged (SDD §5.4)', () => {
+    const server = createTestServer();
+    const cold = server.migrations.find((m) => m.id === 'mig-5d7e2b4a13')!;
+    expect(cold.strategy).toBe('cold');
+    const role: Role = 'approver';
+    const { unmount } = renderWithApp(<MigrationActions migration={cold} plan={null} role={role} />, { server, token: role });
+    expect(within(screen.getByRole('group', { name: /migration actions/i })).queryByRole('button', { name: /force cutover/i })).not.toBeInTheDocument();
+    unmount();
+
+    const { button } = setup('web-01', 'approver');
+    expect(button(/^force cutover$/i)).toHaveAttribute('aria-disabled', 'true');
+    expect(button(/^force cutover$/i)).toHaveAccessibleDescription('A Force cutover skips convergence: it applies while pre-copy or delta passes run.');
   });
 
   it('requires typing the VM name before finalizing', async () => {

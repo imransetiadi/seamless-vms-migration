@@ -2,6 +2,7 @@ import {
   ArrowRight,
   BadgeCheck,
   CircleSlash,
+  FastForward,
   RefreshCw,
   RotateCcw,
   ThumbsUp,
@@ -11,9 +12,9 @@ import {
 } from 'lucide-react';
 import { useId, useState } from 'react';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
-import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
+import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatDuration } from '../lib/format';
+import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
@@ -24,6 +25,7 @@ import { TextAreaField } from './Field';
 const LABEL: Record<MigrationActionKey, string> = {
   approve: 'Approve',
   cutover: 'Cut over',
+  'force-cutover': 'Force cutover',
   sync: 'Sync now',
   rollback: 'Roll back',
   retry: 'Retry',
@@ -34,6 +36,7 @@ const LABEL: Record<MigrationActionKey, string> = {
 const ICON: Record<MigrationActionKey, LucideIcon> = {
   approve: ThumbsUp,
   cutover: Zap,
+  'force-cutover': FastForward,
   sync: RefreshCw,
   rollback: Undo2,
   retry: RotateCcw,
@@ -44,6 +47,7 @@ const ICON: Record<MigrationActionKey, LucideIcon> = {
 const DONE: Record<MigrationActionKey, string> = {
   approve: 'approved',
   cutover: 'cutover requested',
+  'force-cutover': 'cutover forced',
   sync: 'delta sync requested',
   rollback: 'rollback started',
   retry: 'retry requested',
@@ -67,9 +71,10 @@ export interface MigrationActionsProps {
 }
 
 /**
- * Approve / Cut over / Sync / Retry / Roll back / Cancel / Finalize, enabled only for a valid phase
- * and sufficient role (unavailable ones stay focusable and say why). Every action confirms first;
- * destructive ones use the danger tone and Finalize requires typing the VM name.
+ * Approve / Cut over / Force cutover / Sync / Retry / Roll back / Cancel / Finalize, enabled only for a
+ * valid phase and sufficient role (unavailable ones stay focusable and say why). Every action confirms
+ * first; destructive ones use the danger tone and Finalize requires typing the VM name. Force cutover
+ * belongs to warm strategies alone: a single-shot one has no passes to skip (SDD §5.4).
  */
 export function MigrationActions({ migration: m, plan, role, planUnavailable = false }: MigrationActionsProps) {
   // the cutover's requester does not approve it (maker-checker, SDD §5.4)
@@ -118,6 +123,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
   );
   const estimate = m.estimate ? formatDuration(m.estimate.downtime_s) : 'unknown';
+  // the API lists only passes that ended (SDD §4.2): the last one is what a Force cutover records
+  const lastPass = m.sync_passes.filter((p) => p.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
   const closedWindow = !windowOpen(plan);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
@@ -134,7 +141,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         {step.text}
       </p>
       <div role="group" aria-label="Migration actions" className="flex flex-wrap gap-2">
-        {MIGRATION_ACTION_ORDER.map((key) => {
+        {MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy)).map((key) => {
           const primary = key === step.action && availability[key].enabled;
           const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
           return (
@@ -208,6 +215,40 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           </label>
         )}
         {commentField}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        {...common}
+        open={open === 'force-cutover'}
+        tone="danger"
+        title={`Force the cutover of ${m.vm.name}?`}
+        description={
+          <>
+            {lastPass
+              ? `The cutover skips the convergence rule: the running pass finishes, then the source VM stops and the final sync copies what changed. The last pass (pass ${lastPass.number}) changed ${formatBytes(lastPass.bytes_changed)}. `
+              : 'The cutover skips the convergence rule. The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile. '}
+            The estimated downtime is {estimate}
+            {/* forcing skips the passes that would shorten it: say when it misses the SLO already */}
+            {slo ? (m.estimate && plan && m.estimate.downtime_s > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
+            {fourEyes
+              ? 'Another approver still approves the cutover; the window and a free cutover slot still apply.'
+              : 'This also records your approval; the window and a free cutover slot still apply.'}
+          </>
+        }
+        confirmLabel="Force cutover"
+        canConfirm={reason.trim().length >= FORCE_REASON_MIN}
+        confirmReason={`Enter a reason of at least ${FORCE_REASON_MIN} characters.`}
+        onConfirm={() => submit({ action: 'force-cutover', body: { reason: reason.trim() } })}
+      >
+        <TextAreaField
+          label="Reason"
+          required
+          rows={2}
+          maxLength={ACTION_TEXT_MAX}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          hint={`At least ${FORCE_REASON_MIN} characters; recorded in the audit trail.`}
+        />
       </ConfirmDialog>
 
       <ConfirmDialog

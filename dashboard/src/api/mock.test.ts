@@ -18,6 +18,7 @@ import {
   type Plan,
   type Provider,
   type RecommendationPage,
+  type Stats,
   type VMRef,
 } from './types';
 
@@ -1275,5 +1276,134 @@ describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
     for (const a of server.migrations.flatMap((m) => m.approvals)) expect((a.comment ?? '').length, a.actor).toBeGreaterThanOrEqual(15);
     // the fixtures' validations ran as the operator: the admin persona may decide what waits
     expect(new Set(server.recommendations.filter((r) => !r.legacy).map((r) => r.requested_by))).toEqual(new Set(['bayu']));
+  });
+});
+
+describe('mock convergence, Force cutover and data checks, like the API (SDD §5.3–§5.5, ADV-16)', () => {
+  const GiB = 2 ** 30;
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const REASON = 'The change window closes in 20 minutes';
+
+  it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {
+    const { client } = setup('viewer');
+    expect(await client.get<{ demo: boolean; demo_speed: number | null }>('/health')).toMatchObject({ demo: true, demo_speed: 1 });
+  });
+
+  it('records a Force cutover with the last pass and the estimate, and a request that is no approval', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    expect([m.phase, m.strategy, m.converged_by, m.force_cutover]).toEqual(['syncing', 'warm', null, null]);
+    const forced = await as(server, 'approver').post<Migration>(`/migrations/${m.id}/force-cutover`, { reason: `  ${REASON}  ` });
+    expect(forced.force_cutover).toEqual({
+      actor: 'sari',
+      at: new Date(NOW).toISOString(),
+      reason: REASON,
+      delta_bytes: Math.round(12.6 * GiB),
+      estimated_downtime_s: m.estimate!.downtime_s,
+    });
+    // maker-checker (SDD §5.4, ADV-17): the forcer requested the cutover; another approver approves it
+    expect([forced.cutover_requested, forced.cutover_requested_by, forced.approvals]).toEqual([true, 'sari', []]);
+    expect(server.events.at(-1)).toMatchObject({
+      kind: 'migration.force_cutover',
+      actor: 'sari',
+      migration_id: m.id,
+      data: { reason: REASON, delta_bytes: Math.round(12.6 * GiB), estimated_downtime_s: m.estimate!.downtime_s },
+    });
+    // the running pass finishes, then the migration waits for the gate with the rule recorded
+    for (let i = 0; i < 200 && m.phase === 'syncing'; i += 1) server.tick();
+    expect([m.phase, m.converged_by]).toEqual(['awaiting_cutover', 'force']);
+    expect(m.sync_passes.at(-1)!.kind).toBe('delta');
+  });
+
+  it('records a Force cutover as an approval too when the plan needs no distinct approver', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    server.plans.find((p) => p.id === m.plan_id)!.require_distinct_approver = false;
+    const forced = await as(server, 'approver').post<Migration>(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    expect(forced.approvals).toEqual([{ actor: 'sari', at: new Date(NOW).toISOString(), comment: REASON }]);
+  });
+
+  it('refuses what the API refuses: a short reason, a converged or single-shot migration, an operator', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const syncing = 'mig-5d7e2b4a11';
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: ' too short ' })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: 'x'.repeat(2001) })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'operator').post(`/migrations/${syncing}/force-cutover`, { reason: REASON })).rejects.toMatchObject({ status: 403 });
+    for (const id of ['mig-5d7e2b4a12', 'mig-5d7e2b4a13']) {
+      await expect(as(server, 'approver').post(`/migrations/${id}/force-cutover`, { reason: REASON })).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringMatching(/^a Force cutover applies to a warm migration in pre-copy or syncing, not to (warm in awaiting_cutover|cold in ready)$/),
+      });
+    }
+    expect(server.migrations.find((x) => x.id === syncing)!.force_cutover).toBeNull();
+  });
+
+  it('records the rule that ended the passes: the threshold, or the pass limit (SDD §5.3)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    for (let i = 0; i < 400 && m.phase === 'syncing'; i += 1) server.tick();
+    expect(m.phase).toBe('awaiting_cutover');
+    const last = m.sync_passes.at(-1)!;
+    expect(m.converged_by).toBe(last.bytes_changed <= plan.convergence_threshold_bytes ? 'threshold' : 'max_passes');
+
+    const limited = new MockServer({ now: () => NOW, seed: 1 });
+    const other = limited.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    limited.plans.find((p) => p.id === other.plan_id)!.convergence_threshold_bytes = 0;
+    for (let i = 0; i < 400 && other.phase === 'syncing'; i += 1) limited.tick();
+    expect([other.phase, other.converged_by]).toEqual(['awaiting_cutover', 'max_passes']);
+  });
+
+  it('never ends CBT passes on the threshold: the pass limit decides in the mock, which has no SLO rule (SDD §5.4)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b50')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    expect([m.strategy, m.phase]).toEqual(['vmware_warm', 'syncing']);
+    for (let i = 0; i < 600 && m.phase === 'syncing'; i += 1) server.tick();
+    expect([m.phase, m.converged_by]).toEqual(['awaiting_cutover', 'max_passes']);
+    // a pass below the threshold did not end them
+    expect(m.sync_passes.slice(0, -1).some((p) => p.kind === 'delta' && p.bytes_changed <= plan.convergence_threshold_bytes)).toBe(true);
+  });
+
+  it('clears a Force cutover with the request on re-validation and a strategy change, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    await as(server, 'approver').post(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    // the API clears it with the request it belongs to (SDD §5.4): a strategy change is the operator's way
+    m.phase = 'ready';
+    await as(server, 'operator').put(`/migrations/${m.id}/strategy`, { strategy: 'cold' });
+    expect([m.force_cutover, m.cutover_requested]).toEqual([null, false]);
+  });
+
+  it('leaves migrations whose numbers do not hold out of the downtime figures and counts them (SDD §5.5)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const client = as(server, 'viewer');
+    const before = await client.get<Stats>('/stats?plan_id=plan-4f2a9c1e');
+    expect(before.data_inconsistent).toBe(0);
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;
+    m.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];
+    m.actual_downtime_s = 99_999;
+    const after = await client.get<Stats>('/stats?plan_id=plan-4f2a9c1e');
+    expect(after.data_inconsistent).toBe(1);
+    expect(after.max_downtime_s ?? 0).toBeLessThan(99_999);
+    // still counted as completed: only its downtime is left out
+    expect(after.completed).toBe(before.completed);
+  });
+
+  it('records the model seconds of a cutover, at wall speed, and counts the downtime from them like the API (SDD §5.2)', () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e23')!;
+    expect(m.phase).toBe('cutover');
+    for (let i = 0; i < 200 && m.phase !== 'completed'; i += 1) {
+      clock += 1000;
+      server.tick();
+    }
+    expect(m.phase).toBe('completed');
+    expect(m.downtime_model_s).not.toBeNull();
+    expect(m.actual_downtime_s!).toBeGreaterThanOrEqual(m.downtime_model_s!);
+    expect(m.data_issues).toEqual([]);
   });
 });

@@ -222,6 +222,15 @@ describe('PlanDetail', () => {
     expect(m.approvals).toHaveLength(1);
   });
 
+  it('says how many completed migrations its downtime figures leave out (SDD §5.5, ADV-16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;
+    m.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];
+    renderWithApp(<PlanDetail />, { route: `/plans/${m.plan_id}`, path: '/plans/:planId', token: 'viewer', server });
+    const metrics = await screen.findByRole('region', { name: /plan metrics/i });
+    await waitFor(() => expect(within(metrics).getByRole('group', { name: 'Avg downtime' })).toHaveTextContent('1 left out: data inconsistent'));
+  });
+
   it('shows its KPIs as unknown, not zero, when the statistics cannot be loaded (SDD §16)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

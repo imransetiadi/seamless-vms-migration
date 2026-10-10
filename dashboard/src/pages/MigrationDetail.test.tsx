@@ -336,4 +336,54 @@ describe('MigrationDetail', () => {
       expect(button).toHaveAccessibleDescription('You requested this decision. Another approver must decide it.');
     }
   });
+
+  it('badges a migration whose numbers do not hold, and lists what the invariants found (SDD §5.5, ADV-16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;
+    m.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync', 'BYTES_MISMATCH: 1 bytes transferred, the passes add up to 2'];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByText('Data inconsistent')).toBeInTheDocument();
+    const notice = screen.getByRole('note', { name: 'Data inconsistent' });
+    expect(notice).toHaveTextContent('The numbers of this migration do not hold together, so the downtime statistics leave it out.');
+    const issues = within(notice).getAllByRole('listitem');
+    expect(issues.map((li) => li.textContent)).toEqual([
+      '6 s of downtime around a 258 s final sync (DOWNTIME_BELOW_FINAL_SYNC)',
+      '1 bytes transferred, the passes add up to 2 (BYTES_MISMATCH)',
+    ]);
+  });
+
+  it('shows no badge while the numbers hold', async () => {
+    renderMigration('mig-3c1a0f9e21');
+    await screen.findByRole('region', { name: /^downtime$/i });
+    expect(screen.queryByText('Data inconsistent')).not.toBeInTheDocument();
+  });
+
+  it("runs the downtime clock in model time in demo mode, from GET /health's demo_speed (SDD §16, ADV-16)", async () => {
+    const server = createTestServer();
+    server.health = { ...server.health, demo_speed: 60 };
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e23')!;
+    expect(m.phase).toBe('cutover');
+    // the page's clock reads the browser's time, not the mock's
+    m.downtime_started_at = new Date(Date.now() - 95_000).toISOString();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const panel = await screen.findByRole('region', { name: /^downtime$/i });
+    // stopped about 95 s ago: about 95 minutes of model time
+    await waitFor(() => expect(within(panel).getByRole('timer')).toHaveTextContent(/^1:3[5-9]:\d\d$/));
+    expect(panel).toHaveTextContent('Demo time: 60× faster than real time');
+  });
+
+  it("lists the estimate's parts, the final sync among them, and compares the actual downtime (SDD §16, ADV-16)", async () => {
+    renderMigration('mig-3c1a0f9e21');
+    const panel = await screen.findByRole('region', { name: /^downtime$/i });
+    expect(within(panel).getByRole('definition', { name: 'Final sync' })).toBeInTheDocument();
+    expect(within(panel).getByRole('definition', { name: 'Boot' })).toHaveTextContent('2m 00s');
+    expect(panel).toHaveTextContent(/Actual 3m 32s: .* (under|over) the estimate\./);
+  });
+
+  it('names the rule that allowed the cutover on the convergence chart (SDD §5.3, ADV-16)', async () => {
+    renderMigration('mig-3c1a0f9e21');
+    const chart = await screen.findByRole('region', { name: /sync-pass convergence/i });
+    await waitFor(() => expect(chart).toHaveTextContent('Converged on the threshold: pass 2 changed less than 1.0 GiB.'));
+    expect(chart).toHaveTextContent('Final sync (pass 3), after the source stopped:');
+  });
 });

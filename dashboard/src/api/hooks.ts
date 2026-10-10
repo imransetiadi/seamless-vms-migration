@@ -25,6 +25,7 @@ import type {
   Event,
   EventListQuery,
   FinalizeRequest,
+  ForceCutoverRequest,
   Health,
   Me,
   Migration,
@@ -108,6 +109,12 @@ export function useHealth() {
     refetchInterval: 60_000,
     retry: false,
   });
+}
+
+/** Demo mode's time compression from `GET /health` (SDD §7.4): running downtime clocks show model time (§16, ADV-16). */
+export function useDemoSpeed(): number | null {
+  const health = useHealth();
+  return health.data?.demo ? health.data.demo_speed : null;
 }
 
 export function useProviders() {
@@ -453,6 +460,7 @@ export function usePlanAction(planId: string) {
 export type MigrationActionRequest =
   | { action: 'approve'; body?: ApproveRequest }
   | { action: 'cutover'; body?: CutoverRequest }
+  | { action: 'force-cutover'; body: ForceCutoverRequest }
   | { action: 'sync' }
   | { action: 'rollback'; body: RollbackRequest }
   | { action: 'retry' }

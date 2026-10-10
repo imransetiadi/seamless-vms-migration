@@ -329,7 +329,13 @@ export interface Estimate {
   total_s: number;
   final_delta_bytes: number;
   meets_slo: boolean;
+  /** The downtime's parts (SDD §4, ADV-16); empty in an estimate written before them. */
+  downtime_parts: Partial<Record<DowntimePart, number>>;
 }
+
+/** The parts of a downtime estimate, in display order (SDD §4, §9.1, ADV-16): they add up to `downtime_s`. */
+export const DOWNTIME_PARTS = ['shutdown_s', 'copy_s', 'conversion_s', 'create_s', 'boot_s'] as const;
+export type DowntimePart = (typeof DOWNTIME_PARTS)[number];
 
 export interface AdvisorNote {
   kind: AdvisorNoteKind;
@@ -462,6 +468,20 @@ export interface Approval {
   comment: string | null;
 }
 
+/** A cutover forced before convergence (SDD §5.4, ADV-16). */
+export interface ForceCutover {
+  actor: string;
+  at: Timestamp;
+  reason: string;
+  /** The last pass's `bytes_changed` when the cutover was forced. */
+  delta_bytes: number;
+  estimated_downtime_s: number;
+}
+
+/** The rule that ended the passes (SDD §5.3); `force` for a Force cutover (§5.4). */
+export const CONVERGENCE_RULES = ['threshold', 'slo', 'max_passes', 'force'] as const;
+export type ConvergedBy = (typeof CONVERGENCE_RULES)[number];
+
 export interface PhaseChange {
   from_phase: Phase | null;
   to_phase: Phase;
@@ -505,6 +525,13 @@ export interface Migration {
   advisor_notes: AdvisorNote[];
   /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
   advisor_hold: string | null;
+  /** The rule that ended the passes (SDD §5.3); null before convergence and in data written before ADV-16. */
+  converged_by: ConvergedBy | null;
+  force_cutover: ForceCutover | null;
+  /** What the invariants found when it completed, one "CODE: text" each (SDD §5.5). */
+  data_issues: string[];
+  /** Demo: the model seconds a simulated cutover kept the source stopped (SDD §5.2). */
+  downtime_model_s: number | null;
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;
@@ -649,6 +676,8 @@ export interface Health {
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
+  /** Demo mode's time compression (SDD §7.4): a wall second is this many model seconds; null outside demo mode. */
+  demo_speed: number | null;
   db: 'ok' | 'error';
   orchestrator: OrchestratorHealth;
 }
@@ -716,6 +745,14 @@ export interface CutoverRequest {
   comment?: string;
 }
 
+/** POST /migrations/{id}/force-cutover (SDD §5.4, §12). */
+export interface ForceCutoverRequest {
+  reason: string;
+}
+
+/** The shortest reason a Force cutover accepts (SDD §12). */
+export const FORCE_REASON_MIN = 10;
+
 export interface RollbackRequest {
   reason: string;
 }
@@ -763,6 +800,8 @@ export interface Stats {
   p95_downtime_s: number | null;
   max_downtime_s: number | null;
   slo_compliance_pct: number | null;
+  /** Completed migrations whose numbers do not hold, left out of the downtime figures (SDD §5.5). */
+  data_inconsistent: number;
   downtime_by_strategy: Partial<Record<Strategy, number>>;
   /** Last 60 one-minute buckets. */
   throughput_series: ThroughputPoint[];
@@ -839,7 +878,7 @@ export interface RecommendationPage {
 }
 
 /** Migration actions exposed as `POST /migrations/{id}/<action>` (SDD §12). */
-export const MIGRATION_ACTIONS = ['approve', 'cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize'] as const;
+export const MIGRATION_ACTIONS = ['approve', 'cutover', 'force-cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize'] as const;
 export type MigrationAction = (typeof MIGRATION_ACTIONS)[number];
 
 export function isDestinationInventory(inventory: ProviderInventory): inventory is DestinationInventory {

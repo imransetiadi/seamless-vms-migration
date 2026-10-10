@@ -9,6 +9,7 @@ import type {
   AdvisorPolicy,
   AdvisorRecommendation,
   AdvisorSnapshot,
+  ConvergedBy,
   DestinationInventory,
   Disk,
   Estimate,
@@ -598,12 +599,14 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
   const maxPasses = plan.max_sync_passes;
   let precopy = 0;
   let passes = 0;
-  let downtime = 0;
   let finalDelta = 0;
 
+  // the copy, or final sync, and the conversion: the parts of the downtime besides the fixed steps (SDD §9.1)
+  let copy = 0;
+  let conversion = 0;
   switch (strategy) {
     case 'cold':
-      downtime = PARAMS.shutdown_s + PARAMS.snapshot_s + U / L + PARAMS.create_s + PARAMS.boot_s;
+      copy = PARAMS.snapshot_s + U / L;
       break;
     case 'warm': {
       let t = PARAMS.snapshot_s + Math.max(U / L, D / S);
@@ -617,14 +620,15 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
         delta = Math.min(D, c * t);
       }
       finalDelta = delta;
-      downtime = PARAMS.shutdown_s + PARAMS.snapshot_s + Math.max(D / S, finalDelta / L) + PARAMS.create_s + PARAMS.boot_s;
+      copy = PARAMS.snapshot_s + Math.max(D / S, finalDelta / L);
       break;
     }
     case 'storage_handover':
-      downtime = PARAMS.shutdown_s + V * PARAMS.handover_per_volume_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = V * PARAMS.handover_per_volume_s;
       break;
     case 'vmware_cold':
-      downtime = PARAMS.shutdown_s + U / L + PARAMS.v2v_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = U / L;
+      conversion = PARAMS.v2v_s;
       break;
     case 'vmware_warm': {
       let t = U / L;
@@ -638,21 +642,32 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
         delta = Math.min(D, c * t);
       }
       finalDelta = delta;
-      downtime = PARAMS.shutdown_s + finalDelta / L + PARAMS.v2v_inplace_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = finalDelta / L;
+      conversion = PARAMS.v2v_inplace_s;
       break;
     }
   }
   const round = (n: number) => Math.round(n * 10) / 10;
+  // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
+  const downtime_parts = {
+    shutdown_s: PARAMS.shutdown_s,
+    copy_s: round(copy),
+    conversion_s: round(conversion),
+    create_s: PARAMS.create_s,
+    boot_s: PARAMS.boot_s,
+  };
+  const downtime = round(Object.values(downtime_parts).reduce((a, b) => a + b, 0));
   return {
     strategy,
     eligible: reasons.length === 0,
     reasons,
     precopy_s: round(precopy),
     passes,
-    downtime_s: round(downtime),
+    downtime_s: downtime,
     total_s: round(precopy + downtime),
     final_delta_bytes: Math.round(finalDelta),
     meets_slo: downtime <= plan.downtime_slo_s,
+    downtime_parts,
   };
 }
 
@@ -1025,6 +1040,8 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-d4e6f8a090', vm: 'os-0e65', strategy: 'cold', phase: 'finalized', wave: 'wave-1', enteredAgo: 7 * D, progress: 100,
         // the Advisor spec's example (ADV-01): Jev's warm at 57% is under the 60% threshold, so cold is kept
         rec: { option: 'warm', confidence: 0.57, status: 'below_threshold', deterministic: 'cold' },
+        // a cold copy is recorded as a full pass while the source is stopped, as the API's executors record it
+        passes: [{ kind: 'full', changedGiB: 6, durationS: 49 }],
         downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200, comment: 'Approved in CAB-2217; the owner signed off the downtime' }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
       },
       {
@@ -1160,9 +1177,12 @@ interface ScheduledPass {
  */
 function schedulePasses(m: MigrationSpec, enteredAt: number, downtimeStartedAt: number | null): ScheduledPass[] {
   const specs = m.passes ?? [];
-  const open = specs.find((p) => p.open && p.kind !== 'final');
-  const final = specs.find((p) => p.kind === 'final');
-  const done = specs.filter((p) => !p.open && p.kind !== 'final');
+  // the pass a cutover runs with the source stopped: a warm migration's final sync, a cold one's copy (SDD §4.2)
+  const singleShot = m.strategy === 'cold' || m.strategy === 'vmware_cold';
+  const atCutover = (p: (typeof specs)[number]) => p.kind === 'final' || (singleShot && p.kind === 'full');
+  const open = specs.find((p) => p.open && !atCutover(p));
+  const final = specs.find(atCutover);
+  const done = specs.filter((p) => !p.open && !atCutover(p));
   let cursor: number;
   if (open) cursor = enteredAt - 60_000;
   else if (m.phase === 'awaiting_cutover') cursor = enteredAt - 30_000;
@@ -1181,6 +1201,22 @@ function schedulePasses(m: MigrationSpec, enteredAt: number, downtimeStartedAt: 
     scheduled.push({ spec: final, start, end: final.open ? null : start + final.durationS * 1000 });
   }
   return scheduled;
+}
+
+/** Phases a warm migration reaches only once its passes converged (SDD §5.3). */
+const PAST_CONVERGENCE: ReadonlySet<Phase> = new Set(['awaiting_cutover', 'cutover', 'verifying', 'completed', 'finalized']);
+
+/**
+ * The rule that ended a warm fixture's passes, in the API's order (SDD §5.3): the threshold (not for
+ * CBT passes), an estimate within the SLO, the pass limit — so the record and its numbers agree (§5.5).
+ */
+function fixtureConvergedBy(strategy: Strategy, phase: Phase, passes: SyncPass[], estimate: Estimate | null, plan: Plan): ConvergedBy | null {
+  if ((strategy !== 'warm' && strategy !== 'vmware_warm') || !PAST_CONVERGENCE.has(phase)) return null;
+  const last = passes.filter((p) => p.kind !== 'final' && p.ended_at !== null).at(-1);
+  if (!last) return null;
+  if (strategy !== 'vmware_warm' && last.bytes_changed <= plan.convergence_threshold_bytes) return 'threshold';
+  if (estimate && estimate.downtime_s <= plan.downtime_slo_s) return 'slo';
+  return last.number >= plan.max_sync_passes ? 'max_passes' : null;
 }
 
 export interface Fixtures {
@@ -1332,6 +1368,10 @@ export function buildFixtures(now: number): Fixtures {
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
         advisor_hold: null,
+        converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
+        force_cutover: null,
+        data_issues: [],
+        downtime_model_s: null,
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,

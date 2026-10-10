@@ -1,4 +1,4 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Migration } from '../api/types';
@@ -16,6 +16,21 @@ describe('Overview page (mock data)', () => {
     const failed = server.migrations.filter((m) => m.phase === 'failed').length;
     expect(screen.getByRole('group', { name: 'Failed' })).toHaveTextContent(String(failed));
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
+  });
+
+  it('says how many completed migrations the downtime figures leave out, and why (SDD §5.5, ADV-16)', async () => {
+    const server = createTestServer();
+    server.migrations.find((m) => m.id === 'mig-3c1a0f9e21')!.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];
+    renderWithApp(<Overview />, { server });
+    const average = await screen.findByRole('group', { name: 'Average downtime' });
+    expect(average).toHaveTextContent('1 left out: data inconsistent');
+    expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('1 left out: data inconsistent');
+  });
+
+  it('says nothing is left out while every completed migration holds together', async () => {
+    renderWithApp(<Overview />);
+    const average = await screen.findByRole('group', { name: 'Average downtime' });
+    expect(average).not.toHaveTextContent(/left out/);
   });
 
   it('puts the VMs that are down right now first, with their clock and SLO budget', async () => {
@@ -55,6 +70,19 @@ describe('Overview page (mock data)', () => {
       expect(line).not.toHaveClass(TONE_CLASSES.warning.text);
       expect(line.querySelector('svg')).toBeNull();
     }
+  });
+
+  it('runs the Downtime now clocks in model time in demo mode, as the migration page does (SDD §16, ADV-16)', async () => {
+    const server = createTestServer();
+    server.health = { ...server.health, demo_speed: 60 };
+    const web03 = server.migrations.find((m) => m.vm.name === 'web-03')!;
+    web03.downtime_started_at = new Date(Date.now() - 5_000).toISOString();
+    renderWithApp(<Overview />, { server });
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    const item = (await within(down).findByRole('link', { name: 'web-03' })).closest('li')!;
+    // about 5 s of wall time: about 5 minutes of model time
+    await waitFor(() => expect(item).toHaveTextContent(/\b[5-6]:\d{2}of /));
+    expect(down).toHaveTextContent('Demo time: 60× faster than real time.');
   });
 
   it('turns the clock red and says by how much once a cutover runs over its SLO', async () => {

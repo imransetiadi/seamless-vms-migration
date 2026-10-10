@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useMigrations, usePlans, useStats } from '../api/hooks';
+import { useDemoSpeed, useMigrations, usePlans, useStats } from '../api/hooks';
 import type { Migration, Phase, Plan } from '../api/types';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -28,6 +28,7 @@ import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
 import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
+import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
@@ -68,14 +69,17 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
     .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
   const waiting = migrations.filter((m) => m.phase === 'awaiting_cutover').length;
-  const now = useNow(1000, active.length > 0);
+  // in demo mode the clocks run in model time, as on the migration page (SDD §16, ADV-16)
+  const speed = speedOf(useDemoSpeed());
+  const now = useNow(speed > 1 ? 250 : 1000, active.length > 0);
+  const demoNote = demoTimeText(speed);
 
   return (
     <Panel
       title="Downtime now"
       description={
         active.length
-          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.`
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.${demoNote ? ` ${demoNote}.` : ''}`
           : 'VMs whose source is stopped appear here with a running clock.'
       }
     >
@@ -93,7 +97,7 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
           {active.map((m) => {
             const plan = plans.get(m.plan_id);
             const slo = plan?.downtime_slo_s ?? null;
-            const elapsed = secondsBetween(m.downtime_started_at, now) ?? 0;
+            const elapsed = (secondsBetween(m.downtime_started_at, now) ?? 0) * speed;
             // the migration page's rule, with an icon beside the warning and the breach (SDD §16)
             const tone = slo ? sloTone(elapsed, slo) : 'success';
             const ToneIcon = SLO_ICONS[tone];
@@ -310,8 +314,12 @@ export default function Overview() {
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
             { label: 'Completed', value: formatNumber(s.completed), hint: s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
-            { label: 'Average downtime', value: formatDuration(s.avg_downtime_s), hint: `p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}` },
-            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: 'verified cutovers within their plan SLO' },
+            {
+              label: 'Average downtime',
+              value: formatDuration(s.avg_downtime_s),
+              hint: [`p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}`, leftOutText(s)].filter(Boolean).join('; '),
+            },
+            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: ['verified cutovers within their plan SLO', leftOutText(s)].filter(Boolean).join('; ') },
           ]}
         />
       )}

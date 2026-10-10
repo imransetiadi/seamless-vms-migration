@@ -2,7 +2,7 @@ import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, S
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useEventTail, useMigration, usePlan, useRecommendations, useSetStrategy } from '../api/hooks';
+import { useDemoSpeed, useEventTail, useMigration, usePlan, useRecommendations, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
 import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Role, type Strategy, type VerificationConfig } from '../api/types';
@@ -22,7 +22,7 @@ import { ProgressBar } from '../components/ProgressBar';
 import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
-import { PhaseBadge } from '../components/StatusBadge';
+import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
 import { decidable, nonStrategyNotes } from '../lib/advisor';
@@ -59,6 +59,12 @@ function useProgressAnnouncement(m: Migration | undefined): string {
     }
   }, [id, phase, pct, name]);
   return text;
+}
+
+/** "CODE: text", as `check_invariants` writes an issue (SDD §5.5). */
+function splitIssue(issue: string): { code: string | null; text: string } {
+  const match = /^([A-Z][A-Z_]+): (.*)$/s.exec(issue);
+  return match ? { code: match[1] ?? null, text: match[2] ?? issue } : { code: null, text: issue };
 }
 
 /** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
@@ -106,6 +112,29 @@ function Alerts({ m }: { m: Migration }) {
               See the recommendation
             </Link>
           </p>
+        </div>
+      )}
+      {m.data_issues.length > 0 && (
+        // the invariants a completed migration broke (SDD §5.5): its numbers are counted, not measured
+        <div role="note" aria-label="Data inconsistent" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <div className="min-w-0 text-foreground">
+            <p>
+              <strong className="font-semibold">Data inconsistent.</strong> The numbers of this migration do not hold together, so the downtime
+              statistics leave it out.
+            </p>
+            <ul className="mt-1 list-disc pl-5">
+              {m.data_issues.map((issue) => {
+                const { code, text } = splitIssue(issue);
+                return (
+                  <li key={issue} className="wrap-break-word">
+                    {text}
+                    {code && <code className="text-xs text-muted-foreground"> ({code})</code>}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         </div>
       )}
       {m.review_required && (
@@ -511,6 +540,7 @@ export default function MigrationDetail() {
   const plan = usePlan(m?.plan_id);
   const history = useEventTail({ migration_id: migrationId }, 300);
   const role = useRole();
+  const demoSpeed = useDemoSpeed();
   const [liveEvents, setLiveEvents] = useState<Event[]>([]);
   usePageTitle(m ? `${m.vm.name} · ${phaseMeta(m.phase).label}` : 'Migration');
   const announcement = useProgressAnnouncement(m);
@@ -555,6 +585,9 @@ export default function MigrationDetail() {
         meta={
           <>
             <PhaseBadge phase={m.phase} size="md" />
+            {m.data_issues.length > 0 && (
+              <StatusBadge tone="warning" icon={TriangleAlert} label="Data inconsistent" title="The numbers of this migration do not hold together (SDD §5.5)" size="md" />
+            )}
             <span className="text-sm text-foreground">{strategyLabel(m.strategy)}</span>
             {wave && <span className="text-sm text-muted-foreground">Wave {wave.order}: {wave.name}</span>}
             <code className="text-xs text-muted-foreground">{m.id}</code>
@@ -588,6 +621,9 @@ export default function MigrationDetail() {
               actualS={m.actual_downtime_s}
               sloS={p?.downtime_slo_s ?? null}
               estimateS={m.estimate?.downtime_s ?? null}
+              parts={m.estimate?.downtime_parts}
+              strategy={m.strategy}
+              demoSpeed={demoSpeed}
             />
           </Panel>
           <Panel
@@ -599,13 +635,18 @@ export default function MigrationDetail() {
         </div>
 
         {warm && (
-          <Panel title="Sync-pass convergence" description="Bytes changed per pass; cutover becomes possible once a delta is below the threshold">
+          <Panel title="Sync-pass convergence" description="Bytes changed per pass, the final sync after the source stopped, and the rules that allow the cutover">
             <SyncPassChart
               passes={m.sync_passes}
               thresholdBytes={p?.convergence_threshold_bytes ?? null}
               maxPasses={p?.max_sync_passes ?? null}
               droppedBytes={m.sync_bytes_dropped}
               running={runningStep(m)?.pass ?? null}
+              strategy={m.strategy}
+              sloS={p?.downtime_slo_s ?? null}
+              convergedBy={m.converged_by}
+              estimateS={m.estimate?.downtime_s ?? null}
+              force={m.force_cutover}
             />
           </Panel>
         )}
