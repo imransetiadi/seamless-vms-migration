@@ -3582,11 +3582,15 @@ async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_p
         )
         == 1
     )
-    # stopped again: the alert clears, and nothing more is reported
+    # stopped again: the alert clears and migration.source_stopped records it, once; the stopped
+    # source of the first check, never flagged, reported nothing
     h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
     assert (await watch()).source_running_at is None
-    kinds = [e.kind for e in store.events(since_seq=0, limit=100000)]
-    assert kinds.count("migration.source_running") == 1
+    assert (await watch()).source_running_at is None
+    events = store.events(since_seq=0, limit=100000)
+    assert [e.kind for e in events].count("migration.source_running") == 1
+    stopped = [(e.migration_id, e.data) for e in events if e.kind == "migration.source_stopped"]
+    assert stopped == [(m.id, {"power_state": "stopped"})]
 
 
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):

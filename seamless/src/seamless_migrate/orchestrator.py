@@ -1311,7 +1311,8 @@ class Orchestrator:
         raise NotFound("source VM", source_id)
 
     async def _watch_sources(self) -> None:
-        """A completed migration's source VM seen running again is flagged once (SDD §8.1)."""
+        """A completed migration's source VM seen running again is flagged once, and cleared once
+        seen stopped again; each change is an event (SDD §8.1)."""
         now = self._now()
         scale = max(self.settings.demo_speed, 1.0) if self.settings.demo else 1.0
         interval = timedelta(seconds=self.settings.source_watch_s / scale)
@@ -1346,6 +1347,13 @@ class Orchestrator:
                     "migration.source_running",
                     f"{cur.vm.name}: the source VM runs again - its data diverges from RHOSO; "
                     "stop it, or roll back",
+                    migration=cur,
+                    data={"power_state": str(vm.power_state)},
+                )
+            else:
+                await self._emit(
+                    "migration.source_stopped",
+                    f"{cur.vm.name}: the source VM is stopped again",
                     migration=cur,
                     data={"power_state": str(vm.power_state)},
                 )

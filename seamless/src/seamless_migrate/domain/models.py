@@ -351,7 +351,8 @@ class PlanSpec(_Model):
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     #: per VM (source id): its application probes instead of verification.app_probes; [] = none
     probe_overrides: dict[str, list[AppProbe]] = Field(default_factory=dict)
-    #: hours a migration may wait in completed before it is flagged for finalize (SDD §8.1, ADV-19)
+    #: hours a migration may wait in completed before it is flagged for finalize (SDD §8.1, ADV-19);
+    #: TODO(ADV-19): confirm 72 h — the owner's open question 14
     finalize_warning_h: int = Field(default=72, ge=1)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
 
