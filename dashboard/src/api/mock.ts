@@ -103,7 +103,8 @@ const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'roll
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
 /** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
-const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed']);
+// a migration found in validating is a leftover of an interrupted validation (SDD §5.4)
+const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed', 'validating']);
 /** At most `limit` holders from `heldElsewhere`, and how many are left out (the API's wording). */
 function holdersText(held: Map<string, string[]>, limit = 10): string {
   const entries = [...held.values()].flat().sort();
@@ -1061,8 +1062,9 @@ export class MockServer {
       const vm = inventory.find((v) => v.source_id === vmId);
       const m = byVm.get(vmId) ?? (vm ? this.createMigration(plan, vm, me.name) : undefined);
       if (!m) continue;
-      if (REVALIDATABLE.has(m.phase)) {
-        this.transition(m, 'validating', 'plan validation started', me.name);
+      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over
+      if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
+        if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
       }
       validated.push(m);
@@ -1206,6 +1208,10 @@ export class MockServer {
         break;
       }
       case 'cancel': {
+        if (m.phase === 'validating') {
+          // like the API (SDD §5.1): a validation may be moving it
+          throw new HttpError(409, 'conflict', `${m.vm.name} is being validated and cannot be cancelled; validate the plan again - it finishes the migration, or cancels it once its VM left vm_ids`);
+        }
         if (m.downtime_started_at && !m.downtime_ended_at) {
           // SDD §5.1: never leave a stopped source behind
           const advice = m.phase === 'failed' ? 'roll back or retry' : 'cut it over';

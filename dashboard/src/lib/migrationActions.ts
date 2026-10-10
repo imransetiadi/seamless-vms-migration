@@ -69,6 +69,8 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
     case 'retry':
       return m.phase === 'failed' || m.phase === 'rolled_back' ? ok : no('Retry is available after a failure or a rollback.');
     case 'cancel':
+      // SDD §5.1: a validation may be moving it; a validation finishes it, or cancels a leftover whose VM left the plan
+      if (m.phase === 'validating') return no('Being validated: validate the plan again — it finishes this migration, or cancels it once its VM left the plan.');
       // SDD §5.1: a cancel would leave a stopped source with nothing left to restart it (only where the
       // phase could be cancelled at all: a cutover in progress has its clock open by design)
       if (canTransition(m.phase, 'cancelled') && sourceStopped(m)) {

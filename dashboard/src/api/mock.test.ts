@@ -595,6 +595,25 @@ describe('mock API', () => {
     expect(held.phase).toBe('rolled_back');
   });
 
+  it('refuses to cancel a migration being validated, and cancels it once its VM left the plan, like the API (SDD §5.1, §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'draft')!;
+    await client.post(`/plans/${plan.id}/validate`);
+    const [kept, dropped] = server.migrations.filter((m) => m.plan_id === plan.id);
+    // an interrupted validation left both in validating
+    kept!.phase = 'validating';
+    dropped!.phase = 'validating';
+    await expect(client.post(`/migrations/${dropped!.id}/cancel`, {})).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('validate the plan again'),
+    });
+    await client.patch(`/plans/${plan.id}`, { vm_ids: [kept!.vm.source_id] });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(dropped!.phase).toBe('cancelled');
+    expect(dropped!.phase_history.at(-1)?.reason).toBe('removed from the plan');
+    expect(kept!.phase).not.toBe('validating'); // taken over by the validation (SDD §5.4)
+  });
+
   it('lets a never-validated plan hold nothing, and a retry go ahead once the other plan lets the VM go (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

@@ -70,6 +70,12 @@ describe('migrationActions rules', () => {
     }
   });
 
+  it('says to validate the plan again instead of cancelling a migration being validated (SDD §5.1)', () => {
+    const cancel = migrationActions(migration('validating'), 'operator').cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toMatch(/being validated: validate the plan again/i);
+  });
+
   it('does not request a cutover twice', () => {
     const cutover = migrationActions(migration('awaiting_cutover', { cutover_requested: true }), 'approver').cutover;
     expect(cutover.enabled).toBe(false);
