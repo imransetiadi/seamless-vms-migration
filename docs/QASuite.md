@@ -157,7 +157,7 @@ The "Automated tests" column uses the plan's test names; §4 maps every name to 
 
 | NFR | Verified by |
 |---|---|
-| NFR-01 downtime clock | `test_simulated_cutover_marks_downtime`, `test_warm_flow_reaches_completed_with_downtime`; lab downtime = stop → verified boot (§9) |
+| NFR-01 downtime clock | `test_simulated_cutover_marks_downtime`, `test_warm_flow_reaches_completed_with_downtime`; in demo mode the model seconds the simulated steps kept the source stopped — a verified cutover, a rollback, a retry (SDD §5.2): `test_a_simulated_downtime_counts_model_seconds`, `test_a_simulated_step_reports_the_model_seconds_it_kept_the_source_stopped`, `test_a_simulated_rollback_counts_model_seconds`, `test_a_rollback_no_step_reported_model_seconds_for_keeps_wall_time`, `test_a_simulated_rollback_after_its_cutover_finished_counts_the_boot_too`, `test_a_retry_with_the_source_still_stopped_keeps_its_model_seconds`, `test_a_retry_after_a_rollback_starts_its_model_seconds_afresh`, `test_model_seconds_count_only_while_the_source_is_stopped`; lab downtime = stop → verified boot (§9) |
 | NFR-02 throughput | S-PERF-A5, PERF-ENG-01/02, PERF-NET-01 (§9) |
 | NFR-03 scale | PERF-CP-01…04 (§9) |
 | NFR-04 reliability | `test_resume_mid_cutover_is_idempotent`, `test_snapshot_create_is_idempotent_per_transfer_uuid`, `test_transient_vs_permanent_failure`, §11 |
