@@ -52,6 +52,8 @@ interface FormState {
   /** Guest write rate and aggregate scan cap, MiB/s (SDD §9.1 change_rate_bps, max_aggregate_scan_bps). */
   changeMiBps: string;
   aggregateScanMiBps: string;
+  /** Measured step times in seconds (SDD §9.1 shutdown_s, snapshot_s, create_s, boot_s): empty = planning default. */
+  stepTimes: Record<StepTimeKey, string>;
   tcpPorts: string;
   windowsTcpPorts: string;
   autoRollback: boolean;
@@ -67,7 +69,17 @@ interface FormState {
   handoverMap: Record<string, string>;
 }
 
-type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover';
+/** The step times an operator measures on the first migrations (SDD §16, Performance.md §6.4). */
+const STEP_TIMES = [
+  { key: 'shutdown_s', field: 'shutdown', label: 'Source shutdown', planning: 60 },
+  { key: 'snapshot_s', field: 'snapshot', label: 'Snapshot', planning: 30 },
+  { key: 'create_s', field: 'create', label: 'Volume create', planning: 60 },
+  { key: 'boot_s', field: 'boot', label: 'Boot', planning: 120 },
+] as const;
+type StepTimeKey = (typeof STEP_TIMES)[number]['key'];
+const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, ''])) as Record<StepTimeKey, string>;
+
+type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -97,6 +109,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     parallelDisks: '',
     changeMiBps: '',
     aggregateScanMiBps: '',
+    stepTimes: NO_STEP_TIMES,
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
@@ -136,9 +149,10 @@ const PRESTAGE_LABEL: Record<string, string> = {
 };
 const isDefaultPrestage = (resource: string): boolean => DEFAULT_PRESTAGE.includes(resource);
 
-/** Estimator overrides the form does not edit (it edits the four of SDD §16); they are kept. */
+/** Estimator overrides the form does not edit (it edits those of SDD §16); they are kept. */
 function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
   const { scan_bps: _scan, parallel_disks: _parallel, change_rate_bps: _change, max_aggregate_scan_bps: _cap, ...rest } = overrides ?? {};
+  for (const { key } of STEP_TIMES) delete rest[key];
   return rest;
 }
 
@@ -170,6 +184,9 @@ function formFromPlan(plan: Plan): FormState {
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
     aggregateScanMiBps: plan.estimator_overrides.max_aggregate_scan_bps ? plain(plan.estimator_overrides.max_aggregate_scan_bps / MiB) : '',
+    stepTimes: Object.fromEntries(
+      STEP_TIMES.map(({ key }) => [key, plan.estimator_overrides[key] ? plain(plan.estimator_overrides[key]) : '']),
+    ) as Record<StepTimeKey, string>,
     tcpPorts: v.tcp_ports.join(', '),
     windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
     autoRollback: v.auto_rollback,
@@ -382,6 +399,13 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
       if (!(cap > 0) || !Number.isFinite(cap)) e.aggregateScan = 'Enter the aggregate scan cap in MiB/s (more than 0), or leave it empty.';
       else overrides.max_aggregate_scan_bps = cap * MiB;
     }
+    for (const { key, field, label } of STEP_TIMES) {
+      const text = f.stepTimes[key].trim();
+      if (!text) continue;
+      const seconds = Number(text);
+      if (!(seconds > 0) || !Number.isFinite(seconds)) e[field] = `Enter the ${label.toLowerCase()} time in seconds (more than 0), or leave it empty.`;
+      else overrides[key] = seconds;
+    }
     const ports = f.tcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
     const windowsPorts = f.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
@@ -485,11 +509,15 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     parallel: id('parallel'),
     changeRate: id('changeRate'),
     aggregateScan: id('aggregateScan'),
+    shutdown: id('shutdown'),
+    snapshot: id('snapshot'),
+    create: id('create'),
+    boot: id('boot'),
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -851,6 +879,28 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   hint="The conversion host's storage ceiling for all disk streams together, e.g. about 1190 behind 10 GbE"
                 />
               </div>
+              <Fieldset legend="Measured step times">
+                <p className="-mt-2 text-xs text-muted-foreground">
+                  Durations seen on your first migrations replace the planning defaults in every estimate of this plan.
+                </p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {STEP_TIMES.map(({ key, field, label, planning }) => (
+                    <TextField
+                      key={key}
+                      id={id(field)}
+                      label={`${label} (s, optional)`}
+                      type="number"
+                      inputMode="decimal"
+                      min={0}
+                      step="any"
+                      placeholder={`${planning} (planning default)`}
+                      value={form.stepTimes[key]}
+                      onChange={(e) => set('stepTimes', { ...form.stepTimes, [key]: e.target.value })}
+                      error={errors[field]}
+                    />
+                  ))}
+                </div>
+              </Fieldset>
               <Fieldset legend="Pre-staged at the destination">
                 <p id={id('prestage-note')} className="-mt-2 text-xs text-muted-foreground">
                   {source?.kind === 'vmware'

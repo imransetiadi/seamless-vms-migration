@@ -85,6 +85,48 @@ describe('Plans page', () => {
     });
   });
 
+  it('sets the measured step times of a new plan: shutdown, snapshot, create and boot (Performance.md §6.4, SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Step times');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    // empty fields keep the planning defaults, which the placeholders show
+    expect(within(dialog).getByLabelText(/source shutdown/i)).toHaveAttribute('placeholder', '60 (planning default)');
+    expect(within(dialog).getByLabelText(/^boot/i)).toHaveAttribute('placeholder', '120 (planning default)');
+    await user.type(within(dialog).getByLabelText(/source shutdown/i), '30');
+    await user.type(within(dialog).getByLabelText(/snapshot/i), '20');
+    await user.type(within(dialog).getByLabelText(/volume create/i), '45');
+    await user.type(within(dialog).getByLabelText(/^boot/i), '90');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Step times')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Step times')?.estimator_overrides).toEqual({ shutdown_s: 30, snapshot_s: 20, create_s: 45, boot_s: 90 });
+  }, 30_000);
+
+  it('refuses a step time that is not more than 0, like the API (SDD §9.1)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    const before = server.plans.length;
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Bad step times');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.type(within(dialog).getByLabelText(/source shutdown/i), '0');
+    await user.type(within(dialog).getByLabelText(/^boot/i), '-5');
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(summary).toHaveTextContent('Enter the source shutdown time in seconds (more than 0), or leave it empty.');
+    expect(summary).toHaveTextContent('Enter the boot time in seconds (more than 0), or leave it empty.');
+    expect(server.plans).toHaveLength(before);
+  }, 30_000);
+
   it('refuses a guest write rate or aggregate scan cap that is not more than 0, like the API (SDD §9.1)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

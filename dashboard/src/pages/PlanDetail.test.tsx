@@ -469,7 +469,7 @@ describe('PlanDetail', () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
-    plan.estimator_overrides = { change_rate_bps: 4 * 2 ** 20, max_aggregate_scan_bps: 800 * 2 ** 20, boot_s: 90 };
+    plan.estimator_overrides = { change_rate_bps: 4 * 2 ** 20, max_aggregate_scan_bps: 800 * 2 ** 20, v2v_s: 240 };
     renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
 
     await user.click(await actionButton(/^edit plan$/i));
@@ -484,7 +484,27 @@ describe('PlanDetail', () => {
     await user.clear(within(dialog).getByLabelText(/aggregate scan cap/i));
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(plan.estimator_overrides).toEqual({ change_rate_bps: 6 * 2 ** 20, boot_s: 90 });
+    expect(plan.estimator_overrides).toEqual({ change_rate_bps: 6 * 2 ** 20, v2v_s: 240 });
+  });
+
+  it('edits the measured step times, prefilled; a cleared one goes back to the planning default (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.estimator_overrides = { shutdown_s: 30, boot_s: 90, v2v_s: 240 };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    expect(within(dialog).getByLabelText(/source shutdown/i)).toHaveValue(30);
+    expect(within(dialog).getByLabelText(/^boot/i)).toHaveValue(90);
+    await user.clear(within(dialog).getByLabelText(/source shutdown/i));
+    await user.type(within(dialog).getByLabelText(/snapshot/i), '25');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.estimator_overrides).toEqual({ snapshot_s: 25, boot_s: 90, v2v_s: 240 });
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['estimator_overrides'] });
   });
 
   it('edits keep-warm and pre-staging, prefilled; a resource the form does not show is kept (SDD §16)', async () => {
