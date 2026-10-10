@@ -229,7 +229,7 @@ AdvisorNote { kind: "strategy"|"classification"|"verification"|"similar_incident
 AdvisorActor { kind: "policy"|"user"|"system", id: str }    # policy:<id>, user:<name>, system:fallback
 
 AdvisorModelInfo { name: "jev"|"rules", version: str, deployment: "on_prem"|"remote"|"unknown" = "unknown",
-                   endpoint_host: str|null }
+                   endpoint_host: str|null }   # Jev's answers: SEAMLESS_JEV_DEPLOYMENT / _ENDPOINT_HOST (§13.4)
 
 RecommendedOption { option: str|null, confidence: float|null,   # 0..1, the only number compared with a threshold
                     distribution: dict[str, float] = {} }       # raw probabilities, shown only in Details
@@ -1131,7 +1131,8 @@ such lists again on persisted migration events.
 | GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
-| GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
+| GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?,"deployment":"on_prem"\|"remote","endpoint_host":str?,"console_sent":bool},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` (§13.4) |
+| GET | `/advisor/data-sent` | viewer | — | `{"items": [{"decision_type": DecisionType, "tool": str, "fields": [{"key": str, "label": str}], "sent": bool, "note": str?}]}` — generated from the serializers' field specs (§13.4, ADV-06) |
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
@@ -1264,6 +1265,16 @@ the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) wha
 console output is untrusted: it is screened with `jev_screen` (when Jev is available) before any
 LLM-facing use and is never sent to agentmemory.
 
+What leaves the installation is declared (ADV-06): the strategy evidence and the workload description are
+rendered from field specs — key, label, render — in `ai/payloads.py`, so the advisor sends nothing a spec does
+not declare, and `GET /advisor/data-sent` lists those specs per decision type with the Jev tool. Where the model
+runs is configuration: `SEAMLESS_JEV_DEPLOYMENT` (`on_prem` or `remote`, default `remote` — the `jev` sidecar
+forwards to the TypeSafe API; `TODO(ADV-06): confirm`) and `SEAMLESS_JEV_ENDPOINT_HOST` (the host shown on the
+badge, default unset). The console excerpt leaves the installation only when the deployment is `on_prem` or
+`SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` is true (default false): otherwise `review_verification` sends neither
+`jev_screen` nor `jev_verify` the excerpt, verifies the check results alone and its note says the console stayed
+local (rules-only screening: the verification's own console patterns, §7.5).
+
 ---
 
 ## 14. AI integration
@@ -1326,7 +1337,8 @@ skips approval, never triggers rollback or finalize.
 * `classify_workloads(vms) -> (dict[source_id, tier], AdvisorNote)` — `jev_classify` with the six tier classes of
   §9.4 (each with a precise description); items with `decision == "review"` or invalid responses
   fall back to the regex heuristic. Without Jev, the heuristic is used (`source="rules"`).
-* `review_verification(vm, result) -> AdvisorNote | None` — when `use_advisor`: redacts the console
+* `review_verification(vm, result) -> AdvisorNote | None` — when `use_advisor`: when the console excerpt may
+  leave the installation (§13.4: on-prem, or `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`), redacts the console
   excerpt with `redact()` (§13.4 — guests print secrets to consoles too), then screens it with
   `jev_screen` (blocked/review → skip), then `jev_verify` claims ["The guest operating
   system finished booting", "No kernel panic or filesystem errors are reported"] against the
@@ -1496,6 +1508,7 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 | `SEAMLESS_MAX_CONCURRENT_MIGRATIONS`, `SEAMLESS_MAX_CONCURRENT_CUTOVERS`, `SEAMLESS_TICK_S`, `SEAMLESS_MAX_STEP_RETRIES` | `10`, `3`, `1.0`, `2` | orchestrator |
 | `SEAMLESS_STEP_TIMEOUT_S` | `0` (no bound) | wall-clock ceiling of one step attempt (a hung playbook, SSH or blocksync holds a stopped source otherwise): on expiry the step task is cancelled (the executor kills the playbook), the attempt fails permanently (`step … exceeded N s`) and the usual failure handling applies — automatic rollback once the downtime window started (§8) |
 | `SEAMLESS_JEV_MODE`, `SEAMLESS_JEV_COMMAND`, `SEAMLESS_JEV_URL`, `SEAMLESS_JEV_TOKEN`, `SEAMLESS_JEV_TIMEOUT_S`, `SEAMLESS_JEV_MIN_CONFIDENCE` | `off`, `npx -y @jkudish/jev-mcp@0.14.1`, unset, unset, `20`, `0.6` | Jev |
+| `SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE` | `remote`, unset, `false` | Where the model runs and whether the console excerpt may go there (§13.4, ADV-06) |
 | `SEAMLESS_MEMORY_URL`, `SEAMLESS_MEMORY_SECRET`, `SEAMLESS_MEMORY_PROJECT`, `SEAMLESS_MEMORY_REDACT_NAMES` | unset, unset, `seamless-migrate`, `false` | agentmemory |
 | `SEAMLESS_DASHBOARD_DIR`, `SEAMLESS_METRICS_PUBLIC`, `SEAMLESS_LOG_LEVEL`, `SEAMLESS_LOG_JSON` | auto, `false`, `INFO`, `false` (`true` in the container and manifests) | misc; JSON logs for log forwarders (§18) |
 
@@ -1644,7 +1657,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
   "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
   `/advisor/policies` lists the policies and the built-in default, and `advisor.policy.manage` creates, edits and
-  deletes them; the page links to
+  deletes them; the Jev card and every recommendation Jev answered show where the model runs — "On-prem",
+  "Remote: {host}", or "Remote" until `SEAMLESS_JEV_ENDPOINT_HOST` names the host — and a "Data sent to advisor"
+  panel lists, per decision type, the tool and the fields its serializer sends (`GET /advisor/data-sent`) and says
+  when the console excerpt stays local (§13.4, ADV-06); the page links to
   `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live) with action,
   actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
   model version — and as JSON —
