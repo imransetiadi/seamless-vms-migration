@@ -440,6 +440,38 @@ export interface AdvisorSubject {
   name: string;
 }
 
+export const EVIDENCE_EFFECTS = ['supports', 'opposes', 'context'] as const;
+export type EvidenceEffect = (typeof EVIDENCE_EFFECTS)[number];
+export const EVIDENCE_SOURCE_KINDS = ['inventory', 'preflight', 'estimate', 'plan', 'provider', 'run'] as const;
+export type EvidenceSourceKind = (typeof EVIDENCE_SOURCE_KINDS)[number];
+
+/** One fact a recommendation rests on, built by the control plane's code, never by the model (SDD §14.4, ADV-02). */
+export interface EvidenceItem {
+  key: string;
+  label: string;
+  value: string | number | boolean | null;
+  display: string;
+  /** Measured against the recommendation's `evidence_option`. */
+  effect: EvidenceEffect;
+  /** Relevance, 0..100: the card shows the heaviest. */
+  weight: number;
+  /** The VM (inventory), the migration (preflight, estimate, run), the plan or the provider. */
+  source: { kind: EvidenceSourceKind; ref_id: string };
+}
+
+/** A past incident agentmemory knew when the recommendation was recorded (SDD §14.3). */
+export interface SimilarIncident {
+  title: string;
+  content: string;
+  score: number | null;
+}
+
+/** A reason Jev gave that names one of the recommendation's evidence items (SDD §14.4). */
+export interface AdvisorReason {
+  key: string;
+  text: string;
+}
+
 /** A recommendation and the decision taken on it, stored apart (SDD §4.2, §14.4). The engine runs only the decision. */
 export interface AdvisorRecommendation {
   id: string;
@@ -460,6 +492,14 @@ export interface AdvisorRecommendation {
   /** A strategy note written before recommendations existed, read as one (SDD §14.4). */
   legacy: boolean;
   legacy_text: string | null;
+  /** The option every evidence effect is measured against (SDD §14.4, ADV-02). */
+  evidence_option: string | null;
+  /** What validation knew when it was recorded, heaviest first. */
+  evidence: EvidenceItem[];
+  /** At most 3, searched once when it was recorded. */
+  similar_incidents: SimilarIncident[];
+  /** Jev's reasons that name an evidence key. */
+  reasons: AdvisorReason[];
 }
 
 /** Where a policy applies: plans or source providers; neither = everywhere (SDD §14.6). */

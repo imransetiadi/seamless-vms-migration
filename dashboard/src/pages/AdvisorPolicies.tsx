@@ -1,6 +1,5 @@
 import { Hourglass, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2, Zap } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { useLocation } from 'react-router-dom';
 import { usePlans, usePolicies, useProviders, useDeletePolicy } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorPolicy } from '../api/types';
@@ -16,6 +15,7 @@ import { DECISION_TYPE_LABELS, formatThreshold } from '../lib/advisor';
 import { formatDateTime, formatRelative } from '../lib/format';
 import { POLICY_MODE_LABELS } from '../lib/policies';
 import { can } from '../lib/roles';
+import { useHashLanding } from '../lib/useHashLanding';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const MANAGE_REASON = 'Managing advisor policies requires the admin role.';
@@ -158,14 +158,7 @@ export default function AdvisorPolicies() {
   }, [deleted, items]);
 
   // a link to #policy-{id} lands on that policy once the list is there (SDD §16, ADV-20)
-  const { hash } = useLocation();
-  const loaded = Boolean(policies.data);
-  useEffect(() => {
-    if (!loaded || !hash.startsWith('#policy-')) return;
-    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
-    target?.scrollIntoView?.({ block: 'start' });
-    target?.focus({ preventScroll: true });
-  }, [hash, loaded]);
+  useHashLanding(Boolean(policies.data));
 
   const openCreate = () => setDialog({ open: true });
   const fallback = policies.data?.default;

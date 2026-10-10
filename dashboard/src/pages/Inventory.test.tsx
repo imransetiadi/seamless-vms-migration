@@ -7,6 +7,16 @@ import Inventory from './Inventory';
 const REFUSED = { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
 
 describe('Inventory', () => {
+  it('opens searching for the VM a link names by its source id (SDD §16, ADV-02)', async () => {
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1?vm=os-0a14', path: '/inventory/:providerId', token: 'viewer' });
+    const search = await screen.findByLabelText('Search VMs');
+    await waitFor(() => expect(search).toHaveValue('web-cache-01'));
+    const table = screen.getByRole('table', { name: /VMs on/ });
+    const rows = within(table).getAllByRole('row').slice(1);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent('web-cache-01');
+  });
+
   it('names a failed provider load with Retry instead of showing a blank page (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

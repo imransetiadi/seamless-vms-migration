@@ -22,6 +22,18 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     await waitFor(() => expect(builtin).toHaveFocus());
   });
 
+  it('asks a new policy for three facts of evidence, and says what they are (SDD §14.4, ADV-02)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', token: 'admin' });
+    await user.click(await screen.findByRole('button', { name: /new policy/i }));
+    const dialog = await screen.findByRole('dialog');
+    const minimum = within(dialog).getByLabelText(/^minimum evidence/i);
+    expect(minimum).toHaveValue(3);
+    expect(minimum).toHaveAccessibleDescription(
+      "Fewer facts that support or oppose the decision send it for approval; each recommendation's evidence card lists them.",
+    );
+  });
+
   it('lists the policies with the built-in default, which is read-only', async () => {
     renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', token: 'viewer' });
     expect(await screen.findByRole('heading', { level: 2, name: '1 policy' })).toBeInTheDocument();
@@ -85,7 +97,8 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
       decision_types: ['migration_strategy'],
       mode: 'auto_apply_above_threshold',
       threshold: 0.8,
-      min_evidence_for_auto_apply: 0,
+      // the form's default for a new policy (ADV-02)
+      min_evidence_for_auto_apply: 3,
       require_override_reason: false,
       updated_by: 'rina',
     });

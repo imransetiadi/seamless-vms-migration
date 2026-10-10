@@ -12,6 +12,7 @@ import {
   PROVIDER_STATUSES,
   SEVERITIES,
   STRATEGIES,
+  type AdvisorPolicy,
   type AdvisorRecommendation,
   type Event,
   type Migration,
@@ -1588,5 +1589,100 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     server.health = { ...server.health, demo: false, demo_speed: null };
     await expect(as(server, 'operator').post(`/demo/vms/${byName(server, 'web-cache-01').vm.source_id}/power`, { state: 'on' })).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('mock evidence, like the API (SDD §14.4, ADV-02)', () => {
+  function validating(advice: { option: string | null; confidence: number | null }, minimum: number | null = null) {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => advice });
+    server.policies.length = 0;
+    if (minimum !== null) server.policies.push(strict(minimum));
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    // the analytics plan: analytics-db ties cold and warm (nothing meets the SLO)
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    return { server, client, plan, db, before: server.recommendations.length };
+  }
+  function strict(minimum: number): AdvisorPolicy {
+    const at = '2026-10-08T00:00:00Z';
+    return {
+      id: 'pol-strict',
+      name: 'Strict',
+      scope: { provider_ids: [], plan_ids: [] },
+      decision_types: [],
+      mode: 'auto_apply_above_threshold',
+      threshold: 0.6,
+      min_evidence_for_auto_apply: minimum,
+      require_override_reason: false,
+      require_distinct_approver: true,
+      created_at: at,
+      updated_at: at,
+      updated_by: 'rina',
+    };
+  }
+
+  it('records the evidence validation held, measured against the recommended option, with what memory knew', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'warm', confidence: 0.8 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect(rec!.evidence_option).toBe('warm');
+    expect(rec!.evidence.map((i) => [i.key, i.effect])).toEqual([
+      ['downtime_estimate', 'opposes'], // nothing meets the plan's SLO
+      ['mappings', 'supports'],
+      ['findings', 'opposes'], // NET_MTU_SHRINK and APP_PROBE_MISSING apply to warm
+      ['guest_os', 'context'],
+      ['disk_total', 'context'],
+      ['disk_count', 'context'],
+      ['write_rate', 'context'],
+      ['cutover_window', 'context'],
+      ['source_kind', 'context'],
+    ]);
+    expect(rec!.evidence.find((i) => i.key === 'disk_total')!.value).toBe(db.vm.disk_bytes);
+    const refs = new Set([db.vm.source_id, db.id, plan.id, plan.source_provider_id]);
+    expect(rec!.evidence.every((i) => refs.has(i.source.ref_id))).toBe(true);
+    // the query "warm rhel9 200-500G" finds the mock memory's two incidents that say "warm"; at most 3
+    expect(rec!.similar_incidents.map((i) => i.title)).toEqual(['Warm pass never converged on a busy PostgreSQL VM', 'VMware CBT reset after snapshot consolidation']);
+    expect(rec!.reasons).toEqual([]);
+  });
+
+  it('never applies on its own a decision below the policy minimum', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.99 }, 99);
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    // measured against the advisor's option, not the deterministic warm
+    expect(rec!.evidence_option).toBe('cold');
+    expect([rec!.decision.status, rec!.decision.reason_code, rec!.decision.final_option]).toEqual(['pending_approval', 'INSUFFICIENT_EVIDENCE', null]);
+    const bearing = rec!.evidence.filter((i) => i.effect !== 'context').length;
+    server.policies[0] = strict(bearing);
+    await client.post(`/plans/${plan.id}/validate`);
+    const newest = server.recommendations.at(-1)!;
+    expect([newest.decision.status, newest.decision.final_option]).toEqual(['auto_applied', 'cold']);
+  });
+
+  it('counts the attempts a VM made before, with the strategy they ran', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'warm', confidence: 0.8 });
+    db.attempts = 2;
+    db.strategy = 'warm';
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const earlier = rec!.evidence.find((i) => i.key === 'earlier_runs')!;
+    expect([earlier.value, earlier.effect, earlier.display, earlier.source]).toEqual([2, 'opposes', '2 earlier attempts with Warm migration', { kind: 'run', ref_id: db.id }]);
+  });
+
+  it('asks a new policy for three evidence items unless told otherwise, like the API', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const admin = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+    const created = await admin.post<AdvisorPolicy>('/advisor/policies', { name: 'Default minimum', mode: 'auto_apply_above_threshold', threshold: 0.7 });
+    expect(created.min_evidence_for_auto_apply).toBe(3);
+  });
+
+  it('gives every stored fixture recommendation its evidence', () => {
+    const server = new MockServer({ now: () => NOW });
+    const stored = server.recommendations.filter((r) => !r.legacy);
+    expect(stored.length).toBeGreaterThan(0);
+    for (const rec of stored) {
+      expect(rec.evidence_option, rec.id).not.toBeNull();
+      expect(rec.evidence.some((i) => i.key === 'disk_total'), rec.id).toBe(true);
+    }
   });
 });

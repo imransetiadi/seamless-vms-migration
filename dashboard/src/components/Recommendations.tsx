@@ -1,8 +1,10 @@
-import { Bot, ChevronLeft, ChevronRight, History, ListChecks, type LucideIcon } from 'lucide-react';
+import { Bot, ChevronLeft, ChevronRight, History, ListChecks, TriangleAlert, type LucideIcon } from 'lucide-react';
 import { useRef, type ReactNode, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import type { AdvisorRecommendation } from '../api/types';
 import { CONFIDENCE_DEFINITION, DECISION_TYPE_LABELS, decisionText, recommendedParts } from '../lib/advisor';
+import { cn } from '../lib/cn';
+import { evidenceSummary } from '../lib/evidence';
 import { formatDateTime, formatNumber, formatRelative } from '../lib/format';
 import { ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { Button } from './Button';
@@ -42,6 +44,19 @@ export function DecisionLine({ rec, className }: { rec: AdvisorRecommendation; c
 export type ActionsFor = (rec: AdvisorRecommendation, focusAfterRef: RefObject<HTMLElement>) => ReactNode;
 
 /** What the advisor recommended, then what was decided: the line the migration runs (SDD §16). Untrusted text renders as plain text. */
+/** The entry's line on its evidence (SDD §16, ADV-02): its details hold the card. */
+function EvidenceLine({ rec }: { rec: AdvisorRecommendation }) {
+  const summary = evidenceSummary(rec);
+  if (!summary) return null;
+  const limited = rec.decision.reason_code === 'INSUFFICIENT_EVIDENCE';
+  return (
+    <p className={cn('mt-0.5 inline-flex items-center gap-1 text-xs', limited ? 'text-status-warning' : 'text-muted-foreground')}>
+      {limited && <TriangleAlert aria-hidden className="size-3.5 shrink-0" />}
+      {summary}
+    </p>
+  );
+}
+
 function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorRecommendation; showSubject: boolean; actionsFor?: ActionsFor }) {
   const ModelIcon = MODEL_ICON[rec.model.name] ?? Bot;
   // the entry stays when its actions go: focus moves here after a decision (SDD §16)
@@ -80,6 +95,7 @@ function RecommendationItem({ rec, showSubject, actionsFor }: { rec: AdvisorReco
       <RecommendedLine rec={rec} className="mt-1 wrap-break-word text-sm text-muted-foreground" />
       <DecisionLine rec={rec} className="mt-0.5 wrap-break-word text-sm font-medium text-foreground" />
       {rec.decision.reason_text && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{rec.decision.reason_text}</p>}
+      <EvidenceLine rec={rec} />
       {rec.legacy && rec.legacy_text && (
         <p className="mt-1.5 wrap-break-word border-l-2 border-border pl-2 text-xs text-muted-foreground">Original note: {rec.legacy_text}</p>
       )}

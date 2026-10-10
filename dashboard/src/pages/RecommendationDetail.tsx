@@ -7,12 +7,14 @@ import type { AdvisorRecommendation, Event } from '../api/types';
 import { DeploymentBadge } from '../components/DeploymentBadge';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { PageHeader } from '../components/PageHeader';
+import { EvidenceCard } from '../components/EvidenceCard';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { RecommendationActions } from '../components/RecommendationActions';
 import { DecisionLine, RecommendedLine } from '../components/Recommendations';
 import { Tabs } from '../components/Tabs';
 import { CONFIDENCE_DEFINITION, decidable, DECISION_TYPE_LABELS, distributionRows, formatConfidence, optionLabel } from '../lib/advisor';
+import { evidenceTitle } from '../lib/evidence';
 import { auditActionLabel } from '../lib/audit';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { formatDateTime, formatPct } from '../lib/format';
@@ -248,6 +250,11 @@ export default function RecommendationDetail() {
             <dd className="font-mono text-xs break-all text-foreground">{r.id}</dd>
           </dl>
         </Panel>
+        {!r.legacy && (
+          <Panel title="Evidence" description={evidenceTitle(r)}>
+            <EvidenceCard rec={r} />
+          </Panel>
+        )}
         <Panel title="Records" description="The full distribution, the audit events and the input this recommendation rests on">
           <Tabs
             label="Recommendation records"

@@ -49,7 +49,8 @@ function formOf(policy: AdvisorPolicy | undefined, defaultThreshold: number): Fo
       decisionTypes: [],
       mode: 'always_require_approval',
       threshold: plain(defaultThreshold * 100),
-      minEvidence: '0',
+      // a new policy asks for 3 facts, like the API (SDD §4.2, ADV-02)
+      minEvidence: '3',
       requireReason: true,
       requireDistinctApprover: true,
     };
@@ -301,7 +302,6 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
               error={errors.threshold}
               hint="Below it, the default strategy is kept."
             />
-            {/* TODO(ADV-02): the hint changes once the evidence card counts evidence (SDD §14.6) */}
             <TextField
               id={id('minEvidence')}
               label="Minimum evidence"
@@ -313,7 +313,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
               value={form.minEvidence}
               onChange={(e) => set('minEvidence', e.target.value)}
               error={errors.minEvidence}
-              hint="Fewer items of evidence send the decision for approval. The advisor collects none yet, so any value above 0 does that every time."
+              hint="Fewer facts that support or oppose the decision send it for approval; each recommendation's evidence card lists them."
             />
           </div>
 

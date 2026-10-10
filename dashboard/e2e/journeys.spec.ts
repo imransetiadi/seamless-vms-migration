@@ -177,3 +177,19 @@ test('a plan names the advisor policy in force beside its cutover approval; the 
   await expect(page).toHaveURL(/\/advisor\/policies#policy-pol-finance$/);
   await expect(page.getByRole('article', { name: 'Finance — approval required' })).toBeFocused();
 });
+
+test('a recommendation shows the evidence it rests on; a fact links to its VM in the inventory (ADV-02)', async ({ page }) => {
+  await signIn(page, 'viewer');
+  await page.goto('/advisor/recommendations/rec-d4e6f8a09001');
+  const panel = page.getByRole('region', { name: 'Evidence' });
+  await expect(panel).toContainText('Evidence for Warm migration');
+  const items = panel.getByRole('list', { name: 'Evidence items' }).getByRole('listitem');
+  await expect(items).toHaveCount(6);
+  await panel.getByRole('button', { name: /^Show all \(\d+\)$/ }).click();
+  const disk = panel.getByRole('listitem', { name: 'Disk size' });
+  await expect(disk).toContainText('Context');
+  await disk.getByRole('link', { name: 'Inventory' }).click();
+  await expect(page).toHaveURL(/\/inventory\/rhosp17-dc1\?vm=/);
+  await expect(page.getByLabel('Search VMs')).toHaveValue('static-cdn-01');
+  await expect(page.getByRole('table', { name: /VMs on/ }).getByRole('row')).toHaveCount(2);
+});

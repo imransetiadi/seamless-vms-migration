@@ -34,6 +34,10 @@ function rec(
     requested_by: null,
     legacy: false,
     legacy_text: null,
+    evidence_option: null,
+    evidence: [],
+    similar_incidents: [],
+    reasons: [],
     ...extra,
   };
 }

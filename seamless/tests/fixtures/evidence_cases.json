@@ -893,6 +893,203 @@
     ]
   },
   {
+    "name": "vmware warm with CBT off: the fact opposes it",
+    "vm": {
+      "source_id": "vmw-19",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 20,
+          "used_gb": 10.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "windows2019",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": false,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 21474836480,
+      "used_bytes": 10737418240,
+      "guest_os": {
+        "family": "windows",
+        "distro": "windows-server",
+        "version": "2019",
+        "label": "Windows Server 2019",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "vcenter-1",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "vmware",
+    "estimates": [
+      {
+        "strategy": "vmware_warm",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 300.0,
+        "total_s": 900.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [],
+    "option": "vmware_warm",
+    "earlier": null,
+    "migration_id": "mig-0123456789",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 300.0,
+        "display": "Estimated downtime 5m 00s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "cbt",
+        "label": "Changed Block Tracking",
+        "value": false,
+        "display": "Changed Block Tracking is off",
+        "effect": "opposes",
+        "weight": 90,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-19"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to VMware warm migration (CBT)",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-0123456789"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "Windows Server 2019",
+        "display": "Windows Server 2019; virt-v2v supported",
+        "effect": "supports",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-19"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 21474836480,
+        "display": "20.0 GiB provisioned, 10.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-19"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vmw-19"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Cutover window: any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "vmware",
+        "display": "Source platform: VMware vSphere",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "vcenter-1"
+        }
+      }
+    ]
+  },
+  {
     "name": "openstack storage handover, a tiny disk",
     "vm": {
       "source_id": "vm-4",

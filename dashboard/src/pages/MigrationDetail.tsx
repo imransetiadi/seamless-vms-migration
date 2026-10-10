@@ -37,6 +37,7 @@ import { clearedByStrategyChange, countedApprovals } from '../lib/migrationActio
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
 import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
+import { useHashLanding } from '../lib/useHashLanding';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** Announces phase changes and every 10 % of progress — never every tick (aria-live polite). */
@@ -607,6 +608,8 @@ export default function MigrationDetail() {
   const [probeAnnouncement, setProbeAnnouncement] = useState('');
   const [liveEvents, setLiveEvents] = useState<Event[]>([]);
   usePageTitle(m ? `${m.vm.name} · ${phaseMeta(m.phase).label}` : 'Migration');
+  // a link to its findings or estimates (#findings, #estimates) lands there once loaded (SDD §16, ADV-02)
+  useHashLanding(Boolean(m));
   const announcement = useProgressAnnouncement(m);
 
   useEffect(() => setLiveEvents([]), [migrationId]);
@@ -724,7 +727,7 @@ export default function MigrationDetail() {
         </p>
 
         <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">
+          <Panel id="findings" title="Findings" description="Pre-flight checks (SDD §9.3)">
             <FindingsList
               findings={m.findings}
               emptyText={
@@ -741,7 +744,7 @@ export default function MigrationDetail() {
           </Panel>
         </div>
 
-        <Panel title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
+        <Panel id="estimates" title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
           <EstimatesPanel m={m} role={role} />
         </Panel>
 

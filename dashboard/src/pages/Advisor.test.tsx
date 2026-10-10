@@ -95,6 +95,28 @@ describe('Advisor page', () => {
     expect(document.body).not.toHaveTextContent(/selected/i);
   });
 
+  it('says on each entry what its evidence supports and opposes, or that it was too little (SDD §16, ADV-02)', async () => {
+    const server = createTestServer();
+    const rec = server.recommendations.find((r) => r.id === 'rec-d4e6f8a09001')!;
+    const supports = rec.evidence.filter((i) => i.effect === 'supports').length;
+    const opposes = rec.evidence.filter((i) => i.effect === 'opposes').length;
+    // a decision that waited for more evidence, newest of all
+    server.recommendations.push({
+      ...rec,
+      id: 'rec-limited00001',
+      created_at: '2026-10-09T12:00:00Z',
+      subject: { ...rec.subject, name: 'limited-01' },
+      evidence: rec.evidence.filter((i) => i.effect === 'context'),
+      decision: { ...rec.decision, status: 'pending_approval', reason_code: 'INSUFFICIENT_EVIDENCE', final_option: null },
+    });
+    renderWithApp(<Advisor />, { token: 'viewer', server });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const entry = (await within(feed).findByText('Decision: Cold migration — below threshold (57% < 60%), default kept')).closest('li')!;
+    expect(entry).toHaveTextContent(`Evidence: ${supports} support${supports === 1 ? 's' : ''}, ${opposes} oppose${opposes === 1 ? 's' : ''}`);
+    const limited = within(feed).getByRole('link', { name: 'Details for limited-01' }).closest('li')!;
+    expect(limited).toHaveTextContent('Limited evidence: 0 items support or oppose');
+  });
+
   it('lists a strategy note of an earlier version as a Legacy recommendation with its original text, not as a note (SDD §14.4)', async () => {
     renderWithApp(<Advisor />, { token: 'viewer' });
     const feed = await screen.findByRole('region', { name: 'Recommendations' });

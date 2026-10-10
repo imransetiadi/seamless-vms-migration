@@ -530,6 +530,23 @@ describe('MigrationDetail', () => {
     expect(approvals).toHaveTextContent('Approved by sari');
   });
 
+  it('lands on its findings or estimates when a link names them (SDD §16, ADV-02)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    for (const part of ['findings', 'estimates'] as const) {
+      const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}#${part}`, path: '/migrations/:migrationId', token: 'viewer', server });
+      await screen.findByRole('heading', { level: 1, name: 'analytics-db' });
+      const target = await waitFor(() => {
+        const element = document.getElementById(part);
+        expect(element).not.toBeNull();
+        return element!;
+      });
+      await waitFor(() => expect(target).toHaveFocus());
+      expect(within(target).getByRole('heading', { level: 2, name: part === 'findings' ? 'Findings' : 'Estimates' })).toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
   it('shows no demo power control outside demo mode', async () => {
     const server = createTestServer();
     server.health = { ...server.health, demo: false, demo_speed: null };

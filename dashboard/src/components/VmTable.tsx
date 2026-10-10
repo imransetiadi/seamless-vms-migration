@@ -46,6 +46,8 @@ export interface VmTableProps {
   onSelectedChange?: (next: Set<string>) => void;
   caption?: string;
   pageSize?: number;
+  /** The search the table opens with: a link to one VM (SDD §16, ADV-02). */
+  initialQuery?: string;
 }
 
 function PowerCell({ state }: { state: PowerState }) {
@@ -72,9 +74,9 @@ function ReadinessCell({ flags, level }: { flags: ReadinessFlag[]; level: Readin
 }
 
 /** Inventory table with search, power/readiness/project filters, sorting and optional selection. */
-export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200 }: VmTableProps) {
+export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '' }: VmTableProps) {
   const searchId = useId();
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(initialQuery);
   const [power, setPower] = useState<PowerState | 'all'>('all');
   const [readiness, setReadiness] = useState<ReadinessFilter>('all');
   const [project, setProject] = useState('all');

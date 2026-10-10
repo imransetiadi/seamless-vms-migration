@@ -38,6 +38,7 @@ import {
   strategySnapshot,
   type StrategyDecision,
 } from './mockData';
+import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 import type {
@@ -49,6 +50,7 @@ import type {
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
+  ReasonCode,
   AdvisorSnapshot,
   AdvisorStatus,
   ConvergedBy,
@@ -311,33 +313,65 @@ function convergedBy(m: Migration, plan: Plan, pass: SyncPass): ConvergedBy | nu
   return m.sync_passes.length >= plan.max_sync_passes ? 'max_passes' : null;
 }
 
+/** knowledge.size_bucket: the profile bucket a memory query names (SDD §14.3). */
+function sizeBucket(diskBytes: number): string {
+  const gib = diskBytes / 2 ** 30;
+  if (gib < 50) return '<50G';
+  if (gib < 200) return '50-200G';
+  return gib <= 500 ? '200-500G' : '>500G';
+}
+
 /** The part of a policy decide() needs (SDD §14.4, §14.6). */
 interface PolicyRule {
   id: string;
   mode: AdvisorPolicy['mode'];
   threshold: number;
+  min_evidence_for_auto_apply: number;
   require_override_reason: boolean;
   require_distinct_approver: boolean;
 }
 
-const GLOBAL_DEFAULT: PolicyRule = { id: 'global-default', mode: 'auto_apply_above_threshold', threshold: JEV_MIN_CONFIDENCE, require_override_reason: false, require_distinct_approver: true };
+const GLOBAL_DEFAULT: PolicyRule = {
+  id: 'global-default',
+  mode: 'auto_apply_above_threshold',
+  threshold: JEV_MIN_CONFIDENCE,
+  min_evidence_for_auto_apply: 0,
+  require_override_reason: false,
+  require_distinct_approver: true,
+};
 
 /** The policy in force for a plan's strategy decisions (SDD §14.6), or the built-in default. */
 function policyFor(policies: readonly AdvisorPolicy[], plan: Plan): PolicyRule {
   const winner = resolvePolicy(policies, plan.id, plan.source_provider_id, 'migration_strategy');
   return winner
-    ? { id: winner.id, mode: winner.mode, threshold: winner.threshold, require_override_reason: winner.require_override_reason, require_distinct_approver: winner.require_distinct_approver }
+    ? {
+        id: winner.id,
+        mode: winner.mode,
+        threshold: winner.threshold,
+        min_evidence_for_auto_apply: winner.min_evidence_for_auto_apply,
+        require_override_reason: winner.require_override_reason,
+        require_distinct_approver: winner.require_distinct_approver,
+      }
     : GLOBAL_DEFAULT;
 }
 
-/** decide() (SDD §14.4): no usable advice, a policy that asks a person, below the threshold, else applied. */
-function decided(advice: SimulatedAdvice, scope: readonly Strategy[], policy: PolicyRule): { status: StrategyDecision; fallback?: string } {
+/**
+ * decide() (SDD §14.4): no usable advice, a policy that asks a person, below the threshold, fewer facts that
+ * support or oppose than the policy's minimum (ADV-02), else applied.
+ */
+function decided(
+  advice: SimulatedAdvice,
+  scope: readonly Strategy[],
+  policy: PolicyRule,
+  evidence: number,
+): { status: StrategyDecision; fallback?: string; reason?: ReasonCode } {
   if (advice.option === null) return { status: 'fallback_rules', fallback: 'advisor unavailable: Jev gave no answer' };
   if (!scope.includes(advice.option as Strategy)) {
     return { status: 'fallback_rules', fallback: `${advice.option} is not among the options it may choose (${scope.join(', ')})` };
   }
   if (policy.mode === 'always_require_approval') return { status: 'pending_approval' };
   if (advice.confidence === null || advice.confidence < policy.threshold) return { status: 'below_threshold' };
+  if (evidence < policy.min_evidence_for_auto_apply) return { status: 'pending_approval', reason: 'INSUFFICIENT_EVIDENCE' };
   return { status: 'auto_applied' };
 }
 
@@ -375,6 +409,10 @@ function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
         requested_by: null,
         legacy: true,
         legacy_text: note.summary,
+        evidence_option: null,
+        evidence: [],
+        similar_incidents: [],
+        reasons: [],
       };
     });
 }
@@ -898,8 +936,10 @@ export class MockServer {
   }
 
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
+    // the attempts so far, with the strategy they ran: evaluate() chooses anew (SDD §14.4, ADV-02)
+    const earlier = m.attempts > 0 ? { id: m.id, strategy: m.strategy, attempts: m.attempts } : null;
     this.evaluate(m, plan);
-    const rec = this.decideStrategy(m, plan, actor);
+    const rec = this.decideStrategy(m, plan, actor, earlier);
     // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
     m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
@@ -916,14 +956,23 @@ export class MockServer {
    * Like validate_plan (SDD §14.4): an automatic choice whose advisor scope is not empty goes to the
    * advisor, decide() takes the decision, and the migration runs its final option.
    */
-  private decideStrategy(m: Migration, plan: Plan, actor: string): AdvisorRecommendation | null {
+  private decideStrategy(
+    m: Migration,
+    plan: Plan,
+    actor: string,
+    earlier: Pick<Migration, 'id' | 'strategy' | 'attempts'> | null,
+  ): AdvisorRecommendation | null {
     const automatic = plan.default_strategy === 'auto' && !(m.vm.source_id in plan.strategy_overrides);
     const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy);
     const scope = advisorScope(m.estimates, plan.selection_policy);
     if (!automatic || !scope.length || eligible.length < 2) return null;
     const advice = this.advise(m.vm, scope, m.estimates);
     const policy = policyFor(this.policies, plan);
-    const { status, fallback } = decided(advice, scope, policy);
+    // the facts measured against the recommended option, or the deterministic one (SDD §14.4, ADV-02)
+    const evidenceOption = advice.option && eligible.includes(advice.option as Strategy) ? advice.option : m.strategy;
+    const evidence = buildStrategyEvidence(m.vm, plan, this.sourceFor(plan).kind, m.estimates, m.findings, evidenceOption, earlier, m.id);
+    const { status, fallback, reason } = decided(advice, scope, policy, evidenceCount(evidence));
+    const query = `${evidenceOption} ${m.vm.os_type ?? 'unknown OS'} ${sizeBucket(m.vm.disk_bytes)}`;
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
     // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
@@ -944,6 +993,10 @@ export class MockServer {
       policyId: policy.id,
       threshold: policy.threshold,
       requestedBy: actor,
+      reasonCode: reason,
+      evidenceOption,
+      evidence,
+      similarIncidents: this.similarIncidents(query, 3).hits.slice(0, 3),
     });
     // a decision that waits keeps the deterministic choice and holds the migration (SDD §14.6)
     const final = (rec.decision.final_option ?? m.strategy) as Strategy;
@@ -1223,7 +1276,8 @@ export class MockServer {
       decision_types: list(input.decision_types) as AdvisorPolicySpec['decision_types'],
       mode: input.mode as AdvisorPolicySpec['mode'],
       threshold: Number(input.threshold),
-      min_evidence_for_auto_apply: input.min_evidence_for_auto_apply === undefined ? 0 : Number(input.min_evidence_for_auto_apply),
+      // a new policy asks for 3 facts unless told otherwise, like the API (SDD §4.2, ADV-02)
+      min_evidence_for_auto_apply: input.min_evidence_for_auto_apply === undefined ? 3 : Number(input.min_evidence_for_auto_apply),
       require_override_reason: input.require_override_reason === undefined ? true : Boolean(input.require_override_reason),
       require_distinct_approver: input.require_distinct_approver === undefined ? true : Boolean(input.require_distinct_approver),
     };

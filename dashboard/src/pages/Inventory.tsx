@@ -1,6 +1,6 @@
 import { ClipboardPlus, HardDrive, Server } from 'lucide-react';
 import { useState } from 'react';
-import { Navigate, useNavigate, useParams } from 'react-router-dom';
+import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useInventory, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, type DestinationInventory, type Provider } from '../api/types';
@@ -187,6 +187,7 @@ function providerLabel(p: Provider): string {
 export default function Inventory() {
   usePageTitle('Inventory');
   const { providerId } = useParams();
+  const wanted = useSearchParams()[0].get('vm');
   const navigate = useNavigate();
   const providers = useProviders();
   const inventory = useInventory(providerId);
@@ -267,6 +268,9 @@ export default function Inventory() {
               </div>
             )}
             <VmTable
+              // a link to one VM by its source id (`?vm=`, SDD §16) opens the table searching for its name
+              key={wanted ?? ''}
+              initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}
               caption={`VMs on ${provider.name}`}

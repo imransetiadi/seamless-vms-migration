@@ -14,6 +14,7 @@ import type {
   Disk,
   Estimate,
   Event,
+  EvidenceItem,
   Finding,
   Migration,
   Nic,
@@ -23,6 +24,7 @@ import type {
   Provider,
   ProviderKind,
   ReasonCode,
+  SimilarIncident,
   Strategy,
   SyncPass,
   VerificationRecord,
@@ -32,6 +34,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
+import { buildStrategyEvidence } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 
@@ -52,6 +55,17 @@ const REASON_OF: Record<StrategyDecision, ReasonCode> = {
   below_threshold: 'BELOW_THRESHOLD_DEFAULT_KEPT',
   fallback_rules: 'ADVISOR_UNAVAILABLE_FALLBACK',
   pending_approval: 'POLICY_REQUIRES_APPROVAL',
+};
+
+/** What the mock's memory knew when the fixtures' recommendations were recorded (SDD §14.3, ADV-02). */
+const FIXTURE_INCIDENTS: Partial<Record<string, SimilarIncident[]>> = {
+  warm: [
+    { title: 'Warm pass never converged on a busy PostgreSQL VM', content: 'Change rate (~60 MiB/s) exceeded the link share. Scheduled cutover off-peak and raised max_sync_passes to 8.', score: 0.82 },
+    { title: 'sshd bound to the old fixed IP after migration', content: 'Remove ListenAddress from sshd_config or use 0.0.0.0; verification tcp:22 then passed.', score: 0.61 },
+  ],
+  vmware_warm: [
+    { title: 'VMware CBT reset after snapshot consolidation', content: 'Consolidation reset CBT; vmware_warm restarted with a full pass. Consolidate snapshots before pre-copy.', score: 0.88 },
+  ],
 };
 
 /** The demo policy of the spec (ADV-04) for the mock's DC1 source provider (SDD §14.6). */
@@ -83,6 +97,12 @@ export interface StrategyRecommendationInput {
   threshold?: number;
   /** The user whose plan validation recorded it (SDD §14.6): never the one who decides it. */
   requestedBy?: string | null;
+  /** Why a decision waits when it is not the policy's mode: too little evidence (SDD §14.4, ADV-02). */
+  reasonCode?: ReasonCode;
+  /** The option the evidence is measured against, and the evidence (ADV-02). */
+  evidenceOption?: string | null;
+  evidence?: EvidenceItem[];
+  similarIncidents?: SimilarIncident[];
 }
 
 /** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
@@ -112,7 +132,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     decision: {
       final_option: status === 'auto_applied' ? option : status === 'pending_approval' ? null : input.deterministic,
       status,
-      reason_code: REASON_OF[status],
+      reason_code: input.reasonCode ?? REASON_OF[status],
       reason_text: status === 'fallback_rules' ? (input.fallback ?? null) : null,
       actor: byPolicy ? { kind: 'policy', id: policyId } : { kind: 'system', id: 'fallback' },
       policy_id: byPolicy ? policyId : null,
@@ -121,6 +141,10 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
     },
     legacy: false,
     legacy_text: null,
+    evidence_option: input.evidenceOption ?? null,
+    evidence: input.evidence ?? [],
+    similar_incidents: input.similarIncidents ?? [],
+    reasons: [],
   };
 }
 
@@ -1452,6 +1476,9 @@ export function buildFixtures(now: number): Fixtures {
         const validated = history.find((c) => c.from_phase === 'validating')?.at ?? iso(migCreatedAt);
         const snapshot = strategySnapshot({ vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated });
         snapshots.push(snapshot);
+        const eligible = estimates.filter((e) => e.eligible).map((e) => e.strategy);
+        const evidenceOption = m.rec.option && eligible.includes(m.rec.option as Strategy) ? m.rec.option : m.rec.deterministic;
+        const kind = providers.find((p) => p.id === plan.source_provider_id)?.kind ?? 'openstack';
         const rec = strategyRecommendation({
           id: `rec-${m.id.slice(4)}01`,
           at: validated,
@@ -1459,7 +1486,10 @@ export function buildFixtures(now: number): Fixtures {
           providerId: plan.source_provider_id,
           option: m.rec.option,
           confidence: m.rec.confidence,
-          options: estimates.filter((e) => e.eligible).map((e) => e.strategy),
+          evidenceOption,
+          evidence: buildStrategyEvidence(vm, plan, kind, estimates, findings, evidenceOption, null, migration.id),
+          similarIncidents: FIXTURE_INCIDENTS[evidenceOption] ?? [],
+          options: eligible,
           status: m.rec.status,
           deterministic: m.rec.deterministic,
           fallback: m.rec.fallback,

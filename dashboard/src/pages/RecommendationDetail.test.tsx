@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { MockServer } from '../api/mock';
 import { strategyRecommendation } from '../api/mockData';
+import { formatBytes } from '../lib/format';
 import { createTestServer, renderWithApp } from '../test/utils';
 import RecommendationDetail from './RecommendationDetail';
 
@@ -24,6 +25,57 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
       ['Recommendation created', 'system:advisor', 'jev-1.13.0', 'Warm migration recommended at 57%'],
       ['Decision: below threshold, default kept', 'policy:global-default', 'jev-1.13.0', 'Cold migration'],
     ]);
+  });
+
+  it('shows the evidence it rests on, those that support or oppose first, each with its source (SDD §16, ADV-02)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const rec = server.recommendations.find((r) => r.id === 'rec-d4e6f8a09001')!;
+    expect(rec.evidence.length).toBeGreaterThan(6);
+    renderRec(rec.id, server);
+    const panel = await screen.findByRole('region', { name: 'Evidence' });
+    expect(panel).toHaveTextContent('Evidence for Warm migration');
+    const list = within(panel).getByRole('list', { name: 'Evidence items' });
+    let items = within(list).getAllByRole('listitem');
+    expect(items).toHaveLength(6);
+    // those that bear on the decision first, each effect in words beside its icon
+    const bearing = rec.evidence.filter((i) => i.effect !== 'context').length;
+    for (const li of items.slice(0, bearing)) expect(li).toHaveTextContent(/^(Supports|Opposes)/);
+    await user.click(within(panel).getByRole('button', { name: `Show all (${rec.evidence.length})` }));
+    items = within(list).getAllByRole('listitem');
+    expect(items).toHaveLength(rec.evidence.length);
+    // the disk size reads as the Inventory page writes it, and links to the VM there
+    const disk = within(list).getByRole('listitem', { name: 'Disk size' });
+    expect(disk).toHaveTextContent(`Context${rec.evidence.find((i) => i.key === 'disk_total')!.display}`);
+    expect(disk).toHaveTextContent(formatBytes(rec.evidence.find((i) => i.key === 'disk_total')!.value as number));
+    expect(within(disk).getByRole('link', { name: 'Inventory' })).toHaveAttribute('href', `/inventory/${rec.provider_id}?vm=${rec.subject.id}`);
+    const findings = within(list).getByRole('listitem', { name: 'Pre-flight findings' });
+    expect(within(findings).getByRole('link', { name: 'Pre-flight' })).toHaveAttribute('href', `/migrations/${rec.migration_id}#findings`);
+    // what memory knew, with each match
+    const incidents = within(panel).getByRole('list', { name: 'Similar past incidents' });
+    expect(within(incidents).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      expect.stringContaining('Warm pass never converged on a busy PostgreSQL VM'),
+      expect.stringContaining('sshd bound to the old fixed IP after migration'),
+    ]);
+    expect(incidents).toHaveTextContent('match 82%');
+  });
+
+  it('says when the evidence was too little for the policy to apply the decision on its own (SDD §14.4, ADV-02)', async () => {
+    const server = createTestServer();
+    const base = server.recommendations.find((r) => r.id === 'rec-d4e6f8a09001')!;
+    const limited = {
+      ...base,
+      id: 'rec-limited00001',
+      evidence: base.evidence.filter((i) => i.key === 'downtime_estimate' || i.effect === 'context'),
+      similar_incidents: [],
+      decision: { ...base.decision, status: 'pending_approval' as const, reason_code: 'INSUFFICIENT_EVIDENCE' as const, final_option: null, policy_id: 'pol-strict' },
+    };
+    server.recommendations.push(limited);
+    renderRec(limited.id, server);
+    const panel = await screen.findByRole('region', { name: 'Evidence' });
+    expect(within(panel).getByRole('note')).toHaveTextContent('Limited evidence: 1 item supports or opposes. The policy in force asks for more before it applies a decision on its own.');
+    expect(within(panel).queryByRole('list', { name: 'Similar past incidents' })).not.toBeInTheDocument();
+    expect(panel).toHaveTextContent('No similar past incident was known when it was recorded.');
   });
 
   it('shows the redacted input and checks its SHA-256 in the browser', async () => {
