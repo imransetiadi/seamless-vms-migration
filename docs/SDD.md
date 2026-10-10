@@ -201,6 +201,7 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        strategy_overrides: dict[str, Strategy] = {},
        selection_policy: "min_downtime"|"simplest_meeting_slo" = "min_downtime",
        downtime_slo_s: int = 600, require_approval: bool = true, auto_cutover: bool = false,
+       require_distinct_approver: bool = true,   # maker-checker: a cutover's requester never counts as its approver (§5.4)
        cutover_window: CutoverWindow|null, keep_warm_interval_s: int = 900,
        convergence_threshold_bytes: int = 1073741824, max_sync_passes: int = 5,
        link_bps: float = 131072000.0, estimator_overrides: dict[str, float] = {},
@@ -241,6 +242,7 @@ AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type
                         plan_id: str|null, migration_id: str|null, provider_id: str|null,   # provider = source
                         model: AdvisorModelInfo, recommendation: RecommendedOption, decision: Decision,
                         input_snapshot_sha256: str|null,                                     # §14.5
+                        requested_by: str|null,       # the user whose plan validation recorded it (§14.6)
                         legacy: bool = false, legacy_text: str|null }                        # §14.4
 
 AdvisorSnapshot { sha256: str (the id), created_at: datetime, payload: dict }   # §14.5, write-once
@@ -250,6 +252,7 @@ AdvisorPolicy { id: str ("pol-…"), name: str (1–200),
                 decision_types: list[DecisionType] = [],                            # none = every type
                 mode: "auto_apply_above_threshold"|"always_require_approval", threshold: float (0..1),
                 min_evidence_for_auto_apply: int (0..100) = 0, require_override_reason: bool = true,
+                require_distinct_approver: bool = true,   # the decision's requester never decides it (§14.6)
                 created_at: datetime, updated_at: datetime, updated_by: str }
 
 Approval { actor: str, at: datetime, comment: str|null }
@@ -266,6 +269,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             downtime_started_at: datetime|null, downtime_ended_at: datetime|null,
             actual_downtime_s: float|null, approvals: list[Approval] = [],
             cutover_requested: bool = false, force_window: bool = false,  # force_window: cutover window bypass granted with the request; persisted, so a restart keeps it
+            cutover_requested_by: str|null, cutover_requested_at: datetime|null,  # who asked for the cutover first, and when (§5.4)
             advisor_notes: list[AdvisorNote] = [],
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             review_required: bool = false, review_reason: str|null,
@@ -331,7 +335,7 @@ while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at`
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
 it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
-granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
+granted with it (`cutover_requested` with its requester, `force_window`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change). A retry in a
 `completed` plan (a plan completes with a rolled-back migration, which is wave-complete, §8) reopens the plan:
 under the plan's lock it becomes `running` again (event `plan.updated`, data `{"status": "running"}`), so
@@ -375,7 +379,8 @@ Otherwise another delta pass runs.
 A migration in `awaiting_cutover` (warm) or `ready` with a single-shot strategy whose wave is
 active enters `cutover` when all hold:
 
-1. `not plan.require_approval` **or** `len(approvals) >= 1`;
+1. `not plan.require_approval` **or** at least one approval counts — every approval does, except, when
+   `plan.require_distinct_approver` is set, one by the user who requested the cutover (`cutover_requested_by`);
 2. `cutover_window is None` **or** now ∈ [start, end] — bypassed while `Migration.force_window` is set (`POST …/cutover {"force_window": true}`);
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
@@ -384,7 +389,13 @@ A migration whose advisor decision waits for approval (`advisor_hold`, §14.6) s
 nor its cutover until the decision is approved or overridden; the plan runs its other migrations meanwhile,
 and no timeout ever applies the advice.
 
-`POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`. A
+`POST /migrations/{id}/cutover` (approver) sets `cutover_requested` with `cutover_requested_by` and
+`cutover_requested_at` — the first request's user and time; a repeated request keeps them — and, only when the plan
+does not require a distinct approver, records an approval too. With `plan.require_distinct_approver` (default true;
+maker-checker, ADV-17) the requester's approval never counts: `POST …/approve` by the requester answers 409 "You
+requested this cutover. Another approver must approve it.", and an approval the requester gave before requesting
+stays in the history without counting. There is no self-approval for emergencies (break-glass is off,
+`TODO(ADV-17): confirm`). A
 repeated request records another approval and may add `force_window` — an approver can force a
 requested cutover that waits for a closed window — but never clears one. `POST …/approve` is accepted
 in `pending`, `validating`, `blocked`, `ready`, `precopy`, `syncing`, `awaiting_cutover`, `failed` and
@@ -397,7 +408,7 @@ delta pass whenever the last pass ended more than `plan.keep_warm_interval_s` ag
 grow the migration without bound: when a pass takes the list past that, the oldest pass in between is
 dropped and its `bytes_transferred` moves to `sync_bytes_dropped`. `bytes_transferred` stays the total
 (`sync_bytes_dropped` plus the listed passes), and pass numbers keep counting from the last one.
-Approvals, `cutover_requested` and a pending `force_window` belong to the assessment they were given
+Approvals, `cutover_requested` (with its requester) and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one that an interrupted validation left in `validating` (a write that failed
@@ -1101,15 +1112,15 @@ such lists again on persisted migration events.
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
 | POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
-| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry; resets status to `draft`); setting `require_approval`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
+| PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry; resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0); creation order | `Migration[]` |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
-| POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` |
-| POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` |
+| POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester when the plan requires a distinct approver, §5.4) |
+| POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
@@ -1123,7 +1134,7 @@ such lists again on persisted migration events.
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
-| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, or nothing usable or eligible to approve; §14.6) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, nothing usable or eligible to approve, or the decision's requester when the policy in force requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the policy in force requires one, 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
@@ -1418,7 +1429,8 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   then global ones (both scope lists empty); when none matches, the built-in `global-default`
   (`auto_apply_above_threshold`, threshold `SEAMLESS_JEV_MIN_CONFIDENCE`, minimum evidence 0, no override
   reason). Within one level the strictest wins: `always_require_approval` before `auto_apply_above_threshold`,
-  then the higher threshold, the higher minimum evidence, a required override reason, the lower id. (The
+  then the higher threshold, the higher minimum evidence, a required override reason, a required distinct approver,
+  the lower id. (The
   spec's plan tags and environments do not exist in this product: plans and providers stand in for them,
   `TODO(ADV-04): confirm`.) Until evidence exists (ADV-02) the evidence count is 0, so stored policies default
   to a minimum of 0.
@@ -1434,10 +1446,17 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
   `PUT …/strategy`, so a later validation keeps it.
+* **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
+  (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
+  built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
+  decision. Another approver must decide it." A legacy entry or one without a requester has no such restriction.
 * **Policies** are created, replaced and deleted by `advisor.policy.manage` (§12), each change audited (§14.5);
   a change applies from the next validation and never rewrites a decision.
 * **Demo**: the server seeds "Finance — approval required" for the finance source provider
   (`always_require_approval`, override reason required); the dashboard mock seeds it for its DC1 provider.
+  Approvals in the seeds read as an operator would write them: the server's VMware plan has cutovers requested by
+  one user and approved by another, with comments, and a test keeps placeholder strings (such as `demo46`) out of
+  both seeds.
 
 ---
 
@@ -1553,7 +1572,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   paused plan too) says before it runs that the plan returns to draft and must be validated again, which clears
   approvals and cutover requests — Edit reopens the plan
   form prefilled and sends only the changed fields as `PATCH`, in `draft`/`validated` only; in the plan form, new or
-  edited, the approval policy — Require approval,
+  edited, the approval policy — Require approval, Distinct approver (the requester never approves their own
+  cutover, §5.4),
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
   (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
@@ -1573,7 +1593,10 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
   requires typing the VM name; Cancel says that the data copied so far is removed when the migration
   has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
-  completed, that the retry reopens it (§5.1); Approve is offered where an approval lasts (from `ready` until the cutover
+  completed, that the retry reopens it (§5.1); the approvals list the cutover request and each approval in time
+  order — "Requested by {user}", "Approved by {user}" with its comment — and say when an approval does not count
+  (the requester's own, §5.4); Approve is unavailable to the cutover's requester when the plan requires a distinct
+  approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
   cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
@@ -1610,7 +1633,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Details" with
   the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
   its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`) offers
-  Approve and Override — others see neither — and Override opens a dialog: another eligible option and the
+  Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
+  when the policy requires a distinct approver (§14.6) — and Override opens a dialog: another eligible option and the
   reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
   "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
   `/advisor/policies` lists the policies and the built-in default, and `advisor.policy.manage` creates, edits and
