@@ -24,6 +24,8 @@ const ROUTES: Array<[string, string]> = [
   ['/inventory/rhoso-prod', 'Inventory'],
   ['/events', 'Events'],
   ['/advisor', 'Advisor'],
+  ['/advisor/audit', 'Advisor audit'],
+  ['/advisor/recommendations/rec-d4e6f8a09001', 'Migration strategy: static-cdn-01'],
   ['/login', 'Sign in'],
 ];
 
@@ -54,7 +56,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
@@ -69,6 +71,16 @@ describe('axe-core: no WCAG violations', () => {
     renderAt(path);
     expect(await screen.findByRole('heading', { level: 1, name: heading }, { timeout: 8_000 })).toBeInTheDocument();
     await settled();
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a recommendation's input tab", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/advisor/recommendations/rec-d4e6f8a09001');
+    await screen.findByRole('heading', { level: 1, name: 'Migration strategy: static-cdn-01' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('tab', { name: 'Input' }));
+    await screen.findByText(/matches its SHA-256/i);
     expect(await violations()).toEqual([]);
   }, 30_000);
 

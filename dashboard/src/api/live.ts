@@ -165,6 +165,13 @@ export function applyEventToCache(
     }
   }
 
+  if (kind.startsWith('recommendation.') || kind.startsWith('decision.')) {
+    // an audit event (SDD §14.5): the feed, a recommendation's detail and the audit lists
+    invalidate(['advisor', 'recommendations']);
+    invalidate(['events', 'tail']);
+    if (event.migration_id) invalidate(['migration', event.migration_id]);
+    return;
+  }
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {
     // advisor.strategy announces a recorded recommendation (SDD §14.4)
     if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);

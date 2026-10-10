@@ -37,6 +37,9 @@ function RecommendationItem({ rec, showSubject }: { rec: AdvisorRecommendation; 
         <time dateTime={rec.created_at} title={formatDateTime(rec.created_at)} className="text-muted-foreground">
           {formatRelative(rec.created_at)}
         </time>
+        <Link to={`/advisor/recommendations/${encodeURIComponent(rec.id)}`} className="ml-auto underline underline-offset-4">
+          Details<span className="sr-only"> for {rec.subject.name}</span>
+        </Link>
       </div>
       <p className="mt-1 wrap-break-word text-sm text-muted-foreground">Recommended: {recommendedText(rec)}</p>
       <p className="mt-0.5 wrap-break-word text-sm font-medium text-foreground">Decision: {decisionText(rec)}</p>

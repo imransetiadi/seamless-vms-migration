@@ -120,6 +120,7 @@ describe('Advisor page', () => {
           options: ['cold', 'warm'],
           status: 'auto_applied',
           deterministic: 'warm',
+          snapshotSha256: null,
         }),
       );
     }
@@ -145,5 +146,14 @@ describe('Advisor page', () => {
     renderWithApp(<Advisor />, { token: 'viewer', server });
     expect(await screen.findByText(/recommendations are unavailable/i)).toBeInTheDocument();
     expect(screen.queryByText('No recommendations yet.')).not.toBeInTheDocument();
+  });
+
+  it('links to the audit trail and every recommendation to its detail (SDD §16, ADV-05)', async () => {
+    renderWithApp(<Advisor />, { token: 'viewer' });
+    expect(await screen.findByRole('link', { name: /audit trail/i })).toHaveAttribute('href', '/advisor/audit');
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByText('Decision: Cold — below threshold (57% < 60%)');
+    expect(within(feed).getByRole('link', { name: 'Details for static-cdn-01' })).toHaveAttribute('href', '/advisor/recommendations/rec-d4e6f8a09001');
+    expect(within(feed).getByRole('link', { name: 'Details for analytics-node-1' })).toHaveAttribute('href', '/advisor/recommendations/rec-legacy-mig-b2c4d6e870-0');
   });
 });

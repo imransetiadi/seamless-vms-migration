@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
+import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { createMockFetch, MockServer } from './mock';
 import { streamEvents } from './stream';
 import {
   ADVISOR_NOTE_KINDS,
+  AUDIT_EVENT_KINDS,
   ADVISOR_NOTE_SOURCES,
   PHASES,
   PLAN_STATUSES,
@@ -943,6 +945,34 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
   });
 });
 
+describe('mock audit trail, like the API (SDD §14.5)', () => {
+  it('lists only audit events with audit=true, newest last', async () => {
+    const { client } = setup('viewer');
+    const audit = await client.get<Event[]>('/events', { query: { audit: true, tail: true, limit: 1000 } });
+    expect(audit.length).toBeGreaterThan(0);
+    expect(audit.every((e) => (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind))).toBe(true);
+    expect(audit.map((e) => e.seq)).toEqual([...audit.map((e) => e.seq)].sort((a, b) => a - b));
+  });
+
+  it('seeds one recommendation.created and exactly one decision event per stored recommendation', () => {
+    const server = new MockServer({ now: () => NOW });
+    for (const rec of server.recommendations) {
+      const mine = server.events.filter((e) => e.data.target_id === rec.id);
+      expect(mine.map((e) => e.kind), rec.id).toEqual(['recommendation.created', rec.decision.status === 'fallback_rules' ? 'decision.fallback' : `decision.${rec.decision.status}`]);
+      expect(server.snapshots.has(rec.input_snapshot_sha256!), rec.id).toBe(true);
+    }
+  });
+
+  it('serves an input snapshot anyone can re-hash, 404 unknown, 422 malformed', async () => {
+    const { server, client } = setup('viewer');
+    const sha = server.recommendations[0]!.input_snapshot_sha256!;
+    const snapshot = await client.get<{ sha256: string; payload: unknown }>(`/advisor/snapshots/${sha}`);
+    expect(sha256Hex(canonicalJson(snapshot.payload))).toBe(sha);
+    await expect(client.get(`/advisor/snapshots/${'0'.repeat(64)}`)).rejects.toMatchObject({ status: 404 });
+    await expect(client.get('/advisor/snapshots/not-a-hash')).rejects.toMatchObject({ status: 422 });
+  });
+});
+
 describe('mock validation decides like the API (SDD §14.4)', () => {
   function validating(advice: { option: string | null; confidence: number | null }) {
     const advise = vi.fn(() => advice);
@@ -972,10 +1002,24 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
       decision: { final_option: 'cold', status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
     });
     expect(db.strategy).toBe('cold');
-    expect(server.events.filter((e) => e.kind === 'advisor.strategy').at(-1)).toMatchObject({
-      migration_id: db.id,
-      data: { recommendation_id: rec!.id, option: 'cold', confidence: 0.8, final_option: 'cold', status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY' },
+    // SDD §14.5: recommendation.created, then exactly one decision event; advisor.strategy is gone
+    const audit = server.events.filter((e) => e.migration_id === db.id && (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind));
+    expect(audit.map((e) => [e.kind, e.actor])).toEqual([
+      ['recommendation.created', 'system:advisor'],
+      ['decision.auto_applied', 'policy:global-default'],
+    ]);
+    expect(audit[0]!.data).toMatchObject({ target_id: rec!.id, model_version: 'jev-1.13.0', option: 'cold', confidence: 0.8, snapshot_sha256: rec!.input_snapshot_sha256 });
+    expect(audit[1]!.data).toEqual({
+      target_id: rec!.id,
+      model_version: 'jev-1.13.0',
+      before: null,
+      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
     });
+    expect(server.events.filter((e) => e.migration_id === db.id && e.kind === 'advisor.strategy')).toEqual([]);
+    // the input snapshot is named by the SHA-256 of its canonical JSON
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(sha256Hex(canonicalJson(snapshot.payload))).toBe(snapshot.sha256);
+    expect(snapshot.payload).toMatchObject({ tool: 'jev_decide', scope: ['cold', 'warm'], deterministic: 'warm' });
   });
 
   it('keeps the deterministic choice when the confidence is below the threshold', async () => {

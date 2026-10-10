@@ -389,9 +389,18 @@ export interface AdvisorRecommendation {
   model: AdvisorModelInfo;
   recommendation: RecommendedOption;
   decision: Decision;
+  /** The redacted input the recommendation rests on, an `AdvisorSnapshot` (SDD §14.5). */
+  input_snapshot_sha256: string | null;
   /** A strategy note written before recommendations existed, read as one (SDD §14.4). */
   legacy: boolean;
   legacy_text: string | null;
+}
+
+/** A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5). */
+export interface AdvisorSnapshot {
+  sha256: string;
+  created_at: Timestamp;
+  payload: Record<string, unknown>;
 }
 
 export interface Approval {
@@ -489,6 +498,18 @@ export const PERSISTED_EVENT_KINDS = [
   'decision.fallback',
 ] as const;
 export type PersistedEventKind = (typeof PERSISTED_EVENT_KINDS)[number];
+
+/** The audit events: who decided what, when, with which model version (SDD §14.5). */
+export const AUDIT_EVENT_KINDS = [
+  'recommendation.created',
+  'decision.auto_applied',
+  'decision.pending_approval',
+  'decision.approved',
+  'decision.overridden',
+  'decision.below_threshold',
+  'decision.fallback',
+] as const;
+export type AuditEventKind = (typeof AUDIT_EVENT_KINDS)[number];
 
 /** Bus/SSE only, never stored; delivered with SSE `id: 0`. */
 export const EPHEMERAL_EVENT_KINDS = ['migration.progress', 'migration.log', 'heartbeat'] as const;
@@ -655,6 +676,8 @@ export interface EventListQuery {
   limit?: number;
   /** The newest `limit` matching events instead of the first, still ascending (SDD §12). */
   tail?: boolean;
+  /** Only the audit events (SDD §14.5). */
+  audit?: boolean;
 }
 
 export interface ThroughputPoint {

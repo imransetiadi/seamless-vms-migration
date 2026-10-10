@@ -1,4 +1,5 @@
-import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, Search, SearchX } from 'lucide-react';
+import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { useId, useMemo, useState, type FormEvent } from 'react';
 import { useAdvisorStatus, useMigrations, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
@@ -14,6 +15,7 @@ import { RecommendationList, RecommendationPager } from '../components/Recommend
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
 import { nonStrategyNotes } from '../lib/advisor';
+import { buttonClassName } from '../lib/buttonStyles';
 import { formatPct } from '../lib/format';
 import { hasRole } from '../lib/roles';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -119,6 +121,12 @@ export default function Advisor() {
       <PageHeader
         title="Advisor"
         description="Jev gives bounded, evidence-based judgments (strategy ties, workload tiers, verification review, console screening); agentmemory recalls what happened in past migrations. Both are optional and advisory."
+        actions={
+          <Link to="/advisor/audit" className={buttonClassName('secondary', 'md')}>
+            <ScrollText aria-hidden className="size-4 shrink-0" />
+            Audit trail
+          </Link>
+        }
       />
 
       {status.isPending && <LoadingBlock label="Checking advisor services…" rows={2} />}

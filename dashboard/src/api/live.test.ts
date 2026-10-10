@@ -143,6 +143,16 @@ describe('applyEventToCache', () => {
     expect(invalidate).toHaveBeenCalledWith(['providers']);
   });
 
+  it('refreshes the recommendations and the audit lists on an audit event (SDD §14.5)', () => {
+    for (const kind of ['recommendation.created', 'decision.overridden']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 46, kind }, invalidate);
+      expect(invalidate, kind).toHaveBeenCalledWith(['advisor', 'recommendations']);
+      expect(invalidate, kind).toHaveBeenCalledWith(['events', 'tail']);
+      expect(invalidate, kind).toHaveBeenCalledWith(['migration', migration.id]);
+    }
+  });
+
   it('refreshes the recommendations when an advisor event says one was recorded, and only then (SDD §14.4)', () => {
     const { queryClient, invalidate } = setup();
     applyEventToCache(queryClient, { ...progressEvent({ recommendation_id: 'rec-000000000001' }), seq: 44, kind: 'advisor.strategy' }, invalidate);

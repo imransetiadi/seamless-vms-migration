@@ -12,6 +12,8 @@ import {
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
 import type {
+  AdvisorRecommendation,
+  AdvisorSnapshot,
   AdvisorStatus,
   ApproveRequest,
   AutoWavesRequest,
@@ -67,6 +69,9 @@ export const queryKeys = {
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
   recommendations: (query: RecommendationListQuery = {}) => ['advisor', 'recommendations', query] as const,
+  /** Under `recommendations`, so a refresh of the list refreshes it too. */
+  recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
+  snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
 };
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
@@ -217,6 +222,29 @@ export function useRecommendations(query: RecommendationListQuery = {}, options:
   });
 }
 
+/** `GET /advisor/recommendations/{id}`: one recommendation, a legacy one too (SDD §12). */
+export function useRecommendation(recId: string | undefined) {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.recommendation(recId ?? ''),
+    queryFn: ({ signal }) => api.get<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId ?? '')}`, { signal }),
+    enabled: Boolean(recId),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/snapshots/{sha256}`: a redacted advisor input; it never changes (SDD §14.5). */
+export function useSnapshot(sha256: string | null | undefined) {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.snapshot(sha256 ?? ''),
+    queryFn: ({ signal }) => api.get<AdvisorSnapshot>(`/advisor/snapshots/${enc(sha256 ?? '')}`, { signal }),
+    enabled: Boolean(sha256),
+    staleTime: Infinity,
+    retry: noRetryOnClientErrors,
+  });
+}
+
 /** `GET /events` returns at most 1000 events per request (SDD §12). */
 const EVENT_LIMIT = 1000;
 
@@ -232,7 +260,7 @@ export async function fetchEventTail(
 ): Promise<Event[]> {
   return api.get<Event[]>('/events', {
     signal,
-    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id },
+    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id, audit: query.audit || undefined },
   });
 }
 

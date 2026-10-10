@@ -30,6 +30,7 @@ function rec(
       decided_at: AT,
       ...decision,
     },
+    input_snapshot_sha256: null,
     legacy: false,
     legacy_text: null,
     ...extra,

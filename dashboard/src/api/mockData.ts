@@ -7,6 +7,7 @@
 import type {
   AdvisorNote,
   AdvisorRecommendation,
+  AdvisorSnapshot,
   DestinationInventory,
   Disk,
   Estimate,
@@ -24,6 +25,7 @@ import type {
   SyncPass,
   VMRef,
 } from './types';
+import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 
@@ -60,6 +62,8 @@ export interface StrategyRecommendationInput {
   deterministic: Strategy;
   /** Why there was no usable advice (fallback). */
   fallback?: string;
+  /** The input snapshot the recommendation rests on (SDD §14.5). */
+  snapshotSha256: string | null;
 }
 
 /** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
@@ -83,6 +87,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
       ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
       : { name: 'jev', version: JEV_MODEL, deployment: 'unknown', endpoint_host: null },
     recommendation: { option, confidence, distribution },
+    input_snapshot_sha256: input.snapshotSha256,
     decision: {
       final_option: status === 'auto_applied' ? option : input.deterministic,
       status,
@@ -98,15 +103,91 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
   };
 }
 
-/** The `advisor.strategy` event the API emits for a recorded recommendation (SDD §4.3, §14.4). */
-export function strategyEventOf(rec: AdvisorRecommendation): Pick<Event, 'kind' | 'message' | 'data'> {
+/** The audit events the API emits for a recorded recommendation: created, then its decision (SDD §14.5). */
+export function auditEventsOf(rec: AdvisorRecommendation): Array<Pick<Event, 'kind' | 'message' | 'actor' | 'data'>> {
   const { option, confidence } = rec.recommendation;
-  const { final_option: final, status, reason_code } = rec.decision;
-  return {
-    kind: 'advisor.strategy',
-    message: `${rec.subject.name}: recommended ${option ?? 'nothing'} (${confidence === null ? 'no confidence' : `${Math.round(confidence * 100)}%`}); decision ${final ?? 'pending'} (${status})`,
-    data: { recommendation_id: rec.id, option, confidence, final_option: final, status, reason_code },
+  const d = rec.decision;
+  const actor = `${d.actor.kind}:${d.actor.id}`;
+  return [
+    {
+      kind: 'recommendation.created',
+      message: `${rec.subject.name}: recommended ${option ?? 'nothing'} (${confidence === null ? 'no confidence' : `${Math.round(confidence * 100)}%`})`,
+      actor: 'system:advisor',
+      data: {
+        target_id: rec.id,
+        model_version: rec.model.version,
+        decision_type: rec.decision_type,
+        subject: rec.subject,
+        option,
+        confidence,
+        snapshot_sha256: rec.input_snapshot_sha256,
+      },
+    },
+    {
+      kind: d.status === 'fallback_rules' ? 'decision.fallback' : `decision.${d.status}`,
+      message: `${rec.subject.name}: decision ${d.final_option ?? 'pending'} (${d.status}) by ${actor}`,
+      actor,
+      data: {
+        target_id: rec.id,
+        model_version: rec.model.version,
+        before: null,
+        after: { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used },
+      },
+    },
+  ];
+}
+
+/** The API's STRATEGY_REQUIREMENTS. */
+const STRATEGY_REQUIREMENTS = ['Estimated downtime is within the SLO', 'The source VM keeps running until cutover'];
+
+/** One-line strategy descriptions offered to Jev as candidates (demo copy of the API's). */
+const CANDIDATE_DESCRIPTIONS: Record<Strategy, string> = {
+  cold: 'Stop the VM, copy every disk, boot it on RHOSO: downtime grows with the used data.',
+  warm: 'Copy snapshots while the VM runs, then stop it and sync only changed blocks.',
+  storage_handover: 'Hand the volumes over in the shared storage without copying: a metadata-only cutover.',
+  vmware_cold: 'Stop the VMware VM and convert every disk with virt-v2v.',
+  vmware_warm: 'Copy with CBT while the VMware VM runs, then a final delta after shutdown.',
+};
+
+/** The advisor's input for a strategy choice, as the API snapshots it (SDD §14.5): the jev_decide arguments and the scope. */
+export function strategySnapshot(input: {
+  vm: VMRef;
+  plan: Plan;
+  estimates: Estimate[];
+  findings: Finding[];
+  scope: readonly string[];
+  deterministic: Strategy;
+  at: string;
+}): AdvisorSnapshot {
+  const { vm, plan, estimates, findings } = input;
+  const gib = (bytes: number) => `${(bytes / GiB).toFixed(1)} GiB`;
+  const disks = vm.disks
+    .map((d) => `${d.kind} ${d.size_gb} GiB${d.volume_type ? ` type ${d.volume_type}` : ''}${d.multiattach ? ' multi-attach' : ''}${d.encrypted ? ' encrypted' : ''}${d.independent ? ' independent' : ''}`)
+    .join('; ');
+  const rate = vm.change_rate_bps != null ? `${(vm.change_rate_bps / MiB).toFixed(1)} MiB/s measured` : 'unknown (default 2 MiB/s assumed)';
+  const estimateText = estimates
+    .map((e) => `${e.strategy}: downtime ${Math.round(e.downtime_s)} s, pre-copy ${Math.round(e.precopy_s)} s over ${e.passes} pass(es), ${e.eligible ? 'eligible' : `INELIGIBLE (${e.reasons.join('; ')})`}`)
+    .join('; ');
+  const eligible = estimates.filter((e) => e.eligible);
+  const payload = {
+    tool: 'jev_decide',
+    arguments: {
+      decision: `Which migration strategy should be used for VM ${vm.name} moving to RHOSO 18.0?`,
+      evidence:
+        `VM ${vm.name}: ${vm.vcpus} vCPU, ${vm.ram_mb} MB RAM, ${vm.disks.length} disk(s) [${disks}], provisioned ${gib(vm.disk_bytes)}, used ${gib(vm.used_bytes)}. ` +
+        `Guest write rate ${rate}. Downtime SLO ${plan.downtime_slo_s} s. Link ${Math.round(plan.link_bps / MiB)} MiB/s. ` +
+        `Findings: ${findings.map((f) => `${f.code} (${f.severity})`).join(', ') || 'none'}. Estimates: ${estimateText}.`,
+      priorities: `Minimize downtime within the SLO of ${plan.downtime_slo_s} s; prefer the simpler strategy when downtimes differ by less than 10 %; never pick an ineligible strategy`,
+      candidates: eligible.map((e) => ({ id: e.strategy, description: CANDIDATE_DESCRIPTIONS[e.strategy] })),
+      requirements: STRATEGY_REQUIREMENTS,
+      escalate_on_contradiction: true,
+    },
+    scope: [...input.scope],
+    options: eligible.map((e) => e.strategy),
+    deterministic: input.deterministic,
+    deterministic_reason: `${input.deterministic}: the deterministic choice of the selection policy`,
   };
+  return { sha256: sha256Hex(canonicalJson(payload)), created_at: input.at, payload };
 }
 
 export function iso(ms: number): string {
@@ -1043,6 +1124,8 @@ export interface Fixtures {
   migrations: Migration[];
   /** Stored recommendations (document kind `recommendation`, SDD §14.4). */
   recommendations: AdvisorRecommendation[];
+  /** Redacted advisor inputs (document kind `advisor_snapshot`, SDD §14.5). */
+  snapshots: AdvisorSnapshot[];
   events: Event[];
 }
 
@@ -1052,6 +1135,7 @@ export function buildFixtures(now: number): Fixtures {
   const plans: Plan[] = [];
   const migrations: Migration[] = [];
   const recommendations: AdvisorRecommendation[] = [];
+  const snapshots: AdvisorSnapshot[] = [];
   const pending: Array<Omit<Event, 'seq'>> = [];
   const emit = (e: Omit<Event, 'seq'>) => pending.push(e);
 
@@ -1190,6 +1274,8 @@ export function buildFixtures(now: number): Fixtures {
       if (m.rec) {
         // recorded when the validation ended (SDD §14.4)
         const validated = history.find((c) => c.from_phase === 'validating')?.at ?? iso(migCreatedAt);
+        const snapshot = strategySnapshot({ vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated });
+        snapshots.push(snapshot);
         const rec = strategyRecommendation({
           id: `rec-${m.id.slice(4)}01`,
           at: validated,
@@ -1201,9 +1287,10 @@ export function buildFixtures(now: number): Fixtures {
           status: m.rec.status,
           deterministic: m.rec.deterministic,
           fallback: m.rec.fallback,
+          snapshotSha256: snapshot.sha256,
         });
         recommendations.push(rec);
-        emit({ ts: validated, plan_id: plan.id, migration_id: m.id, actor: 'advisor', ...strategyEventOf(rec) });
+        for (const event of auditEventsOf(rec)) emit({ ts: validated, plan_id: plan.id, migration_id: m.id, ...event });
       }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;
@@ -1235,5 +1322,5 @@ export function buildFixtures(now: number): Fixtures {
 
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
-  return { providers, inventories, plans, migrations, recommendations, events };
+  return { providers, inventories, plans, migrations, recommendations, snapshots, events };
 }

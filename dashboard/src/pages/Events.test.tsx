@@ -269,4 +269,13 @@ describe('Events page', () => {
       click.mockRestore();
     }
   });
+
+  it('lists the audit events under Advisor and memory (SDD §14.5)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Events />, { route: '/events', token: 'viewer' });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await user.selectOptions(screen.getByLabelText('Category'), 'advisor');
+    expect(await within(list).findByText('static-cdn-01: decision cold (below_threshold) by policy:global-default')).toBeInTheDocument();
+    expect(within(list).getByText('static-cdn-01: recommended warm (57%)')).toBeInTheDocument();
+  });
 });

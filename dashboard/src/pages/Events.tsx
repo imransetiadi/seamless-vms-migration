@@ -4,6 +4,7 @@ import {
   Bot,
   Download,
   BrainCircuit,
+  Gavel,
   CircleX,
   ClipboardList,
   Hand,
@@ -45,7 +46,12 @@ const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) =>
   { value: 'all', label: 'All', match: () => true },
   { value: 'migrations', label: 'Migrations', match: (k) => k.startsWith('migration.') },
   { value: 'plans', label: 'Plans and waves', match: (k) => k.startsWith('plan.') || k.startsWith('wave.') },
-  { value: 'advisor', label: 'Advisor and memory', match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') },
+  {
+    value: 'advisor',
+    label: 'Advisor and memory',
+    // the advisor's audit events (SDD §14.5) are advisor activity too
+    match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.'),
+  },
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
   { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') },
 ];
@@ -77,7 +83,8 @@ function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
     default:
       if (kind.startsWith('plan.')) return { icon: ClipboardList, tone: 'info' };
       if (kind.startsWith('wave.')) return { icon: Rows3, tone: 'info' };
-      if (kind.startsWith('advisor.')) return { icon: Bot, tone: 'info' };
+      if (kind.startsWith('advisor.') || kind.startsWith('recommendation.')) return { icon: Bot, tone: 'info' };
+      if (kind.startsWith('decision.')) return { icon: Gavel, tone: 'info' };
       if (kind.startsWith('memory.')) return { icon: BrainCircuit, tone: 'info' };
       if (kind.startsWith('provider.')) return { icon: Server, tone: 'neutral' };
       return { icon: Activity, tone: 'neutral' };

@@ -27,13 +27,15 @@ import {
   MiB,
   preflight,
   prng,
-  strategyEventOf,
+  auditEventsOf,
   strategyRecommendation,
+  strategySnapshot,
   type StrategyDecision,
 } from './mockData';
 import type {
   Health,
   AdvisorRecommendation,
+  AdvisorSnapshot,
   AdvisorStatus,
   DecisionType,
   DestinationInventory,
@@ -58,6 +60,7 @@ import {
   ACTION_TEXT_MAX,
   ADVISOR_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
+  AUDIT_EVENT_KINDS,
   DECISION_TYPES,
   PHASES,
   PLAN_DESCRIPTION_MAX,
@@ -191,6 +194,7 @@ function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
           distribution: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
         },
         decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
+        input_snapshot_sha256: null,
         legacy: true,
         legacy_text: note.summary,
       };
@@ -256,6 +260,8 @@ export class MockServer {
   readonly migrations: Migration[];
   /** Stored recommendations; strategy notes of earlier versions are listed beside them (SDD §14.4). */
   readonly recommendations: AdvisorRecommendation[];
+  /** Redacted advisor inputs by SHA-256, written once (SDD §14.5). */
+  readonly snapshots: Map<string, AdvisorSnapshot>;
   readonly events: Event[];
   private seq: number;
   private readonly advise: NonNullable<MockServerOptions['advise']>;
@@ -279,6 +285,7 @@ export class MockServer {
     this.plans = fixtures.plans;
     this.migrations = fixtures.migrations;
     this.recommendations = fixtures.recommendations;
+    this.snapshots = new Map(fixtures.snapshots.map((snapshot) => [snapshot.sha256, snapshot]));
     this.events = fixtures.events;
     this.seq = this.events.at(-1)?.seq ?? 0;
     this.advise = options.advise ?? simulatedAdvice;
@@ -664,8 +671,9 @@ export class MockServer {
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
     if (rec) {
+      // like the API (SDD §14.5): recommendation.created, then the first decision event
       this.recommendations.push(rec);
-      this.emit({ plan_id: plan.id, migration_id: m.id, actor: 'advisor', ...strategyEventOf(rec) });
+      for (const event of auditEventsOf(rec)) this.emit({ plan_id: plan.id, migration_id: m.id, ...event });
     }
   }
 
@@ -682,6 +690,9 @@ export class MockServer {
     const { status, fallback } = decided(advice, scope);
     const at = new Date(this.now()).toISOString();
     const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
+    // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
+    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at });
+    if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
     const rec = strategyRecommendation({
       id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,
       at,
@@ -693,6 +704,7 @@ export class MockServer {
       status,
       deterministic: m.strategy,
       fallback,
+      snapshotSha256: snapshot.sha256,
     });
     const final = rec.decision.final_option as Strategy;
     m.strategy = final;
@@ -895,8 +907,14 @@ export class MockServer {
       const limit = Math.min(1000, Math.max(1, Number(query.get('limit') ?? 500) || 500));
       const planId = query.get('plan_id');
       const migrationId = query.get('migration_id');
+      // audit: only the audit events (SDD §14.5)
+      const audit = query.get('audit') === 'true';
       const matching = this.events.filter(
-        (e) => e.seq > since && (!planId || e.plan_id === planId) && (!migrationId || e.migration_id === migrationId),
+        (e) =>
+          e.seq > since &&
+          (!planId || e.plan_id === planId) &&
+          (!migrationId || e.migration_id === migrationId) &&
+          (!audit || (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind)),
       );
       // tail: the newest `limit` matching events instead of the first, still ascending (SDD §12)
       return ok(query.get('tail') === 'true' ? matching.slice(-limit) : matching.slice(0, limit));
@@ -915,6 +933,13 @@ export class MockServer {
           memory: { enabled: true, available: true, last_error: 'Timed out after 5 s (recovered on retry)' },
         };
         return ok(status);
+      }
+      if (id === 'snapshots' && sub !== undefined && method === 'GET') {
+        this.require(token, 'viewer', path);
+        if (!/^[0-9a-f]{64}$/.test(sub)) throw new HttpError(422, 'validation_error', "sha256: String should match pattern '^[0-9a-f]{64}$'");
+        const snapshot = this.snapshots.get(sub);
+        if (!snapshot) throw new HttpError(404, 'not_found', `advisor_snapshot ${sub} not found`);
+        return ok(snapshot);
       }
       if (id === 'recommendations' && method === 'GET') {
         this.require(token, 'viewer', path);
