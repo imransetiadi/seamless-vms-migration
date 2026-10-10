@@ -11,7 +11,8 @@ P = Phase
 
 TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     P.pending: frozenset({P.validating, P.cancelled}),
-    P.validating: frozenset({P.ready, P.blocked, P.failed}),
+    # cancelled: only by a validation, for a leftover whose VM left vm_ids (SDD §5.1, §5.4)
+    P.validating: frozenset({P.ready, P.blocked, P.failed, P.cancelled}),
     P.blocked: frozenset({P.validating, P.cancelled}),
     P.ready: frozenset({P.precopy, P.cutover, P.validating, P.cancelled}),
     P.precopy: frozenset({P.syncing, P.awaiting_cutover, P.failed, P.cancelled}),

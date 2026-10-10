@@ -307,6 +307,53 @@ async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_valid
     assert (await h.plan(plan.id)).status == PlanStatus.validated
 
 
+async def _left_validating(tmp_path, store):
+    """A plan of two VMs whose first validation failed between vm-2's two writes (SDD §5.4)."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    transition = h.orch._transition
+    failed: list[str] = []
+
+    async def failing_transition(m, version, to, reason, actor="system", data=None):
+        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
+            failed.append(m.id)
+            raise ConnectionError("database connection lost")
+        return await transition(m, version, to, reason, actor, data)
+
+    h.orch._transition = failing_transition
+    with pytest.raises(ConnectionError):
+        await h.orch.validate_plan(plan.id, "alice")
+    stuck = await h.by_vm(plan.id, "vm-2")
+    assert stuck.phase == P.validating
+    return h, plan, stuck
+
+
+async def test_validation_cancels_a_removed_vms_leftover_in_validating(tmp_path, store):
+    """SDD §5.1/§5.4: once its VM left vm_ids, a migration an interrupted validation left in
+    validating is cancelled by the next validation - otherwise it held the VM for good, with no
+    action to release it - and another plan can take the VM."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
+    edited = await h.plan(plan.id)
+    edited.vm_ids = ["vm-1"]
+    store.put("plan", edited)
+    await h.orch.validate_plan(plan.id, "alice")
+    left = await h.migration(stuck.id)
+    assert left.phase == P.cancelled
+    assert left.phase_history[-1].reason == "cancelled: removed from the plan"
+    other = plan_for([vm(2)], name="Second wave")
+    store.put("plan", other)
+    report = await h.orch.validate_plan(other.id, "alice")
+    assert [item.phase for item in report.migrations] == [P.ready], "the VM is free again"
+
+
+async def test_the_cancel_action_refuses_a_migration_in_validating(tmp_path, store):
+    """SDD §5.1: a validation may be moving a migration in validating, so the cancel action
+    refuses it and says to validate the plan again."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
+    with pytest.raises(NotAllowed, match="validate the plan again"):
+        await h.orch.cancel(stuck.id, "alice")
+    assert (await h.migration(stuck.id)).phase == P.validating
+
+
 async def test_validate_cleans_up_a_removed_vms_warm_data_path(tmp_path, store):
     """SDD §5.1/§5.4: validation cancels a removed VM's failed migration through cancel(), so a
     warm one that recorded passes gets the same cleanup as any cancel with a data path."""

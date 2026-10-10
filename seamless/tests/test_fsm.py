@@ -10,7 +10,8 @@ P = Phase
 # SDD §5.1, transcribed independently of the implementation.
 ALLOWED = {
     P.pending: {P.validating, P.cancelled},
-    P.validating: {P.ready, P.blocked, P.failed},
+    # cancelled: only by a validation, for a leftover whose VM left vm_ids (SDD §5.1, §5.4)
+    P.validating: {P.ready, P.blocked, P.failed, P.cancelled},
     P.blocked: {P.validating, P.cancelled},
     P.ready: {P.precopy, P.cutover, P.validating, P.cancelled},
     P.precopy: {P.syncing, P.awaiting_cutover, P.failed, P.cancelled},

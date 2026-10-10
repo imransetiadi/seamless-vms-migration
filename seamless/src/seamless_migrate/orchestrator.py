@@ -100,8 +100,9 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
-#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4)
-REMOVABLE = REVALIDATABLE | {P.failed}
+#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4); a
+#: migration it finds in validating is a leftover of an interrupted validation (plan lock)
+REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
 #: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
 RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
@@ -499,7 +500,7 @@ class Orchestrator:
                 )
             )
         for stale in removed:
-            await self.cancel(stale.id, actor, "removed from the plan")
+            await self.cancel(stale.id, actor, "removed from the plan", by_validation=True)
 
         def mark_validated(fresh: Plan) -> None:
             fresh.status = PlanStatus.validated
@@ -905,9 +906,18 @@ class Orchestrator:
         self.wake()
         return m
 
-    async def cancel(self, mid: str, actor: str, reason: str | None = None) -> Migration:
+    async def cancel(
+        self, mid: str, actor: str, reason: str | None = None, *, by_validation: bool = False
+    ) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
+            if m.phase == P.validating and not by_validation:
+                # SDD §5.1: a validation of the plan may be moving it; only a validation cancels
+                # one - under the plan's lock it knows it is a leftover whose VM left vm_ids
+                raise NotAllowed(
+                    f"{m.vm.name} is being validated and cannot be cancelled; validate the plan "
+                    "again - it finishes the migration, or cancels it once its VM left vm_ids"
+                )
             why = fsm.refusal(m, P.cancelled)
             if why is not None:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
