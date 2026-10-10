@@ -728,6 +728,8 @@ class Migration(_Model):
     destination_server_id: str | None = None
     error: str | None = None
     attempts: int = 0
+    #: each retried attempt's strategy, oldest first: the evidence names them (SDD §14.4)
+    attempt_strategies: list[Strategy] = Field(default_factory=list)
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

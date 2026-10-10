@@ -22,6 +22,7 @@ from seamless_migrate.domain.models import (
     Estimate,
     EvidenceItem,
     Finding,
+    Migration,
     Plan,
     VMRef,
 )
@@ -246,53 +247,62 @@ def test_preflight_findings_that_apply_to_the_option_oppose_it():
 
 def test_an_earlier_run_of_the_same_strategy_opposes_it():
     vm = make_vm()
+
+    def earlier_runs(option: str, earlier: Migration) -> EvidenceItem | None:
+        return by_key(
+            build_strategy_evidence(
+                vm,
+                make_plan(),
+                ProviderKind.openstack,
+                [],
+                [],
+                option,
+                earlier,
+                migration_id="mig-earlier01",
+            )
+        ).get("earlier_runs")
+
+    # SDD §14.4: the attempts' own strategies, not the migration's strategy now - a validation
+    # set this migration to cold after its two warm attempts
     failed = make_migration(
-        id="mig-earlier01", vm=vm, strategy=Strategy.warm, phase=Phase.ready, attempts=2
+        id="mig-earlier01",
+        vm=vm,
+        strategy=Strategy.cold,
+        phase=Phase.ready,
+        attempts=2,
+        attempt_strategies=[Strategy.warm, Strategy.warm],
     )
-    item = by_key(
-        build_strategy_evidence(
-            vm,
-            make_plan(),
-            ProviderKind.openstack,
-            [],
-            [],
-            "warm",
-            failed,
-            migration_id="mig-earlier01",
-        )
-    )["earlier_runs"]
+    item = earlier_runs("warm", failed)
     assert (item.value, item.effect, item.display) == (
         2,
         "opposes",
         "2 earlier attempts with Warm migration",
     )
     assert (item.source.kind, item.source.ref_id) == ("run", "mig-earlier01")
-    other = by_key(
-        build_strategy_evidence(
-            vm,
-            make_plan(),
-            ProviderKind.openstack,
-            [],
-            [],
-            "cold",
-            failed,
-            migration_id="mig-earlier01",
-        )
+    other = earlier_runs("cold", failed)
+    assert (other.effect, other.display) == ("context", "2 earlier attempts with Warm migration")
+    mixed = make_migration(
+        id="mig-earlier01",
+        vm=vm,
+        strategy=Strategy.warm,
+        phase=Phase.ready,
+        attempts=3,
+        attempt_strategies=[Strategy.cold, Strategy.warm, Strategy.cold],
     )
-    assert other["earlier_runs"].effect == "context"
+    for option in ("warm", "cold"):
+        item = earlier_runs(option, mixed)
+        assert (item.effect, item.display) == (
+            "opposes",
+            "3 earlier attempts with Cold migration, Warm migration",
+        )
+    # data recorded before the attempts' strategies were kept names none and opposes none
+    unnamed = make_migration(
+        id="mig-earlier01", vm=vm, strategy=Strategy.warm, phase=Phase.ready, attempts=2
+    )
+    item = earlier_runs("warm", unnamed)
+    assert (item.value, item.effect, item.display) == (2, "context", "2 earlier attempts")
     fresh = make_migration(id="mig-earlier01", vm=vm, attempts=0)
-    assert "earlier_runs" not in by_key(
-        build_strategy_evidence(
-            vm,
-            make_plan(),
-            ProviderKind.openstack,
-            [],
-            [],
-            "warm",
-            fresh,
-            migration_id="mig-earlier01",
-        )
-    )
+    assert earlier_runs("warm", fresh) is None
 
 
 def test_an_evidence_item_has_a_source():

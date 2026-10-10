@@ -589,7 +589,11 @@
     "earlier": {
       "id": "mig-earlier01",
       "strategy": "warm",
-      "attempts": 2
+      "attempts": 2,
+      "attempt_strategies": [
+        "warm",
+        "warm"
+      ]
     },
     "migration_id": "mig-earlier01",
     "expected": [
@@ -692,7 +696,7 @@
     ]
   },
   {
-    "name": "openstack cold, an earlier attempt of another strategy, a Windows guest",
+    "name": "openstack cold, an earlier warm attempt on a migration now set to cold, a Windows guest",
     "vm": {
       "source_id": "vm-3",
       "name": "web-01",
@@ -777,8 +781,11 @@
     "option": "cold",
     "earlier": {
       "id": "mig-earlier02",
-      "strategy": "warm",
-      "attempts": 1
+      "strategy": "cold",
+      "attempts": 1,
+      "attempt_strategies": [
+        "warm"
+      ]
     },
     "migration_id": "mig-earlier02",
     "expected": [
@@ -864,6 +871,208 @@
         "source": {
           "kind": "inventory",
           "ref_id": "vm-3"
+        }
+      },
+      {
+        "key": "cutover_window",
+        "label": "Cutover window",
+        "value": null,
+        "display": "Cutover window: any time",
+        "effect": "context",
+        "weight": 30,
+        "source": {
+          "kind": "plan",
+          "ref_id": "plan-0000abcd"
+        }
+      },
+      {
+        "key": "source_kind",
+        "label": "Source platform",
+        "value": "openstack",
+        "display": "Source platform: OpenStack",
+        "effect": "context",
+        "weight": 20,
+        "source": {
+          "kind": "provider",
+          "ref_id": "src-osp"
+        }
+      }
+    ]
+  },
+  {
+    "name": "openstack warm, an earlier attempt recorded before its strategy was kept",
+    "vm": {
+      "source_id": "vm-5",
+      "name": "web-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d1",
+          "name": null,
+          "size_gb": 20,
+          "used_gb": 10.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": null,
+      "disk_bytes": 21474836480,
+      "used_bytes": 10737418240,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "plan": {
+      "name": "Finance",
+      "source_provider_id": "src-osp",
+      "destination_provider_id": "dst-rhoso",
+      "vm_ids": [
+        "vm-1"
+      ],
+      "downtime_slo_s": 900,
+      "cutover_window": null,
+      "id": "plan-0000abcd"
+    },
+    "provider_kind": "openstack",
+    "estimates": [
+      {
+        "strategy": "warm",
+        "eligible": true,
+        "reasons": [],
+        "precopy_s": 600.0,
+        "passes": 3,
+        "downtime_s": 300.0,
+        "total_s": 900.0,
+        "final_delta_bytes": 1073741824,
+        "meets_slo": true,
+        "downtime_parts": {}
+      }
+    ],
+    "findings": [],
+    "option": "warm",
+    "earlier": {
+      "id": "mig-earlier03",
+      "strategy": "warm",
+      "attempts": 1,
+      "attempt_strategies": []
+    },
+    "migration_id": "mig-earlier03",
+    "expected": [
+      {
+        "key": "downtime_estimate",
+        "label": "Estimated downtime",
+        "value": 300.0,
+        "display": "Estimated downtime 5m 00s, SLO 15m 00s",
+        "effect": "supports",
+        "weight": 100,
+        "source": {
+          "kind": "estimate",
+          "ref_id": "mig-earlier03"
+        }
+      },
+      {
+        "key": "earlier_runs",
+        "label": "Earlier attempts",
+        "value": 1,
+        "display": "1 earlier attempt",
+        "effect": "context",
+        "weight": 85,
+        "source": {
+          "kind": "run",
+          "ref_id": "mig-earlier03"
+        }
+      },
+      {
+        "key": "mappings",
+        "label": "Mappings",
+        "value": 0,
+        "display": "Networks, flavors and volume types are mapped",
+        "effect": "supports",
+        "weight": 80,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier03"
+        }
+      },
+      {
+        "key": "findings",
+        "label": "Pre-flight findings",
+        "value": 0,
+        "display": "No blocker or warning applies to Warm migration",
+        "effect": "supports",
+        "weight": 75,
+        "source": {
+          "kind": "preflight",
+          "ref_id": "mig-earlier03"
+        }
+      },
+      {
+        "key": "guest_os",
+        "label": "Guest OS",
+        "value": "RHEL 9",
+        "display": "RHEL 9; virt-v2v supported",
+        "effect": "context",
+        "weight": 70,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-5"
+        }
+      },
+      {
+        "key": "disk_total",
+        "label": "Disk size",
+        "value": 21474836480,
+        "display": "20.0 GiB provisioned, 10.0 GiB used",
+        "effect": "context",
+        "weight": 60,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-5"
+        }
+      },
+      {
+        "key": "disk_count",
+        "label": "Disks",
+        "value": 1,
+        "display": "1 disk",
+        "effect": "context",
+        "weight": 50,
+        "source": {
+          "kind": "inventory",
+          "ref_id": "vm-5"
         }
       },
       {

@@ -1185,6 +1185,9 @@ class Orchestrator:
                 # is still a new attempt of the cutover (executors key their behaviour on it)
                 m.attempts += 1
             m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
+            # the strategy of the attempt being retried: the evidence names it (SDD §14.4), even
+            # after a later validation chose another
+            m.attempt_strategies = [*m.attempt_strategies, m.strategy]
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)

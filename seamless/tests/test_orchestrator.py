@@ -4000,6 +4000,58 @@ async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_pa
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None
 
 
+async def test_the_earlier_attempts_evidence_names_the_strategy_those_attempts_used(
+    tmp_path, store
+):
+    """SDD §14.4 (advisor Phase 1 audit, A6): a retry records the strategy of the attempt it
+    retries; after a failed warm attempt and a validation that applied cold, the evidence names
+    warm and does not oppose cold - before, it named cold and opposed it, a false fact."""
+    jev_settings = Settings(jev_mode="stdio")
+    answer = load_fixture("decide")
+    answer["recommendation"].update(selected="warm", confidence=0.99)
+    factory, _ = session_factory(fixture_responder({"decide": answer}))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings)
+
+    async def failing_precopy(ctx):
+        raise PermanentStepError("pre-copy failed")
+
+    executor.hooks[StepName.PRECOPY] = failing_precopy
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)],
+        advisor=advisor, executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    await h.orch.stop()
+    await h.orch.pause_plan(plan.id, "alice")
+    retried = await h.orch.retry(m.id, "alice")
+    assert (retried.attempts, retried.attempt_strategies) == (1, [Strategy.warm])
+    answer["recommendation"].update(selected="cold")
+    await h.orch.validate_plan(plan.id, "alice")
+    assert (await h.migration(m.id)).strategy == Strategy.cold
+    await h.orch.validate_plan(plan.id, "alice")
+    newest = max(_recommendations(store), key=lambda r: (r.created_at, r.id))
+    [earlier] = [e for e in newest.evidence if e.key == "earlier_runs"]
+    assert (earlier.display, earlier.effect) == ("1 earlier attempt with Warm migration", "context")
+
+
+async def test_a_retry_records_the_attempts_strategies_oldest_first(tmp_path, store):
+    """SDD §4.2: ``attempt_strategies`` lists each retried attempt's strategy, oldest first - the
+    order the earlier-attempts evidence names them in (§14.4)."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert m.strategy == Strategy.cold
+    m.phase = P.rolled_back
+    m.attempts = 1
+    m.attempt_strategies = [Strategy.warm]  # its first attempt ran warm
+    store.put("migration", m)
+    again = await h.orch.retry(m.id, "alice")
+    assert (again.attempts, again.attempt_strategies) == (2, [Strategy.warm, Strategy.cold])
+
+
 def _strict(minimum: int) -> AdvisorPolicy:
     """A policy that applies a confident decision only when it rests on ``minimum`` facts."""
     return AdvisorPolicy(

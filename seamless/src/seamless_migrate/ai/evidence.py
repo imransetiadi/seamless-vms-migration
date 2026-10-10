@@ -179,13 +179,16 @@ def build_strategy_evidence(
         )
     if earlier is not None and earlier.attempts > 0:
         n = earlier.attempts
+        # the strategies those attempts used, as each retry recorded them - not the migration's
+        # strategy now, which a later validation may have changed; data recorded before names none
+        tried = list(dict.fromkeys(str(s) for s in earlier.attempt_strategies))
+        used = f" with {', '.join(option_label(s) for s in tried)}" if tried else ""
         add(
             "earlier_runs",
             "Earlier attempts",
             n,
-            f"{n} earlier {_plural(n, 'attempt', 'attempts')} with "
-            f"{option_label(str(earlier.strategy))}",
-            "opposes" if str(earlier.strategy) == option else "context",
+            f"{n} earlier {_plural(n, 'attempt', 'attempts')}{used}",
+            "opposes" if option in tried else "context",
             85,
             "run",
             earlier.id,
