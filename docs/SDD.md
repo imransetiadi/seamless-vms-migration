@@ -383,7 +383,9 @@ an open clock and resets a closed one (§5.2); it clears the cutover request and
 granted with it (`cutover_requested` with its requester, `force_window`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change); and it clears what the
 earlier attempt found about itself — the invariants it broke (`data_issues`, §5.5) and the rule that ended its passes
-(`converged_by`, §5.3): the new attempt records its own, and a migration back in `ready` reads neither. A retry in a
+(`converged_by`, §5.3): the new attempt records its own, and a migration back in `ready` reads neither. All of it is
+saved in the same write as the move to `ready`: a crash or a failed write cannot leave a `ready` migration carrying the
+earlier attempt's request and bypass, which the next tick would honour outside the window. A retry in a
 `completed` plan (a plan completes with a rolled-back migration, which is wave-complete, §8) reopens the plan:
 under the plan's lock it becomes `running` again (event `plan.updated`, data `{"status": "running"}`), so
 the tick runs the new attempt through the usual gate (§5.4); the providers of a completed plan may be
