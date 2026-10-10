@@ -1559,7 +1559,7 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   | `downtime_estimate` | the option's estimated downtime (s) against the SLO | supports when it meets the SLO, else opposes | 100 | `estimate`, the migration |
   | `cbt` | `vm.cbt_enabled` (VMware sources, when reported) | `vmware_warm`: supports when true, else opposes; other options: context | 90 | `inventory`, the VM |
   | `earlier_runs` | the migration's `attempts` (when any) | opposes when the option is the strategy that failed before, else context | 85 | `run`, the migration |
-  | `mappings` | the `MAP_*` findings that apply to the option | supports when there are none, else opposes | 80 | `preflight`, the migration |
+  | `mappings` | the blocker and warning `MAP_*` findings that apply to the option (an info one resolved itself) | supports when there are none, else opposes | 80 | `preflight`, the migration |
   | `findings` | the other blocker and warning findings that apply to the option | supports when there are none, else opposes | 75 | `preflight`, the migration |
   | `guest_os` | `guest_os.label` and its virt-v2v support | VMware options: supports when `supported`, opposes when `unsupported` or `unverified`, else context; others: context | 70 | `inventory`, the VM |
   | `disk_total` | `vm.disk_bytes` | context | 60 | `inventory`, the VM |
