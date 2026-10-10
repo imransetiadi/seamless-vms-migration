@@ -351,6 +351,8 @@ class PlanSpec(_Model):
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     #: per VM (source id): its application probes instead of verification.app_probes; [] = none
     probe_overrides: dict[str, list[AppProbe]] = Field(default_factory=dict)
+    #: hours a migration may wait in completed before it is flagged for finalize (SDD §8.1, ADV-19)
+    finalize_warning_h: int = Field(default=72, ge=1)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
 
 
@@ -665,6 +667,8 @@ class Migration(_Model):
     verification: VerificationRecord | None = None
     #: the rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan
     suggested_probes: list[AppProbe] = Field(default_factory=list)
+    #: completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19)
+    source_running_at: UTCDateTime | None = None
     review_required: bool = False
     review_reason: str | None = None
     destination_server_id: str | None = None

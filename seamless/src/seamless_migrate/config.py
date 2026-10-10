@@ -63,6 +63,8 @@ class Settings(BaseModel):
     max_concurrent_migrations: int = 10
     max_concurrent_cutovers: int = 3
     tick_s: float = 1.0
+    #: how often a completed migration's source VM is checked for running again (SDD §8.1)
+    source_watch_s: float = Field(default=300.0, ge=0)
     max_step_retries: int = 2
     #: wall-clock ceiling of one step attempt in seconds; 0 = unbounded (SDD §15.1)
     step_timeout_s: float = 0.0
@@ -135,6 +137,7 @@ class Settings(BaseModel):
             "MAX_CONCURRENT_MIGRATIONS": ("max_concurrent_migrations", int),
             "MAX_CONCURRENT_CUTOVERS": ("max_concurrent_cutovers", int),
             "TICK_S": ("tick_s", float),
+            "SOURCE_WATCH_S": ("source_watch_s", float),
             "MAX_STEP_RETRIES": ("max_step_retries", int),
             "STEP_TIMEOUT_S": ("step_timeout_s", float),
             "AUTH_LOCKOUT_PER_MINUTE": ("auth_lockout_per_minute", int),

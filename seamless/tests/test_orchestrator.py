@@ -3477,3 +3477,121 @@ async def test_validate_refuses_invalid_application_probes(tmp_path, store):
         "probe_overrides[vm-1]: expect_status 99 outside 100-599",
         "probe_overrides[vm-2]: 11 probes, at most 10",
     ]
+
+
+# -- the finalize queue: bulk finalize and the source watch (SDD §8.1, ADV-19) -----------------
+def _waved(vms):
+    return [
+        Wave(id="wave-1", name="Pilot", order=1, vm_ids=["vm-1", "vm-2"]),
+        Wave(id="wave-2", name="Rest", order=2, vm_ids=["vm-3"], depends_on=["wave-1"]),
+    ]
+
+
+async def _completed_plan(tmp_path, store, n=3, **plan_kw):
+    vms = [vm(i) for i in range(1, n + 1)]
+    h, plan = await setup(
+        tmp_path, store, vms, {"default_strategy": Strategy.cold, "waves": _waved(vms), **plan_kw}
+    )
+    await run_plan(h, plan)
+    for i in range(1, n + 1):
+        await h.wait_phase((await h.by_vm(plan.id, f"vm-{i}")).id, P.completed)
+    await h.orch.stop()
+    return h, plan
+
+
+async def test_finalize_plan_finalizes_a_wave_with_one_approval_and_audits_each_vm(tmp_path, store):
+    h, plan = await _completed_plan(tmp_path, store)
+    with pytest.raises(BadRequest, match="Pilot"):
+        await h.orch.finalize_plan(plan.id, "rina", wave_id="wave-1", confirm="pilot")
+    with pytest.raises(NotFound):
+        await h.orch.finalize_plan(plan.id, "rina", wave_id="wave-9", confirm="Pilot")
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id="wave-1", confirm="Pilot")
+    ms = {m.vm.source_id: m for m in store.list("migration", Migration)}
+    assert out == {"finalized": [ms["vm-1"].id, ms["vm-2"].id], "skipped": []}
+    assert [ms[v].phase for v in ("vm-1", "vm-2", "vm-3")] == [
+        P.finalized,
+        P.finalized,
+        P.completed,
+    ]
+    events = store.events(since_seq=0, limit=100000)
+    actions = [
+        e for e in events if e.kind == "migration.action" and e.data.get("action") == "finalize"
+    ]
+    assert sorted((e.migration_id, e.actor) for e in actions) == sorted(
+        [(ms["vm-1"].id, "rina"), (ms["vm-2"].id, "rina")]
+    )
+    [batch] = [e for e in events if e.kind == "plan.finalized"]
+    assert (batch.actor, batch.plan_id) == ("rina", plan.id)
+    assert batch.data == {"wave_id": "wave-1", "finalized": ["web-01", "web-02"], "skipped": []}
+    # the rest of the plan, by its name
+    rest = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
+    assert rest == {"finalized": [ms["vm-3"].id], "skipped": []}
+    with pytest.raises(NotAllowed, match="no completed migration"):
+        await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
+
+
+async def test_finalize_plan_reports_the_vms_it_could_not_finalize(tmp_path, store):
+    h, plan = await _completed_plan(tmp_path, store, n=2, waves=[])
+
+    async def refuse(ctx):
+        if ctx.migration.vm.source_id == "vm-2":
+            raise PermanentStepError("source cleanup failed: HTTP 409")
+        return StepResult(details={"finalized": True})
+
+    h.executor.hooks[StepName.FINALIZE] = refuse
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm="Finance")
+    m2 = await h.by_vm(plan.id, "vm-2")
+    assert out["finalized"] == [(await h.by_vm(plan.id, "vm-1")).id]
+    assert out["skipped"] == [
+        {"migration_id": m2.id, "reason": "finalize failed: source cleanup failed: HTTP 409"}
+    ]
+    assert m2.phase == P.completed
+
+
+async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_path, store):
+    """SDD §8.1: the source VM of a migration awaiting finalize runs again: its data diverges."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+
+    async def watch(seconds=h.settings.source_watch_s + 1):
+        h.clock.advance(seconds)
+        await h.orch.tick()
+        return await h.by_vm(plan.id, "vm-1")
+
+    assert (await watch()).source_running_at is None
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    # not before the interval is up
+    assert (await watch(seconds=1)).source_running_at is None
+    seen = await watch()
+    assert seen.source_running_at is not None
+    alerts = [
+        e for e in store.events(since_seq=0, limit=100000) if e.kind == "migration.source_running"
+    ]
+    assert [(e.migration_id, e.data) for e in alerts] == [(m.id, {"power_state": "running"})]
+    # once: a running source is not reported again
+    again = await watch()
+    assert again.source_running_at == seen.source_running_at
+    assert (
+        len(
+            [
+                e
+                for e in store.events(since_seq=0, limit=100000)
+                if e.kind == "migration.source_running"
+            ]
+        )
+        == 1
+    )
+    # stopped again: the alert clears, and nothing more is reported
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+    assert (await watch()).source_running_at is None
+    kinds = [e.kind for e in store.events(since_seq=0, limit=100000)]
+    assert kinds.count("migration.source_running") == 1
+
+
+async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None

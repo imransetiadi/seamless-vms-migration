@@ -236,6 +236,103 @@ def test_a_migration_reports_its_verification_and_suggested_probes(api):
     assert isinstance(m["suggested_probes"], list)
 
 
+def test_plans_carry_their_derived_status_and_finalize_reminder(api):
+    """SDD §4.2, §8.1 (ADV-19): every plan route returns derived_status; the reminder is ≥ 1 h."""
+    vm_ids = first_clean_vms(api, n=1)
+    base = {
+        "name": "status",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json={**base, "finalize_warning_h": 0})
+    assert refused.status_code == 422 and "finalize_warning_h" in refused.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.operator, json=base)
+    assert created.status_code == 201, created.text
+    plan = created.json()
+    assert (plan["derived_status"], plan["finalize_warning_h"]) == ("draft", 72)
+    assert api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()["derived_status"] == "draft"
+    listed = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert listed[plan["id"]]["derived_status"] == "draft"
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    assert (
+        api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()["derived_status"] == "validated"
+    )
+    # the stored lifecycle says validated; its migration completed: the plan reads completed
+    [m] = [x for x in api.store.list("migration", Migration) if x.plan_id == plan["id"]]
+    api.store.put("migration", m.model_copy(update={"phase": Phase.completed}))
+    got = api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()
+    assert (got["status"], got["derived_status"]) == ("validated", "completed")
+    # derived_status is the API's: a client cannot set it
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"derived_status": "finalized"},
+    )
+    assert patched.status_code == 422
+
+
+def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):
+    """SDD §8.1, §12: POST /plans/{id}/finalize — 403 below approver, 400 for a wrong name,
+    404 for an unknown wave, 409 when nothing in scope is completed."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "to finalize",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    url = f"/api/v1/plans/{plan_id}/finalize"
+    assert api.post(url, Role.operator, json={"confirm": "to finalize"}).status_code == 403
+    assert api.post(url, Role.approver, json={"confirm": "wrong"}).status_code == 400
+    assert (
+        api.post(url, Role.approver, json={"confirm": "Pilot", "wave_id": "wave-9"}).status_code
+        == 404
+    )
+    nothing = api.post(url, Role.approver, json={"confirm": "to finalize"})
+    assert (
+        nothing.status_code == 409
+        and "no completed migration" in nothing.json()["error"]["message"]
+    )
+
+
+def test_the_demo_power_route_sets_a_fake_source_vms_power_and_exists_only_in_demo_mode(
+    api, tmp_path
+):
+    """SDD §8.1, §12: POST /demo/vms/{source_id}/power — operator, demo mode only."""
+    [vm] = api.get("/api/v1/providers/src-osp/inventory", Role.viewer).json()[:1]
+    url = f"/api/v1/demo/vms/{vm['source_id']}/power"
+    assert api.post(url, Role.viewer, json={"state": "on"}).status_code == 403
+    off = api.post(url, Role.operator, json={"state": "off"})
+    assert off.status_code == 200 and off.json()["power_state"] == "stopped"
+    inventory = {
+        v["source_id"]: v
+        for v in api.get("/api/v1/providers/src-osp/inventory", Role.viewer).json()
+    }
+    assert inventory[vm["source_id"]]["power_state"] == "stopped"
+    assert api.post(url, Role.operator, json={"state": "on"}).json()["power_state"] == "running"
+    assert api.post(url, Role.operator, json={"state": "sideways"}).status_code == 422
+    assert (
+        api.post("/api/v1/demo/vms/os-nope/power", Role.operator, json={"state": "on"}).status_code
+        == 404
+    )
+
+    settings, tokens = api_settings(tmp_path / "real", demo=False)
+    store = Store(f"sqlite:///{tmp_path / 'real.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        real = Api(client, store, settings, tokens)
+        refused = real.post(url, Role.operator, json={"state": "on"})
+        assert refused.status_code == 404
+        assert refused.json()["error"]["message"] == "no such route outside demo mode"
+    store.dispose()
+
+
 def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
     """SDD §12: a pre-copied migration waiting for its cutover (here after pause and re-validation)
     would cut over to a changed destination or mappings — PATCH and auto-waves answer 409, naming

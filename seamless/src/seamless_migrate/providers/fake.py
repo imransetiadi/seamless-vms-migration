@@ -305,6 +305,15 @@ class FakeSourceProvider:
         else:
             self._vms = [_openstack_vm(s, rng, i) for i, s in enumerate(_OPENSTACK)]
         self._by_id = {vm.source_id: vm for vm in self._vms}
+        #: power states the demo changed (SDD §8.1): a simulated cutover stops the source, a
+        #: rollback starts it, the demo power control either; the registry keeps one fake each
+        self._power: dict[str, str] = {}
+
+    def _as_now(self, vm: VMRef) -> VMRef:
+        copy = vm.model_copy(deep=True)
+        if vm.source_id in self._power:
+            copy.power_state = self._power[vm.source_id]  # type: ignore[assignment]
+        return copy
 
     async def check(self) -> dict[str, Any]:
         if self.kind == ProviderKind.vmware:
@@ -326,16 +335,21 @@ class FakeSourceProvider:
         }
 
     async def list_vms(self) -> list[VMRef]:
-        return [vm.model_copy(deep=True) for vm in self._vms]
+        return [self._as_now(vm) for vm in self._vms]
 
     async def get_vm(self, source_id: str) -> VMRef:
         try:
-            return self._by_id[source_id].model_copy(deep=True)
+            return self._as_now(self._by_id[source_id])
         except KeyError:
             raise ProviderError(f"VM {source_id!r} not found") from None
 
     async def power_on(self, source_id: str) -> None:
         await self.get_vm(source_id)
+        self._power[source_id] = "running"
+
+    async def power_off(self, source_id: str) -> None:
+        await self.get_vm(source_id)
+        self._power[source_id] = "stopped"
 
     async def delete_server(self, source_id: str) -> None:
         await self.get_vm(source_id)

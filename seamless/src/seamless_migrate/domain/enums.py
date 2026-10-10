@@ -76,6 +76,18 @@ class PlanStatus(StrEnum):
     failed = "failed"
 
 
+class DerivedPlanStatus(StrEnum):
+    """The plan status every view shows (SDD §8.1, ADV-19): the lifecycle told by its migrations."""
+
+    draft = "draft"
+    validated = "validated"
+    running = "running"
+    paused = "paused"
+    completed = "completed"
+    finalized = "finalized"
+    failed = "failed"
+
+
 class SyncPassKind(StrEnum):
     full = "full"
     delta = "delta"

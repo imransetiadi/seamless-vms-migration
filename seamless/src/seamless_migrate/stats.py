@@ -45,6 +45,9 @@ class Stats(BaseModel):
     slo_compliance_pct: float | None
     #: completed migrations with data_issues, left out of the downtime figures (SDD §5.5)
     data_inconsistent: int = 0
+    #: completed = these two: verified and waiting, and finalized (SDD §8.1, ADV-19)
+    awaiting_finalize: int = 0
+    finalized: int = 0
     downtime_by_strategy: dict[str, float]
     throughput_series: list[ThroughputPoint]
 
@@ -108,6 +111,8 @@ def compute_stats(
         bytes_transferred=sum(m.bytes_transferred for m in migrations),
         avg_downtime_s=sum(downtimes) / len(downtimes) if downtimes else None,
         data_inconsistent=len(inconsistent),
+        awaiting_finalize=by_phase[Phase.completed.value],
+        finalized=by_phase[Phase.finalized.value],
         p95_downtime_s=percentile(downtimes, 95),
         max_downtime_s=max(downtimes) if downtimes else None,
         slo_compliance_pct=round(100.0 * len(within) / len(judged), 2) if judged else None,

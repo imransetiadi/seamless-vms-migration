@@ -614,6 +614,8 @@ export const PERSISTED_EVENT_KINDS = [
   'migration.error',
   'migration.force_cutover',
   'migration.data_inconsistent',
+  'migration.source_running',
+  'plan.finalized',
   'migration.approved',
   'migration.action',
   'advisor.strategy',

@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import random
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from ..config import Settings
 from ..domain.enums import Strategy, SyncPassKind
 from ..domain.models import Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..planning.estimator import VMWARE_PASS_OVERHEAD_S, params_for_plan
+from ..providers.base import ProviderError
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -27,9 +29,26 @@ MAX_PROGRESS_TICKS = 40
 class SimulatedExecutor:
     name = "simulated"
 
-    def __init__(self, settings: Settings, *, sleep: Sleep = asyncio.sleep) -> None:
+    def __init__(
+        self, settings: Settings, *, sleep: Sleep = asyncio.sleep, providers: Any = None
+    ) -> None:
         self.settings = settings
         self._sleep = sleep
+        #: the provider registry: the demo's fake source follows the simulated stop and restart
+        self.providers = providers
+
+    async def _source_power(self, ctx: StepContext, on: bool) -> None:
+        """Stop or start the fake source VM the way the real steps do (SDD §7.4, §8.1)."""
+        if self.providers is None:
+            return
+        client = self.providers.get(ctx.source)
+        action = getattr(client, "power_on" if on else "power_off", None)
+        if action is None:
+            return
+        try:
+            await action(ctx.migration.vm.source_id)
+        except ProviderError:
+            pass  # a VM the fake does not hold: nothing to stop or start, never a failed step
 
     def supports(self, strategy: Strategy) -> bool:
         return True
@@ -61,6 +80,7 @@ class SimulatedExecutor:
             return await self._cutover(ctx)
         if step == StepName.ROLLBACK:
             await self._elapse(ctx, 90.0, 0)
+            await self._source_power(ctx, on=True)
             return StepResult(details={"source_running": True})
         if step == StepName.FINALIZE:
             return StepResult(details={"finalized": True})
@@ -117,6 +137,7 @@ class SimulatedExecutor:
         rng = self._rng(ctx, StepName.CUTOVER)
         await ctx.log("simulated cutover: stopping the source VM")
         await self._elapse(ctx, p.shutdown_s, 0)
+        await self._source_power(ctx, on=False)
         await ctx.mark_downtime_start()
         # the final sync (or the copy) runs once the source is stopped (SDD §7.4, ADV-16)
         started = utcnow()

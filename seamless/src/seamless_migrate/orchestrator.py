@@ -23,7 +23,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from .ai.decision import Advice, Approve, Override, decide
@@ -225,6 +225,8 @@ class Orchestrator:
             lambda dst: Verifier(dst, settings, poll_s=verify_poll_s)
         )
         self._locks: dict[str, asyncio.Lock] = {}
+        #: when the next source watch is due (SDD §8.1); set by the first tick
+        self._source_watch_due: datetime | None = None
         self._drivers: dict[str, asyncio.Task[None]] = {}
         #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
         self._driver_crashes: dict[str, tuple[int, float]] = {}
@@ -1236,6 +1238,118 @@ class Orchestrator:
         )
         return m
 
+    async def finalize_plan(
+        self,
+        plan_id: str,
+        actor: str,
+        *,
+        wave_id: str | None,
+        confirm: str,
+        delete_source: bool = False,
+    ) -> dict[str, Any]:
+        """Finalize a wave or the plan with one approval, each VM as ``finalize`` (SDD §8.1)."""
+        plan = await self._plan(plan_id)
+        if wave_id is not None:
+            wave = next((w for w in plan.waves if w.id == wave_id), None)
+            if wave is None:
+                raise NotFound("wave", wave_id)
+            scope, name = set(wave.vm_ids), wave.name
+        else:
+            scope, name = None, plan.name
+        if confirm != name:
+            raise BadRequest(f"confirm must equal the name {name!r}")
+        migrations = await self.db.list("migration", Migration, plan_id=plan_id)
+        waiting = [
+            m
+            for m in migrations
+            if m.phase == P.completed and (scope is None or m.vm.source_id in scope)
+        ]
+        if not waiting:
+            raise NotAllowed(f"no completed migration to finalize in {name}")
+        finalized: list[Migration] = []
+        skipped: list[dict[str, str]] = []
+        for m in sorted(waiting, key=lambda x: x.vm.name):
+            try:
+                finalized.append(
+                    await self.finalize(m.id, actor, delete_source=delete_source, confirm=m.vm.name)
+                )
+            except NotAllowed as exc:  # left completed meanwhile, or the cleanup failed
+                skipped.append({"migration_id": m.id, "reason": str(exc)})
+        names = {m.id: m.vm.name for m in waiting}
+        await self._emit(
+            "plan.finalized",
+            f"{name}: {len(finalized)} finalized by {actor}"
+            + (f", {len(skipped)} skipped" if skipped else ""),
+            plan_id=plan_id,
+            actor=actor,
+            data={
+                "wave_id": wave_id,
+                "finalized": [m.vm.name for m in finalized],
+                "skipped": [{"vm": names[s["migration_id"]], **s} for s in skipped],
+            },
+        )
+        return {"finalized": [m.id for m in finalized], "skipped": skipped}
+
+    async def source_client(self, plan: Plan) -> Any:
+        """The client of the plan's source provider (the source watch, the demo controls)."""
+        provider = await self.db.get("provider", plan.source_provider_id, Provider)
+        return self.providers.get(provider)
+
+    async def demo_power(self, source_id: str, *, on: bool) -> VMRef:
+        """Power a fake source VM on or off (demo mode, SDD §8.1); NotFound for an unknown VM."""
+        for provider in await self.db.list("provider", Provider):
+            if provider.role != ProviderRole.source:
+                continue
+            client = self.providers.get(provider)
+            try:
+                await client.get_vm(source_id)
+            except ProviderError:
+                continue
+            await (client.power_on if on else client.power_off)(source_id)
+            vm: VMRef = await client.get_vm(source_id)
+            return vm
+        raise NotFound("source VM", source_id)
+
+    async def _watch_sources(self) -> None:
+        """A completed migration's source VM seen running again is flagged once (SDD §8.1)."""
+        now = self._now()
+        scale = max(self.settings.demo_speed, 1.0) if self.settings.demo else 1.0
+        interval = timedelta(seconds=self.settings.source_watch_s / scale)
+        if self._source_watch_due is None:
+            self._source_watch_due = now + interval
+        if now < self._source_watch_due:
+            return
+        self._source_watch_due = now + interval
+        clients: dict[str, Any] = {}
+        for m in await self.db.list("migration", Migration, phase=P.completed):
+            try:
+                plan = await self._plan(m.plan_id)
+                if plan.source_provider_id not in clients:
+                    clients[plan.source_provider_id] = await self.source_client(plan)
+                vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)
+            except (ProviderError, NotFound):
+                continue  # gone (a finalize deleted it, a handover rebuilt it) or unreachable
+            except Exception:
+                log.warning("source watch failed for %s", m.id, exc_info=True)
+                continue
+            running = str(vm.power_state) == "running"
+            if running == (m.source_running_at is not None):
+                continue
+            async with self._lock(m.id):
+                cur, v = await self._load(m.id)
+                if cur.phase != P.completed or running == (cur.source_running_at is not None):
+                    continue
+                cur.source_running_at = now if running else None
+                await self._save(cur, v)
+            if running:
+                await self._emit(
+                    "migration.source_running",
+                    f"{cur.vm.name}: the source VM runs again - its data diverges from RHOSO; "
+                    "stop it, or roll back",
+                    migration=cur,
+                    data={"power_state": str(vm.power_state)},
+                )
+
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
         async with self._lock(mid):
@@ -1467,6 +1581,7 @@ class Orchestrator:
 
     async def tick(self) -> None:
         await self._resume_orphans()
+        await self._watch_sources()
         all_plans = await self.db.list("plan", Plan)
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:

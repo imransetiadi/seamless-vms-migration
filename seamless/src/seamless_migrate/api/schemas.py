@@ -6,10 +6,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import DecisionType, Role, Strategy
+from ..domain.enums import DecisionType, DerivedPlanStatus, Role, Strategy
 from ..domain.models import (
     AdvisorPolicy,
     AdvisorRecommendation,
+    Plan,
     PlanCreate,
     ValidationItem,
     ValidationReport,
@@ -89,6 +90,37 @@ class FinalizeRequest(_Body):
 
 class StrategyRequest(_Body):
     strategy: Strategy
+
+
+class PlanOut(Plan):
+    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle."""
+
+    derived_status: DerivedPlanStatus
+
+
+class PlanFinalizeRequest(_Body):
+    """Finalize a wave, or the whole plan, with one approval (SDD §8.1, ADV-19)."""
+
+    wave_id: str | None = Field(default=None, max_length=64)
+    #: the wave's name, or the plan's without wave_id
+    confirm: str = Field(max_length=_TEXT)
+    delete_source: bool = False
+
+
+class FinalizeSkip(BaseModel):
+    migration_id: str
+    reason: str
+
+
+class PlanFinalizeResult(BaseModel):
+    finalized: list[str]
+    skipped: list[FinalizeSkip]
+
+
+class DemoPowerRequest(_Body):
+    """Power a fake source VM on or off (demo mode only, SDD §8.1)."""
+
+    state: Literal["on", "off"]
 
 
 class SimilarIncidentsRequest(_Body):

@@ -335,3 +335,55 @@ async def test_the_demo_probes_its_finance_databases_and_rolls_back_the_one_whos
     assert billing.verification.probes[0].target.endswith(":1521")
     assert ledger.phase == Phase.completed and ledger.review_required is False
     assert [p.result for p in ledger.verification.probes] == ["passed"]
+
+
+async def test_the_demo_keeps_finished_sources_stopped_and_flags_one_powered_on(tmp_path, store):
+    """ADV-19 (SDD §8.1): a simulated cutover stops the fake source; a restart keeps it stopped; the
+    demo power route turns one on, and the next source watch flags its migration."""
+    import asyncio
+
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        demo=True,
+        demo_speed=1e6,
+        demo_failure_rate=0.0,
+        tick_s=0.01,
+        source_watch_s=0.0,
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    orch = services.orchestrator
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+        while loop.time() < deadline:
+            done = [m for m in store.list("migration", Migration) if m.phase == Phase.completed]
+            if len(done) >= 5:
+                break
+            await asyncio.sleep(0.05)
+        # nothing powered on: no completed migration is flagged
+        await asyncio.sleep(0.1)
+        assert done and all(m.source_running_at is None for m in store.list("migration", Migration))
+        target = done[0]
+        plan = next(p for p in store.list("plan", Plan) if p.id == target.plan_id)
+        source = await orch.source_client(plan)
+        assert (await source.get_vm(target.vm.source_id)).power_state == "stopped"
+        await source.power_on(target.vm.source_id)
+        for _ in range(100):
+            flagged = next(m for m in store.list("migration", Migration) if m.id == target.id)
+            if flagged.source_running_at is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert flagged.source_running_at is not None
+    finally:
+        await orch.stop()
+
+    # a restart builds new fakes: the seed stops the finished sources again, the powered-on too
+    restarted = build_services(settings, store)
+    await seed_demo(store, settings, restarted.orchestrator)
+    plan = next(p for p in store.list("plan", Plan) if p.id == target.plan_id)
+    source = await restarted.orchestrator.source_client(plan)
+    others = [m for m in done[1:] if m.plan_id == plan.id]
+    for m in others:
+        assert (await source.get_vm(m.vm.source_id)).power_state == "stopped", m.vm.name

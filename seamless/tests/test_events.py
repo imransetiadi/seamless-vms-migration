@@ -38,6 +38,8 @@ def test_kind_catalog_matches_sdd():
         "migration.error",
         "migration.force_cutover",
         "migration.data_inconsistent",
+        "migration.source_running",
+        "plan.finalized",
         "migration.approved",
         "migration.action",
         "advisor.strategy",

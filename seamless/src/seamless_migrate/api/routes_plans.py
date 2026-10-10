@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from ..domain.enums import PlanStatus, ProviderRole, Role
 from ..domain.models import (
     PLAN_EDITABLE_FIELDS,
+    Migration,
     Plan,
     PlanCreate,
     PlanSpec,
@@ -19,11 +20,12 @@ from ..domain.models import (
     repeated_vm_ids,
 )
 from ..events import emit
+from ..plan_status import derive_plan_status
 from ..planning.estimator import invalid_estimator_overrides
 from ..security.auth import Principal
 from ..store import NotFound
 from .deps import ApiError, _audit_denied, require_role, services
-from .schemas import WavesAutoRequest
+from .schemas import PlanFinalizeRequest, PlanFinalizeResult, PlanOut, WavesAutoRequest
 
 router = APIRouter(tags=["plans"])
 
@@ -112,23 +114,40 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
             raise ApiError(400, "bad_request", f"provider {provider_id!r} is not a {role} provider")
 
 
-@router.get("/plans", response_model=list[Plan])
+async def _out(request: Request, plans: list[Plan]) -> list[PlanOut]:
+    """The plans with their derived status (SDD §8.1), from one read of their migrations."""
+    if not plans:
+        return []
+    migrations = await services(request).db.list(
+        "migration", Migration, plan_id=[p.id for p in plans]
+    )
+    return [
+        PlanOut(**p.model_dump(), derived_status=derive_plan_status(p, migrations)) for p in plans
+    ]
+
+
+async def _one(request: Request, plan: Plan) -> PlanOut:
+    return (await _out(request, [plan]))[0]
+
+
+@router.get("/plans", response_model=list[PlanOut])
 async def list_plans(
     request: Request,
     status: PlanStatus | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=1000),
     offset: int = Query(default=0, ge=0, le=2**63 - 1),
     _: Principal = Depends(require_role(Role.viewer)),
-) -> list[Plan]:
+) -> list[PlanOut]:
     """Plans in creation order; ``status``, ``limit`` and ``offset`` run in SQL (SDD §12)."""
     filters = {"status": status} if status is not None else {}
-    return await services(request).db.list("plan", Plan, limit=limit, offset=offset, **filters)
+    plans = await services(request).db.list("plan", Plan, limit=limit, offset=offset, **filters)
+    return await _out(request, plans)
 
 
-@router.post("/plans", response_model=Plan, status_code=201)
+@router.post("/plans", response_model=PlanOut, status_code=201)
 async def create_plan(
     body: PlanCreate, request: Request, principal: Principal = Depends(require_role(Role.operator))
-) -> Plan:
+) -> PlanOut:
     svc = services(request)
     await _check_policy_fields(request, _non_default_policy_fields(body), principal)
     _check_plan_texts(body)
@@ -147,23 +166,23 @@ async def create_plan(
         actor=principal.name,
         data={"name": plan.name, "vms": len(plan.vm_ids)},
     )
-    return plan
+    return await _one(request, plan)
 
 
-@router.get("/plans/{plan_id}", response_model=Plan)
+@router.get("/plans/{plan_id}", response_model=PlanOut)
 async def get_plan(
     plan_id: str, request: Request, _: Principal = Depends(require_role(Role.viewer))
-) -> Plan:
-    return await services(request).db.get("plan", plan_id, Plan)
+) -> PlanOut:
+    return await _one(request, await services(request).db.get("plan", plan_id, Plan))
 
 
-@router.patch("/plans/{plan_id}", response_model=Plan)
+@router.patch("/plans/{plan_id}", response_model=PlanOut)
 async def update_plan(
     plan_id: str,
     request: Request,
     body: dict[str, Any] = Body(...),
     principal: Principal = Depends(require_role(Role.operator)),
-) -> Plan:
+) -> PlanOut:
     svc = services(request)
     unknown = sorted(set(body) - PLAN_EDITABLE_FIELDS)
     if unknown:
@@ -213,18 +232,19 @@ async def update_plan(
         actor=principal.name,
         data={"fields": sorted(body)},
     )
-    return updated
+    return await _one(request, updated)
 
 
-@router.post("/plans/{plan_id}/waves/auto", response_model=Plan)
+@router.post("/plans/{plan_id}/waves/auto", response_model=PlanOut)
 async def auto_waves(
     plan_id: str,
     request: Request,
     body: WavesAutoRequest | None = None,
     principal: Principal = Depends(require_role(Role.operator)),
-) -> Plan:
+) -> PlanOut:
     size = (body or WavesAutoRequest()).max_wave_size
-    return await services(request).orchestrator.auto_waves(plan_id, size, principal.name)
+    plan = await services(request).orchestrator.auto_waves(plan_id, size, principal.name)
+    return await _one(request, plan)
 
 
 @router.post("/plans/{plan_id}/validate", response_model=ValidationReport)
@@ -234,18 +254,40 @@ async def validate_plan(
     return await services(request).orchestrator.validate_plan(plan_id, principal.name)
 
 
-@router.post("/plans/{plan_id}/start", response_model=Plan)
+@router.post("/plans/{plan_id}/start", response_model=PlanOut)
 async def start_plan(
     plan_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
-) -> Plan:
-    return await services(request).orchestrator.start_plan(plan_id, principal.name)
+) -> PlanOut:
+    return await _one(
+        request, await services(request).orchestrator.start_plan(plan_id, principal.name)
+    )
 
 
-@router.post("/plans/{plan_id}/pause", response_model=Plan)
+@router.post("/plans/{plan_id}/pause", response_model=PlanOut)
 async def pause_plan(
     plan_id: str, request: Request, principal: Principal = Depends(require_role(Role.operator))
-) -> Plan:
-    return await services(request).orchestrator.pause_plan(plan_id, principal.name)
+) -> PlanOut:
+    return await _one(
+        request, await services(request).orchestrator.pause_plan(plan_id, principal.name)
+    )
+
+
+@router.post("/plans/{plan_id}/finalize", response_model=PlanFinalizeResult)
+async def finalize_plan(
+    plan_id: str,
+    body: PlanFinalizeRequest,
+    request: Request,
+    principal: Principal = Depends(require_role(Role.approver)),
+) -> PlanFinalizeResult:
+    """Finalize a wave or the plan with one approval, auditing each VM (SDD §8.1, ADV-19)."""
+    out = await services(request).orchestrator.finalize_plan(
+        plan_id,
+        principal.name,
+        wave_id=body.wave_id,
+        confirm=body.confirm,
+        delete_source=body.delete_source,
+    )
+    return PlanFinalizeResult.model_validate(out)
 
 
 def _summarize(exc: ValidationError) -> str:

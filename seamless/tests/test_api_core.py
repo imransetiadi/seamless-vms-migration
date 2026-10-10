@@ -345,6 +345,8 @@ def test_stats_shape(api):
         "max_downtime_s",
         "slo_compliance_pct",
         "data_inconsistent",
+        "awaiting_finalize",
+        "finalized",
         "downtime_by_strategy",
         "throughput_series",
     }

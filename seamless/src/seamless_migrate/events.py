@@ -52,6 +52,8 @@ PERSISTED_KINDS = frozenset(
         "migration.error",
         "migration.force_cutover",
         "migration.data_inconsistent",
+        "migration.source_running",
+        "plan.finalized",
         "migration.approved",
         "migration.action",
         "advisor.strategy",

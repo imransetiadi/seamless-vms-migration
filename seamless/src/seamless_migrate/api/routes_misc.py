@@ -11,15 +11,16 @@ from .. import __version__
 from ..ai.payloads import console_allowed, data_sent
 from ..ai.recommendations import LEGACY_PREFIX, legacy_by_id, listing
 from ..domain.enums import DecisionType, Role
-from ..domain.models import AdvisorRecommendation, AdvisorSnapshot, Migration, Plan
+from ..domain.models import AdvisorRecommendation, AdvisorSnapshot, Migration, Plan, VMRef
 from ..metrics import advisor_calls, render_metrics
 from ..security.auth import Principal
 from ..stats import Stats, compute_stats
 from ..store import NotFound
-from .deps import metrics_access, require_role, services
+from .deps import ApiError, metrics_access, require_role, services
 from .schemas import (
     AdvisorStatus,
     DataSentList,
+    DemoPowerRequest,
     Health,
     Hit,
     JevStatus,
@@ -31,6 +32,20 @@ from .schemas import (
 )
 
 router = APIRouter(tags=["misc"])
+
+
+@router.post("/demo/vms/{source_id}/power", response_model=VMRef)
+async def demo_power(
+    source_id: str,
+    body: DemoPowerRequest,
+    request: Request,
+    _: Principal = Depends(require_role(Role.operator)),
+) -> VMRef:
+    """Power a fake source VM on or off, so the source watch shows (demo mode only, SDD §8.1)."""
+    svc = services(request)
+    if not svc.settings.demo:
+        raise ApiError(404, "not_found", "no such route outside demo mode")
+    return await svc.orchestrator.demo_power(source_id, on=body.state == "on")
 
 
 @router.get("/health", response_model=Health)

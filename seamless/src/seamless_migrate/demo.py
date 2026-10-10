@@ -181,6 +181,26 @@ async def seed_demo(
         if plan.name == VMWARE_PLAN:
             await _seed_cutover_approvals(orchestrator, plan.id)
         log.info("demo plan %r seeded and started", plan.name)
+    await _restore_source_power(orchestrator)
+
+
+#: a migration in these stopped its source: the simulated cutover did, before a restart
+_SOURCE_STOPPED = frozenset({Phase.cutover, Phase.verifying, Phase.completed, Phase.finalized})
+
+
+async def _restore_source_power(orchestrator: Orchestrator) -> None:
+    """A restart builds new fakes, whose sources run (SDD §8.1): stop again those a simulated
+    cutover stopped, so the source watch flags only a source the demo powered on."""
+    plans = {p.id: p for p in await orchestrator.db.list("plan", Plan)}
+    for m in await orchestrator.db.list("migration", Migration):
+        stopped = m.phase in _SOURCE_STOPPED or (m.downtime_started_at and not m.downtime_ended_at)
+        plan = plans.get(m.plan_id)
+        if not stopped or plan is None:
+            continue
+        source = await orchestrator.source_client(plan)
+        power_off = getattr(source, "power_off", None)
+        if power_off is not None:
+            await power_off(m.vm.source_id)
 
 
 async def _seed_cutover_approvals(orchestrator: Orchestrator, plan_id: str) -> None:
