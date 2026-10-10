@@ -988,7 +988,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   same reason a validation refuses a running plan (409) under the plan's lock before it waits for the claim lock.
   A strategy change (`set_strategy`, `PUT …/strategy`) takes the plan's lock, then the migration's, as the advisor's
   override does (§14.6): it waits for a running validation, and the migration's strategy and the plan's
-  `strategy_overrides` entry are written together under it, so no validation undoes the change. Plan documents are written by several drivers and the tick loop
+  `strategy_overrides` entry are written together under it, so no validation undoes the change. It and an advisor
+  decision refuse a migration whose phase they cannot change (not `pending`, `ready` or `blocked`) before they take
+  the plan's lock — the check repeats under it — so neither waits, holding the lock the tick needs, behind a finalize
+  that holds the migration's lock across a provider deletion. Plan documents are written by several drivers and the tick loop
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
