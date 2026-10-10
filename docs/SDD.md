@@ -1697,7 +1697,11 @@ seamless version
 ```
 
 `plan apply` accepts the `PlanCreate` schema in YAML. Commands operating on the store use the same
-settings as `serve` (they open the DB directly; a running server sees changes on its next tick).
+settings as `serve` (they open the DB directly; a running server sees changes on its next tick). An
+update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
+the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
+only if the plan did not change since it was read (a server that started or validated it meanwhile), and
+otherwise fails and asks to run it again, so it never overwrites a change it did not see.
 
 ### 15.1 Configuration (environment)
 
