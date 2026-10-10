@@ -927,6 +927,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 
 * `Orchestrator(store, bus, providers, executors, advisor, knowledge, settings)` with
   `async start()`/`async stop()` (FastAPI lifespan) and a tick loop (`settings.tick_s`, default 1.0).
+  On SIGTERM `seamless serve` waits at most 5 s for open requests — an event stream never ends by
+  itself — then cancels them, and the lifespan runs `stop()`: running steps are cancelled (a playbook
+  gets SIGTERM, then SIGKILL after 10 s) and their run files (`secrets.yml`, `clouds.yaml`) removed. The
+  container's stop grace leaves room for it: 30 s on Compose (`stop_grace_period`), 60 s on OpenShift
+  (`terminationGracePeriodSeconds`).
 * Public async API used by routes: `validate_plan(plan_id, actor)`, `start_plan`, `pause_plan`,
   `approve(migration_id, actor, comment)`, `request_cutover(migration_id, actor, force_window)`,
   `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `finalize(…,
