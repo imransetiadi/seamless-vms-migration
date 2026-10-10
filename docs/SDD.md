@@ -1332,7 +1332,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   convergence threshold (0 or more), maximum passes (1 or more) and the keep-warm interval (at least a minute, §5.4) —
   estimator overrides (scan rate per disk stream, disks scanned in parallel (1 or more), guest write rate
   `change_rate_bps`, aggregate scan cap
-  `max_aggregate_scan_bps`, §9.1; other overrides a plan already has are kept),
+  `max_aggregate_scan_bps`, and the measured step times in seconds — source shutdown, snapshot, volume create and
+  destination boot: `shutdown_s`, `snapshot_s`, `create_s`, `boot_s` (Performance.md §6.4) — §9.1; other overrides
+  a plan already has are kept),
   the resources pre-staged at the destination (any of the six defaults of §4.2, in that order; other entries a plan
   already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review — and storage handover;
