@@ -305,7 +305,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
-            downtime_model_s: float|null,   # demo: the model seconds a simulated cutover kept the source stopped (§5.2)
+            downtime_model_s: float|null,   # demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (§5.2)
             verification: VerificationRecord|null,   # the last verification: checks and probe results (§7.5, ADV-18)
             suggested_probes: list[AppProbe] = [],   # the rules' suggestion at validation; inactive until added to the plan (§9.6)
             source_running_at: datetime|null,   # completed, not finalized: when its source VM was seen running again (§8.1)
@@ -405,14 +405,18 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
   (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. `actual_downtime_s` = difference — except after a simulated
-  cutover (demo, §7.4): the simulator reports the model seconds it spent with the source stopped (the copy or final
-  sync, the conversion and the create) in `Migration.downtime_model_s`, and a verified migration's downtime is those
-  plus the plan's boot time, in the same time base as the passes' `duration_s`, so a demo's downtime compares with
-  its estimate (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED` would multiply the control plane's own
-  overhead too). A retry resets a
+  rollback, when the source VM is running again. `actual_downtime_s` = difference — except in demo mode (§7.4),
+  where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
+  with its estimate and with the clock that ran before it (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED`
+  would multiply the control plane's own overhead too): each simulated step reports the model seconds it kept the
+  source stopped — the cutover its copy or final sync, conversion and create (up to the failure when it fails), a
+  rollback its own work — and `Migration.downtime_model_s` adds them up while the clock is open. A verified
+  migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
+  cutover had finished (the destination booted for its verification). A clock no step reported model seconds for
+  stays in wall seconds. A retry resets a
   closed clock but keeps an open one: the source has not run since it stopped, so the downtime of
-  the next attempt counts from that first stop and the stats report the VM's whole outage.
+  the next attempt counts from that first stop (in demo mode the kept model seconds and the next attempt's add up)
+  and the stats report the VM's whole outage.
 
 ### 5.3 Convergence rule (warm strategies)
 
@@ -681,7 +685,8 @@ class StepResult:
     details: dict[str, Any] = field(default_factory=dict)
 
 class TransientStepError(Exception): ...   # retried with backoff (max_step_retries, default 2)
-class PermanentStepError(Exception): ...   # migration -> failed
+class PermanentStepError(Exception):       # migration -> failed
+    details: dict[str, Any]                # keyword-only, default {}: what the step reported before it failed (§5.2)
 
 class Executor(Protocol):
     name: str
@@ -850,7 +855,9 @@ shares, or the FlexVol inside its pool search pattern.
 Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default 60). Byte counts
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
-source is stopped, and the cutover reports `downtime_model_s` (§5.2, ADV-16). Cutover fails with
+source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
+cutover its copy, conversion and create — a failed cutover up to its failure, in its `PermanentStepError`'s
+`details` — and the rollback its own 90 s before it starts the source again. Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
 strategy. The fake destination simulates the guests' services for the application probes (§7.5): a
 guest answers its suggested probes (§9.6) and SSH (RDP on Windows), with HTTP status 200, and refuses every
