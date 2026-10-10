@@ -340,9 +340,11 @@ never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
-§7.1): the whole line passes through `redact` (§13.4) and is then cut to 2000 characters, so what
-`redact` recognizes — a password a task prints without `no_log`, a token, a PEM block whose end lies
-beyond the cut — reaches no subscriber. `migration.progress` carries the running step's
+§7.1), cut to 2000 characters after its first 2000 + 16384 characters passed through `redact` (§13.4):
+what `redact` recognizes — a password a task prints without `no_log`, a token, a PEM block that begins
+before the cut and ends within 16 KiB after it — reaches no subscriber, and a line of megabytes costs
+the event loop no more than one of 18 KiB (redacting a 4 MiB line takes about a second).
+`migration.progress` carries the running step's
 `{pct, bytes_done, bytes_total, phase}` as reported to the executor's progress callback (§7.1), not the
 migration's totals.
 
