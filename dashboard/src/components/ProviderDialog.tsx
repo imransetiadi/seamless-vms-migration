@@ -14,6 +14,7 @@ import { Modal } from './Modal';
 import { ProviderStatusBadge } from './StatusBadge';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}$/;
+const PLATFORM_LOCKED = 'A provider keeps its platform type; register a new provider instead.';
 
 interface FormState {
   distribution: Distribution;
@@ -137,40 +138,53 @@ function PlatformPicker({
   onChange: (preset: DistributionPreset) => void;
 }) {
   const name = useId();
+  const reasonId = useId();
+  // a platform of another kind stays focusable and says why it cannot be chosen: to assistive
+  // technology, on hover, and in a note once it is clicked, tapped or arrowed to (SDD §16)
+  const [note, setNote] = useState(false);
   return (
-    <div role="radiogroup" aria-label="Platform" className="grid gap-2 sm:grid-cols-2">
-      {DISTRIBUTION_PRESETS.map((preset) => {
-        const locked = lockedKind !== null && preset.kind !== lockedKind;
-        const checked = preset.id === value;
-        return (
-          <label
-            key={preset.id}
-            className={cn(
-              'relative flex min-h-11 cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors duration-150',
-              checked ? 'border-accent bg-accent/10' : 'border-border hover:bg-muted/60',
-              locked && 'cursor-not-allowed opacity-50 hover:bg-transparent',
-              'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ring',
-            )}
-            title={locked ? 'A provider keeps its platform type; register a new provider instead.' : undefined}
-          >
-            <input
-              type="radio"
-              name={name}
-              value={preset.id}
-              checked={checked}
-              disabled={locked}
-              onChange={() => onChange(preset)}
-              className="sr-only"
-            />
-            <PlatformMark preset={preset} />
-            <span className="min-w-0">
-              <span className="block text-sm font-medium text-foreground">{preset.label}</span>
-              <span className="block text-xs text-muted-foreground">{preset.summary}</span>
-            </span>
-            {checked && <CircleCheck aria-hidden className="absolute right-2 top-2 size-4 text-accent" />}
-          </label>
-        );
-      })}
+    <div>
+      <div role="radiogroup" aria-label="Platform" className="grid gap-2 sm:grid-cols-2">
+        {DISTRIBUTION_PRESETS.map((preset) => {
+          const locked = lockedKind !== null && preset.kind !== lockedKind;
+          const checked = preset.id === value;
+          return (
+            <label
+              key={preset.id}
+              className={cn(
+                'relative flex min-h-11 cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors duration-150',
+                checked ? 'border-accent bg-accent/10' : 'border-border hover:bg-muted/60',
+                locked && 'cursor-not-allowed opacity-50 hover:bg-transparent',
+                'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ring',
+              )}
+              title={locked ? PLATFORM_LOCKED : undefined}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={preset.id}
+                checked={checked}
+                aria-disabled={locked || undefined}
+                aria-describedby={locked ? reasonId : undefined}
+                // the radio group is controlled: an ignored change leaves the current platform checked
+                onChange={() => (locked ? setNote(true) : onChange(preset))}
+                className="sr-only"
+              />
+              <PlatformMark preset={preset} />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium text-foreground">{preset.label}</span>
+                <span className="block text-xs text-muted-foreground">{preset.summary}</span>
+              </span>
+              {checked && <CircleCheck aria-hidden className="absolute right-2 top-2 size-4 text-accent" />}
+            </label>
+          );
+        })}
+      </div>
+      {lockedKind !== null && (
+        <p id={reasonId} role={note ? 'note' : undefined} className={note ? 'mt-2 text-xs text-muted-foreground' : 'sr-only'}>
+          {PLATFORM_LOCKED}
+        </p>
+      )}
     </div>
   );
 }

@@ -196,7 +196,7 @@ describe('Providers page', () => {
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
     await user.click(within(card).getByRole('button', { name: /^edit$/i }));
     const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
-    expect(within(dialog).getByRole('radio', { name: /vmware vcenter/i })).toBeDisabled();
+    expect(within(dialog).getByRole('radio', { name: /vmware vcenter/i })).toHaveAttribute('aria-disabled', 'true');
     expect(within(dialog).getByLabelText(/^id/i)).toBeDisabled();
     expect(within(dialog).getByRole('radio', { name: /clouds\.yaml entry/i })).toBeChecked();
     const region = within(dialog).getByLabelText(/^region/i);
@@ -209,6 +209,27 @@ describe('Providers page', () => {
     expect(updated?.data).toEqual({ provider_id: 'community-lab', fields: ['region'] });
     expect(server.events.some((e) => e.kind === 'provider.credentials_updated')).toBe(false);
     expect(server.providers.find((p) => p.id === 'community-lab')?.region).toBe('RegionTwo');
+  });
+
+  it('says why another platform cannot be chosen when editing a provider: focusable, with the reason (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
+    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
+    const current = within(dialog).getAllByRole('radio').find((r) => (r as HTMLInputElement).checked)!;
+    const vmware = within(dialog).getByRole('radio', { name: /vmware vcenter/i });
+    // focusable and described, never natively disabled (SDD §16)
+    expect(vmware).not.toBeDisabled();
+    expect(vmware).toHaveAttribute('aria-disabled', 'true');
+    expect(vmware).toHaveAccessibleDescription('A provider keeps its platform type; register a new provider instead.');
+    expect(within(dialog).queryByRole('note')).not.toBeInTheDocument();
+
+    // tapping or clicking it says why in a note under the platforms, and changes nothing
+    await user.click(vmware);
+    expect(within(dialog).getByRole('note')).toHaveTextContent('A provider keeps its platform type; register a new provider instead.');
+    expect(vmware).not.toBeChecked();
+    expect(current).toBeChecked();
   });
 
   it('keeps the dialog open with the reason when a running plan locks the provider', async () => {
