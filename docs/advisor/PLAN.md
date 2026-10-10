@@ -48,7 +48,12 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    compression (model seconds next to wall-clock timestamps), a chart that reads the final sync as a delta, and the
    SDD §5.3 SLO rule the owner's invariant 3 leaves out; the real VMware warm cutover records no final pass.
    Proposals P1–P7 wait for the owner.
-2. ADV-17 — maker-checker for approvals (a requester never approves their own request; no break-glass).
+2. ADV-17 — maker-checker for approvals (a requester never approves their own request; no break-glass). Done —
+   02d0dad, 77a6078 (SDD), 2b1a3b4 (API: `Plan.require_distinct_approver`, `cutover_requested_by/at`, the requester's
+   approval refused with 409 and not counted by the gate; `AdvisorPolicy.require_distinct_approver`,
+   `AdvisorRecommendation.requested_by` = the validating user), 2a749d6 (dashboard), the e2e scripts' second approver
+   (`APPROVER_TOKEN`). jev_decide 0.82: a request is not an approval; 0.96: the validating user requests a decision.
+   `TODO(ADV-17): confirm` — approver = anyone with the role other than the requester; break-glass off.
 3. Rest of Phase 1 — the threshold value in the Decision line (ADV-03), approve/override and the Finance policy
    visible on the demo stack (ADV-04, PR-5), the deployment badge and "Data sent to advisor" (ADV-06, PR-7); then
    a new demo for the owner.
