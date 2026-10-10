@@ -1505,6 +1505,20 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     expect(forced.approvals).toEqual([{ actor: 'sari', at: new Date(NOW).toISOString(), comment: REASON }]);
   });
 
+  it('forces a migration once, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!; // syncing
+    await as(server, 'approver').post(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    const first = m.force_cutover;
+    // rina, another approver, would take sari's place: sari's own approval would count again
+    await expect(as(server, 'admin').post(`/migrations/${m.id}/force-cutover`, { reason: 'I would rather force it myself' })).rejects.toMatchObject({
+      status: 409,
+      message: 'Already forced by sari: the cutover follows the running pass.',
+    });
+    expect(m.force_cutover).toEqual(first);
+    expect(server.events.filter((e) => e.migration_id === m.id && e.kind === 'migration.force_cutover')).toHaveLength(1);
+  });
+
   it('refuses what the API refuses: a short reason, a converged or single-shot migration, an operator', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const syncing = 'mig-5d7e2b4a11';

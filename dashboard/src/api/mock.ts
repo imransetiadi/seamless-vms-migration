@@ -1965,6 +1965,8 @@ export class MockServer {
         if (!FORCEABLE.has(m.phase) || SINGLE_SHOT.has(m.strategy)) {
           throw new HttpError(409, 'conflict', `a Force cutover applies to a warm migration in pre-copy or syncing, not to ${m.strategy} in ${m.phase}`);
         }
+        // forced once, like the API (SDD §5.4): a second forcer would take the first one's place
+        if (m.force_cutover) throw new HttpError(409, 'conflict', `Already forced by ${m.force_cutover.actor}: the cutover follows the running pass.`);
         const last = m.sync_passes.filter((p) => p.ended_at !== null).at(-1);
         const at = new Date(this.now()).toISOString();
         const force = { actor: me.name, at, reason, delta_bytes: last?.bytes_changed ?? 0, estimated_downtime_s: m.estimate?.downtime_s ?? 0 };
