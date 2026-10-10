@@ -3,11 +3,14 @@
 # for its cutover, cut it over, assert the outcome and print its audit trail.
 #
 #   export TOKEN='smg_...'            # an admin or approver token (never printed)
+#   export APPROVER_TOKEN='smg_...'   # an approver of another user: the requester never approves (SDD §5.4)
 #   tests/e2e/demo-journey.sh         # BASE defaults to http://127.0.0.1:8080/api/v1
 set -euo pipefail
 BASE=${BASE:-http://127.0.0.1:8080/api/v1}
 : "${TOKEN:?export TOKEN=<admin or approver token>}"
+: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
 api() { curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$@"; }
+second() { curl -fsS -H "Authorization: Bearer $APPROVER_TOKEN" -H 'Content-Type: application/json' "$@"; }
 
 echo "== health";   curl -fsS "$BASE/health" | jq -e '.status == "ok" and .db == "ok" and .demo == true'
 echo "== identity"; api "$BASE/me" | jq -e '.role == "admin" or .role == "approver"'
@@ -23,8 +26,11 @@ done
 [ -n "$MID" ] || { echo "no warm migration reached awaiting_cutover"; exit 1; }
 
 echo "== cutover $MID"
-api -X POST "$BASE/migrations/$MID/cutover" -d '{"force_window": true, "comment": "qa demo journey"}' \
-  | jq -e '.cutover_requested == true and (.approvals | length) >= 1'
+api -X POST "$BASE/migrations/$MID/cutover" -d '{"force_window": true, "comment": "QA journey: window agreed with the owner"}' \
+  | jq -e '.cutover_requested == true and .cutover_requested_by != null'
+# maker-checker (SDD 5.4): a second approver approves the request
+second -X POST "$BASE/migrations/$MID/approve" -d '{"comment": "QA journey: findings checked by a second approver"}' \
+  | jq -e '. as $m | [$m.approvals[] | select(.actor != $m.cutover_requested_by)] | length >= 1' >/dev/null
 
 PHASE=""
 for _ in $(seq 1 120); do

@@ -1020,7 +1020,10 @@ make seamless-down                                   # keeps data;  make seamles
 
 ### 14.7 Journey and RBAC scripts (E2)
 
-Committed scripts (`export TOKEN=…` then run them): [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh)
+Committed scripts (`export TOKEN=…` then run them; `smoke-demo.sh`, `demo-journey.sh` and `demo-restart.sh` also take
+`APPROVER_TOKEN`, an approver token of a second user created like DEMO-05's — `seamless token create --name … --role
+approver`, appended to `tokens.yaml` — because the requester of a cutover never approves it: maker-checker, SDD §5.4;
+the smoke also checks that the requester's own approval is refused with 409): [`tests/e2e/smoke-demo.sh`](../tests/e2e/smoke-demo.sh)
 covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
 decision when it validates its plan — the smoke plan of an earlier run, or a new one on a VM no plan holds (one
 VM, one migration across plans, SDD §5.4; the demo leaves `report-01` and `batch-01` unplanned for it and for a

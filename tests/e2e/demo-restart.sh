@@ -5,6 +5,7 @@
 # migration.phase ordering. Run right after `make seamless-reset CONFIRM=yes && make seamless-demo`.
 #
 #   export TOKEN='smg_...'        # admin or approver token
+#   export APPROVER_TOKEN='smg_...'  # an approver of another user: the requester never approves (SDD §5.4)
 #   tests/e2e/demo-restart.sh     # RESTART_AT=<seconds> (default 45), BASE=<url>
 # shellcheck disable=SC2034
 set -u
@@ -12,7 +13,9 @@ R=$(cd "$(dirname "$0")/../.." && pwd)
 S=${TMPDIR:-/tmp}
 BASE=${BASE:-http://127.0.0.1:8080}
 : "${TOKEN:?export TOKEN=<admin or approver token>}"
+: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
 H="Authorization: Bearer $TOKEN"
+HA="Authorization: Bearer $APPROVER_TOKEN"
 C="docker --context colima-seamless compose -p seamless -f $R/deploy/compose/compose.yaml --env-file $R/deploy/compose/.env"
 seen=""
 restart_at=${RESTART_AT:-45}
@@ -22,11 +25,12 @@ while [ $SECONDS -lt $deadline ]; do
   stats=$(curl -fsS -m 5 -H "$H" "$BASE/api/v1/stats" 2>/dev/null || echo '{}')
   phases=$(python3 -c 'import json,sys; s=json.load(sys.stdin); print(" ".join(k for k,v in (s.get("by_phase") or {}).items() if v))' <<<"$stats")
   seen="$seen $phases"
-  # approve + cutover what waits for an approver (the VMware plan requires approval)
+  # request + approve what waits for an approver (the VMware plan requires approval); maker-checker
+  # (SDD 5.4): one user requests, another approves
   migs=$(curl -fsS -m 5 -H "$H" "$BASE/api/v1/migrations" 2>/dev/null || echo '[]')
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"] in ("awaiting_cutover","ready") and not m.get("cutover_requested")))' <<<"$migs"); do
-    curl -fsS -m 5 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"demo46"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1
-    curl -fsS -m 5 -X POST -H "$H" -H "Content-Type: application/json" -d '{}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1
+    curl -fsS -m 5 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"Restart drill: window agreed"}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1
+    curl -fsS -m 5 -X POST -H "$HA" -H "Content-Type: application/json" -d '{"comment":"Restart drill: approved by a second approver"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1
   done
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"]=="rolled_back" and m["attempts"] < 2))' <<<"$migs"); do
     curl -fsS -m 5 -X POST -H "$H" "$BASE/api/v1/migrations/$mid/retry" >/dev/null 2>&1

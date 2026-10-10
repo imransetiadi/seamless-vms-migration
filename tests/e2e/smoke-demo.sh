@@ -4,6 +4,8 @@
 #
 #   make seamless-demo
 #   export TOKEN='smg_...'            # the admin token printed once by scripts/compose-init.sh
+#   export APPROVER_TOKEN='smg_...'   # an approver of another user: a requester never approves their own
+#                                     # cutover (maker-checker, SDD §5.4) — seamless token create --role approver
 #   tests/e2e/smoke-demo.sh           # BASE defaults to http://127.0.0.1:8080
 #
 # Checks health, RBAC, the dashboard, metrics, the seeded demo flow (approvals, cutovers, one
@@ -14,7 +16,9 @@
 set -u
 BASE=${BASE:-http://127.0.0.1:8080}
 : "${TOKEN:?export TOKEN=<admin token from compose-init.sh>}"
+: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
 H="Authorization: Bearer $TOKEN"
+HA="Authorization: Bearer $APPROVER_TOKEN"
 pass=0; fail=0
 ok()   { pass=$((pass+1)); echo "PASS  $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL  $1"; }
@@ -27,6 +31,8 @@ check "unauthenticated /me is 401"  '[ "$(curl -s -o /dev/null -w "%{http_code}"
 check "readiness is 200 with orchestrator healthy" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/v1/ready")" = 200 ] && curl -fsS -m 10 "$BASE/api/v1/ready" | grep -q "\"healthy\":true"'
 me=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/me" || echo '{}')
 check "/me is admin"                '[[ "$me" == *\"role\":\"admin\"* ]]'
+approver_me=$(curl -fsS -m 10 -H "$HA" "$BASE/api/v1/me" || echo '{}')
+check "APPROVER_TOKEN is an approver of another user" 'python3 -c "import json,sys; a,b=json.loads(sys.argv[1]),json.loads(sys.argv[2]); sys.exit(0 if a.get(\"role\") in (\"approver\",\"admin\") and a.get(\"name\") != b.get(\"name\") else 1)" "$approver_me" "$me"'
 index=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$BASE/")
 check "dashboard served at /"       '[ "$index" = 200 ] && curl -fsS -m 10 "$BASE/" | grep -qi "<div id=\"root\""'
 check "security headers on / and the API" 'curl -sSI -m 10 "$BASE/" | grep -qi "^content-security-policy:" && curl -sSI -m 10 "$BASE/api/v1/health" | grep -qi "^x-content-type-options: nosniff"'
@@ -51,10 +57,14 @@ while [ $SECONDS -lt $deadline ]; do
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"]=="rolled_back" and m["attempts"] < 2))' <<<"$migs"); do
     curl -fsS -m 10 -X POST -H "$H" "$BASE/api/v1/migrations/$mid/retry" >/dev/null 2>&1 && echo "retried $mid"
   done
-  # approve + request cutover: warm strategies wait in awaiting_cutover, single-shot ones in ready
+  # request (admin) + approve (another approver): warm strategies wait in awaiting_cutover, single-shot ones
+  # in ready; maker-checker (SDD 5.4): the requester's own approval is refused, so another user approves
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"] in ("awaiting_cutover","ready") and not m.get("cutover_requested")))' <<<"$migs"); do
-    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"smoke"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1
-    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1 && echo "approved+cutover $mid"
+    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"Smoke run: window agreed"}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1 || continue
+    if [ -z "${self_code:-}" ]; then
+      self_code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"my own request"}' "$BASE/api/v1/migrations/$mid/approve")
+    fi
+    curl -fsS -m 10 -X POST -H "$HA" -H "Content-Type: application/json" -d '{"comment":"Smoke run: findings checked by a second approver"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1 && echo "requested+approved $mid"
   done
   running=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/plans" | python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin) if p["status"]=="running"))')
   done_all=$(python3 -c 'import json,sys; ms=json.load(sys.stdin); print("yes" if ms and int(sys.argv[1])==0 and all(m["phase"] in ("completed","finalized","cancelled","failed","rolled_back","blocked","ready") for m in ms) else "no")' "$running" <<<"$migs")
@@ -63,6 +73,7 @@ while [ $SECONDS -lt $deadline ]; do
 done
 echo "final phases: ${final:-$summary (timeout)}"
 check "migrations reached completed"  '[[ -n "$final" && "$final" == *completed* ]]'
+check "maker-checker: the requester's own approval is refused (409)" '[ "${self_code:-none}" = 409 ] || [ "${self_code:-none}" = none ]'
 check "no failed migration"           '[[ -n "$final" && "$final" != *failed* ]]'
 python3 -c 'import json,sys; ms=json.load(sys.stdin); print("downtime_s:", sorted(round(m["actual_downtime_s"],1) for m in ms if m.get("actual_downtime_s") is not None)); print("blocked:", [(m["vm"]["name"], [f["code"] for f in m["findings"] if f["severity"]=="blocker"]) for m in ms if m["phase"]=="blocked"])' <<<"$migs"
 # plan status after the run
