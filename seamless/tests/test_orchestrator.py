@@ -815,6 +815,25 @@ async def test_a_validation_of_a_running_plan_is_refused_before_it_waits_for_the
             await validation
 
 
+async def test_the_lock_table_does_not_grow_with_the_ids_requests_name(tmp_path, store):
+    """SDD §8: a lock lives while a coroutine holds it or waits for it — requests naming unknown
+    ids (404) leave no lock behind, and a held lock is the one every caller gets for its key."""
+    h, plan = await setup(tmp_path, store, [vm(1)])
+    before = len(h.orch._locks)
+    for n in range(500):
+        with pytest.raises(NotFound):
+            await h.orch.cancel(f"mig-unknown-{n}", "bayu")
+        with pytest.raises(NotFound):
+            await h.orch.validate_plan(f"plan-unknown-{n}", "bayu")
+    assert len(h.orch._locks) <= before
+    async with h.orch.plan_lock(plan.id):
+        assert h.orch.plan_lock(plan.id).locked()  # the same lock while it is held
+        waiter = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+        await asyncio.sleep(0.05)
+        assert not waiter.done(), "a validation waits for the plan's lock"
+    assert (await waiter).plan_id == plan.id
+
+
 async def test_a_retry_during_the_plans_completion_reopens_it(tmp_path, store):
     """SDD §8: the completion holds the plan's lock from its re-read to its write; a retry that
     arrives meanwhile waits for it, then finds the plan completed and reopens it."""

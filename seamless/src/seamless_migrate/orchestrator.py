@@ -20,6 +20,7 @@ import contextlib
 import inspect
 import logging
 import time
+import weakref
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
@@ -280,7 +281,8 @@ class Orchestrator:
         self._verifier_factory = verifier_factory or (
             lambda dst: Verifier(dst, settings, poll_s=verify_poll_s)
         )
-        self._locks: dict[str, asyncio.Lock] = {}
+        # SDD §8: a lock lives while a coroutine holds it or waits for it
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         #: when the next source watch is due (SDD §8.1); set by the first tick
         self._source_watch_due: datetime | None = None
         #: the source watch in progress: the tick starts it and never waits for it (SDD §8.1)
