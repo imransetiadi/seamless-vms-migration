@@ -184,8 +184,6 @@ class Orchestrator:
         self._prestage_tasks: dict[str, asyncio.Task[None]] = {}
         #: best-effort rollback of the data path after a cancel in precopy/syncing (SDD §7.2)
         self._cleanups: dict[str, asyncio.Task[None]] = {}
-        #: migrations whose failed attempt waits out its transient-retry backoff (SDD §8)
-        self._backoff: set[str] = set()
         self._wave_events_seen: dict[str, set[tuple[str, str]]] = {}
         self._progress_at: dict[str, float] = {}
         self._tick_task: asyncio.Task[None] | None = None
@@ -878,17 +876,18 @@ class Orchestrator:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
                     raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
+            previous = m.phase
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-            # SDD §5.1: the data path of a warm migration — the killed pass, a failed attempt
-            # waiting for its retry (no step runs then; the cancel ends the retries, §8) or the
-            # passes it recorded — left snapshots, temporary and destination volumes behind, and
-            # `cancelled` is terminal: no later action could remove them
-            data_path = step is not None or mid in self._backoff or bool(m.sync_passes)
+            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
+            # the retries, §8) or has just finished unrecorded; with the passes a migration
+            # recorded, that data path left snapshots, temporary and destination volumes behind,
+            # and `cancelled` is terminal: no later action could remove them
+            data_path = previous in (P.precopy, P.syncing) or bool(m.sync_passes)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -1514,70 +1513,65 @@ class Orchestrator:
         executor = self.executors.for_strategy(m.strategy)
         attempt = 0
         loop = asyncio.get_running_loop()
-        try:
-            while True:
-                async with self._lock(m.id):
-                    # SDD §8: an attempt starts under the migration's lock and only while the
-                    # migration is still in the step's phase, so a cancel either finds it running
-                    # or ends the retries (and cleans up after the failed attempt, §5.1)
-                    current, _ = await self._load(m.id)
-                    if current.phase != m.phase:
-                        return None
-                    ctx = self._context(current, plan, source, destination)
-                    work = runner(ctx) if runner is not None else executor.run(step, ctx)
-                    task = asyncio.create_task(work, name=f"{step}:{m.id}")
-                    self._steps[m.id] = task
-                started = loop.time()
-                timeout = self.settings.step_timeout_s or None
-                timed_out = False
-                try:
-                    done, _ = await asyncio.wait({task}, timeout=timeout)
-                    if not done:
-                        # SDD §15.1: the attempt exceeded its wall-clock ceiling — cancel it (the
-                        # executor kills the playbook) and fail it like any other permanent error
-                        timed_out = True
-                        task.cancel()
-                        with contextlib.suppress(BaseException):
-                            await task
-                except asyncio.CancelledError:
+        while True:
+            async with self._lock(m.id):
+                # SDD §8: an attempt starts under the migration's lock and only while the
+                # migration is still in the step's phase, so a cancel either finds it running
+                # or ends the retries (and cleans up after the failed attempt, §5.1)
+                current, _ = await self._load(m.id)
+                if current.phase != m.phase:
+                    return None
+                ctx = self._context(current, plan, source, destination)
+                work = runner(ctx) if runner is not None else executor.run(step, ctx)
+                task = asyncio.create_task(work, name=f"{step}:{m.id}")
+                self._steps[m.id] = task
+            started = loop.time()
+            timeout = self.settings.step_timeout_s or None
+            timed_out = False
+            try:
+                done, _ = await asyncio.wait({task}, timeout=timeout)
+                if not done:
+                    # SDD §15.1: the attempt exceeded its wall-clock ceiling — cancel it (the
+                    # executor kills the playbook) and fail it like any other permanent error
+                    timed_out = True
                     task.cancel()
                     with contextlib.suppress(BaseException):
                         await task
-                    raise
-                finally:
-                    if self._steps.get(m.id) is task:
-                        del self._steps[m.id]
-                stats = self.step_stats[str(step)]
-                stats[0] += loop.time() - started
-                stats[1] += 1
-                if timed_out:
-                    raise PermanentStepError(
-                        f"{step} exceeded the step timeout of {self.settings.step_timeout_s:g} s"
-                    )
-                if task.cancelled():
-                    return None
-                exc = task.exception()
-                if exc is None:
-                    return task.result()
-                if isinstance(exc, TransientStepError) and attempt < self.settings.max_step_retries:
-                    # until the next attempt starts, a cancel cleans up after this one (SDD §5.1)
-                    self._backoff.add(m.id)
-                    attempt += 1
-                    delay = float(2**attempt)
-                    if self.settings.demo:
-                        delay /= max(self.settings.demo_speed, 1.0)
-                    await self._emit(
-                        "migration.log",
-                        f"{step}: transient failure ({redact(str(exc))[:200]}); retry "
-                        f"{attempt}/{self.settings.max_step_retries} in {delay:g} s",
-                        migration=current,
-                        persist=False,
-                    )
-                    await self._sleep(delay)
-                    continue
-                raise exc
-        finally:
-            self._backoff.discard(m.id)
+            except asyncio.CancelledError:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                raise
+            finally:
+                if self._steps.get(m.id) is task:
+                    del self._steps[m.id]
+            stats = self.step_stats[str(step)]
+            stats[0] += loop.time() - started
+            stats[1] += 1
+            if timed_out:
+                raise PermanentStepError(
+                    f"{step} exceeded the step timeout of {self.settings.step_timeout_s:g} s"
+                )
+            if task.cancelled():
+                return None
+            exc = task.exception()
+            if exc is None:
+                return task.result()
+            if isinstance(exc, TransientStepError) and attempt < self.settings.max_step_retries:
+                attempt += 1
+                delay = float(2**attempt)
+                if self.settings.demo:
+                    delay /= max(self.settings.demo_speed, 1.0)
+                await self._emit(
+                    "migration.log",
+                    f"{step}: transient failure ({redact(str(exc))[:200]}); retry "
+                    f"{attempt}/{self.settings.max_step_retries} in {delay:g} s",
+                    migration=current,
+                    persist=False,
+                )
+                await self._sleep(delay)
+                continue
+            raise exc
 
     def _params(self, m: Migration, plan: Plan) -> EstimatorParams:
         """Plan estimator parameters with this migration's calibrated scan rate."""

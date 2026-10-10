@@ -1293,6 +1293,55 @@ async def test_a_shutdown_interrupts_a_cancels_cleanup_and_records_why(tmp_path,
     assert "interrupted" in errors[0].message and "rollback_workloads.yml" in errors[0].message
 
 
+async def test_cancel_after_a_pass_finished_but_before_it_is_recorded_cleans_up(tmp_path, store):
+    """SDD §5.1: a cancel from precopy cleans up even in the gap between a finished first pass and
+    its recording - no step runs, no retry waits and no pass is recorded yet, but the pass's
+    destination volumes and snapshots exist."""
+    settings = make_settings(tmp_path)
+    finished, cancelled = asyncio.Event(), asyncio.Event()
+    rollbacks: list[dict] = []
+
+    async def first_pass(ctx):
+        result = await executor.sim.run(StepName.PRECOPY, ctx)
+        finished.set()  # snapshots and destination volumes exist now
+        return result
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: first_pass, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    read_plan = h.orch._plan
+
+    async def plan_then_cancel(plan_id):
+        # the driver reads the plan before it records the finished pass: the operator cancels now
+        if finished.is_set() and not cancelled.is_set():
+            cancelled.set()
+            m = await h.by_vm(plan.id, "vm-1")
+            assert m.phase == P.precopy and not m.sync_passes and m.id not in h.orch._steps
+            await h.orch.cancel(m.id, "rina", "window closed")
+        return await read_plan(plan_id)
+
+    h.orch._plan = plan_then_cancel
+    await run_plan(h, plan)
+    await asyncio.wait_for(cancelled.wait(), 5)
+    m = await h.by_vm(plan.id, "vm-1")
+    assert await _settled(h, m.id) == ["cancel", "cleanup"]
+    assert rollbacks == [{"delete_dest_volumes": True}]
+    assert (await h.migration(m.id)).phase == P.cancelled
+    await h.orch.stop()
+
+
 async def test_cancel_without_a_data_path_runs_no_cleanup(tmp_path, store):
     """SDD §5.1: a warm migration that never ran a pass (validated, its plan not started) left
     nothing behind: its cancel runs no rollback step."""
