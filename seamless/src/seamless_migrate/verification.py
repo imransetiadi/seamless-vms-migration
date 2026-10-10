@@ -151,8 +151,13 @@ async def _app_probe(host: str, probe: AppProbe) -> ProbeAnswer:
         return ProbeAnswer("passed", f"connected to {where}", True)
     url = f"{probe.kind}://{_url_host(host)}:{probe.port}{probe.path}"
     try:
-        # the certificate cannot name the address probed: only the status is read (SDD §7.5)
-        async with httpx.AsyncClient(verify=False, timeout=TCP_TIMEOUT_S) as client:  # noqa: S501
+        # the certificate cannot name the address probed: only the status is read; and the probe
+        # goes to the guest itself, never through a proxy from the environment (SDD §7.5)
+        async with httpx.AsyncClient(
+            verify=False,  # noqa: S501
+            timeout=TCP_TIMEOUT_S,
+            trust_env=False,
+        ) as client:
             response = await client.get(url)
     except httpx.ConnectTimeout as exc:
         return _connect_failure(where, exc)

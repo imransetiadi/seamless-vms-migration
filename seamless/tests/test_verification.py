@@ -309,6 +309,36 @@ async def test_http_probes_read_the_status_of_the_path(http_server):
     assert exact.passed is False and exact.probes[0].detail == "HTTP 204, expected 200"
 
 
+async def test_an_application_probe_goes_to_the_guest_never_through_a_proxy(
+    http_server, monkeypatch
+):
+    """SDD §7.5: a probe runs from the control plane against the probe address - an HTTP(S) proxy
+    in the environment (a proxied deployment sets one) never answers for the guest."""
+    proxied: list[bytes] = []
+
+    async def proxy(reader, writer):
+        proxied.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(proxy, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.setenv(name, url)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    try:
+        ok = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+            app_ctx([AppProbe(kind="http", port=http_server["port"], path="/healthz")])
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert proxied == [] and http_server["paths"] == ["/healthz"]
+    assert ok.passed and ok.probes[0].detail == "HTTP 200"
+
+
 async def test_https_probes_do_not_verify_the_certificate(monkeypatch):
     """The probe connects to an address the certificate does not name: it reads only the status."""
     import seamless_migrate.verification as verification
@@ -337,6 +367,7 @@ async def test_https_probes_do_not_verify_the_certificate(monkeypatch):
         "10.0.0.5", AppProbe(kind="https", port=8443, path="/health")
     )
     assert answer.result == "passed" and seen["verify"] is False
+    assert seen["trust_env"] is False, "https goes to the guest too, never through a proxy"
     assert seen["url"] == "https://10.0.0.5:8443/health"
     # an IPv6 address is bracketed in the URL
     await verification._app_probe("fd00::5", AppProbe(kind="http", port=80))
