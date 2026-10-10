@@ -128,7 +128,7 @@ never a dump of logs, console output or API payloads.**
 
 | Never stored in agentmemory | Why | Enforced by |
 |---|---|---|
-| Passwords, tokens, API keys, `Authorization` headers, PEM/private-key blocks, credentials inside URLs | Secret exposure (NFR-06, NFR-07) | `ai.memory.redact()` client-side (`test_redact_removes_secrets`); agentmemory's own privacy filter server-side; `<private>` tags are stripped by the server |
+| Passwords, tokens, API keys, `Authorization` headers, PEM/private-key blocks, credentials inside URLs and connection strings, the `auth` section of a `clouds.yaml` | Secret exposure (NFR-06, NFR-07) | The one redaction layer `ai/redaction.py`, applied by `MemoryClient` to every request body (`test_redact_removes_secrets`, `test_every_agentmemory_request_leaves_redacted`); agentmemory's own privacy filter server-side; `<private>` tags are stripped by the server |
 | Guest console output (including excerpts) | Untrusted text (prompt-injection carrier) and may contain secrets | By construction: only `review_verification` reads it, after `jev_screen`, and sends it to Jev — never to `KnowledgeService` (SDD §13.4; `test_verification_blocked_console_sets_review_required`) |
 | API tokens, token hashes, `clouds.yaml` or VMware credential material | Credentials never leave the credential path (SDD §13.3) | Never part of any `Migration`/`Plan` field that lessons are built from |
 | Raw Ansible/`blocksync` output and run-directory contents | Hostnames, paths, addresses; unbounded size | Lessons carry the error *class* and a truncated message only |
@@ -136,13 +136,16 @@ never a dump of logs, console output or API payloads.**
 | VM names, **when** `SEAMLESS_MEMORY_REDACT_NAMES=true` | Customer-identifying names | Name list passed to `redact()` (§3.6) |
 | Operator identities | Personal data | Only L2 events carry `actor`; lessons do not |
 
-Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/memory.py` (SDD §13.4; the plan
-test `test_redact_removes_secrets` covers them): PEM blocks (`-----BEGIN … -----END …` → `[REDACTED PEM]`);
-credentials in URLs (`scheme://user:password@host`); `Authorization` headers and bare `Bearer` tokens;
-`key=value`, `key: value` and `"key": "value"` assignments for password, passwd, pwd, secret, client secret,
-token, auth token, `x-auth-token`, API/access/secret/private key and credential(s); and well-known token shapes —
-Seamless API tokens (`smg_…`), Keystone Fernet tokens (`gAAAAA…`) and JWTs (`eyJ….….…`). Matches become
-`[REDACTED]`. Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
+Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/redaction.py`, the one layer every
+agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_secrets` and the reviewed snapshot
+`test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot` cover them): PEM blocks (`-----BEGIN … -----END …`
+→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON → `auth: [REDACTED]`); credentials in URLs
+and connection strings (`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization`
+headers and bare `Bearer` tokens; `key=value`, `key: value` and `"key": "value"` assignments for password, passwd,
+pwd, secret, client secret, token, auth token, `x-auth-token`, API/access/secret/private key and credential(s),
+the key possibly prefixed (`OS_PASSWORD`); and well-known token shapes — Seamless API tokens (`smg_…`), Keystone
+Fernet tokens (`gAAAAA…`), JWTs (`eyJ….….…`), AWS access key ids, GitHub tokens, `sk-` keys and Slack tokens.
+Matches become `[REDACTED]`; `redact_payload` also replaces the whole value of a credential key. Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
 words that appear in an error message — treat the memory server as an internal system and prefer
 `SEAMLESS_MEMORY_REDACT_NAMES=true` whenever the server is shared (§3.6).
 
@@ -198,7 +201,7 @@ words that appear in an error message — treat the memory server as an internal
 * **Sensitive data found in memory** (checklist): ① delete the memories with a reason; ② verify with a
   search for the offending string; ③ **rotate** the leaked secret (Security.md §7, §13); ④ find the leak's
   origin — if a Seamless payload carried it, add a failing case to `test_redact_removes_secrets` first, then
-  fix `redact()`; ⑤ record the incident (Security.md §13).
+  fix `redact()` in `ai/redaction.py`; ⑤ record the incident (Security.md §13).
 * **Erasure requests:** operator identities exist only in L2 `events` (`actor`) and git history; agentmemory
   holds none by design. Handle requests against L2 under change control.
 * **Access control:** bind the memory server to loopback; when it must be reachable (team server, cluster),
@@ -397,7 +400,7 @@ server; never impersonate another agent id.
 | Tolerant parsing of `results\|memories\|items`, `content\|narrative\|title` | `test_memory_search_tolerant_parsing` |
 | Failures swallowed | `test_memory_failures_swallowed` |
 | Similar incidents attached on failure | `test_knowledge_on_failure_attaches_hits`, `test_similar_incidents_attached_on_failure` (orchestrator) |
-| Redaction | `test_redact_removes_secrets` |
+| Redaction | `test_redact_removes_secrets`, `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot`, `test_every_agentmemory_request_leaves_redacted` |
 | Console output blocked from AI use | `test_verification_blocked_console_sets_review_required` |
 | Live server | `test_live_memory_roundtrip` (`SEAMLESS_LIVE_MEMORY=1`) |
 | Outage behavior | QASuite §11 R-04 (agentmemory outage and black-holed network); R-03 covers the Jev counterpart |

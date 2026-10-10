@@ -11,7 +11,8 @@ import logging
 from ..domain.models import AdvisorNote, Migration
 from ..events import EventBus, emit
 from ..store import Store
-from .memory import MemoryClient, redact
+from .memory import MemoryClient
+from .redaction import redact
 
 log = logging.getLogger(__name__)
 GIB = 2**30

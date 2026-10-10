@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .ai.memory import redact
+from .ai.redaction import redact
 from .config import Settings
 from .providers.base import ProviderError
 

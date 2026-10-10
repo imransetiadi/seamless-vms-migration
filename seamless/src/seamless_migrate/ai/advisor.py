@@ -19,7 +19,7 @@ from ..planning.selector import advisor_scope, select_strategy
 from ..planning.waves import TIERS, heuristic_tier
 from .decision import Advice
 from .jev import JevClient, JevUnavailable
-from .memory import redact
+from .redaction import redact
 
 log = logging.getLogger(__name__)
 GIB = 2**30

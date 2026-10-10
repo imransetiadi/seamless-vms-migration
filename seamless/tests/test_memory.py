@@ -3,7 +3,8 @@ import json
 import httpx
 import pytest
 
-from seamless_migrate.ai.memory import MemoryClient, MemoryHit, parse_hits, redact
+from seamless_migrate.ai.memory import MemoryClient, MemoryHit, parse_hits
+from seamless_migrate.ai.redaction import redact
 from seamless_migrate.config import Settings
 
 

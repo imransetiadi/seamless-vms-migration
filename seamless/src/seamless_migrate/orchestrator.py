@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Any
 
 from .ai.decision import Advice, decide, default_policy
-from .ai.memory import redact
+from .ai.redaction import redact
 from .config import Settings
 from .domain import fsm
 from .domain.enums import (

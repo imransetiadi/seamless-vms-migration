@@ -22,7 +22,8 @@ from .. import __version__
 from ..ai.advisor import Advisor
 from ..ai.jev import JevClient
 from ..ai.knowledge import KnowledgeService
-from ..ai.memory import MemoryClient, redact
+from ..ai.memory import MemoryClient
+from ..ai.redaction import redact
 from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
