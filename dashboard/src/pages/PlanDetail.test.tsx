@@ -472,6 +472,28 @@ describe('PlanDetail', () => {
     expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
   });
 
+  it('edits a plan whose mapping names contain =, -> or → and keeps them (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    // names the API accepts, as the API or `seamless plan apply` may store them
+    plan.mappings = { ...plan.mappings, flavors: { 'm1=gpu': 'm2->gpu' }, networks: { 'net→a': 'net-b' } };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    expect(within(dialog).getByLabelText(/flavor mappings/i)).toHaveValue('"m1=gpu" = "m2->gpu"');
+
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const saved = server.plans.find((p) => p.id === plan.id)!;
+    expect([saved.name, saved.mappings.flavors, saved.mappings.networks]).toEqual(['Renamed', { 'm1=gpu': 'm2->gpu' }, { 'net→a': 'net-b' }]);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['name'] });
+  }, 30_000);
+
   it('lists a selected VM that left the source, with Remove, so the plan can be saved without it (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

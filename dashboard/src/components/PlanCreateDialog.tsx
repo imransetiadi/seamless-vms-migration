@@ -375,7 +375,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const flavors = parseMappings(f.flavors);
     const volumeTypes = parseMappings(f.volumeTypes);
     const projects = parseMappings(f.projects);
-    const formatHint = 'Use one "source = destination" pair per line.';
+    const formatHint = 'Use one "source = destination" pair per line; put a name in double quotes when it contains =, -> or →.';
     if (!networks) e.networks = formatHint;
     if (!flavors) e.flavors = formatHint;
     if (!volumeTypes) e.volumeTypes = formatHint;
