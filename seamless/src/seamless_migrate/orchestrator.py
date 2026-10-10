@@ -1587,7 +1587,10 @@ class Orchestrator:
 
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
-        async with self._lock(mid):
+        plan_id = (await self._load(mid))[0].plan_id
+        # SDD §8: the plan's lock first, as the advisor's override (§14.6): a running validation
+        # finishes before the change, and no validation undoes it afterwards
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in REVALIDATABLE:
                 raise NotAllowed(f"the strategy cannot change in {m.phase}")
@@ -1606,12 +1609,12 @@ class Orchestrator:
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
             _clear_request(m)
             await self._save(m, v)
-        source_id = m.vm.source_id
+            source_id = m.vm.source_id
 
-        def override(plan: Plan) -> None:
-            plan.strategy_overrides[source_id] = strategy
+            def override(plan: Plan) -> None:
+                plan.strategy_overrides[source_id] = strategy
 
-        plan = await self._update_plan(m.plan_id, override)
+            plan = await self._update_plan(m.plan_id, override)
         await self._emit(
             "migration.action",
             f"{m.vm.name}: strategy set to {strategy}",

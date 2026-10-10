@@ -2547,6 +2547,49 @@ async def test_cancel_and_set_strategy(tmp_path, store):
         await h.orch.cancel(m2.id, "rina", "again")
 
 
+async def test_a_strategy_change_during_a_validation_waits_for_it_and_is_kept(tmp_path, store):
+    """SDD §8: a strategy change takes the plan's lock, then the migration's, as the advisor's
+    override does: during a validation it waits for it and then applies, so the migration's
+    strategy and the plan's override agree — no stale validation write undoes the change."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    m2 = await h.by_vm(plan.id, "vm-2")
+    other = next(e.strategy for e in m2.estimates if e.eligible and e.strategy != m2.strategy)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    real_get_vm = h.source.get_vm
+
+    async def slow_get_vm(source_id):
+        if source_id == "vm-1":  # the validation has read the plan and fetches its VMs
+            entered.set()
+            await gate.wait()
+        return await real_get_vm(source_id)
+
+    h.source.get_vm = slow_get_vm
+    validation = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+    await asyncio.wait_for(entered.wait(), 5)
+    change = asyncio.create_task(h.orch.set_strategy(m2.id, other, "bayu"))
+    await asyncio.sleep(0.05)
+    assert not change.done(), "the change waits for the running validation"
+    gate.set()
+    await validation
+    assert (await change).strategy == other
+    stored, stored_plan = await h.migration(m2.id), await h.plan(plan.id)
+    assert (stored.strategy, stored_plan.strategy_overrides.get("vm-2")) == (other, other)
+
+    # the override is written under the plan's lock: a validation queued behind the change
+    # reads the plan only once it holds the change
+    under_lock: list[bool] = []
+    update_plan = h.orch._update_plan
+
+    async def spying_update(plan_id, mutate):
+        under_lock.append(h.orch.plan_lock(plan_id).locked())
+        return await update_plan(plan_id, mutate)
+
+    h.orch._update_plan = spying_update
+    await h.orch.set_strategy(m2.id, m2.strategy, "bayu")
+    assert under_lock == [True]
+
+
 async def test_set_strategy_clears_force_window(tmp_path, store):
     """SDD §5.4: approvals, cutover_requested and a pending force_window belong to the assessment
     they were given for — a strategy change clears all three."""
