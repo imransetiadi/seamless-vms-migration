@@ -245,6 +245,13 @@ AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type
 
 AdvisorSnapshot { sha256: str (the id), created_at: datetime, payload: dict }   # §14.5, write-once
 
+AdvisorPolicy { id: str ("pol-…"), name: str (1–200),
+                scope: { provider_ids: list[str] = [], plan_ids: list[str] = [] },  # at most one set; none = global (§14.6)
+                decision_types: list[DecisionType] = [],                            # none = every type
+                mode: "auto_apply_above_threshold"|"always_require_approval", threshold: float (0..1),
+                min_evidence_for_auto_apply: int (0..100) = 0, require_override_reason: bool = true,
+                created_at: datetime, updated_at: datetime, updated_by: str }
+
 Approval { actor: str, at: datetime, comment: str|null }
 
 PhaseChange { from_phase: Phase|null, to_phase: Phase, at: datetime, reason: str, actor: str }
@@ -260,6 +267,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             actual_downtime_s: float|null, approvals: list[Approval] = [],
             cutover_requested: bool = false, force_window: bool = false,  # force_window: cutover window bypass granted with the request; persisted, so a restart keeps it
             advisor_notes: list[AdvisorNote] = [],
+            advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             created_at: datetime, updated_at: datetime }
@@ -283,7 +291,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `auth.denied`, and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
-`decision.fallback`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
+`decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
@@ -371,6 +379,10 @@ active enters `cutover` when all hold:
 2. `cutover_window is None` **or** now ∈ [start, end] — bypassed while `Migration.force_window` is set (`POST …/cutover {"force_window": true}`);
 3. `plan.auto_cutover` **or** `cutover_requested` (set by `POST …/cutover`);
 4. fewer than `max_concurrent_cutovers` migrations are in `cutover`.
+
+A migration whose advisor decision waits for approval (`advisor_hold`, §14.6) starts neither its pre-copy
+nor its cutover until the decision is approved or overridden; the plan runs its other migrations meanwhile,
+and no timeout ever applies the advice.
 
 `POST /migrations/{id}/cutover` (approver) records an approval **and** sets `cutover_requested`. A
 repeated request records another approval and may add `force_window` — an approver can force a
@@ -1032,7 +1044,8 @@ documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
 ```
 
-Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5).
+Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
+`advisor_policy` (§14.6).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
@@ -1102,7 +1115,7 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
-| PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible) | `Migration` |
+| PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
 | GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
@@ -1110,6 +1123,12 @@ such lists again on persisted migration events.
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, or nothing usable or eligible to approve; §14.6) |
+| POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the policy in force requires one, 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
+| GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
+| POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
+| PUT | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | as POST | `AdvisorPolicy` (404 unknown) |
+| DELETE | `/advisor/policies/{id}` | admin (`advisor.policy.manage`) | — | 204 (404 unknown) |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
@@ -1167,7 +1186,9 @@ minute are recorded.
 ### 13.2 Authorization
 
 Ordered roles `viewer < operator < approver < admin`; each route declares its minimum role (§12).
-Every mutating call emits an audit event with `actor = principal.name`.
+Every mutating call emits an audit event with `actor = principal.name`. Named permissions map to a minimum
+role: `advisor.policy.manage` and `advisor.approve` → `admin` (§14.6; `approver` is the alternative the owner
+may choose, `TODO(ADV-04): confirm`).
 
 ### 13.3 Secrets
 
@@ -1329,7 +1350,8 @@ All memory failures are logged and swallowed (never fail a migration).
 An advisor recommendation and the decision taken on it are stored apart, as an `AdvisorRecommendation`
 document (kind `recommendation`, §4.2); the engine reads only the decision.
 
-* `decide(recommendation, policy, evidence_count, default_option, *, action=None) -> Decision` is the only
+* `decide(recommendation, policy, evidence_count, default_option, *, action=None) -> Decision` — `policy` is the
+  one in force (§14.6) — is the only
   place a decision is made (the dashboard never compares a confidence with a threshold). In order:
   1. a user action: approve → `approved` (`APPROVED_BY_USER`, final = the recommended option); override with
      another option → `overridden` (`OVERRIDDEN_BY_USER`, final = that option, `reason_text` = the reason);
@@ -1375,7 +1397,11 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
   `user:<name>`); data `{target_id, model_version, before, after}`, where `before` (null for the first
   decision) and `after` are `{status, final_option, reason_code, policy_id, threshold_used}`.
 
-`target_id` is the recommendation id and `model_version` its `model.version` (`jev-…`, `rules`, `unknown`).
+* `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
+  (the policy, null where there is none).
+
+`target_id` is the recommendation id (the policy id for `policy.*`) and `model_version` its `model.version`
+(`jev-…`, `rules`, `unknown`).
 The input snapshot is what the advisor based the recommendation on — for a migration strategy
 `{tool: "jev_decide", arguments: {decision, evidence, priorities, candidates, requirements,
 escalate_on_contradiction}, scope, options, deterministic, deterministic_reason}`, built even when Jev is
@@ -1384,6 +1410,34 @@ SHA-256 (lowercase hex) of its canonical JSON: `json.dumps(payload, sort_keys=Tr
 ensure_ascii=False)` encoded as UTF-8. A snapshot already stored is never written again (same content, same
 id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can recompute the hash from
 `GET /advisor/snapshots/{sha256}`.
+
+### 14.6 Advisor policies, approval and override (`ai/policies.py`, ADV-04)
+
+* **Resolution** for a plan, its source provider and a decision type: of the stored policies whose
+  `decision_types` is empty or names the type, those listing the plan win; then those listing the provider;
+  then global ones (both scope lists empty); when none matches, the built-in `global-default`
+  (`auto_apply_above_threshold`, threshold `SEAMLESS_JEV_MIN_CONFIDENCE`, minimum evidence 0, no override
+  reason). Within one level the strictest wins: `always_require_approval` before `auto_apply_above_threshold`,
+  then the higher threshold, the higher minimum evidence, a required override reason, the lower id. (The
+  spec's plan tags and environments do not exist in this product: plans and providers stand in for them,
+  `TODO(ADV-04): confirm`.) Until evidence exists (ADV-02) the evidence count is 0, so stored policies default
+  to a minimum of 0.
+* **Hold**: validation decides with the policy in force; a `pending_approval` decision sets
+  `migration.advisor_hold` to the recommendation id (§5.4: no start meanwhile). A later validation that records
+  another decision for the migration replaces the hold or clears it.
+* **Approve** and **override** (`advisor.approve`) act on the migration's newest stored recommendation while the
+  migration is `pending`, `blocked` or `ready`: approve → `approved`, final = the recommended option, which must
+  be usable and eligible now; override → `overridden`, final = the chosen eligible option, `reason_text` = the
+  reason (required, at least 10 characters, when the policy in force says so — the API refuses with 422, not only
+  the dashboard). The new decision replaces the recommendation's (the earlier one stays in the audit trail as
+  `before`), emits `decision.approved` or `decision.overridden` (actor `user:<name>`), sets `migration.strategy`
+  to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
+  request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
+  `PUT …/strategy`, so a later validation keeps it.
+* **Policies** are created, replaced and deleted by `advisor.policy.manage` (§12), each change audited (§14.5);
+  a change applies from the next validation and never rewrites a decision.
+* **Demo**: the server seeds "Finance — approval required" for the finance source provider
+  (`always_require_approval`, override reason required); the dashboard mock seeds it for its DC1 provider.
 
 ---
 
@@ -1555,7 +1609,12 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   a "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
   way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Details" with
   the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
-  its redacted input snapshot and SHA-256, §14.5); the page links to
+  its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`) offers
+  Approve and Override — others see neither — and Override opens a dialog: another eligible option and the
+  reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
+  "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
+  `/advisor/policies` lists the policies and the built-in default, and `advisor.policy.manage` creates, edits and
+  deletes them; the page links to
   `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live) with action,
   actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
   model version — and as JSON —
