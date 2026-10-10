@@ -491,7 +491,8 @@ migration stopped it (a cancel is refused then, §5.1): such a VM stays in the p
 over or rolled back. One VM, one migration holds across plans too: a migration
 *holds* its VM in every phase but `cancelled`, `finalized` and `rolled_back`, and `validate_plan` refuses
 (409, before changing anything) a VM that a migration of another plan with the same source provider holds,
-naming the VM, that plan and the phase — finish, roll back or cancel it there, or remove the VM from
+naming the VM, that plan — its name and its id, as plan names need not be unique — and the phase
+(`web-01 (plan "Finance", plan-1a2b3c4d, ready)`) — finish, roll back or cancel it there, or remove the VM from
 `vm_ids`; two plans would both stop the source and cut it over. For the same reason a retry (`failed` or
 `rolled_back` → `ready`) is refused (409) while another plan holds the VM. Validations and retries take one
 shared lock for this check, so two plans cannot claim a VM at the same time.
