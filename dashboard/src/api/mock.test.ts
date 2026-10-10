@@ -1817,6 +1817,27 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
   });
 
+  it('skips a VM whose finalize fails and finalizes the others, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    const other = server.migrations.find((m) => m.plan_id === plan.id && m.id !== web01.id && m.phase === 'syncing')!;
+    other.phase = 'completed';
+    const internals = server as unknown as { migrationAction: (...args: unknown[]) => unknown };
+    const real = internals.migrationAction.bind(server);
+    internals.migrationAction = (me, m, action, input) => {
+      if (action === 'finalize' && (m as Migration).id === web01.id) throw new Error('source cleanup failed: HTTP 409');
+      return real(me, m, action, input);
+    };
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: null, confirm: plan.name });
+    const reason = 'finalize failed: source cleanup failed: HTTP 409';
+    expect(out).toEqual({ finalized: [other.id], skipped: [{ migration_id: web01.id, reason }] });
+    expect([web01.phase, other.phase]).toEqual(['completed', 'finalized']);
+    const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
+    expect(batch.message).toBe(`${plan.name}: 1 finalized by sari, 1 skipped`);
+    expect(batch.data).toEqual({ wave_id: null, finalized: [other.vm.name], skipped: [{ vm: 'web-01', migration_id: web01.id, reason }] });
+  });
+
   it('declares the item key jev_classify sends, never the VM\'s id, like the API (SDD §14.2, §13.4)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');

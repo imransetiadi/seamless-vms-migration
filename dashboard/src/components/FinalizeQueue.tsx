@@ -2,8 +2,8 @@ import { AlarmClock, BadgeCheck, Power, TriangleAlert } from 'lucide-react';
 import { useId, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useFinalizePlan } from '../api/hooks';
-import type { Migration, Plan, Wave } from '../api/types';
-import { completedSince, finalizedText, inScope, isOverdue, queueByWave } from '../lib/finalize';
+import type { Migration, Plan, PlanFinalizeResult, Wave } from '../api/types';
+import { completedSince, inScope, isOverdue, queueByWave, type SkippedVm } from '../lib/finalize';
 import { formatDateTime, formatRelative } from '../lib/format';
 import type { Availability } from '../lib/planActions';
 import { useNow } from '../lib/useNow';
@@ -123,8 +123,33 @@ export interface FinalizePlanDialogProps {
   /** Open while set. */
   scope: FinalizeScope | null;
   onClose: () => void;
-  /** The outcome in words ("2 VMs finalized."), for the page's live region. */
-  onDone: (text: string) => void;
+  /** The outcome: the page announces the counts and lists the VMs it skipped (SDD §16). */
+  onDone: (result: PlanFinalizeResult) => void;
+}
+
+/** The VMs a bulk finalize skipped, each with the reason the API gave, until dismissed (SDD §8.1, §16). */
+export function FinalizeSkippedNotice({ skipped, onDismiss }: { skipped: SkippedVm[]; onDismiss: () => void }) {
+  return (
+    <section
+      aria-label="Not finalized"
+      className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm"
+    >
+      <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+      <div className="min-w-0 flex-1">
+        <p className="text-foreground">{skipped.length === 1 ? '1 VM was not finalized:' : `${skipped.length} VMs were not finalized:`}</p>
+        <ul className="mt-1.5 flex flex-col gap-1">
+          {skipped.map((s) => (
+            <li key={s.id} className="break-words text-muted-foreground">
+              <span className="font-mono text-foreground">{s.name}</span>: {s.reason}
+            </li>
+          ))}
+        </ul>
+      </div>
+      <Button variant="ghost" size="sm" onClick={onDismiss}>
+        Dismiss
+      </Button>
+    </section>
+  );
 }
 
 /** Finalize a wave or the plan with one approval, typing its name (`POST /plans/{id}/finalize`, SDD §8.1). */
@@ -161,7 +186,7 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone }:
           { wave_id: wave?.id ?? null, confirm: name, delete_source: deleteSource },
           {
             onSuccess: (result) => {
-              onDone(finalizedText(result));
+              onDone(result);
               close();
             },
           },

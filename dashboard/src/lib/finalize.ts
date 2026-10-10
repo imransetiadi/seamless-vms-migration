@@ -41,10 +41,25 @@ export function queueByWave(plan: Plan, migrations: readonly Migration[]): Queue
   return [...groups, { wave: null, items: loose }].filter((g) => g.items.length > 0);
 }
 
-/** What a bulk finalize did, in words: "2 VMs finalized. 1 skipped: it left Completed meanwhile." */
+/**
+ * What a bulk finalize did, for the page's live region: the counts only — the API's reasons vary
+ * (left Completed, a failed finalize), and the notice lists them (SDD §16).
+ */
 export function finalizedText(result: PlanFinalizeResult): string {
   const n = result.finalized.length;
   const done = `${n} VM${n === 1 ? '' : 's'} finalized.`;
   const skipped = result.skipped.length;
-  return skipped ? `${done} ${skipped} skipped: ${skipped === 1 ? 'it' : 'they'} left Completed meanwhile.` : done;
+  return skipped ? `${done} ${skipped} not finalized: the page lists why.` : done;
+}
+
+export interface SkippedVm {
+  id: string;
+  name: string;
+  reason: string;
+}
+
+/** The VMs a bulk finalize skipped, by name, each with the reason the API gave (SDD §8.1). */
+export function skippedVms(result: PlanFinalizeResult, migrations: Migration[]): SkippedVm[] {
+  const names = new Map(migrations.map((m) => [m.id, m.vm.name]));
+  return result.skipped.map((s) => ({ id: s.migration_id, name: names.get(s.migration_id) ?? s.migration_id, reason: s.reason }));
 }

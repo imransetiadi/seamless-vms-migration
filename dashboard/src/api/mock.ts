@@ -1606,16 +1606,28 @@ export class MockServer {
       .filter((m) => m.plan_id === plan.id && m.phase === 'completed' && (!scope || scope.has(m.vm.source_id)))
       .sort((a, b) => a.vm.name.localeCompare(b.vm.name));
     if (waiting.length === 0) throw new HttpError(409, 'conflict', `no completed migration to finalize in ${name}`);
-    for (const m of waiting) this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
+    const finalized: Migration[] = [];
+    const skipped: Array<{ migration_id: string; reason: string }> = [];
+    for (const m of waiting) {
+      // like the API: one VM's error skips that VM, never the others (SDD §8.1)
+      try {
+        this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
+        finalized.push(m);
+      } catch (e) {
+        const reason = e instanceof HttpError ? e.message : `finalize failed: ${e instanceof Error ? e.message : String(e)}`;
+        skipped.push({ migration_id: m.id, reason });
+      }
+    }
+    const names = new Map(waiting.map((m) => [m.id, m.vm.name]));
     this.emit({
       kind: 'plan.finalized',
       plan_id: plan.id,
       migration_id: null,
       actor: me.name,
-      message: `${name}: ${waiting.length} finalized by ${me.name}`,
-      data: { wave_id: waveId, finalized: waiting.map((m) => m.vm.name), skipped: [] },
+      message: `${name}: ${finalized.length} finalized by ${me.name}${skipped.length ? `, ${skipped.length} skipped` : ''}`,
+      data: { wave_id: waveId, finalized: finalized.map((m) => m.vm.name), skipped: skipped.map((s) => ({ vm: names.get(s.migration_id), ...s })) },
     });
-    return ok({ finalized: waiting.map((m) => m.id), skipped: [] });
+    return ok({ finalized: finalized.map((m) => m.id), skipped });
   }
 
   /** The power state of a source VM: what the demo set, else stopped once its cutover stopped it (SDD §8.1). */

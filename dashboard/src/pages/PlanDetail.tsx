@@ -28,7 +28,7 @@ import { PlanCreateDialog } from '../components/PlanCreateDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
-import { FinalizePlanDialog, FinalizeQueue, type FinalizeScope } from '../components/FinalizeQueue';
+import { FinalizePlanDialog, FinalizeQueue, FinalizeSkippedNotice, type FinalizeScope } from '../components/FinalizeQueue';
 import { FindingGroupsList, type FindingRow } from '../components/FindingsList';
 import { KpiTile } from '../components/KpiTile';
 import { MigrationsTable } from '../components/MigrationsTable';
@@ -41,7 +41,7 @@ import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
 import { DECISION_TYPE_LABELS, thresholdDecimals } from '../lib/advisor';
 import { cn } from '../lib/cn';
-import { finalizeQueue, isOverdue } from '../lib/finalize';
+import { finalizedText, finalizeQueue, isOverdue, skippedVms, type SkippedVm } from '../lib/finalize';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
@@ -271,6 +271,8 @@ export default function PlanDetail() {
   const [finalizing, setFinalizing] = useState<FinalizeScope | null>(null);
   // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
   const [announcement, setAnnouncement] = useState('');
+  // what the last bulk finalize skipped, shown until dismissed (SDD §16)
+  const [notFinalized, setNotFinalized] = useState<SkippedVm[]>([]);
   // the header's Validate and Auto-plan waves stay on the page: they take the focus when the empty
   // state an action was started from goes away with it (SDD §16)
   const validateRef = useRef<HTMLButtonElement>(null);
@@ -439,6 +441,7 @@ export default function PlanDetail() {
 
       <div className="flex flex-col gap-4">
         <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
+        {notFinalized.length > 0 && <FinalizeSkippedNotice skipped={notFinalized} onDismiss={() => setNotFinalized([])} />}
         <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={setFinalizing} />
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
 
@@ -527,7 +530,16 @@ export default function PlanDetail() {
           action.reset();
         }}
       />
-      <FinalizePlanDialog plan={p} migrations={list} scope={finalizing} onClose={() => setFinalizing(null)} onDone={setAnnouncement} />
+      <FinalizePlanDialog
+        plan={p}
+        migrations={list}
+        scope={finalizing}
+        onClose={() => setFinalizing(null)}
+        onDone={(result) => {
+          setAnnouncement(finalizedText(result));
+          setNotFinalized(skippedVms(result, list));
+        }}
+      />
       <ConfirmDialog
         open={confirm === 'pause'}
         title="Pause this plan?"

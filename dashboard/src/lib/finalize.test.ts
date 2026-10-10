@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration, PhaseChange, Plan, Wave } from '../api/types';
-import { completedSince, finalizedText, finalizeQueue, inScope, isOverdue, queueByWave } from './finalize';
+import { completedSince, finalizedText, finalizeQueue, inScope, isOverdue, queueByWave, skippedVms } from './finalize';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations[0]!;
@@ -52,11 +52,27 @@ describe('the finalize queue (SDD §8.1, ADV-19)', () => {
     expect(queueByWave({ ...plan, waves: [w1, wave('wave-3', 3, ['vm-z'])] }, [b]).map((g) => g.wave?.id)).toEqual(['wave-1']);
   });
 
-  it('says what a bulk finalize did, and what it skipped', () => {
-    const skipped = (n: number) => Array.from({ length: n }, (_, i) => ({ migration_id: `mig-${i}`, reason: 'left completed' }));
+  it('says what a bulk finalize did, and how many it skipped, never a cause the API did not give', () => {
+    const skipped = (n: number) => Array.from({ length: n }, (_, i) => ({ migration_id: `mig-${i}`, reason: 'finalize failed: HTTP 409' }));
     expect(finalizedText({ finalized: ['mig-a'], skipped: [] })).toBe('1 VM finalized.');
-    expect(finalizedText({ finalized: ['mig-a', 'mig-b'], skipped: skipped(1) })).toBe('2 VMs finalized. 1 skipped: it left Completed meanwhile.');
-    expect(finalizedText({ finalized: [], skipped: skipped(2) })).toBe('0 VMs finalized. 2 skipped: they left Completed meanwhile.');
+    expect(finalizedText({ finalized: ['mig-a', 'mig-b'], skipped: skipped(1) })).toBe('2 VMs finalized. 1 not finalized: the page lists why.');
+    expect(finalizedText({ finalized: [], skipped: skipped(2) })).toBe('0 VMs finalized. 2 not finalized: the page lists why.');
+  });
+
+  it('names each skipped VM with the reason the API gave (SDD §8.1)', () => {
+    const m = completedAt('mig-a', '2026-10-09T00:00:00Z');
+    const result = {
+      finalized: [],
+      skipped: [
+        { migration_id: 'mig-a', reason: 'finalize failed: [Errno 28] No space left on device' },
+        { migration_id: 'mig-gone', reason: 'only completed migrations can be finalized (rolled_back)' },
+      ],
+    };
+    expect(skippedVms(result, [m])).toEqual([
+      { id: 'mig-a', name: m.vm.name, reason: 'finalize failed: [Errno 28] No space left on device' },
+      // a migration the page no longer lists keeps its id
+      { id: 'mig-gone', name: 'mig-gone', reason: 'only completed migrations can be finalized (rolled_back)' },
+    ]);
   });
 
   it('lists the completed migrations oldest first', () => {

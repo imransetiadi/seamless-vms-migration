@@ -320,6 +320,31 @@ describe('PlanDetail', () => {
     expect(await screen.findByText('1 VM finalized.')).toBeInTheDocument();
   });
 
+  it('names each VM a bulk finalize skipped, with why, until dismissed (SDD §8.1, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const cache = server.migrations.find((m) => m.vm.name === 'web-cache-01')!;
+    const internals = server as unknown as { migrationAction: (...args: unknown[]) => unknown };
+    const real = internals.migrationAction.bind(server);
+    internals.migrationAction = (me, m, action, input) => {
+      if (action === 'finalize') throw new Error('source cleanup failed: HTTP 409');
+      return real(me, m, action, input);
+    };
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    await user.click(within(await screen.findByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${plan.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${plan.name} to confirm`), plan.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize all' }));
+    const notice = await screen.findByRole('region', { name: 'Not finalized' });
+    expect(notice).toHaveTextContent('1 VM was not finalized:');
+    expect(within(notice).getByRole('listitem')).toHaveTextContent('web-cache-01: finalize failed: source cleanup failed: HTTP 409');
+    expect(screen.getByText('0 VMs finalized. 1 not finalized: the page lists why.')).toBeInTheDocument();
+    expect(cache.phase).toBe('completed');
+    await user.click(within(notice).getByRole('button', { name: 'Dismiss' }));
+    expect(screen.queryByRole('region', { name: 'Not finalized' })).not.toBeInTheDocument();
+  });
+
   it('finalizes one wave by its name, and keeps Finalize from an operator (SDD §8.1, ADV-19)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
