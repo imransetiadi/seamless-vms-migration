@@ -598,6 +598,15 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   measures tick duration with a 1,000-VM plan; as a stopgap at ≥ 500 migrations use `SEAMLESS_TICK_S=2–5`.
 * **Concurrency model:** store calls run in worker threads (`asyncio.to_thread`); the engine pool is 5 (+5
   overflow) connections per process, `pool_pre_ping=True` — a PostgreSQL restart is absorbed on the next call.
+* **Redaction (SDD §4, §13.4):** text from outside the control plane is redacted over its cut plus 16 KiB and
+  then cut (`redact_cut`, `redact_tail`), so its cost is bounded whatever the text's length — measured on the
+  developer host (2026-10-11): 3.5–6.3 ms for the 18 KiB window of a 4 MiB playbook line, against 0.4–1.5 s to
+  redact the whole line on the event loop (Python's `re` holds the GIL, so a worker thread would stall the loop
+  as well); a typical 150-character line costs 0.04 ms. Every service-log record passes through `redact` too:
+  19–27 µs per access-log record, against 1.4 µs without.
+* **Shutdown (SDD §8):** on SIGTERM `seamless serve` waits at most 5 s for open requests (an event stream never
+  ends by itself), then the lifespan runs `stop()`, which may take up to 15 s while it stops a running playbook
+  (SIGTERM, then SIGKILL after 10 s); the container's stop grace covers both — 30 s on Compose, 60 s on OpenShift.
 
 ### 9.2 PostgreSQL
 
