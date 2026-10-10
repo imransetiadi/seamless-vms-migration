@@ -177,6 +177,32 @@ async def test_memory_failures_swallowed(mode):
     assert client.last_error
 
 
+async def test_a_memory_failure_says_what_happened():
+    """The Advisor page shows memory.last_error: a timeout reads like Jev's ("search timed out
+    after 5 s"), and an error without a message names its kind without an empty tail."""
+
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    client = MemoryClient("http://memory:3111", None, "p", transport=httpx.MockTransport(timeout))
+    assert await client.search("x") == []
+    assert (client.available, client.last_error) == (False, "search timed out after 5 s")
+    assert await client.remember("x", "fact", []) is False
+    assert client.last_error == "remember timed out after 5 s"
+    quick = MemoryClient(
+        "http://memory:3111", None, "p", transport=httpx.MockTransport(timeout), timeout_s=2.5
+    )
+    await quick.search("x")
+    assert quick.last_error == "search timed out after 2.5 s"
+
+    def silent(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("", request=request)
+
+    client = MemoryClient("http://memory:3111", None, "p", transport=httpx.MockTransport(silent))
+    assert await client.health() is False
+    assert client.last_error == "health: ConnectError"
+
+
 async def test_memory_health_and_from_settings():
     client = MemoryClient(
         "http://memory:3111",

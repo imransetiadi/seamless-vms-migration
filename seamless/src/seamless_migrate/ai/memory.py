@@ -110,7 +110,13 @@ class MemoryClient:
 
     def _failed(self, what: str, exc: Exception) -> None:
         self.available = False
-        self.last_error = redact(f"{what}: {type(exc).__name__}: {exc}")[:300]
+        if isinstance(exc, httpx.TimeoutException):
+            # worded like Jev's timeouts: the Advisor page shows it
+            text = f"{what} timed out after {self._timeout:g} s"
+        else:
+            detail = str(exc).strip()
+            text = f"{what}: {type(exc).__name__}" + (f": {detail}" if detail else "")
+        self.last_error = redact(text)[:300]
         log.warning("agentmemory %s failed: %s", what, self.last_error)
 
     def _ok(self) -> None:
