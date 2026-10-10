@@ -812,7 +812,11 @@ manage are journaled as *sent* as soon as Cinder accepts them — a manage with 
 again when their wait ends: a crash during the wait resumes by waiting for that call instead of
 repeating it (a volume Cinder no longer knows has been unmanaged; a second manage would find the
 object renamed), and the rollback unmanages a sent manage's volume at RHOSO and names the source's
-manage after it. QASuite marks handover as **lab-verification required** before production use.
+manage after it. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
+`vm_ids`, `strategy_overrides` and `probe_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
+"to"}}`) — before the migration becomes `rolled_back` (it then carries the new `vm`): a stop in between resumes
+`rolling_back` and repeats the rewrite, which changes nothing once done, so a rolled-back migration's plan never
+names a VM that no longer exists. QASuite marks handover as **lab-verification required** before production use.
 
 #### 7.3.1 Storage references per driver family
 
