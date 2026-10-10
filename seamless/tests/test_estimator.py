@@ -1,16 +1,20 @@
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from seamless_migrate.domain.enums import Strategy
-from seamless_migrate.domain.models import SyncPass
+from seamless_migrate.domain.models import SyncPass, VMRef
 from seamless_migrate.planning.estimator import (
     EstimatorParams,
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    estimate_forced_downtime,
     final_downtime_parts,
+    first_pass_seconds,
     invalid_estimator_overrides,
     observed_scan_rate,
     params_for_plan,
@@ -298,3 +302,43 @@ def test_the_final_downtime_parts_add_up_to_the_final_downtime(strategy):
     parts = final_downtime_parts(vm, strategy, 3063.7, P)
     assert set(parts) == PART_KEYS
     assert sum(parts.values()) == pytest.approx(estimate_final_downtime(vm, strategy, 3063.7, P))
+
+
+@pytest.mark.parametrize("strategy", [Strategy.warm, Strategy.vmware_warm])
+def test_a_forced_estimate_before_any_pass_ended_counts_the_expected_first_pass(strategy):
+    """SDD §5.4 (ADV-16..20 audit, F2): in pre-copy no pass has ended - a Force cutover follows
+    the running first pass, so its estimate is the downtime after that pass, not after a 0 s one;
+    once a pass ended it is the downtime after a pass as long as that one."""
+    vm = vm_with(200, 150, rate_mib=60)  # writes fast: the delta, not the scan, sets the copy
+    first = first_pass_seconds(vm, strategy, P)
+    if strategy == Strategy.warm:
+        assert first == pytest.approx(
+            P.snapshot_s + max(vm.used_bytes / P.link_bps, scan_seconds(vm, P))
+        )
+    else:
+        assert first == pytest.approx(vm.used_bytes / P.link_bps)
+    forced = estimate_forced_downtime(vm, strategy, None, P)
+    assert forced == pytest.approx(estimate_final_downtime(vm, strategy, first, P))
+    assert forced > estimate_final_downtime(vm, strategy, 0.0, P)
+    assert estimate_forced_downtime(vm, strategy, 812.5, P) == estimate_final_downtime(
+        vm, strategy, 812.5, P
+    )
+
+
+#: shared with the dashboard's port of the formula (forcedEstimate.test.ts): SDD §5.4, §16
+FORCED_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "forced_estimate_cases.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", FORCED_CASES, ids=[c["name"] for c in FORCED_CASES])
+def test_the_shared_forced_estimate_cases(case):
+    """What Orchestrator.force_cutover records for each case: the plan's parameters, the
+    migration's calibrated scan rate (as Orchestrator._params applies it), then the forced
+    estimate - the dashboard's port is checked against the same table."""
+    params = params_for_plan(make_plan(**case["plan"]))
+    if case["observed_scan_bps"]:
+        params = replace(params, scan_bps=float(case["observed_scan_bps"]))
+    vm = VMRef.model_validate(case["vm"])
+    got = estimate_forced_downtime(vm, Strategy(case["strategy"]), case["last_pass_s"], params)
+    assert got == pytest.approx(case["expected_s"], rel=1e-12)

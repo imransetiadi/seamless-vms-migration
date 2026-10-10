@@ -90,6 +90,7 @@ from .planning.estimator import (
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    estimate_forced_downtime,
     final_downtime_parts,
     observed_scan_rate,
     params_for_plan,
@@ -1081,10 +1082,12 @@ class Orchestrator:
                 )
             plan = await self._plan(m.plan_id)
             last = m.sync_passes[-1] if m.sync_passes else None
-            estimated = estimate_final_downtime(
+            # after the running pass: as long as the last one that ended, or the first pass
+            # while none has (SDD §5.4)
+            estimated = estimate_forced_downtime(
                 m.vm,
                 m.strategy,
-                float(last.duration_s or 0.0) if last is not None else 0.0,
+                float(last.duration_s or 0.0) if last is not None else None,
                 self._params(m, plan),
             )
             now = self._now()

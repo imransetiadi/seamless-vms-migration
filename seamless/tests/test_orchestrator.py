@@ -50,7 +50,11 @@ from seamless_migrate.orchestrator import (
     Unprocessable,
     counted_approvals,
 )
-from seamless_migrate.planning.estimator import params_for_plan
+from seamless_migrate.planning.estimator import (
+    estimate_final_downtime,
+    first_pass_seconds,
+    params_for_plan,
+)
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
 from tests.executor_support import make_ctx
@@ -3379,6 +3383,21 @@ async def test_a_migration_is_forced_once(tmp_path, store):
     )
     assert counted_approvals(m, plan) == [], "the forcer's own approval still does not count"
     assert h.kinds().count("migration.force_cutover") == 1
+
+
+async def test_a_force_cutover_in_precopy_expects_the_running_first_pass(tmp_path, store):
+    """SDD §5.4 (ADV-16..20 audit, F2): in pre-copy no pass has ended - the recorded estimate is
+    the downtime after the running first pass, not after a 0 s one."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    fast = vm(1).model_copy(update={"change_rate_bps": 60 * 2**20})  # the delta sets the copy
+    precopy = make_migration(plan_id=plan.id, vm=fast, strategy=Strategy.warm, phase=P.precopy)
+    store.put("migration", precopy)
+    forced = await h.orch.force_cutover(precopy.id, "sari", "the window closes in ten minutes")
+    params = params_for_plan(plan)
+    first = first_pass_seconds(fast, Strategy.warm, params)
+    recorded = forced.force_cutover.estimated_downtime_s
+    assert recorded == pytest.approx(estimate_final_downtime(fast, Strategy.warm, first, params))
+    assert recorded > estimate_final_downtime(fast, Strategy.warm, 0.0, params)
 
 
 async def test_a_force_cutover_is_in_the_audit_trail(tmp_path, store):

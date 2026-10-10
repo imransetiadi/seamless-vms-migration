@@ -131,6 +131,18 @@ def _precopy_passes(
     return durations, min(float(disk_bytes), change_rate * durations[-1])
 
 
+def first_pass_seconds(vm: VMRef, strategy: Strategy, params: EstimatorParams) -> float:
+    """The expected duration of a warm migration's first pass (SDD §9.1): it copies the used
+    data - on OpenStack it also scans every disk once, fresh destination volumes are not read
+    (--assume-zero)."""
+    strategy = Strategy(strategy)
+    if strategy == Strategy.warm:
+        return params.snapshot_s + max(vm.used_bytes / params.link_bps, scan_seconds(vm, params))
+    if strategy == Strategy.vmware_warm:
+        return vm.used_bytes / params.link_bps
+    raise ValueError(f"{strategy} has no pre-copy passes")
+
+
 def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: float) -> Estimate:
     """Estimate pre-copy time, passes and downtime for ``vm`` under ``strategy``.
 
@@ -150,10 +162,13 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
         copy_s, conversion_s = p.snapshot_s + used / link, 0.0
     elif strategy == Strategy.warm:
         scan = scan_seconds(vm, p)
-        # fresh destination volumes are not read on the first pass (--assume-zero)
-        first = p.snapshot_s + max(used / link, scan)
         durations, final_delta = _precopy_passes(
-            first, used, lambda d: p.snapshot_s + max(scan, d / link), disk, rate, p
+            first_pass_seconds(vm, strategy, p),
+            used,
+            lambda d: p.snapshot_s + max(scan, d / link),
+            disk,
+            rate,
+            p,
         )
         precopy_s, passes = sum(durations), len(durations)
         copy_s, conversion_s = p.snapshot_s + max(scan, final_delta / link), 0.0
@@ -163,7 +178,12 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
         copy_s, conversion_s = used / link, p.v2v_s
     elif strategy == Strategy.vmware_warm:
         durations, final_delta = _precopy_passes(
-            used / link, used, lambda d: VMWARE_PASS_OVERHEAD_S + d / link, disk, rate, p
+            first_pass_seconds(vm, strategy, p),
+            used,
+            lambda d: VMWARE_PASS_OVERHEAD_S + d / link,
+            disk,
+            rate,
+            p,
         )
         precopy_s, passes = sum(durations), len(durations)
         copy_s, conversion_s = final_delta / link, p.v2v_inplace_s
@@ -214,6 +234,16 @@ def estimate_final_downtime(
 ) -> float:
     """Downtime if cut over now, given the duration of the last completed pass (SDD §5.3)."""
     return sum(final_downtime_parts(vm, strategy, last_pass_s, params).values())
+
+
+def estimate_forced_downtime(
+    vm: VMRef, strategy: Strategy, last_pass_s: float | None, params: EstimatorParams
+) -> float:
+    """The downtime a Force cutover expects (SDD §5.4): after a pass as long as the last one that
+    ended, or - before any pass ended (``None``) - after the running first pass."""
+    if last_pass_s is None:
+        last_pass_s = first_pass_seconds(vm, strategy, params)
+    return estimate_final_downtime(vm, strategy, last_pass_s, params)
 
 
 # -- calibration (SDD §9.1 "Configuration and calibration") ----------------------------------
