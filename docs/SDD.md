@@ -412,7 +412,8 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   with its estimate and with the clock that ran before it (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED`
   would multiply the control plane's own overhead too): each simulated step reports the model seconds it kept the
   source stopped — the cutover its copy or final sync, conversion and create (up to the failure when it fails), a
-  rollback its own work — and `Migration.downtime_model_s` adds them up while the clock is open. A verified
+  rollback its own work, and those of a cutover it interrupted — and `Migration.downtime_model_s` adds them up while
+  the clock is open. A verified
   migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
   cutover had finished (the destination booted for its verification). A clock no step reported model seconds for
   stays in wall seconds. A retry resets a
@@ -860,7 +861,8 @@ follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Ea
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
 source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
 cutover its copy, conversion and create — a failed cutover up to its failure, in its `PermanentStepError`'s
-`details` — and the rollback its own 90 s before it starts the source again. Cutover fails with
+`details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted (cancelled mid-copy,
+the cutover reported none), before it starts the source again. Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
 strategy. The fake destination simulates the guests' services for the application probes (§7.5): a
 guest answers its suggested probes (§9.6) and SSH (RDP on Windows), with HTTP status 200, and refuses every
