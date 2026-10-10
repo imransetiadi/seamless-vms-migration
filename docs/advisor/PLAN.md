@@ -74,7 +74,20 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    suggested probe). jev_decide 0.98 for the model. `TODO(ADV-18): confirm` — the advisor's part of the suggestions waits
    for ADV-11 (the rules suggest for now). The demo stack keeps its data: the new demo plans (probes, the fault) show
    on a fresh demo only.
-5. ADV-19 plan status and the finalize queue, 6. ADV-20 the two kinds of approval.
+5. ADV-19 plan status and the finalize queue. Done — b3d87a9, f58a8d1 (SDD), 59cefe6 (API: `derive_plan_status`
+   returned as `Plan.derived_status` by every plan route, never stored; `Plan.finalize_warning_h`;
+   `Stats.awaiting_finalize`/`finalized`; `POST /plans/{id}/finalize` for a wave or the plan with one approval and an
+   audit event per VM; the source watch with `migration.source_running`; demo `POST /demo/vms/{source_id}/power`),
+   3063bc7 (`migration.source_stopped`: the watch cleared the flag silently, so the dashboard kept a stale alert —
+   jev_decide 1.0), e1f2220 (dashboard: the derived status in every view, Finalize all in place of Start on a
+   Completed plan and no Start once a plan runs, the finalize queue by wave with Finalize wave, "Finalize overdue" and
+   "Source VM running", Awaiting finalize and Finalized where Completed was, the source alert and the next step on
+   the migration page, the demo power control, the reminder in the plan form, the Overview's attention items).
+   jev_decide 0.99 (derive, never store), 0.96 (bulk finalize through each VM's finalize). `TODO(ADV-19): confirm` —
+   the 72 h reminder (open question 14). Beyond the spec's wording: Pause is hidden on a finished plan too, a
+   completed VM whose source runs again gets no finalize advice until it is stopped, and both finalize dialogs warn
+   about it.
+6. ADV-20 the two kinds of approval.
 7. Then the original order (PR-6 ADV-02 first); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
    review of Phase 1.
 
