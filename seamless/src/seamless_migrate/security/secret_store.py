@@ -74,6 +74,10 @@ class FileSecretStore:
         _check(name, values)
         try:
             self.root.mkdir(parents=True, exist_ok=True)
+            if self.root.stat().st_uid == os.geteuid():
+                # created or owned: the secret names are not for other local users; a mount
+                # the store does not own keeps its mode (SDD §13.3)
+                os.chmod(self.root, 0o700)
             directory = self.root / name
             directory.mkdir(mode=0o700, exist_ok=True)
             os.chmod(directory, 0o700)

@@ -4,6 +4,7 @@ and the conversion-host key in the platform secret store, distributions, secret 
 import base64
 import json
 import logging
+import os
 import stat
 from datetime import UTC, datetime
 
@@ -294,6 +295,28 @@ def test_file_store_roundtrip(tmp_path):
             store.write(bad, {"a": "b"}, {})
     with pytest.raises(SecretStoreError):
         store.write("ok", {"bad key": "v"}, {})
+
+
+def test_file_store_root_lists_no_secret_names_to_other_users(tmp_path, monkeypatch):
+    """SDD §13.3: the store creates its root 0700 and tightens one it owns, so other local users
+    cannot list the secret names; a root it does not own (a mount) keeps its mode."""
+    fresh = tmp_path / "fresh" / "secrets"
+    FileSecretStore(fresh).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o700
+
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    os.chmod(loose, 0o755)
+    FileSecretStore(loose).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o700
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    os.chmod(foreign, 0o755)
+    monkeypatch.setattr(os, "geteuid", lambda: foreign.stat().st_uid + 1)
+    FileSecretStore(foreign).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(foreign.stat().st_mode) == 0o755
+    assert FileSecretStore(foreign).read("provider-x") == {"username": "u"}
 
 
 def test_kubernetes_store_against_a_fake_api_server():
