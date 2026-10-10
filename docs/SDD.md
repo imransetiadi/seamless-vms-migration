@@ -864,7 +864,9 @@ eligible estimates: `min_downtime` → minimal `downtime_s`, with ties (differen
 broken by simplicity order `cold < storage_handover < warm` / `vmware_cold < vmware_warm`;
 `simplest_meeting_slo` → simplest strategy with `meets_slo`, else minimal downtime. The advisor may
 replace the choice only **within the tie set** or when **no** eligible strategy meets the SLO
-(§14.2), and only with an eligible strategy.
+(§14.2), and only with an eligible strategy. Ties exist only under `min_downtime`: under
+`simplest_meeting_slo` the simplest strategy meeting the SLO is the operator's chosen rule and has no
+tie, so the advisor keeps out of it unless no eligible strategy meets the SLO.
 
 ### 9.3 Pre-flight validation (`planning/preflight.py`)
 
@@ -1222,7 +1224,8 @@ The advisor is **advisory and bounded**: it never makes an ineligible strategy e
 skips approval, never triggers rollback or finalize.
 
 * `recommend_strategy(vm, estimates, plan) -> AdvisorNote | None` — called only when the
-  deterministic selector reports a tie set of size ≥ 2 or no eligible strategy meets the SLO.
+  deterministic selector reports a tie set of size ≥ 2 (`min_downtime`; under `simplest_meeting_slo`
+  the choice has no tie, §9.2) or no eligible strategy meets the SLO.
   Calls `jev_decide` with candidate ids = eligible strategy names, evidence = disks, change rate,
   findings and estimates (redacted), priorities = "Minimize downtime within the SLO of {slo} s;
   prefer the simpler strategy when downtimes differ by less than 10 %; never pick an ineligible
