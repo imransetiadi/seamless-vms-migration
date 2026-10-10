@@ -2359,6 +2359,61 @@ async def test_with_the_finance_policy_a_decision_waits_and_holds_its_migration(
     )
 
 
+async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
+    tmp_path, store
+):
+    """SDD §14.6 (advisor Phase 1 audit, A4): once the plan sets the VM's strategy, the newest
+    recommendation no longer stands - approving it would flip the strategy back against the plan;
+    and an approved decision is not approved again (one event per decision status change)."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    pinned = store.get("plan", plan.id, Plan)
+    pinned.strategy_overrides = {"vm-1": Strategy.cold}
+    store.put("plan", pinned)
+    for decide in (
+        lambda: h.orch.approve_recommendation(rec.id, "rina"),
+        lambda: h.orch.override_recommendation(rec.id, "cold", "the owner chose cold", "rina"),
+    ):
+        with pytest.raises(NotAllowed) as refused:
+            await decide()
+        assert str(refused.value) == (
+            "The plan sets the strategy of web-01 (cold): change it in the plan."
+        )
+    pinned.strategy_overrides = {}
+    store.put("plan", pinned)
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+    events = len([e for e in _audit(store) if e.kind == "decision.approved"])
+    with pytest.raises(NotAllowed) as again:
+        await h.orch.approve_recommendation(rec.id, "rina")
+    assert str(again.value) == "The decision is already approved."
+    assert len([e for e in _audit(store) if e.kind == "decision.approved"]) == events
+    # another option is still a person's call while nothing started (SDD §14.6)
+    overridden = await h.orch.override_recommendation(
+        rec.id, "cold", "the owner chose cold", "rina"
+    )
+    assert overridden.decision.status == DecisionStatus.overridden
+
+
+async def test_a_person_may_still_approve_an_auto_applied_decision(tmp_path, store):
+    """SDD §14.6: approve acts on the newest recommendation of an unstarted migration whatever its
+    decision - only an approved one is not approved again."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert rec.decision.status == DecisionStatus.auto_applied
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved
+
+
 async def test_a_cancel_clears_the_advisor_hold(tmp_path, store):
     """SDD §14.6 (advisor Phase 1 audit, A5): a cancelled migration takes no decision - the cancel
     action and a validation's cancel of a VM that left the plan both clear the hold, or Pending

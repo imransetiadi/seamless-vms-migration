@@ -1566,6 +1566,15 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in REVALIDATABLE:
                 raise NotAllowed(f"the strategy cannot change in {m.phase}")
+            pinned = plan.strategy_overrides.get(m.vm.source_id)
+            if pinned is not None:
+                # SDD §14.6: a person set the strategy in the plan, which a validation honours
+                # without a recommendation - the newest one no longer stands
+                raise NotAllowed(
+                    f"The plan sets the strategy of {m.vm.name} ({pinned}): change it in the plan."
+                )
+            if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
+                raise NotAllowed("The decision is already approved.")  # one event per change
             eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
             advice = Advice(
                 option=rec.recommendation.option,
