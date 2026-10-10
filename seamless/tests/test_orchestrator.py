@@ -2338,6 +2338,87 @@ async def test_prestage_failure_fails_the_plan(tmp_path, store):
     assert "plan.updated" in h.kinds()
 
 
+async def _hanging_prestage(tmp_path, store):
+    """A started plan whose pre-staging hangs until ``release`` is set, then fails."""
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings)
+    release = asyncio.Event()
+
+    async def hanging_prestage(plan, source, destination):
+        await release.wait()
+        raise RuntimeError("deploy_conversion_hosts.yml failed")
+
+    executor.prestage = hanging_prestage
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    deadline = asyncio.get_running_loop().time() + 5
+    while plan.id not in h.orch._prestage_tasks:  # the tick launched it; it hangs
+        assert asyncio.get_running_loop().time() < deadline, "pre-staging never started"
+        await asyncio.sleep(0.01)
+    return h, plan, release
+
+
+async def _prestage_failure_recorded(h):
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        failures = [
+            e
+            for e in h.store.events(since_seq=0, limit=1000)
+            if e.kind == "plan.updated" and "pre-staging failed" in e.message
+        ]
+        if failures:
+            return failures
+        assert asyncio.get_running_loop().time() < deadline, "the failure was never recorded"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("meanwhile", ["paused", "validated", "edited"])
+async def test_a_late_prestage_failure_leaves_a_plan_changed_meanwhile_as_it_is(
+    tmp_path, store, meanwhile
+):
+    """SDD §8: only a plan that still runs fails with its pre-staging. One paused, validated
+    again or edited meanwhile keeps its status - an edited draft must not become a failed plan
+    that start_plan accepts without a validation - and the failure is still recorded."""
+    h, plan, release = await _hanging_prestage(tmp_path, store)
+    await h.orch.pause_plan(plan.id, "alice")
+    expected = PlanStatus.paused
+    if meanwhile in ("validated", "edited"):
+        await h.orch.validate_plan(plan.id, "alice")
+        expected = PlanStatus.validated
+    if meanwhile == "edited":
+        async with h.orch.plan_lock(plan.id):  # what PATCH /plans/{id} does
+            edited = store.get("plan", plan.id, Plan)
+            edited.status = PlanStatus.draft
+            store.put("plan", edited)
+        expected = PlanStatus.draft
+    release.set()
+    failures = await _prestage_failure_recorded(h)
+    await asyncio.sleep(0.05)
+    assert (await h.plan(plan.id)).status == expected
+    assert len(failures) == 1 and "status" not in failures[0].data
+    if meanwhile == "edited":
+        with pytest.raises(NotAllowed, match="validate it first"):
+            await h.orch.start_plan(plan.id, "alice")
+    await h.orch.stop()
+
+
+async def test_a_prestage_failure_writes_the_status_under_the_plans_lock(tmp_path, store):
+    """SDD §8: a pre-staging failure sets the status like the other status writers - under the
+    plan's lock - so it never writes between a pause's read and its write."""
+    h, plan, release = await _hanging_prestage(tmp_path, store)
+    async with h.orch.plan_lock(plan.id):
+        release.set()
+        await asyncio.sleep(0.1)
+        status = (await h.plan(plan.id)).status
+        assert status == PlanStatus.running, "the failure waits for the lock"
+    await _prestage_failure_recorded(h)
+    await h.orch.stop()
+    assert (await h.plan(plan.id)).status == PlanStatus.failed
+
+
 async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, caplog):
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")

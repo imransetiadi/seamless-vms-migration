@@ -1371,17 +1371,29 @@ class Orchestrator:
             raise
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
+            failed = False
 
-            def fail(fresh: Plan) -> None:
+            def fail(fresh: Plan) -> bool:
+                nonlocal failed
+                failed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                if not failed:
+                    return False
                 fresh.status = PlanStatus.failed
+                return True
 
-            await self._update_plan(plan.id, fail)
-            await self._emit(
-                "plan.updated",
-                f"{plan.name}: pre-staging failed",
-                plan_id=plan.id,
-                data={"status": "failed", "error": redact(str(exc))[:500]},
-            )
+            # SDD §8: a status writer like the others, under the plan's lock; only a plan that
+            # still runs fails. One paused, validated again or edited meanwhile keeps its status
+            # (an edited draft must not become a failed plan that start_plan accepts unvalidated)
+            # and pre-stages again at its next start
+            async with self._lock(f"plan:{plan.id}"):
+                await self._update_plan(plan.id, fail)
+                error = redact(str(exc))[:500]
+                await self._emit(
+                    "plan.updated",
+                    f"{plan.name}: pre-staging failed",
+                    plan_id=plan.id,
+                    data={"status": "failed", "error": error} if failed else {"error": error},
+                )
         finally:
             self._prestage_tasks.pop(plan.id, None)
 
