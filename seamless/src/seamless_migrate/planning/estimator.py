@@ -147,7 +147,7 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
     final_delta = 0.0
 
     if strategy == Strategy.cold:
-        downtime = p.shutdown_s + p.snapshot_s + used / link + p.create_s + p.boot_s
+        copy_s, conversion_s = p.snapshot_s + used / link, 0.0
     elif strategy == Strategy.warm:
         scan = scan_seconds(vm, p)
         # fresh destination volumes are not read on the first pass (--assume-zero)
@@ -156,22 +156,21 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
             first, used, lambda d: p.snapshot_s + max(scan, d / link), disk, rate, p
         )
         precopy_s, passes = sum(durations), len(durations)
-        downtime = (
-            p.shutdown_s + p.snapshot_s + max(scan, final_delta / link) + p.create_s + p.boot_s
-        )
+        copy_s, conversion_s = p.snapshot_s + max(scan, final_delta / link), 0.0
     elif strategy == Strategy.storage_handover:
-        volumes = len(vm.disks)
-        downtime = p.shutdown_s + volumes * p.handover_per_volume_s + p.create_s + p.boot_s
+        copy_s, conversion_s = len(vm.disks) * p.handover_per_volume_s, 0.0
     elif strategy == Strategy.vmware_cold:
-        downtime = p.shutdown_s + used / link + p.v2v_s + p.create_s + p.boot_s
+        copy_s, conversion_s = used / link, p.v2v_s
     elif strategy == Strategy.vmware_warm:
         durations, final_delta = _precopy_passes(
             used / link, used, lambda d: VMWARE_PASS_OVERHEAD_S + d / link, disk, rate, p
         )
         precopy_s, passes = sum(durations), len(durations)
-        downtime = p.shutdown_s + final_delta / link + p.v2v_inplace_s + p.create_s + p.boot_s
+        copy_s, conversion_s = final_delta / link, p.v2v_inplace_s
     else:  # pragma: no cover - exhaustive over the enum
         raise ValueError(f"unknown strategy {strategy}")
+    parts = _parts(p, copy_s, conversion_s)
+    downtime = sum(parts.values())
 
     return Estimate(
         strategy=strategy,
@@ -183,25 +182,38 @@ def estimate(vm: VMRef, strategy: Strategy, params: EstimatorParams, slo_s: floa
         total_s=precopy_s + downtime,
         final_delta_bytes=int(final_delta),
         meets_slo=downtime <= slo_s,
+        downtime_parts=parts,
     )
+
+
+def _parts(p: EstimatorParams, copy_s: float, conversion_s: float) -> dict[str, float]:
+    """The downtime's parts, shown by the Downtime panel (SDD §4, §9.1, ADV-16)."""
+    return {
+        "shutdown_s": p.shutdown_s,
+        "copy_s": copy_s,
+        "conversion_s": conversion_s,
+        "create_s": p.create_s,
+        "boot_s": p.boot_s,
+    }
+
+
+def final_downtime_parts(
+    vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
+) -> dict[str, float]:
+    """The parts of the downtime if cut over now, after a pass of ``last_pass_s`` (SDD §5.3)."""
+    rate = vm.change_rate_bps if vm.change_rate_bps is not None else params.change_rate_bps
+    delta = min(float(vm.disk_bytes), rate * max(0.0, last_pass_s))
+    p = params
+    if Strategy(strategy) == Strategy.vmware_warm:
+        return _parts(p, delta / p.link_bps, p.v2v_inplace_s)
+    return _parts(p, p.snapshot_s + max(scan_seconds(vm, p), delta / p.link_bps), 0.0)
 
 
 def estimate_final_downtime(
     vm: VMRef, strategy: Strategy, last_pass_s: float, params: EstimatorParams
 ) -> float:
     """Downtime if cut over now, given the duration of the last completed pass (SDD §5.3)."""
-    rate = vm.change_rate_bps if vm.change_rate_bps is not None else params.change_rate_bps
-    delta = min(float(vm.disk_bytes), rate * max(0.0, last_pass_s))
-    p = params
-    if Strategy(strategy) == Strategy.vmware_warm:
-        return p.shutdown_s + delta / p.link_bps + p.v2v_inplace_s + p.create_s + p.boot_s
-    return (
-        p.shutdown_s
-        + p.snapshot_s
-        + max(scan_seconds(vm, p), delta / p.link_bps)
-        + p.create_s
-        + p.boot_s
-    )
+    return sum(final_downtime_parts(vm, strategy, last_pass_s, params).values())
 
 
 # -- calibration (SDD §9.1 "Configuration and calibration") ----------------------------------

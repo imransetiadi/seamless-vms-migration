@@ -109,3 +109,19 @@ async def test_simulated_time_is_compressed_by_demo_speed():
     m = mig()
     result = await ex.run(StepName.PRECOPY, make_ctx(make_plan(), m, SRC, DST, settings)[0])
     assert sum(slept) == pytest.approx(result.sync_pass.duration_s / 60, rel=1e-6)
+
+
+async def test_a_simulated_final_sync_starts_once_the_source_is_stopped():
+    """ADV-16 (SDD §7.4): the final pass is recorded after the stop, like a real cutover's."""
+    slow = Settings(
+        demo=True, demo_speed=1e4, demo_failure_rate=0.0
+    )  # 60 model s of shutdown = 6 ms
+    ex = SimulatedExecutor(slow)
+    m = mig()
+    m.sync_passes.append(
+        (await ex.run(StepName.PRECOPY, make_ctx(make_plan(), m, SRC, DST, slow)[0])).sync_pass
+    )
+    ctx, rec = make_ctx(make_plan(), m, SRC, DST, slow)
+    final = (await ex.run(StepName.CUTOVER, ctx)).sync_pass
+    assert final.kind == SyncPassKind.final
+    assert final.started_at >= rec.downtime_at[0]

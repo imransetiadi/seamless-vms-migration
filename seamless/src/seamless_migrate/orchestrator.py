@@ -24,7 +24,7 @@ from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from .ai.decision import Advice, Approve, Override, decide
 from .ai.policies import resolve_policy
@@ -54,6 +54,7 @@ from .domain.models import (
     Decision,
     Estimate,
     Finding,
+    ForceCutover,
     Mappings,
     Migration,
     PhaseChange,
@@ -79,11 +80,13 @@ from .executors.base import (
     StepResult,
     TransientStepError,
 )
+from .invariants import check_invariants
 from .planning.estimator import (
     EstimatorParams,
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    final_downtime_parts,
     observed_scan_rate,
     params_for_plan,
 )
@@ -156,6 +159,12 @@ def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     return None
 
 
+#: a Force cutover: where it applies and its shortest reason (SDD §5.4, ADV-16)
+FORCEABLE = frozenset({Phase.precopy, Phase.syncing})
+FORCE_REASON_MIN = 10
+#: the convergence rules (SDD §5.3)
+ConvergedBy = Literal["threshold", "slo", "max_passes", "force"]
+
 #: maker-checker refusals (SDD §5.4, §14.6, ADV-17)
 OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
 OWN_DECISION = "You requested this decision. Another approver must decide it."
@@ -167,6 +176,7 @@ def _clear_request(m: Migration) -> None:
     m.cutover_requested_by = None
     m.cutover_requested_at = None
     m.force_window = False
+    m.force_cutover = None  # a Force cutover belongs to its assessment too (ADV-16)
 
 
 def counted_approvals(m: Migration, plan: Plan) -> list[Approval]:
@@ -919,6 +929,58 @@ class Orchestrator:
         self.wake()
         return m
 
+    async def force_cutover(self, mid: str, actor: str, reason: str) -> Migration:
+        """Cut over before convergence: recorded, audited; the gate still applies (SDD §5.4)."""
+        reason = reason.strip()
+        if len(reason) < FORCE_REASON_MIN:
+            raise Unprocessable(
+                f"a Force cutover needs a reason of at least {FORCE_REASON_MIN} characters"
+            )
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if m.phase not in FORCEABLE or m.strategy not in WARM_STRATEGIES:
+                raise NotAllowed(
+                    "a Force cutover applies to a warm migration in pre-copy or syncing, "
+                    f"not to {m.strategy} in {m.phase}"
+                )
+            plan = await self._plan(m.plan_id)
+            last = m.sync_passes[-1] if m.sync_passes else None
+            estimated = estimate_final_downtime(
+                m.vm,
+                m.strategy,
+                float(last.duration_s or 0.0) if last is not None else 0.0,
+                self._params(m, plan),
+            )
+            now = self._now()
+            m.force_cutover = ForceCutover(
+                actor=actor,
+                at=now,
+                reason=reason,
+                delta_bytes=last.bytes_changed if last is not None else 0,
+                estimated_downtime_s=estimated,
+            )
+            # a request too, under maker-checker like POST ...cutover (SDD §5.4, ADV-17)
+            if not plan.require_distinct_approver:
+                m.approvals.append(Approval(actor=actor, at=now, comment=reason))
+            if m.cutover_requested_by is None:
+                m.cutover_requested_by = actor
+                m.cutover_requested_at = now
+            m.cutover_requested = True
+            await self._save(m, v)
+        await self._emit(
+            "migration.force_cutover",
+            f"cutover of {m.vm.name} forced by {actor}: {reason}",
+            migration=m,
+            actor=actor,
+            data={
+                "reason": reason,
+                "delta_bytes": m.force_cutover.delta_bytes,
+                "estimated_downtime_s": estimated,
+            },
+        )
+        self.wake()
+        return m
+
     async def request_sync(self, mid: str, actor: str) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
@@ -997,6 +1059,7 @@ class Orchestrator:
             m.progress_pct = 0
             m.review_required = False
             m.review_reason = None
+            m.downtime_model_s = None  # the next cutover reports its own (SDD §5.2)
             # the downtime clock belongs to the outage (SDD §5.2): a closed clock — verified boot,
             # or the source running again after a rollback — starts afresh; an open one means the
             # source has not run since it stopped, so the next cutover counts from that first stop
@@ -1898,6 +1961,8 @@ class Orchestrator:
             observed = observed_scan_rate(sync_pass, m.vm, params_for_plan(plan))
             if observed is not None:
                 m.observed_scan_bps = observed
+        if sync_pass.kind == SyncPassKind.final:
+            return  # the estimate stays the one the convergence rule used (SDD §5.3, ADV-16)
         fresh = estimate(m.vm, m.strategy, self._params(m, plan), plan.downtime_slo_s)
         if m.estimate is not None:
             fresh = fresh.model_copy(
@@ -1928,24 +1993,55 @@ class Orchestrator:
         )
         return cur, v
 
-    def _converged(self, m: Migration, plan: Plan) -> tuple[bool, str]:
+    def _converged(self, m: Migration, plan: Plan) -> tuple[ConvergedBy | None, str]:
+        """The rule that ends the passes, or ``None`` and why another pass runs (SDD §5.3)."""
         last = m.sync_passes[-1]
+        if m.force_cutover is not None:  # the only way past the rules below (SDD §5.4)
+            force = m.force_cutover
+            return "force", f"Force cutover by {force.actor}: {force.reason}"
         counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
         if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
-            return True, f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
+            return "threshold", f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
         final = estimate_final_downtime(
             m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
         )
         if final <= plan.downtime_slo_s:
-            return True, f"estimated final downtime {final:.0f} s is within the SLO"
+            return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
         if len(m.sync_passes) >= plan.max_sync_passes:
-            return True, f"max_sync_passes ({plan.max_sync_passes}) reached"
-        return False, (
+            return "max_passes", f"max_sync_passes ({plan.max_sync_passes}) reached"
+        return None, (
             f"another delta pass: changed {_fmt_bytes(last.bytes_changed)}, "
             f"estimated downtime {final:.0f} s"
             if counted
             else f"another CBT pass: estimated downtime {final:.0f} s"
         )
+
+    def _converge(self, m: Migration, plan: Plan, rule: ConvergedBy) -> None:
+        """Record the rule, and make the estimate the one it used: the final-downtime estimate
+        with its parts (SDD §5.3, ADV-16)."""
+        m.converged_by = rule
+        last = m.sync_passes[-1]
+        parts = final_downtime_parts(
+            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+        )
+        if m.estimate is not None:
+            downtime = sum(parts.values())
+            m.estimate = m.estimate.model_copy(
+                update={
+                    "downtime_s": downtime,
+                    "downtime_parts": parts,
+                    "total_s": m.estimate.precopy_s + downtime,
+                    "meets_slo": downtime <= plan.downtime_slo_s,
+                }
+            )
+
+    def _downtime_s(self, m: Migration, ended: datetime, plan: Plan) -> float:
+        """The downtime of a verified migration (SDD §5.2): wall time, or - after a simulated
+        cutover - its model seconds plus the plan's boot time, like the passes' durations."""
+        if m.downtime_model_s is not None:
+            return m.downtime_model_s + self._params(m, plan).boot_s
+        assert m.downtime_started_at is not None
+        return (ended - m.downtime_started_at).total_seconds()
 
     async def _do_pass(self, m: Migration) -> None:
         step = StepName.PRECOPY if m.phase == P.precopy else StepName.SYNC
@@ -1974,12 +2070,13 @@ class Orchestrator:
             cur.progress_pct = 100.0
             cur.checkpoint = f"{step}:{next_pass_number(cur)}"
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
-            converged, why = self._converged(cur, plan)
-            if converged:
+            rule, why = self._converged(cur, plan)
+            if rule is not None:
+                self._converge(cur, plan, rule)
                 await self._transition(cur, v, P.awaiting_cutover, why)
             elif cur.phase == P.precopy:
                 await self._transition(cur, v, P.syncing, why)
-        if converged:
+        if rule is not None:
             self.wake()
 
     async def _do_cutover(self, m: Migration) -> None:
@@ -2003,6 +2100,9 @@ class Orchestrator:
             if result.sync_pass is not None:
                 cur, v = await self._record_pass(cur, v, result.sync_pass, plan)
             cur.destination_server_id = result.destination_server_id or cur.destination_server_id
+            model_s = result.details.get("downtime_model_s")
+            # a simulated cutover counts its downtime in model seconds (SDD §5.2, ADV-16)
+            cur.downtime_model_s = float(model_s) if isinstance(model_s, int | float) else None
             cur.checkpoint = "cutover"
             cur.progress_pct = 100.0
             if cur.downtime_started_at is None:
@@ -2058,8 +2158,12 @@ class Orchestrator:
                 now = self._now()
                 if cur.downtime_started_at is not None:
                     cur.downtime_ended_at = now
-                    cur.actual_downtime_s = (now - cur.downtime_started_at).total_seconds()
+                    cur.actual_downtime_s = self._downtime_s(cur, now, plan)
                 cur.checkpoint = "verified"
+                # the numbers of a completed migration must hold together (SDD §5.5, ADV-16)
+                cur.data_issues = check_invariants(
+                    cur, await self._plan(cur.plan_id), self.settings
+                )
             v = await self._save(cur, v)
             # events first, then the terminal transition (nothing is lost on a stop)
             if note is not None:
@@ -2076,6 +2180,14 @@ class Orchestrator:
                         f"{cur.vm.name}: verified after {cur.actual_downtime_s:.0f} s of downtime",
                         migration=cur,
                         data={"actual_downtime_s": cur.actual_downtime_s},
+                    )
+                if cur.data_issues:
+                    await self._emit(
+                        "migration.data_inconsistent",
+                        f"{cur.vm.name}: its numbers do not hold together - "
+                        + "; ".join(cur.data_issues),
+                        migration=cur,
+                        data={"issues": list(cur.data_issues)},
                     )
                 cur, v = await self._transition(
                     cur, v, P.completed, "verification passed", data={"verification": summary}

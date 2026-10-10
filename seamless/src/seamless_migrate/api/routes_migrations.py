@@ -15,6 +15,7 @@ from .schemas import (
     CancelRequest,
     CutoverRequest,
     FinalizeRequest,
+    ForceCutoverRequest,
     RollbackRequest,
     StrategyRequest,
 )
@@ -73,6 +74,19 @@ async def cutover(
     body = body or CutoverRequest()
     return await services(request).orchestrator.request_cutover(
         migration_id, principal.name, force_window=body.force_window, comment=body.comment
+    )
+
+
+@router.post("/migrations/{migration_id}/force-cutover", response_model=Migration)
+async def force_cutover(
+    migration_id: str,
+    request: Request,
+    body: ForceCutoverRequest,
+    principal: Principal = Depends(require_role(Role.approver)),
+) -> Migration:
+    """Cut over before convergence, with a reason; the gate still applies (SDD §5.4)."""
+    return await services(request).orchestrator.force_cutover(
+        migration_id, principal.name, body.reason
     )
 
 

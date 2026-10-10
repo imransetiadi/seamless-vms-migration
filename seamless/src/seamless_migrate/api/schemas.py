@@ -68,6 +68,12 @@ class CutoverRequest(_Body):
     comment: str | None = Field(default=None, max_length=_TEXT)
 
 
+class ForceCutoverRequest(_Body):
+    """A cutover before convergence needs a reason (SDD §5.4, ADV-16)."""
+
+    reason: str = Field(min_length=10, max_length=_TEXT)
+
+
 class RollbackRequest(_Body):
     reason: str = Field(min_length=1, max_length=_TEXT)
 
@@ -118,6 +124,8 @@ class Health(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
     demo: bool
+    #: a demo's time compression: its downtime clock runs in model time (SDD §5.2, ADV-16)
+    demo_speed: float | None = None
     db: Literal["ok", "error"]
     orchestrator: OrchestratorHealth
 

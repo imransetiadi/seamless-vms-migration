@@ -25,7 +25,14 @@ def test_health_public_reports_db(api, monkeypatch):
     assert res.status_code == 200
     body = res.json()
     orchestrator = body.pop("orchestrator")
-    assert body == {"status": "ok", "version": "0.1.0", "demo": True, "db": "ok"}
+    # demo_speed: the dashboard runs a demo's downtime clock in model time (SDD §12, ADV-16)
+    assert body == {
+        "status": "ok",
+        "version": "0.1.0",
+        "demo": True,
+        "demo_speed": 1e7,
+        "db": "ok",
+    }
     assert orchestrator["running"] is True and orchestrator["healthy"] is True
     assert orchestrator["ticks"] >= 0
     assert orchestrator["last_tick_age_s"] is None or orchestrator["last_tick_age_s"] >= 0
@@ -337,6 +344,7 @@ def test_stats_shape(api):
         "p95_downtime_s",
         "max_downtime_s",
         "slo_compliance_pct",
+        "data_inconsistent",
         "downtime_by_strategy",
         "throughput_series",
     }

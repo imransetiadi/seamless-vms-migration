@@ -232,3 +232,45 @@ def test_the_demo_seed_carries_no_placeholder_strings():
         text = Path(module.__file__).read_text(encoding="utf-8")
         found = [match.group(0) for match in placeholder.finditer(text)]
         assert found == [], module.__name__
+
+
+async def test_every_demo_migration_keeps_the_invariants(tmp_path, store):
+    """ADV-16 property test (SDD §5.5): run the demo seed to the end; no migration breaks an
+    invariant, and a warm migration's downtime is never shorter than its final sync."""
+    import asyncio
+
+    from seamless_migrate.invariants import check_invariants
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    orch = services.orchestrator
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+        while loop.time() < deadline:
+            migrations = store.list("migration", Migration)
+            for m in migrations:
+                if m.phase in (Phase.ready, Phase.awaiting_cutover) and not m.cutover_requested:
+                    try:  # it may have moved on since the list was read
+                        await orch.request_cutover(m.id, "sari")
+                        await orch.approve(m.id, "rina", "Checked for the property test")
+                    except NotAllowed:
+                        continue
+            if all(m.phase in (Phase.completed, Phase.cancelled) for m in migrations):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await orch.stop()
+    plans = {p.id: p for p in store.list("plan", Plan)}
+    completed = [m for m in store.list("migration", Migration) if m.phase == Phase.completed]
+    assert len(completed) >= 30
+    for m in completed:
+        assert m.data_issues == [], (m.vm.name, m.data_issues)
+        assert check_invariants(m, plans[m.plan_id], settings) == [], m.vm.name
+        final = [p for p in m.sync_passes if p.kind == "final"]
+        if final:
+            assert m.actual_downtime_s >= final[-1].duration_s, m.vm.name

@@ -115,10 +115,11 @@ class SimulatedExecutor:
         vm = m.vm
         p = params_for_plan(ctx.plan)
         rng = self._rng(ctx, StepName.CUTOVER)
-        started = utcnow()
         await ctx.log("simulated cutover: stopping the source VM")
         await self._elapse(ctx, p.shutdown_s, 0)
         await ctx.mark_downtime_start()
+        # the final sync (or the copy) runs once the source is stopped (SDD §7.4, ADV-16)
+        started = utcnow()
 
         sync_pass: SyncPass | None = None
         if m.strategy in (Strategy.warm, Strategy.vmware_warm):
@@ -161,4 +162,9 @@ class SimulatedExecutor:
                 duration_s=copy_s,
             )
         await self._elapse(ctx, p.create_s, 0)
-        return StepResult(sync_pass=sync_pass, destination_server_id=f"sim-{m.id}")
+        # the model seconds the source stayed down here: the downtime counts them (SDD §5.2)
+        return StepResult(
+            sync_pass=sync_pass,
+            destination_server_id=f"sim-{m.id}",
+            details={"downtime_model_s": copy_s + p.create_s},
+        )

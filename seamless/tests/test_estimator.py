@@ -10,6 +10,7 @@ from seamless_migrate.planning.estimator import (
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    final_downtime_parts,
     invalid_estimator_overrides,
     observed_scan_rate,
     params_for_plan,
@@ -274,3 +275,26 @@ def test_calibration_helpers():
     assert observed_scan_rate(second.model_copy(update={"duration_s": 0}), two_disks, P) is None
     empty = second.model_copy(update={"bytes_scanned": 0})
     assert observed_scan_rate(empty, two_disks, P) is None
+
+
+PART_KEYS = {"shutdown_s", "copy_s", "conversion_s", "create_s", "boot_s"}
+
+
+@pytest.mark.parametrize("strategy", list(Strategy))
+def test_the_downtime_parts_add_up_to_the_downtime(strategy):
+    """ADV-16 (SDD §4, §9.1): the Downtime panel shows the estimate's parts."""
+    est = estimate(vm_with(500, 360, 5, disks=2), strategy, P, 900)
+    assert set(est.downtime_parts) == PART_KEYS
+    assert sum(est.downtime_parts.values()) == pytest.approx(est.downtime_s)
+    assert (
+        est.downtime_parts["shutdown_s"] == P.shutdown_s
+        and est.downtime_parts["boot_s"] == P.boot_s
+    )
+
+
+@pytest.mark.parametrize("strategy", [Strategy.warm, Strategy.vmware_warm])
+def test_the_final_downtime_parts_add_up_to_the_final_downtime(strategy):
+    vm = vm_with(500, 360, 5, disks=2)
+    parts = final_downtime_parts(vm, strategy, 3063.7, P)
+    assert set(parts) == PART_KEYS
+    assert sum(parts.values()) == pytest.approx(estimate_final_downtime(vm, strategy, 3063.7, P))

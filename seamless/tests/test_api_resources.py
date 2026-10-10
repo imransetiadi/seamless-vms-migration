@@ -797,3 +797,13 @@ def test_only_an_approver_changes_the_distinct_approver_setting(api):
         "/api/v1/plans", Role.operator, json={**body, "require_distinct_approver": True}
     )
     assert plain.status_code == 201, "the default value needs no approver"
+
+
+def test_a_force_cutover_needs_an_approver_a_reason_and_a_warm_pass_in_progress(api):
+    """ADV-16 (SDD §5.4, §12): only precopy/syncing of a warm migration; 10-2000 characters."""
+    migs = seed_migrations(api.store)
+    ready = f"/api/v1/migrations/{migs['ready'].id}/force-cutover"
+    body = {"reason": "The change window closes at 22:00"}
+    assert api.post(ready, Role.operator, json=body).status_code == 403
+    assert api.post(ready, Role.approver, json={"reason": "short"}).status_code == 422
+    assert api.post(ready, Role.approver, json=body).status_code == 409  # not in a pass

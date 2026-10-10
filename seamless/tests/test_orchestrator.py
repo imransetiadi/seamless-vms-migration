@@ -22,6 +22,7 @@ from seamless_migrate.domain.models import (
     Approval,
     CutoverWindow,
     Event,
+    ForceCutover,
     Migration,
     Nic,
     Plan,
@@ -30,6 +31,8 @@ from seamless_migrate.domain.models import (
     SyncPass,
     VerificationConfig,
     Wave,
+    next_pass_number,
+    utcnow,
 )
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.executors.base import (
@@ -39,6 +42,7 @@ from seamless_migrate.executors.base import (
     TransientStepError,
 )
 from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed, Unprocessable
+from seamless_migrate.planning.estimator import params_for_plan
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
 from tests.factories import make_disk, make_migration, make_vm
@@ -838,8 +842,9 @@ async def test_warm_flow_reaches_completed_with_downtime(tmp_path, store):
     assert [p.kind for p in done.sync_passes] == ["full", "delta", "final"]
     assert [p.number for p in done.sync_passes] == [1, 2, 3]
     assert done.downtime_started_at and done.downtime_ended_at
+    # a simulated cutover counts model seconds plus the plan's boot time (SDD §5.2, ADV-16)
     assert done.actual_downtime_s == pytest.approx(
-        (done.downtime_ended_at - done.downtime_started_at).total_seconds()
+        done.downtime_model_s + params_for_plan(plan).boot_s
     )
     assert done.destination_server_id and done.progress_pct == 100
     assert done.bytes_transferred == sum(p.bytes_transferred for p in done.sync_passes)
@@ -1082,12 +1087,12 @@ async def test_vmware_warm_convergence_ignores_missing_byte_counts(tmp_path, sto
         }
     )
     converged, reason = h.orch._converged(cbt, plan)
-    assert (converged, reason) == (True, "estimated final downtime 365 s is within the SLO")
+    assert (converged, reason) == ("slo", "estimated final downtime 365 s is within the SLO")
     tight = plan.model_copy(update={"downtime_slo_s": 100})
     converged, reason = h.orch._converged(cbt, tight)
-    assert converged is False and reason.startswith("another CBT pass: estimated downtime")
+    assert converged is None and reason.startswith("another CBT pass: estimated downtime")
     warm = cbt.model_copy(update={"strategy": Strategy.warm})
-    assert h.orch._converged(warm, plan) == (True, "converged: last pass changed 0 B")
+    assert h.orch._converged(warm, plan) == ("threshold", "converged: last pass changed 0 B")
 
 
 async def test_keep_warm_history_is_bounded_and_bytes_stay_counted(tmp_path, store):
@@ -3121,3 +3126,227 @@ async def test_a_recommendation_without_jev_names_no_deployment(tmp_path, store)
             "unknown",
             None,
         )
+
+
+# -- ADV-16: invariants, the rule that converged, model time in demo mode (SDD §5.2-§5.5) ---------
+
+
+async def test_a_completed_migration_records_its_rule_its_estimate_parts_and_no_data_issue(
+    tmp_path, store
+):
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    done = await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+    assert done.converged_by in {"threshold", "slo", "max_passes"}
+    assert set(done.estimate.downtime_parts) == {
+        "shutdown_s",
+        "copy_s",
+        "conversion_s",
+        "create_s",
+        "boot_s",
+    }
+    assert sum(done.estimate.downtime_parts.values()) == pytest.approx(done.estimate.downtime_s)
+    assert done.data_issues == []
+    assert "migration.data_inconsistent" not in h.kinds()
+
+
+async def test_a_completed_migration_whose_numbers_do_not_hold_is_flagged(tmp_path, store):
+    """A final pass recorded before the stop breaks invariant 1: stored and announced (SDD §5.5)."""
+    early: dict = {}
+
+    async def cutover(ctx):
+        early["at"] = utcnow() - timedelta(seconds=30)
+        await ctx.mark_downtime_start()
+        return StepResult(
+            destination_server_id="dst-1",
+            sync_pass=SyncPass(
+                number=next_pass_number(ctx.migration),
+                kind="final",
+                started_at=early["at"],
+                ended_at=utcnow(),
+                bytes_changed=1,
+                bytes_transferred=1,
+                duration_s=0.0,
+            ),
+        )
+
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300},
+        settings=settings,
+        executor=ScriptedExecutor(settings, hooks={StepName.CUTOVER: cutover}),
+    )
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert [i.split(":")[0] for i in done.data_issues] == ["FINAL_SYNC_MISSING"]
+    assert "migration.data_inconsistent" in h.kinds()
+
+
+async def test_a_simulated_downtime_counts_model_seconds(tmp_path, store):
+    """ADV-16 (SDD §5.2): after a simulated cutover the downtime is its model seconds plus the
+    plan's boot time, like the passes' durations - so it compares with its estimate."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    params = params_for_plan(plan)
+    copy = done.sync_passes[-1].duration_s
+    assert done.downtime_model_s == pytest.approx(copy + params.create_s)
+    assert done.actual_downtime_s == pytest.approx(copy + params.create_s + params.boot_s)
+    wall = (done.downtime_ended_at - done.downtime_started_at).total_seconds()
+    assert done.actual_downtime_s > wall, "the simulator compresses wall time"
+
+
+# -- ADV-16 P4: Force cutover (SDD §5.4) ------------------------------------------------------
+
+
+async def test_a_pass_alone_never_cuts_over_before_convergence_but_a_force_cutover_does(
+    tmp_path, store
+):
+    """The spec's gating test: a 16.8 GiB delta above the 1 GiB threshold, 2 of 5 passes, an
+    estimate over the SLO - no rule ends the passes; a recorded Force cutover does."""
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 60}
+    )
+    big = [
+        SyncPass(
+            number=1,
+            kind="full",
+            started_at=utcnow(),
+            bytes_changed=374 * 2**30,
+            bytes_transferred=374 * 2**30,
+            duration_s=3000.0,
+        ),
+        SyncPass(
+            number=2,
+            kind="delta",
+            started_at=utcnow(),
+            bytes_changed=int(16.8 * 2**30),
+            bytes_transferred=int(16.8 * 2**30),
+            duration_s=300.0,
+        ),
+    ]
+    m = make_migration(plan_id=plan.id, phase=P.syncing, sync_passes=big, vm=vm(1))
+    assert h.orch._converged(m, plan)[0] is None
+    forced = m.model_copy(
+        update={
+            "force_cutover": ForceCutover(
+                actor="sari",
+                at=utcnow(),
+                reason="The window closes in ten minutes",
+                delta_bytes=int(16.8 * 2**30),
+                estimated_downtime_s=480.0,
+            )
+        }
+    )
+    assert h.orch._converged(forced, plan)[0] == "force"
+
+
+async def test_a_force_cutover_is_recorded_audited_and_still_needs_another_approver(
+    tmp_path, store
+):
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=200, used_gb=150.0)],
+        {
+            "default_strategy": Strategy.warm,
+            "require_approval": True,
+            "auto_cutover": False,
+            "downtime_slo_s": 1,
+            "convergence_threshold_bytes": 0,
+            "max_sync_passes": 50,
+        },
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.syncing)
+    with pytest.raises(Unprocessable):
+        await h.orch.force_cutover(m.id, "sari", "too short")
+    forced = await h.orch.force_cutover(m.id, "sari", "The change window closes at 22:00")
+    record = forced.force_cutover
+    assert (record.actor, record.reason) == ("sari", "The change window closes at 22:00")
+    assert record.estimated_downtime_s > 0 and forced.cutover_requested_by == "sari"
+    event = [
+        e for e in h.store.events(since_seq=0, limit=100000) if e.kind == "migration.force_cutover"
+    ][-1]
+    assert (event.actor, event.data["reason"]) == ("sari", "The change window closes at 22:00")
+    m = await h.wait_phase(m.id, P.awaiting_cutover)
+    assert m.converged_by == "force"
+    await asyncio.sleep(0.1)  # maker-checker: the forcer's request is not an approval
+    assert (await h.migration(m.id)).phase == P.awaiting_cutover
+    await h.orch.approve(m.id, "rina", "Agreed to cut over outside convergence")
+    done = await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+    assert done.data_issues == []
+    with pytest.raises(NotAllowed):
+        await h.orch.force_cutover(m.id, "sari", "The change window closes at 22:00")
+
+
+async def test_a_final_pass_keeps_the_estimate_the_convergence_rule_used(tmp_path, store):
+    """SDD §5.3 (ADV-16): the Downtime panel compares with the estimate the gate saw."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm})
+    full = SyncPass(
+        number=1,
+        kind="full",
+        started_at=utcnow(),
+        bytes_changed=2**30,
+        bytes_transferred=2**30,
+        duration_s=600.0,
+    )
+    m = make_migration(
+        plan_id=plan.id, phase=P.syncing, sync_passes=[full], vm=vm(1), estimate=estimate_for_test()
+    )
+    h.orch._converge(m, plan, "slo")
+    gate = m.estimate
+    final = SyncPass(
+        number=2,
+        kind="final",
+        started_at=utcnow(),
+        bytes_changed=2**28,
+        bytes_transferred=2**28,
+        duration_s=30.0,
+    )
+    m.sync_passes.append(final)
+    h.orch._calibrate(m, plan, final)
+    assert m.estimate == gate
+
+
+def estimate_for_test():
+    from seamless_migrate.domain.models import Estimate
+
+    return Estimate(
+        strategy="warm",
+        eligible=True,
+        precopy_s=600,
+        passes=1,
+        downtime_s=900,
+        total_s=1500,
+        final_delta_bytes=0,
+        meets_slo=False,
+    )
+
+
+def test_clearing_a_cutover_request_drops_its_force_cutover():
+    from seamless_migrate.orchestrator import _clear_request
+
+    m = make_migration(
+        cutover_requested=True,
+        cutover_requested_by="sari",
+        force_cutover=ForceCutover(
+            actor="sari",
+            at=utcnow(),
+            reason="The window closes soon",
+            delta_bytes=1,
+            estimated_downtime_s=10.0,
+        ),
+    )
+    _clear_request(m)
+    assert (m.cutover_requested, m.cutover_requested_by, m.force_cutover) == (False, None, None)

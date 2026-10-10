@@ -398,6 +398,9 @@ class Estimate(_Model):
     total_s: float
     final_delta_bytes: int
     meets_slo: bool
+    #: shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s: they add up to
+    #: downtime_s (SDD §4, §9.1, ADV-16)
+    downtime_parts: dict[str, float] = Field(default_factory=dict)
 
 
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]
@@ -524,6 +527,17 @@ class AdvisorPolicy(AdvisorPolicySpec):
     updated_by: str
 
 
+class ForceCutover(_Model):
+    """A cutover before convergence, asked for with a reason (SDD §5.4, ADV-16)."""
+
+    actor: str
+    at: UTCDateTime
+    reason: str
+    #: the last pass's bytes_changed, and the estimated final downtime, when it was asked for
+    delta_bytes: int
+    estimated_downtime_s: float
+
+
 class Approval(_Model):
     actor: str
     at: UTCDateTime = Field(default_factory=utcnow)
@@ -573,6 +587,13 @@ class Migration(_Model):
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
     #: the recommendation whose decision waits for approval: no start meanwhile (SDD §5.4, §14.6)
     advisor_hold: str | None = None
+    #: the convergence rule that ended the passes (SDD §5.3, ADV-16)
+    converged_by: Literal["threshold", "slo", "max_passes", "force"] | None = None
+    force_cutover: ForceCutover | None = None
+    #: the model seconds a simulated cutover spent with the source stopped (demo, SDD §5.2)
+    downtime_model_s: float | None = None
+    #: invariant violations found when it completed (SDD §5.5)
+    data_issues: list[str] = Field(default_factory=list)
     review_required: bool = False
     review_reason: str | None = None
     destination_server_id: str | None = None
