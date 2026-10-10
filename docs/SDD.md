@@ -1908,7 +1908,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
   completed, that the retry reopens it (§5.1); the approvals list the cutover request and each approval in time
   order — "Requested by {user}", "Approved by {user}" with its comment — and say when an approval does not count
-  (the requester's own, §5.4); each entry names its kind: "Cutover approval" for the request and each approval,
+  and why: the requester's own ("{user} requested the cutover") or the forcer's ("{user} forced the cutover"), §5.4;
+  each entry names its kind: "Cutover approval" for the request and each approval,
   "Advisor decision · {decision type}" for the migration's advisor decision while it waits for approval and once a
   person approved or overrode it, with who and when (ADV-20); Approve is unavailable to the cutover's requester when the plan requires a distinct
   approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
