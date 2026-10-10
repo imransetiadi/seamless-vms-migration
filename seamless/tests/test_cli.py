@@ -354,6 +354,111 @@ def test_the_service_log_is_redacted(env, capsys, log_json):
         assert "RuntimeError: Unauthorized: POST https://[REDACTED]@" in records[1]["exc"]
 
 
+class _MemoryTransport:
+    """An in-memory socket for uvicorn's HTTP protocol: no port is opened."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def get_extra_info(self, name, default=None):
+        return {"sockname": ("127.0.0.1", 8080), "peername": ("127.0.0.1", 50000)}.get(
+            name, default
+        )
+
+    def write(self, data) -> None:
+        self.data += data
+
+    def close(self) -> None:
+        self.closed = True
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def pause_reading(self) -> None:
+        pass
+
+    def resume_reading(self) -> None:
+        pass
+
+
+async def test_serve_stops_the_orchestrator_though_an_event_stream_stays_open(
+    tmp_path, monkeypatch
+):
+    """SDD §8: SIGTERM reaches orchestrator.stop() — which cancels running steps and removes their
+    run files — even while a dashboard keeps its event stream open (it never ends by itself):
+    `seamless serve` lets uvicorn wait at most 5 s for open requests, then cancel them."""
+    import asyncio
+
+    import uvicorn
+    from uvicorn.config import Config
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+    from uvicorn.server import Server
+
+    from seamless_migrate.api.app import create_app
+    from seamless_migrate.domain.enums import Role
+    from seamless_migrate.store import Store
+    from tests.api_support import api_settings
+
+    assert getattr(cli, "SHUTDOWN_GRACE_S", None) == 5
+    monkeypatch.setattr(cli, "SHUTDOWN_GRACE_S", 0.5, raising=False)  # the test waits less
+    settings, tokens = api_settings(tmp_path)
+    store = Store(f"sqlite:///{tmp_path / 'sse.db'}")
+    store.create_schema()
+    app = create_app(settings, store, sse_heartbeat_s=0.2)
+    served: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda target, **options: served.update(options))
+    cli.run_server(app, settings, False)
+    # the development server (--reload) gets the same bound; it exports its settings: restored
+    for key in ("SEAMLESS_HOST", "SEAMLESS_PORT", "SEAMLESS_DEMO", "SEAMLESS_AUTH_DISABLED"):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+    reloaded: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda target, **options: reloaded.update(options))
+    cli.run_server(app, settings, True)
+    assert reloaded["timeout_graceful_shutdown"] == served["timeout_graceful_shutdown"] == 0.5
+    orch = app.state.services.orchestrator
+    stopped = asyncio.Event()
+    real_stop = orch.stop
+
+    async def spy_stop():
+        stopped.set()
+        await real_stop()
+
+    orch.stop = spy_stop
+    config = Config(
+        app,
+        lifespan="on",
+        log_level="warning",
+        timeout_graceful_shutdown=served.get("timeout_graceful_shutdown"),
+    )
+    config.load()
+    server = Server(config)
+    server.lifespan = config.lifespan_class(config)
+    await server.lifespan.startup()
+    protocol = H11Protocol(
+        config=config, server_state=server.server_state, app_state=server.lifespan.state
+    )
+    transport = _MemoryTransport()
+    protocol.connection_made(transport)
+    protocol.data_received(
+        b"GET /api/v1/events/stream HTTP/1.1\r\nHost: seamless\r\n"
+        b"Authorization: Bearer " + tokens[Role.viewer].encode() + b"\r\n\r\n"
+    )
+    for _ in range(200):
+        if b"text/event-stream" in transport.data:
+            break
+        await asyncio.sleep(0.01)
+    assert b"200 OK" in transport.data  # a dashboard's live events
+    server.servers = []  # SIGTERM: uvicorn closes its listeners, then waits for connections
+    shutdown = asyncio.create_task(server.shutdown())
+    done, _ = await asyncio.wait({shutdown}, timeout=5)
+    finished, orchestrator_stopped = shutdown in done, stopped.is_set()
+    protocol.connection_lost(None)  # clean up either way
+    await asyncio.wait_for(shutdown, 10)
+    store.dispose()
+    assert finished and orchestrator_stopped, (finished, orchestrator_stopped)
+
+
 def test_events_export_and_prune(env, capsys, tmp_path):
     import json
     from datetime import UTC, datetime, timedelta

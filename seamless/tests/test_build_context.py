@@ -378,6 +378,18 @@ def test_strict_gitleaks_config_never_allowlists_a_secret_path():
     assert covered == [], f".gitleaks.toml allowlists secret files: {covered}"
 
 
+def test_the_containers_stop_grace_leaves_room_for_the_orchestrator_to_stop():
+    """SDD §8: on SIGTERM the server waits up to 5 s for open requests, then stop() may take 15 s
+    (a playbook gets SIGTERM, then SIGKILL after 10 s); the container's grace covers both — 30 s on
+    Compose (its default 10 s would kill the stop), 60 s on OpenShift."""
+    compose = yaml.safe_load((ROOT / "deploy/compose/compose.yaml").read_text(encoding="utf-8"))
+    assert compose["services"]["seamless"]["stop_grace_period"] == "30s"
+    deployment = yaml.safe_load(
+        (ROOT / "deploy/openshift/deployment.yaml").read_text(encoding="utf-8")
+    )
+    assert deployment["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 60
+
+
 def test_tree_gitleaks_config_skips_only_the_git_ignored_secret_files():
     """``.gitleaks-tree.toml`` (working-tree scans) skips the local secret files a checkout holds
     and nothing broader: each of its patterns stands for one kind of git-ignored secret file."""

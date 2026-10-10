@@ -114,6 +114,9 @@ services:
       dockerfile: seamless/Containerfile
     image: seamless-migrate:${SEAMLESS_VERSION:-0.1.0}
     init: true
+    # SIGTERM: up to 5 s for open requests, then the orchestrator stops its steps (a playbook gets
+    # 10 s after SIGTERM before SIGKILL) and removes their run files (SDD 8); the default 10 s is too short
+    stop_grace_period: 30s
     cap_drop:
       - ALL
     # To rehearse the OpenShift security context (SDD 17) uncomment the next two lines:

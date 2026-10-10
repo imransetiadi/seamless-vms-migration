@@ -86,6 +86,11 @@ def configure_logging(settings: Settings) -> None:
     root.setLevel(settings.log_level.upper())
 
 
+#: on SIGTERM the server waits this long for open requests — an event stream never ends by
+#: itself — then cancels them, so the lifespan stops the orchestrator (SDD §8)
+SHUTDOWN_GRACE_S = 5
+
+
 #: uvicorn installs its own plain-text handlers; ``uvicorn_log_config`` routes them through the
 #: root handler of :func:`configure_logging` so JSON logging covers access and error lines too.
 def uvicorn_log_config(level: str = "INFO") -> dict[str, Any]:
@@ -156,6 +161,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
             reload=True,
             log_level=settings.log_level.lower(),
             log_config=uvicorn_log_config(settings.log_level),
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
         )
         return
     uvicorn.run(
@@ -165,6 +171,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
         log_level=settings.log_level.lower(),
         log_config=uvicorn_log_config(settings.log_level),
         proxy_headers=True,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
     )
 
 
