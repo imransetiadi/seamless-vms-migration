@@ -1303,6 +1303,72 @@ def _strategy_changed_before(h, to: Phase, strategy: Strategy) -> asyncio.Event:
     return changed
 
 
+@pytest.mark.parametrize(
+    ("strategy", "step"), [(Strategy.cold, P.cutover), (Strategy.warm, P.precopy)]
+)
+async def test_a_pause_stops_the_step_the_tick_already_chose(tmp_path, store, strategy, step):
+    """SDD §8: the tick chose the step on its plan snapshot; a pause that returned before the step
+    starts wins - starting a step re-checks, under the plan's lock, that the plan still runs - so
+    the source is not stopped (cutover) or copied (pre-copy) after the operator paused the plan."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": strategy})
+    begin = h.orch._begin
+    paused = asyncio.Event()
+
+    async def racing_begin(mid, allowed, target, reason):
+        if target == step and not paused.is_set():
+            await h.orch.pause_plan(plan.id, "rina")
+            paused.set()
+        return await begin(mid, allowed, target, reason)
+
+    h.orch._begin = racing_begin
+    await run_plan(h, plan)
+    await asyncio.wait_for(paused.wait(), 5)
+    await asyncio.sleep(0.1)  # many ticks of the paused plan
+    m = await h.migration((await h.by_vm(plan.id, "vm-1")).id)
+    await h.orch.stop()
+    assert (await h.plan(plan.id)).status == PlanStatus.paused
+    assert m.phase == P.ready and step not in h.history(m)
+    assert h.executor.calls == []
+
+
+async def test_a_pause_waits_for_a_step_that_is_starting(tmp_path, store):
+    """SDD §8: a step starts under the plan's lock, so a pause that arrives after the start read the
+    plan's status waits for it: when the pause returns, no step starts any more - the cutover's
+    phase event comes before the plan.paused event, never after it."""
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    begin, read_plan = h.orch._begin, h.orch._plan
+    starting: list[asyncio.Task] = []
+    pause: list[asyncio.Task] = []
+
+    async def tracked_begin(mid, allowed, target, reason):
+        starting.append(asyncio.current_task())
+        return await begin(mid, allowed, target, reason)
+
+    async def racing_plan(plan_id):
+        loaded = await read_plan(plan_id)
+        if not pause and asyncio.current_task() in starting:
+            # the start has read the plan's status: the operator pauses now
+            pause.append(asyncio.create_task(h.orch.pause_plan(plan.id, "rina")))
+            await asyncio.sleep(0.05)  # as far as the pause gets meanwhile
+        return loaded
+
+    h.orch._begin, h.orch._plan = tracked_begin, racing_plan
+    await run_plan(h, plan)
+    for _ in range(300):
+        if pause and pause[0].done():
+            break
+        await asyncio.sleep(0.01)
+    await pause[0]
+    await asyncio.sleep(0.1)
+    await h.orch.stop()
+    events = h.store.events(since_seq=0, limit=10000)
+    paused_at = next(e.seq for e in events if e.kind == "plan.paused")
+    started_at = [
+        e.seq for e in events if e.kind == "migration.phase" and e.data.get("to") == "cutover"
+    ]
+    assert started_at and all(seq < paused_at for seq in started_at)
+
+
 async def test_a_migration_turned_cold_before_its_precopy_starts_does_not_precopy(tmp_path, store):
     """SDD §8: the tick chose a warm migration for pre-copy on its snapshot; a set_strategy to cold
     meanwhile wins: a pre-copy starts only for a warm strategy, so the cold migration cuts over

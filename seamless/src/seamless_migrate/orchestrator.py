@@ -1248,7 +1248,12 @@ class Orchestrator:
                 )
 
     async def _begin(self, mid: str, allowed: set[Phase], to: Phase, reason: str) -> bool:
-        async with self._lock(mid):
+        plan_id = (await self._load(mid))[0].plan_id
+        # SDD §8: under the plan's lock (then the migration's, the documented order), so a pause
+        # that returned starts nothing the tick chose on its snapshot
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+            if (await self._plan(plan_id)).status != PlanStatus.running:
+                return False
             m, v = await self._load(mid)
             if m.phase not in allowed:
                 return False
