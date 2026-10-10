@@ -139,6 +139,19 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
   });
 
+  it('warns in Finalize while the source VM runs again (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'web-cache-01') as Migration;
+    migration.source_running_at = '2026-10-08T11:00:00Z';
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /finalize/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /finalize web-cache-01/i });
+    expect(dialog).toHaveTextContent('The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.');
+  });
+
   it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');

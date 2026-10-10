@@ -46,7 +46,8 @@ describe('PlanDetail', () => {
 
     const pause = await actionButton(/pause/i);
     expect(pause).not.toHaveAttribute('aria-disabled');
-    expect(await actionButton(/^start|resume/i)).toHaveAttribute('aria-disabled', 'true');
+    // Start is hidden once the plan runs (ADV-19)
+    expect(within(screen.getByRole('group', { name: /plan actions/i })).queryByRole('button', { name: /^start|^resume/i })).not.toBeInTheDocument();
     expect(await actionButton(/validate/i)).toHaveAttribute('aria-disabled', 'true');
     expect(await actionButton(/auto-plan waves/i)).toHaveAttribute('aria-disabled', 'true');
   });
@@ -272,6 +273,151 @@ describe('PlanDetail', () => {
     expect(use).toHaveAccessibleDescription(/Only a draft or validated plan can be edited \(this one is running\)/);
   });
 
+  it('shows the status its migrations tell, and Finalize instead of Start once they all ended (SDD §8.1, §16, ADV-19)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    plan.status = 'validated'; // a re-validation of a finished plan stores it so
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const header = (await screen.findByRole('heading', { level: 1, name: plan.name })).closest('header')!;
+    await waitFor(() => expect(header).toHaveTextContent('Completed'));
+    expect(header).not.toHaveTextContent('Validated');
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    expect(within(actions).queryByRole('button', { name: /^start|^resume/i })).not.toBeInTheDocument();
+    // nothing to pause either
+    expect(within(actions).queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(within(actions).getByRole('button', { name: 'Finalize all' })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('lists the VMs awaiting finalize, oldest first, with what needs a look, and finalizes them with one approval (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const cache = server.migrations.find((m) => m.vm.name === 'web-cache-01')!;
+    expect(cache.phase).toBe('completed');
+    cache.source_running_at = '2026-10-08T11:00:00Z';
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    expect(queue).toHaveTextContent('1 VM awaits finalize: the source VM is still there until it is finalized.');
+    const row = within(queue).getByRole('listitem', { name: 'web-cache-01' });
+    // completed 8 days ago: past the plan's 72 h
+    expect(row).toHaveTextContent('Finalize overdue');
+    expect(row).toHaveTextContent('Source VM running');
+    // its one wave holds every VM listed: the header's Finalize all does what Finalize wave would
+    expect(within(queue).queryByRole('button', { name: /^finalize wave/i })).not.toBeInTheDocument();
+
+    await user.click(within(screen.getByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${plan.name}?` });
+    expect(dialog).toHaveTextContent('Finalizing is irreversible: this VM can no longer be rolled back, and the temporary resources of its source VM are cleaned up.');
+    expect(dialog).toHaveTextContent('The source VM of web-cache-01 runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.');
+    // one VM: "the source VM", not "VMs"
+    expect(within(dialog).getByRole('checkbox', { name: /^also delete the source VM\b/i })).not.toBeChecked();
+    const confirm = within(dialog).getByRole('button', { name: 'Finalize all' });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await user.type(within(dialog).getByLabelText(`Type ${plan.name} to confirm`), plan.name);
+    await user.click(confirm);
+    await waitFor(() => expect(cache.phase).toBe('finalized'));
+    expect(await screen.findByText('1 VM finalized.')).toBeInTheDocument();
+  });
+
+  it('finalizes one wave by its name, and keeps Finalize from an operator (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    let queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    const blocked = within(queue).getByRole('button', { name: `Finalize wave ${wave.name}` });
+    expect(blocked).toHaveAttribute('aria-disabled', 'true');
+    expect(blocked).toHaveAccessibleDescription('Requires the approver role.');
+    view.unmount();
+
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    await user.click(within(queue).getByRole('button', { name: `Finalize wave ${wave.name}` }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${wave.name}?` });
+    await user.type(within(dialog).getByLabelText(`Type ${wave.name} to confirm`), wave.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize wave' }));
+    await waitFor(() => expect(web01.phase).toBe('finalized'));
+  });
+
+  it('offers Finalize all in the queue of a running plan once it spans waves, and deletes the sources when asked (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    // a VM of another wave completes too
+    const other = server.migrations.find((m) => m.plan_id === plan.id && m.wave_id && m.wave_id !== web01.wave_id && m.phase === 'syncing')!;
+    other.phase = 'completed';
+    other.phase_history = [
+      ...other.phase_history,
+      { from_phase: 'verifying', to_phase: 'completed', at: new Date(Date.now() - 3_600_000).toISOString(), reason: 'verification passed', actor: 'orchestrator' },
+    ];
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    expect(queue).toHaveTextContent('2 VMs await finalize: their source VMs are still there until they are finalized.');
+    expect(within(queue).getAllByRole('button', { name: /^finalize wave/i })).toHaveLength(2);
+    // the plan still runs: Finalize all is the queue's, not the header's
+    expect(within(screen.getByRole('group', { name: /plan actions/i })).queryByRole('button', { name: 'Finalize all' })).not.toBeInTheDocument();
+
+    await user.click(within(queue).getByRole('button', { name: 'Finalize all' }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 2 VMs of ${plan.name}?` });
+    expect(dialog).toHaveTextContent('Finalizing is irreversible: these VMs can no longer be rolled back, and the temporary resources of their source VMs are cleaned up.');
+    await user.click(within(dialog).getByRole('checkbox', { name: /^also delete the source VMs/i }));
+    await user.type(within(dialog).getByLabelText(`Type ${plan.name} to confirm`), plan.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize all' }));
+    await waitFor(() => expect(other.phase).toBe('finalized'));
+    expect(web01.phase).toBe('finalized');
+    expect([web01, other].map((m) => m.phase_history.at(-1)?.reason)).toEqual(['finalized; source deleted', 'finalized; source deleted']);
+    expect(await screen.findByText('2 VMs finalized.')).toBeInTheDocument();
+  });
+
+  it('hides Start once the plan runs: Pause is its action, Resume once paused (ADV-19)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    expect(plan.status).toBe('running');
+    const view = renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    let actions = await screen.findByRole('group', { name: /plan actions/i });
+    await waitFor(() => expect(within(actions).getByRole('button', { name: 'Pause' })).not.toHaveAttribute('aria-disabled'));
+    expect(within(actions).queryByRole('button', { name: /^start|^resume/i })).not.toBeInTheDocument();
+    view.unmount();
+
+    plan.status = 'paused';
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    actions = await screen.findByRole('group', { name: /plan actions/i });
+    expect(await within(actions).findByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  });
+
+  it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
+    renderPlan('plan-2d5c8b93', 'viewer');
+    const metrics = await screen.findByRole('region', { name: /plan metrics/i });
+    await waitFor(() => expect(within(metrics).getByRole('group', { name: 'Awaiting finalize' })).toHaveTextContent('Awaiting finalize1'));
+    expect(within(metrics).getByRole('group', { name: 'Finalized' })).toHaveTextContent('Finalized1');
+    expect(within(metrics).queryByRole('group', { name: 'Completed' })).not.toBeInTheDocument();
+  });
+
+  it('sets the finalize reminder in the plan form (SDD §16, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const reminder = within(dialog).getByLabelText(/finalize reminder \(hours\)/i);
+    expect(reminder).toHaveValue(72);
+    await user.clear(reminder);
+    await user.type(reminder, '48');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.finalize_warning_h).toBe(48);
+    // and comes back into the form
+    await user.click(await actionButton(/^edit plan$/i));
+    const again = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(again).getByText(/^advanced:/i));
+    expect(within(again).getByLabelText(/finalize reminder \(hours\)/i)).toHaveValue(48);
+  });
+
   it('shows its KPIs as unknown, not zero, when the statistics cannot be loaded (SDD §16)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
@@ -283,7 +429,7 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'viewer', server });
     expect(await screen.findByText(/statistics are unavailable/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /plan metrics/i });
-    for (const label of ['In progress', 'Completed', 'Failed']) {
+    for (const label of ['In progress', 'Awaiting finalize', 'Finalized', 'Failed']) {
       expect(within(metrics).getByRole('group', { name: label })).toHaveTextContent(`${label}—`);
     }
     // the count still comes from the plan's migrations, which did load

@@ -3,7 +3,7 @@ import { useEffect, useId, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useMigrations, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import { PLAN_STATUSES, type PlanStatus } from '../api/types';
+import { DERIVED_PLAN_STATUSES, type DerivedPlanStatus } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -37,7 +37,8 @@ export default function Plans() {
   const location = useLocation();
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
-  const [status, setStatus] = useState<PlanStatus | 'all'>('all');
+  // every view shows the status the migrations tell, never the stored lifecycle (SDD §8.1)
+  const [status, setStatus] = useState<DerivedPlanStatus | 'all'>('all');
   const [sort, setSort] = useState<SortState<SortKey> | null>({ key: 'updated', direction: 'descending' });
   const [dialog, setDialog] = useState<{ open: boolean; sourceId?: string; vmIds?: string[] }>({ open: false });
   const canCreate = hasRole(role, 'operator');
@@ -66,14 +67,14 @@ export default function Plans() {
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     const filtered = (plans.data ?? []).filter(
-      (p) => (status === 'all' || p.status === status) && (!q || `${p.name} ${p.id} ${p.description ?? ''}`.toLowerCase().includes(q)),
+      (p) => (status === 'all' || p.derived_status === status) && (!q || `${p.name} ${p.id} ${p.description ?? ''}`.toLowerCase().includes(q)),
     );
     return sortBy(filtered, sort, (p, key) => {
       switch (key) {
         case 'name':
           return p.name;
         case 'status':
-          return PLAN_STATUSES.indexOf(p.status);
+          return DERIVED_PLAN_STATUSES.indexOf(p.derived_status);
         case 'vms':
           return p.vm_ids.length;
         case 'done': {
@@ -119,8 +120,8 @@ export default function Plans() {
           label="Status"
           className="md:w-44"
           value={status}
-          onChange={(e) => setStatus(e.target.value as PlanStatus | 'all')}
-          options={[{ value: 'all', label: 'All' }, ...PLAN_STATUSES.map((s) => ({ value: s, label: planStatusMeta(s).label }))]}
+          onChange={(e) => setStatus(e.target.value as DerivedPlanStatus | 'all')}
+          options={[{ value: 'all', label: 'All' }, ...DERIVED_PLAN_STATUSES.map((s) => ({ value: s, label: planStatusMeta(s).label }))]}
         />
       </div>
 
@@ -173,7 +174,7 @@ export default function Plans() {
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>
                     </th>
                     <td>
-                      <PlanStatusBadge status={p.status} />
+                      <PlanStatusBadge status={p.derived_status} />
                     </td>
                     <td className="hidden text-sm md:table-cell">
                       {providerName.get(p.source_provider_id) ?? p.source_provider_id}

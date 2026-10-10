@@ -116,3 +116,39 @@ test('an admin approves a decision the Finance policy holds; the audit trail nam
     .filter({ has: page.getByRole('link', { name: 'analytics-node-2', exact: true }) });
   await expect(approved).toHaveCount(1);
 });
+
+test('an approver finalizes a completed plan with one approval; it then reads Finalized (ADV-19)', async ({ page }) => {
+  await signIn(page, 'approver');
+  await page.goto('/plans/plan-2d5c8b93');
+  const header = page.locator('header').filter({ has: page.getByRole('heading', { level: 1, name: 'Pilot — static content' }) });
+  await expect(header.getByText('Completed', { exact: true })).toBeVisible();
+  const queue = page.getByRole('region', { name: 'Awaiting finalize' });
+  await expect(queue.getByRole('listitem', { name: 'web-cache-01' })).toContainText('Finalize overdue');
+
+  await page.getByRole('group', { name: /plan actions/i }).getByRole('button', { name: 'Finalize all' }).click();
+  const dialog = page.getByRole('alertdialog', { name: 'Finalize 1 VM of Pilot — static content?' });
+  await dialog.getByLabel('Type Pilot — static content to confirm').fill('Pilot — static content');
+  await dialog.getByRole('button', { name: 'Finalize all' }).click();
+
+  await expect(dialog).toBeHidden();
+  await expect(header.getByText('Finalized', { exact: true })).toBeVisible();
+  await expect(queue).toBeHidden();
+  await expect(page.getByRole('group', { name: 'Finalized' })).toContainText('2');
+});
+
+test('powering a finished migration source VM on in demo mode raises the alert on the next watch; off clears it (ADV-19)', async ({ page }) => {
+  await signIn(page, 'operator');
+  await page.goto('/plans/plan-2d5c8b93');
+  await page.getByRole('region', { name: 'Awaiting finalize' }).getByRole('link', { name: 'web-cache-01' }).click();
+  const step = page.getByRole('region', { name: 'Next step' });
+  await step.getByRole('button', { name: 'Power on the source VM (demo)' }).click();
+  await expect(step.getByRole('button', { name: 'Power off the source VM (demo)' })).toBeVisible();
+  // the in-browser mock watches every second (the API every SEAMLESS_SOURCE_WATCH_S ÷ demo_speed)
+  const alert = page.getByRole('alert', { name: 'Source VM running' });
+  await expect(alert).toContainText('its data diverges from RHOSO: stop it, or roll back.');
+
+  await step.getByRole('button', { name: 'Power off the source VM (demo)' }).click();
+  // migration.source_stopped refreshes the page: no reload
+  await expect(alert).toBeHidden();
+  await expect(step.getByRole('button', { name: 'Power on the source VM (demo)' })).toBeVisible();
+});

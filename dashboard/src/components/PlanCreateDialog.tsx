@@ -61,6 +61,8 @@ interface FormState {
   tcpPorts: string;
   windowsTcpPorts: string;
   autoRollback: boolean;
+  /** Hours a migration may wait in Completed before it is flagged for finalize (SDD §8.1, ADV-19). */
+  finalizeWarningH: string;
   /** Source project -> RHOSO project (SDD §4.3 mappings). */
   projects: string;
   /** Verification (SDD §7.5): where the probes connect, how long they try, what the console must show. */
@@ -85,7 +87,7 @@ const STEP_TIMES = [
 type StepTimeKey = (typeof STEP_TIMES)[number]['key'];
 const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, ''])) as Record<StepTimeKey, string>;
 
-type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
+type FieldKey = 'keepWarm' | 'finalizeReminder' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -120,6 +122,8 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
+    // TODO(ADV-19): confirm 72 h — the owner's open question 14 (the API's default, SDD §4.2)
+    finalizeWarningH: '72',
     projects: '',
     probeAddress: DEFAULT_VERIFICATION.probe_address,
     timeoutMinutes: plain(DEFAULT_VERIFICATION.timeout_s / 60),
@@ -199,6 +203,7 @@ function formFromPlan(plan: Plan): FormState {
     tcpPorts: v.tcp_ports.join(', '),
     windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
     autoRollback: v.auto_rollback,
+    finalizeWarningH: String(plan.finalize_warning_h),
     projects: formatMappings(plan.mappings.projects),
     probeAddress: v.probe_address,
     timeoutMinutes: plain(v.timeout_s / 60),
@@ -376,6 +381,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
     const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
     if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
+    // whole hours, 1 or more, like the API (SDD §4.2)
+    const finalizeWarningH = f.finalizeWarningH.trim() === '' ? Number.NaN : Number(f.finalizeWarningH);
+    if (!Number.isInteger(finalizeWarningH) || finalizeWarningH < 1) e.finalizeReminder = 'Enter the finalize reminder in whole hours (1 or more).';
     const overrides: Record<string, number> = {};
     if (f.scanMiBps.trim()) {
       const scan = Number(f.scanMiBps);
@@ -447,6 +455,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
         keep_warm_interval_s: Math.round(keepWarm * 60),
+        finalize_warning_h: finalizeWarningH,
         // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
         prestage_resources: [...DEFAULT_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isDefaultPrestage(r))],
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
@@ -516,6 +525,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     threshold: id('threshold'),
     passes: id('passes'),
     keepWarm: id('keep-warm'),
+    finalizeReminder: id('finalize-reminder'),
     scan: id('scan'),
     parallel: id('parallel'),
     changeRate: id('changeRate'),
@@ -529,7 +539,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     appProbes: id('app-probes'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
@@ -979,6 +989,18 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   hint="RDP 3389 or WinRM 5985. Windows guests skip the console check."
                 />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
+                <TextField
+                  id={id('finalize-reminder')}
+                  label="Finalize reminder (hours)"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  step={1}
+                  value={form.finalizeWarningH}
+                  onChange={(e) => set('finalizeWarningH', e.target.value)}
+                  error={errors.finalizeReminder}
+                  hint="A verified VM waiting longer than this for finalize is flagged: finalize it or roll it back."
+                />
               </div>
               <ProbeListEditor
                 id={id('app-probes')}

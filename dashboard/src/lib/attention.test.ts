@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration } from '../api/types';
 import { attentionItems } from './attention';
+import { completedSince } from './finalize';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
 
@@ -17,6 +18,34 @@ function scenario() {
 }
 
 describe('attentionItems', () => {
+  it('flags a completed migration whose source VM runs again, and one waiting for finalize past its plan reminder (SDD §8.1, ADV-19)', () => {
+    const { fx, plans, byName } = scenario();
+    const cache = byName('web-cache-01');
+    expect(cache.phase).toBe('completed');
+    expect(NOW - Date.parse(completedSince(cache) ?? '')).toBeGreaterThan(72 * 3_600_000);
+    const find = () => attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === cache);
+    expect(find()).toMatchObject({
+      tone: 'warning',
+      reason: 'Waiting for finalize longer than the plan allows (72 h)',
+      nextAction: 'Finalize or roll it back (approver)',
+      rank: 6,
+    });
+    // the plan sets the reminder; without the plan it is unknown, so nothing is claimed
+    const plan = plans.get(cache.plan_id)!;
+    plan.finalize_warning_h = 24 * 30;
+    expect(find()).toBeUndefined();
+    expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === cache)).toBeUndefined();
+
+    // a source VM running again: its data diverges from RHOSO, plan or not
+    cache.source_running_at = '2026-10-08T11:00:00Z';
+    const running = { tone: 'danger', reason: 'The source VM runs again: its data diverges from RHOSO', nextAction: 'Stop the source VM, or roll it back (operator)', rank: 1 };
+    expect(find()).toMatchObject(running);
+    expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === cache)).toMatchObject(running);
+    // only while it waits in Completed
+    cache.phase = 'finalized';
+    expect(find()).toBeUndefined();
+  });
+
   it('ranks a failed cutover with a stopped source first', () => {
     const { fx, plans } = scenario();
     const items = attentionItems(fx.migrations, plans, NOW);

@@ -17,6 +17,7 @@ import {
   type Migration,
   type Plan,
   type Provider,
+  type PlanFinalizeResult,
   type RecommendationPage,
   type Stats,
   type VMRef,
@@ -1511,5 +1512,81 @@ describe('mock application probes, like the API (SDD §7.5, §9.3, §9.6, ADV-18
       ['9999', 'failed'],
     ]);
     expect(m.error).toContain('app:tcp:9999');
+  });
+});
+
+describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
+
+  it('returns every plan with its derived status and the finalize reminder', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const pilot = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    pilot.status = 'validated';
+    const viewer = as(server, 'viewer');
+    const one = await viewer.get<Plan>(`/plans/${pilot.id}`);
+    expect([one.status, one.derived_status, one.finalize_warning_h]).toEqual(['validated', 'completed', 72]);
+    const all = await viewer.get<Plan[]>('/plans');
+    expect(all.find((p) => p.id === pilot.id)!.derived_status).toBe('completed');
+    expect(all.every((p) => typeof p.derived_status === 'string')).toBe(true);
+    // derived on every answer, never stored: the plan's last VM awaiting finalize is finalized
+    byName(server, 'web-cache-01').phase = 'finalized';
+    expect((await viewer.get<Plan>(`/plans/${pilot.id}`)).derived_status).toBe('finalized');
+    expect((await viewer.get<Plan[]>('/plans')).find((p) => p.id === pilot.id)!.derived_status).toBe('finalized');
+  });
+
+  it('splits completed into awaiting finalize and finalized', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const stats = await as(server, 'viewer').get<Stats>('/stats?plan_id=plan-2d5c8b93');
+    expect([stats.completed, stats.awaiting_finalize, stats.finalized]).toEqual([2, 1, 1]);
+  });
+
+  it('finalizes a wave or the plan with one approval, refusing what the API refuses', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const url = `/plans/${plan.id}/finalize`;
+    await expect(as(server, 'operator').post(url, { wave_id: null, confirm: plan.name })).rejects.toMatchObject({ status: 403 });
+    await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: 'nope' })).rejects.toMatchObject({ status: 400 });
+    await expect(as(server, 'approver').post(url, { wave_id: 'wave-9', confirm: wave.name })).rejects.toMatchObject({ status: 404 });
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(url, { wave_id: wave.id, confirm: wave.name, delete_source: false });
+    expect(out).toEqual({ finalized: [web01.id], skipped: [] });
+    expect(web01.phase).toBe('finalized');
+    const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
+    expect(batch).toMatchObject({ actor: 'sari', plan_id: plan.id, data: { wave_id: wave.id, finalized: ['web-01'], skipped: [] } });
+    await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('powers a fake source VM on and off, and the next watch flags its completed migration', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    const url = `/demo/vms/${cache.vm.source_id}/power`;
+    await expect(as(server, 'viewer').post(url, { state: 'on' })).rejects.toMatchObject({ status: 403 });
+    await expect(as(server, 'operator').post(url, { state: 'sideways' })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'operator').post('/demo/vms/os-nope/power', { state: 'on' })).rejects.toMatchObject({ status: 404 });
+    // a finished migration's source is stopped
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+    const on = await as(server, 'operator').post<VMRef>(url, { state: 'on' });
+    expect(on.power_state).toBe('running');
+    server.tick();
+    expect(cache.source_running_at).not.toBeNull();
+    expect(server.events.filter((e) => e.kind === 'migration.source_running').map((e) => e.migration_id)).toEqual([cache.id]);
+    await as(server, 'operator').post(url, { state: 'off' });
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+    // stopped again: recorded once, so every view drops the alert (SDD §8.1)
+    server.tick();
+    const stopped = server.events.filter((e) => e.kind === 'migration.source_stopped');
+    expect(stopped.map((e) => [e.migration_id, e.data])).toEqual([[cache.id, { power_state: 'stopped' }]]);
+  });
+
+  it('refuses the demo power route outside demo mode, like the API', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    server.health = { ...server.health, demo: false, demo_speed: null };
+    await expect(as(server, 'operator').post(`/demo/vms/${byName(server, 'web-cache-01').vm.source_id}/power`, { state: 'on' })).rejects.toMatchObject({ status: 404 });
   });
 });

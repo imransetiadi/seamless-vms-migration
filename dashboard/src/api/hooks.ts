@@ -33,6 +33,8 @@ import type {
   MigrationListQuery,
   Plan,
   PlanCreate,
+  PlanFinalizeRequest,
+  PlanFinalizeResult,
   PlanPatch,
   PolicyList,
   OverrideRequest,
@@ -49,6 +51,7 @@ import type {
   Stats,
   Strategy,
   ValidationReport,
+  VMRef,
 } from './types';
 
 export const ApiContext = createContext<ApiClient | null>(null);
@@ -480,6 +483,29 @@ export function useMigrationAction(migrationId: string) {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
       invalidateAll(queryClient, [['migrations'], ['stats'], queryKeys.plan(migration.plan_id), ['events']]);
     },
+  });
+}
+
+/** POST /plans/{id}/finalize (SDD §8.1, ADV-19): a wave or the plan, with one approval. */
+export function useFinalizePlan(planId: string) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: PlanFinalizeRequest) => api.post<PlanFinalizeResult>(`/plans/${enc(planId)}/finalize`, body),
+    onSuccess: () => invalidateAll(queryClient, [['migrations'], ['migration'], ['stats'], queryKeys.plan(planId), queryKeys.plans, ['events']]),
+  });
+}
+
+/**
+ * POST /demo/vms/{source_id}/power (demo mode, SDD §8.1): show the source watch's alert. Only the inventory
+ * changes now; the migration changes at the watch's next check, whose event refreshes it.
+ */
+export function useDemoPower() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sourceId, on }: { sourceId: string; on: boolean }) => api.post<VMRef>(`/demo/vms/${enc(sourceId)}/power`, { state: on ? 'on' : 'off' }),
+    onSuccess: () => invalidateAll(queryClient, [['inventory']]),
   });
 }
 

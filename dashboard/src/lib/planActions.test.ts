@@ -8,15 +8,16 @@ const base = fx.plans.find((p) => p.id === 'plan-c81d44a0') as Plan;
 const planWith = (status: PlanStatus): Plan => ({ ...base, status });
 const ready: Migration[] = fx.migrations.filter((m) => m.plan_id === base.id);
 
+// finalize needs a completed migration (and an approver): none of these has one
 const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
-  draft: { validate: true, waves: true, start: false, pause: false, edit: true },
-  validated: { validate: true, waves: true, start: true, pause: false, edit: true },
-  running: { validate: false, waves: false, start: false, pause: true, edit: false },
+  draft: { validate: true, waves: true, start: false, pause: false, edit: true, finalize: false },
+  validated: { validate: true, waves: true, start: true, pause: false, edit: true, finalize: false },
+  running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false },
   // the API plans waves on a paused plan too, returning it to draft (SDD §12)
-  paused: { validate: true, waves: true, start: true, pause: false, edit: false },
-  completed: { validate: false, waves: false, start: false, pause: false, edit: false },
+  paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false },
+  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false },
   // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
-  failed: { validate: true, waves: false, start: true, pause: false, edit: false },
+  failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false },
 };
 
 describe('planActions', () => {
@@ -81,6 +82,24 @@ describe('planActions', () => {
     // a failed migration whose source runs keeps the plan editable: fix the cause, then retry
     const failed = ready.map((m, i) => (i === 0 ? { ...m, phase: 'failed' as const, downtime_started_at: null } : m));
     expect(planActions(planWith('validated'), 'operator', failed).edit.enabled).toBe(true);
+  });
+
+  it('offers Start to no plan whose migrations all ended, whatever its stored status says (SDD §8.1, §16, ADV-19)', () => {
+    const done = ready.map((m) => ({ ...m, phase: 'completed' as const }));
+    // a re-validated finished plan: stored validated, derived completed
+    const finished = { ...planWith('validated'), derived_status: 'completed' as const };
+    expect(planActions(finished, 'operator', done).start).toEqual({ enabled: false, reason: 'The plan has completed: finalize or roll back its VMs.' });
+    const finalized = { ...planWith('completed'), derived_status: 'finalized' as const };
+    expect(planActions(finalized, 'operator', done.map((m) => ({ ...m, phase: 'finalized' as const }))).start.reason).toBe('The plan is finalized.');
+  });
+
+  it('offers Finalize to an approver while a migration awaits finalize (SDD §8.1, ADV-19)', () => {
+    const done = ready.map((m, i) => ({ ...m, phase: i === 0 ? ('completed' as const) : ('finalized' as const) }));
+    const plan = { ...planWith('completed'), derived_status: 'completed' as const };
+    expect(planActions(plan, 'approver', done).finalize).toEqual({ enabled: true, reason: null });
+    expect(planActions(plan, 'operator', done).finalize).toEqual({ enabled: false, reason: 'Requires the approver role.' });
+    const none = done.map((m) => ({ ...m, phase: 'finalized' as const }));
+    expect(planActions(plan, 'approver', none).finalize).toEqual({ enabled: false, reason: 'No VM awaits finalize.' });
   });
 
   it('requires the operator role for every plan action', () => {

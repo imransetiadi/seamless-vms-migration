@@ -38,6 +38,7 @@ import {
   strategySnapshot,
   type StrategyDecision,
 } from './mockData';
+import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 import type {
   AppProbe,
@@ -113,6 +114,8 @@ const SINGLE_SHOT: ReadonlySet<Strategy> = new Set(['cold', 'storage_handover', 
 /** orchestrator.APPROVABLE and CUTOVER_REQUESTABLE (SDD §5.4). */
 const APPROVABLE: ReadonlySet<Phase> = new Set(['pending', 'validating', 'blocked', 'ready', 'precopy', 'syncing', 'awaiting_cutover', 'failed', 'rolled_back']);
 const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+/** A migration in these stopped its source (its cutover did, SDD §8.1). */
+const STOPPED_SOURCE: ReadonlySet<Phase> = new Set(['cutover', 'verifying', 'completed', 'finalized']);
 /** orchestrator.FORCEABLE (SDD §5.4, ADV-16). */
 const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 const SIMPLICITY: Record<Strategy, number> = { cold: 0, storage_handover: 1, warm: 2, vmware_cold: 0, vmware_warm: 1 };
@@ -442,6 +445,8 @@ export class MockServer {
   /** Stored advisor policies (SDD §14.6). */
   readonly policies: AdvisorPolicy[];
   readonly events: Event[];
+  /** Source power states the demo set (POST /demo/vms/…/power, SDD §8.1). */
+  private readonly power = new Map<string, 'running' | 'stopped'>();
   private seq: number;
   private readonly advise: NonNullable<MockServerOptions['advise']>;
   private readonly listeners = new Set<(event: Event) => void>();
@@ -508,6 +513,7 @@ export class MockServer {
 
   /** One simulation step (1 s of demo time). */
   tick(): void {
+    this.watchSources();
     const now = this.now();
     for (const m of this.migrations) {
       const plan = this.plans.find((p) => p.id === m.plan_id);
@@ -1084,27 +1090,13 @@ export class MockServer {
     }
 
     if (root === 'plans') {
-      if (!id) {
-        if (method === 'GET') {
-          this.require(token, 'viewer', path);
-          // SDD §12: status filter and limit/offset paging, like the migrations list
-          const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
-          const offset = Number(query.get('offset') ?? 0);
-          const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
-          return ok(rows.slice(offset, offset + limit));
-        }
-        if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);
-      } else {
-        if (!sub && method === 'GET') {
-          this.require(token, 'viewer', path);
-          return ok(this.plan(id));
-        }
-        if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
-        if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
-        if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
-        if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
-        if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
-      }
+      const res = this.routePlans(method, path, query, input, token, id, sub, subsub);
+      if (res) return this.withDerivedStatus(res);
+    }
+
+    if (root === 'demo' && id === 'vms' && sub && subsub === 'power' && method === 'POST') {
+      this.require(token, 'operator', path);
+      return this.demoPower(sub, input);
     }
 
     if (root === 'migrations') {
@@ -1464,6 +1456,114 @@ export class MockServer {
     if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
   }
 
+  private routePlans(
+    method: string,
+    path: string,
+    query: URLSearchParams,
+    input: Record<string, unknown>,
+    token: string | null,
+    id: string | undefined,
+    sub: string | undefined,
+    subsub: string | undefined,
+  ): MockResponse | null {
+    if (!id) {
+      if (method === 'GET') {
+        this.require(token, 'viewer', path);
+        // SDD §12: status filter and limit/offset paging, like the migrations list
+        const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
+        const offset = Number(query.get('offset') ?? 0);
+        const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+        return ok(rows.slice(offset, offset + limit));
+      }
+      if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);
+      return null;
+    }
+    if (!sub && method === 'GET') {
+      this.require(token, 'viewer', path);
+      return ok(this.plan(id));
+    }
+    if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
+    return null;
+  }
+
+  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19). */
+  private withDerivedStatus(res: MockResponse): MockResponse {
+    const out = (plan: Plan): Plan => ({ ...plan, derived_status: derivePlanStatus(plan, this.migrations) });
+    const isPlan = (value: unknown): value is Plan => typeof value === 'object' && value !== null && 'vm_ids' in value && 'waves' in value;
+    if (Array.isArray(res.body)) return { ...res, body: res.body.map((item: unknown) => (isPlan(item) ? out(item) : item)) };
+    return isPlan(res.body) ? { ...res, body: out(res.body) } : res;
+  }
+
+  /** POST /plans/{id}/finalize (SDD §8.1): every completed migration of a wave or the plan, one approval. */
+  private finalizePlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    const waveId = typeof input.wave_id === 'string' ? input.wave_id : null;
+    const wave = waveId ? plan.waves.find((w) => w.id === waveId) : null;
+    if (waveId && !wave) throw new HttpError(404, 'not_found', `wave '${waveId}' not found`);
+    const name = wave ? wave.name : plan.name;
+    if (input.confirm !== name) throw new HttpError(400, 'bad_request', `confirm must equal the name '${name}'`);
+    const scope = wave ? new Set(wave.vm_ids) : null;
+    const waiting = this.migrations
+      .filter((m) => m.plan_id === plan.id && m.phase === 'completed' && (!scope || scope.has(m.vm.source_id)))
+      .sort((a, b) => a.vm.name.localeCompare(b.vm.name));
+    if (waiting.length === 0) throw new HttpError(409, 'conflict', `no completed migration to finalize in ${name}`);
+    for (const m of waiting) this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
+    this.emit({
+      kind: 'plan.finalized',
+      plan_id: plan.id,
+      migration_id: null,
+      actor: me.name,
+      message: `${name}: ${waiting.length} finalized by ${me.name}`,
+      data: { wave_id: waveId, finalized: waiting.map((m) => m.vm.name), skipped: [] },
+    });
+    return ok({ finalized: waiting.map((m) => m.id), skipped: [] });
+  }
+
+  /** The power state of a source VM: what the demo set, else stopped once its cutover stopped it (SDD §8.1). */
+  sourcePower(sourceId: string): 'running' | 'stopped' {
+    const set = this.power.get(sourceId);
+    if (set) return set;
+    const m = this.migrations.find((x) => x.vm.source_id === sourceId && x.phase !== 'cancelled' && x.phase !== 'rolled_back');
+    if (m && (STOPPED_SOURCE.has(m.phase) || (m.downtime_started_at && !m.downtime_ended_at))) return 'stopped';
+    const vm = Object.values(this.inventories).flatMap((inv) => (Array.isArray(inv) ? inv : [])).find((v) => v.source_id === sourceId);
+    return vm?.power_state === 'running' ? 'running' : 'stopped';
+  }
+
+  /** POST /demo/vms/{source_id}/power (demo mode only, SDD §8.1). */
+  private demoPower(sourceId: string, input: Record<string, unknown>): MockResponse {
+    if (!this.health.demo) throw new HttpError(404, 'not_found', 'no such route outside demo mode');
+    if (input.state !== 'on' && input.state !== 'off') throw new HttpError(422, 'validation_error', "state: Input should be 'on' or 'off'");
+    const vm = Object.values(this.inventories).flatMap((inv) => (Array.isArray(inv) ? inv : [])).find((v) => v.source_id === sourceId);
+    if (!vm) throw new HttpError(404, 'not_found', `source VM '${sourceId}' not found`);
+    this.power.set(sourceId, input.state === 'on' ? 'running' : 'stopped');
+    return ok({ ...vm, power_state: this.sourcePower(sourceId) });
+  }
+
+  /** The source watch (SDD §8.1): a completed migration's source VM seen running is flagged once, and
+   * cleared once seen stopped again; each change is an event. */
+  private watchSources(): void {
+    for (const m of this.migrations) {
+      if (m.phase !== 'completed') continue;
+      const running = this.sourcePower(m.vm.source_id) === 'running';
+      if (running === (m.source_running_at !== null)) continue;
+      m.source_running_at = running ? new Date(this.now()).toISOString() : null;
+      this.emit({
+        kind: running ? 'migration.source_running' : 'migration.source_stopped',
+        plan_id: m.plan_id,
+        migration_id: m.id,
+        actor: 'orchestrator',
+        message: running
+          ? `${m.vm.name}: the source VM runs again - its data diverges from RHOSO; stop it, or roll back`
+          : `${m.vm.name}: the source VM is stopped again`,
+        data: { power_state: running ? 'running' : 'stopped' },
+      });
+    }
+  }
+
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
@@ -1601,6 +1701,7 @@ export class MockServer {
       downtime_model_s: null,
       verification: null,
       suggested_probes: [],
+      source_running_at: null,
       review_required: false,
       review_reason: null,
       destination_server_id: null,
@@ -1926,6 +2027,8 @@ export class MockServer {
       max_downtime_s: values.length ? (values.at(-1) ?? null) : null,
       slo_compliance_pct: downtimes.length ? Math.round((downtimes.filter((m) => (m.actual_downtime_s ?? 0) <= sloOf(m)).length / downtimes.length) * 1000) / 10 : null,
       data_inconsistent: done.filter((m) => m.data_issues.length > 0).length,
+      awaiting_finalize: mine.filter((m) => m.phase === 'completed').length,
+      finalized: mine.filter((m) => m.phase === 'finalized').length,
       downtime_by_strategy: byStrategy,
       throughput_series: series,
     };

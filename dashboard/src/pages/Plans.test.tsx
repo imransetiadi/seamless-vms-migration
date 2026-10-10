@@ -13,6 +13,21 @@ describe('Plans page', () => {
     expect(screen.getByRole('button', { name: /new plan/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('shows each plan with the status its migrations tell, and filters by it (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    plan.status = 'validated'; // a re-validated finished plan
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('link', { name: plan.name })).closest('tr')!;
+    expect(row).toHaveTextContent('Completed');
+    expect(row).not.toHaveTextContent('Validated');
+    await user.selectOptions(screen.getByLabelText(/^status/i), 'completed');
+    expect(screen.getByRole('link', { name: plan.name })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText(/^status/i), 'validated');
+    expect(screen.queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
+  });
+
   it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
@@ -426,6 +441,24 @@ describe('Plans page', () => {
     const summary = await within(dialog).findByRole('alert');
     expect(summary).toHaveTextContent(/keep-warm interval in minutes \(1 or more\)/i);
     expect(within(dialog).getByLabelText(/^keep-warm interval/i)).toHaveAttribute('aria-invalid', 'true');
+  });
+
+  it('refuses a finalize reminder that is not whole hours, 1 or more (SDD §4.2, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const reminder = within(dialog).getByLabelText(/^finalize reminder \(hours\)/i);
+    expect(reminder).toHaveValue(72);
+    for (const value of ['0', '1.5']) {
+      await user.clear(reminder);
+      await user.type(reminder, value);
+      await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+      const summary = await within(dialog).findByRole('alert');
+      expect(summary).toHaveTextContent('Enter the finalize reminder in whole hours (1 or more).');
+      expect(within(dialog).getByLabelText(/^finalize reminder \(hours\)/i)).toHaveAttribute('aria-invalid', 'true');
+    }
   });
 
   it('says a VMware source pre-stages nothing (SDD §7.2)', async () => {

@@ -235,7 +235,7 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
               <Link to={`/plans/${plan.id}`} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">
                 {plan.name}
               </Link>
-              <PlanStatusBadge status={plan.status} />
+              <PlanStatusBadge status={plan.derived_status} />
             </div>
             {migrations && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">
@@ -261,7 +261,7 @@ export default function Overview() {
   const plansById = useMemo(() => new Map(plans.map((p) => [p.id, p])), [plans]);
   const migrations = migrationsQuery.data ?? [];
   const scopedPlans = planId ? plans.filter((p) => p.id === planId) : plans;
-  const activePlans = scopedPlans.filter((p) => p.status !== 'draft');
+  const activePlans = scopedPlans.filter((p) => p.derived_status !== 'draft');
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;
@@ -300,7 +300,7 @@ export default function Overview() {
         statsUnknown ? (
           <MetricStrip
             label="Key metrics"
-            metrics={['Migrations', 'In progress', 'Completed', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
+            metrics={['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
           />
         ) : (
           <Skeleton className="h-[86px]" />
@@ -312,7 +312,9 @@ export default function Overview() {
           metrics={[
             { label: 'Migrations', value: formatNumber(s.total), hint: plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
-            { label: 'Completed', value: formatNumber(s.completed), hint: s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined },
+            // Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19)
+            { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; the source VM is kept' },
+            { label: 'Finalized', value: formatNumber(s.finalized), hint: s.total ? `${formatPct((s.finalized / s.total) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
             {
               label: 'Average downtime',

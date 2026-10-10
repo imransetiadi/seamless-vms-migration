@@ -1,5 +1,8 @@
 """The plan status every view shows (SDD §8.1, ADV-19): derived from the plan and its migrations."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from seamless_migrate.domain.enums import DerivedPlanStatus, Phase
@@ -8,39 +11,18 @@ from tests.factories import make_migration, make_plan
 
 P = Phase
 
-CASES = [
-    # 1. a draft plan is a draft (an edited plan is validated again), whatever its migrations did
-    ("draft", [P.finalized], "draft"),
-    # 2. no migration: the stored status
-    ("validated", [], "validated"),
-    ("running", [], "running"),
-    # 3. a migration at work: running, or paused when the plan is
-    ("running", [P.completed, P.syncing], "running"),
-    ("paused", [P.awaiting_cutover, P.ready], "paused"),
-    ("validated", [P.cutover], "running"),  # re-validated while a cutover still ran
-    ("running", [P.rolling_back], "running"),
-    # 4. a running or paused plan with a migration still to start keeps its status
-    ("running", [P.completed, P.ready], "running"),
-    ("paused", [P.ready, P.failed], "paused"),
-    # 5. a failed migration, nothing at work
-    ("running", [P.completed, P.failed], "failed"),
-    ("validated", [P.failed, P.ready], "failed"),
-    # 6. all done: completed while one awaits finalize, else finalized
-    ("validated", [P.completed] * 12, "completed"),  # the demo's DC2 plan after a re-validation
-    ("completed", [P.completed, P.finalized, P.rolled_back], "completed"),
-    ("completed", [P.finalized, P.rolled_back], "finalized"),
-    ("completed", [P.rolled_back], "completed"),  # nothing migrated: nothing to finalize
-    # cancelled migrations do not count
-    ("completed", [P.finalized, P.cancelled], "finalized"),
-    ("validated", [P.cancelled], "validated"),
-    # 7. otherwise the stored status
-    ("validated", [P.ready, P.blocked], "validated"),
-    ("failed", [P.ready], "failed"),  # pre-staging failed (SDD §8)
+CASES = json.loads((Path(__file__).parent / "fixtures" / "plan_status_cases.json").read_text())[
+    "cases"
 ]
 
 
-@pytest.mark.parametrize(("stored", "phases", "expected"), CASES)
+@pytest.mark.parametrize(
+    ("stored", "phases", "expected"),
+    [(c["stored"], [Phase(p) for p in c["phases"]], c["expected"]) for c in CASES],
+    ids=[f"{c['stored']}-{'+'.join(sorted(set(c['phases']))) or 'none'}" for c in CASES],
+)
 def test_the_plan_status_follows_its_migrations(stored, phases, expected):
+    """One case table for the control plane and the dashboard's mock (SDD §8.1)."""
     plan = make_plan(status=stored)
     migrations = [
         make_migration(id=f"mig-{i:010x}", plan_id=plan.id, phase=phase)
@@ -50,7 +32,7 @@ def test_the_plan_status_follows_its_migrations(stored, phases, expected):
 
 
 def test_every_derived_status_is_covered():
-    assert {expected for _, _, expected in CASES} == {s.value for s in DerivedPlanStatus}
+    assert {c["expected"] for c in CASES} == {s.value for s in DerivedPlanStatus}
 
 
 def test_only_the_plans_own_migrations_count():

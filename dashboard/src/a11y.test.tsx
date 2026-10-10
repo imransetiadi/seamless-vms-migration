@@ -5,7 +5,7 @@ import axe from 'axe-core';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import App from './App';
 import { ApiClient } from './api/client';
-import { createMockFetch } from './api/mock';
+import { createMockFetch, type MockServer } from './api/mock';
 import { createTestServer } from './test/utils';
 
 /*
@@ -27,6 +27,8 @@ const ROUTES: Array<[string, string]> = [
   ['/advisor/audit', 'Advisor audit'],
   ['/advisor/policies', 'Advisor policies'],
   ['/plans/plan-c81d44a0', 'Shared Ceph handover — analytics'],
+  // a completed plan: Finalize all and the finalize queue (ADV-19)
+  ['/plans/plan-2d5c8b93', 'Pilot — static content'],
   ['/advisor/recommendations/rec-d4e6f8a09001', 'Migration strategy: static-cdn-01'],
   ['/login', 'Sign in'],
 ];
@@ -44,9 +46,10 @@ async function violations(): Promise<Array<{ id: string; impact: string | null |
   }));
 }
 
-function renderAt(path: string, token = 'admin') {
+function renderAt(path: string, token = 'admin', prepare?: (server: MockServer) => void) {
   window.history.pushState({}, '', path);
   const server = createTestServer();
+  prepare?.(server);
   const client = new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   render(<App client={client} queryClient={queryClient} />);
@@ -118,6 +121,27 @@ describe('axe-core: no WCAG violations', () => {
     const group = screen.getByRole('group', { name: /migration actions/i });
     await user.click(within(group).getByRole('button', { name: /finalize/i }));
     await screen.findByRole('alertdialog', { name: /finalize web-01/i });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the bulk finalize dialog of a completed plan (ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/plans/plan-2d5c8b93', 'approver');
+    await screen.findByRole('heading', { level: 1, name: 'Pilot — static content' }, { timeout: 8_000 });
+    await settled();
+    await user.click(within(screen.getByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    await screen.findByRole('alertdialog', { name: 'Finalize 1 VM of Pilot — static content?' });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('a completed migration whose source VM runs again, with the demo power control (ADV-19)', async () => {
+    renderAt('/migrations/mig-d4e6f8a091', 'operator', (server) => {
+      server.migrations.find((m) => m.vm.name === 'web-cache-01')!.source_running_at = '2026-10-08T11:00:00Z';
+    });
+    await screen.findByRole('heading', { level: 1, name: 'web-cache-01' }, { timeout: 8_000 });
+    await settled();
+    await screen.findByRole('alert', { name: 'Source VM running' });
+    await screen.findByRole('button', { name: 'Power off the source VM (demo)' });
     expect(await violations()).toEqual([]);
   }, 30_000);
 

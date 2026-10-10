@@ -1,9 +1,11 @@
 import {
   Activity,
+  BadgeCheck,
   CircleCheck,
   CircleX,
   ClipboardX,
   Gauge,
+  Hourglass,
   Layers,
   ListChecks,
   Pause,
@@ -26,6 +28,7 @@ import { PlanCreateDialog } from '../components/PlanCreateDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
+import { FinalizePlanDialog, FinalizeQueue, type FinalizeScope } from '../components/FinalizeQueue';
 import { FindingGroupsList, type FindingRow } from '../components/FindingsList';
 import { KpiTile } from '../components/KpiTile';
 import { MigrationsTable } from '../components/MigrationsTable';
@@ -37,6 +40,7 @@ import { PlanStatusBadge } from '../components/StatusBadge';
 import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
 import { cn } from '../lib/cn';
+import { finalizeQueue, isOverdue } from '../lib/finalize';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
@@ -225,6 +229,7 @@ export default function PlanDetail() {
   const [editing, setEditing] = useState(false);
   const [clearing, setClearing] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [finalizing, setFinalizing] = useState<FinalizeScope | null>(null);
   // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
   const [announcement, setAnnouncement] = useState('');
   // the header's Validate and Auto-plan waves stay on the page: they take the focus when the empty
@@ -296,6 +301,11 @@ export default function PlanDetail() {
   // what is built from the migrations reads as unknown when they could not be loaded, never as empty (SDD §16)
   const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
   const migrationCount = migrations.data?.length ?? s?.total;
+  // the primary action follows the derived status (SDD §8.1, ADV-19): Start is hidden once it has nothing to
+  // start — while the plan runs (Pause is its action) and once its migrations ended; a Completed plan finalizes
+  const ended = p.derived_status === 'completed' || p.derived_status === 'finalized';
+  const startShown = p.status !== 'running' && !ended;
+  const overdue = finalizeQueue(list).filter((m) => isOverdue(m, p.finalize_warning_h)).length;
 
   return (
     <>
@@ -305,7 +315,7 @@ export default function PlanDetail() {
         description={p.description ?? undefined}
         meta={
           <>
-            <PlanStatusBadge status={p.status} size="md" />
+            <PlanStatusBadge status={p.derived_status} size="md" />
             <code className="text-xs text-muted-foreground">{p.id}</code>
             <span className="text-xs text-muted-foreground">updated {formatRelative(p.updated_at)}</span>
           </>
@@ -328,12 +338,22 @@ export default function PlanDetail() {
             <Button ref={wavesRef} size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
               Auto-plan waves
             </Button>
-            <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
-              {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
-            </Button>
-            <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
-              Pause
-            </Button>
+            {p.derived_status === 'completed' ? (
+              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => setFinalizing({ wave: null })}>
+                Finalize all
+              </Button>
+            ) : (
+              startShown && (
+                <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
+                  {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
+                </Button>
+              )
+            )}
+            {!ended && (
+              <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
+                Pause
+              </Button>
+            )}
           </div>
         }
       />
@@ -357,10 +377,18 @@ export default function PlanDetail() {
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
-      <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
+      <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
         <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
-        <KpiTile label="Completed" value={formatNumber(s?.completed)} icon={CircleCheck} tone="success" />
+        {/* Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19) */}
+        <KpiTile
+          label="Awaiting finalize"
+          value={formatNumber(s?.awaiting_finalize)}
+          icon={Hourglass}
+          tone={overdue > 0 ? 'warning' : 'neutral'}
+          hint={overdue > 0 ? `${overdue} overdue` : undefined}
+        />
+        <KpiTile label="Finalized" value={formatNumber(s?.finalized)} icon={BadgeCheck} tone="success" />
         <KpiTile label="Failed" value={formatNumber(s?.failed)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
         {/* a migration whose numbers do not hold is counted, not measured (SDD §5.5) */}
         <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={[`SLO ${formatDuration(p.downtime_slo_s)}`, leftOutText(s)].filter(Boolean).join('; ')} />
@@ -369,6 +397,7 @@ export default function PlanDetail() {
 
       <div className="flex flex-col gap-4">
         <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
+        <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={setFinalizing} />
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
@@ -456,6 +485,7 @@ export default function PlanDetail() {
           action.reset();
         }}
       />
+      <FinalizePlanDialog plan={p} migrations={list} scope={finalizing} onClose={() => setFinalizing(null)} onDone={setAnnouncement} />
       <ConfirmDialog
         open={confirm === 'pause'}
         title="Pause this plan?"

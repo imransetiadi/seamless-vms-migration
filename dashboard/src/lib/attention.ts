@@ -1,4 +1,5 @@
 import type { Migration, Plan } from '../api/types';
+import { isOverdue } from './finalize';
 import { formatRelative } from './format';
 import type { Tone } from './phase';
 import { isWaveActive } from './waves';
@@ -77,6 +78,15 @@ export function attentionItems(
         nextAction: 'Roll back to restart the source, or retry (operator)',
         rank: 0,
       };
+    } else if (m.phase === 'completed' && m.source_running_at) {
+      // the source watch saw it running again (SDD §8.1): what it writes no longer reaches RHOSO
+      item = {
+        migration: m,
+        tone: 'danger',
+        reason: 'The source VM runs again: its data diverges from RHOSO',
+        nextAction: 'Stop the source VM, or roll it back (operator)',
+        rank: 1,
+      };
     } else if (m.phase === 'failed') {
       item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction: 'Retry, roll back or cancel (operator)', rank: 1 };
     } else if (m.review_required) {
@@ -118,6 +128,15 @@ export function attentionItems(
       };
     } else if (m.phase === 'rolling_back') {
       item = { migration: m, tone: 'info', reason: 'Rolling back — restarting the source VM', nextAction: 'Watch the rollback; retry when fixed', rank: 5 };
+    } else if (m.phase === 'completed' && plan && isOverdue(m, plan.finalize_warning_h, now)) {
+      // past the plan's finalize reminder (SDD §8.1, ADV-19); without its plan the reminder is unknown
+      item = {
+        migration: m,
+        tone: 'warning',
+        reason: `Waiting for finalize longer than the plan allows (${plan.finalize_warning_h} h)`,
+        nextAction: 'Finalize or roll it back (approver)',
+        rank: 6,
+      };
     }
     if (item) items.push(item);
   }

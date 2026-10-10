@@ -18,6 +18,14 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
   });
 
+  it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
+    const { server } = renderWithApp(<Overview />);
+    const awaiting = await screen.findByRole('group', { name: 'Awaiting finalize' });
+    expect(awaiting).toHaveTextContent(String(server.migrations.filter((m) => m.phase === 'completed').length));
+    expect(screen.getByRole('group', { name: 'Finalized' })).toHaveTextContent(String(server.migrations.filter((m) => m.phase === 'finalized').length));
+    expect(screen.queryByRole('group', { name: 'Completed' })).not.toBeInTheDocument();
+  });
+
   it('says how many completed migrations the downtime figures leave out, and why (SDD §5.5, ADV-16)', async () => {
     const server = createTestServer();
     server.migrations.find((m) => m.id === 'mig-3c1a0f9e21')!.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];

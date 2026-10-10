@@ -32,6 +32,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
+import { derivePlanStatus } from './mockPlanStatus';
 import { isDatabase, suggestProbes } from './mockProbes';
 
 export const GiB = 1024 ** 3;
@@ -837,8 +838,11 @@ export function defaultPlanFields(now: number) {
       app_probes: [],
     },
     probe_overrides: {},
+    finalize_warning_h: 72,
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
     waves: [],
+    // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
+    derived_status: 'draft' as const,
     created_at: iso(now),
     updated_at: iso(now),
   };
@@ -1413,6 +1417,7 @@ export function buildFixtures(now: number): Fixtures {
         downtime_model_s: null,
         verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
         suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),
+        source_running_at: null,
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,
@@ -1503,6 +1508,7 @@ export function buildFixtures(now: number): Fixtures {
   });
   emit({ ts: iso(now - 7 * D * 1000 + 600_000), kind: 'memory.lesson_saved', plan_id: 'plan-2d5c8b93', migration_id: 'mig-d4e6f8a091', actor: 'agentmemory', message: 'Lesson saved: warm, <50G, 3 passes, estimate 3m 40s vs actual 3m 08s', data: { type: 'fact' } });
 
+  for (const plan of plans) plan.derived_status = derivePlanStatus(plan, migrations);
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
   return { providers, inventories, plans, migrations, recommendations, snapshots, policies, events };

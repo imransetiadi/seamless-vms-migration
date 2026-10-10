@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react';
-import type { Phase, PlanStatus, ProviderStatus, Severity } from '../api/types';
+import type { DerivedPlanStatus, Phase, ProviderStatus, Severity } from '../api/types';
 import { cn } from '../lib/cn';
 import { phaseMeta, type Tone } from '../lib/phase';
 import { planStatusMeta, providerStatusMeta, severityMeta, TONE_CLASSES } from '../lib/status';
@@ -37,7 +37,7 @@ export function PhaseBadge({ phase, size, className }: { phase: Phase; size?: 's
   return <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} title={meta.description} size={size} className={className} />;
 }
 
-export function PlanStatusBadge({ status, size }: { status: PlanStatus; size?: 'sm' | 'md' }) {
+export function PlanStatusBadge({ status, size }: { status: DerivedPlanStatus; size?: 'sm' | 'md' }) {
   const meta = planStatusMeta(status);
   return <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} size={size} />;
 }

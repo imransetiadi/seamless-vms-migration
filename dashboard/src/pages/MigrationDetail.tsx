@@ -1,4 +1,4 @@
-import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, Power, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
@@ -10,6 +10,7 @@ import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
+import { DemoSourcePower } from '../components/DemoSourcePower';
 import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -77,6 +78,16 @@ function Alerts({ m }: { m: Migration }) {
   const stillStopped = clockOpen && BEFORE_CUTOVER.has(m.phase);
   return (
     <div className="flex flex-col gap-2 empty:hidden">
+      {m.phase === 'completed' && m.source_running_at && (
+        // the source watch saw it running after the cutover (SDD §8.1, ADV-19)
+        <div role="alert" aria-label="Source VM running" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <Power aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="text-foreground">
+            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from RHOSO: stop it,
+            or roll back.
+          </p>
+        </div>
+      )}
       {stillStopped && (
         <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
@@ -609,6 +620,7 @@ export default function MigrationDetail() {
 
         <Panel title="Next step">
           <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} />
+          <DemoSourcePower key={m.id} migration={m} role={role} />
         </Panel>
 
         <section aria-label="Lifecycle" className="card p-4">

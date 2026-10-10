@@ -1,4 +1,6 @@
 import type { Approval, Migration, Phase, Plan, Role } from '../api/types';
+import { completedSince, isOverdue } from './finalize';
+import { formatRelative } from './format';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
@@ -211,8 +213,22 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
       return { text: 'Cutover in progress — the source VM is stopped and the downtime clock is running.', action: null };
     case 'verifying':
       return { text: 'Verifying the destination VM: server state, ports, TCP probes and console.', action: null };
-    case 'completed':
-      return { text: 'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.', action: 'finalize' };
+    case 'completed': {
+      if (m.source_running_at) {
+        // the source watch saw it running (SDD §8.1): finalizing now would keep a diverged source
+        return {
+          text: 'The source VM runs again, so its data diverges from RHOSO. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
+          action: null,
+        };
+      }
+      // its time in the finalize queue, flagged past the plan's reminder (SDD §8.1, ADV-19)
+      const since = completedSince(m);
+      const verified = `Verified on RHOSO${since ? ` ${formatRelative(since, now)}` : ''}.`;
+      if (plan && isOverdue(m, plan.finalize_warning_h, now)) {
+        return { text: `${verified} It has waited in Completed longer than the plan allows (${plan.finalize_warning_h} h): finalize it or roll it back.`, action: 'finalize' };
+      }
+      return { text: `${verified} Next: finalize to clean up the source (approver), or roll back if needed.`, action: 'finalize' };
+    }
     case 'finalized':
       return { text: 'Finalized. The migration is done.', action: null };
     case 'failed':

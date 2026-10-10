@@ -51,6 +51,10 @@ export type Role = (typeof ROLES)[number];
 export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed'] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
+/** The plan status every view shows (SDD §8.1, ADV-19): the lifecycle, told by the plan's migrations. */
+export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed'] as const;
+export type DerivedPlanStatus = (typeof DERIVED_PLAN_STATUSES)[number];
+
 export const SYNC_PASS_KINDS = ['full', 'delta', 'final'] as const;
 export type SyncPassKind = (typeof SYNC_PASS_KINDS)[number];
 
@@ -339,9 +343,13 @@ export interface Plan {
   verification: VerificationConfig;
   /** Per VM (source id): its application probes instead of `verification.app_probes`; [] = none (SDD §7.5). */
   probe_overrides: Record<string, AppProbe[]>;
+  /** Hours a migration may wait in Completed before it is flagged for finalize (SDD §8.1, ADV-19). */
+  finalize_warning_h: number;
   prestage_resources: string[];
   waves: Wave[];
   status: PlanStatus;
+  /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
+  derived_status: DerivedPlanStatus;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -584,6 +592,8 @@ export interface Migration {
   verification: VerificationRecord | null;
   /** The rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan. */
   suggested_probes: AppProbe[];
+  /** Completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19). */
+  source_running_at: Timestamp | null;
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;
@@ -743,7 +753,7 @@ export interface Me {
 }
 
 
-type PlanServerFields = 'id' | 'waves' | 'status' | 'created_at' | 'updated_at';
+type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';
 
 /** Plan fields minus id/waves/status/created_at/updated_at; name, providers and vm_ids required. */
@@ -822,6 +832,19 @@ export interface FinalizeRequest {
   confirm: string;
 }
 
+/** POST /plans/{id}/finalize (SDD §8.1): a wave, or the plan, with one approval. */
+export interface PlanFinalizeRequest {
+  wave_id: string | null;
+  /** The wave's name, or the plan's without `wave_id`. */
+  confirm: string;
+  delete_source: boolean;
+}
+
+export interface PlanFinalizeResult {
+  finalized: string[];
+  skipped: Array<{ migration_id: string; reason: string }>;
+}
+
 export interface StrategyRequest {
   strategy: Strategy;
 }
@@ -857,6 +880,9 @@ export interface Stats {
   slo_compliance_pct: number | null;
   /** Completed migrations whose numbers do not hold, left out of the downtime figures (SDD §5.5). */
   data_inconsistent: number;
+  /** `completed` = these two: verified and waiting, and finalized (SDD §8.1, ADV-19). */
+  awaiting_finalize: number;
+  finalized: number;
   downtime_by_strategy: Partial<Record<Strategy, number>>;
   /** Last 60 one-minute buckets. */
   throughput_series: ThroughputPoint[];

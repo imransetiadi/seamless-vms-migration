@@ -2,7 +2,7 @@ import type { Migration, Phase, Plan, Role } from '../api/types';
 import { hasRole } from './roles';
 import { WAVE_COMPLETE_PHASES } from './waves';
 
-export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit';
+export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit' | 'finalize';
 
 export interface Availability {
   enabled: boolean;
@@ -49,6 +49,9 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
     : [];
 
   const start = (): Availability => {
+    // a plan whose migrations all ended is finished, whatever a re-validation stored (SDD §8.1, ADV-19)
+    if (plan.derived_status === 'completed') return gate(false, 'The plan has completed: finalize or roll back its VMs.');
+    if (plan.derived_status === 'finalized') return gate(false, 'The plan is finalized.');
     switch (status) {
       case 'draft':
         return gate(false, 'Validate the plan first.');
@@ -86,6 +89,12 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
     ),
     start: start(),
     pause: gate(status === 'running', 'Only a running plan can be paused.'),
+    // POST /plans/{id}/finalize (SDD §8.1): an approver, while a VM awaits finalize
+    finalize: !hasRole(role, 'approver')
+      ? { enabled: false, reason: 'Requires the approver role.' }
+      : migrations.some((m) => m.plan_id === plan.id && m.phase === 'completed')
+        ? { enabled: true, reason: null }
+        : { enabled: false, reason: 'No VM awaits finalize.' },
     // PATCH /plans/{id} (SDD §12): only in draft or validated; saving returns the plan to draft
     edit: gate(
       (status === 'draft' || status === 'validated') && !busy,

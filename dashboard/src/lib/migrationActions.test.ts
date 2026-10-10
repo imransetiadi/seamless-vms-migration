@@ -232,6 +232,41 @@ describe('migrationActions rules', () => {
     );
   });
 
+  it('says how long a completed migration has waited, and asks for finalize past the plan reminder (SDD §8.1, ADV-19)', () => {
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const completed = (hoursAgo: number) =>
+      migration('completed', {
+        phase_history: [
+          { from_phase: 'cutover', to_phase: 'verifying', at: new Date(now - (hoursAgo + 1) * 3_600_000).toISOString(), reason: '', actor: 'orchestrator' },
+          { from_phase: 'verifying', to_phase: 'completed', at: new Date(now - hoursAgo * 3_600_000).toISOString(), reason: '', actor: 'orchestrator' },
+        ],
+      });
+    const plan = { ...(fx.plans[0] as Plan), finalize_warning_h: 72 };
+    expect(nextStep(completed(10), plan, now)).toEqual({
+      text: 'Verified on RHOSO 10 h ago. Next: finalize to clean up the source (approver), or roll back if needed.',
+      action: 'finalize',
+    });
+    expect(nextStep(completed(80), plan, now)).toEqual({
+      text: 'Verified on RHOSO 3 d ago. It has waited in Completed longer than the plan allows (72 h): finalize it or roll it back.',
+      action: 'finalize',
+    });
+    // longer than, not as long as; the plan sets the reminder
+    expect(nextStep(completed(72), plan, now).text).not.toMatch(/longer than/);
+    expect(nextStep(completed(80), { ...plan, finalize_warning_h: 96 }, now).text).not.toMatch(/longer than/);
+    expect(nextStep(completed(100), { ...plan, finalize_warning_h: 96 }, now).text).toMatch(/allows \(96 h\)/);
+    // without its plan the reminder is unknown, so nothing is claimed
+    expect(nextStep(completed(80), null, now).text).not.toMatch(/longer than/);
+    // the source runs again: no finalize advice until it is stopped (SDD §8.1)
+    expect(nextStep({ ...completed(80), source_running_at: '2026-10-08T11:00:00Z' }, plan, now)).toEqual({
+      text: 'The source VM runs again, so its data diverges from RHOSO. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
+      action: null,
+    });
+    // no transition into Completed recorded: no time is claimed either
+    expect(nextStep(migration('completed', { phase_history: [] }), plan, now).text).toBe(
+      'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.',
+    );
+  });
+
   it('names the next step', () => {
     expect(nextStep(migration('awaiting_cutover'), null).action).toBe('cutover');
     expect(nextStep(migration('completed'), null).action).toBe('finalize');

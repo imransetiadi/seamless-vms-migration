@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { queryKeys } from '../api/hooks';
 import { STRATEGY_LABELS } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
@@ -460,5 +461,53 @@ describe('MigrationDetail', () => {
     const edit = await within(panel).findByRole('button', { name: 'Edit probes' });
     expect(edit).toHaveAttribute('aria-disabled', 'true');
     expect(edit).toHaveAccessibleDescription('Requires the operator role.');
+  });
+
+  it('alerts while the source VM of a completed migration runs again (SDD §8.1, §16, ADV-19)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    m.source_running_at = '2026-10-08T11:00:00Z';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const alert = await screen.findByRole('alert', { name: 'Source VM running' });
+    expect(alert).toHaveTextContent('The source VM runs again since');
+    expect(alert).toHaveTextContent('its data diverges from RHOSO: stop it, or roll back.');
+    // a viewer sees the demo control, and why it is not theirs
+    const power = await within(screen.getByRole('region', { name: 'Next step' })).findByRole('button', { name: 'Power off the source VM (demo)' });
+    expect(power).toHaveAttribute('aria-disabled', 'true');
+    expect(power).toHaveAccessibleDescription('Requires the operator role.');
+  });
+
+  it('says how long a completed migration has waited, and asks for finalize past the plan reminder (ADV-19)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!; // completed 8 days ago
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const step = await screen.findByRole('region', { name: 'Next step' });
+    await waitFor(() => expect(step).toHaveTextContent('It has waited in Completed longer than the plan allows (72 h): finalize it or roll it back.'));
+  });
+
+  it('lets an operator power the source VM on and off in demo mode, to show the alert (SDD §8.1, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const step = await screen.findByRole('region', { name: 'Next step' });
+    await user.click(await within(step).findByRole('button', { name: 'Power on the source VM (demo)' }));
+    expect(await within(step).findByRole('button', { name: 'Power off the source VM (demo)' })).toBeInTheDocument();
+    expect(server.sourcePower(m.vm.source_id)).toBe('running');
+    // the next source watch flags it
+    server.tick();
+    expect(m.source_running_at).not.toBeNull();
+  });
+
+  it('shows no demo power control outside demo mode', async () => {
+    const server = createTestServer();
+    server.health = { ...server.health, demo: false, demo_speed: null };
+    const m = server.migrations.find((x) => x.vm.name === 'web-cache-01')!;
+    const { queryClient } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const step = await screen.findByRole('region', { name: 'Next step' });
+    await within(step).findByRole('group', { name: /migration actions/i });
+    // once the control plane said it is not in demo mode
+    await waitFor(() => expect(queryClient.getQueryData(queryKeys.health)).toMatchObject({ demo: false }));
+    expect(within(step).queryByRole('button', { name: /source VM \(demo\)/ })).not.toBeInTheDocument();
   });
 });
