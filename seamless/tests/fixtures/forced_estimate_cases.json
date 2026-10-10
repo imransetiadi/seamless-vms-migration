@@ -659,6 +659,140 @@
     "expected_s": 679.6
   },
   {
+    "name": "warm, pre-copy, little data on a big disk: the scan sets the first pass",
+    "vm": {
+      "source_id": "vm-1",
+      "name": "archive-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 2000,
+          "used_gb": 50.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 209715200.0,
+      "disk_bytes": 2147483648000,
+      "used_bytes": 53687091200,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "strategy": "warm",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 1073741824,
+      "max_sync_passes": 5,
+      "estimator_overrides": {}
+    },
+    "observed_scan_bps": null,
+    "last_pass_s": null,
+    "expected_s": 6871.6
+  },
+  {
+    "name": "warm, pre-copy, a calibrated scan rate sets the first pass",
+    "vm": {
+      "source_id": "vm-1",
+      "name": "archive-01",
+      "project": "finance",
+      "flavor": "m1.small",
+      "vcpus": 2,
+      "ram_mb": 4096,
+      "disks": [
+        {
+          "id": "d0",
+          "name": null,
+          "size_gb": 2000,
+          "used_gb": 50.0,
+          "bootable": true,
+          "volume_type": "ceph-ssd",
+          "device": "/dev/vda",
+          "kind": "volume",
+          "multiattach": false,
+          "encrypted": false,
+          "independent": false,
+          "pool": null
+        }
+      ],
+      "nics": [
+        {
+          "network": "app-net",
+          "mac": "fa:16:3e:00:00:01",
+          "fixed_ips": [
+            "10.0.0.5"
+          ],
+          "vnic_type": "normal",
+          "mtu": 1500
+        }
+      ],
+      "power_state": "running",
+      "os_type": "rhel9",
+      "host": null,
+      "tags": {},
+      "flavor_extra_specs": {},
+      "cbt_enabled": null,
+      "snapshot_count": 0,
+      "tools_ok": null,
+      "change_rate_bps": 209715200.0,
+      "disk_bytes": 2147483648000,
+      "used_bytes": 53687091200,
+      "guest_os": {
+        "family": "linux",
+        "distro": "rhel",
+        "version": "9",
+        "label": "RHEL 9",
+        "lifecycle": "current",
+        "v2v": "supported"
+      }
+    },
+    "strategy": "warm",
+    "plan": {
+      "link_bps": 131072000.0,
+      "convergence_threshold_bytes": 1073741824,
+      "max_sync_passes": 5,
+      "estimator_overrides": {}
+    },
+    "observed_scan_bps": 1048576000,
+    "last_pass_s": null,
+    "expected_s": 3594.8
+  },
+  {
     "name": "vmware warm, pre-copy",
     "vm": {
       "source_id": "vm-1",
