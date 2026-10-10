@@ -481,8 +481,9 @@ class Orchestrator:
     # planning actions
     async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> dict[str, list[str]]:
         """The VMs of ``vm_ids`` that migrations of other plans with the same source provider hold
-        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", phase)``
-        once per holder — plans validated before the rule may hold a VM several times."""
+        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", plan-id,
+        phase)`` once per holding plan — plans validated before the rule may hold a VM several
+        times, and plan names need not be unique, so the id tells two plans apart."""
         others = {
             other.id: other
             for other in await self.db.list("plan", Plan)
@@ -493,7 +494,7 @@ class Orchestrator:
         held: dict[str, set[str]] = {}
         for m in await self.db.list("migration", Migration, plan_id=list(others)):
             if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM:
-                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
+                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.plan_id}, {m.phase})'
                 held.setdefault(m.vm.source_id, set()).add(holder)
         return {vm_id: sorted(holders) for vm_id, holders in held.items()}
 
