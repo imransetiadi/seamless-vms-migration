@@ -271,6 +271,43 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it('reopens a completed plan at a retry, and refuses one whose provider is gone, like the API (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'completed';
+    const retried = await client.post<Migration>(`/migrations/${rolled.id}/retry`);
+    expect(retried.phase).toBe('ready');
+    expect(plan.status).toBe('running');
+    const reopened = server.events.filter((e) => e.kind === 'plan.updated' && e.plan_id === plan.id);
+    expect(reopened.at(-1)).toMatchObject({ actor: expect.any(String), data: { status: 'running' }, message: expect.stringContaining(`retry of ${rolled.vm.name}`) });
+
+    // a completed plan's providers may be deleted (SDD §12): the reopened plan would need them
+    const again = setup('operator');
+    const gone = byPhase(again.server, 'rolled_back');
+    const completed = again.server.plans.find((p) => p.id === gone.plan_id)!;
+    completed.status = 'completed';
+    const destination = again.server.providers.findIndex((p) => p.id === completed.destination_provider_id);
+    again.server.providers.splice(destination, 1);
+    await expect(again.client.post(`/migrations/${gone.id}/retry`)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(`provider '${completed.destination_provider_id}' no longer exists`),
+    });
+    expect(completed.status).toBe('completed');
+    expect(again.server.migrations.find((m) => m.id === gone.id)?.phase).toBe('rolled_back');
+  });
+
+  it.each(['draft', 'validated', 'running', 'paused', 'failed'] as const)('leaves a %s plan as it is at a retry, like the API (SDD §5.1)', async (status) => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = status;
+    const before = server.events.length;
+    await client.post(`/migrations/${rolled.id}/retry`);
+    expect(plan.status).toBe(status);
+    expect(server.events.slice(before).filter((e) => e.kind === 'plan.updated')).toEqual([]);
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');

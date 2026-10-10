@@ -1166,8 +1166,16 @@ export class MockServer {
       }
       case 'retry': {
         if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
-        const held = this.heldElsewhere(this.plan(m.plan_id), [m.vm.source_id]);
+        const plan = this.plan(m.plan_id);
+        const held = this.heldElsewhere(plan, [m.vm.source_id]);
         if (held.size) throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: a migration in another plan holds the VM: ${holdersText(held)}; finish, roll back or cancel it there first`);
+        // only a completed plan's providers can be deleted, and the retry reopens such a plan: it needs them (SDD §5.1, §12)
+        for (const [role, id] of [['source', plan.source_provider_id], ['destination', plan.destination_provider_id]] as const) {
+          if (!this.providers.some((p) => p.id === id)) {
+            throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: the plan's ${role} provider '${id}' no longer exists; create a new plan for the VM`);
+          }
+        }
+        const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
         if (!m.downtime_started_at || m.downtime_ended_at) {
@@ -1180,6 +1188,11 @@ export class MockServer {
         m.cutover_requested = false;
         m.force_window = false;
         m.progress_pct = 0;
+        if (reopen) {
+          plan.status = 'running';
+          plan.updated_at = new Date(this.now()).toISOString();
+          this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} reopened: retry of ${m.vm.name}`, data: { status: 'running' } });
+        }
         record('retry requested');
         break;
       }

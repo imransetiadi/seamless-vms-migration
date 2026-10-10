@@ -80,6 +80,23 @@ describe('MigrationActions', () => {
     expect(dialog).toHaveTextContent(/starts over/i);
     // this migration failed with its source stopped: the clock keeps running (SDD §5.2)
     expect(dialog).toHaveTextContent(/still stopped.*downtime clock keeps running/i);
+    expect(dialog).not.toHaveTextContent(/reopens/i);
+  });
+
+  it('says a retry reopens a completed plan, which then runs again (SDD §5.1)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.phase === 'rolled_back') as Migration;
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    plan.status = 'completed';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={'operator' as Role} />, { server, token: 'operator' });
+
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /retry/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`retry ${migration.vm.name}`, 'i') });
+    expect(dialog).toHaveTextContent(/the plan has completed: the retry reopens it, so the new attempt runs/i);
+    await user.click(within(dialog).getByRole('button', { name: /^retry$/i }));
+    await waitFor(() => expect(plan.status).toBe('running'));
   });
 
   it('caps a rollback reason at the API limit of 2000 characters (SDD §12)', async () => {

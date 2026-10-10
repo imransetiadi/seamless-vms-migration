@@ -221,6 +221,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           m.downtime_started_at && !m.downtime_ended_at
             ? ' The source VM is still stopped: its downtime clock keeps running until the next cutover is verified.'
             : ''
+        }${
+          // SDD §5.1: a completed plan is driven no more; the retry returns it to running
+          plan?.status === 'completed' ? ' The plan has completed: the retry reopens it, so the new attempt runs.' : ''
         } Make sure the cause of the failure is fixed.`}
         confirmLabel="Retry"
         onConfirm={() => submit({ action: 'retry' })}
