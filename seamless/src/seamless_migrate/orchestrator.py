@@ -26,12 +26,14 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+from .ai.decision import Advice, decide, default_policy
 from .ai.memory import redact
 from .config import Settings
 from .domain import fsm
 from .domain.enums import (
     SINGLE_SHOT_STRATEGIES,
     WARM_STRATEGIES,
+    DecisionType,
     Phase,
     PlanStatus,
     ProviderRole,
@@ -39,8 +41,12 @@ from .domain.enums import (
     SyncPassKind,
 )
 from .domain.models import (
+    AdvisorModelInfo,
     AdvisorNote,
+    AdvisorRecommendation,
+    AdvisorSubject,
     Approval,
+    Decision,
     Estimate,
     Finding,
     Mappings,
@@ -48,6 +54,7 @@ from .domain.models import (
     PhaseChange,
     Plan,
     Provider,
+    RecommendedOption,
     SyncPass,
     ValidationItem,
     ValidationReport,
@@ -471,24 +478,34 @@ class Orchestrator:
                 for strategy, why in reasons.items()
             ]
             strategy, why = select_strategy(vm, estimates, plan)
-            notes: list[AdvisorNote] = []
             automatic = (
                 plan.default_strategy == "auto" and vm.source_id not in plan.strategy_overrides
             )
+            advice = None
             if self.advisor is not None and automatic:
-                note = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
-                if note is not None:
-                    notes.append(note)
-                    chosen = note.data.get("selected")
-                    match = next((e for e in estimates if e.strategy == chosen), None)
-                    if note.data.get("applied") and match is not None and match.eligible:
-                        strategy, why = match.strategy, f"advisor ({note.source}): {note.summary}"
+                advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
+            decision = None
+            if advice is not None:
+                # SDD §14.4: decide() takes the decision; the engine reads only its final option
+                decision = decide(
+                    advice, default_policy(self.settings), 0, strategy.value, now=self._now()
+                )
+                final = decision.final_option
+                match = next((e for e in estimates if e.strategy == final), None)
+                if match is not None and match.eligible and match.strategy != strategy:
+                    strategy = match.strategy
+                    why = (
+                        f"advisor decision {decision.status}: {final} "
+                        f"(confidence {advice.confidence:.2f})"
+                    )
             migration = existing.get(vm.source_id) or await self._create_migration(
                 plan, vm, strategy, actor
             )
             migration = await self._apply_validation(
-                migration.id, plan, vm, strategy, why, estimates, findings, notes, actor, resolved
+                migration.id, plan, vm, strategy, why, estimates, findings, actor, resolved
             )
+            if advice is not None and decision is not None:
+                await self._record_strategy_recommendation(plan, vm, migration, advice, decision)
             items.append(
                 ValidationItem(
                     migration_id=migration.id,
@@ -560,7 +577,6 @@ class Orchestrator:
         why: str,
         estimates: list[Estimate],
         findings: list[Finding],
-        notes: list[AdvisorNote],
         actor: str,
         resolved: Mappings | None = None,
     ) -> Migration:
@@ -583,8 +599,8 @@ class Orchestrator:
             m.resolved_mappings = resolved or Mappings()
             m.wave_id = wave.id if wave else None
             m.bytes_total = vm.used_bytes
-            # keep one strategy note per validation (the latest)
-            m.advisor_notes = [n for n in m.advisor_notes if n.kind != "strategy"] + notes
+            # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
+            # stay - strategy notes of earlier versions are listed as legacy recommendations
             m.error = None
             # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
             # this validation carries over to the new strategy, findings and estimate
@@ -604,14 +620,50 @@ class Orchestrator:
                 m, v = await self._transition(
                     m, v, P.ready, why, actor, data={"strategy": str(strategy)}
                 )
-        for note in notes:
-            await self._emit(
-                "advisor.strategy",
-                note.summary,
-                migration=m,
-                data={"source": note.source, **note.data},
-            )
         return m
+
+    async def _record_strategy_recommendation(
+        self, plan: Plan, vm: VMRef, migration: Migration, advice: Advice, decision: Decision
+    ) -> AdvisorRecommendation:
+        """Store the strategy recommendation and its decision (SDD §14.4)."""
+        answered = advice.unavailable is None
+        rec = AdvisorRecommendation(
+            created_at=decision.decided_at,
+            decision_type=DecisionType.migration_strategy,
+            subject=AdvisorSubject(kind="vm", id=vm.source_id, name=vm.name),
+            plan_id=plan.id,
+            migration_id=migration.id,
+            provider_id=plan.source_provider_id,
+            model=AdvisorModelInfo(
+                name="jev" if answered else "rules",
+                version=(advice.model_version or "unknown") if answered else "rules",
+            ),
+            recommendation=RecommendedOption(
+                option=advice.option,
+                confidence=advice.confidence,
+                distribution=dict(advice.distribution),
+            ),
+            decision=decision,
+        )
+        await self.db.put("recommendation", rec)
+        confidence = (
+            f"{advice.confidence:.0%}" if advice.confidence is not None else "no confidence"
+        )
+        await self._emit(
+            "advisor.strategy",
+            f"{vm.name}: recommended {advice.option or 'nothing'} ({confidence}); decision "
+            f"{decision.final_option or 'pending'} ({decision.status})",
+            migration=migration,
+            data={
+                "recommendation_id": rec.id,
+                "option": advice.option,
+                "confidence": advice.confidence,
+                "final_option": decision.final_option,
+                "status": str(decision.status),
+                "reason_code": str(decision.reason_code),
+            },
+        )
+        return rec
 
     async def in_flight(self, plan_id: str) -> list[str]:
         """VM names of the plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""

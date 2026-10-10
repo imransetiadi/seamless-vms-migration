@@ -17,6 +17,7 @@ from ..domain.enums import Strategy
 from ..domain.models import AdvisorNote, Estimate, Finding, Plan, VMRef
 from ..planning.selector import advisor_scope, select_strategy
 from ..planning.waves import TIERS, heuristic_tier
+from .decision import Advice
 from .jev import JevClient, JevUnavailable
 from .memory import redact
 
@@ -146,13 +147,12 @@ class Advisor:
         estimates: Sequence[Estimate],
         plan: Plan,
         findings: Sequence[Finding] = (),
-    ) -> AdvisorNote | None:
-        """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when not needed.
-
-        ``note.data["applied"]`` tells the caller whether to switch to ``note.data["selected"]``.
-        """
+    ) -> Advice | None:
+        """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when no advice is
+        needed. Returns the advice - or why Jev gave none; ``decide()`` takes the decision
+        (SDD §14.2, §14.4)."""
         scope = advisor_scope(estimates, plan.selection_policy)
-        if not scope or not self.jev_enabled:
+        if not scope:
             return None
         deterministic, reason = select_strategy(vm, estimates, plan)
         eligible = [e for e in estimates if e.eligible]
@@ -162,12 +162,19 @@ class Advisor:
         ]
         if len(candidates) < 2:
             return None  # nothing to decide: jev_decide needs at least two candidates
-        base_data: dict[str, Any] = {
+        base: dict[str, Any] = {
+            "scope": tuple(s.value for s in scope),
+            "options": tuple(c["id"] for c in candidates),
             "deterministic": deterministic.value,
             "deterministic_reason": reason,
-            "scope": [s.value for s in scope],
-            "candidates": [c["id"] for c in candidates],
         }
+        if not self.jev_enabled:
+            return Advice(
+                option=None,
+                confidence=None,
+                unavailable="Jev is disabled (SEAMLESS_JEV_MODE=off)",
+                **base,
+            )
         assert self.jev is not None
         try:
             response = await self.jev.decide(
@@ -187,54 +194,22 @@ class Advisor:
                 escalate_on_contradiction=True,
             )
         except JevUnavailable as exc:
-            return AdvisorNote(
-                kind="strategy",
-                source="rules",
-                summary=f"Jev unavailable ({exc}); kept the deterministic choice {deterministic}",
-                data={**base_data, "selected": None, "applied": False},
-            )
-
+            return Advice(option=None, confidence=None, unavailable=str(exc), **base)
         rec = response.get("recommendation") or {}
         selected = rec.get("selected")
         confidence = rec.get("confidence")
-        status = rec.get("status") or response.get("status")
-        confident = isinstance(confidence, int | float) and float(confidence) >= (
-            self.settings.jev_min_confidence
-        )
-        in_scope = isinstance(selected, str) and selected in base_data["scope"]
-        applied = bool(
-            in_scope
-            and confident
-            and not rec.get("escaped")
-            and status not in ("escalate", "invalid_response")
-        )
-        if applied:
-            summary = f"Jev recommends {selected} (confidence {confidence:.2f}); applied"
-        elif selected is None or not in_scope:
-            summary = (
-                f"Jev answered {selected or status or 'no selection'}; kept the deterministic "
-                f"choice {deterministic}"
-            )
-        else:
-            summary = (
-                f"Jev suggested {selected} (confidence {confidence}, status {status or 'ok'}); "
-                f"below the bar, kept {deterministic}"
-            )
-        return AdvisorNote(
-            kind="strategy",
-            source="jev",
-            summary=summary,
+        probabilities = rec.get("probabilities") or {}
+        model = response.get("model")
+        return Advice(
+            option=selected if isinstance(selected, str) else None,
             confidence=float(confidence) if isinstance(confidence, int | float) else None,
-            data={
-                **base_data,
-                "selected": selected,
-                "applied": applied,
-                "status": status,
-                "escaped": bool(rec.get("escaped")),
-                "probabilities": rec.get("probabilities") or {},
-                "contradicted_requirements": rec.get("contradicted_requirements") or [],
-                "warnings": response.get("warnings") or [],
+            distribution={
+                k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)
             },
+            status=rec.get("status") or response.get("status"),
+            escaped=bool(rec.get("escaped")),
+            model_version=model if isinstance(model, str) else None,
+            **base,
         )
 
     # -- classification ----------------------------------------------------------------------

@@ -11,8 +11,10 @@ from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.ai.knowledge import KnowledgeService
 from seamless_migrate.ai.memory import MemoryClient
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import Phase, PlanStatus, Strategy
+from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
 from seamless_migrate.domain.models import (
+    AdvisorNote,
+    AdvisorRecommendation,
     CutoverWindow,
     Migration,
     Nic,
@@ -2175,23 +2177,111 @@ async def test_resume_mid_cutover_is_idempotent(tmp_path, store):
     assert kinds.count("migration.downtime_started") == 1
 
 
-async def test_advisor_tie_break_recorded(tmp_path, store):
-    # 1 GiB used on a 4 GiB disk: cold and warm downtimes tie (within 60 s)
-    tie_vm = vm(1, size_gb=4, used_gb=1.0)
+def _tie_advisor(selected: str, confidence: float):
+    """A Jev that answers ``selected`` at ``confidence`` for a VM whose cold and warm tie."""
     jev_settings = Settings(jev_mode="stdio")
     decide = load_fixture("decide")
-    decide["recommendation"].update(selected="warm", confidence=0.9)
+    decide["recommendation"].update(selected=selected, confidence=confidence)
     factory, session = session_factory(fixture_responder({"decide": decide}))
-    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
-    h, plan = await setup(tmp_path, store, [tie_vm], advisor=advisor)
+    return Advisor(JevClient(jev_settings, session_factory=factory), jev_settings), session
+
+
+def _recommendations(store) -> list[AdvisorRecommendation]:
+    return store.list("recommendation", AdvisorRecommendation)
+
+
+async def test_advisor_tie_break_recorded(tmp_path, store):
+    """SDD §14.4: the tie is recorded as a recommendation and its decision; the strategy note of
+    earlier versions is no longer written."""
+    # 1 GiB used on a 4 GiB disk: cold and warm downtimes tie (within 60 s)
+    advisor, session = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
     await h.orch.validate_plan(plan.id, "alice")
     m = await h.by_vm(plan.id, "vm-1")
     assert m.strategy == Strategy.warm
-    [note] = [n for n in m.advisor_notes if n.kind == "strategy"]
-    assert note.source == "jev" and note.data["applied"] is True
-    assert note.data["deterministic"] == "cold"
-    assert "advisor.strategy" in h.kinds()
+    assert [n for n in m.advisor_notes if n.kind == "strategy"] == []
+    [rec] = _recommendations(store)
+    assert (rec.decision_type, rec.migration_id, rec.plan_id, rec.provider_id) == (
+        "migration_strategy",
+        m.id,
+        plan.id,
+        plan.source_provider_id,
+    )
+    assert (rec.subject.kind, rec.subject.id, rec.subject.name) == ("vm", "vm-1", m.vm.name)
+    assert (rec.model.name, rec.model.version) == ("jev", "jev-1.13.0")
+    assert (rec.recommendation.option, rec.recommendation.confidence) == ("warm", 0.9)
+    assert (rec.decision.status, rec.decision.final_option) == (DecisionStatus.auto_applied, "warm")
+    [event] = [e for e in store.events(since_seq=0, limit=1000) if e.kind == "advisor.strategy"]
+    assert event.data == {
+        "recommendation_id": rec.id,
+        "option": "warm",
+        "confidence": 0.9,
+        "final_option": "warm",
+        "status": "auto_applied",
+        "reason_code": "ABOVE_THRESHOLD_AUTO_APPLY",
+    }
     assert session.calls and session.calls[0][0] == "jev_decide"
+
+
+@pytest.mark.parametrize(
+    ("confidence", "status", "first_step"),
+    [
+        (0.57, DecisionStatus.below_threshold, StepName.CUTOVER),
+        (0.9, DecisionStatus.auto_applied, StepName.PRECOPY),
+    ],
+)
+async def test_the_engine_runs_the_decision_not_the_recommendation(
+    tmp_path, store, confidence, status, first_step
+):
+    """SDD §14.4 (ADV-01): Jev recommends warm either way; at 0.57 against the 0.6 threshold the
+    decision keeps the deterministic cold and the migration runs cold (no pre-copy)."""
+    advisor, _ = _tie_advisor("warm", confidence)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    done = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    [rec] = _recommendations(store)
+    assert rec.recommendation.option == "warm" and rec.decision.status == status
+    assert done.strategy == Strategy(rec.decision.final_option)
+    assert [step for m_id, step in h.executor.calls if m_id == mid][0] == first_step
+
+
+async def test_with_jev_off_an_automatic_choice_is_recorded_as_a_rules_fallback(tmp_path, store):
+    """SDD §14.4: Jev off is no outage of the migration - the rules decide, and it is recorded."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, size_gb=4, used_gb=1.0)],
+        advisor=Advisor(None, settings),
+        settings=settings,
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    assert (rec.model.name, rec.recommendation.option) == ("rules", None)
+    assert (rec.decision.status, rec.decision.reason_code) == (
+        DecisionStatus.fallback_rules,
+        ReasonCode.ADVISOR_UNAVAILABLE_FALLBACK,
+    )
+    assert (rec.decision.actor.kind, rec.decision.actor.id) == ("system", "fallback")
+    assert m.strategy == Strategy(rec.decision.final_option) == Strategy.cold
+
+
+async def test_validation_keeps_the_notes_a_migration_already_has(tmp_path, store):
+    """SDD §14.4: strategy notes of earlier versions stay (they are listed as legacy)."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    old = AdvisorNote(kind="strategy", source="jev", summary="Jev recommends warm (0.70); applied")
+    m.advisor_notes = [old]
+    store.put("migration", m)
+    await h.orch.validate_plan(plan.id, "alice")
+    again = await h.migration(m.id)
+    assert again.advisor_notes == [old]
+    assert len(_recommendations(store)) == 2, "each validation adds a recommendation"
 
 
 async def test_similar_incidents_attached_on_failure(tmp_path, store):

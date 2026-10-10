@@ -1,18 +1,21 @@
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 
 from seamless_migrate.ai.advisor import TIER_CLASSES, VERIFICATION_CLAIMS, Advisor
+from seamless_migrate.ai.decision import decide, default_policy
 from seamless_migrate.ai.jev import JevClient
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.enums import Strategy
+from seamless_migrate.domain.enums import DecisionStatus, Strategy
 from seamless_migrate.domain.models import Estimate
 from seamless_migrate.planning.waves import TIERS
 from tests.factories import make_plan, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 
 ON = Settings(jev_mode="stdio")
+NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 
 
 def est(strategy, downtime, eligible=True, slo=1200):
@@ -46,14 +49,20 @@ def advisor_for(overrides=None, settings=ON):
 TIE = [est(Strategy.cold, 1000), est(Strategy.warm, 950), est(Strategy.storage_handover, 2000)]
 
 
+def decision_of(advice, settings=ON):
+    """The decision taken on an advice under the global default policy (SDD §14.4)."""
+    return decide(advice, default_policy(settings), 0, advice.deterministic, now=NOW)
+
+
 async def test_recommend_applies_only_within_tie_set_and_threshold():
     plan = make_plan(downtime_slo_s=1200)
     vm = make_vm()
     advisor, session = advisor_for({"decide": decide_with("warm", 0.7)})
-    note = await advisor.recommend_strategy(vm, TIE, plan)
-    assert note.kind == "strategy" and note.source == "jev" and note.confidence == 0.7
-    assert note.data["applied"] is True and note.data["selected"] == "warm"
-    assert note.data["deterministic"] == "cold" and note.data["scope"] == ["cold", "warm"]
+    advice = await advisor.recommend_strategy(vm, TIE, plan)
+    assert (advice.option, advice.confidence, advice.model_version) == ("warm", 0.7, "jev-1.13.0")
+    assert advice.deterministic == "cold" and list(advice.scope) == ["cold", "warm"]
+    decision = decision_of(advice)
+    assert (decision.status, decision.final_option) == (DecisionStatus.auto_applied, "warm")
     args = session.calls[0][1]
     assert [c["id"] for c in args["candidates"]] == ["cold", "warm", "storage_handover"]
     assert args["requirements"] == [
@@ -62,17 +71,19 @@ async def test_recommend_applies_only_within_tie_set_and_threshold():
     ]
     assert "1200 s" in args["priorities"] and args["escalate_on_contradiction"] is True
 
-    # eligible but outside the tie set -> recorded, not applied
+    # eligible but outside the tie set -> recorded, the rules decide
     advisor, _ = advisor_for({"decide": decide_with("storage_handover", 0.95)})
-    note = await advisor.recommend_strategy(vm, TIE, plan)
-    assert note.data["applied"] is False and note.source == "jev"
+    decision = decision_of(await advisor.recommend_strategy(vm, TIE, plan))
+    assert (decision.status, decision.final_option) == (DecisionStatus.fallback_rules, "cold")
 
     # below SEAMLESS_JEV_MIN_CONFIDENCE (0.6)
     advisor, _ = advisor_for({"decide": decide_with("warm", 0.55)})
-    assert (await advisor.recommend_strategy(vm, TIE, plan)).data["applied"] is False
+    decision = decision_of(await advisor.recommend_strategy(vm, TIE, plan))
+    assert (decision.status, decision.final_option) == (DecisionStatus.below_threshold, "cold")
     strict = Settings(jev_mode="stdio", jev_min_confidence=0.8)
     advisor, _ = advisor_for({"decide": decide_with("warm", 0.7)}, settings=strict)
-    assert (await advisor.recommend_strategy(vm, TIE, plan)).data["applied"] is False
+    advice = await advisor.recommend_strategy(vm, TIE, plan)
+    assert decision_of(advice, strict).status == DecisionStatus.below_threshold
 
     # no tie and the SLO is met: Jev is not consulted at all
     advisor, session = advisor_for()
@@ -87,8 +98,12 @@ async def test_recommend_applies_only_within_tie_set_and_threshold():
         est(Strategy.warm, 1700, slo=600),
         est(Strategy.storage_handover, 640, slo=600),
     ]
-    note = await advisor.recommend_strategy(vm, slow, make_plan(downtime_slo_s=600))
-    assert note.data["applied"] is True and note.data["selected"] == "storage_handover"
+    advice = await advisor.recommend_strategy(vm, slow, make_plan(downtime_slo_s=600))
+    decision = decision_of(advice)
+    assert (decision.status, decision.final_option) == (
+        DecisionStatus.auto_applied,
+        "storage_handover",
+    )
 
 
 async def test_the_advisor_keeps_out_of_the_simplest_meeting_slo_choice():
@@ -111,9 +126,13 @@ async def test_the_advisor_still_picks_under_simplest_meeting_slo_when_nothing_m
         est(Strategy.storage_handover, 640, slo=600),
     ]
     advisor, _ = advisor_for()
-    note = await advisor.recommend_strategy(make_vm(), slow, plan)
-    assert note.data["scope"] == ["cold", "storage_handover", "warm"]
-    assert note.data["applied"] is True and note.data["selected"] == "storage_handover"
+    advice = await advisor.recommend_strategy(make_vm(), slow, plan)
+    assert list(advice.scope) == ["cold", "storage_handover", "warm"]
+    decision = decision_of(advice)
+    assert (decision.status, decision.final_option) == (
+        DecisionStatus.auto_applied,
+        "storage_handover",
+    )
 
 
 @pytest.mark.parametrize(
@@ -128,8 +147,10 @@ async def test_the_advisor_still_picks_under_simplest_meeting_slo_when_nothing_m
 )
 async def test_recommend_ignores_escape_hatch_and_escalate(payload):
     advisor, _ = advisor_for({"decide": payload})
-    note = await advisor.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200))
-    assert note.source == "jev" and note.data["applied"] is False
+    advice = await advisor.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200))
+    assert advice.unavailable is None, "Jev answered: it is not an outage"
+    decision = decision_of(advice)
+    assert (decision.status, decision.final_option) == (DecisionStatus.fallback_rules, "cold")
 
 
 async def test_recommend_never_returns_ineligible():
@@ -139,9 +160,10 @@ async def test_recommend_never_returns_ineligible():
         est(Strategy.storage_handover, 990),
     ]
     advisor, session = advisor_for({"decide": decide_with("warm", 0.99)})
-    note = await advisor.recommend_strategy(make_vm(), estimates, make_plan(downtime_slo_s=1200))
-    assert note.data["applied"] is False
+    advice = await advisor.recommend_strategy(make_vm(), estimates, make_plan(downtime_slo_s=1200))
+    assert decision_of(advice).status == DecisionStatus.fallback_rules
     assert "warm" not in [c["id"] for c in session.calls[0][1]["candidates"]]
+    assert "warm" not in advice.options
 
 
 async def test_recommend_needs_two_candidates():
@@ -154,16 +176,19 @@ async def test_recommend_needs_two_candidates():
 
 
 async def test_recommend_without_jev_is_none_or_rules_note():
+    """SDD §14.4: with Jev off or broken the advice says why, and the rules decide."""
     off = Advisor(None, Settings())
-    assert await off.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200)) is None
+    advice = await off.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200))
+    assert advice.option is None and "disabled" in (advice.unavailable or "")
+    assert decision_of(advice).status == DecisionStatus.fallback_rules
 
     def broken(name, args):
         return RuntimeError("npx: command not found")
 
     factory, _ = session_factory(broken)
     advisor = Advisor(JevClient(ON, session_factory=factory), ON)
-    note = await advisor.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200))
-    assert note.source == "rules" and note.data["applied"] is False
+    advice = await advisor.recommend_strategy(make_vm(), TIE, make_plan(downtime_slo_s=1200))
+    assert advice.unavailable and decision_of(advice).status == DecisionStatus.fallback_rules
 
 
 async def test_classify_review_items_fall_back_to_heuristic():

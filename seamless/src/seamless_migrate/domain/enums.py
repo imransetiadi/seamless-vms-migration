@@ -82,6 +82,34 @@ class SyncPassKind(StrEnum):
     final = "final"
 
 
+class DecisionType(StrEnum):
+    """What an advisor recommendation decides (SDD §14.4)."""
+
+    migration_strategy = "migration_strategy"
+    workload_tier = "workload_tier"
+    verification_review = "verification_review"
+    console_screening = "console_screening"
+
+
+class DecisionStatus(StrEnum):
+    auto_applied = "auto_applied"
+    pending_approval = "pending_approval"
+    approved = "approved"
+    overridden = "overridden"
+    below_threshold = "below_threshold"
+    fallback_rules = "fallback_rules"
+
+
+class ReasonCode(StrEnum):
+    ABOVE_THRESHOLD_AUTO_APPLY = "ABOVE_THRESHOLD_AUTO_APPLY"
+    POLICY_REQUIRES_APPROVAL = "POLICY_REQUIRES_APPROVAL"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    APPROVED_BY_USER = "APPROVED_BY_USER"
+    OVERRIDDEN_BY_USER = "OVERRIDDEN_BY_USER"
+    BELOW_THRESHOLD_DEFAULT_KEPT = "BELOW_THRESHOLD_DEFAULT_KEPT"
+    ADVISOR_UNAVAILABLE_FALLBACK = "ADVISOR_UNAVAILABLE_FALLBACK"
+
+
 #: Strategies considered per source family (SDD §9.2).
 OPENSTACK_STRATEGIES = (Strategy.cold, Strategy.warm, Strategy.storage_handover)
 VMWARE_STRATEGIES = (Strategy.vmware_cold, Strategy.vmware_warm)

@@ -24,7 +24,18 @@ from pydantic import (
 )
 
 from ..guest_os import GuestOS, identify
-from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
+from .enums import (
+    DecisionStatus,
+    DecisionType,
+    Phase,
+    PlanStatus,
+    ProviderKind,
+    ProviderRole,
+    ReasonCode,
+    Severity,
+    Strategy,
+    SyncPassKind,
+)
 
 GIB = 2**30
 #: Fraction of the provisioned size assumed used when a disk does not report usage (SDD §4.2).
@@ -50,6 +61,10 @@ def new_plan_id() -> str:
 
 def new_migration_id() -> str:
     return f"mig-{secrets.token_hex(5)}"
+
+
+def new_recommendation_id() -> str:
+    return f"rec-{secrets.token_hex(6)}"
 
 
 class _Model(BaseModel):
@@ -389,6 +404,64 @@ class AdvisorNote(_Model):
     confidence: float | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
+
+
+class AdvisorActor(_Model):
+    """Who took a decision: ``policy:<id>``, ``user:<name>`` or ``system:fallback`` (SDD §14.4)."""
+
+    kind: Literal["policy", "user", "system"]
+    id: str
+
+
+class AdvisorModelInfo(_Model):
+    name: Literal["jev", "rules"]
+    version: str
+    deployment: Literal["on_prem", "remote", "unknown"] = "unknown"
+    endpoint_host: str | None = None
+
+
+class RecommendedOption(_Model):
+    option: str | None = None
+    #: 0..1 - the only number compared with a threshold (SDD §14.4)
+    confidence: float | None = None
+    #: raw probabilities per option, shown only in Details
+    distribution: dict[str, float] = Field(default_factory=dict)
+
+
+class Decision(_Model):
+    final_option: str | None = None
+    status: DecisionStatus
+    reason_code: ReasonCode
+    reason_text: str | None = None
+    actor: AdvisorActor
+    policy_id: str | None = None
+    threshold_used: float | None = None
+    decided_at: UTCDateTime = Field(default_factory=utcnow)
+
+
+class AdvisorSubject(_Model):
+    kind: Literal["vm", "plan", "wave"]
+    id: str
+    name: str
+
+
+class AdvisorRecommendation(_Model):
+    """A recommendation and the decision taken on it, stored apart (document kind
+    ``recommendation``, SDD §4.2, §14.4). The engine reads only the decision."""
+
+    id: str = Field(default_factory=new_recommendation_id)
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    decision_type: DecisionType
+    subject: AdvisorSubject
+    plan_id: str | None = None
+    migration_id: str | None = None
+    #: the plan's source provider
+    provider_id: str | None = None
+    model: AdvisorModelInfo
+    recommendation: RecommendedOption
+    decision: Decision
+    legacy: bool = False
+    legacy_text: str | None = None
 
 
 class Approval(_Model):

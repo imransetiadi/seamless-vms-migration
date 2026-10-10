@@ -8,11 +8,13 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from .. import __version__
-from ..domain.enums import Role
-from ..domain.models import Migration, Plan
+from ..ai.recommendations import LEGACY_PREFIX, legacy_by_id, listing
+from ..domain.enums import DecisionType, Role
+from ..domain.models import AdvisorRecommendation, Migration, Plan
 from ..metrics import advisor_calls, render_metrics
 from ..security.auth import Principal
 from ..stats import Stats, compute_stats
+from ..store import NotFound
 from .deps import metrics_access, require_role, services
 from .schemas import (
     AdvisorStatus,
@@ -21,6 +23,7 @@ from .schemas import (
     JevStatus,
     Me,
     MemoryStatus,
+    RecommendationPage,
     SimilarIncidentsRequest,
     SimilarIncidentsResponse,
 )
@@ -95,6 +98,48 @@ async def advisor_status(
             await memory.health()
         memory_status = MemoryStatus(**memory.status())
     return AdvisorStatus(jev=jev_status, memory=memory_status)
+
+
+@router.get("/advisor/recommendations", response_model=RecommendationPage)
+async def list_recommendations(
+    request: Request,
+    migration_id: str | None = None,
+    plan_id: str | None = None,
+    decision_type: DecisionType | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    _: Principal = Depends(require_role(Role.viewer)),
+) -> RecommendationPage:
+    """Stored recommendations and legacy strategy notes, newest first (SDD §12, §14.4)."""
+    svc = services(request)
+    items = listing(
+        await svc.all_documents("recommendation", AdvisorRecommendation),
+        await svc.all_documents("migration", Migration),
+        migration_id=migration_id,
+        plan_id=plan_id,
+        decision_type=decision_type,
+    )
+    return RecommendationPage(
+        items=items[offset : offset + limit], total=len(items), offset=offset, limit=limit
+    )
+
+
+@router.get("/advisor/recommendations/{rec_id}", response_model=AdvisorRecommendation)
+async def get_recommendation(
+    rec_id: str, request: Request, _: Principal = Depends(require_role(Role.viewer))
+) -> AdvisorRecommendation:
+    svc = services(request)
+    if rec_id.startswith(LEGACY_PREFIX):
+        migration_id = rec_id.removeprefix(LEGACY_PREFIX).rpartition("-")[0]
+        try:
+            migration = await svc.db.get("migration", migration_id, Migration)
+        except NotFound:
+            raise NotFound("recommendation", rec_id) from None
+        found = legacy_by_id(rec_id, migration)
+        if found is None:
+            raise NotFound("recommendation", rec_id)
+        return found
+    return await svc.db.get("recommendation", rec_id, AdvisorRecommendation)
 
 
 @router.post("/advisor/similar-incidents", response_model=SimilarIncidentsResponse)

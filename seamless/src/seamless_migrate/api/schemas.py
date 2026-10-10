@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.enums import Role, Strategy
-from ..domain.models import PlanCreate, ValidationItem, ValidationReport
+from ..domain.models import AdvisorRecommendation, PlanCreate, ValidationItem, ValidationReport
 from ..stats import Stats, ThroughputPoint
 
 
@@ -92,6 +92,13 @@ class Hit(BaseModel):
 
 class SimilarIncidentsResponse(BaseModel):
     hits: list[Hit]
+
+
+class RecommendationPage(BaseModel):
+    items: list[AdvisorRecommendation]
+    total: int
+    offset: int
+    limit: int
 
 
 class OrchestratorHealth(BaseModel):
