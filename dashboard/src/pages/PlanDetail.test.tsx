@@ -961,6 +961,15 @@ describe('PlanDetail', () => {
     expect(await actionButton(/^edit plan$/i)).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('lists no cancelled migration as waiting for advisor approval, whatever hold it stored (SDD §14.6)', async () => {
+    const server = createTestServer();
+    server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!.phase = 'cancelled';
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'admin', server });
+    // the plan's migrations have loaded
+    expect((await screen.findAllByRole('link', { name: 'analytics-node-1' })).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('region', { name: 'Waiting for advisor approval' })).not.toBeInTheDocument();
+  });
+
   it('lists the migrations waiting for advisor approval and keeps the panel, focused, after the last decision (SDD §14.6, §16, ADV-04)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-c81d44a0', 'admin');

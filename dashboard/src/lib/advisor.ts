@@ -163,6 +163,14 @@ export function nonStrategyNotes<T extends Pick<AdvisorNote, 'kind'>>(notes: T[]
 /** Phases in which a migration's strategy can still change (SDD §14.6). */
 const CHANGEABLE = new Set(['pending', 'blocked', 'ready']);
 
+/**
+ * The recommendation a migration waits on (`advisor_hold`) while it can still take the decision (SDD §14.6): a
+ * cancelled migration takes none, whatever a hold stored before a cancel cleared it says.
+ */
+export function waitingDecision(m: Pick<Migration, 'advisor_hold' | 'phase'>): string | null {
+  return m.advisor_hold && CHANGEABLE.has(m.phase) ? m.advisor_hold : null;
+}
+
 /** Whether a person may decide on `rec` now: the newest recommendation of a migration that has not started (SDD §14.6). */
 export function decidable(rec: AdvisorRecommendation, migration: Migration | undefined, newestId: string | undefined): migration is Migration {
   return !rec.legacy && rec.decision_type === 'migration_strategy' && migration !== undefined && CHANGEABLE.has(migration.phase) && newestId === rec.id;

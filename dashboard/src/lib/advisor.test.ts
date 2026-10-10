@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { REASON_CODES, type AdvisorNote, type AdvisorRecommendation, type Decision, type ReasonCode } from '../api/types';
-import { decisionText, distributionLabel, distributionRows, nonStrategyNotes, optionLabel, recommendedText } from './advisor';
+import { buildFixtures } from '../api/mockData';
+import { decisionText, distributionLabel, distributionRows, nonStrategyNotes, optionLabel, recommendedText, waitingDecision } from './advisor';
 
 const AT = '2026-10-10T08:00:00Z';
 
@@ -174,5 +175,18 @@ describe('advisor recommendation wording (SDD §14.4, §16)', () => {
   it('leaves strategy notes out of note lists: they are listed as recommendations', () => {
     const note = (kind: AdvisorNote['kind']): AdvisorNote => ({ kind, source: 'jev', summary: kind, confidence: null, data: {}, created_at: AT });
     expect(nonStrategyNotes([note('strategy'), note('classification'), note('screen')]).map((n) => n.kind)).toEqual(['classification', 'screen']);
+  });
+});
+
+describe('waitingDecision (SDD §14.6)', () => {
+  it('names the held recommendation only while the migration can take the decision', () => {
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0]!;
+    for (const phase of ['pending', 'blocked', 'ready'] as const) {
+      expect(waitingDecision({ ...base, phase, advisor_hold: 'rec-1' }), phase).toBe('rec-1');
+    }
+    for (const phase of ['cancelled', 'precopy', 'completed', 'failed'] as const) {
+      expect(waitingDecision({ ...base, phase, advisor_hold: 'rec-1' }), phase).toBeNull();
+    }
+    expect(waitingDecision({ ...base, phase: 'ready', advisor_hold: null })).toBeNull();
   });
 });

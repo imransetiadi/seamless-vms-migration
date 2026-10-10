@@ -1285,6 +1285,20 @@ describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
     expect(node.phase).toBe('cutover');
   });
 
+  it('clears the advisor hold of a migration it cancels, like the API (SDD §14.6)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const held = server.migrations.find((m) => m.advisor_hold)!;
+    await as(server, 'operator').post(`/migrations/${held.id}/cancel`, { reason: 'not this one' });
+    expect([held.phase, held.advisor_hold]).toEqual(['cancelled', null]);
+    // and a validation that cancels the migration of a VM that left the plan
+    const other = new MockServer({ now: () => NOW, seed: 1 });
+    const kept = other.migrations.find((m) => m.advisor_hold)!;
+    const plan = other.plans.find((p) => p.id === kept.plan_id)!;
+    plan.vm_ids = plan.vm_ids.filter((id) => id !== kept.vm.source_id);
+    await as(other, 'operator').post(`/plans/${plan.id}/validate`);
+    expect([kept.phase, kept.advisor_hold]).toEqual(['cancelled', null]);
+  });
+
   it('refuses the approval of the approver who forced the cutover, like the API (SDD §5.4)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const warm = byPhase(server, 'syncing');

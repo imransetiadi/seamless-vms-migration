@@ -888,6 +888,8 @@ export class MockServer {
     const from = m.phase;
     m.phase = to;
     m.updated_at = at;
+    // like the API (SDD §14.6): a cancelled migration takes no advisor decision
+    if (to === 'cancelled') m.advisor_hold = null;
     if (to !== 'precopy' && to !== 'syncing' && to !== 'cutover') this.dropRunningPass(m);
     this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason, ...data } });
   }

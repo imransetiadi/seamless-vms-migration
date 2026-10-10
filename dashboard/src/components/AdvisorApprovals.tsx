@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { useRecommendations } from '../api/hooks';
 import { useRole } from '../api/session';
 import { RECOMMENDATION_LIMIT_MAX, type Migration } from '../api/types';
+import { waitingDecision } from '../lib/advisor';
 import { can } from '../lib/roles';
 import { ErrorBanner } from './ErrorBanner';
 import { Panel } from './Panel';
@@ -16,7 +17,7 @@ import { LoadingBlock } from './Skeleton';
  * last decision here the panel stays, saying so, and its heading takes the focus (SDD §16).
  */
 export function AdvisorApprovals({ planId, migrations, onDecided }: { planId: string; migrations: Migration[]; onDecided?: (message: string) => void }) {
-  const held = migrations.filter((m) => m.advisor_hold);
+  const held = migrations.filter((m) => waitingDecision(m));
   const recommendations = useRecommendations({ plan_id: planId, limit: RECOMMENDATION_LIMIT_MAX }, { enabled: held.length > 0 });
   const role = useRole();
   const headingRef = useRef<HTMLSpanElement>(null);

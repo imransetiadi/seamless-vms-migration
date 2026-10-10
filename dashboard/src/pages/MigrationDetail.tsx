@@ -28,7 +28,7 @@ import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
 import { Unavailable } from '../components/Unavailable';
 import { VerificationPanel } from '../components/VerificationPanel';
-import { decidable, nonStrategyNotes, optionLabel } from '../lib/advisor';
+import { decidable, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
 import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
@@ -78,6 +78,8 @@ const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing
 function Alerts({ m }: { m: Migration }) {
   const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
   const sourceStopped = m.phase === 'failed' && clockOpen;
+  // the recommendation the migration waits on, while it can still take it (SDD §14.6)
+  const waiting = waitingDecision(m);
   const stillStopped = clockOpen && BEFORE_CUTOVER.has(m.phase);
   return (
     <div className="flex flex-col gap-2 empty:hidden">
@@ -117,13 +119,13 @@ function Alerts({ m }: { m: Migration }) {
           </p>
         </div>
       )}
-      {m.advisor_hold && (
+      {waiting && (
         <div role="status" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
           <Hourglass aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
           <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Waiting for advisor approval.</strong> The migration starts once a person approves or overrides the
             advisor&apos;s decision.{' '}
-            <Link to={`/advisor/recommendations/${encodeURIComponent(m.advisor_hold)}`} className="underline underline-offset-4">
+            <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className="underline underline-offset-4">
               See the recommendation
             </Link>
           </p>

@@ -31,6 +31,15 @@ describe('pending approvals, both kinds (SDD §16, ADV-20)', () => {
     expect(items.map((i) => i.plan?.id)).toEqual(['plan-4f2a9c1e', 'plan-4f2a9c1e', 'plan-c81d44a0']);
   });
 
+  it('lists an advisor decision only while its migration can still take it: a cancelled one waits for nothing (SDD §14.6)', () => {
+    const { byName, find } = scenario();
+    const held = byName('analytics-node-2');
+    expect(find(held)?.kind).toBe('advisor_decision');
+    // a hold stored before a cancel cleared it (data from before the rule)
+    held.phase = 'cancelled';
+    expect(find(held)).toBeUndefined();
+  });
+
   it("counts only the approvals the gate counts: the requester's own does not (maker-checker, SDD §5.4)", () => {
     const { byName, find } = scenario();
     const billing = byName('app-billing-01');

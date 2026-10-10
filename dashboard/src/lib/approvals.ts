@@ -1,5 +1,5 @@
 import type { DecisionType, Migration, Plan } from '../api/types';
-import { DECISION_TYPE_LABELS } from './advisor';
+import { DECISION_TYPE_LABELS, waitingDecision } from './advisor';
 import { countedApprovals } from './migrationActions';
 import { isWarmStrategy } from './phase';
 import { PERMISSIONS } from './roles';
@@ -62,14 +62,15 @@ export function pendingApprovals(
   const advisor: PendingApproval[] = [];
   for (const m of migrations) {
     const plan = plans.get(m.plan_id);
-    if (m.advisor_hold) {
+    const held = waitingDecision(m);
+    if (held) {
       advisor.push({
         kind: 'advisor_decision',
         migration: m,
         plan,
         decisionType: 'migration_strategy',
         waitsFor: `Approve or override the advisor's decision (${PERMISSIONS['advisor.approve']}); nothing starts before that.`,
-        href: `/advisor/recommendations/${encodeURIComponent(m.advisor_hold)}`,
+        href: `/advisor/recommendations/${encodeURIComponent(held)}`,
       });
     }
     if (plan?.require_approval && atGate(m, plan, migrations) && countedApprovals(m, plan).length === 0) {

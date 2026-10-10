@@ -235,6 +235,15 @@ describe('MigrationDetail', () => {
     expect(await within(advisor).findByText('No advisor recommendations or notes for this migration.')).toBeInTheDocument();
   });
 
+  it('shows no advisor wait on a cancelled migration, whatever hold it stored (SDD §14.6)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!;
+    m.phase = 'cancelled'; // a hold stored before a cancel cleared it
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByRole('heading', { level: 1, name: m.vm.name })).toBeInTheDocument();
+    expect(screen.queryByText(/^Waiting for advisor approval\./)).not.toBeInTheDocument();
+  });
+
   it('shows that the migration waits for advisor approval, to everyone, and the actions only to advisor.approve (SDD §14.6, ADV-04)', async () => {
     const { server } = renderMigration('mig-b2c4d6e871');
     const hold = await screen.findByText(/^Waiting for advisor approval\./);
