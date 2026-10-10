@@ -14,8 +14,8 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
   it('shows the recommendation, its decision and its audit trail', async () => {
     renderRec('rec-d4e6f8a09001');
     const user = userEvent.setup({ delay: null });
-    expect(await screen.findByText('Decision: Cold migration — below threshold, default kept')).toBeInTheDocument();
-    expect(screen.getByText(/^Recommended: Warm migration/)).toHaveTextContent('Recommended: Warm migration · 57% confidence (threshold 60%)');
+    expect(await screen.findByText('Decision: Cold migration — below threshold (57% < 60%), default kept')).toBeInTheDocument();
+    expect(screen.getByText(/^Recommended: Warm migration/)).toHaveTextContent('Recommended: Warm migration · 57% confidence');
     expect(screen.getByRole('link', { name: 'static-cdn-01' })).toHaveAttribute('href', '/migrations/mig-d4e6f8a090');
     await user.click(screen.getByRole('tab', { name: 'Audit' }));
     const audit = screen.getByRole('tabpanel', { name: 'Audit' });
@@ -103,7 +103,7 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
 
   it('offers no action on a recommendation whose migration has started', async () => {
     const { queryClient } = renderWithApp(<RecommendationDetail />, { route: '/advisor/recommendations/rec-d4e6f8a09001', path: '/advisor/recommendations/:recId', token: 'admin' });
-    await screen.findByText('Decision: Cold migration — below threshold, default kept');
+    await screen.findByText('Decision: Cold migration — below threshold (57% < 60%), default kept');
     // absent once the migration and its newest recommendations are loaded, not merely before
     await waitFor(() => expect(queryClient.isFetching()).toBe(0));
     expect(queryClient.getQueryData(['migration', 'mig-d4e6f8a090'])).toMatchObject({ phase: 'finalized' });

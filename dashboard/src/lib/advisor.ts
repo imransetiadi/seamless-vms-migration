@@ -42,10 +42,42 @@ export function distributionLabel(option: string): string {
   return option === 'none' ? 'Other' : (OPTION_LABELS[option] ?? option);
 }
 
-/** The confidence as shown: a whole percent rounded down, so a missed threshold never reads as met. */
-export function formatConfidence(confidence: number): string {
+/** The decimals a threshold needs in percent: 0 for a whole percent, else 1 or 2 (SDD §16). */
+export function thresholdDecimals(threshold: number): number {
+  const pct = threshold * 100;
+  return [0, 1, 2].find((d) => Math.abs(pct * 10 ** d - Math.round(pct * 10 ** d)) < 1e-6) ?? 2;
+}
+
+/** The confidence as shown: rounded down — at the threshold's decimals — so a missed threshold never reads as met. */
+export function formatConfidence(confidence: number, decimals = 0): string {
+  const scale = 10 ** decimals;
   // 0.57 * 100 is 56.99999999999999 in binary floating point
-  return `${Math.floor(confidence * 100 + 1e-9)}%`;
+  return `${(Math.floor(confidence * 100 * scale + 1e-6) / scale).toFixed(decimals)}%`;
+}
+
+/** A threshold as shown: exact, at its own decimals ("60%", "60.5%"). */
+export function formatThreshold(threshold: number): string {
+  return `${(threshold * 100).toFixed(thresholdDecimals(threshold))}%`;
+}
+
+/** Decisions taken against the threshold, and the sign each one's comparison reads (SDD §14.4: decide() compared). */
+const COMPARED: Partial<Record<AdvisorRecommendation['decision']['reason_code'], '<' | '≥'>> = {
+  BELOW_THRESHOLD_DEFAULT_KEPT: '<',
+  ABOVE_THRESHOLD_AUTO_APPLY: '≥',
+  // the evidence check comes after the threshold, so its confidence met it
+  INSUFFICIENT_EVIDENCE: '≥',
+};
+
+/**
+ * " (57% < 60%)" for a decision taken against the threshold, else "" (the review of 10 October 2026, SDD §16).
+ * The sign is the decision's, never the dashboard's own comparison of the numbers.
+ */
+function comparison(rec: AdvisorRecommendation): string {
+  const sign = COMPARED[rec.decision.reason_code];
+  const threshold = rec.decision.threshold_used;
+  const confidence = rec.recommendation.confidence;
+  if (!sign || threshold === null || confidence === null) return '';
+  return ` (${formatConfidence(confidence, thresholdDecimals(threshold))} ${sign} ${formatThreshold(threshold)})`;
 }
 
 export interface RecommendedParts {
@@ -53,7 +85,7 @@ export interface RecommendedParts {
   option: string;
   /** "57%", or null when no confidence was given. */
   confidence: string | null;
-  /** The threshold the decision used ("60%"), or null when it used none. */
+  /** The threshold of a decision a policy took before any comparison ("60%"), or null: the others show it in their comparison. */
   threshold: string | null;
 }
 
@@ -66,8 +98,9 @@ export function recommendedParts(rec: AdvisorRecommendation): RecommendedParts {
   }
   return {
     option: optionLabel(option),
-    confidence: confidence === null ? null : formatConfidence(confidence),
-    threshold: threshold === null ? null : formatPct(threshold * 100, 0),
+    confidence: confidence === null ? null : formatConfidence(confidence, threshold === null ? 0 : thresholdDecimals(threshold)),
+    // every entry with a threshold_used shows it once: in the Decision's comparison, or here (SDD §16)
+    threshold: threshold === null || comparison(rec) ? null : formatThreshold(threshold),
   };
 }
 
@@ -84,15 +117,15 @@ function decisionReason(rec: AdvisorRecommendation): string {
   const d = rec.decision;
   switch (d.reason_code) {
     case 'ABOVE_THRESHOLD_AUTO_APPLY':
-      return d.policy_id ? `applied automatically by policy ${d.policy_id}` : 'applied automatically';
+      return d.policy_id ? `applied automatically by policy ${d.policy_id}${comparison(rec)}` : `applied automatically${comparison(rec)}`;
     case 'BELOW_THRESHOLD_DEFAULT_KEPT':
-      return 'below threshold, default kept';
+      return `below threshold${comparison(rec)}, default kept`;
     case 'ADVISOR_UNAVAILABLE_FALLBACK':
       return rec.model.name === 'rules' ? 'advisor unavailable, decided by rules' : 'no usable recommendation, decided by rules';
     case 'POLICY_REQUIRES_APPROVAL':
       return d.policy_id ? `policy ${d.policy_id} requires approval` : 'the policy requires approval';
     case 'INSUFFICIENT_EVIDENCE':
-      return 'too little evidence to apply it automatically';
+      return `too little evidence to apply it automatically${comparison(rec)}`;
     case 'APPROVED_BY_USER':
       return `approved by ${d.actor.id}`;
     case 'OVERRIDDEN_BY_USER':

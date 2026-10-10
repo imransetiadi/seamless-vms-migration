@@ -11,7 +11,7 @@ import { PageHeader } from '../components/PageHeader';
 import { PolicyDialog } from '../components/PolicyDialog';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
-import { DECISION_TYPE_LABELS, formatConfidence } from '../lib/advisor';
+import { DECISION_TYPE_LABELS, formatThreshold } from '../lib/advisor';
 import { formatDateTime, formatRelative } from '../lib/format';
 import { POLICY_MODE_LABELS } from '../lib/policies';
 import { can } from '../lib/roles';
@@ -77,7 +77,7 @@ function PolicyCard({
           <dt className="text-muted-foreground">Decisions</dt>
           <dd className="min-w-0">{policy.decision_types.length ? policy.decision_types.map((t) => DECISION_TYPE_LABELS[t]).join(', ') : 'Every kind'}</dd>
           <dt className="text-muted-foreground">Threshold</dt>
-          <dd className="num">{formatConfidence(policy.threshold)}</dd>
+          <dd className="num">{formatThreshold(policy.threshold)}</dd>
           <dt className="text-muted-foreground">Minimum evidence</dt>
           <dd className="num">{policy.min_evidence_for_auto_apply}</dd>
           <dt className="text-muted-foreground">Override reason</dt>
@@ -179,7 +179,7 @@ export default function AdvisorPolicies() {
             <EmptyState
               icon={SlidersHorizontal}
               title="No policies yet"
-              description={`The built-in default decides everywhere: the advisor's decision applies on its own from ${formatConfidence(policies.data.default.threshold)} confidence. Add a policy to have a person approve decisions first.`}
+              description={`The built-in default decides everywhere: the advisor's decision applies on its own from ${formatThreshold(policies.data.default.threshold)} confidence. Add a policy to have a person approve decisions first.`}
             />
           )}
           <ul className="grid gap-4 lg:grid-cols-2">

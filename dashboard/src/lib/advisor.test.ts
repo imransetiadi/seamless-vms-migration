@@ -50,43 +50,56 @@ const BY_CODE: Record<ReasonCode, Partial<Decision>> = {
 };
 
 describe('advisor recommendation wording (SDD §14.4, §16)', () => {
-  it('reads a 0.57 recommendation under a 0.60 threshold as Recommended: Warm and Decision: Cold, below threshold', () => {
+  it('reads a 0.57 recommendation under a 0.60 threshold as Recommended: Warm and Decision: Cold, below threshold (57% < 60%)', () => {
     const r = rec();
-    expect(`Recommended: ${recommendedText(r)}`).toBe('Recommended: Warm migration · 57% confidence (threshold 60%)');
-    expect(`Decision: ${decisionText(r)}`).toBe('Decision: Cold migration — below threshold, default kept');
+    expect(`Recommended: ${recommendedText(r)}`).toBe('Recommended: Warm migration · 57% confidence');
+    expect(`Decision: ${decisionText(r)}`).toBe('Decision: Cold migration — below threshold (57% < 60%), default kept');
     expect(`${recommendedText(r)} ${decisionText(r)}`).not.toMatch(/selected/i);
   });
 
-  it('shows the confidence once, as a whole percent, with the threshold the decision used beside it (ADV-03)', () => {
+  it('shows the threshold the decision used once, and the confidence in one format (ADV-03, the review of 10 October)', () => {
     for (const code of REASON_CODES) {
       const r = rec({ confidence: 0.6789 }, { reason_code: code, ...BY_CODE[code] });
       const note = `${recommendedText(r)} ${decisionText(r)}`;
-      expect(note.match(/67%/g) ?? [], code).toHaveLength(1);
+      expect(note.match(/60%/g) ?? [], code).toHaveLength(r.decision.threshold_used !== null ? 1 : 0);
+      expect(note, code).toMatch(/67%/);
       expect(note, code).not.toMatch(/0\.67|67\.\d/);
-      expect(note.includes('(threshold 60%)'), code).toBe(r.decision.threshold_used !== null);
     }
   });
 
   it.each(REASON_CODES.map((code) => [code] as const))('words the reason code %s from the decision, never as the bare code', (code) => {
-    const text = decisionText(rec({}, { reason_code: code, ...BY_CODE[code] }));
+    const text = decisionText(rec({ confidence: 0.83 }, { reason_code: code, ...BY_CODE[code] }));
     expect(text).toMatch(/ — \S/);
     expect(text).not.toContain(code);
-    expect(text).not.toMatch(/selected|undefined|null|\d+%/i);
+    expect(text).not.toMatch(/selected|undefined|null/i);
+    // numbers only in the comparison a decision taken against the threshold ends with
+    const compared = ['BELOW_THRESHOLD_DEFAULT_KEPT', 'ABOVE_THRESHOLD_AUTO_APPLY', 'INSUFFICIENT_EVIDENCE'].includes(code);
+    expect(/\(\d+% [<≥] \d+%\)/.test(text), code).toBe(compared);
   });
 
-  it('words every decision as decide() took it: it never compares the confidence with the threshold itself', () => {
+  it("takes the comparison's sign from the decision: the dashboard compares nothing itself", () => {
     // a contradiction only decide() could resolve: the dashboard repeats the decision, whatever the numbers say
     const kept = rec({ confidence: 0.91 }, { status: 'below_threshold', reason_code: 'BELOW_THRESHOLD_DEFAULT_KEPT', final_option: 'cold' });
-    expect(decisionText(kept)).toBe('Cold migration — below threshold, default kept');
+    expect(decisionText(kept)).toBe('Cold migration — below threshold (91% < 60%), default kept');
     const applied = rec({ confidence: 0.31 }, { status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', final_option: 'warm' });
-    expect(decisionText(applied)).toBe('Warm migration — applied automatically by policy global-default');
+    expect(decisionText(applied)).toBe('Warm migration — applied automatically by policy global-default (31% ≥ 60%)');
   });
 
   it('rounds the confidence down, so a missed threshold never reads as met', () => {
-    expect(recommendedText(rec({ confidence: 0.595 }))).toBe('Warm migration · 59% confidence (threshold 60%)');
+    expect(recommendedText(rec({ confidence: 0.595 }))).toBe('Warm migration · 59% confidence');
+    expect(decisionText(rec({ confidence: 0.595 }))).toBe('Cold migration — below threshold (59% < 60%), default kept');
     // 0.57 * 100 is 56.99999999999999 in binary floating point
-    expect(recommendedText(rec({ confidence: 0.57 }))).toBe('Warm migration · 57% confidence (threshold 60%)');
-    expect(recommendedText(rec({ confidence: 0.6 }, { status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY' }))).toBe('Warm migration · 60% confidence (threshold 60%)');
+    expect(recommendedText(rec({ confidence: 0.57 }))).toBe('Warm migration · 57% confidence');
+    const exact = rec({ confidence: 0.6 }, { status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', final_option: 'warm' });
+    expect(decisionText(exact)).toBe('Warm migration — applied automatically by policy global-default (60% ≥ 60%)');
+  });
+
+  it('shows both numbers at the decimals of a threshold that is not a whole percent, so the sign always holds', () => {
+    const above = rec({ confidence: 0.6051 }, { status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', final_option: 'warm', threshold_used: 0.605 });
+    expect(recommendedText(above)).toBe('Warm migration · 60.5% confidence');
+    expect(decisionText(above)).toBe('Warm migration — applied automatically by policy global-default (60.5% ≥ 60.5%)');
+    const below = rec({ confidence: 0.6049 }, { threshold_used: 0.605 });
+    expect(decisionText(below)).toBe('Cold migration — below threshold (60.4% < 60.5%), default kept');
   });
 
   it('says who decided when a person did', () => {
@@ -94,9 +107,13 @@ describe('advisor recommendation wording (SDD §14.4, §16)', () => {
     expect(decisionText(rec({}, { reason_code: 'OVERRIDDEN_BY_USER', ...BY_CODE.OVERRIDDEN_BY_USER }))).toBe('Cold migration — overridden by bayu');
   });
 
-  it('says a pending decision is waiting for approval, and why', () => {
-    expect(decisionText(rec({}, { reason_code: 'POLICY_REQUIRES_APPROVAL', ...BY_CODE.POLICY_REQUIRES_APPROVAL }))).toBe('Waiting for approval — policy finance requires approval');
-    expect(decisionText(rec({}, { reason_code: 'INSUFFICIENT_EVIDENCE', ...BY_CODE.INSUFFICIENT_EVIDENCE }))).toBe('Waiting for approval — too little evidence to apply it automatically');
+  it('says a pending decision is waiting for approval, and why; a policy that asks first shows its threshold on the Recommended line', () => {
+    const asked = rec({}, { reason_code: 'POLICY_REQUIRES_APPROVAL', ...BY_CODE.POLICY_REQUIRES_APPROVAL });
+    expect(decisionText(asked)).toBe('Waiting for approval — policy finance requires approval');
+    expect(recommendedText(asked)).toBe('Warm migration · 57% confidence (threshold 60%)');
+    const thin = rec({ confidence: 0.83 }, { reason_code: 'INSUFFICIENT_EVIDENCE', ...BY_CODE.INSUFFICIENT_EVIDENCE });
+    expect(decisionText(thin)).toBe('Waiting for approval — too little evidence to apply it automatically (83% ≥ 60%)');
+    expect(recommendedText(thin)).toBe('Warm migration · 83% confidence');
   });
 
   it('tells a fallback without an answer from one whose answer was unusable', () => {
