@@ -417,7 +417,9 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   → completed`.
 * **Downtime clock:** `downtime_started_at` is set when the executor stops the source VM
   (`StepContext.mark_downtime_start()`), `downtime_ended_at` when verification passes or, on
-  rollback, when the source VM is running again. `actual_downtime_s` = difference — except in demo mode (§7.4),
+  rollback, when the source VM is running again. A verification that passes again — the first one was saved,
+  but a stop or a failed event write came before `completed` — keeps the end and the downtime the first one
+  recorded: the outage ended then. `actual_downtime_s` = difference — except in demo mode (§7.4),
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
   with its estimate and with the clock that ran before it (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED`
   would multiply the control plane's own overhead too): each simulated step reports the model seconds it kept the
