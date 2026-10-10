@@ -83,6 +83,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const tableRef = useRef<HTMLTableElement>(null);
   const selectable = Boolean(selected && onSelectedChange);
 
   const rows = useMemo<Row[]>(
@@ -269,7 +270,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
         />
       ) : (
         <div className="table-wrap rounded-lg border border-border">
-          <table className="data-table">
+          <table ref={tableRef} tabIndex={-1} className="data-table outline-hidden">
             <caption className="sr-only">{caption}</caption>
             <thead>
               <tr>
@@ -359,7 +360,15 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
 
       {sorted.length > visible.length && (
         <div>
-          <Button onClick={() => setLimit((n) => n + pageSize)}>Show {Math.min(pageSize, sorted.length - visible.length)} more</Button>
+          <Button
+            onClick={() => {
+              // the last page removes this button: focus moves to the table, never to the page (SDD §16)
+              if (sorted.length <= limit + pageSize) tableRef.current?.focus();
+              setLimit((n) => n + pageSize);
+            }}
+          >
+            Show {Math.min(pageSize, sorted.length - visible.length)} more
+          </Button>
         </div>
       )}
     </div>

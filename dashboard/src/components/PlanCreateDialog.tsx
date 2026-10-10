@@ -320,8 +320,11 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     setPendingVm('');
     setPendingStrategy('');
   };
-  const removeOverride = (vmId: string) =>
+  const removeOverride = (vmId: string) => {
     setForm((f) => ({ ...f, overrides: Object.fromEntries(Object.entries(f.overrides).filter(([key]) => key !== vmId)) }));
+    // the row and its Remove button go: focus moves to the section, never to the page (SDD §16)
+    document.getElementById(id('overrides'))?.focus();
+  };
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
 
   // storage handover (SDD §7.3, §7.3.1): one RHOSO backend per volume type of the selected VMs
@@ -725,7 +728,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
               />
             </div>
             <fieldset className="flex min-w-0 flex-col gap-2">
-              <legend className="mb-1 text-sm font-medium text-foreground">Per-VM strategy</legend>
+              <legend id={id('overrides')} tabIndex={-1} className="mb-1 text-sm font-medium text-foreground outline-hidden">
+                Per-VM strategy
+              </legend>
               <p className="field-hint mt-0">
                 Overrides the default for one VM. An override that is not eligible for the VM is ignored at validation, and the
                 migration says why.

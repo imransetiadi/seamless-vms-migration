@@ -116,6 +116,8 @@ describe('PlanDetail', () => {
     await user.click(within(panel).getByRole('button', { name: /^validate$/i }));
     expect(await within(panel).findByRole('table', { name: /migrations in fresh wave/i })).toBeInTheDocument();
     expect(server.migrations.filter((m) => m.plan_id === plan.id)).toHaveLength(2);
+    // the empty table's Validate is gone with it: focus moves to the plan's Validate, never to the page (SDD §16)
+    expect(await actionButton(/^validate$/i)).toHaveFocus();
     await waitFor(() => expect(findings).not.toHaveTextContent(/pre-flight runs when the plan is validated/i));
   });
 
@@ -370,6 +372,19 @@ describe('PlanDetail', () => {
     expect(await screen.findByText(message)).toHaveAttribute('role', 'status');
   });
 
+  it('returns focus to the header Auto-plan waves when the empty waves board it was opened from goes (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-0e9f6a17');
+    const waves = await screen.findByRole('region', { name: /^waves$/i });
+    await user.click(within(waves).getByRole('button', { name: /auto-plan waves/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /auto-plan waves/i });
+    await user.click(within(dialog).getByRole('button', { name: /^plan waves$/i }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+    await within(waves).findByText('Pilot');
+    expect(within(waves).queryByRole('button', { name: /auto-plan waves/i })).not.toBeInTheDocument();
+    expect(await actionButton(/auto-plan waves/i)).toHaveFocus();
+  });
+
   it('announces how many waves were planned (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-0e9f6a17');
@@ -609,6 +624,8 @@ describe('PlanDetail', () => {
     const overrides = within(dialog).getByRole('group', { name: /per-vm strategy/i });
     expect(await within(overrides).findByLabelText(new RegExp(`^strategy for ${vmName}$`, 'i'))).toHaveValue('warm');
     await user.click(within(overrides).getByRole('button', { name: new RegExp(`^remove the override for ${vmName}$`, 'i') }));
+    // the removed row's button is gone: focus moves to its section, never to the page (SDD §16)
+    expect(within(overrides).getByText('Per-VM strategy', { selector: 'legend' })).toHaveFocus();
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());

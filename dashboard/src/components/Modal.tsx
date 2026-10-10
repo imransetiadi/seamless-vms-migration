@@ -18,6 +18,11 @@ export interface ModalProps {
   /** `alertdialog` for confirmations of consequential actions. */
   role?: 'dialog' | 'alertdialog';
   initialFocusRef?: RefObject<HTMLElement>;
+  /**
+   * Where focus goes on close instead of the control that opened the dialog, when that control may
+   * be gone by then (an empty state the action replaces): focus never drops to the page (SDD §16).
+   */
+  returnFocusRef?: RefObject<HTMLElement>;
   /** When false, Escape does nothing (e.g. while a request is in flight). */
   dismissible?: boolean;
   size?: 'md' | 'lg';
@@ -35,6 +40,7 @@ export function Modal({
   describedBy,
   role = 'dialog',
   initialFocusRef,
+  returnFocusRef,
   dismissible = true,
   size = 'md',
   children,
@@ -51,13 +57,15 @@ export function Modal({
 
     const target = initialFocusRef?.current ?? focusables(panelRef.current)[0] ?? panelRef.current;
     target?.focus();
+    // read at close on purpose: the element the ref points to then takes the focus
+    const returnTo = returnFocusRef;
 
     return () => {
       appRoot?.removeAttribute('inert');
       document.body.style.overflow = previousOverflow;
-      previouslyFocused?.focus();
+      (returnTo?.current ?? previouslyFocused)?.focus();
     };
-    // Focus management runs once per opening; initialFocusRef is a stable ref object.
+    // Focus management runs once per opening; initialFocusRef and returnFocusRef are stable ref objects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 

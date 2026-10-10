@@ -154,6 +154,25 @@ describe('Events page', () => {
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
   });
 
+  it('moves focus to the list when its last Show older events button goes, never to the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 250; i++) {
+      server.emit({ kind: 'plan.updated', plan_id: 'plan-4f2a9c1e', migration_id: null, actor: 'rina', message: `bulk change ${i}`, data: {} });
+    }
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText('bulk change 249');
+    let clicks = 0;
+    for (let more = screen.queryByRole('button', { name: /show \d+ older events/i }); more; more = screen.queryByRole('button', { name: /show \d+ older events/i })) {
+      await user.click(more);
+      clicks += 1;
+      // while the button stays, it keeps the focus; once it goes, the list takes it
+      expect(screen.queryByRole('button', { name: /show \d+ older events/i }) ?? list).toHaveFocus();
+    }
+    expect(clicks).toBeGreaterThan(1);
+  });
+
   it('downloads only the events shown, not the older ones behind Show older events (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

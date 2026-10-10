@@ -146,6 +146,21 @@ describe('VmTable', () => {
     expect(screen.getByRole('checkbox', { name: 'Select all 3 matching VMs, 2 shown' })).toBeInTheDocument();
   });
 
+  it('moves focus to the table when its last Show more button goes, never to the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" pageSize={2} />);
+    let clicks = 0;
+    for (let more = screen.queryByRole('button', { name: /^show \d+ more$/i }); more; more = screen.queryByRole('button', { name: /^show \d+ more$/i })) {
+      await user.click(more);
+      clicks += 1;
+      const still = screen.queryByRole('button', { name: /^show \d+ more$/i });
+      // while the button stays, it keeps the focus; once it goes, the table takes it
+      expect(still ?? screen.getByRole('table')).toHaveFocus();
+    }
+    expect(clicks).toBeGreaterThan(1);
+    expect(bodyRows()).toHaveLength(openstackVms.length);
+  });
+
   it('names each guest OS, flags legacy releases and filters by OS', async () => {
     const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);

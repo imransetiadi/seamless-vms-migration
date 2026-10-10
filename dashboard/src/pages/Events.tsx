@@ -111,6 +111,7 @@ export default function Events() {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState(PAGE);
   const counter = useRef(0);
+  const listRef = useRef<HTMLOListElement>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const progressRef = useRef(showProgress);
@@ -287,7 +288,7 @@ export default function Events() {
       )}
 
       {filtered.length > 0 && (
-        <ol aria-label="Events, newest first" className="card divide-y divide-border">
+        <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
           {filtered.slice(0, limit).map(({ key, event }) => {
             const meta = kindMeta(event.kind);
             return (
@@ -324,7 +325,15 @@ export default function Events() {
       )}
       {filtered.length > limit && (
         <div className="mt-3">
-          <Button onClick={() => setLimit((n) => n + PAGE)}>Show {Math.min(PAGE, filtered.length - limit)} older events</Button>
+          <Button
+            onClick={() => {
+              // the last page removes this button: focus moves to the list, never to the page (SDD §16)
+              if (filtered.length <= limit + PAGE) listRef.current?.focus();
+              setLimit((n) => n + PAGE);
+            }}
+          >
+            Show {Math.min(PAGE, filtered.length - limit)} older events
+          </Button>
         </div>
       )}
     </>

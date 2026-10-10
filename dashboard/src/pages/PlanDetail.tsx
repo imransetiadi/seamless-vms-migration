@@ -13,7 +13,7 @@ import {
   Timer,
   TriangleAlert,
 } from 'lucide-react';
-import { useId, useMemo, useState, type ReactNode } from 'react';
+import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
 import { useMigrations, usePlan, usePlanAction, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
@@ -218,6 +218,11 @@ export default function PlanDetail() {
   const [checking, setChecking] = useState(false);
   // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
   const [announcement, setAnnouncement] = useState('');
+  // the header's Validate and Auto-plan waves stay on the page: they take the focus when the empty
+  // state an action was started from goes away with it (SDD §16)
+  const validateRef = useRef<HTMLButtonElement>(null);
+  const wavesRef = useRef<HTMLButtonElement>(null);
+  const emptyValidateRef = useRef<HTMLButtonElement>(null);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
@@ -251,7 +256,11 @@ export default function PlanDetail() {
         after?.(result);
       },
     });
-  const validate = () => run({ action: 'validate' }, (r) => setReport(r as ValidationReport));
+  const validate = () =>
+    run({ action: 'validate' }, (r) => {
+      setReport(r as ValidationReport);
+      if (document.activeElement === emptyValidateRef.current) validateRef.current?.focus();
+    });
   // a re-validation clears the approvals and cutover requests of migrations that have not started (SDD §5.4):
   // count them on the server at the click, as a list loaded before an approval would hide it; ask anyway
   // when they cannot be counted
@@ -298,6 +307,7 @@ export default function PlanDetail() {
               Edit plan
             </Button>
             <Button
+              ref={validateRef}
               size="lg"
               icon={ListChecks}
               loading={pending('validate') || checking}
@@ -306,7 +316,7 @@ export default function PlanDetail() {
             >
               Validate
             </Button>
-            <Button size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
+            <Button ref={wavesRef} size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
               Auto-plan waves
             </Button>
             <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
@@ -374,7 +384,13 @@ export default function PlanDetail() {
               caption={`Migrations in ${p.name}`}
               emptyDescription="Validation creates one migration per VM and runs the pre-flight checks."
               emptyAction={
-                <Button icon={ListChecks} loading={pending('validate') || checking} disabledReason={actions.validate.reason} onClick={() => void askOrValidate()}>
+                <Button
+                  ref={emptyValidateRef}
+                  icon={ListChecks}
+                  loading={pending('validate') || checking}
+                  disabledReason={actions.validate.reason}
+                  onClick={() => void askOrValidate()}
+                >
                   Validate
                 </Button>
               }
@@ -442,6 +458,7 @@ export default function PlanDetail() {
       />
       <ConfirmDialog
         open={confirm === 'validate'}
+        returnFocusRef={validateRef}
         title="Validate this plan again?"
         description={`Validating again clears ${clearing ?? 'nothing'} of the migrations that have not started: approvers approve them again after the new assessment.`}
         confirmLabel="Validate and clear"
@@ -455,6 +472,7 @@ export default function PlanDetail() {
       />
       <ConfirmDialog
         open={confirm === 'waves'}
+        returnFocusRef={wavesRef}
         title={p.waves.length ? 'Replace the waves?' : 'Auto-plan waves?'}
         description="Builds a pilot wave of up to three low-risk VMs, then orders the rest by workload tier and disk size; VMs sharing an app tag stay together. The plan returns to draft: validate it again before starting, which clears approvals and cutover requests."
         confirmLabel="Plan waves"

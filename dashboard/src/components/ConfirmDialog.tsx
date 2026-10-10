@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
 import { ErrorBanner } from './ErrorBanner';
 import { Button } from './Button';
 import { Modal } from './Modal';
@@ -20,6 +20,8 @@ export interface ConfirmDialogProps {
   confirmReason?: string;
   pending?: boolean;
   error?: unknown;
+  /** Where focus goes on close when the control that opened the dialog may be gone (SDD §16). */
+  returnFocusRef?: RefObject<HTMLElement>;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -38,6 +40,7 @@ export function ConfirmDialog({
   confirmReason,
   pending = false,
   error,
+  returnFocusRef,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -83,6 +86,7 @@ export function ConfirmDialog({
       role="alertdialog"
       dismissible={!pending}
       initialFocusRef={initialFocusRef}
+      returnFocusRef={returnFocusRef}
     >
       <form onSubmit={submit} className="flex flex-col gap-4 p-5" noValidate>
         <h2 id={titleId} className="text-lg font-semibold text-foreground">
