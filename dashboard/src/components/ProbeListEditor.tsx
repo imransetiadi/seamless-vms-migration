@@ -16,6 +16,11 @@ export interface ProbeListEditorProps {
   hint?: string;
   /** What the API would refuse in the list, once the form was submitted. */
   error?: string | null;
+  /**
+   * For a list checked as it is edited (after a refused save): its error is announced when it appears, from a live
+   * region already on the page (SDD §16). A form that focuses an error summary announces it there instead.
+   */
+  liveError?: boolean;
   emptyText?: string;
 }
 
@@ -30,6 +35,7 @@ export function ProbeListEditor({
   onChange,
   hint,
   error,
+  liveError,
   emptyText = 'No application probe: verification checks the boot only.',
 }: ProbeListEditorProps) {
   const hintId = useId();
@@ -37,6 +43,12 @@ export function ProbeListEditor({
   const legendRef = useRef<HTMLLegendElement>(null);
   const set = (index: number, patch: Partial<ProbeDraft>) => onChange(drafts.map((d, i) => (i === index ? { ...d, ...patch } : d)));
   const full = drafts.length >= MAX_PROBES_PER_VM;
+  const message = error && (
+    <p id={errorId} className="field-error">
+      <CircleAlert aria-hidden className="size-3.5 shrink-0" />
+      {error}
+    </p>
+  );
   return (
     <fieldset id={id} tabIndex={id ? -1 : undefined} className="flex min-w-0 flex-col gap-2" aria-describedby={[hint ? hintId : '', error ? errorId : ''].filter(Boolean).join(' ') || undefined}>
       <legend ref={legendRef} tabIndex={-1} className="field-label outline-hidden">
@@ -102,11 +114,13 @@ export function ProbeListEditor({
           })}
         </ol>
       )}
-      {error && (
-        <p id={errorId} className="field-error">
-          <CircleAlert aria-hidden className="size-3.5 shrink-0" />
-          {error}
-        </p>
+      {/* empty, it takes no room: -mt-2 cancels the fieldset's gap */}
+      {liveError ? (
+        <div role="status" className="empty:-mt-2">
+          {message}
+        </div>
+      ) : (
+        message
       )}
       <div>
         <Button

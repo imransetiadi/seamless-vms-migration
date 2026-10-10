@@ -537,6 +537,28 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.probe_overrides).toBe(false));
   });
 
+  it('announces why Save probes was refused from a live region already in the dialog (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit probes' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Application probes of analytics-db' });
+    await user.click(within(dialog).getByRole('button', { name: 'Add probe' }));
+    const port = within(dialog).getAllByRole('spinbutton', { name: /^probe \d+ port$/i }).at(-1)!;
+    await user.clear(port);
+    await user.type(port, '70000');
+    const regions = within(dialog).getAllByRole('status');
+    const before = structuredClone(plan.probe_overrides);
+    await user.click(within(dialog).getByRole('button', { name: 'Save probes' }));
+    const error = await within(dialog).findByText(/use a port from 1 to 65535\./);
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(error.closest('[role="status"]'));
+    expect(plan.probe_overrides).toEqual(before);
+  });
+
   it('keeps Edit probes from a viewer, saying which role it needs', async () => {
     renderMigration('mig-5d7e2b4a11');
     const panel = await screen.findByRole('region', { name: 'Verification' });

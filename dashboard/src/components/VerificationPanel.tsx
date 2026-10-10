@@ -90,6 +90,7 @@ function VmProbes({ m, plan, edit, onSaved }: { m: Migration; plan: Plan; edit: 
               onChange={setDrafts}
               hint="They replace the plan's probes for this VM; an empty list probes nothing."
               error={tried ? (parsed?.problems[0] ?? null) : null}
+              liveError
               emptyText="No application probe for this VM: verification checks the boot only."
             />
           </div>
