@@ -166,38 +166,42 @@ async def update_plan(
     unknown = sorted(set(body) - PLAN_EDITABLE_FIELDS)
     if unknown:
         raise ApiError(422, "validation_error", f"fields cannot be changed: {', '.join(unknown)}")
-    plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
-    await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
-    if plan.status not in (PlanStatus.draft, PlanStatus.validated):
-        raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
-    busy = await svc.orchestrator.in_flight(plan_id)
-    if busy:
-        raise ApiError(
-            409,
-            "conflict",
-            f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
-            "before editing the plan",
+    # SDD §8: an edit sets the plan's status (back to draft) like validate, auto-waves, start and
+    # pause, so it runs under the plan's lock: it waits for a running validation, which would
+    # otherwise mark the edited plan validated with settings it never saw
+    async with svc.orchestrator.plan_lock(plan_id):
+        plan, version = await svc.db.get_versioned("plan", plan_id, Plan)
+        await _check_policy_fields(request, _changed_policy_fields(body, plan), principal)
+        if plan.status not in (PlanStatus.draft, PlanStatus.validated):
+            raise ApiError(409, "conflict", f"a {plan.status} plan cannot be edited")
+        busy = await svc.orchestrator.in_flight(plan_id)
+        if busy:
+            raise ApiError(
+                409,
+                "conflict",
+                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
+                "before editing the plan",
+            )
+        try:
+            merged = PlanCreate.model_validate(
+                {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
+            )
+        except ValidationError as exc:
+            raise ApiError(422, "validation_error", _summarize(exc)) from None
+        _check_plan_texts(merged)
+        _check_vm_ids(merged)
+        _check_plan_settings(merged)
+        _check_estimator_overrides(merged)
+        await _check_providers(request, merged)
+        updated = Plan.model_validate(
+            {
+                **plan.model_dump(mode="json"),
+                **merged.model_dump(mode="json"),
+                "status": PlanStatus.draft,
+                "updated_at": svc.orchestrator.now(),
+            }
         )
-    try:
-        merged = PlanCreate.model_validate(
-            {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
-        )
-    except ValidationError as exc:
-        raise ApiError(422, "validation_error", _summarize(exc)) from None
-    _check_plan_texts(merged)
-    _check_vm_ids(merged)
-    _check_plan_settings(merged)
-    _check_estimator_overrides(merged)
-    await _check_providers(request, merged)
-    updated = Plan.model_validate(
-        {
-            **plan.model_dump(mode="json"),
-            **merged.model_dump(mode="json"),
-            "status": PlanStatus.draft,
-            "updated_at": svc.orchestrator.now(),
-        }
-    )
-    await svc.db.put("plan", updated, expected_version=version)
+        await svc.db.put("plan", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,

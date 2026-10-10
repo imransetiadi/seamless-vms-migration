@@ -1,6 +1,8 @@
+import asyncio
 import json
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -8,8 +10,9 @@ from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role, Strategy, SyncPassKind
 from seamless_migrate.domain.models import Estimate, Migration, Plan, SyncPass, utcnow
 from seamless_migrate.store import Store
-from tests.api_support import DESTINATION, SOURCE, Api, api_settings
-from tests.factories import make_vm
+from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
+from tests.factories import make_plan, make_vm
+from tests.orch_support import build_harness, make_settings
 
 
 @pytest.fixture
@@ -678,3 +681,46 @@ def test_a_failed_plan_keeps_its_providers_from_deletion(api):
     stored.status = PlanStatus.completed
     api.store.put("plan", stored)
     assert delete().status_code == 204
+
+
+async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):
+    """SDD §8: PATCH /plans/{id} runs under the plan's lock like the other status writers, so an
+    edit that arrives while a validation runs waits for it and the plan ends draft - never
+    'validated' with vm_ids no validation saw - and Start refuses it until it is validated again."""
+    store = Store(f"sqlite:///{tmp_path / 'race.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    vms = [make_vm(source_id="vm-1", name="web-01"), make_vm(source_id="vm-2", name="db-01")]
+    h = build_harness(tmp_path, store, vms, settings=settings)
+    entered, release = asyncio.Event(), asyncio.Event()
+    inventory = h.source.inventory
+
+    async def slow_inventory():
+        # the validation holds here, inside the plan's lock
+        entered.set()
+        await release.wait()
+        return await inventory()
+
+    h.source.inventory = slow_inventory
+    plan = make_plan(vm_ids=["vm-1", "vm-2"], default_strategy="warm")
+    store.put("plan", plan, expected_version=0)
+    app = create_app(settings, orchestrator=h.orch)
+    headers = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        validate = asyncio.create_task(c.post(f"/api/v1/plans/{plan.id}/validate", headers=headers))
+        await asyncio.wait_for(entered.wait(), 5)
+        edit = asyncio.create_task(
+            c.patch(f"/api/v1/plans/{plan.id}", headers=headers, json={"vm_ids": ["vm-1"]})
+        )
+        await asyncio.sleep(0.05)  # as far as the edit gets while the validation runs
+        release.set()
+        assert (await validate).status_code == 200
+        edited = await edit
+        assert edited.status_code == 200
+        assert (edited.json()["status"], edited.json()["vm_ids"]) == ("draft", ["vm-1"])
+        stored = (await c.get(f"/api/v1/plans/{plan.id}", headers=headers)).json()
+        assert (stored["status"], stored["vm_ids"]) == ("draft", ["vm-1"])
+        assert (await c.post(f"/api/v1/plans/{plan.id}/start", headers=headers)).status_code == 409
+    await h.orch.stop()
+    store.dispose()

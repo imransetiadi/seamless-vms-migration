@@ -207,6 +207,10 @@ class Orchestrator:
 
     # ------------------------------------------------------------------------------------------
     # plumbing
+    def plan_lock(self, plan_id: str) -> asyncio.Lock:
+        """The plan's lock (SDD §8): an edit through the API takes it, like the status writers."""
+        return self._lock(f"plan:{plan_id}")
+
     def _lock(self, mid: str) -> asyncio.Lock:
         lock = self._locks.get(mid)
         if lock is None:
