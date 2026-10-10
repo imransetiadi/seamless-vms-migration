@@ -882,7 +882,9 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
 
 **Application probes** (ADV-18). A VM's probes are `plan.probe_overrides[vm.source_id]` when the plan has an entry
 for it (an empty list: none), else `plan.verification.app_probes`. Each runs from the control plane against the
-probe address with a 5 s timeout and adds a check `app:<kind>:<port>` and a `ProbeResult` — target (`host:port`,
+probe address — directly: an HTTP(S) proxy the control plane's environment names (`HTTP_PROXY`, `HTTPS_PROXY`, which
+a proxied deployment sets for its API calls and the playbooks) never carries a probe, as it would answer for a
+guest it cannot see — with a 5 s timeout and adds a check `app:<kind>:<port>` and a `ProbeResult` — target (`host:port`,
 the URL for http(s)), kind, result, latency, time, detail. `tcp` connects; `http`/`https` send `GET <path>` and read
 the status (`https` does not verify the certificate: the probe connects to an address the certificate does not
 name and reads only the status). The result is `passed`; `failed` when the connection is refused, the service does
