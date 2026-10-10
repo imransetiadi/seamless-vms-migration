@@ -759,9 +759,11 @@ non-skipped checks ok. The advisor (§14.2) may then set `review_required`, neve
   (ids rewritten after a rollback, status changes, strategy overrides): those read-modify-writes
   use the store's optimistic version (`_update_plan`: re-read, mutate, `put(expected_version)`,
   retry on conflict), so no concurrent update is lost. The operations that set a plan's status —
-  validate, auto-waves, start, pause — run under the plan's lock and re-check the status on the fresh
-  copy before they write it, so none writes over another's change (auto-waves never turns a plan
-  started meanwhile back into a draft, validation never marks a started plan `validated`).
+  validate, auto-waves, start, pause, and an edit (`PATCH /plans/{id}`, which returns the plan to
+  draft) — run under the plan's lock and re-check the status on the fresh copy before they write it,
+  so none writes over another's change (auto-waves never turns a plan started meanwhile back into a
+  draft, validation never marks a started plan `validated`, and an edit waits for a running validation:
+  a plan edited during a validation ends up `draft`, never `validated` with settings no validation saw).
 
 ---
 
