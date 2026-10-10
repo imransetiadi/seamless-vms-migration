@@ -1831,6 +1831,30 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect(web01.phase).toBe('completed');
   });
 
+  it("refuses to change a plan's providers while one of its migrations is failed, like the API (SDD §12)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const failed = server.migrations.find((m) => m.phase === 'failed')!;
+    const plan = server.plans.find((p) => p.id === failed.plan_id)!;
+    // a failed migration whose cutover stopped its source holds the whole plan; this one ran on
+    failed.downtime_started_at = null;
+    failed.downtime_ended_at = null;
+    if (!['draft', 'validated'].includes(plan.status)) plan.status = 'validated';
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id && x.id !== failed.id)) {
+      Object.assign(m, { phase: 'ready', downtime_started_at: null, downtime_ended_at: null });
+    }
+    const operator = as(server, 'operator');
+    await expect(operator.patch(`/plans/${plan.id}`, { destination_provider_id: 'dst-other' })).rejects.toMatchObject({
+      status: 409,
+      message: `roll back or cancel the failed migration (${failed.vm.name}) before changing the plan's providers: its rollback acts on the clouds its attempt used`,
+    });
+    await expect(operator.patch(`/plans/${plan.id}`, { source_provider_id: 'src-other' })).rejects.toMatchObject({ status: 409 });
+    // the rest stays editable for the retry, and repeating a provider changes nothing
+    expect((await operator.patch<Plan>(`/plans/${plan.id}`, { description: 'fix the mapping' })).description).toBe('fix the mapping');
+    await operator.patch(`/plans/${plan.id}`, { destination_provider_id: plan.destination_provider_id });
+    failed.phase = 'rolled_back';
+    expect((await operator.patch<Plan>(`/plans/${plan.id}`, { destination_provider_id: 'dst-other' })).destination_provider_id).toBe('dst-other');
+  });
+
   it('skips a VM whose finalize fails and finalizes the others, like the API (SDD §8.1)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;

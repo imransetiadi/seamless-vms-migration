@@ -1728,6 +1728,19 @@ export class MockServer {
     refuseBadProbes(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
+    // like the API (SDD §12): a failed migration's rollback acts on the clouds its attempt used
+    const providers = ['source_provider_id', 'destination_provider_id'] as const;
+    if (providers.some((field) => field in input && input[field] !== plan[field])) {
+      const failed = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'failed').map((m) => m.vm.name);
+      if (failed.length) {
+        const noun = failed.length === 1 ? 'migration' : 'migrations';
+        throw new HttpError(
+          409,
+          'conflict',
+          `roll back or cancel the failed ${noun} (${failed.slice(0, 10).join(', ')}) before changing the plan's providers: its rollback acts on the clouds its attempt used`,
+        );
+      }
+    }
     for (const key of Object.keys(input)) {
       if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
       (plan as unknown as Record<string, unknown>)[key] = input[key];
