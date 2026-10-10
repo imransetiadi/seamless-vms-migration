@@ -42,6 +42,7 @@ from seamless_migrate.executors.base import (
     StepResult,
     TransientStepError,
 )
+from seamless_migrate.executors.simulated import SimulatedExecutor
 from seamless_migrate.orchestrator import (
     VM_CLAIMS,
     BadRequest,
@@ -52,6 +53,7 @@ from seamless_migrate.orchestrator import (
 from seamless_migrate.planning.estimator import params_for_plan
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
+from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 from tests.orch_support import (
@@ -3571,6 +3573,43 @@ async def test_a_simulated_rollback_counts_model_seconds(tmp_path, store):
     events = h.store.events(since_seq=0, limit=1000)
     [ended] = [e for e in events if e.kind == "migration.downtime_ended"]
     assert ended.data == {"actual_downtime_s": 690.0}
+
+
+async def test_a_rollback_that_interrupts_a_simulated_cutover_counts_its_model_seconds(
+    tmp_path, store
+):
+    """SDD §5.2 (ADV-16..20 audit, F8): a rollback cancels the running simulated cutover, which
+    reports nothing; the downtime counts the model seconds that cutover kept the source stopped,
+    with the rollback's own 90 s - not only the 90 s."""
+    settings = make_settings(tmp_path)
+    executor = ScriptedExecutor(settings)
+    calls = 0
+    blocked = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:  # the shutdown, the copy, then the create: the rollback interrupts it
+            blocked.set()
+            await asyncio.Event().wait()
+
+    executor.sim = SimulatedExecutor(settings, sleep=sleep)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await asyncio.wait_for(blocked.wait(), 10)
+    # the same seeded copy, run to its end by another simulator: its model seconds without create
+    ctx, _ = make_ctx(plan, await h.migration(mid), SRC_PROVIDER, DST_PROVIDER, settings)
+    whole = (await SimulatedExecutor(settings).run(StepName.CUTOVER, ctx)).details
+    copy = whole["downtime_model_s"] - params_for_plan(plan).create_s
+    await h.orch.rollback(mid, "bayu", "the copy is stuck")
+    rolled = await h.wait_phase(mid, P.rolled_back)
+    await h.orch.stop()
+    assert rolled.actual_downtime_s == pytest.approx(copy + 90.0)
+    assert rolled.actual_downtime_s > 90.0
 
 
 async def test_a_rollback_no_step_reported_model_seconds_for_keeps_wall_time(tmp_path, store):
