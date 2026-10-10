@@ -294,6 +294,19 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const destinations = (providers.data ?? []).filter((p) => p.role === 'destination');
   const source = sources.find((p) => p.id === form.sourceId);
   const vms = inventory.data && !isDestinationInventory(inventory.data) ? inventory.data : [];
+  // SDD §16: a selected VM the source no longer lists cannot be validated (502): listed with Remove
+  const inventoryIds = new Set(vms.map((v) => v.source_id));
+  // judged on the inventory the table shows (a stale one after a failed refetch too)
+  const gone = inventory.data ? [...form.vmIds].filter((vmId) => !inventoryIds.has(vmId)) : [];
+  const removeGone = (vmId: string) => {
+    setForm((f) => {
+      const next = new Set(f.vmIds);
+      next.delete(vmId);
+      return { ...f, vmIds: next };
+    });
+    // the Remove button goes away with the VM: focus moves to the VMs, never to the page (SDD §16)
+    document.getElementById(id('vms'))?.focus();
+  };
   // per-VM strategy overrides (SDD §16): the VM and strategy of the override being added
   const [pendingVm, setPendingVm] = useState('');
   const [pendingStrategy, setPendingStrategy] = useState('');
@@ -638,6 +651,27 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   if (migrationsUnknown) void migrations.refetch();
                 }}
               />
+            )}
+            {gone.length > 0 && (
+              <div role="group" aria-labelledby={id('gone')} className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+                <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+                <div className="min-w-0 flex-1">
+                  <p id={id('gone')} className="font-medium text-foreground">
+                    {gone.length === 1 ? 'A selected VM is' : `${gone.length} selected VMs are`} no longer in the source: validation cannot
+                    reach {gone.length === 1 ? 'it' : 'them'}
+                  </p>
+                  <ul className="mt-2 flex flex-col gap-1">
+                    {gone.map((vmId) => (
+                      <li key={vmId} className="flex min-w-0 items-center justify-between gap-2">
+                        <code className="min-w-0 break-all text-muted-foreground">{vmId}</code>
+                        <Button size="sm" aria-label={`Remove ${vmId} from the plan`} onClick={() => removeGone(vmId)}>
+                          Remove
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
             )}
             {held.size > 0 && (
               <div role="status" aria-labelledby={id('held')} className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">

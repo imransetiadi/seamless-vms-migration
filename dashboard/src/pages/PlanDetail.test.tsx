@@ -457,6 +457,29 @@ describe('PlanDetail', () => {
     expect([saved.convergence_threshold_bytes, saved.max_sync_passes, saved.estimator_overrides.parallel_disks]).toEqual([0, 60, 100]);
   });
 
+  it('lists a selected VM that left the source, with Remove, so the plan can be saved without it (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const kept = [...plan.vm_ids];
+    // a VM deleted from the source after the plan was made: the inventory no longer lists it
+    plan.vm_ids = [...kept, 'os-gone-01'];
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const gone = await within(dialog).findByRole('group', { name: /a selected vm is no longer in the source/i });
+    expect(gone).toHaveTextContent('os-gone-01');
+
+    await user.click(within(gone).getByRole('button', { name: 'Remove os-gone-01 from the plan' }));
+    expect(within(dialog).queryByRole('group', { name: /no longer in the source/i })).not.toBeInTheDocument();
+    // the removed button's place: focus moves to the VMs, never to the page
+    expect(within(dialog).getByText('VMs', { selector: 'legend' }).closest('legend')).toHaveFocus();
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(server.plans.find((p) => p.id === plan.id)!.vm_ids).toEqual(kept);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['vm_ids'] });
+  });
+
   it('shows an operator the approval policy read-only, with the reason (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPlan('plan-c81d44a0', 'operator');
