@@ -1072,6 +1072,13 @@ class Orchestrator:
                     "a Force cutover applies to a warm migration in pre-copy or syncing, "
                     f"not to {m.strategy} in {m.phase}"
                 )
+            if m.force_cutover is not None:
+                # forced once (SDD §5.4): a second forcer would take the first one's place, whose
+                # own approval would then count again, and the first record would be lost
+                raise NotAllowed(
+                    f"Already forced by {m.force_cutover.actor}: "
+                    "the cutover follows the running pass."
+                )
             plan = await self._plan(m.plan_id)
             last = m.sync_passes[-1] if m.sync_passes else None
             estimated = estimate_final_downtime(

@@ -3360,6 +3360,27 @@ async def test_the_approver_who_forced_a_cutover_never_approves_it(tmp_path, sto
     assert [a.actor for a in counted_approvals(again, free)] == ["bob", "sari", "sari"]
 
 
+async def test_a_migration_is_forced_once(tmp_path, store):
+    """SDD §5.4: while a Force cutover is recorded, another is refused - the second forcer would
+    take the first one's place, whose own approval would then count again, and the first record
+    would be lost."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    syncing = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", syncing)
+    await h.orch.approve(syncing.id, "sari", "looked fine before the force")
+    await h.orch.force_cutover(syncing.id, "sari", "the window closes in ten minutes")
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.force_cutover(syncing.id, "rina", "I would rather force it myself")
+    assert str(refused.value) == "Already forced by sari: the cutover follows the running pass."
+    m = await h.migration(syncing.id)
+    assert (m.force_cutover.actor, m.force_cutover.reason) == (
+        "sari",
+        "the window closes in ten minutes",
+    )
+    assert counted_approvals(m, plan) == [], "the forcer's own approval still does not count"
+    assert h.kinds().count("migration.force_cutover") == 1
+
+
 async def test_a_force_cutover_is_in_the_audit_trail(tmp_path, store):
     """SDD §14.5 (the owner's ADV-16 acceptance): a Force cutover is recorded in the audit trail
     with its approver, its reason and the migration it forced."""
