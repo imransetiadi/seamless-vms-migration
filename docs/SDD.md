@@ -995,7 +995,8 @@ in demo mode ÷ `demo_speed`) the source watch asks its source provider for the 
 starts the watch, as a task of its own, one at a time, and never waits for it: a slow or hanging source provider
 (one call may take minutes) delays the next watch, never the cutover gates, the passes or the tick's heartbeat
 (`/ready`, §12); stopping the orchestrator cancels it. Seen `running`, the
-migration records `source_running_at` once and emits `migration.source_running` (data `{"power_state"}`): the VM
+migration records `source_running_at` once — when the provider answered, not when the watch began: one call may take
+minutes — and emits `migration.source_running` (data `{"power_state"}`): the VM
 writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
 the timeline records it. Any other power state — `paused`, `transitioning` (a reboot or a resize), `error`, `unknown` —
