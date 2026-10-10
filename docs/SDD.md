@@ -955,8 +955,11 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   `max_step_retries`; then `failed`. Each attempt starts under the migration's lock and only while the
   migration is still in the step's phase, so an action under that lock (a cancel) either finds the
   attempt running or ends the retries (§5.1). If downtime had started and
-  `plan.verification.auto_rollback` is true → `rolling_back` automatically. On every failure the
-  knowledge service looks up similar incidents (§14.3) and attaches them as an `AdvisorNote`.
+  `plan.verification.auto_rollback` is true → `rolling_back` automatically, saved in the same write as
+  `failed` (the history keeps both): a restart, or an event that fails to be written, right after the
+  failure resumes the rollback (`rolling_back` is resumed) and never leaves the stopped VM in `failed`.
+  On every failure the knowledge service looks up similar incidents (§14.3) and attaches them as an
+  `AdvisorNote` — after that write, so a slow agentmemory never holds the rollback back.
 * Locks: one `asyncio.Lock` per migration id serializes API actions with the driver; one lock per
   plan id serializes validations; one shared lock serializes the cross-plan claim of validations and
   retries (§5.4); one lock per provider id serializes provider checks, so a validation and a manual
