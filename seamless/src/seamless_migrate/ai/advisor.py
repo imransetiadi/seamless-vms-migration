@@ -214,7 +214,13 @@ class Advisor:
         errors: list[str] = []
         for start in range(0, len(vms), CLASSIFY_BATCH):
             batch = vms[start : start + CLASSIFY_BATCH]
-            items = [{"id": vm.source_id, "text": self._describe_vm(vm)} for vm in batch]
+            # SDD §14.2/§13.4: an opaque key per item, its place in the batch - the VM's own id
+            # never leaves; the answer maps back through it
+            keys = {f"item-{n}": vm.source_id for n, vm in enumerate(batch, 1)}
+            items = [
+                {"id": key, "text": self._describe_vm(vm)}
+                for key, vm in zip(keys, batch, strict=True)
+            ]
             try:
                 response = await self.jev.classify(
                     items=items, classes=TIER_CLASSES, purpose=CLASSIFY_PURPOSE
@@ -223,7 +229,7 @@ class Advisor:
                 errors.append(str(exc))
                 continue
             for result in response.get("results") or []:
-                rid = result.get("id")
+                rid = keys.get(str(result.get("id")))
                 tier = result.get("classification")
                 if (
                     rid in tiers

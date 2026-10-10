@@ -145,6 +145,9 @@ WORKLOAD_FIELDS: tuple[FieldSpec, ...] = (
     ),
 )
 
+#: each jev_classify item's key: its place in the batch, never the VM's id (§14.2)
+CLASSIFY_ITEM_KEY = ("id", "The item's place in the batch (item-1, item-2 …), not the VM's id")
+
 CONSOLE_LABEL = f"The last {CONSOLE_EXCERPT_CHARS:,} characters of the console, redacted"
 
 
@@ -191,7 +194,7 @@ def data_sent(settings: Settings) -> list[dict[str, Any]]:
         {
             "decision_type": "workload_tier",
             "tool": "jev_classify",
-            "fields": fields([(s.key, s.label) for s in WORKLOAD_FIELDS]),
+            "fields": fields([CLASSIFY_ITEM_KEY, *((s.key, s.label) for s in WORKLOAD_FIELDS)]),
             "sent": on,
             "note": None if on else "Jev is off: nothing is sent.",
         },

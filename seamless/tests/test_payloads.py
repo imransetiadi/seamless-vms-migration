@@ -116,10 +116,12 @@ def test_every_field_spec_is_listed_with_its_label_and_tool():
     ]
     assert len(keys) == len(set(keys)) and all(f["label"] for f in strategy["fields"])
     workload = _listed("workload_tier")
+    # each item's key leaves too: its place in the batch, never the VM's id (SDD §14.2)
     assert (workload["tool"], [f["key"] for f in workload["fields"]]) == (
         "jev_classify",
-        [s.key for s in WORKLOAD_FIELDS],
+        ["id", *(s.key for s in WORKLOAD_FIELDS)],
     )
+    assert "not the VM's id" in workload["fields"][0]["label"]
     assert _listed("verification_review")["tool"] == "jev_verify"
     assert _listed("console_screening")["tool"] == "jev_screen"
 

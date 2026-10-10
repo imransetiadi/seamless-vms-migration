@@ -206,18 +206,23 @@ async def test_classify_review_items_fall_back_to_heuristic():
         return {
             "results": [
                 {
-                    "id": "a",
+                    "id": "item-1",
                     "classification": "stateful_database",
                     "confidence": 0.97,
                     "decision": "auto",
                 },
                 {
-                    "id": "b",
+                    "id": "item-2",
                     "classification": "stateful_database",
                     "confidence": 0.51,
                     "decision": "review",
                 },
-                {"id": "d", "classification": "not-a-tier", "confidence": 0.99, "decision": "auto"},
+                {
+                    "id": "item-4",
+                    "classification": "not-a-tier",
+                    "confidence": 0.99,
+                    "decision": "auto",
+                },
             ]
         }
 
@@ -236,6 +241,35 @@ async def test_classify_review_items_fall_back_to_heuristic():
     rules = Advisor(None, Settings())
     tiers, note = await rules.classify_workloads(vms)
     assert note.source == "rules" and tiers["b"] == "stateless_web"
+
+
+async def test_classify_sends_an_item_key_never_the_vms_id():
+    """SDD §14.2/§13.4 (advisor Phase 1 audit, A11): each item goes out as item-<n>, its place in
+    the batch, and the answer maps back to the VM - the VM's own id never leaves."""
+    vms = [
+        make_vm(source_id="2f6c1e0a-uuid-of-web", name="web-01"),
+        make_vm(source_id="9b1d77c3-uuid-of-db", name="db-02"),
+    ]
+    sent = []
+
+    def classify(args):
+        sent.append(args)
+        return {
+            "results": [
+                {"id": "item-2", "classification": "stateful_database", "decision": "auto"},
+                {"id": "item-1", "classification": "stateless_web", "decision": "auto"},
+            ]
+        }
+
+    advisor, _ = advisor_for({"classify": classify})
+    tiers, note = await advisor.classify_workloads(vms)
+    assert [item["id"] for item in sent[0]["items"]] == ["item-1", "item-2"]
+    assert "uuid-of" not in json.dumps(sent[0])
+    assert tiers == {
+        "2f6c1e0a-uuid-of-web": "stateless_web",
+        "9b1d77c3-uuid-of-db": "stateful_database",
+    }
+    assert note.data["jev"] == 2
 
 
 async def test_classify_uses_recorded_fixture_ids():
