@@ -3926,6 +3926,21 @@ async def test_a_source_watch_that_fails_is_logged_and_the_next_one_runs(tmp_pat
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is not None
 
 
+async def test_a_rollback_clears_the_source_running_flag(tmp_path, store):
+    """SDD §8.1 (advisor Phase 1 audit, A9): a rollback starts the source on purpose; a migration
+    that completes again is watched afresh, not flagged by a stale alert."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    assert (await h.migration(m.id)).source_running_at is not None
+    rolled = await h.orch.rollback(m.id, "bayu", "the application misbehaves on RHOSO")
+    assert rolled.source_running_at is None
+    assert (await h.migration(m.id)).source_running_at is None
+
+
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover

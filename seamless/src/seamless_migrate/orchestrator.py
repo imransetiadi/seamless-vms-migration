@@ -1134,6 +1134,9 @@ class Orchestrator:
                     f"{m.vm.name} cannot be rolled back: the plan's {role} provider "
                     f"{provider_id!r} no longer exists"
                 )
+            # SDD §8.1: the rollback starts the source on purpose; a migration that completes
+            # again is watched afresh
+            m.source_running_at = None
             m, v = await self._transition(
                 m, v, P.rolling_back, f"rollback requested: {reason}", actor
             )
