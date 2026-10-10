@@ -1480,7 +1480,11 @@ One redaction layer, `ai/redaction.py`, stands between the control plane and the
   `web-01-data`, `web-01_root`, `data-web-01` become `[vm]-data`, `[vm]_root`, `data-[vm]`.
 
 The control plane uses the same `redact` for the text it publishes from outside sources: step and
-provider error messages and every `migration.log` line (§4).
+provider error messages and every `migration.log` line (§4). Where it cuts such text, it redacts first,
+over the cut plus 16384 characters, and cuts after (`redact_cut(text, limit)`): a secret the cut splits
+— a PEM block, a URL with credentials — is still found, at a bounded cost. The cuts: a `migration.log`
+line at 2000 characters (§4), the failing output line in an Ansible step's error at 500, a provider
+SDK's error message at 500, an HTTP error body in the handover executor at 300.
 
 `redact_payload(value, names=None)` applies `redact` to every string of a JSON-like value and replaces
 the whole value of a credential key (`password`, `auth`, `OS_PASSWORD`, …) whatever its type. Guest
