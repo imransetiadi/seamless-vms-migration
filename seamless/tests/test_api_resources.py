@@ -369,6 +369,47 @@ def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
     assert allowed.status_code == 200, allowed.text
 
 
+def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):
+    """SDD §12: a failed migration whose source runs keeps its plan editable — to fix the cause
+    before a retry — but not its providers: its rollback acts on the clouds its attempt used (the
+    cold one matches the destination server by name), so a changed provider is refused until it
+    is rolled back or cancelled."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "switch clouds",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    for kept, copy in (("dst-rhoso", "dst-rhoso-2"), ("src-osp", "src-osp-2")):
+        other = api.store.get("provider", kept, Provider).model_copy(update={"id": copy})
+        api.store.put("provider", other, expected_version=0)
+    failed = api.store.list("migration", Migration, plan_id=plan["id"])[0]
+    failed.phase = Phase.failed  # its pre-copy failed; the source VM kept running
+    api.store.put("migration", failed)
+    url = f"/api/v1/plans/{plan['id']}"
+
+    def edit(change: dict):
+        return api.client.patch(url, headers=api.h(Role.operator), json=change)
+
+    refused = edit({"destination_provider_id": "dst-rhoso-2"})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == (
+        f"roll back or cancel the failed migration ({failed.vm.name}) before changing the plan's "
+        "providers: its rollback acts on the clouds its attempt used"
+    )
+    assert edit({"source_provider_id": "src-osp-2"}).status_code == 409  # either side
+    assert edit({"description": "fix the network mapping"}).status_code == 200  # for the retry
+    assert edit({"destination_provider_id": "dst-rhoso"}).status_code == 200  # not a change
+    failed = api.store.get("migration", failed.id, Migration)
+    failed.phase = Phase.rolled_back
+    api.store.put("migration", failed)
+    moved = edit({"destination_provider_id": "dst-rhoso-2"})
+    assert moved.status_code == 200, moved.text
+
+
 def test_the_in_flight_refusal_says_what_releases_each_vm(api):
     """SDD §12: a completed migration is finished and cannot be cancelled, nor can a failed one
     whose cutover stopped the source — the 409 of an edit or re-wave names each VM with what

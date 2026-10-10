@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import ValidationError
 
-from ..domain.enums import PlanStatus, ProviderRole, Role
+from ..domain.enums import Phase, PlanStatus, ProviderRole, Role
 from ..domain.models import (
     PLAN_EDITABLE_FIELDS,
     Migration,
@@ -32,6 +32,8 @@ router = APIRouter(tags=["plans"])
 POLICY_FIELDS = frozenset(
     {"require_approval", "require_distinct_approver", "auto_cutover", "cutover_window"}
 )
+#: a plan's clouds: they do not change while a failed migration's rollback may still need them (§12)
+PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
 
 
 async def _check_policy_fields(request: Request, fields: set[str], principal: Principal) -> None:
@@ -165,6 +167,22 @@ async def update_plan(
         busy = await svc.orchestrator.in_flight(plan_id)
         if busy:
             raise ApiError(409, "conflict", in_flight_refusal(busy, "editing the plan"))
+        if any(body.get(f, getattr(plan, f)) != getattr(plan, f) for f in PROVIDER_FIELDS):
+            # SDD §12: a failed migration's rollback acts on the clouds its attempt used
+            failed = [
+                m.vm.name
+                for m in await svc.db.list("migration", Migration, plan_id=plan_id)
+                if m.phase == Phase.failed
+            ]
+            if failed:
+                noun = "migration" if len(failed) == 1 else "migrations"
+                raise ApiError(
+                    409,
+                    "conflict",
+                    f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before "
+                    "changing the plan's providers: its rollback acts on the clouds its attempt "
+                    "used",
+                )
         try:
             merged = PlanCreate.model_validate(
                 {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}
