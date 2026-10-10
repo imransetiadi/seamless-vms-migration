@@ -213,6 +213,7 @@ const DATA_SENT: DataSentItem[] = [
     decision_type: 'workload_tier',
     tool: 'jev_classify',
     fields: [
+      { key: 'id', label: "The item's place in the batch (item-1, item-2 …), not the VM's id" },
       { key: 'name', label: 'VM name' },
       { key: 'os', label: 'Guest OS' },
       { key: 'tags', label: 'Tags' },

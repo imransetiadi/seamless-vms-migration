@@ -1705,6 +1705,15 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
   });
 
+  it('declares the item key jev_classify sends, never the VM\'s id, like the API (SDD §14.2, §13.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');
+    const items = (res.body as { items: Array<{ decision_type: string; fields: Array<{ key: string; label: string }> }> }).items;
+    const classify = items.find((i) => i.decision_type === 'workload_tier')!;
+    expect(classify.fields.map((f) => f.key)).toEqual(['id', 'name', 'os', 'tags', 'disks', 'flavor']);
+    expect(classify.fields[0]!.label).toContain("not the VM's id");
+  });
+
   it('clears the source-running flag and the demo power at a rollback, like the API (SDD §8.1)', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const cache = byName(server, 'web-cache-01');
