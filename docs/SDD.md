@@ -1078,7 +1078,7 @@ such lists again on persisted migration events.
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
-| POST | `/advisor/similar-incidents` | operator | `{"query": str, "limit": int = 5}` | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
+| POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
 The free-text fields of the migration actions — `comment` (approve, cutover), `reason` (rollback,
@@ -1426,7 +1426,8 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
-  similar-incident search), `/login` (token entry stored in `sessionStorage`).
+  similar-incident search — the query field takes at most 2000 characters and the result count stays in
+  1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
