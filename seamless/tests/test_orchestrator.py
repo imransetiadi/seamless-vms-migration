@@ -2829,9 +2829,11 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
     executor = ScriptedExecutor(
         settings, hooks={StepName.CUTOVER: failing_cutover, StepName.ROLLBACK: recreating_rollback}
     )
+    probe = AppProbe(kind="tcp", port=5432)
     h, plan = await setup(
         tmp_path, store, [vm(1), vm(2)],
-        {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold}},
+        {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold},
+         "probe_overrides": {"vm-1": [probe]}},
         executor=executor, settings=settings,
     )  # fmt: skip
     await h.orch.auto_waves(plan.id, 10, "alice")  # resets the plan to draft: validate after
@@ -2850,8 +2852,79 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
         "vm-2-recreated",
     ]
     assert updated.strategy_overrides == {"vm-1-recreated": Strategy.cold}
+    assert updated.probe_overrides == {"vm-1-recreated": [probe]}
     assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
     assert updated.status == PlanStatus.completed
+
+
+def _recreating_executor(settings):
+    async def failing_cutover(ctx):
+        await ctx.mark_downtime_start()
+        raise PermanentStepError("manage at the destination failed")
+
+    async def recreating_rollback(ctx):
+        new_vm = ctx.migration.vm.model_copy(update={"source_id": "vm-1-recreated"})
+        return StepResult(details={"source_running": True, "vm": new_vm.model_dump(mode="json")})
+
+    return ScriptedExecutor(
+        settings, hooks={StepName.CUTOVER: failing_cutover, StepName.ROLLBACK: recreating_rollback}
+    )
+
+
+async def test_a_recreated_source_vm_is_in_the_plan_before_the_migration_is_rolled_back(
+    tmp_path, store
+):
+    """SDD §7.3: the plan follows the new id before the migration becomes rolled_back - a stop
+    in between resumes rolling_back; rolled_back is never resumed, so a later rewrite could be
+    lost for good."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=_recreating_executor(settings), settings=settings,
+    )  # fmt: skip
+    put = h.orch.db.put
+    seen: list[Phase] = []
+
+    async def watching_put(kind, model, expected_version=None):
+        version = await put(kind, model, expected_version)
+        if kind == "plan" and "vm-1-recreated" in model.vm_ids and not seen:
+            # the phase the migration had when its plan first named the recreated VM
+            seen.extend(m.phase for m in await h.migrations(plan.id))
+        return version
+
+    h.orch.db.put = watching_put
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert seen == [P.rolling_back]
+    assert m.vm.source_id == "vm-1-recreated"
+    assert (await h.plan(plan.id)).vm_ids == ["vm-1-recreated"]
+
+
+async def test_a_rollback_resumed_after_its_rewrite_changes_the_plan_no_further(tmp_path, store):
+    """SDD §7.3: stopped after the plan was rewritten but before the migration was rolled back,
+    the resumed rollback finds the new id already there: no second write, no second event."""
+    settings = make_settings(tmp_path)
+    h, plan = await setup(
+        tmp_path, store, [vm(1)],
+        {"default_strategy": Strategy.cold, "vm_ids": ["vm-1-recreated"],
+         "strategy_overrides": {"vm-1-recreated": Strategy.cold}},
+        executor=_recreating_executor(settings), settings=settings,
+    )  # fmt: skip
+    _, version = store.get_versioned("plan", plan.id, Plan)
+    stopped = make_migration(
+        plan_id=plan.id, vm=vm(1), strategy=Strategy.cold, phase=Phase.rolling_back
+    )
+    store.put("migration", stopped)
+    await h.orch.start()
+    m = await h.wait_phase(stopped.id, P.rolled_back)
+    await h.orch.stop()
+    assert m.vm.source_id == "vm-1-recreated"
+    rewritten, after = store.get_versioned("plan", plan.id, Plan)
+    assert (rewritten.vm_ids, after) == (["vm-1-recreated"], version)
+    assert not [
+        e for e in store.events(since_seq=0, limit=1000) if "vm_id_changed" in (e.data or {})
+    ]
 
 
 async def test_tick_ignores_migrations_of_finished_plans_and_records_timing(tmp_path, store):

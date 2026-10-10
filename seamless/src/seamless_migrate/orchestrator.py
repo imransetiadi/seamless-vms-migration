@@ -2465,7 +2465,13 @@ class Orchestrator:
             return
         if result is None:
             return
-        old_source_id = m.vm.source_id
+        vm = result.details.get("vm")
+        recreated = VMRef.model_validate(vm) if isinstance(vm, dict) else None
+        if recreated is not None and recreated.source_id != m.vm.source_id:
+            # SDD §7.3: the plan follows a recreated source VM before the migration is rolled
+            # back - rolled_back is never resumed, so a stop after it would lose the rewrite; a
+            # stop before it resumes rolling_back, and the rewrite changes nothing the second time
+            await self._replace_vm_id(m.plan_id, m.vm.source_id, recreated.source_id)
         async with self._lock(m.id):
             cur, v = await self._load(m.id)
             if cur.phase != P.rolling_back:
@@ -2474,8 +2480,8 @@ class Orchestrator:
                 (c.reason for c in reversed(cur.phase_history) if c.to_phase == P.rolling_back),
                 "rollback",
             )
-            if isinstance(result.details.get("vm"), dict):
-                cur.vm = VMRef.model_validate(result.details["vm"])
+            if recreated is not None:
+                cur.vm = recreated
             ended = cur.downtime_started_at is not None and cur.downtime_ended_at is None
             if ended:
                 now = self._now()
@@ -2494,21 +2500,31 @@ class Orchestrator:
             cur, v = await self._transition(
                 cur, v, P.rolled_back, "rollback finished; the source VM runs again"
             )
-        if cur.vm.source_id != old_source_id:
-            await self._replace_vm_id(cur.plan_id, old_source_id, cur.vm.source_id)
         if self.knowledge is not None:
             await self.knowledge.on_rolled_back(cur, reason)
         self.wake()
 
     async def _replace_vm_id(self, plan_id: str, old: str, new: str) -> None:
-        def rewrite(plan: Plan) -> None:
+        """The plan follows a recreated source VM (SDD §7.3): every field keyed by its id; once
+        done nothing names ``old``, and a repeat writes nothing."""
+        changed = False
+
+        def rewrite(plan: Plan) -> bool:
+            nonlocal changed
+            before = plan.model_dump()
             plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
             for wave in plan.waves:
                 wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
             if old in plan.strategy_overrides:
                 plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
+            if old in plan.probe_overrides:
+                plan.probe_overrides[new] = plan.probe_overrides.pop(old)
+            changed = plan.model_dump() != before
+            return changed
 
         plan = await self._update_plan(plan_id, rewrite)
+        if not changed:
+            return
         await self._emit(
             "plan.updated",
             f"{plan.name}: source VM {old} is now {new}",
