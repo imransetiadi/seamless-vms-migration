@@ -311,6 +311,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             source_running_at: datetime|null,   # completed, not finalized: when its source VM was seen running again (§8.1)
             review_required: bool = false, review_reason: str|null,
             destination_server_id: str|null, error: str|null, attempts: int = 0,
+            attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
             created_at: datetime, updated_at: datetime }
 
 Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|null,
@@ -1579,7 +1580,7 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   |---|---|---|---|---|
   | `downtime_estimate` | the option's estimated downtime (s) against the SLO | supports when it meets the SLO, else opposes | 100 | `estimate`, the migration |
   | `cbt` | `vm.cbt_enabled` (VMware sources, when reported) | `vmware_warm`: supports when true, else opposes; other options: context | 90 | `inventory`, the VM |
-  | `earlier_runs` | the migration's `attempts` (when any) | opposes when the option is the strategy that failed before, else context | 85 | `run`, the migration |
+  | `earlier_runs` | the migration's `attempts` (when any), naming the strategies of those attempts (`attempt_strategies`: a retry records the strategy of the attempt it retries) | opposes when the option is a strategy an earlier attempt used, else context — data recorded before names none: context | 85 | `run`, the migration |
   | `mappings` | the blocker and warning `MAP_*` findings that apply to the option (an info one resolved itself) | supports when there are none, else opposes | 80 | `preflight`, the migration |
   | `findings` | the other blocker and warning findings that apply to the option | supports when there are none, else opposes | 75 | `preflight`, the migration |
   | `guest_os` | `guest_os.label` and its virt-v2v support | VMware options: supports when `supported`, opposes when `unsupported` or `unverified`, else context; others: context | 70 | `inventory`, the VM |
