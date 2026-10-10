@@ -400,7 +400,10 @@ cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
-`migration.error` naming the manual `rollback_workloads.yml` run.
+`migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
+in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
+orchestrator starts (the step is idempotent, §7.1), and once its outcome is recorded the checkpoint becomes
+`cleaned` or `cleanup_failed`.
 
 Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `completed`, `finalized`,
 `cancelled`, `rolled_back` (`failed` blocks a wave until an operator retries, rolls back or cancels).
