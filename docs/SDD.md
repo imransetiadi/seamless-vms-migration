@@ -1542,12 +1542,20 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
   lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
-  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence" and "Decision:
-  <final option> — <why>" (applied automatically by policy <policy>; below threshold (<confidence>% <
-  <threshold>%); advisor unavailable, decided by rules; …), never the word "Selected"; a legacy entry shows a
-  "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
-  way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Audit" with
-  its audit events and tab "Input" with its redacted input snapshot and SHA-256, §14.5); the page links to
+  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence (threshold
+  <threshold>%)" and "Decision: <final option> — <why>" (applied automatically by policy <policy>; below
+  threshold, default kept; advisor unavailable, decided by rules; no usable recommendation, decided by rules;
+  …), never the word "Selected". The confidence appears once, as a whole percent rounded down (never shown
+  equal to a threshold it missed; 0..1 values only in the API), followed by the threshold the decision used
+  when it used one; the word "confidence" carries its one-sentence definition (Jev's calibrated confidence in
+  its own recommendation, not the probability it gives that option) on hover and focus; the why never repeats
+  a number. Options read as labels: Cold migration, Warm migration, Storage handover, VMware cold migration,
+  VMware warm migration (CBT) — CBT only where the strategy uses it, §9.2 —, Needs your input, Needs
+  investigation; `none` reads "no clear option" in the lines and "Other" only in Details. A legacy entry shows
+  a "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
+  way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Details" with
+  the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
+  its redacted input snapshot and SHA-256, §14.5); the page links to
   `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live) with action,
   actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
   model version — and as JSON —
