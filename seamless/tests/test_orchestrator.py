@@ -16,6 +16,7 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import DecisionStatus, Phase, PlanStatus, ReasonCode, Strategy
 from seamless_migrate.domain.models import (
     AdvisorNote,
+    AdvisorPolicy,
     AdvisorRecommendation,
     AdvisorSnapshot,
     CutoverWindow,
@@ -23,6 +24,7 @@ from seamless_migrate.domain.models import (
     Migration,
     Nic,
     Plan,
+    PolicyScope,
     Provider,
     SyncPass,
     VerificationConfig,
@@ -35,7 +37,7 @@ from seamless_migrate.executors.base import (
     StepResult,
     TransientStepError,
 )
-from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed
+from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed, Unprocessable
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
 from tests.factories import make_disk, make_vm
@@ -2282,6 +2284,122 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
         "cold",
         ["cold", "warm"],
     )
+
+
+def _finance(plan) -> AdvisorPolicy:
+    return AdvisorPolicy(
+        id="pol-finance",
+        name="Finance — approval required",
+        scope=PolicyScope(provider_ids=[plan.source_provider_id]),
+        mode="always_require_approval",
+        threshold=0.6,
+        require_override_reason=True,
+        updated_by="rina",
+    )
+
+
+#: a plan that would cut a cold migration over at once: only the advisor hold can stop it
+NO_GATE = {"require_approval": False, "auto_cutover": True}
+
+
+async def test_with_the_finance_policy_a_decision_waits_and_holds_its_migration(tmp_path, store):
+    """ADV-04: never auto_applied under the Finance policy, whatever the confidence; the migration
+    does not start until a human decides (SDD §5.4, §14.6)."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    assert (rec.decision.status, rec.decision.final_option, rec.decision.policy_id) == (
+        DecisionStatus.pending_approval,
+        None,
+        "pol-finance",
+    )
+    assert (m.advisor_hold, m.strategy) == (rec.id, Strategy.cold)
+    assert [e.kind for e in _audit(store)][-1] == "decision.pending_approval"
+    await asyncio.sleep(0.3)  # thirty ticks: no timeout applies the advice
+    assert (await h.migration(m.id)).phase == P.ready
+
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert (approved.decision.status, approved.decision.final_option) == (
+        DecisionStatus.approved,
+        "warm",
+    )
+    m = await h.wait_phase(m.id, P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.completed)
+    assert (m.strategy, m.advisor_hold) == (Strategy.warm, None)
+    decided = _audit(store)[-1]
+    assert (decided.kind, decided.actor, decided.data["before"]["status"]) == (
+        "decision.approved",
+        "user:rina",
+        "pending_approval",
+    )
+
+
+async def test_after_an_override_the_engine_runs_the_chosen_option(tmp_path, store):
+    """ADV-04 scenario 4: override to cold with a reason; the engine runs cold, the plan keeps
+    the choice and the audit trail records who overrode what."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await run_plan(h, plan)
+    [rec] = _recommendations(store)
+    with pytest.raises(Unprocessable, match="reason"):
+        await h.orch.override_recommendation(rec.id, "cold", "too short", "rina")
+    with pytest.raises(Unprocessable, match="not an eligible option"):
+        await h.orch.override_recommendation(
+            rec.id, "storage_handover", "No shared Ceph between the clouds", "rina"
+        )
+    overridden = await h.orch.override_recommendation(
+        rec.id, "cold", "The change window fits a cold cutover", "rina"
+    )
+    assert (overridden.decision.status, overridden.decision.final_option) == (
+        DecisionStatus.overridden,
+        "cold",
+    )
+    assert overridden.decision.reason_text == "The change window fits a cold cutover"
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.cutover, P.verifying, P.completed)
+    assert m.strategy == Strategy.cold and m.advisor_hold is None
+    assert (await h.plan(plan.id)).strategy_overrides == {"vm-1": Strategy.cold}
+    assert _audit(store)[-1].kind == "decision.overridden"
+
+
+async def test_approve_and_override_act_only_on_a_waiting_choice_that_can_still_change(
+    tmp_path, store
+):
+    """SDD §14.6: the migration's newest recommendation, while it is pending, blocked or ready;
+    PUT …/strategy cannot bypass a hold."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    with pytest.raises(NotAllowed, match="waits for approval"):
+        await h.orch.set_strategy(m.id, Strategy.warm, "bayu")
+    await h.orch.validate_plan(plan.id, "alice")  # a newer recommendation replaces the hold
+    older, newer = sorted(_recommendations(store), key=lambda r: r.created_at)
+    assert (await h.migration(m.id)).advisor_hold == newer.id
+    with pytest.raises(NotAllowed, match="newer"):
+        await h.orch.approve_recommendation(older.id, "rina")
+    store.put("migration", (await h.migration(m.id)).model_copy(update={"phase": P.precopy}))
+    with pytest.raises(NotAllowed, match="precopy"):
+        await h.orch.approve_recommendation(newer.id, "rina")
+
+
+async def test_a_validation_without_the_policy_lets_the_migration_go(tmp_path, store):
+    """A policy change applies from the next validation (SDD §14.6): the hold goes with it."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    store.delete("advisor_policy", "pol-finance")
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    assert (m.advisor_hold, m.strategy) == (None, Strategy.warm)
 
 
 async def test_a_revalidation_asks_and_records_nothing_for_a_migration_it_leaves_alone(

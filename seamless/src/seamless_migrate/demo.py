@@ -11,12 +11,14 @@ from __future__ import annotations
 import logging
 
 from .config import Settings
-from .domain.enums import Phase, ProviderKind, ProviderRole
+from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
+    AdvisorPolicy,
     ConversionHostConfig,
     Mappings,
     Migration,
     Plan,
+    PolicyScope,
     Provider,
     VerificationConfig,
 )
@@ -33,6 +35,7 @@ UNPLANNED_FINANCE_VMS = frozenset({"report-01", "batch-01"})
 VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
+FINANCE_POLICY = "Finance — approval required"
 
 DEMO_PROVIDERS = (
     Provider(
@@ -132,6 +135,22 @@ async def seed_demo(
                 stored.model_copy(update={"distribution": provider.distribution}),
                 expected_version=version,
             )
+    # SDD §14.6 (ADV-04): the spec's demo policy, in force before the demo plans are validated
+    if FINANCE_POLICY not in {p.name for p in await db.list("advisor_policy", AdvisorPolicy)}:
+        await db.put(
+            "advisor_policy",
+            AdvisorPolicy(
+                id="pol-finance",
+                name=FINANCE_POLICY,
+                scope=PolicyScope(provider_ids=["rhosp17-finance"]),
+                decision_types=[DecisionType.migration_strategy],
+                mode="always_require_approval",
+                threshold=settings.jev_min_confidence,
+                require_override_reason=True,
+                updated_by=DEMO_ACTOR,
+            ),
+            expected_version=0,
+        )
     existing_plans = {p.name for p in await db.list("plan", Plan)}
     for plan in await _plans(settings):
         if plan.name in existing_plans:

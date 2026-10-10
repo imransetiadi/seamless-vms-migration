@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 M = TypeVar("M", bound=BaseModel)
 
-KINDS = ("provider", "plan", "migration", "recommendation", "advisor_snapshot")
+KINDS = ("provider", "plan", "migration", "recommendation", "advisor_snapshot", "advisor_policy")
 
 JSONType = sa.JSON().with_variant(JSONB(), "postgresql")
 

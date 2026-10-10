@@ -7,7 +7,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.enums import Role, Strategy
-from ..domain.models import AdvisorRecommendation, PlanCreate, ValidationItem, ValidationReport
+from ..domain.models import (
+    AdvisorPolicy,
+    AdvisorRecommendation,
+    PlanCreate,
+    ValidationItem,
+    ValidationReport,
+)
 from ..stats import Stats, ThroughputPoint
 
 
@@ -168,3 +174,19 @@ __all__ = [
     "ValidationReport",
     "WavesAutoRequest",
 ]
+
+
+class PolicyList(BaseModel):
+    """GET /advisor/policies: the stored policies and the built-in default (SDD §12, §14.6)."""
+
+    items: list[AdvisorPolicy]
+    default: AdvisorPolicy
+
+
+class OverrideRequest(BaseModel):
+    """POST /advisor/recommendations/{id}/override (SDD §12, §14.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option: Strategy
+    reason: str | None = Field(default=None, max_length=_TEXT)

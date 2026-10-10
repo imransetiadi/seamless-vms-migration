@@ -29,6 +29,9 @@ AUDIT_KINDS = frozenset(
         "decision.overridden",
         "decision.below_threshold",
         "decision.fallback",
+        "policy.created",
+        "policy.updated",
+        "policy.deleted",
     }
 )
 PERSISTED_KINDS = frozenset(

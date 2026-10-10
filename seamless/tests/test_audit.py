@@ -42,6 +42,9 @@ def test_the_audit_kinds_are_the_persisted_kinds_sdd_lists():
         "decision.overridden",
         "decision.below_threshold",
         "decision.fallback",
+        "policy.created",
+        "policy.updated",
+        "policy.deleted",
     }
     assert AUDIT_KINDS <= PERSISTED_KINDS
 

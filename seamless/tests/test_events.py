@@ -57,6 +57,9 @@ def test_kind_catalog_matches_sdd():
         "decision.overridden",
         "decision.below_threshold",
         "decision.fallback",
+        "policy.created",
+        "policy.updated",
+        "policy.deleted",
     }
     assert EPHEMERAL_KINDS == {"migration.progress", "migration.log", "heartbeat"}
 

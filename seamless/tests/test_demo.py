@@ -4,7 +4,7 @@ from seamless_migrate.api.app import build_services
 from seamless_migrate.config import Settings
 from seamless_migrate.demo import DEMO_PLAN_NAMES, seed_demo
 from seamless_migrate.domain.enums import Phase, PlanStatus, ProviderKind, ProviderRole
-from seamless_migrate.domain.models import Mappings, Migration, Plan, Provider
+from seamless_migrate.domain.models import AdvisorPolicy, Mappings, Migration, Plan, Provider
 from seamless_migrate.orchestrator import NotAllowed
 from seamless_migrate.providers.fake import FakeSourceProvider
 
@@ -173,3 +173,21 @@ async def test_demo_leaves_finance_vms_a_new_plan_can_take(tmp_path, store):
     assert sorted(item.vm_name for item in report.migrations) == ["batch-01", "report-01"]
     with pytest.raises(NotAllowed, match="another plan"):
         await services.orchestrator.validate_plan(new_plan("web-01").id, "tester")
+
+
+async def test_demo_seeds_the_finance_approval_policy_once(tmp_path, store):
+    """SDD §14.6 (ADV-04): 'Finance — approval required' for the finance source provider, before
+    the demo plans are validated, and only once."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    await seed_demo(store, settings, services.orchestrator)
+    [policy] = store.list("advisor_policy", AdvisorPolicy)
+    assert (policy.name, policy.scope.provider_ids, policy.mode) == (
+        "Finance — approval required",
+        ["rhosp17-finance"],
+        "always_require_approval",
+    )
+    assert policy.require_override_reason and policy.decision_types == ["migration_strategy"]

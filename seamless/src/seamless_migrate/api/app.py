@@ -28,12 +28,19 @@ from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
 from ..executors.router import ExecutorRouter
-from ..orchestrator import BadRequest, NotAllowed, Orchestrator
+from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
 from ..providers.registry import ProviderRegistry
 from ..security.auth import TokenStore
 from ..store import ConflictError, NotFound, Store
-from . import routes_events, routes_migrations, routes_misc, routes_plans, routes_providers
+from . import (
+    routes_advisor,
+    routes_events,
+    routes_migrations,
+    routes_misc,
+    routes_plans,
+    routes_providers,
+)
 from .deps import ApiError, Services
 
 log = logging.getLogger(__name__)
@@ -102,6 +109,10 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(BadRequest)
     async def bad_request(_: Request, exc: BadRequest) -> JSONResponse:
         return _error(400, "bad_request", str(exc))
+
+    @app.exception_handler(Unprocessable)
+    async def unprocessable(_: Request, exc: Unprocessable) -> JSONResponse:
+        return _error(422, "validation_error", str(exc))
 
     @app.exception_handler(ProviderError)
     async def provider_error(_: Request, exc: ProviderError) -> JSONResponse:
@@ -357,7 +368,14 @@ def create_app(
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
-    for module in (routes_misc, routes_providers, routes_plans, routes_migrations, routes_events):
+    for module in (
+        routes_misc,
+        routes_advisor,
+        routes_providers,
+        routes_plans,
+        routes_migrations,
+        routes_events,
+    ):
         app.include_router(module.router, prefix=API_PREFIX)
     dist = settings.dashboard_dir
     if dist is not None and (Path(dist) / "index.html").is_file():

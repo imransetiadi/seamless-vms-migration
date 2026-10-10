@@ -26,7 +26,9 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
-from .ai.decision import Advice, decide, default_policy
+from .ai.decision import Advice, Approve, Override, decide
+from .ai.policies import resolve_policy
+from .ai.recommendations import LEGACY_PREFIX
 from .ai.redaction import redact
 from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
@@ -34,6 +36,7 @@ from .domain import fsm
 from .domain.enums import (
     SINGLE_SHOT_STRATEGIES,
     WARM_STRATEGIES,
+    DecisionStatus,
     DecisionType,
     Phase,
     PlanStatus,
@@ -44,6 +47,7 @@ from .domain.enums import (
 from .domain.models import (
     AdvisorModelInfo,
     AdvisorNote,
+    AdvisorPolicy,
     AdvisorRecommendation,
     AdvisorSubject,
     Approval,
@@ -62,6 +66,7 @@ from .domain.models import (
     VMRef,
     invalid_plan_settings,
     keep_sync_history,
+    new_recommendation_id,
     next_pass_number,
     repeated_vm_ids,
     utcnow,
@@ -133,6 +138,10 @@ class NotAllowed(OrchestratorError):
 
 class BadRequest(OrchestratorError, ValueError):
     """The request is invalid (HTTP 400)."""
+
+
+class Unprocessable(OrchestratorError, ValueError):
+    """The request is well formed but cannot be applied as given (HTTP 422)."""
 
 
 class VerificationFailed(PermanentStepError):
@@ -465,6 +474,14 @@ class Orchestrator:
                 "from vm_ids"
             )
         params = params_for_plan(plan)
+        # SDD §14.6: the policy in force for the plan's strategy decisions
+        policy = resolve_policy(
+            await self.db.list("advisor_policy", AdvisorPolicy),
+            plan.id,
+            plan.source_provider_id,
+            DecisionType.migration_strategy,
+            self.settings,
+        )
         items: list[ValidationItem] = []
         for vm in vms:
             findings = run_preflight(
@@ -490,11 +507,10 @@ class Orchestrator:
             if self.advisor is not None and automatic and chooses:
                 advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
             decision = None
+            rec_id = new_recommendation_id()
             if advice is not None:
                 # SDD §14.4: decide() takes the decision; the engine reads only its final option
-                decision = decide(
-                    advice, default_policy(self.settings), 0, strategy.value, now=self._now()
-                )
+                decision = decide(advice, policy, 0, strategy.value, now=self._now())
                 final = decision.final_option
                 match = next((e for e in estimates if e.strategy == final), None)
                 if match is not None and match.eligible and match.strategy != strategy:
@@ -506,14 +522,28 @@ class Orchestrator:
             migration = existing.get(vm.source_id) or await self._create_migration(
                 plan, vm, strategy, actor
             )
+            # a decision that waits for approval holds the migration from the same write on
+            # (SDD §5.4, §14.6); any other validation clears an earlier hold
+            waiting = decision is not None and decision.status == DecisionStatus.pending_approval
             migration = await self._apply_validation(
-                migration.id, plan, vm, strategy, why, estimates, findings, actor, resolved
+                migration.id,
+                plan,
+                vm,
+                strategy,
+                why,
+                estimates,
+                findings,
+                actor,
+                resolved,
+                hold=rec_id if waiting else None,
             )
             # recorded only when this validation took the choice (ready or blocked now): one that
             # went in flight meanwhile was left alone and runs what it ran
             validated = migration.phase in (P.ready, P.blocked)
             if advice is not None and decision is not None and validated:
-                await self._record_strategy_recommendation(plan, vm, migration, advice, decision)
+                await self._record_strategy_recommendation(
+                    plan, vm, migration, advice, decision, rec_id
+                )
             items.append(
                 ValidationItem(
                     migration_id=migration.id,
@@ -587,6 +617,8 @@ class Orchestrator:
         findings: list[Finding],
         actor: str,
         resolved: Mappings | None = None,
+        *,
+        hold: str | None = None,
     ) -> Migration:
         no_eligible = not any(e.eligible for e in estimates)
         blocked = has_blocker(findings) or no_eligible
@@ -607,6 +639,7 @@ class Orchestrator:
             m.resolved_mappings = resolved or Mappings()
             m.wave_id = wave.id if wave else None
             m.bytes_total = vm.used_bytes
+            m.advisor_hold = hold
             # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
             # stay - strategy notes of earlier versions are listed as legacy recommendations
             m.error = None
@@ -631,7 +664,13 @@ class Orchestrator:
         return m
 
     async def _record_strategy_recommendation(
-        self, plan: Plan, vm: VMRef, migration: Migration, advice: Advice, decision: Decision
+        self,
+        plan: Plan,
+        vm: VMRef,
+        migration: Migration,
+        advice: Advice,
+        decision: Decision,
+        rec_id: str,
     ) -> AdvisorRecommendation:
         """Store the strategy recommendation, its decision and its input; audit both (SDD §14.4,
         §14.5)."""
@@ -649,6 +688,7 @@ class Orchestrator:
             now=decision.decided_at,
         )
         rec = AdvisorRecommendation(
+            id=rec_id,
             created_at=decision.decided_at,
             decision_type=DecisionType.migration_strategy,
             subject=AdvisorSubject(kind="vm", id=vm.source_id, name=vm.name),
@@ -1103,6 +1143,11 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in REVALIDATABLE:
                 raise NotAllowed(f"the strategy cannot change in {m.phase}")
+            if m.advisor_hold is not None:
+                raise NotAllowed(
+                    f"the advisor's decision ({m.advisor_hold}) waits for approval: approve or "
+                    "override it (advisor.approve)"
+                )
             est = m.estimate_for(strategy)
             if est is None:
                 raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
@@ -1135,6 +1180,101 @@ class Orchestrator:
             data={"strategy_overrides": {m.vm.source_id: str(strategy)}},
         )
         return m
+
+    async def approve_recommendation(self, rec_id: str, actor: str) -> AdvisorRecommendation:
+        """Apply the advisor's recommended option (SDD §14.6)."""
+        return await self._decide_recommendation(rec_id, Approve(user=actor), actor)
+
+    async def override_recommendation(
+        self, rec_id: str, option: str, reason: str | None, actor: str
+    ) -> AdvisorRecommendation:
+        """Choose another eligible option than the advisor did (SDD §14.6)."""
+        reason = (reason or "").strip() or None
+        return await self._decide_recommendation(
+            rec_id, Override(user=actor, option=option, reason=reason), actor
+        )
+
+    async def _decide_recommendation(
+        self, rec_id: str, action: Approve | Override, actor: str
+    ) -> AdvisorRecommendation:
+        if rec_id.startswith(LEGACY_PREFIX):
+            raise NotAllowed("a legacy entry is history: it cannot be approved or overridden")
+        rec = await self.db.get("recommendation", rec_id, AdvisorRecommendation)
+        if rec.migration_id is None or rec.plan_id is None:
+            raise NotAllowed(f"recommendation {rec_id} decides nothing a person can change yet")
+        mid, plan_id = rec.migration_id, rec.plan_id
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+            stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
+            newest = max(stored, key=lambda r: (r.created_at, r.id))
+            if newest.id != rec_id:
+                raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
+            rec = newest
+            plan = await self._plan(plan_id)
+            policies = await self.db.list("advisor_policy", AdvisorPolicy)
+            policy = resolve_policy(
+                policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
+            )
+            if isinstance(action, Override) and policy.require_override_reason:
+                if len(action.reason or "") < 10:
+                    raise Unprocessable(
+                        f"policy {policy.id} requires an override reason of at least 10 characters"
+                    )
+            m, v = await self._load(mid)
+            if m.phase not in REVALIDATABLE:
+                raise NotAllowed(f"the strategy cannot change in {m.phase}")
+            eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
+            advice = Advice(
+                option=rec.recommendation.option,
+                confidence=rec.recommendation.confidence,
+                scope=eligible,
+                options=eligible,
+            )
+            try:
+                decision = decide(
+                    advice, policy, 0, m.strategy.value, action=action, now=self._now()
+                )
+            except ValueError as exc:
+                if isinstance(action, Override):
+                    raise Unprocessable(str(exc)) from None
+                raise NotAllowed(str(exc)) from None
+            before = rec.decision
+            rec = rec.model_copy(update={"decision": decision})
+            await self.db.put("recommendation", rec)
+            final = Strategy(str(decision.final_option))
+            changed = final != m.strategy
+            m.strategy = final
+            m.estimate = m.estimate_for(final)
+            m.advisor_hold = None
+            if changed:  # the approval was given for the previous strategy (SDD §5.4)
+                m.approvals = []
+                m.cutover_requested = False
+                m.force_window = False
+            await self._save(m, v)
+        if isinstance(action, Override):
+            source_id = m.vm.source_id
+
+            def keep(fresh: Plan) -> None:
+                fresh.strategy_overrides[source_id] = final
+
+            plan = await self._update_plan(plan_id, keep)
+            await self._emit(
+                "plan.updated",
+                f"{plan.name}: strategy override for {m.vm.name}",
+                plan_id=plan.id,
+                actor=actor,
+                data={"strategy_overrides": {source_id: str(final)}},
+            )
+        kind, message, by, data = decision_event(rec, before)
+        await self._emit(kind, message, migration=m, actor=by, data=data)
+        if changed:
+            await self._emit(
+                "migration.action",
+                f"{m.vm.name}: strategy set to {final} by the advisor decision",
+                migration=m,
+                actor=actor,
+                data={"action": "strategy", "strategy": str(final)},
+            )
+        return rec
 
     # ------------------------------------------------------------------------------------------
     # lifecycle and tick loop
@@ -1374,6 +1514,8 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in allowed:
                 return False
+            if m.advisor_hold is not None:
+                return False  # its advisor decision waits for approval (SDD §5.4, §14.6)
             # the tick chose it for its strategy on its snapshot; set_strategy under this lock may
             # have changed it since: a pre-copy is a warm migration's, a cutover from ready a
             # single-shot one's (SDD §8)

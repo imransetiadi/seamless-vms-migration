@@ -67,6 +67,10 @@ def new_recommendation_id() -> str:
     return f"rec-{secrets.token_hex(6)}"
 
 
+def new_policy_id() -> str:
+    return f"pol-{secrets.token_hex(6)}"
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -478,6 +482,42 @@ class AdvisorSnapshot(_Model):
         return self.sha256
 
 
+class PolicyScope(_Model):
+    """Where a policy applies: plans or source providers; neither = everywhere (SDD §14.6)."""
+
+    provider_ids: list[str] = Field(default_factory=list)
+    plan_ids: list[str] = Field(default_factory=list)
+
+
+class AdvisorPolicySpec(_Model):
+    """A policy as it is written (POST/PUT /advisor/policies, SDD §12, §14.6)."""
+
+    name: str = Field(min_length=1, max_length=200)
+    scope: PolicyScope = Field(default_factory=PolicyScope)
+    #: none = every decision type
+    decision_types: list[DecisionType] = Field(default_factory=list)
+    mode: Literal["auto_apply_above_threshold", "always_require_approval"]
+    threshold: float = Field(ge=0, le=1)
+    #: TODO(ADV-02): the spec's default of 3 applies once recommendations carry evidence
+    min_evidence_for_auto_apply: int = Field(default=0, ge=0, le=100)
+    require_override_reason: bool = True
+
+    @model_validator(mode="after")
+    def _one_scope_level(self) -> AdvisorPolicySpec:
+        if self.scope.provider_ids and self.scope.plan_ids:
+            raise ValueError("a policy scopes either providers or plans, not both")
+        return self
+
+
+class AdvisorPolicy(AdvisorPolicySpec):
+    """A stored advisor policy (document kind ``advisor_policy``, SDD §4.2, §14.6)."""
+
+    id: str = Field(default_factory=new_policy_id)
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_by: str
+
+
 class Approval(_Model):
     actor: str
     at: UTCDateTime = Field(default_factory=utcnow)
@@ -522,6 +562,8 @@ class Migration(_Model):
     #: cutover window bypass granted with the request (SDD §5.4 rule 2); persisted
     force_window: bool = False
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
+    #: the recommendation whose decision waits for approval: no start meanwhile (SDD §5.4, §14.6)
+    advisor_hold: str | None = None
     review_required: bool = False
     review_reason: str | None = None
     destination_server_id: str | None = None

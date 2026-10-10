@@ -1,0 +1,131 @@
+"""Advisor policies, approval and override (SDD §12, §13.2, §14.6, ADV-04)."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, Request, Response
+
+from ..ai.policies import builtin_default
+from ..domain.enums import Role
+from ..domain.models import AdvisorPolicy, AdvisorPolicySpec, AdvisorRecommendation, Plan, Provider
+from ..events import emit
+from ..security.auth import Principal
+from ..store import ConflictError, NotFound
+from .deps import ApiError, Services, require_permission, require_role, services
+from .schemas import OverrideRequest, PolicyList
+
+router = APIRouter(tags=["advisor"])
+
+
+async def _check_scope(svc: Services, spec: AdvisorPolicySpec) -> None:
+    """A policy names providers and plans that exist (422 otherwise)."""
+    providers = {p.id for p in await svc.db.list("provider", Provider)}
+    plans = {p.id for p in await svc.db.list("plan", Plan)}
+    unknown = [p for p in spec.scope.provider_ids if p not in providers] + [
+        p for p in spec.scope.plan_ids if p not in plans
+    ]
+    if unknown:
+        raise ApiError(422, "validation_error", f"unknown provider or plan: {', '.join(unknown)}")
+
+
+async def _audit(
+    svc: Services, kind: str, principal: Principal, policy_id: str, before: Any, after: Any
+) -> None:
+    def dump(policy: AdvisorPolicy | None) -> Any:
+        return policy.model_dump(mode="json") if policy is not None else None
+
+    await emit(
+        svc.store,
+        svc.bus,
+        kind,
+        f"advisor policy {policy_id} {kind.removeprefix('policy.')}",
+        actor=f"user:{principal.name}",
+        data={"target_id": policy_id, "before": dump(before), "after": dump(after)},
+    )
+
+
+@router.get("/advisor/policies", response_model=PolicyList)
+async def list_policies(
+    request: Request, _: Principal = Depends(require_role(Role.viewer))
+) -> PolicyList:
+    svc = services(request)
+    items = await svc.db.list("advisor_policy", AdvisorPolicy)
+    return PolicyList(items=items, default=builtin_default(svc.settings))
+
+
+@router.post("/advisor/policies", response_model=AdvisorPolicy, status_code=201)
+async def create_policy(
+    body: AdvisorPolicySpec,
+    request: Request,
+    principal: Principal = Depends(require_permission("advisor.policy.manage")),
+) -> AdvisorPolicy:
+    svc = services(request)
+    await _check_scope(svc, body)
+    policy = AdvisorPolicy(**body.model_dump(), updated_by=principal.name)
+    await svc.db.put("advisor_policy", policy, expected_version=0)
+    await _audit(svc, "policy.created", principal, policy.id, None, policy)
+    return policy
+
+
+@router.put("/advisor/policies/{policy_id}", response_model=AdvisorPolicy)
+async def replace_policy(
+    policy_id: str,
+    body: AdvisorPolicySpec,
+    request: Request,
+    principal: Principal = Depends(require_permission("advisor.policy.manage")),
+) -> AdvisorPolicy:
+    svc = services(request)
+    await _check_scope(svc, body)
+    before, version = await svc.db.get_versioned("advisor_policy", policy_id, AdvisorPolicy)
+    after = AdvisorPolicy(
+        **body.model_dump(),
+        id=policy_id,
+        created_at=before.created_at,
+        updated_by=principal.name,
+    )
+    try:
+        await svc.db.put("advisor_policy", after, expected_version=version)
+    except ConflictError:
+        raise ApiError(
+            409, "conflict", f"policy {policy_id} changed meanwhile; try again"
+        ) from None
+    await _audit(svc, "policy.updated", principal, policy_id, before, after)
+    return after
+
+
+@router.delete("/advisor/policies/{policy_id}", status_code=204)
+async def delete_policy(
+    policy_id: str,
+    request: Request,
+    principal: Principal = Depends(require_permission("advisor.policy.manage")),
+) -> Response:
+    svc = services(request)
+    before = await svc.db.get("advisor_policy", policy_id, AdvisorPolicy)
+    try:
+        await svc.db.delete("advisor_policy", policy_id)
+    except NotFound:
+        raise  # deleted meanwhile
+    await _audit(svc, "policy.deleted", principal, policy_id, before, None)
+    return Response(status_code=204)
+
+
+@router.post("/advisor/recommendations/{rec_id}/approve", response_model=AdvisorRecommendation)
+async def approve_recommendation(
+    rec_id: str,
+    request: Request,
+    principal: Principal = Depends(require_permission("advisor.approve")),
+) -> AdvisorRecommendation:
+    return await services(request).orchestrator.approve_recommendation(rec_id, principal.name)
+
+
+@router.post("/advisor/recommendations/{rec_id}/override", response_model=AdvisorRecommendation)
+async def override_recommendation(
+    rec_id: str,
+    body: OverrideRequest,
+    request: Request,
+    principal: Principal = Depends(require_permission("advisor.approve")),
+) -> AdvisorRecommendation:
+    return await services(request).orchestrator.override_recommendation(
+        rec_id, str(body.option), body.reason, principal.name
+    )

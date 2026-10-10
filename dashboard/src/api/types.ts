@@ -496,6 +496,9 @@ export const PERSISTED_EVENT_KINDS = [
   'decision.overridden',
   'decision.below_threshold',
   'decision.fallback',
+  'policy.created',
+  'policy.updated',
+  'policy.deleted',
 ] as const;
 export type PersistedEventKind = (typeof PERSISTED_EVENT_KINDS)[number];
 
