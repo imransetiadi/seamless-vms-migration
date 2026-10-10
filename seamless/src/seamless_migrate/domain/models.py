@@ -252,6 +252,42 @@ class CutoverWindow(_Model):
 DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached target .*Multi-User"]
 
 
+ProbeKind = Literal["tcp", "http", "https"]
+
+
+class AppProbe(_Model):
+    """An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of ``path``."""
+
+    kind: ProbeKind
+    port: int
+    #: http(s) only
+    path: str = "/"
+    #: http(s) only: the status that passes; None = any 2xx or 3xx
+    expect_status: int | None = None
+
+
+class ProbeResult(_Model):
+    """What one application probe found (SDD §7.5): unreachable is not failed (ADV-18)."""
+
+    target: str
+    kind: ProbeKind
+    result: Literal["passed", "failed", "unreachable"]
+    #: the time to the service's answer; None when it did not answer
+    latency_ms: float | None = None
+    at: UTCDateTime
+    detail: str = ""
+
+
+class VerificationRecord(_Model):
+    """The last verification of a migration: its checks and probe results (SDD §7.5)."""
+
+    at: UTCDateTime
+    passed: bool
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    probes: list[ProbeResult] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class VerificationConfig(_Model):
     tcp_ports: list[int] = Field(default_factory=list)
     # Windows guests probe these instead and skip the console check (SDD §7.5)
@@ -263,6 +299,8 @@ class VerificationConfig(_Model):
     timeout_s: int = 600
     auto_rollback: bool = True
     use_advisor: bool = True
+    #: the application probes of every VM; Plan.probe_overrides replaces them per VM (ADV-18)
+    app_probes: list[AppProbe] = Field(default_factory=list)
 
 
 class Wave(_Model):
@@ -311,10 +349,35 @@ class PlanSpec(_Model):
     estimator_overrides: dict[str, float] = Field(default_factory=dict)
     handover: HandoverConfig = Field(default_factory=HandoverConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
+    #: per VM (source id): its application probes instead of verification.app_probes; [] = none
+    probe_overrides: dict[str, list[AppProbe]] = Field(default_factory=dict)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
 
 
 PlanCreate = PlanSpec
+
+#: SDD §12: what one probe list may hold, and the longest http(s) path
+MAX_PROBES_PER_VM = 10
+MAX_PROBE_PATH = 200
+
+
+def _probe_problems(where: str, probes: Sequence[AppProbe]) -> list[str]:
+    problems = [
+        f"{where}: port {p.port} outside 1-65535" for p in probes if not 1 <= p.port <= 65535
+    ]
+    problems += [
+        f"{where}: path {p.path!r} must start with '/' (at most {MAX_PROBE_PATH} characters)"
+        for p in probes
+        if p.kind != "tcp" and (not p.path.startswith("/") or len(p.path) > MAX_PROBE_PATH)
+    ]
+    problems += [
+        f"{where}: expect_status {p.expect_status} outside 100-599"
+        for p in probes
+        if p.expect_status is not None and not 100 <= p.expect_status <= 599
+    ]
+    if len(probes) > MAX_PROBES_PER_VM:
+        problems.append(f"{where}: {len(probes)} probes, at most {MAX_PROBES_PER_VM}")
+    return problems
 
 
 def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
@@ -338,6 +401,10 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
         problems.append(
             f"verification.timeout_s must not be negative (got {verification.timeout_s})"
         )
+    # application probes (SDD §7.5, §12, ADV-18)
+    problems += _probe_problems("verification.app_probes", verification.app_probes)
+    for vm_id, probes in spec.probe_overrides.items():
+        problems += _probe_problems(f"probe_overrides[{vm_id}]", probes)
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")
@@ -594,6 +661,10 @@ class Migration(_Model):
     downtime_model_s: float | None = None
     #: invariant violations found when it completed (SDD §5.5)
     data_issues: list[str] = Field(default_factory=list)
+    #: the last verification: its checks and application probe results (SDD §7.5, ADV-18)
+    verification: VerificationRecord | None = None
+    #: the rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan
+    suggested_probes: list[AppProbe] = Field(default_factory=list)
     review_required: bool = False
     review_reason: str | None = None
     destination_server_id: str | None = None

@@ -342,6 +342,39 @@ async def test_verification_contradiction_sets_review_never_flips_pass():
     assert (await advisor.review_verification(make_vm(), result())).data["review_required"] is False
 
 
+async def test_the_review_says_boot_verified_once_and_names_other_verdicts_once():
+    """ADV-18: the note never reads "verified, verified" (SDD §14.2)."""
+    advisor, _ = advisor_for({"screen": {"recommendation": {"action": "pass"}}}, settings=ON_PREM)
+    note = await advisor.review_verification(make_vm(), result())
+    assert note.summary == "Boot verified; no review needed"
+    mixed = load_fixture("verify")
+    mixed["results"][1].update(verdict="unsupported", action="auto")
+    advisor, _ = advisor_for(
+        {"screen": {"recommendation": {"action": "pass"}}, "verify": mixed}, settings=ON_PREM
+    )
+    note = await advisor.review_verification(make_vm(), result())
+    assert note.summary == (
+        "Boot claims verified and unsupported, none contradicted; no review needed"
+    )
+
+
+async def test_a_reason_from_the_rules_makes_the_review_required():
+    """SDD §7.5/§14.2: a database VM without an application probe is never 'no review needed'."""
+    reason = "database VM without an application probe: only its boot was verified"
+    advisor, _ = advisor_for({"screen": {"recommendation": {"action": "pass"}}}, settings=ON_PREM)
+    note = await advisor.review_verification(make_vm(), result(), review_reason=reason)
+    assert (note.data["review_required"], note.data["review_reason"]) == (True, reason)
+    assert note.summary == f"Review required: {reason}"
+    # a contradiction adds its own reason after the rules'
+    contradicted = load_fixture("verify")
+    contradicted["results"][1].update(verdict="contradicted", action="auto")
+    advisor, _ = advisor_for(
+        {"screen": {"recommendation": {"action": "pass"}}, "verify": contradicted}, settings=ON_PREM
+    )
+    note = await advisor.review_verification(make_vm(), result(), review_reason=reason)
+    assert note.data["review_reason"].startswith(reason + "; advisor contradicted: ")
+
+
 async def test_verification_review_skipped_without_jev():
     assert await Advisor(None, Settings()).review_verification(make_vm(), result()) is None
 

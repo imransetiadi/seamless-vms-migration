@@ -1,5 +1,11 @@
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
-from seamless_migrate.domain.models import HandoverConfig, Mappings, Nic
+from seamless_migrate.domain.models import (
+    AppProbe,
+    HandoverConfig,
+    Mappings,
+    Nic,
+    VerificationConfig,
+)
 from seamless_migrate.planning.preflight import (
     CATALOG,
     DestinationInventory,
@@ -93,6 +99,7 @@ def test_catalog_is_complete():
         "GUEST_CONVERSION_UNSUPPORTED",
         "CONV_HOST_MISSING",
         "HANDOVER_BACKEND_UNMAPPED",
+        "APP_PROBE_MISSING",
     }
 
 
@@ -570,6 +577,34 @@ def test_finding_handover_backend_unmapped():
     assert f.severity == Severity.info and f.strategies == [Strategy.storage_handover]
     ok = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@b#p"}))
     assert check(plan=ok) == []
+
+
+def test_finding_app_probe_missing_for_a_database_vm_without_an_application_probe():
+    """SDD §9.3, ADV-18: a database VM verified only by its boot is flagged at validation."""
+    db = make_vm(source_id="vm-db", name="ledger-db-01", tags={"role": "postgresql"})
+    f = only(check(vm=db), "APP_PROBE_MISSING")
+    assert f.severity == Severity.warning and f.strategies == []
+    assert f.message == (
+        "ledger-db-01 is a database VM without an application probe: verification would check only "
+        "that it booted. Suggested: TCP 5432."
+    )
+    probe = AppProbe(kind="tcp", port=5432)
+
+    def flagged(plan):
+        return "APP_PROBE_MISSING" in [x.code for x in check(vm=db, plan=plan)]
+
+    # a probe for every VM, or one for this VM, clears it; an empty override does not
+    assert not flagged(make_plan(verification=VerificationConfig(app_probes=[probe])))
+    assert not flagged(make_plan(probe_overrides={"vm-db": [probe]}))
+    assert flagged(
+        make_plan(
+            verification=VerificationConfig(app_probes=[probe]), probe_overrides={"vm-db": []}
+        )
+    )
+    # a database that names no engine gets no suggestion; a web VM is never flagged
+    plain = only(check(vm=make_vm(name="dc2-db-01")), "APP_PROBE_MISSING")
+    assert plain.message.endswith("verification would check only that it booted.")
+    assert "APP_PROBE_MISSING" not in [x.code for x in check()]
 
 
 def test_catalog_matches_sdd_9_3():

@@ -248,11 +248,15 @@ class Advisor:
         )
 
     # -- verification review -------------------------------------------------------------------
-    async def review_verification(self, vm: VMRef, result: Any) -> AdvisorNote | None:
+    async def review_verification(
+        self, vm: VMRef, result: Any, review_reason: str | None = None
+    ) -> AdvisorNote | None:
         """Screen the console excerpt and cross-check the boot claims; may flag for review.
 
-        Returns a note whose ``data["review_required"]``/``data["review_reason"]`` the caller
-        applies to the migration. ``result.passed`` is never modified.
+        ``review_reason`` is what the verification rules ask review for (SDD §7.5: a database VM
+        without an application probe, an unreachable probe); it comes first. Returns a note whose
+        ``data["review_required"]``/``data["review_reason"]`` the caller applies to the migration.
+        ``result.passed`` is never modified.
         """
         if not self.jev_enabled:
             return None
@@ -263,8 +267,7 @@ class Advisor:
             for c in result.checks
         )
         evidence = [{"id": "checks", "text": self._redact(checks, [vm.name])}]
-        review_required = False
-        review_reason: str | None = None
+        reasons: list[str] = [review_reason] if review_reason else []
         screen: dict[str, Any] = {}
         console = (result.evidence or {}).get("console")
         # with a remote model the excerpt stays in this installation unless allowed (SDD §13.4)
@@ -284,8 +287,7 @@ class Advisor:
             except JevUnavailable as exc:
                 screen = {"action": "unavailable", "reason": str(exc)}
             if screen.get("action") == "block":
-                review_required = True
-                review_reason = INJECTION_REASON
+                reasons.append(INJECTION_REASON)
             elif screen.get("action") == "pass":
                 evidence.append({"id": "console", "text": excerpt})
             # review / skip / unavailable: untrusted text stays out of the evidence
@@ -300,27 +302,35 @@ class Advisor:
                 source="jev",
                 summary=f"Verification review unavailable: {exc}",
                 data={
-                    "review_required": review_required,
-                    "review_reason": review_reason,
+                    "review_required": bool(reasons),
+                    "review_reason": "; ".join(reasons) or None,
                     "screen": screen,
                     "results": [],
                     "passed": bool(result.passed),
                     "console_sent": console_sent,
                 },
             )
-        for item in results:
-            if item.get("verdict") == "contradicted" and item.get("action") == "auto":
-                review_required = True
-                review_reason = review_reason or f"advisor contradicted: {item.get('claim')}"
+        contradicted = [
+            item
+            for item in results
+            if item.get("verdict") == "contradicted" and item.get("action") == "auto"
+        ]
+        if contradicted and INJECTION_REASON not in reasons:
+            reasons.append(f"advisor contradicted: {contradicted[0].get('claim')}")
+        review_required = bool(reasons)
+        review_reason = "; ".join(reasons) or None
         confidences = [
             float(i["confidence"]) for i in results if isinstance(i.get("confidence"), int | float)
         ]
-        verdicts = ", ".join(f"{i.get('verdict')}" for i in results) or "none"
-        summary = (
-            f"Review required: {review_reason}"
-            if review_required
-            else f"Boot claims {verdicts}; no review needed"
-        )
+        # each verdict once, in the order seen: never "verified, verified" (ADV-18)
+        verdicts = list(dict.fromkeys(str(i.get("verdict")) for i in results))
+        if review_required:
+            summary = f"Review required: {review_reason}"
+        elif verdicts == ["verified"]:
+            summary = "Boot verified; no review needed"
+        else:
+            named = " and ".join(verdicts) or "none"
+            summary = f"Boot claims {named}, none contradicted; no review needed"
         if console and not console_sent:
             summary += (
                 ". The console excerpt stayed in this installation (remote advisor): "

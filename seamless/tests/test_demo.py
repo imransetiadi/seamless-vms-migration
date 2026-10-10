@@ -260,7 +260,10 @@ async def test_every_demo_migration_keeps_the_invariants(tmp_path, store):
                         await orch.approve(m.id, "rina", "Checked for the property test")
                     except NotAllowed:
                         continue
-            if all(m.phase in (Phase.completed, Phase.cancelled) for m in migrations):
+            # billing-db-01's service is down on purpose and it rolls back (ADV-18)
+            if all(
+                m.phase in (Phase.completed, Phase.cancelled, Phase.rolled_back) for m in migrations
+            ):
                 break
             await asyncio.sleep(0.05)
     finally:
@@ -274,3 +277,61 @@ async def test_every_demo_migration_keeps_the_invariants(tmp_path, store):
         final = [p for p in m.sync_passes if p.kind == "final"]
         if final:
             assert m.actual_downtime_s >= final[-1].duration_s, m.vm.name
+
+
+async def test_the_demo_probes_its_finance_databases_and_rolls_back_the_one_whose_service_is_down(
+    tmp_path, store
+):
+    """ADV-18 (SDD §7.4): the finance plan probes its three databases with their suggested probes;
+    billing-db-01 carries `demo-fault: app-down`, so its probe fails after boot and the plan's
+    automatic rollback rolls it back; the VMware plan probes nothing, its databases are flagged."""
+    import asyncio
+
+    from seamless_migrate.demo import FINANCE_PLAN, VMWARE_PLAN
+    from seamless_migrate.domain.models import AppProbe
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    plans = {p.name: p for p in store.list("plan", Plan)}
+    finance, vmware = plans[FINANCE_PLAN], plans[VMWARE_PLAN]
+    names = {m.vm.source_id: m.vm.name for m in store.list("migration", Migration)}
+    assert {names[vm_id]: probes for vm_id, probes in finance.probe_overrides.items()} == {
+        "ledger-db-01": [AppProbe(kind="tcp", port=5432)],
+        "payroll-db-01": [AppProbe(kind="tcp", port=3306)],
+        "billing-db-01": [AppProbe(kind="tcp", port=1521)],
+    }
+    assert vmware.probe_overrides == {} and vmware.verification.app_probes == []
+    flagged = sorted(
+        m.vm.name
+        for m in store.list("migration", Migration)
+        if m.plan_id == vmware.id and "APP_PROBE_MISSING" in [f.code for f in m.findings]
+    )
+    assert flagged == ["dc2-db-01", "dc2-db-02"]
+
+    orch = services.orchestrator
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+        while loop.time() < deadline:
+            by_name = {
+                m.vm.name: m for m in store.list("migration", Migration) if m.plan_id == finance.id
+            }
+            if (
+                by_name["billing-db-01"].phase == Phase.rolled_back
+                and by_name["ledger-db-01"].phase == Phase.completed
+            ):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await orch.stop()
+    billing, ledger = by_name["billing-db-01"], by_name["ledger-db-01"]
+    assert billing.phase == Phase.rolled_back, billing.phase
+    assert billing.verification is not None and billing.verification.passed is False
+    assert [(p.kind, p.result) for p in billing.verification.probes] == [("tcp", "failed")]
+    assert billing.verification.probes[0].target.endswith(":1521")
+    assert ledger.phase == Phase.completed and ledger.review_required is False
+    assert [p.result for p in ledger.verification.probes] == ["passed"]

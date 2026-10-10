@@ -91,11 +91,12 @@ from .planning.estimator import (
     params_for_plan,
 )
 from .planning.preflight import has_blocker, resolve_mappings, run_preflight
+from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError
 from .store import AsyncStore, ConflictError, NotFound, Store
-from .verification import VerificationResult, Verifier
+from .verification import VerificationResult, Verifier, review_reason
 
 log = logging.getLogger(__name__)
 P = Phase
@@ -666,6 +667,8 @@ class Orchestrator:
             m.estimates = estimates
             m.estimate = next((e for e in estimates if e.strategy == strategy), None)
             m.findings = findings
+            # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+            m.suggested_probes = suggest_probes(vm)
             m.resolved_mappings = resolved or Mappings()
             m.wave_id = wave.id if wave else None
             m.bytes_total = vm.used_bytes
@@ -2137,11 +2140,16 @@ class Orchestrator:
         if result is None:
             return
         note: AdvisorNote | None = None
+        # what the rules ask review for (SDD §7.5, ADV-18): an unreachable probe, a database VM
+        # that only booted - with or without the advisor
+        rules_reason = review_reason(m.vm, plan, result) if result.passed else None
         # SDD §14.2: the advisor may flag a *passed* verification; a failed one carries
         # provider error text (endpoints) the review cannot change and must not ship
         if plan.verification.use_advisor and self.advisor is not None and result.passed:
             try:
-                note = await self.advisor.review_verification(m.vm, result)
+                note = await self.advisor.review_verification(
+                    m.vm, result, review_reason=rules_reason
+                )
             except Exception:
                 log.warning("verification review failed", exc_info=True)
         summary = result.summary()
@@ -2149,6 +2157,11 @@ class Orchestrator:
             cur, v = await self._load(m.id)
             if cur.phase != P.verifying:
                 return
+            # the checks and probe results, passed or failed (SDD §7.5)
+            cur.verification = result.record(self._now())
+            if rules_reason:
+                cur.review_required = True
+                cur.review_reason = rules_reason
             if note is not None:
                 cur.advisor_notes.append(note)
                 if note.data.get("review_required"):

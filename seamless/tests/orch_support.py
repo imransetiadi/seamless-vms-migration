@@ -51,6 +51,8 @@ class StaticDestination:
         self.status = "ACTIVE"
         self.console: str | None = "[  OK  ] Reached target Multi-User System.\nweb-01 login: "
         self.deleted: list[str] = []
+        #: the simulated guest's answer per probed port (SDD §7.5): passed, failed or unreachable
+        self.services: dict[int, str] = {}
 
     async def check(self) -> dict[str, Any]:
         return {"admin": True, "compute_microversion": "2.95", "ovn": True}
@@ -80,6 +82,17 @@ class StaticDestination:
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
         return self.console
+
+    async def probe_service(self, server_id: str, vm: Any, probe: Any, address: str) -> Any:
+        from seamless_migrate.verification import ProbeAnswer
+
+        result = self.services.get(probe.port, "failed")
+        detail = {
+            "passed": f"connected to {address}:{probe.port}",
+            "failed": f"{address}:{probe.port} refused the connection",
+            "unreachable": f"{address}:{probe.port} unreachable (TimeoutError)",
+        }[result]
+        return ProbeAnswer(result, detail, result == "passed")
 
     async def delete_server(self, server_id: str) -> None:
         self.deleted.append(server_id)

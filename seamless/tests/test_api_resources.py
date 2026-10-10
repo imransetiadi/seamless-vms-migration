@@ -167,6 +167,75 @@ def test_plan_rejects_out_of_range_tcp_port(api):
     assert patched.status_code == 422 and "65536" in patched.json()["error"]["message"]
 
 
+def test_plan_takes_application_probes_and_refuses_bad_ones(api):
+    """SDD §7.5, §12 (ADV-18): application probes for every VM and per VM, checked like ports."""
+    vm_ids = first_clean_vms(api, n=1)
+    base = {
+        "name": "probes",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    bad = [
+        ({"verification": {"app_probes": [{"kind": "tcp", "port": 70000}]}}, "70000"),
+        ({"verification": {"app_probes": [{"kind": "http", "port": 80, "path": "x"}]}}, "path"),
+        (
+            {
+                "probe_overrides": {
+                    vm_ids[0]: [{"kind": "https", "port": 443, "expect_status": 700}]
+                }
+            },
+            "expect_status",
+        ),
+        ({"verification": {"app_probes": [{"kind": "ftp", "port": 21}]}}, "kind"),
+    ]
+    for extra, needle in bad:
+        refused = api.post("/api/v1/plans", Role.operator, json={**base, **extra})
+        assert refused.status_code == 422, (extra, refused.text)
+        assert needle in refused.json()["error"]["message"]
+    probes = {
+        "verification": {"app_probes": [{"kind": "http", "port": 80}]},
+        "probe_overrides": {vm_ids[0]: [{"kind": "tcp", "port": 5432}]},
+    }
+    created = api.post("/api/v1/plans", Role.operator, json={**base, **probes})
+    assert created.status_code == 201, created.text
+    plan = created.json()
+    assert plan["verification"]["app_probes"] == [
+        {"kind": "http", "port": 80, "path": "/", "expect_status": None}
+    ]
+    assert plan["probe_overrides"] == {
+        vm_ids[0]: [{"kind": "tcp", "port": 5432, "path": "/", "expect_status": None}]
+    }
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"probe_overrides": {vm_ids[0]: []}},
+    )
+    assert patched.status_code == 200 and patched.json()["probe_overrides"] == {vm_ids[0]: []}
+
+
+def test_a_migration_reports_its_verification_and_suggested_probes(api):
+    """SDD §4.2 (ADV-18): Migration.verification (null before one) and suggested_probes."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "suggest",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert (
+        api.post(f"/api/v1/plans/{created.json()['id']}/validate", Role.operator).status_code == 200
+    )
+    [m] = api.get(f"/api/v1/migrations?plan_id={created.json()['id']}", Role.viewer).json()
+    assert m["verification"] is None
+    assert isinstance(m["suggested_probes"], list)
+
+
 def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
     """SDD §12: a pre-copied migration waiting for its cutover (here after pause and re-validation)
     would cut over to a changed destination or mappings — PATCH and auto-waves answer 409, naming

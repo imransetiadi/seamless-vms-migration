@@ -181,6 +181,12 @@ CATALOG: dict[str, CatalogEntry] = {
         (S.storage_handover,),
         "Map the volume type to a RHOSO Cinder backend in handover.backend_map.",
     ),
+    "APP_PROBE_MISSING": CatalogEntry(
+        Severity.warning,
+        (),
+        "Add an application probe for its service to the plan, for every VM or for this one "
+        "(probe_overrides), or use the suggested probe on the plan page.",
+    ),
 }
 
 _SRIOV_VNIC_TYPES = frozenset({"direct", "direct-physical", "macvtap"})
@@ -658,7 +664,26 @@ def run_preflight(
                     f"Volume type(s) without a handover backend: {_names(unmapped)}.",
                 )
             )
+    missing = _app_probe_missing(vm, plan)
+    if missing is not None:
+        out.append(missing)
     return out
+
+
+def _app_probe_missing(vm: VMRef, plan: Plan) -> Finding | None:
+    """A database VM verified only by its boot (SDD §9.3, ADV-18)."""
+    # imported here: the wave planner (planning.waves, behind planning.probes) imports this module
+    from .probes import describe_probe, is_database, probes_for, suggest_probes
+
+    if not is_database(vm) or probes_for(vm, plan):
+        return None
+    suggested = suggest_probes(vm)
+    hint = f" Suggested: {', '.join(describe_probe(p) for p in suggested)}." if suggested else ""
+    return finding(
+        "APP_PROBE_MISSING",
+        f"{vm.name} is a database VM without an application probe: verification would check only "
+        f"that it booted.{hint}",
+    )
 
 
 def has_blocker(findings: Iterable[Finding]) -> bool:

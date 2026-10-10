@@ -19,6 +19,7 @@ from seamless_migrate.domain.models import (
     AdvisorPolicy,
     AdvisorRecommendation,
     AdvisorSnapshot,
+    AppProbe,
     Approval,
     CutoverWindow,
     Event,
@@ -1850,7 +1851,7 @@ async def test_failed_verification_rolls_back(tmp_path, store):
     h.destination.status = "ERROR"
     reviews: list[object] = []
 
-    async def review(vm_ref, result):
+    async def review(vm_ref, result, review_reason=None):
         reviews.append(result)
         return None
 
@@ -2798,7 +2799,7 @@ async def test_verification_review_error_is_logged_not_fatal(tmp_path, store, ca
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")
 
-    async def exploding_review(vm_ref, result):
+    async def exploding_review(vm_ref, result, review_reason=None):
         raise RuntimeError("jev_screen: HTTP 500")
 
     h.orch.advisor = SimpleNamespace(review_verification=exploding_review)
@@ -3350,3 +3351,129 @@ def test_clearing_a_cutover_request_drops_its_force_cutover():
     )
     _clear_request(m)
     assert (m.cutover_requested, m.cutover_requested_by, m.force_cutover) == (False, None, None)
+
+
+# -- application probes (SDD §7.5, §9.3, §9.6, ADV-18) ----------------------------------------
+DB_REASON = "database VM without an application probe: only its boot was verified"
+
+
+async def test_a_database_vm_without_an_application_probe_completes_with_review_required(
+    tmp_path, store
+):
+    """Boot alone does not verify a database: the rules ask for review, with or without Jev."""
+    db = vm(1, "ledger-db-01", tags={"role": "postgresql"})
+    h, plan = await setup(tmp_path, store, [db], {"default_strategy": Strategy.cold})
+    reasons: list[object] = []
+
+    async def review(vm_ref, result, review_reason=None):
+        reasons.append(review_reason)
+        return None
+
+    h.orch.advisor = SimpleNamespace(review_verification=review)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert (m.review_required, m.review_reason) == (True, DB_REASON)
+    assert reasons == [DB_REASON]
+    # validation flagged it and recorded what to probe; nothing was probed
+    assert "APP_PROBE_MISSING" in [f.code for f in m.findings]
+    assert m.suggested_probes == [AppProbe(kind="tcp", port=5432)]
+    assert m.verification is not None and m.verification.passed and m.verification.probes == []
+    assert [c["name"] for c in m.verification.checks][:2] == ["server_active", "ports_up"]
+
+
+async def test_a_failed_application_probe_rolls_the_vm_back(tmp_path, store):
+    """A refused probe fails the verification; the plan's automatic rollback runs (SDD §7.5)."""
+    db = vm(1, "ledger-db-01", tags={"role": "postgresql"})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [db],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(timeout_s=0),
+            "probe_overrides": {"vm-1": [AppProbe(kind="tcp", port=5432)]},
+        },
+    )
+    h.destination.services = {}  # the guest runs nothing on 5432
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.rolled_back)
+    await h.orch.stop()
+    assert h.history(m)[-5:] == [P.cutover, P.verifying, P.failed, P.rolling_back, P.rolled_back]
+    assert "app:tcp:5432" in (m.error or "")
+    assert m.verification is not None and m.verification.passed is False
+    (probe,) = m.verification.probes
+    assert (probe.target, probe.result) == ("10.0.0.5:5432", "failed")
+    phase_events = [
+        e for e in store.events(since_seq=0, limit=10000) if e.kind == "migration.phase"
+    ]
+    assert any(e.data.get("verification", {}).get("probes") for e in phase_events)
+
+
+async def test_an_unreachable_application_probe_passes_with_review_required(tmp_path, store):
+    """Owner's open question 15: unreachable from the control plane is not a failure."""
+    db = vm(1, "ledger-db-01", tags={"role": "postgresql"})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [db],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(timeout_s=0),
+            "probe_overrides": {"vm-1": [AppProbe(kind="tcp", port=5432)]},
+        },
+    )
+    h.destination.services = {5432: "unreachable"}
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert m.review_required is True
+    assert m.review_reason == "application probe unreachable from the control plane: 10.0.0.5:5432"
+    assert [p.result for p in m.verification.probes] == ["unreachable"]
+    # the probe is configured: the database is not flagged for missing one
+    assert "APP_PROBE_MISSING" not in [f.code for f in m.findings]
+
+
+async def test_a_database_vm_whose_probe_answers_needs_no_review(tmp_path, store):
+    db = vm(1, "ledger-db-01", tags={"role": "postgresql"})
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [db],
+        {
+            "default_strategy": Strategy.cold,
+            "verification": VerificationConfig(
+                timeout_s=0, app_probes=[AppProbe(kind="tcp", port=5432)]
+            ),
+        },
+    )
+    h.destination.services = {5432: "passed"}
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert (m.review_required, m.review_reason) == (False, None)
+    assert [(p.target, p.result) for p in m.verification.probes] == [("10.0.0.5:5432", "passed")]
+
+
+async def test_validate_refuses_invalid_application_probes(tmp_path, store):
+    """SDD §12: a probe port outside 1-65535, a path without '/', a status outside 100-599, or
+    more than 10 probes for one VM would fail every verification or flood it."""
+    from seamless_migrate.domain.models import invalid_plan_settings
+
+    bad = plan_for(
+        [vm(1)],
+        verification=VerificationConfig(
+            app_probes=[AppProbe(kind="tcp", port=0), AppProbe(kind="http", port=80, path="health")]
+        ),
+        probe_overrides={
+            "vm-1": [AppProbe(kind="https", port=443, expect_status=99)],
+            "vm-2": [AppProbe(kind="tcp", port=1000 + i) for i in range(11)],
+        },
+    )
+    problems = invalid_plan_settings(bad)
+    assert problems == [
+        "verification.app_probes: port 0 outside 1-65535",
+        "verification.app_probes: path 'health' must start with '/' (at most 200 characters)",
+        "probe_overrides[vm-1]: expect_status 99 outside 100-599",
+        "probe_overrides[vm-2]: 11 probes, at most 10",
+    ]

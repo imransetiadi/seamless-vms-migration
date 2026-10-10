@@ -23,6 +23,7 @@ from .domain.models import (
     VerificationConfig,
 )
 from .orchestrator import Orchestrator
+from .planning.probes import is_database, suggest_probes
 from .providers.fake import FakeSourceProvider
 from .store import Store
 
@@ -87,13 +88,17 @@ DEMO_PROVIDERS = (
 async def _plans(settings: Settings) -> list[Plan]:
     finance_vms = await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed).list_vms()
     vmware_vms = await FakeSourceProvider(ProviderKind.vmware, settings.demo_seed).list_vms()
+    planned = [vm for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS]
+    # the finance plan probes its databases' services (ADV-18, SDD §7.4); the VMware plan probes
+    # nothing, so its validation warns about its database VMs (APP_PROBE_MISSING)
+    probed = {vm.source_id: suggest_probes(vm) for vm in planned if is_database(vm)}
     return [
         Plan(
             name=FINANCE_PLAN,
             description="Side-by-side migration of the finance estate; cuts over automatically.",
             source_provider_id="rhosp17-finance",
             destination_provider_id="rhoso18",
-            vm_ids=[vm.source_id for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS],
+            vm_ids=[vm.source_id for vm in planned],
             mappings=Mappings(
                 networks={"finance-app": "finance-app", "finance-db": "finance-db"},
                 volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
@@ -103,6 +108,7 @@ async def _plans(settings: Settings) -> list[Plan]:
             auto_cutover=True,
             keep_warm_interval_s=120,
             verification=VerificationConfig(timeout_s=120),
+            probe_overrides={vm_id: probes for vm_id, probes in probed.items() if probes},
         ),
         Plan(
             name=VMWARE_PLAN,

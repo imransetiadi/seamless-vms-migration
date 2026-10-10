@@ -122,6 +122,7 @@ QASuite case that exercises the control.
 | C2-05 | Denial of service | Retry storms, runaway concurrency | `max_step_retries`, exponential backoff, `max_concurrent_migrations/cutovers`, per-wave `max_parallel` | Impl | L | `test_max_concurrent_cutovers`, `test_retry_after_failure` |
 | C2-06 | Elevation | Playbooks run arbitrary code on conversion hosts | Playbooks come from the image (read-only root filesystem); `SEAMLESS_ANSIBLE_PLAYBOOK`/`SEAMLESS_COLLECTION_ROOT` are deployer-controlled; no user-supplied playbook paths in the API | Impl + Cfg | L | image review; QASuite §10 |
 | C2-07 | Repudiation | Executor actions without attribution | `migration.action`, `migration.downtime_started/ended`, `migration.phase` events with actor `system` or the requesting principal | Impl | L | `test_warm_flow_reaches_completed_with_downtime` |
+| C2-08 | Spoofing | Something other than the migrated service answers an application probe (address reuse, a host on the tenant network) and a broken cutover passes verification | Probes add to `server_active`, `ports_up` and the console check, never replace them; a refused or wrong-status probe fails the verification and the plan's automatic rollback runs; an unreachable probe asks for review (SDD §7.5, ADV-18) | Impl | L | `test_a_failed_application_probe_rolls_the_vm_back`, `test_an_unreachable_application_probe_passes_with_review_required` |
 
 ### 4.3 Conversion hosts and the data path (C3)
 
@@ -428,6 +429,7 @@ provider supports per-key budgets or scopes, create one key per environment.
 | Control plane → Jev sidecar | HTTP + bearer on an internal network (Compose) | jev-mcp serves plain HTTP: keep it internal or terminate TLS in front; the token is mandatory for non-loopback binds |
 | Control plane → provider API | HTTPS | provider TLS; egress allowed only to the provider |
 | Control plane → agentmemory | HTTP(S) | loopback/host gateway in Compose; TLS and bearer for any remote server |
+| Control plane → migrated VMs (verification probes, SDD §7.5) | TCP connect; HTTP(S) `GET` of the configured path | No credentials are sent; only the status is read. HTTPS certificates are **not** verified — the probe targets an address the certificate does not name — so a passed probe proves the service answers, not who answered (C2-08). Egress to the destination's tenant networks must be allowed for probes to reach them; otherwise they report *Unreachable* and the migration needs review, never a rollback |
 
 **NetworkPolicy** (`deploy/openshift/networkpolicy.yaml`): default-deny for ingress and egress; ingress to the
 control plane only from the OpenShift ingress namespace (label `policy-group.network.openshift.io/ingress`);

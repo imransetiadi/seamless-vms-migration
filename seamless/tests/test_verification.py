@@ -219,3 +219,255 @@ async def test_verification_windows_guest_without_ports_passes_with_a_warning():
     result = await Verifier(Dest(console=""), Settings(), poll_s=0).verify(windows_ctx())
     assert result.passed
     assert any("no TCP port" in w for w in result.evidence["warnings"])
+
+
+# -- application probes (SDD §7.5, ADV-18) ----------------------------------------------------
+from seamless_migrate.domain.models import AppProbe  # noqa: E402
+
+
+def app_ctx(probes, *, overrides=None, vm=None, timeout_s=0):
+    plan = make_plan(
+        verification=VerificationConfig(timeout_s=timeout_s, app_probes=list(probes)),
+        probe_overrides=overrides or {},
+    )
+    kw = {"vm": vm} if vm is not None else {}
+    return SimpleNamespace(plan=plan, migration=make_migration(destination_server_id="srv-9", **kw))
+
+
+@pytest.fixture
+async def http_server():
+    """A local HTTP server answering with the status the test sets (default 200)."""
+    state = {"status": 200, "paths": []}
+
+    async def handle(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        state["paths"].append(request.split(b" ")[1].decode())
+        writer.write(
+            f"HTTP/1.1 {state['status']} X\r\n"
+            "Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    state["port"] = server.sockets[0].getsockname()[1]
+    yield state
+    server.close()
+    await server.wait_closed()
+
+
+async def test_an_application_probe_that_answers_passes_with_its_target_latency_and_time(listener):
+    result = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="tcp", port=listener)])
+    )
+    assert result.passed, result.checks
+    check = next(c for c in result.checks if c["name"] == f"app:tcp:{listener}")
+    assert check["ok"] is True
+    (probe,) = result.probes
+    assert (probe.target, probe.kind, probe.result) == (f"127.0.0.1:{listener}", "tcp", "passed")
+    assert probe.latency_ms is not None and probe.latency_ms >= 0
+    assert probe.at.tzinfo is not None
+    record = result.record()
+    assert record.passed and [p.target for p in record.probes] == [f"127.0.0.1:{listener}"]
+    assert result.summary()["probes"][0]["result"] == "passed"
+
+
+async def test_a_refused_application_probe_fails_the_verification():
+    closed = unused_port()
+    result = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="tcp", port=closed)])
+    )
+    assert result.passed is False
+    assert result.failed_checks() == [f"app:tcp:{closed}"]
+    (probe,) = result.probes
+    assert probe.result == "failed" and "refused" in probe.detail and probe.latency_ms is None
+
+
+async def test_http_probes_read_the_status_of_the_path(http_server):
+    port = http_server["port"]
+    ok = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="http", port=port, path="/healthz")])
+    )
+    assert ok.passed, ok.checks
+    assert http_server["paths"] == ["/healthz"]
+    (probe,) = ok.probes
+    assert probe.target == f"http://127.0.0.1:{port}/healthz" and probe.detail == "HTTP 200"
+    http_server["status"] = 503
+    bad = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="http", port=port)])
+    )
+    assert (
+        bad.passed is False
+        and bad.probes[0].result == "failed"
+        and bad.probes[0].detail == "HTTP 503"
+    )
+    # an expected status is matched exactly
+    http_server["status"] = 204
+    exact = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="http", port=port, expect_status=200)])
+    )
+    assert exact.passed is False and exact.probes[0].detail == "HTTP 204, expected 200"
+
+
+async def test_https_probes_do_not_verify_the_certificate(monkeypatch):
+    """The probe connects to an address the certificate does not name: it reads only the status."""
+    import seamless_migrate.verification as verification
+
+    seen = {}
+
+    class Response:
+        status_code = 200
+
+    class Client:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            seen["url"] = url
+            return Response()
+
+    monkeypatch.setattr(verification.httpx, "AsyncClient", Client)
+    answer = await verification._app_probe(
+        "10.0.0.5", AppProbe(kind="https", port=8443, path="/health")
+    )
+    assert answer.result == "passed" and seen["verify"] is False
+    assert seen["url"] == "https://10.0.0.5:8443/health"
+    # an IPv6 address is bracketed in the URL
+    await verification._app_probe("fd00::5", AppProbe(kind="http", port=80))
+    assert seen["url"] == "http://[fd00::5]:80/"
+
+
+async def test_an_unreachable_probe_is_retried_until_the_deadline_then_passes_for_review():
+    """Owner's open question 15: unreachable from the control plane is not a failure (SDD §7.5)."""
+    from seamless_migrate.verification import ProbeAnswer
+
+    calls = []
+
+    async def unreachable(host, probe):
+        calls.append(probe.port)
+        return ProbeAnswer("unreachable", f"{host}:{probe.port} unreachable (TimeoutError)", False)
+
+    clock = {"t": 0.0}
+
+    async def sleep(seconds):
+        clock["t"] += max(seconds, 0.5)
+
+    verifier = Verifier(
+        Dest(), Settings(), poll_s=1, sleep=sleep, clock=lambda: clock["t"], app_probe=unreachable
+    )
+    result = await verifier.verify(app_ctx([AppProbe(kind="tcp", port=5432)], timeout_s=5))
+    assert result.passed is True
+    assert len(calls) > 1  # polled while it was unreachable
+    assert result.unreachable_targets() == ["127.0.0.1:5432"]
+    check = next(c for c in result.checks if c["name"] == "app:tcp:5432")
+    assert check["skipped"] is True and "unreachable" in check["detail"]
+    assert result.probes[0].result == "unreachable" and result.probes[0].latency_ms is None
+
+
+async def test_a_vm_runs_its_probe_override(listener):
+    vm_probes = {"vm-1": [AppProbe(kind="tcp", port=listener)]}
+    closed = unused_port()
+    result = await Verifier(Dest(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="tcp", port=closed)], overrides=vm_probes)
+    )
+    assert result.passed, result.checks
+    assert [p.target for p in result.probes] == [f"127.0.0.1:{listener}"]
+
+
+async def test_a_destination_that_simulates_its_guests_answers_the_probes():
+    """Demo mode (SDD §7.4): the fake destination says what the guest runs; nothing leaves."""
+    from seamless_migrate.verification import ProbeAnswer
+
+    asked = []
+
+    class Simulated(Dest):
+        async def probe_service(self, server_id, vm, probe, address):
+            asked.append((server_id, vm.name, probe.port, address))
+            return ProbeAnswer("failed", f"{address}:{probe.port} refused the connection", False)
+
+    result = await Verifier(Simulated(address="10.30.0.7"), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="tcp", port=1521)])
+    )
+    assert asked == [("srv-9", "web-01", 1521, "10.30.0.7")]
+    assert result.passed is False and result.probes[0].target == "10.30.0.7:1521"
+
+
+async def test_demo_verification_runs_in_model_time():
+    """SDD §7.5: in demo mode the timeout and the polling run divided by demo_speed."""
+    clock = {"t": 0.0}
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+        clock["t"] += seconds
+
+    dest = Dest(status="BUILD")
+    settings = Settings(demo=True, demo_speed=60)
+    result = await Verifier(
+        dest, settings, poll_s=10, sleep=sleep, clock=lambda: clock["t"]
+    ).verify(ctx(timeout_s=120))
+    assert result.passed is False
+    assert clock["t"] == pytest.approx(2.0)  # 120 s of model time
+    assert max(slept) == pytest.approx(10 / 60)
+
+
+async def test_a_probe_failure_says_whether_the_guest_answered(monkeypatch):
+    """Refused or a TLS error: the guest answered and its service did not (failed). A read timeout
+    after connecting fails too; only an address the control plane cannot reach is unreachable."""
+    import ssl
+
+    import httpx
+
+    import seamless_migrate.verification as verification
+
+    def chained(cause):
+        try:
+            raise cause
+        except Exception as inner:
+            try:
+                raise httpx.ConnectError("connect failed") from inner
+            except httpx.ConnectError as outer:
+                return outer
+
+    tls = verification._connect_failure("10.0.0.5:443", chained(ssl.SSLError("wrong version")))
+    assert (tls.result, tls.detail) == ("failed", "10.0.0.5:443: TLS handshake failed")
+    refused = verification._connect_failure("10.0.0.5:80", chained(ConnectionRefusedError()))
+    assert refused.result == "failed" and "refused" in refused.detail
+    no_route = verification._connect_failure("10.0.0.5:80", chained(OSError(113, "No route")))
+    assert no_route.result == "unreachable"
+
+    class Slow:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            raise httpx.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(verification.httpx, "AsyncClient", Slow)
+    slow = await verification._app_probe("10.0.0.5", AppProbe(kind="http", port=80))
+    assert (slow.result, slow.answered) == ("failed", False)
+    assert slow.detail == "http://10.0.0.5:80/: no answer within 5 s"
+
+
+async def test_an_application_probe_without_an_address_fails():
+    class NoAddress(Dest):
+        async def get_server(self, server_id):
+            return {"status": "ACTIVE", "ports": [{"status": "ACTIVE", "fixed_ips": []}]}
+
+    result = await Verifier(NoAddress(), Settings(), poll_s=0.01).verify(
+        app_ctx([AppProbe(kind="tcp", port=5432)])
+    )
+    assert result.passed is False and result.failed_checks() == ["app:tcp:5432"]
+    assert [(p.target, p.result) for p in result.probes] == [("no fixed address", "failed")]

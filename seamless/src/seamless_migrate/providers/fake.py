@@ -123,7 +123,8 @@ _OPENSTACK: tuple[_Spec, ...] = (
         "rhel8",
         network="finance-db",
         rate_mib=12.0,
-        tags=(("app", "billing"), ("role", "oracle")),
+        # the demo's application failure (ADV-18): its Oracle listener never starts on RHOSO
+        tags=(("app", "billing"), ("role", "oracle"), ("demo-fault", "app-down")),
     ),
     _Spec(
         "billing-legacy-01",
@@ -405,6 +406,26 @@ class FakeDestinationProvider:
             "[  OK  ] Reached target Multi-User System.\n"
             f"Red Hat Enterprise Linux 9.4 (Plow)\n{server_id} login: "
         )
+
+    async def probe_service(self, server_id: str, vm: VMRef, probe: Any, address: str) -> Any:
+        """The simulated guest's answer to an application probe (SDD §7.4, ADV-18): it runs its
+        suggested services (§9.6) and SSH, or RDP on Windows, and answers HTTP 200; a VM tagged
+        ``demo-fault: app-down`` runs none of its application services."""
+        # imported here: the verifier and the probe rules import the providers' module
+        from ..planning.probes import suggest_probes
+        from ..verification import ProbeAnswer
+
+        listening = {3389 if vm.guest_os.family == "windows" else 22}
+        if vm.tags.get("demo-fault") != "app-down":
+            listening |= {p.port for p in suggest_probes(vm)}
+        where = f"{address}:{probe.port}"
+        if probe.port not in listening:
+            return ProbeAnswer("failed", f"{where} refused the connection", False)
+        if probe.kind == "tcp":
+            return ProbeAnswer("passed", f"connected to {where}", True)
+        if probe.expect_status not in (None, 200):
+            return ProbeAnswer("failed", f"HTTP 200, expected {probe.expect_status}", True)
+        return ProbeAnswer("passed", "HTTP 200", True)
 
     async def delete_server(self, server_id: str) -> None:
         self.deleted.add(server_id)
