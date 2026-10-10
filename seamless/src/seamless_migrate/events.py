@@ -32,6 +32,8 @@ AUDIT_KINDS = frozenset(
         "policy.created",
         "policy.updated",
         "policy.deleted",
+        # a cutover before convergence, with its approver and reason (SDD §5.4, §14.5, ADV-16)
+        "migration.force_cutover",
     }
 )
 PERSISTED_KINDS = frozenset(

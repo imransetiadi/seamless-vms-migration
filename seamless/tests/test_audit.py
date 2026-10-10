@@ -45,6 +45,7 @@ def test_the_audit_kinds_are_the_persisted_kinds_sdd_lists():
         "policy.created",
         "policy.updated",
         "policy.deleted",
+        "migration.force_cutover",
     }
     assert AUDIT_KINDS <= PERSISTED_KINDS
 

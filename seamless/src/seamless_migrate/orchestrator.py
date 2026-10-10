@@ -1094,6 +1094,9 @@ class Orchestrator:
             migration=m,
             actor=actor,
             data={
+                # in the audit trail (SDD §14.5): its target is the migration
+                "target_id": m.id,
+                "vm": m.vm.name,
                 "reason": reason,
                 "delta_bytes": m.force_cutover.delta_bytes,
                 "estimated_downtime_s": estimated,

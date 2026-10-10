@@ -3301,6 +3301,22 @@ async def test_the_approver_who_forced_a_cutover_never_approves_it(tmp_path, sto
     assert [a.actor for a in counted_approvals(again, free)] == ["bob", "sari", "sari"]
 
 
+async def test_a_force_cutover_is_in_the_audit_trail(tmp_path, store):
+    """SDD §14.5 (the owner's ADV-16 acceptance): a Force cutover is recorded in the audit trail
+    with its approver, its reason and the migration it forced."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    syncing = make_migration(plan_id=plan.id, vm=vm(1), strategy=Strategy.warm, phase=P.syncing)
+    store.put("migration", syncing)
+    await h.orch.force_cutover(syncing.id, "sari", "the window closes in ten minutes")
+    [event] = [e for e in _audit(store) if e.kind == "migration.force_cutover"]
+    assert (event.actor, event.migration_id) == ("sari", syncing.id)
+    assert {k: event.data[k] for k in ("target_id", "vm", "reason")} == {
+        "target_id": syncing.id,
+        "vm": "web-01",
+        "reason": "the window closes in ten minutes",
+    }
+
+
 async def test_validation_and_a_strategy_change_clear_the_cutover_requester(tmp_path, store):
     h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
     await h.orch.validate_plan(plan.id, "alice")
