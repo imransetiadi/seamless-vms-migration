@@ -297,9 +297,10 @@ an open clock and resets a closed one (§5.2); it clears the cutover request and
 granted with it (`cutover_requested`, `force_window`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change). A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
-no further attempt starts. Whenever the migration has a data path — a step was running, a failed
-attempt waited for its retry, or it recorded `sync_passes` (a warm migration cancelled in
-`awaiting_cutover`, between passes, or after a retry) — the cancel then runs the `rollback` step once
+no further attempt starts. Whenever the migration has a data path — it was cancelled in `precopy` or
+`syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it recorded
+`sync_passes` (a warm migration cancelled in `awaiting_cutover`, after a retry or a failed pass) — the
+cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
