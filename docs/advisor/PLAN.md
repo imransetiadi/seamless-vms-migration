@@ -65,8 +65,16 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
 3. Rest of Phase 1 — the threshold value in the Decision line (ADV-03), approve/override and the Finance policy
    visible on the demo stack (ADV-04, PR-5), the deployment badge and "Data sent to advisor" (ADV-06, PR-7); then
    a new demo for the owner.
-4. ADV-18 application-level verification, 5. ADV-19 plan status and the finalize queue, 6. ADV-20 the two kinds
-   of approval.
+4. ADV-18 application-level verification. Done — 16c87df (SDD), 55945ad (API: `AppProbe` in
+   `verification.app_probes` and `Plan.probe_overrides`; refused or a wrong status fails the verification and the plan's
+   auto-rollback runs, unreachable passes with review; results in `Migration.verification`; `APP_PROBE_MISSING` and
+   review for a database VM without a probe; "Boot verified; no review needed"; rules-based suggestions in
+   `Migration.suggested_probes`; demo: billing-db-01 carries `demo-fault: app-down` and rolls back), 0bc821e (dashboard:
+   probe editor in the plan form and per VM, the Verification panel, the plan's "Application probes" warning with Use
+   suggested probe). jev_decide 0.98 for the model. `TODO(ADV-18): confirm` — the advisor's part of the suggestions waits
+   for ADV-11 (the rules suggest for now). The demo stack keeps its data: the new demo plans (probes, the fault) show
+   on a fresh demo only.
+5. ADV-19 plan status and the finalize queue, 6. ADV-20 the two kinds of approval.
 7. Then the original order (PR-6 ADV-02 first); ADV-21 goes with ADV-14. Phase 2 still waits for the owner's
    review of Phase 1.
 
