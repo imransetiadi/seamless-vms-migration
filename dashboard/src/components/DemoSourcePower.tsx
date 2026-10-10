@@ -42,7 +42,8 @@ export function DemoSourcePower({ migration: m, role }: { migration: Migration; 
         >
           {running ? 'Power off the source VM (demo)' : 'Power on the source VM (demo)'}
         </Button>
-        <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+        {/* a basis, not flex-1 min-w-0: on a phone the note wraps under the button instead of shrinking to a column of words */}
+        <p className="min-w-0 grow basis-60 text-xs text-muted-foreground">
           Demo mode: a source VM running after the cutover writes data RHOSO no longer receives; the source watch alerts on it.
         </p>
       </div>

@@ -193,3 +193,18 @@ test('a recommendation shows the evidence it rests on; a fact links to its VM in
   await expect(page.getByLabel('Search VMs')).toHaveValue('static-cdn-01');
   await expect(page.getByRole('table', { name: /VMs on/ }).getByRole('row')).toHaveCount(2);
 });
+
+test('on a phone the demo power note sits under its button, not squeezed beside it (ADV-19, SDD §16)', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'operator');
+  await page.goto('/plans/plan-2d5c8b93');
+  await page.getByRole('region', { name: 'Awaiting finalize' }).getByRole('link', { name: 'web-cache-01' }).click();
+  const step = page.getByRole('region', { name: 'Next step' });
+  const button = step.getByRole('button', { name: 'Power on the source VM (demo)' });
+  const note = step.getByText(/^Demo mode: a source VM running after the cutover/);
+  await expect(note).toBeVisible();
+  const [b, n] = [await button.boundingBox(), await note.boundingBox()];
+  // a flex-1 min-w-0 note shrank to a column of single words (54 px) instead of wrapping below
+  expect(n!.width).toBeGreaterThan(200);
+  expect(n!.y).toBeGreaterThanOrEqual(b!.y + b!.height);
+});
