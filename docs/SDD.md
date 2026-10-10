@@ -240,7 +240,10 @@ AdvisorRecommendation { id: str ("rec-…"), created_at: datetime, decision_type
                         subject: { kind: "vm"|"plan"|"wave", id: str, name: str },
                         plan_id: str|null, migration_id: str|null, provider_id: str|null,   # provider = source
                         model: AdvisorModelInfo, recommendation: RecommendedOption, decision: Decision,
+                        input_snapshot_sha256: str|null,                                     # §14.5
                         legacy: bool = false, legacy_text: str|null }                        # §14.4
+
+AdvisorSnapshot { sha256: str (the id), created_at: datetime, payload: dict }   # §14.5, write-once
 
 Approval { actor: str, at: datetime, comment: str|null }
 
@@ -278,7 +281,9 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
-`auth.denied`. `provider.credentials_updated` carries the provider id and the key *names* written,
+`auth.denied`, and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
+`decision.fallback`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
@@ -1027,7 +1032,7 @@ documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
 ```
 
-Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4).
+Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
@@ -1098,12 +1103,13 @@ such lists again on persisted migration events.
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
 | POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible) | `Migration` |
-| GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false) | `Event[]` (ascending `seq`) |
+| GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` |
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
+| GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
 | POST | `/advisor/similar-incidents` | operator | `{"query": str (1–2000 characters), "limit": int = 5 (1–20)}`; 422 outside these bounds | `{"hits":[{"title":str,"content":str,"score":float?}]}` |
 | GET | `/metrics` | viewer (public if `SEAMLESS_METRICS_PUBLIC`) | — | Prometheus text format |
 
@@ -1346,14 +1352,38 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   The migration's `strategy` is `decision.final_option`, or the deterministic choice while it is null. Each
   validation adds a recommendation (history is kept); validation no longer writes strategy notes and keeps the
   notes a migration already has. A migration validation leaves alone (in flight or finished, §5.4) gets no
-  choice: the advisor is not asked about it and no recommendation is recorded for it. Event `advisor.strategy` carries `{recommendation_id, option, confidence,
-  final_option, status, reason_code}`.
+  choice: the advisor is not asked about it and no recommendation is recorded for it. Recording a
+  recommendation stores its input snapshot and emits `recommendation.created` and its first
+  `decision.<status>` (§14.5).
 * Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
   are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
   the note's summary, the option, confidence and distribution parsed from `data` where present, and a decision
   read from it (`applied` → `auto_applied`; `source rules` → `fallback_rules`; otherwise `below_threshold`,
   final = `data.deterministic`), actor `system:legacy`. Nothing is copied or rewritten: the listing adapts the
   notes when it reads them, so the number of legacy entries always equals the number of strategy notes.
+
+### 14.5 Audit trail and input snapshots (`ai/snapshots.py`)
+
+Audit events are persisted events of the append-only `events` table (§4.3): no route updates or deletes
+them (`seamless events purge` is the only deletion, by hand, Security.md §12).
+
+* `recommendation.created` — actor `system:advisor`; data `{target_id, model_version, decision_type, subject,
+  option, confidence, snapshot_sha256}`.
+* `decision.<status>` — one per decision status change, the first one included: `auto_applied`,
+  `pending_approval`, `approved`, `overridden`, `below_threshold`, and `decision.fallback` for
+  `fallback_rules`. Actor `<kind>:<id>` of the decision's actor (`policy:global-default`, `system:fallback`,
+  `user:<name>`); data `{target_id, model_version, before, after}`, where `before` (null for the first
+  decision) and `after` are `{status, final_option, reason_code, policy_id, threshold_used}`.
+
+`target_id` is the recommendation id and `model_version` its `model.version` (`jev-…`, `rules`, `unknown`).
+The input snapshot is what the advisor based the recommendation on — for a migration strategy
+`{tool: "jev_decide", arguments: {decision, evidence, priorities, candidates, requirements,
+escalate_on_contradiction}, scope, options, deterministic, deterministic_reason}`, built even when Jev is
+off. It passes `redact_payload` (§13.4) and is stored as document kind `advisor_snapshot` whose id is the
+SHA-256 (lowercase hex) of its canonical JSON: `json.dumps(payload, sort_keys=True, separators=(",", ":"),
+ensure_ascii=False)` encoded as UTF-8. A snapshot already stored is never written again (same content, same
+id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can recompute the hash from
+`GET /advisor/snapshots/{sha256}`.
 
 ---
 
@@ -1516,7 +1546,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   <final option> — <why>" (applied automatically by policy <policy>; below threshold (<confidence>% <
   <threshold>%); advisor unavailable, decided by rules; …), never the word "Selected"; a legacy entry shows a
   "Legacy" badge and its original text; the migration page lists that migration's recommendations the same
-  way (§14.4) —
+  way (§14.4); each entry links to its detail `/advisor/recommendations/:id` (the two lines, tab "Audit" with
+  its audit events and tab "Input" with its redacted input snapshot and SHA-256, §14.5); the page links to
+  `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live) with action,
+  actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
+  model version — and as JSON —
   similar-incident search — the query field takes at most 2000 characters and the result count stays in
   1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
