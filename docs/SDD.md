@@ -444,7 +444,9 @@ does not require a distinct approver, records an approval too (otherwise the req
 `migration.action` event, `data.comment`). With `plan.require_distinct_approver` (default true;
 maker-checker, ADV-17) the requester's approval never counts: `POST …/approve` by the requester answers 409 "You
 requested this cutover. Another approver must approve it.", and an approval the requester gave before requesting
-stays in the history without counting. There is no self-approval for emergencies (break-glass is off,
+stays in the history without counting. The approver who forces the cutover (`force_cutover.actor`) is held to the same
+rule, also when another user requested it first: their approval never counts, and their `POST …/approve` answers 409
+"You forced this cutover. Another approver must approve it." There is no self-approval for emergencies (break-glass is off,
 `TODO(ADV-17): confirm`). A
 repeated request records another approval and may add `force_window` — an approver can force a
 requested cutover that waits for a closed window — but never clears one. `POST …/approve` is accepted
@@ -1293,7 +1295,7 @@ such lists again on persisted migration events.
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0); creation order | `Migration[]` |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
-| POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester when the plan requires a distinct approver, §5.4) |
+| POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
 | POST | `/migrations/{id}/force-cutover` | approver | `{"reason": str}` (10–2000 characters, 422 otherwise) | `Migration` (409 outside `precopy`/`syncing` of a warm strategy; §5.4) |
 | POST | `/migrations/{id}/sync` | operator | — | `Migration` (only `awaiting_cutover`) |
