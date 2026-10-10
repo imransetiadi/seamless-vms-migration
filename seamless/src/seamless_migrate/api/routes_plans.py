@@ -28,7 +28,9 @@ from .schemas import WavesAutoRequest
 router = APIRouter(tags=["plans"])
 
 #: Plan fields that decide whether a cutover needs a human (SDD §12): approver-only.
-POLICY_FIELDS = frozenset({"require_approval", "auto_cutover", "cutover_window"})
+POLICY_FIELDS = frozenset(
+    {"require_approval", "require_distinct_approver", "auto_cutover", "cutover_window"}
+)
 
 
 async def _check_policy_fields(request: Request, fields: set[str], principal: Principal) -> None:

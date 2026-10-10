@@ -30,6 +30,7 @@ def builtin_default(settings: Settings) -> AdvisorPolicy:
         threshold=rule.threshold,
         min_evidence_for_auto_apply=rule.min_evidence_for_auto_apply,
         require_override_reason=rule.require_override_reason,
+        require_distinct_approver=rule.require_distinct_approver,
         created_at=since,
         updated_at=since,
         updated_by="system",
@@ -43,15 +44,17 @@ def rule_of(policy: AdvisorPolicy) -> PolicyRule:
         threshold=policy.threshold,
         min_evidence_for_auto_apply=policy.min_evidence_for_auto_apply,
         require_override_reason=policy.require_override_reason,
+        require_distinct_approver=policy.require_distinct_approver,
     )
 
 
-def _strictest_first(policy: AdvisorPolicy) -> tuple[bool, float, int, bool, str]:
+def _strictest_first(policy: AdvisorPolicy) -> tuple[bool, float, int, bool, bool, str]:
     return (
         policy.mode != "always_require_approval",
         -policy.threshold,
         -policy.min_evidence_for_auto_apply,
         not policy.require_override_reason,
+        not policy.require_distinct_approver,
         policy.id,
     )
 

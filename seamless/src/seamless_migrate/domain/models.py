@@ -298,6 +298,8 @@ class PlanSpec(_Model):
     selection_policy: Literal["min_downtime", "simplest_meeting_slo"] = "min_downtime"
     downtime_slo_s: int = Field(default=600, ge=1)
     require_approval: bool = True
+    #: maker-checker (SDD §5.4, ADV-17): the cutover's requester never counts as its approver
+    require_distinct_approver: bool = True
     auto_cutover: bool = False
     cutover_window: CutoverWindow | None = None
     #: at least a minute: a shorter interval would run delta passes back to back
@@ -466,6 +468,8 @@ class AdvisorRecommendation(_Model):
     decision: Decision
     #: the redacted input the recommendation rests on (document kind ``advisor_snapshot``, §14.5)
     input_snapshot_sha256: str | None = None
+    #: the user whose plan validation recorded it: never the one who decides it (SDD §14.6)
+    requested_by: str | None = None
     legacy: bool = False
     legacy_text: str | None = None
 
@@ -501,6 +505,8 @@ class AdvisorPolicySpec(_Model):
     #: TODO(ADV-02): the spec's default of 3 applies once recommendations carry evidence
     min_evidence_for_auto_apply: int = Field(default=0, ge=0, le=100)
     require_override_reason: bool = True
+    #: maker-checker (ADV-17): the decision's requester neither approves nor overrides it
+    require_distinct_approver: bool = True
 
     @model_validator(mode="after")
     def _one_scope_level(self) -> AdvisorPolicySpec:
@@ -559,6 +565,9 @@ class Migration(_Model):
     actual_downtime_s: float | None = None
     approvals: list[Approval] = Field(default_factory=list)
     cutover_requested: bool = False
+    #: who asked for the cutover first, and when (SDD §5.4): never the approver that counts
+    cutover_requested_by: str | None = None
+    cutover_requested_at: UTCDateTime | None = None
     #: cutover window bypass granted with the request (SDD §5.4 rule 2); persisted
     force_window: bool = False
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)

@@ -36,6 +36,13 @@ VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
 FINANCE_POLICY = "Finance — approval required"
+#: ADV-17 (SDD §5.4): the VMware plan's first cutovers, asked for by one person, approved by another
+DEMO_REQUESTER = "sari"
+DEMO_APPROVER = "rina"
+DEMO_APPROVAL_COMMENTS = (
+    "Change CHG-2041 approved by the DC2 service owner; backups checked this morning.",
+    "Agreed with the application team for tonight's window; rollback steps reviewed.",
+)
 
 DEMO_PROVIDERS = (
     Provider(
@@ -165,4 +172,21 @@ async def seed_demo(
                 migration.id, DEMO_ACTOR, f"excluded from the demo: blocked by {codes}"
             )
         await orchestrator.start_plan(plan.id, DEMO_ACTOR)
+        if plan.name == VMWARE_PLAN:
+            await _seed_cutover_approvals(orchestrator, plan.id)
         log.info("demo plan %r seeded and started", plan.name)
+
+
+async def _seed_cutover_approvals(orchestrator: Orchestrator, plan_id: str) -> None:
+    """Two cutovers of the first wave, requested and approved by two people (ADV-17); the rest
+    of the plan waits for an approver."""
+    plan = await orchestrator.db.get("plan", plan_id, Plan)
+    order = {wave.id: index for index, wave in enumerate(plan.waves)}
+    migrations = await orchestrator.db.list("migration", Migration, plan_id=plan_id)
+    waiting = sorted(
+        (m for m in migrations if m.phase == Phase.ready),
+        key=lambda m: (order.get(m.wave_id or "", len(order)), m.vm.name),
+    )
+    for migration, comment in zip(waiting, DEMO_APPROVAL_COMMENTS, strict=False):
+        await orchestrator.request_cutover(migration.id, DEMO_REQUESTER)
+        await orchestrator.approve(migration.id, DEMO_APPROVER, comment)

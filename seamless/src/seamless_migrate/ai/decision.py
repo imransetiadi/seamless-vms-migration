@@ -54,6 +54,7 @@ class PolicyRule:
     threshold: float
     min_evidence_for_auto_apply: int = 0
     require_override_reason: bool = False
+    require_distinct_approver: bool = True
 
 
 @dataclass(frozen=True)

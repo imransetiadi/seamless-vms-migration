@@ -19,6 +19,7 @@ from seamless_migrate.domain.models import (
     AdvisorPolicy,
     AdvisorRecommendation,
     AdvisorSnapshot,
+    Approval,
     CutoverWindow,
     Event,
     Migration,
@@ -40,7 +41,7 @@ from seamless_migrate.executors.base import (
 from seamless_migrate.orchestrator import VM_CLAIMS, BadRequest, NotAllowed, Unprocessable
 from seamless_migrate.providers.base import ProviderError
 from seamless_migrate.store import ConflictError, NotFound
-from tests.factories import make_disk, make_vm
+from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
 from tests.orch_support import (
     DST_PROVIDER,
@@ -892,6 +893,8 @@ async def test_cutover_window_respected_and_force_window(tmp_path, store):
         {
             "default_strategy": Strategy.warm,
             "require_approval": True,
+            # a test of the window: the request approves, as without maker-checker (SDD §5.4)
+            "require_distinct_approver": False,
             "auto_cutover": False,
             "cutover_window": window,
         },
@@ -912,6 +915,7 @@ async def test_cutover_window_respected_and_force_window(tmp_path, store):
         {
             "default_strategy": Strategy.warm,
             "require_approval": True,
+            "require_distinct_approver": False,
             "auto_cutover": False,
             "cutover_window": window,
         },
@@ -992,7 +996,8 @@ async def test_revalidation_and_strategy_change_clear_approvals(tmp_path, store)
     await h.orch.approve(m.id, "sari", "ok")
     await h.orch.request_cutover(m.id, "sari", force_window=True)
     m = await h.migration(m.id)
-    assert len(m.approvals) == 2 and m.cutover_requested is True
+    # ADV-17: the request is not an approval (the plan requires a distinct approver)
+    assert len(m.approvals) == 1 and m.cutover_requested is True
     assert m.force_window is True
     await h.orch.validate_plan(plan.id, "alice")
     m = await h.migration(m.id)
@@ -1943,10 +1948,13 @@ async def test_cutover_requested_twice_transitions_once(tmp_path, store):
     await run_plan(h, plan)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
     await asyncio.gather(h.orch.request_cutover(m.id, "sari"), h.orch.request_cutover(m.id, "rina"))
+    # ADV-17: neither request approves; a third approver opens the gate
+    await h.orch.approve(m.id, "dewi", "Second pair of eyes")
     done = await h.wait_phase(m.id, P.completed)
     await h.orch.stop()
     assert h.history(done).count(P.cutover) == 1
-    assert len(done.approvals) == 2
+    assert done.cutover_requested_by in {"sari", "rina"}
+    assert [a.actor for a in done.approvals] == ["dewi"]
     with pytest.raises(NotAllowed):
         await h.orch.request_cutover(m.id, "sari")
 
@@ -2919,3 +2927,164 @@ async def test_executor_supplied_downtime_start_is_kept(tmp_path, store):
     await h.orch.stop()
     assert m.downtime_started_at == stopped_at
     assert m.actual_downtime_s is not None and m.actual_downtime_s >= 90
+
+
+# -- ADV-17: maker-checker (SDD §5.4, §14.6) --------------------------------------------------
+
+#: the API's answer to a requester approving their own cutover (SDD §5.4)
+OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
+#: and to the validating user deciding their own advisor decision (SDD §14.6)
+OWN_DECISION = "You requested this decision. Another approver must decide it."
+#: a warm plan whose cutover waits for a request and an approval
+GATED = {"default_strategy": Strategy.warm, "require_approval": True, "auto_cutover": False}
+
+
+async def test_a_cutover_request_is_not_an_approval_when_a_distinct_approver_is_required(
+    tmp_path, store
+):
+    """ADV-17: the request records who asked and when; only another approver opens the gate."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    assert plan.require_distinct_approver is True  # the default
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    requested = await h.orch.request_cutover(m.id, "sari", comment="Window agreed with the owner")
+    assert (requested.cutover_requested, requested.cutover_requested_by) == (True, "sari")
+    assert requested.cutover_requested_at is not None and requested.approvals == []
+    events = h.store.events(since_seq=0, limit=100000)
+    action = [e for e in events if e.kind == "migration.action"][-1]
+    assert action.data["comment"] == "Window agreed with the owner"
+    await asyncio.sleep(0.1)  # many ticks: a request alone opens no gate
+    assert (await h.migration(m.id)).phase == P.awaiting_cutover
+    with pytest.raises(NotAllowed) as refused:
+        await h.orch.approve(m.id, "sari", "approving my own request")
+    assert str(refused.value) == OWN_CUTOVER
+    assert (await h.migration(m.id)).approvals == []
+    await h.orch.approve(m.id, "rina", "Checked the pre-flight warnings")
+    await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+
+async def test_an_approval_the_requester_gave_before_requesting_does_not_count(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    await h.orch.approve(m.id, "sari", "Looks good")
+    await h.orch.request_cutover(m.id, "sari")
+    await asyncio.sleep(0.1)
+    assert (await h.migration(m.id)).phase == P.awaiting_cutover, "sari's own approval"
+    await h.orch.approve(m.id, "rina", "A second pair of eyes")
+    await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+
+async def test_a_repeated_cutover_request_keeps_the_first_requester(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    first = await h.orch.request_cutover(m.id, "sari")
+    again = await h.orch.request_cutover(m.id, "rina", force_window=True)
+    assert (again.cutover_requested_by, again.cutover_requested_at) == (
+        "sari",
+        first.cutover_requested_at,
+    )
+    assert again.force_window is True and again.approvals == []
+
+
+async def test_without_a_distinct_approver_a_request_is_an_approval_as_before(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)], {**GATED, "require_distinct_approver": False})
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.awaiting_cutover)
+    out = await h.orch.request_cutover(m.id, "sari", comment="emergency")
+    assert out.cutover_requested_by == "sari"
+    assert (out.approvals[-1].actor, out.approvals[-1].comment) == ("sari", "emergency")
+    await h.wait_phase(m.id, P.completed)
+    await h.orch.stop()
+
+
+async def test_the_gate_counts_approvals_by_anyone_but_the_cutover_requester(tmp_path, store):
+    """SDD §5.4 rule 1; data stored before ADV-17 has no requester, so its approvals count."""
+    h, plan = await setup(tmp_path, store, [vm(1)], GATED)
+    now = h.clock()
+
+    def gate(plan_kw=None, **m_kw) -> bool:
+        p = plan.model_copy(update=plan_kw or {})
+        m = make_migration(plan_id=plan.id, phase=P.awaiting_cutover, **m_kw)
+        return h.orch._gate(m, p, now)
+
+    def approval(actor: str) -> Approval:
+        return Approval(actor=actor, at=now, comment=None)
+
+    asked = {"cutover_requested": True, "cutover_requested_by": "sari"}
+    assert gate(approvals=[approval("sari")], **asked) is False
+    assert gate(approvals=[approval("sari"), approval("rina")], **asked) is True
+    assert gate(approvals=[], **asked) is False
+    assert gate(approvals=[approval("sari")], cutover_requested=True) is True  # no requester
+    off = {"require_distinct_approver": False}
+    assert gate(off, approvals=[approval("sari")], **asked) is True
+    auto = {"auto_cutover": True}
+    assert gate(auto, approvals=[approval("sari")]) is True  # nobody requested
+
+
+async def test_validation_and_a_strategy_change_clear_the_cutover_requester(tmp_path, store):
+    h, plan = await setup(tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold})
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    await h.orch.request_cutover(m.id, "sari")
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.migration(m.id)
+    assert (m.cutover_requested, m.cutover_requested_by, m.cutover_requested_at) == (
+        False,
+        None,
+        None,
+    )
+    await h.orch.request_cutover(m.id, "sari")
+    await h.orch.set_strategy(m.id, Strategy.warm, "rina")
+    m = await h.migration(m.id)
+    assert (m.cutover_requested_by, m.cutover_requested_at) == (None, None)
+
+
+async def test_a_validation_names_its_user_as_the_requester_of_the_decisions_it_records(
+    tmp_path, store
+):
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert rec.requested_by == "alice"
+
+
+async def test_the_requester_of_a_decision_neither_approves_nor_overrides_it(tmp_path, store):
+    """ADV-17 with the Finance policy (a distinct approver by default): another admin decides."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "rina")
+    [rec] = _recommendations(store)
+    for decide in (
+        h.orch.approve_recommendation(rec.id, "rina"),
+        h.orch.override_recommendation(rec.id, "cold", "The change window fits a cold one", "rina"),
+    ):
+        with pytest.raises(NotAllowed) as refused:
+            await decide
+        assert str(refused.value) == OWN_DECISION
+    approved = await h.orch.approve_recommendation(rec.id, "sari")
+    assert (approved.decision.status, approved.decision.actor.id) == (
+        DecisionStatus.approved,
+        "sari",
+    )
+
+
+async def test_a_policy_without_a_distinct_approver_lets_the_requester_decide(tmp_path, store):
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put(
+        "advisor_policy", _finance(plan).model_copy(update={"require_distinct_approver": False})
+    )
+    await h.orch.validate_plan(plan.id, "rina")
+    [rec] = _recommendations(store)
+    approved = await h.orch.approve_recommendation(rec.id, "rina")
+    assert approved.decision.status == DecisionStatus.approved

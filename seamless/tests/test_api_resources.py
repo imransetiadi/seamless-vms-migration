@@ -759,3 +759,41 @@ async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):
         assert (await c.post(f"/api/v1/plans/{plan.id}/start", headers=headers)).status_code == 409
     await h.orch.stop()
     store.dispose()
+
+
+def test_the_cutover_requester_cannot_approve_it_over_the_api(api):
+    """ADV-17 (SDD §5.4): the request is not an approval; the requester's approval is refused."""
+    migs = seed_migrations(api.store)
+    base = f"/api/v1/migrations/{migs['ready'].id}"
+    requested = api.post(f"{base}/cutover", Role.approver, json={"comment": "Window agreed"})
+    assert requested.status_code == 200, requested.text
+    body = requested.json()
+    assert (body["cutover_requested_by"], body["approvals"]) == ("approver-user", [])
+    assert body["cutover_requested_at"] is not None
+    refused = api.post(f"{base}/approve", Role.approver, json={"comment": "my own"})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["message"] == (
+        "You requested this cutover. Another approver must approve it."
+    )
+    approved = api.post(f"{base}/approve", Role.admin, json={"comment": "Checked the findings"})
+    assert approved.status_code == 200 and approved.json()["approvals"][-1]["actor"] == "admin-user"
+
+
+def test_only_an_approver_changes_the_distinct_approver_setting(api):
+    """ADV-17: Distinct approver belongs to the approval policy, approver-only like it (SDD §12)."""
+    body = {
+        "name": "Four eyes off",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api),
+        "require_distinct_approver": False,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json=body)
+    assert refused.status_code == 403, refused.text
+    assert "require_distinct_approver" in refused.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.approver, json=body)
+    assert created.status_code == 201 and created.json()["require_distinct_approver"] is False
+    plain = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "require_distinct_approver": True}
+    )
+    assert plain.status_code == 201, "the default value needs no approver"

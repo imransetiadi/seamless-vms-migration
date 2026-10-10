@@ -70,6 +70,8 @@ def test_the_most_specific_level_wins():
         ([pol("pol-a", min_evidence_for_auto_apply=3), pol("pol-b")], "pol-a"),
         # then a required override reason
         ([pol("pol-a", require_override_reason=False), pol("pol-b")], "pol-b"),
+        # then a required distinct approver (ADV-17)
+        ([pol("pol-a", require_distinct_approver=False), pol("pol-b")], "pol-b"),
         # then the lower id
         ([pol("pol-b"), pol("pol-a")], "pol-a"),
     ],
@@ -96,13 +98,14 @@ def test_without_a_stored_policy_the_built_in_default_keeps_todays_behaviour():
         0,
     )
     assert rule.require_override_reason is False
+    assert rule.require_distinct_approver is True  # ADV-17: on by default
 
 
 # -- API ----------------------------------------------------------------------------------------
 
 
 def rec_for(
-    mid: str, *, status=DecisionStatus.pending_approval, legacy=False
+    mid: str, *, status=DecisionStatus.pending_approval, legacy=False, requested_by=None
 ) -> AdvisorRecommendation:
     return AdvisorRecommendation(
         id=f"rec-{mid[-6:]}aa0001",
@@ -124,6 +127,7 @@ def rec_for(
             decided_at=T0,
         ),
         legacy=legacy,
+        requested_by=requested_by,
     )
 
 
@@ -188,6 +192,7 @@ def test_an_admin_creates_replaces_and_deletes_a_policy_and_each_change_is_audit
     assert created.status_code == 201, created.text
     policy = created.json()
     assert policy["id"].startswith("pol-") and policy["updated_by"] == "admin-user"
+    assert policy["require_distinct_approver"] is True  # the default (ADV-17)
     changed = api.client.put(
         f"/api/v1/advisor/policies/{policy['id']}",
         headers=api.h(Role.admin),
@@ -280,3 +285,23 @@ def test_a_legacy_entry_cannot_be_approved(api):
         "/api/v1/advisor/recommendations/rec-legacy-mig-0000000001-0/approve", json={}
     )
     assert response.status_code == 409
+
+
+def test_the_requester_of_a_decision_is_refused_by_the_api(api):
+    """ADV-17: the validating admin cannot approve or override their own decision (409)."""
+    api.store.put("plan", make_plan(id="plan-1", source_provider_id="src-osp"))
+    api.store.put(
+        "advisor_policy", pol("pol-finance", "always_require_approval", providers=["src-osp"])
+    )
+    api.store.put("migration", held_migration("mig-0000000001"))
+    api.store.put("recommendation", rec_for("mig-0000000001", requested_by="admin-user"))
+    base = "/api/v1/advisor/recommendations/rec-000001aa0001"
+    for action, body in (
+        ("approve", {}),
+        ("override", {"option": "cold", "reason": "Rehearsed the cold path twice"}),
+    ):
+        refused = api.post(f"{base}/{action}", json=body)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["message"] == (
+            "You requested this decision. Another approver must decide it."
+        )

@@ -191,3 +191,44 @@ async def test_demo_seeds_the_finance_approval_policy_once(tmp_path, store):
         "always_require_approval",
     )
     assert policy.require_override_reason and policy.decision_types == ["migration_strategy"]
+
+
+async def test_the_demo_vmware_plan_has_cutovers_requested_and_approved_by_two_people(
+    tmp_path, store
+):
+    """ADV-17: the seeded approvals read like an operator's — a requester, another approver and a
+    comment — and the seed starts nothing a person did not ask for twice."""
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e7, demo_failure_rate=0.0
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    vmware = next(p for p in store.list("plan", Plan) if p.source_provider_id == "vcenter-dc2")
+    assert vmware.require_approval and vmware.require_distinct_approver
+    requested = [
+        m for m in store.list("migration", Migration, plan_id=vmware.id) if m.cutover_requested_by
+    ]
+    assert requested, "at least one requested cutover"
+    for m in requested:
+        assert m.approvals, m.vm.name
+        assert all(a.actor != m.cutover_requested_by for a in m.approvals), m.vm.name
+        assert all(a.comment and len(a.comment) >= 20 for a in m.approvals), m.vm.name
+    assert len(requested) < len(vmware.vm_ids), "others still wait for an approver"
+
+
+def test_the_demo_seed_carries_no_placeholder_strings():
+    """ADV-17: no test strings such as 'demo46' in the seed (grep test)."""
+    import re
+    from pathlib import Path
+
+    import seamless_migrate.demo as demo
+    import seamless_migrate.providers.fake as fake
+
+    placeholder = re.compile(
+        r"\bdemo\d+\b|\btest\d+\b|\b(foo|bar|baz|qux|asdf|qwerty|lorem|ipsum|dummy)\b|xxx+",
+        re.IGNORECASE,
+    )
+    for module in (demo, fake):
+        text = Path(module.__file__).read_text(encoding="utf-8")
+        found = [match.group(0) for match in placeholder.finditer(text)]
+        assert found == [], module.__name__

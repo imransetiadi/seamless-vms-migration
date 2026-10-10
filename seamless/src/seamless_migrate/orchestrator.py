@@ -156,6 +156,26 @@ def _phase_started(m: Migration, phase: Phase) -> datetime | None:
     return None
 
 
+#: maker-checker refusals (SDD §5.4, §14.6, ADV-17)
+OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
+OWN_DECISION = "You requested this decision. Another approver must decide it."
+
+
+def _clear_request(m: Migration) -> None:
+    """Drop the cutover request with its requester and the window bypass granted with it (§5.4)."""
+    m.cutover_requested = False
+    m.cutover_requested_by = None
+    m.cutover_requested_at = None
+    m.force_window = False
+
+
+def counted_approvals(m: Migration, plan: Plan) -> list[Approval]:
+    """The approvals the gate counts: all, but the requester's under a distinct approver (§5.4)."""
+    if plan.require_distinct_approver and m.cutover_requested_by is not None:
+        return [a for a in m.approvals if a.actor != m.cutover_requested_by]
+    return list(m.approvals)
+
+
 def _fmt_bytes(n: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if abs(n) < 1024 or unit == "TiB":
@@ -542,7 +562,7 @@ class Orchestrator:
             validated = migration.phase in (P.ready, P.blocked)
             if advice is not None and decision is not None and validated:
                 await self._record_strategy_recommendation(
-                    plan, vm, migration, advice, decision, rec_id
+                    plan, vm, migration, advice, decision, rec_id, actor
                 )
             items.append(
                 ValidationItem(
@@ -646,8 +666,7 @@ class Orchestrator:
             # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
             # this validation carries over to the new strategy, findings and estimate
             m.approvals = []
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
             if no_eligible:
                 details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
                 m.error = f"no eligible strategy ({details})"[:1000]
@@ -671,6 +690,7 @@ class Orchestrator:
         advice: Advice,
         decision: Decision,
         rec_id: str,
+        requested_by: str,
     ) -> AdvisorRecommendation:
         """Store the strategy recommendation, its decision and its input; audit both (SDD §14.4,
         §14.5)."""
@@ -706,6 +726,7 @@ class Orchestrator:
             ),
             decision=decision,
             input_snapshot_sha256=snapshot,
+            requested_by=requested_by,
         )
         await self.db.put("recommendation", rec)
         for kind, message, actor, data in (created_event(rec), decision_event(rec)):
@@ -845,6 +866,9 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in APPROVABLE:
                 raise NotAllowed(f"a migration in {m.phase} cannot be approved")
+            plan = await self._plan(m.plan_id)
+            if plan.require_distinct_approver and m.cutover_requested_by == actor:
+                raise NotAllowed(OWN_CUTOVER)
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
             await self._save(m, v)
         await self._emit(
@@ -864,23 +888,30 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in CUTOVER_REQUESTABLE:
                 raise NotAllowed(f"cutover cannot be requested in {m.phase}")
-            m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
+            # maker-checker (SDD §5.4): the request is an approval only without a distinct approver
+            approves = not (await self._plan(m.plan_id)).require_distinct_approver
+            if approves:
+                m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
+            if m.cutover_requested_by is None:  # a repeated request keeps the first requester
+                m.cutover_requested_by = actor
+                m.cutover_requested_at = self._now()
             m.cutover_requested = True
             m.force_window = m.force_window or force_window
             await self._save(m, v)
-        await self._emit(
-            "migration.approved",
-            f"{m.vm.name} approved by {actor}",
-            migration=m,
-            actor=actor,
-            data={"comment": comment},
-        )
+        if approves:
+            await self._emit(
+                "migration.approved",
+                f"{m.vm.name} approved by {actor}",
+                migration=m,
+                actor=actor,
+                data={"comment": comment},
+            )
         await self._emit(
             "migration.action",
             f"cutover of {m.vm.name} requested by {actor}",
             migration=m,
             actor=actor,
-            data={"action": "cutover", "force_window": force_window},
+            data={"action": "cutover", "force_window": force_window, "comment": comment},
         )
         self.wake()
         return m
@@ -958,8 +989,7 @@ class Orchestrator:
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
             m.checkpoint = None
             m.progress_pct = 0
             m.review_required = False
@@ -1156,8 +1186,7 @@ class Orchestrator:
             m.strategy = strategy
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
             await self._save(m, v)
         source_id = m.vm.source_id
 
@@ -1214,6 +1243,8 @@ class Orchestrator:
             policy = resolve_policy(
                 policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
             )
+            if policy.require_distinct_approver and rec.requested_by == actor:
+                raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
             if isinstance(action, Override) and policy.require_override_reason:
                 if len(action.reason or "") < 10:
                     raise Unprocessable(
@@ -1247,8 +1278,7 @@ class Orchestrator:
             m.advisor_hold = None
             if changed:  # the approval was given for the previous strategy (SDD §5.4)
                 m.approvals = []
-                m.cutover_requested = False
-                m.force_window = False
+                _clear_request(m)
             await self._save(m, v)
         if isinstance(action, Override):
             source_id = m.vm.source_id
@@ -1389,7 +1419,7 @@ class Orchestrator:
             await self._tick_plan(plan, by_plan.get(plan.id, []), counts, now)
 
     def _gate(self, m: Migration, plan: Plan, now: datetime) -> bool:
-        if plan.require_approval and not m.approvals:
+        if plan.require_approval and not counted_approvals(m, plan):
             return False
         window = plan.cutover_window
         if window is not None and not m.force_window and not window.contains(now):
