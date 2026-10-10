@@ -722,8 +722,16 @@ class Orchestrator:
                     estimates=migration.estimates,
                 )
             )
+        kept: list[dict[str, str]] = []
         for stale in removed:
-            await self.cancel(stale.id, actor, "removed from the plan", by_validation=True)
+            try:
+                await self.cancel(stale.id, actor, "removed from the plan", by_validation=True)
+            except NotAllowed:
+                # SDD §5.4: an operator moved it meanwhile (a rollback): it stays as it is, and the
+                # validation finishes
+                moved, _ = await self._load(stale.id)
+                if moved.phase != P.cancelled:
+                    kept.append({"vm": moved.vm.name, "phase": str(moved.phase)})
 
         def mark_validated(fresh: Plan) -> None:
             fresh.status = PlanStatus.validated
@@ -731,12 +739,18 @@ class Orchestrator:
         plan = await self._update_plan(plan_id, mark_validated)
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
+        left = "".join(f"; {k['vm']} left as it is ({k['phase']})" for k in kept)
         await self._emit(
             "plan.validated",
-            f"{plan.name}: {len(items)} VM(s) validated, {blocked} blocked",
+            f"{plan.name}: {len(items)} VM(s) validated, {blocked} blocked{left}",
             plan_id=plan.id,
             actor=actor,
-            data={"ok": ok, "migrations": len(items), "blocked": blocked},
+            data={
+                "ok": ok,
+                "migrations": len(items),
+                "blocked": blocked,
+                **({"kept": kept} if kept else {}),
+            },
         )
         return ValidationReport(plan_id=plan.id, ok=ok, migrations=items)
 

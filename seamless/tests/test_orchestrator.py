@@ -373,6 +373,50 @@ async def test_validate_cancels_a_removed_vms_failed_migration(tmp_path, store):
     assert store.get("migration", dropped.id, Migration).phase == P.cancelled
 
 
+async def test_a_validation_leaves_a_removed_vms_migration_that_moved_meanwhile_and_finishes(
+    tmp_path, store
+):
+    """SDD §5.4: an operator rolls a removed VM's failed migration back while the validation
+    re-assesses the plan's VMs; it can no longer be cancelled — the validation leaves it as it
+    is, cancels the other removed VM's migration, still finishes, and names it in kept."""
+    from seamless_migrate.domain.models import Migration, Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2), vm(3)])
+    await h.orch.validate_plan(plan.id, "alice")
+    moved, dropped = [await h.by_vm(plan.id, v) for v in ("vm-2", "vm-3")]
+    for m in (moved, dropped):
+        m.phase = P.failed  # a pre-copy failed; the source VM kept running
+        store.put("migration", m)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    apply_validation = h.orch._apply_validation
+
+    async def slow_apply_validation(*args, **kwargs):
+        # the removed VMs are known; the plan's VMs are being re-assessed (minutes of provider,
+        # Jev and memory calls in a real plan)
+        entered.set()
+        await gate.wait()
+        return await apply_validation(*args, **kwargs)
+
+    h.orch._apply_validation = slow_apply_validation
+    validation = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+    await asyncio.wait_for(entered.wait(), 5)
+    await h.orch.rollback(moved.id, "bayu", "keep the source running")  # meanwhile
+    gate.set()
+    report = await validation
+    await h.orch.stop()
+    assert [item.vm_name for item in report.migrations] == ["web-01"]
+    assert store.get("migration", dropped.id, Migration).phase == P.cancelled
+    kept_phase = store.get("migration", moved.id, Migration).phase
+    assert kept_phase in (P.rolling_back, P.rolled_back)
+    assert store.get("plan", plan.id, Plan).status == PlanStatus.validated
+    validated = [e for e in store.events(since_seq=0, limit=100000) if e.kind == "plan.validated"]
+    [kept] = validated[-1].data["kept"]
+    assert kept["vm"] == "web-02" and kept["phase"] in ("rolling_back", "rolled_back")
+
+
 async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_validating(
     tmp_path, store
 ):
