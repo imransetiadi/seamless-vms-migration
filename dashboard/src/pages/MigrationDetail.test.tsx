@@ -195,4 +195,23 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.strategy).toBe(other));
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
+
+  it('announces a strategy change from a live region already on the page (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.estimates.filter((e) => e.eligible).length >= 2)!;
+    m.phase = 'ready';
+    m.approvals = [];
+    m.cutover_requested = false;
+    const other = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const use = await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` });
+    const regions = screen.getAllByRole('status');
+
+    await user.click(use);
+    await waitFor(() => expect(m.strategy).toBe(other));
+    const announced = await screen.findByText(`${m.vm.name}: strategy set to ${STRATEGY_LABELS[other]}.`);
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(announced.closest('[role="status"]'));
+  });
 });

@@ -179,7 +179,6 @@ function ReportBanner({ report }: { report: ValidationReport }) {
   const ok = report.ok && blocked === 0;
   return (
     <div
-      role="status"
       className={cn(
         'mb-4 flex items-start gap-2 rounded-md border p-3 text-sm',
         ok ? 'border-status-success/40 bg-status-success/10' : 'border-status-warning/40 bg-status-warning/10',
@@ -323,11 +322,19 @@ export default function PlanDetail() {
       {action.error && confirm === null && (
         <ErrorBanner error={action.error} title="The plan action failed" className="mb-4" />
       )}
-      {report && <ReportBanner report={report} />}
+      {/* a live region already on the page: one inserted together with its text is not reliably read (SDD §16) */}
+      <div role="status">{report && <ReportBanner report={report} />}</div>
       <p role="status" className="sr-only">
         {announcement}
       </p>
-      {editing && <PlanCreateDialog open onClose={() => setEditing(false)} plan={p} />}
+      {editing && (
+        <PlanCreateDialog
+          open
+          onClose={() => setEditing(false)}
+          plan={p}
+          onSaved={() => setAnnouncement('Plan saved. It is a draft again: validate it before starting.')}
+        />
+      )}
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}

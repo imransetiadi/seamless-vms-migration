@@ -64,6 +64,34 @@ describe('PlanDetail', () => {
     expect(await actionButton(/^start/i)).not.toHaveAttribute('aria-disabled');
   });
 
+  it('announces the validation report from a live region already on the page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-0e9f6a17');
+    const validate = await actionButton(/^validate$/i);
+    const regions = screen.getAllByRole('status');
+
+    await user.click(validate);
+    const report = await screen.findByText(/validation finished/i);
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(report.closest('[role="status"]'));
+  });
+
+  it('announces a saved plan edit (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPlan('plan-c81d44a0');
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const regions = screen.getAllByRole('status');
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const announced = regions.find((r) => /plan saved/i.test(r.textContent ?? ''));
+    expect(announced).toHaveTextContent('Plan saved. It is a draft again: validate it before starting.');
+  });
+
   it('says that validation creates the migrations of a new plan, with Validate there too (SDD §16)', async () => {
     const server = createTestServer();
     const taken = new Set(server.migrations.map((m) => m.vm.source_id));

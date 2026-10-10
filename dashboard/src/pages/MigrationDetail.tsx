@@ -168,7 +168,15 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   // be counted
   const [asking, setAsking] = useState<{ strategy: Strategy; cleared: string } | null>(null);
   const [checking, setChecking] = useState<Strategy | null>(null);
-  const choose = (strategy: Strategy) => setStrategy.mutate(strategy, { onSuccess: () => setAsking(null) });
+  // the outcome, for screen readers, from a live region already on the page (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
+  const choose = (strategy: Strategy) =>
+    setStrategy.mutate(strategy, {
+      onSuccess: () => {
+        setAsking(null);
+        setAnnouncement(`${m.vm.name}: strategy set to ${strategyLabel(strategy)}.`);
+      },
+    });
   const askOrChoose = async (strategy: Strategy) => {
     setChecking(strategy);
     const latest = await migration.refetch();
@@ -189,6 +197,9 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   if (m.estimates.length === 0) return <EmptyState icon={ClipboardX} title="Not estimated yet" description="Validate the plan to estimate every strategy." />;
   return (
     <div className="flex flex-col gap-2">
+      <p role="status" className="sr-only">
+        {announcement}
+      </p>
       {setStrategy.error && asking === null && <ErrorBanner error={setStrategy.error} title="The strategy was not changed" />}
       <div className="table-wrap rounded-md border border-border">
         <table className="data-table">

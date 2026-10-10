@@ -255,10 +255,12 @@ export interface PlanCreateDialogProps {
   initialVmIds?: string[];
   /** Edit this plan instead of creating one (PATCH /plans/{id}; only the changed fields are sent). */
   plan?: Plan;
+  /** Called once the edited plan was saved, so the page can announce it (SDD §16). */
+  onSaved?: () => void;
 }
 
 /** Create a draft plan (POST /plans, operator). Validation happens on submit with an error summary. */
-export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan }: PlanCreateDialogProps) {
+export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved }: PlanCreateDialogProps) {
   const titleId = useId();
   const id = (key: string) => `plan-create-${key}`;
   const providers = useProviders();
@@ -477,7 +479,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         onClose();
         return;
       }
-      patch.mutate(changes as PlanPatch, { onSuccess: () => onClose() });
+      patch.mutate(changes as PlanPatch, {
+        onSuccess: () => {
+          onSaved?.();
+          onClose();
+        },
+      });
       return;
     }
     create.mutate(body, {
