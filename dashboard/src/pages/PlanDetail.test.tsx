@@ -21,7 +21,8 @@ describe('PlanDetail', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'DC1 → RHOSO production rollout' })).toBeInTheDocument();
     const settings = screen.getByRole('region', { name: /settings/i });
     expect(settings).toHaveTextContent('5m 00s');
-    expect(settings).toHaveTextContent(/require approval/i);
+    // the plan's approval is named by its kind (SDD §16, ADV-20)
+    expect(settings).toHaveTextContent(/cutover approval/i);
     const waves = screen.getByRole('region', { name: /waves/i });
     expect(within(waves).getByText('Pilot — stateless web')).toBeInTheDocument();
     expect(within(waves).getByText('Middleware')).toBeInTheDocument();
@@ -386,6 +387,25 @@ describe('PlanDetail', () => {
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
     actions = await screen.findByRole('group', { name: /plan actions/i });
     expect(await within(actions).findByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  });
+
+  it('names the advisor policy in force beside the cutover approval, with its mode, threshold and a link (SDD §16, ADV-20)', async () => {
+    const view = renderPlan('plan-c81d44a0', 'viewer');
+    let settings = await screen.findByRole('region', { name: 'Settings' });
+    // the Finance policy covers the DC1 source
+    const finance = await within(settings).findByRole('link', { name: 'Finance — approval required' });
+    expect(finance).toHaveAttribute('href', '/advisor/policies#policy-pol-finance');
+    expect(settings).toHaveTextContent('Asks a person for every migration strategy decision');
+    expect(settings).toHaveTextContent('Cutover approvalYes — an approver other than the requester must approve each cutover');
+    view.unmount();
+
+    // no stored policy covers the VMware source: the built-in default
+    renderPlan('plan-7b3e0d52', 'viewer');
+    settings = await screen.findByRole('region', { name: 'Settings' });
+    // named as the card the link lands on
+    const builtin = await within(settings).findByRole('link', { name: 'Built-in default' });
+    expect(builtin).toHaveAttribute('href', '/advisor/policies#policy-global-default');
+    expect(settings).toHaveTextContent('Applies a migration strategy decision at 60% confidence or more');
   });
 
   it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {

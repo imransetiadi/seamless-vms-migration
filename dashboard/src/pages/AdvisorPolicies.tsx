@@ -1,5 +1,6 @@
 import { Hourglass, Pencil, Plus, ShieldCheck, SlidersHorizontal, Trash2, Zap } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { usePlans, usePolicies, useProviders, useDeletePolicy } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorPolicy } from '../api/types';
@@ -59,7 +60,13 @@ function PolicyCard({
         : 'Every plan';
   return (
     <li>
-      <article aria-labelledby={headingId} className="card flex h-full min-w-0 flex-col gap-3 p-4">
+      {/* addressable as #policy-{id}: the plan settings link to the policy in force (SDD §16, ADV-20) */}
+      <article
+        id={`policy-${policy.id}`}
+        tabIndex={-1}
+        aria-labelledby={headingId}
+        className="card flex h-full min-w-0 scroll-mt-20 flex-col gap-3 p-4 outline-offset-2 focus:outline-2 focus:outline-ring"
+      >
         <header className="flex flex-wrap items-start gap-2">
           <div className="min-w-0 flex-1">
             <h3 id={headingId} className="text-base font-semibold text-foreground wrap-break-word">
@@ -149,6 +156,16 @@ export default function AdvisorPolicies() {
       setDeleted(null);
     }
   }, [deleted, items]);
+
+  // a link to #policy-{id} lands on that policy once the list is there (SDD §16, ADV-20)
+  const { hash } = useLocation();
+  const loaded = Boolean(policies.data);
+  useEffect(() => {
+    if (!loaded || !hash.startsWith('#policy-')) return;
+    const target = document.getElementById(decodeURIComponent(hash.slice(1)));
+    target?.scrollIntoView?.({ block: 'start' });
+    target?.focus({ preventScroll: true });
+  }, [hash, loaded]);
 
   const openCreate = () => setDialog({ open: true });
   const fallback = policies.data?.default;

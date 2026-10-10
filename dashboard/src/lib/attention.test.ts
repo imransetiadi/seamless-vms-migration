@@ -57,6 +57,8 @@ describe('attentionItems', () => {
     const { fx, plans, byName } = scenario();
     // wave-3 depends on wave-1 and wave-2, which are still running.
     byName('api-gw-02').phase = 'ready';
+    // approved: what is left is the cutover request (a pending approval is in Pending approvals, ADV-20)
+    for (const name of ['ad-dc-01', 'api-gw-02']) byName(name).approvals = [{ actor: 'sari', at: '2026-10-08T11:59:00Z', comment: null }];
     const names = attentionItems(fx.migrations, plans, NOW).map((i) => i.migration.vm.name);
     expect(names).toContain('ad-dc-01'); // wave-2 has no dependencies
     expect(names).not.toContain('api-gw-02');
@@ -65,7 +67,17 @@ describe('attentionItems', () => {
   it('distinguishes waiting for approval from waiting for a cutover request', () => {
     const { fx, plans, byName } = scenario();
     const billing = byName('app-billing-01');
-    expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)?.reason).toMatch(/waiting for approval/);
+    // waiting for an approval: listed once on the Overview, in Pending approvals (SDD §16, ADV-20)
+    expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)).toBeUndefined();
+    // the requester's own approval does not count (maker-checker, SDD §5.4): still an approval to give, even
+    // while the window is closed — the window is a wait after the approval, not instead of it
+    plans.get(billing.plan_id)!.cutover_window = { start: '2026-10-08T20:00:00Z', end: '2026-10-08T23:00:00Z' };
+    billing.cutover_requested = true;
+    billing.cutover_requested_by = 'rina';
+    billing.approvals = [{ actor: 'rina', at: '2026-10-08T11:58:00Z', comment: null }];
+    expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)).toBeUndefined();
+    billing.cutover_requested = false;
+    billing.cutover_requested_by = null;
     billing.approvals = [{ actor: 'sari', at: '2026-10-08T11:59:00Z', comment: null }];
     expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)?.reason).toMatch(/cutover request/);
   });

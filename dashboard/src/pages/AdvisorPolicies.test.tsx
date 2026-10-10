@@ -9,6 +9,19 @@ const FINANCE = 'Finance — approval required';
 const card = (name: string) => screen.getByRole('article', { name });
 
 describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
+  it('scrolls to and focuses the policy a link names, the built-in default too (SDD §16, ADV-20)', async () => {
+    const view = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies#policy-pol-finance', token: 'viewer' });
+    const finance = await screen.findByRole('article', { name: 'Finance — approval required' });
+    expect(finance).toHaveAttribute('id', 'policy-pol-finance');
+    await waitFor(() => expect(finance).toHaveFocus());
+    view.unmount();
+
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies#policy-global-default', token: 'viewer' });
+    const builtin = await screen.findByRole('article', { name: 'Built-in default' });
+    expect(builtin).toHaveAttribute('id', 'policy-global-default');
+    await waitFor(() => expect(builtin).toHaveFocus());
+  });
+
   it('lists the policies with the built-in default, which is read-only', async () => {
     renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', token: 'viewer' });
     expect(await screen.findByRole('heading', { level: 2, name: '1 policy' })).toBeInTheDocument();

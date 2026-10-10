@@ -26,14 +26,16 @@ import { LoadingBlock } from '../components/Skeleton';
 import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
+import { Unavailable } from '../components/Unavailable';
 import { VerificationPanel } from '../components/VerificationPanel';
-import { decidable, nonStrategyNotes } from '../lib/advisor';
+import { decidable, nonStrategyNotes, optionLabel } from '../lib/advisor';
+import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
 import { clearedByStrategyChange, countedApprovals } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
-import { can, hasRole } from '../lib/roles';
+import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -493,11 +495,24 @@ function When({ at }: { at: string }) {
 }
 
 /** The cutover request and the approvals in time order, saying which approval does not count (SDD §5.4, §16). */
+/** A person's advisor decisions (SDD §14.6): one waiting for approval, approved or overridden. */
+const PERSON_DECISIONS: ReadonlySet<string> = new Set(['pending_approval', 'approved', 'overridden']);
+
+/** The kind of an approval entry (SDD §16, ADV-20). */
+function Kind({ label }: { label: string }) {
+  return <p className="text-xs font-medium text-muted-foreground">{label}</p>;
+}
+
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
   const counted = new Set(countedApprovals(m, plan));
+  // the same query as the Advisor panel: the newest strategy decision is the one the migration runs (ADV-01)
+  const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
+  const newest = recommendations.data?.items.find((r) => !r.legacy && r.decision_type === 'migration_strategy');
+  const decision = newest && PERSON_DECISIONS.has(newest.decision.status) ? newest : null;
   // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
   const request = m.cutover_requested ? (
     <div className="flex flex-col gap-0.5 text-sm">
+      <Kind label="Cutover approval" />
       <p className="inline-flex flex-wrap items-center gap-1">
         <CircleCheck aria-hidden className="size-3.5 shrink-0 text-status-success" />
         {/* a request stored before ADV-17 names nobody */}
@@ -518,6 +533,7 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
       at: a.at,
       node: (
         <div className="text-sm">
+          <Kind label="Cutover approval" />
           <p className="inline-flex flex-wrap items-center gap-1">
             <strong className="font-medium text-foreground">Approved by {a.actor}</strong>
             <When at={a.at} />
@@ -528,12 +544,46 @@ function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined })
       ),
     })),
     ...(request ? [{ key: 'request', at: m.cutover_requested_at ?? '', node: request }] : []),
+    ...(decision
+      ? [
+          {
+            key: `decision-${decision.id}`,
+            at: decision.decision.decided_at,
+            node: (
+              <div className="text-sm">
+                <Kind label={approvalKindLabel({ kind: 'advisor_decision', decisionType: decision.decision_type })} />
+                {decision.decision.status === 'pending_approval' ? (
+                  <p className="text-foreground">
+                    Waits for approval ({PERMISSIONS['advisor.approve']}): approve or override it on{' '}
+                    <Link to={`/advisor/recommendations/${encodeURIComponent(decision.id)}`} className="underline underline-offset-4">
+                      its recommendation
+                    </Link>
+                    .
+                  </p>
+                ) : (
+                  <p className="inline-flex flex-wrap items-center gap-1">
+                    <strong className="font-medium text-foreground">
+                      {decision.decision.status === 'approved' ? 'Approved' : 'Overridden'} by {decision.decision.actor.id}
+                    </strong>
+                    {decision.decision.status === 'overridden' && decision.decision.final_option && (
+                      <span className="text-foreground">: {optionLabel(decision.decision.final_option)}</span>
+                    )}
+                    <When at={decision.decision.decided_at} />
+                  </p>
+                )}
+              </div>
+            ),
+          },
+        ]
+      : []),
   ].sort((a, b) => (a.at && b.at ? Date.parse(a.at) - Date.parse(b.at) : a.at ? -1 : 1));
   return (
     <div className="flex flex-col gap-2">
       {m.approvals.length === 0 && (
-        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
+        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require a cutover approval.' : 'No cutover approvals yet.'}</p>
       )}
+      {/* built from the recommendations too: unknown when they could not be loaded, never left out (SDD §16) */}
+      {recommendations.error && !recommendations.data && <Unavailable what="recommendations" subject="Advisor decision" />}
       {entries.length > 0 && (
         <ul className="flex flex-col gap-2">
           {entries.map((e) => (

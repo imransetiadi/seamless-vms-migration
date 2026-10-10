@@ -16,6 +16,7 @@ import { ErrorBanner } from '../components/ErrorBanner';
 import { DowntimeSloChart } from '../components/DowntimeSloChart';
 import { SelectField } from '../components/Field';
 import { MetricStrip } from '../components/MetricStrip';
+import { PendingApprovals } from '../components/PendingApprovals';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseDistribution } from '../components/PhaseDistribution';
@@ -179,7 +180,7 @@ function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migra
       {/* without the plans, approvals and cutover requests cannot be told: never "nothing" (SDD §16) */}
       {plansUnknown && <Unavailable what="plans" className={items.length ? 'mb-2' : undefined} />}
       {items.length === 0 ? (
-        !plansUnknown && <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, approvals or blockers are waiting." />
+        !plansUnknown && <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, reviews, cutover requests or blockers are waiting; approvals are in Pending approvals." />
       ) : (
         <>
           <ul className="-my-2 divide-y divide-border">
@@ -340,15 +341,21 @@ export default function Overview() {
         ) : (
           <DowntimeNow migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
         )}
-        <div className="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-1">
+        <div className="flex min-w-0 flex-col gap-4 xl:col-start-2 xl:row-span-2 xl:row-start-1">
           {migrationsQuery.isPending || plansQuery.isPending ? (
             <LoadingBlock label="Loading items that need attention…" />
-          ) : migrationsUnknown ? (
-            <Panel title="Needs attention" description="The next human action, most urgent first">
-              <Unavailable what="migrations" />
-            </Panel>
           ) : (
-            <NeedsAttention migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
+            <>
+              {/* a pending approval is listed once, here, not in Needs attention (SDD §16, ADV-20) */}
+              <PendingApprovals migrations={migrationsUnknown ? null : migrations} plans={plansById} plansUnknown={plansUnknown} />
+              {migrationsUnknown ? (
+                <Panel title="Needs attention" description="The next human action, most urgent first">
+                  <Unavailable what="migrations" />
+                </Panel>
+              ) : (
+                <NeedsAttention migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
+              )}
+            </>
           )}
         </div>
         <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">

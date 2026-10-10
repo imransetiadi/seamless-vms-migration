@@ -2,8 +2,9 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { queryKeys } from '../api/hooks';
+import type { Migration } from '../api/types';
 import { STRATEGY_LABELS } from '../lib/status';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
 
 function renderMigration(id: string) {
@@ -32,7 +33,7 @@ describe('MigrationDetail', () => {
     m.cutover_requested = true;
     m.force_window = false;
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
-    expect(await screen.findByText('This plan does not require approval.')).toBeInTheDocument();
+    expect(await screen.findByText('This plan does not require a cutover approval.')).toBeInTheDocument();
     expect(screen.getByText('Cutover requested')).toBeInTheDocument();
     expect(screen.queryByText(/outside the cutover window/i)).not.toBeInTheDocument();
   });
@@ -173,7 +174,7 @@ describe('MigrationDetail', () => {
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
     const use = await screen.findByRole('button', { name: `Use ${STRATEGY_LABELS[other]}` });
     // the page shows the migration without approvals; then an approver approves elsewhere
-    expect(await screen.findByText(/no approvals yet|does not require approval/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no cutover approvals yet|does not require a cutover approval/i)).toBeInTheDocument();
     m.approvals = [{ actor: 'sari', at: '2026-10-08T11:00:00Z', comment: null }];
 
     await user.click(use);
@@ -497,6 +498,36 @@ describe('MigrationDetail', () => {
     // the next source watch flags it
     server.tick();
     expect(m.source_running_at).not.toBeNull();
+  });
+
+  it('names the kind of every approval, the advisor decision among them (SDD §16, ADV-20)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    const route = (m: Migration) => ({ route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    let view = renderWithApp(<MigrationDetail />, route(held));
+    let approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Advisor decision · Migration strategy'));
+    expect(approvals).toHaveTextContent('Waits for approval (admin): approve or override it on its recommendation.');
+    expect(within(approvals).getByRole('link', { name: 'its recommendation' })).toHaveAttribute('href', `/advisor/recommendations/${held.advisor_hold}`);
+    // its cutover approval is a kind of its own, not given yet
+    expect(approvals).toHaveTextContent('No cutover approvals yet.');
+    view.unmount();
+
+    // once a person decided: who, and how
+    await createTestClient(server, 'admin').post(`/advisor/recommendations/${held.advisor_hold}/approve`, {});
+    view = renderWithApp(<MigrationDetail />, route(held));
+    approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(approvals).toHaveTextContent('Advisor decision · Migration strategy'));
+    expect(approvals).toHaveTextContent('Approved by rina');
+    view.unmount();
+
+    // a cutover approval says its kind too
+    const erp = server.migrations.find((m) => m.vm.name === 'vm-erp-db-01')!;
+    expect(erp.approvals.map((a) => a.actor)).toEqual(['sari']);
+    renderWithApp(<MigrationDetail />, route(erp));
+    approvals = await screen.findByRole('region', { name: 'Approvals' });
+    await waitFor(() => expect(within(approvals).getAllByText('Cutover approval')).toHaveLength(1));
+    expect(approvals).toHaveTextContent('Approved by sari');
   });
 
   it('shows no demo power control outside demo mode', async () => {

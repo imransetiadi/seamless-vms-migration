@@ -155,9 +155,32 @@ describe('Overview page (mock data)', () => {
     const attention = await screen.findByRole('region', { name: /needs attention/i });
     await within(attention).findByRole('link', { name: 'legacy-rhel6-app' });
     expect(attention).toHaveTextContent(/source VM is stopped/i);
-    expect(within(attention).getByRole('link', { name: 'app-billing-01' })).toBeInTheDocument();
-    expect(attention).toHaveTextContent(/waiting for approval/i);
     expect(within(attention).getByRole('link', { name: 'gpu-render-01' })).toBeInTheDocument();
+  });
+
+  it('lists the pending approvals of both kinds once, each with its kind, filtered by kind (SDD §16, ADV-20)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Overview />);
+    const inbox = await screen.findByRole('region', { name: 'Pending approvals' });
+    const billing = await within(inbox).findByRole('listitem', { name: 'app-billing-01' });
+    expect(billing).toHaveTextContent('Cutover approval');
+    expect(billing).toHaveTextContent('Converged: waiting for an approval; keep-warm syncs run meanwhile.');
+    expect(within(billing).getByRole('link', { name: 'app-billing-01' })).toHaveAttribute('href', expect.stringMatching(/^\/migrations\/mig-/));
+    const held = within(inbox).getByRole('listitem', { name: 'analytics-node-2' });
+    expect(held).toHaveTextContent('Advisor decision · Migration strategy');
+    expect(held).toHaveTextContent('Shared Ceph handover — analytics');
+    expect(within(held).getByRole('link', { name: 'analytics-node-2' })).toHaveAttribute('href', '/advisor/recommendations/rec-b2c4d6e87101');
+    expect(within(inbox).getAllByRole('listitem')).toHaveLength(3);
+    // listed once on the page: Needs attention leaves it to the inbox
+    const attention = screen.getByRole('region', { name: 'Needs attention' });
+    expect(within(attention).queryByRole('link', { name: 'app-billing-01' })).not.toBeInTheDocument();
+
+    await user.click(within(inbox).getByRole('radio', { name: 'Advisor decision (1)' }));
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['analytics-node-2']);
+    await user.click(within(inbox).getByRole('radio', { name: 'Cutover approval (2)' }));
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['ad-dc-01', 'app-billing-01']);
+    await user.click(within(inbox).getByRole('radio', { name: 'All (3)' }));
+    expect(within(inbox).getAllByRole('listitem')).toHaveLength(3);
   });
 
   it('shows the phase distribution with labels and counts', async () => {
@@ -213,7 +236,7 @@ describe('Overview page (mock data)', () => {
     expect(screen.queryByText(/no plans yet/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
     // they say they are unknown instead, and the key figures are dashes, not zeros
-    expect(screen.getAllByText(/unknown: the migrations could not be loaded/i)).toHaveLength(2);
+    expect(screen.getAllByText(/unknown: the migrations could not be loaded/i)).toHaveLength(3);
     expect(screen.getAllByText(/unknown: the statistics could not be loaded/i)).toHaveLength(3);
     expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /key metrics/i });
@@ -235,6 +258,10 @@ describe('Overview page (mock data)', () => {
     expect(within(attention).getByText(/waiting at the cutover gate/i)).toBeInTheDocument();
     expect(within(attention).getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     expect(within(attention).queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    // the inbox cannot tell the cutover approvals, and still lists the advisor decisions (ADV-20)
+    const inbox = screen.getByRole('region', { name: 'Pending approvals' });
+    expect(within(inbox).getByText('Cutover approvals unknown: the plans could not be loaded.')).toBeInTheDocument();
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['analytics-node-2']);
     // a down VM's SLO is unknown, not met
     const downtime = screen.getByRole('region', { name: 'Downtime now' });
     expect(within(downtime).getAllByText(/slo unknown: the plans could not be loaded/i).length).toBeGreaterThan(0);

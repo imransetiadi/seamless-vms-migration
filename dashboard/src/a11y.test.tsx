@@ -145,6 +145,15 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it('a migration whose advisor decision waits for approval, its approvals named by kind (ADV-20)', async () => {
+    const held = createTestServer().migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    renderAt(`/migrations/${held.id}`, 'viewer');
+    await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
+    await settled();
+    await within(screen.getByRole('region', { name: 'Approvals' })).findByText('Advisor decision · Migration strategy');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it('the new-plan dialog with validation errors', async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/plans', 'operator');

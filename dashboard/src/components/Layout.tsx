@@ -179,7 +179,7 @@ function SessionFooter() {
 
 /** App shell: skip link, sidebar navigation (≥1024 px) or a disclosure menu, and the main region. */
 export function Layout() {
-  const { pathname } = useLocation();
+  const { pathname, hash } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const lastPath = useRef(pathname);
@@ -187,13 +187,18 @@ export function Layout() {
   // Move focus to the main region after client-side navigation (screen readers announce the page).
   // Comparing paths (not a "first render" flag) keeps the initial load untouched — so the first Tab
   // reaches the skip link — even when StrictMode runs effects twice.
+  // A page that lands on the part a link names (`/advisor/policies#policy-…`) keeps the focus there: its effect
+  // runs first in the same commit. While it still loads that part, main takes focus and the page moves it
+  // there once it shows (SDD §16).
   useEffect(() => {
     setMenuOpen(false);
     if (lastPath.current === pathname) return;
     lastPath.current = pathname;
+    const target = hash.length > 1 ? document.getElementById(decodeURIComponent(hash.slice(1))) : null;
+    if (target && document.activeElement === target) return;
     mainRef.current?.focus({ preventScroll: true });
     window.scrollTo(0, 0);
-  }, [pathname]);
+  }, [pathname, hash]);
 
   return (
     <div className="min-h-dvh lg:grid lg:grid-cols-[15rem_minmax(0,1fr)]">

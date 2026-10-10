@@ -18,9 +18,9 @@ import {
 import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useMigrations, usePlan, usePlanAction, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
+import { useMigrations, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
-import type { Plan, Provider, ValidationReport } from '../api/types';
+import type { AdvisorPolicy, Plan, Provider, ValidationReport } from '../api/types';
 import { AdvisorApprovals } from '../components/AdvisorApprovals';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -39,11 +39,13 @@ import { ProbeWarnings } from '../components/ProbeWarnings';
 import { PlanStatusBadge } from '../components/StatusBadge';
 import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
+import { DECISION_TYPE_LABELS, thresholdDecimals } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { finalizeQueue, isOverdue } from '../lib/finalize';
 import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
+import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
 import { leftOutText } from '../lib/stats';
@@ -104,7 +106,27 @@ function windowText(plan: Plan): string {
   return `${formatDateTime(w.start)} → ${formatDateTime(w.end)} (${when})`;
 }
 
-function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[] }) {
+/** What the policy in force does with a migration strategy decision (SDD §14.6, §16, ADV-20). */
+function policyModeText(policy: AdvisorPolicy): string {
+  const what = DECISION_TYPE_LABELS.migration_strategy.toLowerCase();
+  return policy.mode === 'always_require_approval'
+    ? `Asks a person for every ${what} decision`
+    : `Applies a ${what} decision at ${formatPct(policy.threshold * 100, thresholdDecimals(policy.threshold))} confidence or more`;
+}
+
+function SettingsSummary({
+  plan,
+  providers,
+  policy,
+  builtIn = false,
+}: {
+  plan: Plan;
+  providers: Provider[];
+  /** The advisor policy in force; undefined while unknown (loading or not loaded). */
+  policy: AdvisorPolicy | undefined;
+  /** No stored policy applies: the built-in default decides, named as on /advisor/policies. */
+  builtIn?: boolean;
+}) {
   const source = providers.find((p) => p.id === plan.source_provider_id);
   const destination = providers.find((p) => p.id === plan.destination_provider_id);
   const overrides = Object.keys(plan.strategy_overrides).length;
@@ -124,12 +146,28 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         {strategyLabel(plan.default_strategy)} · {plan.selection_policy === 'min_downtime' ? 'minimum downtime' : 'simplest meeting the SLO'}
         {overrides > 0 && <span className="block text-xs text-muted-foreground">{overrides} per-VM override(s)</span>}
       </Setting>
-      <Setting label="Require approval">
+      {/* the two kinds of approval, each named (SDD §16, ADV-20) */}
+      <Setting label="Cutover approval">
         {plan.require_approval
           ? plan.require_distinct_approver
             ? 'Yes — an approver other than the requester must approve each cutover'
             : 'Yes — an approver must approve each cutover'
           : 'No'}
+      </Setting>
+      <Setting label="Advisor policy">
+        {policy ? (
+          <>
+            <Link to={`/advisor/policies#policy-${encodeURIComponent(policy.id)}`} className="underline underline-offset-4">
+              {builtIn ? 'Built-in default' : policy.name}
+            </Link>
+            <span className="block text-xs text-muted-foreground">
+              {policyModeText(policy)}
+              {plan.default_strategy !== 'auto' && '; not asked while the plan sets the strategy'}
+            </span>
+          </>
+        ) : (
+          <span className="text-muted-foreground">Unknown</span>
+        )}
       </Setting>
       <Setting label="Cutover trigger">{plan.auto_cutover ? 'Automatic once the gate opens' : 'On request (Cutover action)'}</Setting>
       <Setting label="Cutover window">{windowText(plan)}</Setting>
@@ -220,6 +258,7 @@ export default function PlanDetail() {
   const migrations = useMigrations({ plan_id: planId });
   const providers = useProviders();
   const stats = useStats(planId);
+  const policies = usePolicies();
   const role = useRole();
   const action = usePlanAction(planId);
   const waveSizeId = useId();
@@ -304,6 +343,9 @@ export default function PlanDetail() {
   // the primary action follows the derived status (SDD §8.1, ADV-19): Start is hidden once it has nothing to
   // start — while the plan runs (Pause is its action) and once its migrations ended; a Completed plan finalizes
   const ended = p.derived_status === 'completed' || p.derived_status === 'finalized';
+  // the advisor policy in force for the plan's strategy decisions (SDD §14.6, §16, ADV-20)
+  const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
+  const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
   const startShown = p.status !== 'running' && !ended;
   const overdue = finalizeQueue(list).filter((m) => isOverdue(m, p.finalize_warning_h)).length;
 
@@ -401,7 +443,7 @@ export default function PlanDetail() {
         <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
-          <SettingsSummary plan={p} providers={providers.data ?? []} />
+          <SettingsSummary plan={p} providers={providers.data ?? []} policy={policy?.policy} builtIn={policy?.builtIn} />
         </Panel>
 
         <Panel title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">

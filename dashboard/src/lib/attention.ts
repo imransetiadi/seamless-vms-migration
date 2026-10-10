@@ -1,5 +1,6 @@
 import type { Migration, Plan } from '../api/types';
 import { isOverdue } from './finalize';
+import { countedApprovals } from './migrationActions';
 import { formatRelative } from './format';
 import type { Tone } from './phase';
 import { isWaveActive } from './waves';
@@ -23,17 +24,13 @@ function windowState(plan: Plan | undefined, now: number): 'none' | 'open' | 'cl
   return now >= start && now <= end ? 'open' : 'closed';
 }
 
-/** What a human has to do next for a migration that is waiting at the cutover gate (SDD §5.4). */
+/**
+ * What a human has to do next for a migration that is waiting at the cutover gate (SDD §5.4). An approval still
+ * to give is listed once on the Overview, in Pending approvals (lib/approvals.ts, SDD §16, ADV-20): the gate's
+ * own count, so the requester's approval does not count under maker-checker.
+ */
 function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: number): AttentionItem | null {
-  if (plan && plan.require_approval && m.approvals.length === 0) {
-    return {
-      migration: m,
-      tone: 'warning',
-      reason: m.phase === 'awaiting_cutover' ? 'Converged — waiting for approval' : 'Ready for cutover — waiting for approval',
-      nextAction: 'Approve or request cutover (approver)',
-      rank,
-    };
-  }
+  if (plan && plan.require_approval && countedApprovals(m, plan).length === 0) return null;
   if (plan && !plan.auto_cutover && !m.cutover_requested) {
     return {
       migration: m,

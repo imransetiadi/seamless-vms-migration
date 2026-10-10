@@ -20,7 +20,14 @@ function renderApp(token: string | null, strict = false) {
 // React.lazy pages are compiled by Vite on first import; warm them so a cold transform under a busy
 // parallel run cannot exceed the query timeouts (the assertions measure the app, not the bundler).
 beforeAll(async () => {
-  await Promise.all([import('./pages/Overview'), import('./pages/Events'), import('./pages/Login')]);
+  await Promise.all([
+    import('./pages/Overview'),
+    import('./pages/Events'),
+    import('./pages/Login'),
+    import('./pages/Plans'),
+    import('./pages/PlanDetail'),
+    import('./pages/AdvisorPolicies'),
+  ]);
 }, 30_000);
 
 afterEach(() => {
@@ -64,6 +71,23 @@ describe('App shell', () => {
     await screen.findByRole('heading', { level: 1, name: 'Providers' }, PAGE_TIMEOUT);
     // focus moves in the layout's effect after the navigation commits
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('main')));
+  });
+
+  it('lands on the part of another page a link names, not on main (SDD §16, ADV-20)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderApp('viewer');
+    await screen.findByRole('heading', { level: 1, name: 'Overview' }, PAGE_TIMEOUT);
+    const nav = screen.getAllByRole('navigation', { name: 'Primary' })[0] as HTMLElement;
+    await user.click(within(nav).getByRole('link', { name: 'Plans' }));
+    await user.click(await screen.findByRole('link', { name: 'Shared Ceph handover — analytics' }, PAGE_TIMEOUT));
+    const settings = await screen.findByRole('region', { name: 'Settings' }, PAGE_TIMEOUT);
+    // the plan settings link to the advisor policy in force
+    await user.click(await within(settings).findByRole('link', { name: 'Finance — approval required' }, PAGE_TIMEOUT));
+    const card = await screen.findByRole('article', { name: 'Finance — approval required' }, PAGE_TIMEOUT);
+    await waitFor(() => expect(document.activeElement).toBe(card));
+    // and stays there once the shell's navigation effects ran
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(document.activeElement).toBe(card);
   });
 
   it('sends an unauthenticated user to the sign-in page', async () => {

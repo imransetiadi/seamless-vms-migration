@@ -152,3 +152,28 @@ test('powering a finished migration source VM on in demo mode raises the alert o
   await expect(alert).toBeHidden();
   await expect(step.getByRole('button', { name: 'Power on the source VM (demo)' })).toBeVisible();
 });
+
+test('the Overview inbox lists both kinds of pending approval; the advisor decision opens its recommendation (ADV-20)', async ({ page }) => {
+  await signIn(page, 'approver');
+  const inbox = page.getByRole('region', { name: 'Pending approvals' });
+  await expect(inbox.getByRole('listitem', { name: 'app-billing-01' })).toContainText('Cutover approval');
+  const held = inbox.getByRole('listitem', { name: 'analytics-node-2' });
+  await expect(held).toContainText('Advisor decision · Migration strategy');
+  // one kind at a time
+  await inbox.getByText('Cutover approval (2)').click();
+  await expect(held).toBeHidden();
+  await inbox.getByText('Advisor decision (1)').click();
+  await expect(inbox.getByRole('listitem', { name: 'app-billing-01' })).toBeHidden();
+  await held.getByRole('link', { name: 'analytics-node-2' }).click();
+  await expect(page).toHaveURL(/\/advisor\/recommendations\/rec-/);
+});
+
+test('a plan names the advisor policy in force beside its cutover approval; the link lands on the policy (ADV-20)', async ({ page }) => {
+  await signIn(page, 'viewer');
+  await page.goto('/plans/plan-c81d44a0');
+  const settings = page.getByRole('region', { name: 'Settings' });
+  await expect(settings).toContainText('Asks a person for every migration strategy decision');
+  await settings.getByRole('link', { name: 'Finance — approval required' }).click();
+  await expect(page).toHaveURL(/\/advisor\/policies#policy-pol-finance$/);
+  await expect(page.getByRole('article', { name: 'Finance — approval required' })).toBeFocused();
+});
