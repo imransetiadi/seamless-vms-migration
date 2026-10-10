@@ -1468,7 +1468,11 @@ is resolved the same way by `security.secrets.resolve_private_key(name) -> str` 
 admin) are written to the platform's **secret store** — never to the database, never returned — under
 the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key). The
 provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
-time (`credentials_updated_at`, `conversion_key_updated_at`). `SEAMLESS_SECRET_STORE` selects it:
+time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
+check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
+the change is recorded, with its `provider.credentials_updated` event — a 409 after the store already holds the
+new secret would leave the change unaudited. A provider deleted meanwhile answers 404, and the secret just
+written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
