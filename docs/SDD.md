@@ -890,7 +890,9 @@ Finding catalog (code — severity — condition):
 Tiers (from the advisor, §14.2; deterministic fallback by regex on name/tags/os_type):
 `stateless_web`, `middleware_queue`, `infrastructure_service`, `stateful_database`, `legacy_os`,
 `manual_review`. Wave 1 is a **pilot** of up to 3 lowest-risk VMs (`stateless_web` first, smallest
-disks first). Remaining VMs are ordered by tier (the order above) then disk size ascending and
+disks first): app groups are taken whole in that order while they fit, and once one does not fit, only
+groups of the same risk may still fill the pilot — never a riskier one, so a pilot may hold fewer than 3
+VMs. Remaining VMs are ordered by tier (the order above) then disk size ascending and
 chunked by `max_wave_size`; VMs sharing `tags["app"]` stay in the same wave (a wave may exceed
 `max_wave_size` to keep an app together). Each wave depends on the previous one. `manual_review`
 VMs go to a final wave named `Manual review`.
