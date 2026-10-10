@@ -1302,7 +1302,9 @@ settings as `serve` (they open the DB directly; a running server sees changes on
   label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids).
   Tokens are CSS variables consumed by Tailwind (`bg-background`, `text-muted-foreground`, …).
 * Accessibility: WCAG 2.2 AA contrast, visible focus rings, keyboard reachable actions, `aria-live`
-  for progress and for the outcome of an action (a plan started, resumed, paused or its waves planned),
+  for progress and for the outcome of an action (a plan started, resumed, paused, saved or validated — with
+  the report's counts — or its waves planned; a migration's action or strategy change), announced from a live
+  region already on the page (a region inserted together with its text is not reliably read),
   a form error announced when it appears (not only shown next to its field), focus that never drops to the
   page when the focused control goes away (Clear filters → the search field, a dialog's next step → its
   heading, a deleted item → its list's heading) or while its request runs (a busy button stays focusable,
