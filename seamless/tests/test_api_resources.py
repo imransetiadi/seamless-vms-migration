@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
-from seamless_migrate.domain.models import Estimate, Migration, Plan, SyncPass, utcnow
+from seamless_migrate.domain.models import Estimate, Migration, Plan, Provider, SyncPass, utcnow
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
@@ -917,6 +917,211 @@ async def test_a_retry_in_a_completed_plan_whose_provider_was_deleted_answers_40
         assert stored["status"] == "completed"
     await h.orch.stop()
     store.dispose()
+
+
+def test_a_completed_plan_keeps_its_providers_while_a_migration_holds_its_vm(api):
+    """SDD §12/§8.1: a completed migration can be rolled back until it is finalized, and its
+    rollback needs both providers - so can a rollback in progress or one that failed; a rolled-back
+    migration lets its VM go (a retry refuses when a provider is gone)."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "awaiting finalize",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = api.store.list("migration", Migration, plan_id=plan["id"])
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    delete = lambda: api.client.delete(  # noqa: E731
+        "/api/v1/providers/dst-rhoso", headers=api.h(Role.admin)
+    )
+    second.phase = Phase.finalized
+    api.store.put("migration", second)
+    for phase in (Phase.completed, Phase.rolling_back, Phase.failed):
+        first.phase = phase
+        api.store.put("migration", first)
+        refused = delete()
+        assert refused.status_code == 409, (phase, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("awaiting finalize", '
+            "1 VM not finalized); a plan needs its providers until it completes and its VMs are "
+            "finalized"
+        )
+    second.phase = Phase.completed
+    api.store.put("migration", second)
+    assert '("awaiting finalize", 2 VMs not finalized)' in delete().json()["error"]["message"]
+    first.phase, second.phase = Phase.rolled_back, Phase.cancelled
+    for m in (first, second):
+        api.store.put("migration", m)
+    assert delete().status_code == 204
+
+
+def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):
+    body = {
+        "name": "still a draft",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    refused = api.client.delete("/api/v1/providers/src-osp", headers=api.h(Role.admin))
+    assert refused.status_code == 409
+    assert refused.json()["error"]["message"] == (
+        f'provider is used by plan(s) that still need it: {plan["id"]} ("still a draft", draft); '
+        "a plan needs its providers until it completes and its VMs are finalized"
+    )
+    ids = [plan["id"]] + [
+        api.post("/api/v1/plans", Role.operator, json={**body, "name": f"draft {i}"}).json()["id"]
+        for i in range(10)
+    ]
+    message = api.client.delete("/api/v1/providers/src-osp", headers=api.h(Role.admin)).json()[
+        "error"
+    ]["message"]
+    # at most ten plans, then how many more
+    assert ids[9] in message and ids[10] not in message and '("draft 9"' not in message
+    assert message.endswith(
+        "draft) and 1 more; a plan needs its providers until it completes and its VMs are finalized"
+    )
+
+
+async def test_a_rollback_whose_provider_no_longer_exists_answers_409(tmp_path):
+    """SDD §5.1: without its providers a rollback would fail, and a migration whose cutover stopped
+    its source could then be neither rolled back, retried nor cancelled - so it is refused and the
+    migration stays as it is (a provider deleted before the rule of SDD §12)."""
+    store = Store(f"sqlite:///{tmp_path / 'rollback.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    h = build_harness(
+        tmp_path, store, [make_vm(source_id="vm-1", name="web-01")], settings=settings
+    )
+    plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = (await h.migrations(plan.id))[0]
+    m.phase = Phase.completed
+    m.downtime_started_at = utcnow()
+    m.downtime_ended_at = utcnow()
+    store.put("migration", m)
+    store.delete("provider", "dst-rhoso")
+    app = create_app(settings, orchestrator=h.orch)
+    operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        refused = await c.post(
+            f"/api/v1/migrations/{m.id}/rollback", headers=operator, json={"reason": "app broken"}
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["message"] == (
+            "web-01 cannot be rolled back: the plan's destination provider 'dst-rhoso' no longer "
+            "exists"
+        )
+        migration = (await c.get(f"/api/v1/migrations/{m.id}", headers=operator)).json()
+        assert migration["phase"] == "completed"
+    await h.orch.stop()
+    store.dispose()
+
+
+async def _race_with_a_provider_deletion(tmp_path, act):
+    """Run ``act`` (a request that checks the plan's providers) and DELETE /providers/src-osp while
+    ``act`` holds between its source and its destination check (SDD §12: one lock)."""
+    store = Store(f"sqlite:///{tmp_path / 'race.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    h = build_harness(
+        tmp_path, store, [make_vm(source_id="vm-1", name="web-01")], settings=settings
+    )
+    app = create_app(settings, orchestrator=h.orch)
+    headers = {r: {"Authorization": f"Bearer {tokens[r]}"} for r in (Role.operator, Role.admin)}
+    entered, release = asyncio.Event(), asyncio.Event()
+    get = h.orch.db.get
+
+    async def slow_get(kind, key, model):
+        if kind == "provider" and key == "dst-rhoso" and not entered.is_set():
+            entered.set()  # the source was checked; the destination check waits here
+            await release.wait()
+        return await get(kind, key, model)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        setup = await act(c, headers, store, h, arm=lambda: setattr(h.orch.db, "get", slow_get))
+        acting = asyncio.create_task(setup())
+        await asyncio.wait_for(entered.wait(), 5)
+        deleting = asyncio.create_task(
+            c.delete("/api/v1/providers/src-osp", headers=headers[Role.admin])
+        )
+        await asyncio.sleep(0.05)  # as far as the deletion gets meanwhile
+        release.set()
+        acted, deleted = await acting, await deleting
+        providers = {
+            p["id"] for p in (await c.get("/api/v1/providers", headers=headers[Role.admin])).json()
+        }
+    await h.orch.stop()
+    store.dispose()
+    return acted, deleted, providers
+
+
+async def test_a_plan_created_while_its_provider_is_deleted_keeps_the_provider(tmp_path):
+    async def act(c, headers, store, h, arm):
+        body = {
+            "name": "racing",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": ["vm-1"],
+        }
+        arm()
+        return lambda: c.post("/api/v1/plans", headers=headers[Role.operator], json=body)
+
+    created, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert created.status_code == 201, created.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
+
+
+async def test_a_plan_edited_onto_a_provider_being_deleted_keeps_the_provider(tmp_path):
+    async def act(c, headers, store, h, arm):
+        plan = make_plan(
+            vm_ids=["vm-1"], source_provider_id="src-other", destination_provider_id="dst-rhoso"
+        )
+        other = store.get("provider", "src-osp", Provider).model_copy(update={"id": "src-other"})
+        store.put("provider", other, expected_version=0)
+        store.put("plan", plan, expected_version=0)
+        arm()
+        return lambda: c.patch(
+            f"/api/v1/plans/{plan.id}",
+            headers=headers[Role.operator],
+            json={"source_provider_id": "src-osp"},
+        )
+
+    edited, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert edited.status_code == 200, edited.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
+
+
+async def test_a_retry_that_reopens_a_plan_while_its_provider_is_deleted_keeps_the_provider(
+    tmp_path,
+):
+    async def act(c, headers, store, h, arm):
+        plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+        store.put("plan", plan, expected_version=0)
+        await h.orch.validate_plan(plan.id, "alice")
+        m = (await h.migrations(plan.id))[0]
+        m.phase = Phase.rolled_back  # a rolled-back migration lets its VM go: deletable
+        store.put("migration", m)
+        done = store.get("plan", plan.id, Plan)
+        done.status = PlanStatus.completed
+        store.put("plan", done)
+        arm()
+        return lambda: c.post(f"/api/v1/migrations/{m.id}/retry", headers=headers[Role.operator])
+
+    retried, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert retried.status_code == 200, retried.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
 
 
 async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):

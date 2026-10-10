@@ -129,6 +129,10 @@ RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
 #: it is taken after a plan lock and before a migration lock
 VM_CLAIMS = "vm-claims"
+#: a provider's deletion checks and deletes under this lock, and a plan's creation, edit and retry
+#: check their providers under it, so none saves a plan with a provider deleted meanwhile (SDD
+#: §12); it is taken last and never held while another lock is awaited
+PROVIDERS = "providers"
 #: a migration in one of these depends on the plan's providers, mappings and strategy as they were
 #: when it started: the plan is not edited or re-waved meanwhile (SDD §12)
 IN_FLIGHT_PHASES = frozenset(
@@ -292,6 +296,22 @@ class Orchestrator:
     def plan_lock(self, plan_id: str) -> asyncio.Lock:
         """The plan's lock (SDD §8): an edit through the API takes it, like the status writers."""
         return self._lock(f"plan:{plan_id}")
+
+    def provider_lock(self) -> asyncio.Lock:
+        """The lock of provider deletions and the provider checks of plans (SDD §12)."""
+        return self._lock(PROVIDERS)
+
+    async def _missing_provider(self, plan: Plan) -> tuple[str, ProviderRole] | None:
+        """The first provider of ``plan`` that no longer exists, with its role (SDD §5.1)."""
+        for provider_id, role in (
+            (plan.source_provider_id, ProviderRole.source),
+            (plan.destination_provider_id, ProviderRole.destination),
+        ):
+            try:
+                await self.db.get("provider", provider_id, Provider)
+            except NotFound:
+                return provider_id, role
+        return None
 
     def _lock(self, mid: str) -> asyncio.Lock:
         lock = self._locks.get(mid)
@@ -1091,6 +1111,15 @@ class Orchestrator:
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.rolling_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be rolled back")
+            # SDD §5.1: without its providers the rollback fails, and a migration whose cutover
+            # stopped its source could then be neither rolled back, retried nor cancelled
+            missing = await self._missing_provider(await self._plan(m.plan_id))
+            if missing is not None:
+                provider_id, role = missing
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be rolled back: the plan's {role} provider "
+                    f"{provider_id!r} no longer exists"
+                )
             m, v = await self._transition(
                 m, v, P.rolling_back, f"rollback requested: {reason}", actor
             )
@@ -1108,7 +1137,9 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
-        async with self._lock(VM_CLAIMS), self._lock(mid):
+        # the provider check and the save of ready share the deletions' lock (SDD §12): a ready
+        # migration holds its VM, so a deletion after it refuses and one before it is seen here
+        async with self._lock(VM_CLAIMS), self._lock(mid), self._lock(PROVIDERS):
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
@@ -1122,17 +1153,13 @@ class Orchestrator:
                 )
             # only a completed plan's providers can be deleted (SDD §12), and the plan may still
             # complete before the reopen below: the new attempt needs both
-            for provider_id, role in (
-                (plan.source_provider_id, ProviderRole.source),
-                (plan.destination_provider_id, ProviderRole.destination),
-            ):
-                try:
-                    await self.db.get("provider", provider_id, Provider)
-                except NotFound:
-                    raise NotAllowed(
-                        f"{m.vm.name} cannot be retried: the plan's {role} provider "
-                        f"{provider_id!r} no longer exists; create a new plan for the VM"
-                    ) from None
+            missing = await self._missing_provider(plan)
+            if missing is not None:
+                provider_id, role = missing
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: the plan's {role} provider "
+                    f"{provider_id!r} no longer exists; create a new plan for the VM"
+                )
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)

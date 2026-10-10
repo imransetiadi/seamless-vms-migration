@@ -155,9 +155,11 @@ async def create_plan(
     _check_vm_ids(body)
     _check_plan_settings(body)
     _check_estimator_overrides(body)
-    await _check_providers(request, body)
     plan = Plan(**body.model_dump())
-    await svc.db.put("plan", plan, expected_version=0)
+    # SDD §12: a provider's deletion waits until the plan that uses it is saved, and then refuses
+    async with svc.orchestrator.provider_lock():
+        await _check_providers(request, body)
+        await svc.db.put("plan", plan, expected_version=0)
     await emit(
         svc.store,
         svc.bus,
@@ -209,7 +211,6 @@ async def update_plan(
         _check_vm_ids(merged)
         _check_plan_settings(merged)
         _check_estimator_overrides(merged)
-        await _check_providers(request, merged)
         updated = Plan.model_validate(
             {
                 **plan.model_dump(mode="json"),
@@ -218,7 +219,9 @@ async def update_plan(
                 "updated_at": svc.orchestrator.now(),
             }
         )
-        await svc.db.put("plan", updated, expected_version=version)
+        async with svc.orchestrator.provider_lock():  # SDD §12, as for a new plan
+            await _check_providers(request, merged)
+            await svc.db.put("plan", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,
