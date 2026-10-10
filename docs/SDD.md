@@ -1317,8 +1317,9 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   evidence 0 — so behaviour is unchanged.
 * A strategy recommendation is created by `validate_plan` for every automatic choice (plan default `auto`,
   no override) whose advisor scope is not empty (§9.2): `decision_type migration_strategy`, subject the VM,
-  `migration_id`, `plan_id`, `provider_id` = the plan's source provider, `model` = Jev and its version (or
-  `rules` when Jev gave no usable answer), `default_option` = the deterministic choice of `select_strategy`.
+  `migration_id`, `plan_id`, `provider_id` = the plan's source provider, `model` = Jev and its version whenever
+  Jev answered (an escape hatch too), `rules` (version `rules`) when it did not — off, unreachable or timed out —
+  and `default_option` = the deterministic choice of `select_strategy`.
   The migration's `strategy` is `decision.final_option`, or the deterministic choice while it is null. Each
   validation adds a recommendation (history is kept); validation no longer writes strategy notes and keeps the
   notes a migration already has. Event `advisor.strategy` carries `{recommendation_id, option, confidence,
