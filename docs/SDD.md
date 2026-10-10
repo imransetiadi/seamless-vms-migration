@@ -1314,7 +1314,7 @@ such lists again on persisted migration events.
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
-| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, nothing usable or eligible to approve, or the decision's requester when the policy in force requires a distinct approver; §14.6) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the policy in force requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the policy in force requires one, 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
@@ -1672,7 +1672,11 @@ id); the recommendation keeps its id in `input_snapshot_sha256`, and anyone can 
   `before`), emits `decision.approved` or `decision.overridden` (actor `user:<name>`), sets `migration.strategy`
   to the final option, clears `advisor_hold` and — when the strategy changes — the approvals, the cutover
   request and `force_window` (§5.4). An override also records the option in `plan.strategy_overrides`, like
-  `PUT …/strategy`, so a later validation keeps it.
+  `PUT …/strategy`, so a later validation keeps it. Neither acts while the plan sets the VM's strategy
+  (`strategy_overrides` names it: a person chose it in the plan, §9.2, and a validation honours that without
+  recording a recommendation, so the newest one no longer stands — 409 "The plan sets the strategy of <vm>
+  (<option>): change it in the plan."), and an approve of a decision already `approved` is refused (409 "The
+  decision is already approved."): one event per decision status change (§14.5).
 * **Maker-checker** (ADV-17): a recommendation recorded by a validation names the validating user in `requested_by`
   (the demo's own validations: `demo`). When the policy in force requires a distinct approver (the default, the
   built-in `global-default` too), that user neither approves nor overrides the decision: 409 "You requested this
