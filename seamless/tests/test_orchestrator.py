@@ -1211,6 +1211,57 @@ async def test_a_cleanup_stays_tracked_until_its_outcome_is_recorded(tmp_path, s
     await h.orch.stop()
 
 
+async def test_a_shutdown_interrupts_a_cancels_cleanup_and_records_why(tmp_path, store):
+    """SDD §5.1/§8: stop() cancels a cleanup that still waits for its killed step; the cleanup must
+    not swallow that cancellation and run the rollback playbook during the shutdown. Its outcome is
+    still recorded: a migration.error naming the manual rollback_workloads.yml run."""
+    settings = make_settings(tmp_path)
+    started, dying = asyncio.Event(), asyncio.Event()
+    rollbacks: list[dict] = []
+
+    async def slow_dying_pass(ctx):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            dying.set()
+            await asyncio.sleep(5)  # the executor kills the playbook and removes its files
+            raise
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: slow_dying_pass, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.by_vm(plan.id, "vm-1")
+    await asyncio.wait_for(started.wait(), 5)
+    await h.orch.cancel(m.id, "rina", "window closed")
+    await asyncio.wait_for(dying.wait(), 5)
+    await asyncio.sleep(0.05)  # the cleanup task starts and waits for the dying step
+    assert m.id in h.orch._cleanups, "the cleanup waits for the dying step"
+
+    await asyncio.wait_for(h.orch.stop(), 2)
+    assert rollbacks == [], "no rollback playbook runs during the shutdown"
+    errors = [
+        e
+        for e in h.store.events(since_seq=0, limit=1000)
+        if e.kind == "migration.error" and e.migration_id == m.id
+    ]
+    assert [e.data.get("step") for e in errors] == ["cleanup"]
+    assert "interrupted" in errors[0].message and "rollback_workloads.yml" in errors[0].message
+
+
 async def test_cancel_without_a_data_path_runs_no_cleanup(tmp_path, store):
     """SDD §5.1: a warm migration that never ran a pass (validated, its plan not started) left
     nothing behind: its cancel runs no rollback step."""

@@ -902,8 +902,9 @@ class Orchestrator:
     ) -> None:
         try:
             if step is not None:
-                with contextlib.suppress(BaseException):
-                    await step  # the executor kills the playbook and removes its secret files
+                # the executor kills the playbook and removes its secret files; the step's own
+                # outcome does not matter, but a stop() cancelling this task is not swallowed
+                await asyncio.wait({step})
             try:
                 plan = await self._plan(m.plan_id)
                 source = await self.db.get("provider", plan.source_provider_id, Provider)
@@ -930,6 +931,17 @@ class Orchestrator:
                 actor=actor,
                 data={"action": "cleanup"},
             )
+        except asyncio.CancelledError:
+            # a shutdown interrupted the cleanup: its outcome is still recorded (SDD §5.1)
+            with contextlib.suppress(Exception):
+                await self._emit(
+                    "migration.error",
+                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; run "
+                    "rollback_workloads.yml for the workload to remove its temporary resources",
+                    migration=m,
+                    data={"step": "cleanup", "error_class": "CancelledError"},
+                )
+            raise
         finally:
             # tracked until it has finished, its outcome event included: whoever waits for the
             # cleanup (or cancels it, as stop() does) never finds it gone before its outcome
