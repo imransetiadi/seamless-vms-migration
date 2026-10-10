@@ -99,8 +99,11 @@ smoke_validate() {  # the plan's validation report, then its HTTP status on the 
 }
 npid=""
 vreport='{}'
+# A smoke plan someone gave a strategy override (from the dashboard) is theirs now: its choice is no longer
+# automatic, so the advisor is not asked (SDD §14.4). It is left as it is, like one without a VM, and
+# another one is used.
 for earlier in $(curl -fsS -m 30 -H "$H" "$BASE/api/v1/plans" |
-  python3 -c 'import json,sys; print(" ".join(p["id"] for p in reversed(json.load(sys.stdin)) if p["name"] == "smoke jev"))'); do
+  python3 -c 'import json,sys; print(" ".join(p["id"] for p in reversed(json.load(sys.stdin)) if p["name"] == "smoke jev" and p.get("vm_ids") and not p.get("strategy_overrides")))'); do
   answer=$(smoke_validate "$earlier")
   if [ "${answer##*$'\n'}" = 200 ]; then npid=$earlier; vreport=${answer%$'\n'*}; break; fi
 done
@@ -113,10 +116,12 @@ vms = inventory if isinstance(inventory, list) else inventory.get("vms", [])
 held = {m["vm"]["source_id"] for m in migrations if m["phase"] not in ("cancelled", "finalized", "rolled_back")}
 print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs") and v["source_id"] not in held][:1]))')
   check "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)" '[ "$vm_ids" != "[]" ]'
-  newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
-  npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
-  answer=$(smoke_validate "$npid")
-  [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
+  if [ "$vm_ids" != "[]" ]; then  # no free VM: no plan is created (the API cannot delete one)
+    newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
+    npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
+    answer=$(smoke_validate "$npid")
+    [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
+  fi
 fi
 check "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
 # validation records the recommendation and its decision apart; the migration runs the decision (SDD §14.4)
@@ -135,6 +140,23 @@ print(json.dumps({"recommendations": seen, "runs_decision": runs}, separators=("
 echo "advisor recommendations: $advice"
 check "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
 check "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
+# the newest recommendation is audited (created, then one decision) and its stored input re-hashes (SDD §14.5)
+audit=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/events?audit=true&tail=true&limit=1000&plan_id=$npid" || echo '[]'; } |
+  python3 -c '
+import json, sys
+page, events = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+rec = next((r for r in page.get("items", []) if not r["legacy"]), None)
+kinds = [e["kind"] for e in events if rec and e["data"].get("target_id") == rec["id"]]
+print(json.dumps({"kinds": kinds, "sha": rec and rec.get("input_snapshot_sha256")}, separators=(",", ":")))')
+echo "advisor audit: $audit"
+check "the recommendation is audited: created, then one decision (ADV-05)" '[[ "$audit" =~ \"kinds\":\[\"recommendation\.created\",\"decision\.[a-z_]+\"\] ]]'
+sha=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha") or "")' <<<"$audit")
+rehash=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/snapshots/$sha" 2>/dev/null | python3 -c '
+import hashlib, json, sys
+s = json.load(sys.stdin)
+canonical = json.dumps(s["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest() == s["sha256"])' 2>/dev/null || echo error)
+check "its input snapshot re-hashes to its SHA-256 (ADV-05)" '[ -n "$sha" ] && [ "$rehash" = True ]'
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
 check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]]'
 echo "advisor after: $advisor"
