@@ -180,6 +180,8 @@ class Advisor:
         confidence = rec.get("confidence")
         probabilities = rec.get("probabilities") or {}
         model = response.get("model")
+        # jev_decide gives no reasons today; any it gives are checked against the evidence (ADV-02)
+        reasons = rec.get("reasons", response.get("reasons"))
         return Advice(
             option=selected if isinstance(selected, str) else None,
             confidence=float(confidence) if isinstance(confidence, int | float) else None,
@@ -189,6 +191,7 @@ class Advisor:
             status=rec.get("status") or response.get("status"),
             escaped=bool(rec.get("escaped")),
             model_version=model if isinstance(model, str) else None,
+            reasons=tuple(reasons) if isinstance(reasons, list) else (),
             **base,
         )
 

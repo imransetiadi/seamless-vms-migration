@@ -43,6 +43,8 @@ class Advice:
     deterministic_reason: str | None = None
     #: the jev_decide arguments, built even when Jev is not asked: the input snapshot (§14.5)
     request: Mapping[str, Any] | None = None
+    #: the reasons Jev gave, as it gave them: kept only when they name an evidence key (ADV-02)
+    reasons: Sequence[Any] = ()
 
 
 @dataclass(frozen=True)

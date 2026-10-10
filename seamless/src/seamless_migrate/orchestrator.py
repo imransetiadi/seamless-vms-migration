@@ -21,12 +21,13 @@ import inspect
 import logging
 import time
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from .ai.decision import Advice, Approve, Override, decide
+from .ai.evidence import build_strategy_evidence, evidence_count, keep_reasons
 from .ai.policies import resolve_policy
 from .ai.recommendations import LEGACY_PREFIX
 from .ai.redaction import redact
@@ -53,6 +54,7 @@ from .domain.models import (
     Approval,
     Decision,
     Estimate,
+    EvidenceItem,
     Finding,
     ForceCutover,
     Mappings,
@@ -61,12 +63,14 @@ from .domain.models import (
     Plan,
     Provider,
     RecommendedOption,
+    SimilarIncident,
     SyncPass,
     ValidationItem,
     ValidationReport,
     VMRef,
     invalid_plan_settings,
     keep_sync_history,
+    new_migration_id,
     new_recommendation_id,
     next_pass_number,
     repeated_vm_ids,
@@ -516,6 +520,8 @@ class Orchestrator:
             self.settings,
         )
         items: list[ValidationItem] = []
+        # a memory outage is met once per validation: the search is not repeated for every VM
+        memory_up = True
         for vm in vms:
             findings = run_preflight(
                 vm, plan, src_inv, dst_inv, vms, source=source, destination=destination
@@ -541,9 +547,30 @@ class Orchestrator:
                 advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
             decision = None
             rec_id = new_recommendation_id()
+            # the evidence names the migration this validation writes, created below if new
+            migration_id = current.id if current is not None else new_migration_id()
+            evidence_option = None
+            evidence: list[EvidenceItem] = []
             if advice is not None:
+                # SDD §14.4 (ADV-02): the facts measured against the recommended option, or the
+                # deterministic one when the advisor gave none; decide() counts those that bear
+                evidence_option = (
+                    advice.option if advice.option in advice.options else strategy.value
+                )
+                evidence = build_strategy_evidence(
+                    vm,
+                    plan,
+                    source.kind,
+                    estimates,
+                    findings,
+                    evidence_option,
+                    current,
+                    migration_id=migration_id,
+                )
                 # SDD §14.4: decide() takes the decision; the engine reads only its final option
-                decision = decide(advice, policy, 0, strategy.value, now=self._now())
+                decision = decide(
+                    advice, policy, evidence_count(evidence), strategy.value, now=self._now()
+                )
                 final = decision.final_option
                 match = next((e for e in estimates if e.strategy == final), None)
                 if match is not None and match.eligible and match.strategy != strategy:
@@ -553,7 +580,7 @@ class Orchestrator:
                         f"(confidence {advice.confidence:.2f})"
                     )
             migration = existing.get(vm.source_id) or await self._create_migration(
-                plan, vm, strategy, actor
+                plan, vm, strategy, actor, migration_id=migration_id
             )
             # a decision that waits for approval holds the migration from the same write on
             # (SDD §5.4, §14.6); any other validation clears an earlier hold
@@ -574,8 +601,22 @@ class Orchestrator:
             # went in flight meanwhile was left alone and runs what it ran
             validated = migration.phase in (P.ready, P.blocked)
             if advice is not None and decision is not None and validated:
+                incidents: list[SimilarIncident] = []
+                if memory_up and self.knowledge is not None and evidence_option is not None:
+                    found = await self.knowledge.similar_for(evidence_option, vm)
+                    memory_up = found is not None
+                    incidents = found or []
                 await self._record_strategy_recommendation(
-                    plan, vm, migration, advice, decision, rec_id, actor
+                    plan,
+                    vm,
+                    migration,
+                    advice,
+                    decision,
+                    rec_id,
+                    actor,
+                    evidence_option=evidence_option,
+                    evidence=evidence,
+                    incidents=incidents,
                 )
             items.append(
                 ValidationItem(
@@ -606,11 +647,18 @@ class Orchestrator:
         return ValidationReport(plan_id=plan.id, ok=ok, migrations=items)
 
     async def _create_migration(
-        self, plan: Plan, vm: VMRef, strategy: Strategy, actor: str
+        self,
+        plan: Plan,
+        vm: VMRef,
+        strategy: Strategy,
+        actor: str,
+        *,
+        migration_id: str | None = None,
     ) -> Migration:
         now = self._now()
         wave = plan.wave_of(vm.source_id)
         migration = Migration(
+            id=migration_id or new_migration_id(),
             plan_id=plan.id,
             wave_id=wave.id if wave else None,
             vm=vm,
@@ -706,9 +754,13 @@ class Orchestrator:
         decision: Decision,
         rec_id: str,
         requested_by: str,
+        *,
+        evidence_option: str | None = None,
+        evidence: Sequence[EvidenceItem] = (),
+        incidents: Sequence[SimilarIncident] = (),
     ) -> AdvisorRecommendation:
-        """Store the strategy recommendation, its decision and its input; audit both (SDD §14.4,
-        §14.5)."""
+        """Store the strategy recommendation, its decision, its evidence and its input; audit both
+        (SDD §14.4, §14.5)."""
         answered = advice.unavailable is None
         snapshot = await store_snapshot(
             self.db,
@@ -745,6 +797,10 @@ class Orchestrator:
             decision=decision,
             input_snapshot_sha256=snapshot,
             requested_by=requested_by,
+            evidence_option=evidence_option,
+            evidence=list(evidence),
+            similar_incidents=list(incidents),
+            reasons=keep_reasons(advice.reasons, evidence, recommendation_id=rec_id),
         )
         await self.db.put("recommendation", rec)
         for kind, message, actor, data in (created_event(rec), decision_event(rec)):

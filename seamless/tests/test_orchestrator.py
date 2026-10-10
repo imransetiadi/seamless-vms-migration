@@ -35,7 +35,7 @@ from seamless_migrate.domain.models import (
     next_pass_number,
     utcnow,
 )
-from seamless_migrate.events import AUDIT_KINDS
+from seamless_migrate.events import AUDIT_KINDS, EventBus
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -57,6 +57,7 @@ from tests.orch_support import (
     build_harness,
     make_settings,
 )
+from tests.test_knowledge import memory_with
 
 P = Phase
 
@@ -786,11 +787,11 @@ async def test_a_validation_waits_while_another_plan_claims_its_vms(tmp_path, st
     creating, release = asyncio.Event(), asyncio.Event()
     create = h.orch._create_migration
 
-    async def slow_create(plan, vm_ref, strategy, actor):
+    async def slow_create(plan, vm_ref, strategy, actor, **kw):
         if plan.id == first.id:
             creating.set()
             await release.wait()
-        return await create(plan, vm_ref, strategy, actor)
+        return await create(plan, vm_ref, strategy, actor, **kw)
 
     monkeypatch.setattr(h.orch, "_create_migration", slow_create)
     claiming = asyncio.create_task(h.orch.validate_plan(first.id, "alice"))
@@ -3599,3 +3600,125 @@ async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_pa
     h.clock.advance(h.settings.source_watch_s + 1)
     await h.orch.tick()
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None
+
+
+def _strict(minimum: int) -> AdvisorPolicy:
+    """A policy that applies a confident decision only when it rests on ``minimum`` facts."""
+    return AdvisorPolicy(
+        id="pol-strict",
+        name="Strict",
+        mode="auto_apply_above_threshold",
+        threshold=0.6,
+        min_evidence_for_auto_apply=minimum,
+        updated_by="rina",
+    )
+
+
+async def test_validation_records_the_evidence_and_counts_what_bears_on_the_decision(
+    tmp_path, store
+):
+    """ADV-02 (SDD §14.4): the recommendation stores the evidence validation held, measured against
+    the recommended option; a decision below the policy's minimum is never applied on its own."""
+    advisor, _ = _tie_advisor("warm", 0.9)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    store.put("advisor_policy", _strict(99))
+    await h.orch.validate_plan(plan.id, "alice")
+    m = await h.by_vm(plan.id, "vm-1")
+    [rec] = _recommendations(store)
+    assert rec.evidence_option == "warm"
+    keys = [i.key for i in rec.evidence]
+    assert keys[0] == "downtime_estimate" and {
+        "mappings",
+        "findings",
+        "disk_total",
+        "source_kind",
+    } <= set(keys)
+    assert {i.source.ref_id for i in rec.evidence} <= {
+        rec.subject.id,
+        m.id,
+        plan.id,
+        plan.source_provider_id,
+    }
+    assert next(i for i in rec.evidence if i.key == "disk_total").value == m.vm.disk_bytes
+    bearing = sum(1 for i in rec.evidence if i.effect != "context")
+    assert 0 < bearing < 99
+    assert (rec.decision.status, rec.decision.reason_code, rec.decision.final_option) == (
+        DecisionStatus.pending_approval,
+        ReasonCode.INSUFFICIENT_EVIDENCE,
+        None,
+    )
+    assert m.advisor_hold == rec.id
+
+    # as many facts as the policy asks for: applied
+    store.put("advisor_policy", _strict(bearing))
+    await h.orch.validate_plan(plan.id, "alice")
+    newest = max(_recommendations(store), key=lambda r: r.created_at)
+    assert (newest.decision.status, newest.decision.final_option) == (
+        DecisionStatus.auto_applied,
+        "warm",
+    )
+    assert (await h.by_vm(plan.id, "vm-1")).advisor_hold is None
+
+
+async def test_a_recommendation_keeps_the_similar_incidents_memory_knew(tmp_path, store):
+    """ADV-02 (SDD §14.3, §14.4): at most three incidents, searched once at validation; a memory
+    outage stores none, fails nothing, and is not asked again in the same validation."""
+    seen = []
+    hits = [
+        {"title": f"incident {i}", "content": "warm cutover " * 10, "score": 0.9 - i / 10}
+        for i in range(5)
+    ]
+    knowledge = KnowledgeService(memory_with(hits, seen), store, EventBus(store))
+    advisor, _ = _tie_advisor("warm", 0.9)
+    vms = [vm(1, size_gb=4, used_gb=1.0), vm(2, size_gb=4, used_gb=1.0)]
+    h, plan = await setup(tmp_path, store, vms, advisor=advisor, knowledge=knowledge)
+    await h.orch.validate_plan(plan.id, "alice")
+    for rec in _recommendations(store):
+        assert [(i.title, i.score) for i in rec.similar_incidents] == [
+            ("incident 0", 0.9),
+            ("incident 1", 0.8),
+            ("incident 2", 0.7),
+        ]
+
+    down = []
+    knowledge = KnowledgeService(memory_with([], down, fail=True), store, EventBus(store))
+    advisor, _ = _tie_advisor("warm", 0.9)
+    store2 = store  # same store: a new plan of other VMs
+    h2, plan2 = await setup(
+        tmp_path,
+        store2,
+        [vm(3, size_gb=4, used_gb=1.0), vm(4, size_gb=4, used_gb=1.0)],
+        advisor=advisor,
+        knowledge=knowledge,
+    )
+    report = await h2.orch.validate_plan(plan2.id, "alice")
+    assert {i.phase for i in report.migrations} == {Phase.ready}
+    recs = [r for r in _recommendations(store) if r.plan_id == plan2.id]
+    assert len(recs) == 2 and all(r.similar_incidents == [] for r in recs)
+    assert len([path for path, _ in down if path.endswith("/smart-search")]) == 1
+
+
+async def test_jev_reasons_that_name_no_evidence_key_are_dropped_and_logged(
+    tmp_path, store, caplog
+):
+    """ADV-02 (SDD §14.4): only a reason naming an evidence key of the recommendation is kept."""
+    jev_settings = Settings(jev_mode="stdio")
+    answer = load_fixture("decide")
+    answer["recommendation"].update(
+        selected="warm",
+        confidence=0.9,
+        reasons=[
+            {"key": "downtime_estimate", "text": "The warm estimate fits the SLO."},
+            {"key": "licence", "text": "Cheaper licence."},
+        ],
+    )
+    factory, _ = session_factory(fixture_responder({"decide": answer}))
+    advisor = Advisor(JevClient(jev_settings, session_factory=factory), jev_settings)
+    h, plan = await setup(tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], advisor=advisor)
+    with caplog.at_level("WARNING"):
+        await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    assert [(r.key, r.text) for r in rec.reasons] == [
+        ("downtime_estimate", "The warm estimate fits the SLO.")
+    ]
+    assert any("licence" in message for message in caplog.messages)

@@ -524,6 +524,46 @@ class AdvisorSubject(_Model):
     name: str
 
 
+EvidenceSourceKind = Literal["inventory", "preflight", "estimate", "plan", "provider", "run"]
+EvidenceEffect = Literal["supports", "opposes", "context"]
+
+
+class EvidenceSource(_Model):
+    """Where an evidence item comes from: the VM, the migration, the plan or the provider."""
+
+    kind: EvidenceSourceKind
+    ref_id: str = Field(min_length=1)
+
+
+class EvidenceItem(_Model):
+    """One fact a recommendation rests on, built by code, never by the model (SDD §14.4, ADV-02)."""
+
+    key: str
+    label: str
+    value: str | int | float | bool | None = None
+    display: str
+    #: measured against the recommendation's ``evidence_option``
+    effect: EvidenceEffect
+    #: relevance, 0..100: the card shows the heaviest
+    weight: int = Field(ge=0, le=100)
+    source: EvidenceSource
+
+
+class SimilarIncident(_Model):
+    """A past incident agentmemory knew when the recommendation was recorded (SDD §14.3)."""
+
+    title: str
+    content: str = Field(max_length=1000)
+    score: float | None = None
+
+
+class AdvisorReason(_Model):
+    """A reason Jev gave that names one of the recommendation's evidence items."""
+
+    key: str
+    text: str
+
+
 class AdvisorRecommendation(_Model):
     """A recommendation and the decision taken on it, stored apart (document kind
     ``recommendation``, SDD §4.2, §14.4). The engine reads only the decision."""
@@ -545,6 +585,14 @@ class AdvisorRecommendation(_Model):
     requested_by: str | None = None
     legacy: bool = False
     legacy_text: str | None = None
+    #: the option every evidence effect is measured against (SDD §14.4, ADV-02)
+    evidence_option: str | None = None
+    #: what validation knew when it was recorded, heaviest first
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    #: at most 3, searched once when it was recorded
+    similar_incidents: list[SimilarIncident] = Field(default_factory=list)
+    #: Jev's reasons that name one of the evidence keys
+    reasons: list[AdvisorReason] = Field(default_factory=list)
 
 
 class AdvisorSnapshot(_Model):
@@ -575,8 +623,9 @@ class AdvisorPolicySpec(_Model):
     decision_types: list[DecisionType] = Field(default_factory=list)
     mode: Literal["auto_apply_above_threshold", "always_require_approval"]
     threshold: float = Field(ge=0, le=1)
-    #: TODO(ADV-02): the spec's default of 3 applies once recommendations carry evidence
-    min_evidence_for_auto_apply: int = Field(default=0, ge=0, le=100)
+    #: the evidence items that support or oppose (SDD §14.4): a new policy asks for 3 (ADV-02); the
+    #: built-in default asks for none
+    min_evidence_for_auto_apply: int = Field(default=3, ge=0, le=100)
     require_override_reason: bool = True
     #: maker-checker (ADV-17): the decision's requester neither approves nor overrides it
     require_distinct_approver: bool = True
