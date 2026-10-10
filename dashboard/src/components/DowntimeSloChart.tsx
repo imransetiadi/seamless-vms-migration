@@ -77,24 +77,25 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
   return (
     <figure className="m-0 flex min-w-0 flex-col gap-2">
       <figcaption className="text-sm text-muted-foreground">{summary}</figcaption>
-      <ul aria-label="Legend" className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        <li className="flex items-center gap-1.5">
-          <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.series1 }} />
-          <CircleCheck aria-hidden className="size-3.5 text-status-success" />
-          Within SLO
-        </li>
-        <li className="flex items-center gap-1.5">
-          <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.danger }} />
-          <TriangleAlert aria-hidden className="size-3.5 text-status-danger" />
-          Over SLO
-        </li>
-        {sloS !== null && (
+      {/* without an SLO (none set, or the plans could not be loaded) there is no verdict to give (SDD §16) */}
+      {sloS !== null && (
+        <ul aria-label="Legend" className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <li className="flex items-center gap-1.5">
+            <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.series1 }} />
+            <CircleCheck aria-hidden className="size-3.5 text-status-success" />
+            Within SLO
+          </li>
+          <li className="flex items-center gap-1.5">
+            <span aria-hidden className="size-2.5 rounded-xs" style={{ background: colors.danger }} />
+            <TriangleAlert aria-hidden className="size-3.5 text-status-danger" />
+            Over SLO
+          </li>
           <li className="flex items-center gap-1.5">
             <span aria-hidden className="h-0 w-4 border-t-2 border-dashed" style={{ borderColor: colors.reference }} />
             {sloLabel} {formatDuration(sloS)}
           </li>
-        )}
-      </ul>
+        </ul>
+      )}
       <div ref={measureRef} className="w-full min-w-0 overflow-hidden" style={{ height: data.length * 44 + 56 }}>
         <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 200 }}>
           <BarChart
@@ -152,7 +153,9 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
           cells: [
             formatDuration(d.downtime),
             sloS === null ? '—' : formatDuration(sloS),
-            d.over ? (
+            sloS === null ? (
+              '—'
+            ) : d.over ? (
               <span className="inline-flex items-center gap-1 text-status-danger">
                 <TriangleAlert aria-hidden className="size-3.5" />
                 Over SLO

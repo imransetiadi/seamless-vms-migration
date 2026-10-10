@@ -1,6 +1,7 @@
 import {
   Activity,
   CircleCheck,
+  CircleHelp,
   CircleX,
   ClipboardList,
   TriangleAlert,
@@ -62,7 +63,7 @@ const DOWN_DETAIL: Partial<Record<Phase, string>> = {
  * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
  * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
  */
-function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
+function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
   const active = migrations
     .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
@@ -122,6 +123,13 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                     {slo !== null && <span className="num text-sm text-muted-foreground">of {formatClock(slo)}</span>}
                   </p>
                 </div>
+                {slo === null && plansUnknown && (
+                  // a failed load never reads as a met SLO (SDD §16)
+                  <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <CircleHelp aria-hidden className="size-3.5" />
+                    SLO unknown: the plans could not be loaded.
+                  </p>
+                )}
                 {slo !== null && (
                   <div className="flex flex-col gap-1">
                     <div
@@ -159,13 +167,15 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
   );
 }
 
-function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
-  const items = attentionItems(migrations, plans);
+function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
+  const items = attentionItems(migrations, plans, Date.now(), { plansUnknown });
   const shown = items.slice(0, 8);
   return (
     <Panel title="Needs attention" description="The next human action, most urgent first">
+      {/* without the plans, approvals and cutover requests cannot be told: never "nothing" (SDD §16) */}
+      {plansUnknown && <Unavailable what="plans" className={items.length ? 'mb-2' : undefined} />}
       {items.length === 0 ? (
-        <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, approvals or blockers are waiting." />
+        !plansUnknown && <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, approvals or blockers are waiting." />
       ) : (
         <>
           <ul className="-my-2 divide-y divide-border">
@@ -296,7 +306,7 @@ export default function Overview() {
           label="Key metrics"
           className={cn(stats.isPlaceholderData && 'opacity-60')}
           metrics={[
-            { label: 'Migrations', value: formatNumber(s.total), hint: `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
+            { label: 'Migrations', value: formatNumber(s.total), hint: plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
             { label: 'Completed', value: formatNumber(s.completed), hint: s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
@@ -318,22 +328,25 @@ export default function Overview() {
             <Unavailable what="migrations" />
           </Panel>
         ) : (
-          <DowntimeNow migrations={migrations} plans={plansById} />
+          <DowntimeNow migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
         )}
         <div className="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-1">
-          {migrationsQuery.isPending ? (
+          {migrationsQuery.isPending || plansQuery.isPending ? (
             <LoadingBlock label="Loading items that need attention…" />
           ) : migrationsUnknown ? (
             <Panel title="Needs attention" description="The next human action, most urgent first">
               <Unavailable what="migrations" />
             </Panel>
           ) : (
-            <NeedsAttention migrations={migrations} plans={plansById} />
+            <NeedsAttention migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
           )}
         </div>
         <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
           {s ? (
-            <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+            <>
+              {plansUnknown && <Unavailable what="plans" className="mb-2" />}
+              <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+            </>
           ) : statsUnknown ? (
             <Unavailable what="statistics" />
           ) : (

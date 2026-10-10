@@ -1,6 +1,7 @@
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import type { Migration } from '../api/types';
 import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
@@ -181,6 +182,65 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /key metrics/i });
     expect(within(metrics).getByRole('group', { name: 'Failed' })).toHaveTextContent('Failed—');
+  });
+
+  it('never reads a failed plans load as all clear while the migrations load (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/plans'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Overview />, { server });
+    expect(await screen.findByText(/plans are unavailable/i)).toBeInTheDocument();
+    // a converged migration still waits at the cutover gate: for what is unknown, never "nothing"
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    expect(await within(attention).findByRole('link', { name: 'app-billing-01' })).toBeInTheDocument();
+    expect(within(attention).getByText(/waiting at the cutover gate/i)).toBeInTheDocument();
+    expect(within(attention).getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    expect(within(attention).queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    // a down VM's SLO is unknown, not met
+    const downtime = screen.getByRole('region', { name: 'Downtime now' });
+    expect(within(downtime).getAllByText(/slo unknown: the plans could not be loaded/i).length).toBeGreaterThan(0);
+    // no figure counts the plans or judges against an SLO it does not know
+    const metrics = screen.getByRole('region', { name: /key metrics/i });
+    const total = within(metrics).getByRole('group', { name: 'Migrations' });
+    expect(total).not.toHaveTextContent(/in 0 plans/);
+    expect(total).toHaveTextContent(/plans unknown/);
+    const slo = screen.getByRole('region', { name: 'Downtime vs SLO' });
+    expect(within(slo).getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    // neither the legend nor the data table (rows rendered, closed) gives a verdict
+    expect(within(slo).getAllByRole('row', { hidden: true }).length).toBeGreaterThan(1);
+    expect(within(slo).queryByText(/within slo|over slo/i)).not.toBeInTheDocument();
+  });
+
+  it('says what needs attention is unknown, not nothing, when the plans fail and nothing else is waiting (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET' && path === '/plans') return { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
+      const result = handle(method, path, query, body, token);
+      // only finished migrations: nothing a human must do that the migrations alone could show
+      return method === 'GET' && path === '/migrations' && Array.isArray(result.body)
+        ? { ...result, body: (result.body as Migration[]).filter((m) => m.phase === 'completed') }
+        : result;
+    };
+    renderWithApp(<Overview />, { server });
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    expect(await within(attention).findByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    expect(within(attention).queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+  });
+
+  it('waits for the plans before saying what needs attention (SDD §16)', async () => {
+    const pending = new Promise<Response>(() => {});
+    renderWithApp(<Overview />, {
+      wrapFetch: (mock) => (input, init) => (String(input).split('?')[0]!.endsWith('/api/v1/plans') ? pending : mock(input, init)),
+    });
+    // the migrations have loaded (a down VM has its clock), the plans have not
+    const downtime = await screen.findByRole('region', { name: 'Downtime now' });
+    await within(downtime).findByRole('link', { name: 'web-02' });
+    expect(screen.getByText('Loading items that need attention…')).toBeInTheDocument();
+    expect(screen.queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
   });
 
   it('shows plan progress only once the migrations have loaded, never "0 of 0 done" before (SDD §16)', async () => {

@@ -54,8 +54,17 @@ function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: numbe
   return null;
 }
 
-/** Migrations that need a human, most urgent first — one entry per migration. */
-export function attentionItems(migrations: Migration[], plans: ReadonlyMap<string, Plan>, now = Date.now()): AttentionItem[] {
+/**
+ * Migrations that need a human, most urgent first — one entry per migration. When the plans could not be
+ * loaded (`plansUnknown`), a converged migration still waits at the cutover gate: listed with what it waits
+ * for unknown, never left out (SDD §16).
+ */
+export function attentionItems(
+  migrations: Migration[],
+  plans: ReadonlyMap<string, Plan>,
+  now = Date.now(),
+  { plansUnknown = false }: { plansUnknown?: boolean } = {},
+): AttentionItem[] {
   const items: AttentionItem[] = [];
   for (const m of migrations) {
     const plan = plans.get(m.plan_id);
@@ -79,7 +88,16 @@ export function attentionItems(migrations: Migration[], plans: ReadonlyMap<strin
         rank: 2,
       };
     } else if (m.phase === 'awaiting_cutover') {
-      item = gateItem(m, plan, now, 3);
+      item =
+        plan || !plansUnknown
+          ? gateItem(m, plan, now, 3)
+          : {
+              migration: m,
+              tone: 'warning',
+              reason: 'Converged — waiting at the cutover gate',
+              nextAction: 'Load the plans again to see whether it waits for an approval, a cutover request or its window',
+              rank: 3,
+            };
     } else if (
       m.phase === 'ready' &&
       SINGLE_SHOT.has(m.strategy) &&
