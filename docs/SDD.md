@@ -2009,7 +2009,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
   `/inventory/:providerId`
-  (a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
+  arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
+  a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
   `?vm={source id}` opens it searching for that VM, ADV-02;
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
