@@ -847,6 +847,7 @@ describe('mock API', () => {
     ).rejects.toMatchObject({ status: 400, code: 'bad_request' });
     const result = await client.post<Migration>(`/migrations/${completed.id}/finalize`, { confirm: completed.vm.name });
     expect(result.phase).toBe('finalized');
+    expect(result.checkpoint).toBe('finalized'); // the API's value (SDD §8.1)
     // like the API (SDD §12): the phase is checked first - a migration that is not completed answers 409, whatever its name
     const ready = byPhase(server, 'ready');
     await expect(client.post(`/migrations/${ready.id}/finalize`, { confirm: 'wrong' })).rejects.toMatchObject({
@@ -1749,6 +1750,7 @@ describe('mock application probes, like the API (SDD §7.5, §9.3, §9.6, ADV-18
     m.vm = { ...m.vm, name: 'db-web-02', tags: { tier: 'database' } };
     verifyNow(server, m, clock);
     expect(m.phase).toBe('completed');
+    expect(m.checkpoint).toBe('verified'); // the API's value (SDD §8.1)
     expect(m.verification).toMatchObject({ passed: true, probes: [] });
     // the plan's boot checks run as before: its TCP ports, then the console (SDD §7.5)
     expect(m.verification!.checks.map((c) => c.name)).toEqual(['server_active', 'ports_up', 'tcp:22', 'console']);
@@ -1815,6 +1817,18 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
     expect(batch).toMatchObject({ actor: 'sari', plan_id: plan.id, data: { wave_id: wave.id, finalized: ['web-01'], skipped: [] } });
     await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('refuses to roll back a completed migration whose finalize began deleting the source, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const web01 = byName(server, 'web-01');
+    expect(web01.phase).toBe('completed');
+    web01.checkpoint = 'finalizing';
+    await expect(as(server, 'operator').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' })).rejects.toMatchObject({
+      status: 409,
+      message: 'the finalize began deleting the source VM: finalize it again',
+    });
+    expect(web01.phase).toBe('completed');
   });
 
   it('skips a VM whose finalize fails and finalizes the others, like the API (SDD §8.1)', async () => {

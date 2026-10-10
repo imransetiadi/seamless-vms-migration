@@ -99,6 +99,8 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
       return m.phase === 'awaiting_cutover' ? ok : no('A delta sync can be requested only while awaiting cutover.');
     case 'rollback':
       if (m.phase === 'finalized') return no('A finalized migration cannot be rolled back.');
+      // SDD §8.1: the source may be gone; a rollback would delete the destination server and find no source
+      if (m.phase === 'completed' && m.checkpoint === 'finalizing') return no('The finalize began deleting the source VM: finalize it again.');
       return canTransition(m.phase, 'rolling_back')
         ? ok
         : no('Rollback is possible during cutover or verification, after a failure, or after completion until finalized.');

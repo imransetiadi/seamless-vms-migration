@@ -949,7 +949,7 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-3c1a0f9e21', vm: 'os-0a11', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 2 * H, progress: 100,
         passes: [{ kind: 'full', changedGiB: 12, durationS: 128 }, { kind: 'delta', changedGiB: 0.42, durationS: 84 }, { kind: 'final', changedGiB: 0.05, durationS: 81 }],
         downtimeStartedAgo: 2 * H + 212, downtimeS: 212, approvals: [{ actor: 'sari', ago: 2 * H + 300, comment: 'Pilot approved in CAB-2291' }], cutoverRequested: true,
-        destination: 'b7e2c0f4-1d2a-4c55-9a1e-6f4c2d8e9a01', checkpoint: 'verify',
+        destination: 'b7e2c0f4-1d2a-4c55-9a1e-6f4c2d8e9a01', checkpoint: 'verified',
         notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as stateless_web: name matches ^web- and tag tier=web.', confidence: null, data: { tier: 'stateless_web' }, ago: 3 * D }],
       },
       {

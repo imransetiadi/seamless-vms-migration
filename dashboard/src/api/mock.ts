@@ -867,7 +867,7 @@ export class MockServer {
       m.review_required = true;
       m.review_reason = review;
     }
-    m.checkpoint = 'verify';
+    m.checkpoint = 'verified';
     this.transition(m, 'completed', 'verification passed', 'orchestrator', { verification: m.verification });
     this.endDowntime(m);
     this.emit({ kind: 'memory.lesson_saved', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `Lesson saved: ${m.strategy}, actual downtime ${Math.round(m.actual_downtime_s ?? 0)} s`, data: { type: 'fact' } });
@@ -2028,6 +2028,10 @@ export class MockServer {
         const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
         if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);
+        // like the API (SDD §8.1): a finalize that began deleting the source is finalized again, never rolled back
+        if (m.phase === 'completed' && m.checkpoint === 'finalizing') {
+          throw new HttpError(409, 'conflict', 'the finalize began deleting the source VM: finalize it again');
+        }
         // like the API (SDD §5.1): without its providers a rollback fails, and a migration whose cutover
         // stopped its source could then be neither rolled back, retried nor cancelled
         const plan = this.plan(m.plan_id);
@@ -2110,7 +2114,7 @@ export class MockServer {
         if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
-        m.checkpoint = 'finalize';
+        m.checkpoint = 'finalized'; // the API's checkpoint values (SDD §8.1)
         record('finalized', { delete_source: Boolean(input.delete_source) });
         break;
       }

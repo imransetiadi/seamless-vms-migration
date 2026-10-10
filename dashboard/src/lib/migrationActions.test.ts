@@ -56,6 +56,15 @@ describe('migrationActions rules', () => {
     expect(verifying.reason).toMatch(/completed/i);
   });
 
+  it('keeps Rollback from a completed migration whose finalize began deleting the source, and offers Finalize again (SDD §8.1)', () => {
+    const interrupted = migrationActions(migration('completed', { checkpoint: 'finalizing' }), 'approver');
+    expect(interrupted.rollback.enabled).toBe(false);
+    expect(interrupted.rollback.reason).toBe('The finalize began deleting the source VM: finalize it again.');
+    expect(interrupted.finalize.enabled).toBe(true);
+    // a completed migration whose finalize never began keeps its rollback
+    expect(migrationActions(migration('completed', { checkpoint: 'verified' }), 'approver').rollback.enabled).toBe(true);
+  });
+
   it('lets single-shot strategies cut over from ready (SDD §5.2)', () => {
     expect(migrationActions(migration('ready', {}, 'cold'), 'approver').cutover.enabled).toBe(true);
     // a warm migration may be requested from ready too: it cuts over once pre-copy converged
