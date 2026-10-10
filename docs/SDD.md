@@ -1924,7 +1924,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
-  editable),
+  editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
+  failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
   `/plans/:id` (its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
