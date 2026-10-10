@@ -15,6 +15,7 @@ import {
 } from 'recharts';
 import { STRATEGIES, type Strategy } from '../api/types';
 import { formatDuration } from '../lib/format';
+import { barLabelText } from '../lib/slo';
 import { STRATEGY_LABELS } from '../lib/status';
 import { formatDurationTick, niceDurationTicks } from '../lib/ticks';
 import { useElementWidth } from '../lib/useElementWidth';
@@ -44,7 +45,7 @@ export function DowntimeSloChart({ byStrategy, sloS, sloLabel = 'SLO' }: Downtim
       STRATEGIES.filter((s) => typeof byStrategy[s] === 'number').map((s) => {
         const downtime = byStrategy[s] ?? 0;
         const over = sloS !== null && downtime > sloS;
-        return { strategy: s, label: STRATEGY_LABELS[s], downtime, over, text: `${formatDuration(downtime)}${over ? ' · over SLO' : ''}` };
+        return { strategy: s, label: STRATEGY_LABELS[s], downtime, over, text: barLabelText(downtime, over) };
       }),
     [byStrategy, sloS],
   );
