@@ -1322,7 +1322,8 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
   and `default_option` = the deterministic choice of `select_strategy`.
   The migration's `strategy` is `decision.final_option`, or the deterministic choice while it is null. Each
   validation adds a recommendation (history is kept); validation no longer writes strategy notes and keeps the
-  notes a migration already has. Event `advisor.strategy` carries `{recommendation_id, option, confidence,
+  notes a migration already has. A migration validation leaves alone (in flight or finished, §5.4) gets no
+  choice: the advisor is not asked about it and no recommendation is recorded for it. Event `advisor.strategy` carries `{recommendation_id, option, confidence,
   final_option, status, reason_code}`.
 * Legacy: strategy notes written before this change (`AdvisorNote kind=strategy` in `Migration.advisor_notes`)
   are listed as recommendations with `legacy: true`, id `rec-legacy-<migration id>-<index>`, `legacy_text` =
