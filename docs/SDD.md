@@ -218,7 +218,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        handover: HandoverConfig, verification: VerificationConfig,
        probe_overrides: dict[str, list[AppProbe]] = {},   # per VM (source id): replaces verification.app_probes; [] = none (§7.5, ADV-18)
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
-                                        "security_groups","security_group_rules"],
+                                        "security_groups","security_group_rules"],   # each names os-migrate resources with an
+                                        # export_<r>.yml/import_<r>.yml pair, else refused (422); "flavors" opt-in (§7.2)
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
@@ -829,7 +830,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   group `conversion_host` points at the RHOSO conversion host.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
-  migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host).
+  migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
+  to the plan: only the flavors of its VMs that have neither a plan mapping nor a same-named destination flavor
+  are exported and imported (`os_migrate_flavors_filter`, each name anchored and `re.escape`d), and with none
+  the flavor playbooks are skipped — os-migrate's import rewrites the extra specs of a same-named flavor it
+  finds, so a destination flavor, shared by every project, is never changed. The orchestrator looks the
+  destination flavors up when it pre-stages.
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
@@ -1207,6 +1213,7 @@ Finding catalog (code — severity — condition):
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
 | `MAP_NETWORK_MISSING` | blocker | a NIC network has no mapping and no same-named destination network, and `"networks"` is not in `plan.prestage_resources` (when it is — and the source is OpenStack; VMware sources have no pre-stage step — emit `MAP_NETWORK_PRESTAGED` — info — instead: the network will be created with the same name); also when a mapping's *target* network does not exist in the destination |
+| `MAP_FLAVOR_PRESTAGED` | info | `"flavors"` is in `plan.prestage_resources`, the source is OpenStack, and the VM's flavor has no mapping and no same-named destination flavor: pre-staging creates it in RHOSO with the same name, size and extra specs, so nothing is matched automatically (`resolved_mappings` stays empty for it, and neither `MAP_FLAVOR_MISSING` nor `MAP_FLAVOR_AUTO` is emitted) |
 | `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
 | `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty, and when a mapping's *target* type does not exist in the destination | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume) |
@@ -2045,8 +2052,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   `max_aggregate_scan_bps`, and the measured step times in seconds — source shutdown, snapshot, volume create and
   destination boot: `shutdown_s`, `snapshot_s`, `create_s`, `boot_s` (Performance.md §6.4) — §9.1; other overrides
   a plan already has are kept),
-  the resources pre-staged at the destination (any of the six defaults of §4.2, in that order; other entries a plan
-  already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
+  the resources pre-staged at the destination (any of the six defaults of §4.2, in that order, then Flavors — off
+  by default: the plan's flavors that RHOSO lacks, created with the same specs, `MAP_FLAVOR_PRESTAGED`; other
+  entries a plan already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
