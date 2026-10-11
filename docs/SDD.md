@@ -705,6 +705,11 @@ exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name
 keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
 `web-01` and the workload was skipped as already migrated, and a name like `app(` was an invalid expression.
 
+The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
+from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
+network partition ends the ssh about a minute later and the pass fails — a transient failure, retried — instead of
+keeping the source stopped for the kernel's TCP keepalive, about two hours (Security.md C3-08).
+
 ---
 
 ## 7. Control plane executors
