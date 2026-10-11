@@ -130,6 +130,23 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
     expect(eligibility(vm, 'vmware', plan({ network: 'tenant-web' }), vcenter, destination, vmw).vmware_cold?.some((r) => r.includes('MAP_NIC_OVERRIDE_INVALID'))).toBe(true);
   });
 
+  it('blocks an address Neutron gives no VM, as the API words it', () => {
+    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.0.0', '10.30.255.255', '10.30.1.5'] }), nets, [vm.name], {
+      subnets,
+      selected: [vm],
+    });
+    expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
+      'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: 10.30.0.0 is the network address of 10.30.0.0/16, not a host address; ' +
+        'fa:16:3e:00:00:01: 10.30.255.255 is the broadcast address of 10.30.0.0/16, not a host address.',
+    );
+  });
+
+  it('finds an address another NIC gets whatever way it is written', () => {
+    const v6 = makeVm({ id: 'os-o2', name: 'nic-02', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:02', fixed_ips: ['FD00:0::0005'] }] });
+    const found = preflight(vm, 'openstack', plan({ fixed_ips: ['fd00::5'] }), nets, [vm.name], { subnets: [...subnets, { name: 'app-v6', network: 'tenant-app', cidr: 'fd00::/64' }], selected: [vm, v6] });
+    expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain('fa:16:3e:00:00:01: fd00::5 also goes to nic-02 (fa:16:3e:00:00:02)');
+  });
+
   it('counts the addresses a NIC gets for the port rules', () => {
     const dual = makeVm({ id: 'os-o1', name: 'nic-01', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:01', fixed_ips: ['10.20.1.5', 'fd00::5'] }] });
     expect(eligibility(dual, 'openstack', plan({ fixed_ips: ['10.20.1.5'] }), source, destination, []).cold).toEqual([]);

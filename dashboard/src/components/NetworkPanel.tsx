@@ -1,5 +1,5 @@
-import { Pencil } from 'lucide-react';
-import { useId, useRef, useState, type FormEvent } from 'react';
+import { Pencil, Trash2, TriangleAlert } from 'lucide-react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { useInventory, useMigrations, usePatchPlan, useProviders } from '../api/hooks';
 import type { Migration, Plan, Role } from '../api/types';
 import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
@@ -10,7 +10,8 @@ import { Modal } from './Modal';
 
 /**
  * Network (SDD §16): each NIC of the VM — its source network, MAC and addresses — and where it goes in RHOSO, the plan's
- * mapping or the VM's override; Edit (an operator, OpenStack sources) sets the VM's `nic_overrides` entry, a plan edit.
+ * mapping or the VM's override; Edit (an operator, OpenStack sources) sets the VM's `nic_overrides` entry, a plan edit. A
+ * VMware VM takes none: one that still has entries offers to remove them.
  */
 export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration: Migration; plan: Plan | null | undefined; role: Role | undefined; onSaved: (text: string) => void }) {
   // the plan's edit rules (SDD §12), as for the probes: only a draft or validated plan is editable
@@ -21,13 +22,22 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
   const patch = usePatchPlan(plan?.id ?? '');
   const titleId = useId();
   const caption = useId();
-  const problemsId = useId();
   const editRef = useRef<HTMLButtonElement>(null);
+  const addressRefs = useRef<Array<HTMLInputElement | null>>([]);
   const [drafts, setDrafts] = useState<NicDraft[] | null>(null);
-  const [problems, setProblems] = useState<string[]>([]);
+  // what the API would refuse, by MAC: each address field carries its own (SDD §16)
+  const [problems, setProblems] = useState<Record<string, string[]>>({});
+  const [focusField, setFocusField] = useState<number | null>(null);
+  // the first refused field gets the focus once it is marked invalid and described by its problem
+  useEffect(() => {
+    if (focusField === null) return;
+    addressRefs.current[focusField]?.focus();
+    setFocusField(null);
+  }, [focusField]);
   if (!plan) return <p className="text-sm text-muted-foreground">Loading the plan…</p>;
   const vmware = providers.data?.find((p) => p.id === plan.source_provider_id)?.kind === 'vmware';
   const edit = planActions(plan, role, siblings.data ?? [m]).edit;
+  const listed = Boolean(inventory.data && !Array.isArray(inventory.data));
   const networks = inventory.data && !Array.isArray(inventory.data) ? Object.keys(inventory.data.networks).sort() : [];
   const nics = m.vm.nics;
   const hasEntry = Object.keys(plan.nic_overrides?.[m.vm.source_id] ?? {}).length > 0;
@@ -44,24 +54,35 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
     );
   const open = () => {
     patch.reset();
-    setProblems([]);
+    setProblems({});
     setDrafts(nics.map((nic) => toNicDraft(plan, m.vm.source_id, nic)));
   };
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const parsed = parseNicDrafts(drafts ?? []);
     setProblems(parsed.problems);
-    if (parsed.problems.length) return;
+    const refused = (drafts ?? []).findIndex((d) => parsed.problems[d.mac]);
+    if (refused >= 0) {
+      setFocusField(refused);
+      return;
+    }
     save(parsed.entries, `${m.vm.name}'s network is saved.`);
   };
   const setDraft = (index: number, change: Partial<NicDraft>) => setDrafts((list) => (list ?? []).map((d, i) => (i === index ? { ...d, ...change } : d)));
+  // an edited address field is no longer the one refused
+  const setAddresses = (index: number, mac: string, addresses: string) => {
+    setDraft(index, { addresses });
+    setProblems(({ [mac]: _refused, ...others }) => others);
+  };
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <p className="min-w-0 text-sm text-muted-foreground">
           {vmware
-            ? "The migration kit keeps the guest's network settings: network overrides are for OpenStack sources."
+            ? hasEntry
+              ? "The migration kit keeps the guest's network settings: this VM's network overrides cannot be applied and block it."
+              : "The migration kit keeps the guest's network settings: network overrides are for OpenStack sources."
             : hasEntry
               ? "This VM's overrides send some NICs elsewhere."
               : "Every NIC goes where the plan's mappings send its network, with its own addresses."}
@@ -71,7 +92,13 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
             Edit network
           </Button>
         )}
+        {vmware && hasEntry && (
+          <Button size="sm" icon={Trash2} disabledReason={edit.reason} loading={patch.isPending} onClick={() => save({}, `${m.vm.name}'s network overrides are removed.`)}>
+            Remove the overrides
+          </Button>
+        )}
       </div>
+      {vmware && patch.error && <ErrorBanner error={patch.error} title="The overrides were not removed" />}
       {nics.length === 0 ? (
         <p className="text-sm text-muted-foreground">The VM has no NIC.</p>
       ) : (
@@ -123,18 +150,15 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
           </div>
           <div className="flex min-h-0 flex-col gap-4 overflow-y-auto px-5 py-4">
             {patch.error && <ErrorBanner error={patch.error} title="The network was not saved" />}
-            <div id={problemsId} role="status">
-              {problems.length > 0 && (
-                <ul className="field-error flex flex-col gap-1">
-                  {problems.map((p) => (
-                    <li key={p}>{p}</li>
-                  ))}
-                </ul>
-              )}
-            </div>
             {(drafts ?? []).map((draft, i) => {
               const nic = nics[i]!;
               const mapped = plan.mappings.networks[nic.network] ?? nic.network;
+              const refused = problems[draft.mac] ?? [];
+              const hint = `${titleId}-ips-${i}-hint`;
+              const error = `${titleId}-ips-${i}-error`;
+              // an entry's network RHOSO no longer lists stays selected, marked so (SDD §16)
+              const unlisted = Boolean(draft.network) && !networks.includes(draft.network);
+              const note = `${titleId}-net-${i}-note`;
               return (
                 <fieldset key={draft.mac} className="flex flex-col gap-2 rounded-md border border-border p-3">
                   <legend className="px-1 text-sm font-medium text-foreground">
@@ -147,17 +171,26 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                       </label>
                       <select
                         id={`${titleId}-net-${i}`}
+                        aria-describedby={unlisted && listed ? note : undefined}
                         className="input"
                         value={draft.network}
                         onChange={(e) => setDraft(i, { network: e.target.value })}
                       >
                         <option value="">As the plan maps it ({mapped})</option>
+                        {unlisted && <option value={draft.network}>{listed ? `${draft.network} (not in RHOSO)` : draft.network}</option>}
                         {networks.map((name) => (
                           <option key={name} value={name}>
                             {name}
                           </option>
                         ))}
                       </select>
+                      {/* said under the field too: a narrow select cuts its option's text */}
+                      {unlisted && listed && (
+                        <p id={note} className="mt-1 flex items-start gap-1 text-xs text-muted-foreground">
+                          <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0 text-status-warning" />
+                          RHOSO does not list {draft.network}: validation refuses it.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <label htmlFor={`${titleId}-ips-${i}`} className="field-label">
@@ -165,14 +198,23 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                       </label>
                       <input
                         id={`${titleId}-ips-${i}`}
-                        aria-describedby={`${titleId}-ips-${i}-hint ${problemsId}`}
+                        ref={(el) => {
+                          addressRefs.current[i] = el;
+                        }}
+                        aria-invalid={refused.length ? true : undefined}
+                        aria-describedby={refused.length ? `${error} ${hint}` : hint}
                         className="input font-mono"
                         value={draft.addresses}
-                        onChange={(e) => setDraft(i, { addresses: e.target.value })}
+                        onChange={(e) => setAddresses(i, draft.mac, e.target.value)}
                         autoComplete="off"
                         spellCheck={false}
                       />
-                      <p id={`${titleId}-ips-${i}-hint`} className="mt-1 text-xs text-muted-foreground">
+                      {refused.length > 0 && (
+                        <p id={error} className="field-error mt-1">
+                          {refused.join('; ')}
+                        </p>
+                      )}
+                      <p id={hint} className="mt-1 text-xs text-muted-foreground">
                         Comma separated. Empty keeps its own: {nic.fixed_ips.join(', ') || 'no fixed IP'}.
                       </p>
                     </div>

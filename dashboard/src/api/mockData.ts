@@ -34,7 +34,7 @@ import type {
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
-import { ipInCidr, nicOverride, nicTarget } from '../lib/nics';
+import { canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -808,7 +808,7 @@ function nicOverrideFindings(
     for (const n of other.nics) {
       const target = nicTarget(plan, other.source_id, n);
       for (const a of target.addresses) {
-        const key = `${target.network}|${a}`;
+        const key = `${target.network}|${canonicalIp(a)}`;
         holders.set(key, [...(holders.get(key) ?? []), { vmId: other.source_id, mac: (n.mac ?? '').toLowerCase(), name: other.name }]);
       }
     }
@@ -832,8 +832,12 @@ function nicOverrideFindings(
     const cidrs = (context.subnets ?? []).filter((s) => s.network === network).map((s) => s.cidr);
     const outside = addresses.filter((a) => !cidrs.some((c) => ipInCidr(a, c)));
     if (outside.length) problems.push(`${mac}: ${outside.join(', ')} ${outside.length === 1 ? 'lies' : 'lie'} in no subnet of '${network}'`);
+    for (const a of addresses) {
+      const why = noHostAddress(a, cidrs);
+      if (why) problems.push(`${mac}: ${a} is ${why}, not a host address`);
+    }
     for (const a of addresses)
-      for (const h of holders.get(`${network}|${a}`) ?? []) if (h.vmId !== vm.source_id || h.mac !== mac) problems.push(`${mac}: ${a} also goes to ${h.name} (${h.mac})`);
+      for (const h of holders.get(`${network}|${canonicalIp(a)}`) ?? []) if (h.vmId !== vm.source_id || h.mac !== mac) problems.push(`${mac}: ${a} also goes to ${h.name} (${h.mac})`);
     applied.push(`${mac} (${nic.network}) -> ${network}: ${addresses.join(', ')}`);
   }
   if (problems.length) return [['MAP_NIC_OVERRIDE_INVALID', `NIC override(s) of ${vm.name} cannot be applied: ${problems.join('; ')}.`]];

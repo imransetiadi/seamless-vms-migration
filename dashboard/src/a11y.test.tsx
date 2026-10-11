@@ -114,7 +114,13 @@ describe('axe-core: no WCAG violations', () => {
     await settled();
     const panel = screen.getByRole('region', { name: 'Network' });
     await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
-    expect(await screen.findByRole('dialog', { name: 'Network of analytics-db' })).toBeInTheDocument();
+    const dialog = await screen.findByRole('dialog', { name: 'Network of analytics-db' });
+    expect(await violations()).toEqual([]);
+    // a refused address field: marked invalid and described by its problem
+    const [addresses] = within(dialog).getAllByRole('textbox');
+    await user.type(addresses!, 'nonsense');
+    await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
+    await waitFor(() => expect(addresses).toHaveAttribute('aria-invalid', 'true'));
     expect(await violations()).toEqual([]);
   }, 30_000);
 

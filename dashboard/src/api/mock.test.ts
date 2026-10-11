@@ -2215,4 +2215,15 @@ describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
         "nic_overrides[vm-1][fa:16:3e:00:00:01]: fixed_ips must list at least one address (leave it out to keep the NIC's own); nic_overrides[vm-1][not-a-mac]: not a MAC address",
     });
   });
+
+  it("stores addresses in the API's canonical form and finds a repeat however it is written", async () => {
+    const { client } = setup('operator');
+    const body = { name: 'nics', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: ['FD00:0::0009', '10.20.1.9'] } } } });
+    expect(created.nic_overrides['vm-1']?.['fa:16:3e:00:00:01']?.fixed_ips).toEqual(['fd00::9', '10.20.1.9']);
+    await expect(client.post('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: ['fd00::5', 'FD00:0::0005', '10.20.1.300'] } } } })).rejects.toMatchObject({
+      status: 422,
+      message: 'nic_overrides[vm-1][fa:16:3e:00:00:01]: not an IP address: 10.20.1.300; nic_overrides[vm-1][fa:16:3e:00:00:01]: fd00::5 given twice',
+    });
+  });
 });

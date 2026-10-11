@@ -51,16 +51,30 @@ export function isIpAddress(value: string): boolean {
   }
 }
 
-/** The editor's rows as `nic_overrides` entries, and what the API would refuse (SDD §12), named by MAC. */
-export function parseNicDrafts(drafts: NicDraft[]): { entries: Record<string, NicOverride>; problems: string[] } {
+/**
+ * An address as the API's `ipaddress` writes it ("FD00:0::0005" is "fd00::5", SDD §4.2); anything else as given. The
+ * URL standard writes IPv6 as RFC 5952 does, as Python does; an address with an embedded IPv4 part stays as given.
+ */
+export function canonicalIp(address: string): string {
+  if (IPV4.test(address) || !isIpAddress(address) || address.includes('.')) return address;
+  return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+}
+
+/**
+ * The editor's rows as `nic_overrides` entries, their addresses written as the API stores them, and what the API would
+ * refuse (SDD §12) by MAC: each address field carries its own problems (SDD §16).
+ */
+export function parseNicDrafts(drafts: NicDraft[]): { entries: Record<string, NicOverride>; problems: Record<string, string[]> } {
   const entries: Record<string, NicOverride> = {};
-  const problems: string[] = [];
+  const problems: Record<string, string[]> = {};
   for (const draft of drafts) {
-    const addresses = draft.addresses.split(/[\s,]+/).filter(Boolean);
+    const addresses = draft.addresses.split(/[\s,]+/).filter(Boolean).map(canonicalIp);
+    const own: string[] = [];
     const bad = addresses.filter((a) => !isIpAddress(a));
-    if (bad.length) problems.push(`${draft.mac}: not an IP address: ${bad.join(', ')}`);
+    if (bad.length) own.push(`not an IP address: ${bad.join(', ')}`);
     const twice = [...new Set(addresses.filter((a, i) => addresses.indexOf(a) !== i))].sort();
-    if (twice.length) problems.push(`${draft.mac}: ${twice.join(', ')} given twice`);
+    if (twice.length) own.push(`${twice.join(', ')} given twice`);
+    if (own.length) problems[draft.mac] = own;
     if (draft.network || addresses.length) {
       entries[draft.mac] = { network: draft.network || null, fixed_ips: addresses.length ? addresses : null };
     }
@@ -80,6 +94,38 @@ function toBits(address: string): { value: bigint; bits: 32 | 128 } | null {
   const groups = address.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
   if (groups.length !== 8) return null;
   return { value: groups.reduce((n, g) => (n << 16n) + BigInt(parseInt(g, 16)), 0n), bits: 128 };
+}
+
+/** A 32- or 128-bit value written as an address, as the API writes it. */
+function fromBits(value: bigint, bits: 32 | 128): string {
+  if (bits === 32) return [24n, 16n, 8n, 0n].map((shift) => String((value >> shift) & 255n)).join('.');
+  return canonicalIp(Array.from({ length: 8 }, (_, i) => ((value >> BigInt(112 - 16 * i)) & 0xffffn).toString(16)).join(':'));
+}
+
+/**
+ * What makes `address` no host address of the subnets of `cidrs` that hold it, in the API's words (SDD §9.3, as Neutron's
+ * check_subnet_ip): an IPv4 subnet's network address at any prefix length, its broadcast address below a /31, an IPv6
+ * subnet's first address. Null for a host address of one of them, or an address none of them holds.
+ */
+export function noHostAddress(address: string, cidrs: string[]): string | null {
+  const ip = toBits(address);
+  if (!ip) return null;
+  let why: string | null = null;
+  for (const cidr of cidrs) {
+    const [base, prefix] = cidr.split('/');
+    const net = base ? toBits(base) : null;
+    const length = Number(prefix);
+    if (!net || net.bits !== ip.bits || !Number.isInteger(length) || length < 0 || length > ip.bits) continue;
+    const host = BigInt(ip.bits - length);
+    const first = (net.value >> host) << host;
+    if (ip.value >> host !== first >> host) continue;
+    // the subnet as the API's ip_network(cidr, strict=False) writes it
+    const subnet = `${fromBits(first, ip.bits)}/${length}`;
+    if (ip.value === first) why = why ?? `the network address of ${subnet}`;
+    else if (ip.bits === 32 && length < 31 && ip.value === (first | ((1n << host) - 1n))) why = why ?? `the broadcast address of ${subnet}`;
+    else return null;
+  }
+  return why;
 }
 
 /** Whether `address` lies in `cidr` ("10.20.0.0/16", "fd00:10::/64"), like the API's ipaddress check. */

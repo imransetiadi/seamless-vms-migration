@@ -14,7 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
-import { isIpAddress } from '../lib/nics';
+import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
@@ -341,16 +341,21 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
 }
 
-/** Like the API's model (SDD §4.2): NIC override keys are stored lower case, each entry with both fields. */
-function withLowerCaseMacs(input: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Like the API's model (SDD §4.2): NIC override keys are stored lower case, each entry with both fields and its valid
+ * addresses in their canonical form ("FD00:0::0005" is "fd00::5"), before anything is checked.
+ */
+function withCanonicalNicOverrides(input: Record<string, unknown>): Record<string, unknown> {
   if (!input.nic_overrides || typeof input.nic_overrides !== 'object') return input;
-  const overrides = input.nic_overrides as Record<string, Record<string, object>>;
+  const overrides = input.nic_overrides as Record<string, Record<string, { fixed_ips?: unknown }>>;
+  const canonical = (entry: { fixed_ips?: unknown }) =>
+    Array.isArray(entry.fixed_ips) ? { ...entry, fixed_ips: entry.fixed_ips.map((a) => (typeof a === 'string' ? canonicalIp(a) : a)) } : entry;
   return {
     ...input,
     nic_overrides: Object.fromEntries(
       Object.entries(overrides).map(([vm, nics]) => [
         vm,
-        Object.fromEntries(Object.entries(nics ?? {}).map(([mac, entry]) => [mac.toLowerCase(), { network: null, fixed_ips: null, ...entry }])),
+        Object.fromEntries(Object.entries(nics ?? {}).map(([mac, entry]) => [mac.toLowerCase(), { network: null, fixed_ips: null, ...canonical(entry ?? {}) }])),
       ]),
     ),
   };
@@ -1791,7 +1796,7 @@ export class MockServer {
   }
 
   private createPlan(me: Me, raw: Record<string, unknown>): MockResponse {
-    const input = withLowerCaseMacs(raw);
+    const input = withCanonicalNicOverrides(raw);
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
     const body = input as unknown as PlanCreate;
@@ -1843,7 +1848,7 @@ export class MockServer {
   }
 
   private patchPlan(me: Me, plan: Plan, raw: Record<string, unknown>): MockResponse {
-    const input = withLowerCaseMacs(raw);
+    const input = withCanonicalNicOverrides(raw);
     // like the API (SDD §12): the body is a partial PlanCreate, a field it cannot change is refused first
     const unknown = Object.keys(input).filter((key) => !PLAN_EDITABLE_FIELDS.has(key)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);

@@ -626,14 +626,20 @@ describe('MigrationDetail', () => {
     expect(within(panel).getByRole('row', { name: new RegExp(nic!.mac!) })).toHaveTextContent('10.20.9.9');
     expect(within(panel).getByRole('row', { name: new RegExp(nic!.mac!) })).toHaveTextContent('Override');
 
-    // a bad address is named before anything is sent
+    // a bad address is named on its field, marked invalid, and gets the focus before anything is sent
     await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
     const bad = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
     const addresses = within(bad).getByRole('textbox', { name: `Addresses of ${nic!.mac}` });
     await user.clear(addresses);
     await user.type(addresses, '10.20.9.300');
     await user.click(within(bad).getByRole('button', { name: 'Save network' }));
-    expect(await within(bad).findByText(`${nic!.mac}: not an IP address: 10.20.9.300`)).toBeInTheDocument();
+    await waitFor(() => expect(addresses).toHaveFocus());
+    expect(addresses).toHaveAttribute('aria-invalid', 'true');
+    expect(addresses).toHaveAccessibleDescription(expect.stringContaining('not an IP address: 10.20.9.300'));
+    expect(plan.nic_overrides[m.vm.source_id]?.[nic!.mac!]?.fixed_ips).toEqual(['10.20.9.9']);
+    await user.clear(addresses);
+    await user.type(addresses, '10.20.9.10');
+    expect(addresses).not.toHaveAttribute('aria-invalid');
 
     // back to the plan's mapping: the VM's entry goes
     await user.click(within(bad).getByRole('button', { name: "Use the plan's mapping" }));
@@ -647,6 +653,72 @@ describe('MigrationDetail', () => {
     const panel = await screen.findByRole('region', { name: 'Network' });
     await waitFor(() => expect(panel).toHaveTextContent("The migration kit keeps the guest's network settings"));
     expect(within(panel).queryByRole('button', { name: 'Edit network' })).not.toBeInTheDocument();
+    expect(within(panel).queryByRole('button', { name: 'Remove the overrides' })).not.toBeInTheDocument();
+  });
+
+  it('offers to remove the overrides a VMware VM still has, which block it (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    // an editable plan: validated, nothing of it in flight
+    plan.status = 'validated';
+    for (const x of server.migrations.filter((y) => y.plan_id === plan.id)) Object.assign(x, { phase: 'ready', downtime_started_at: null, downtime_ended_at: null });
+    plan.nic_overrides = { [m.vm.source_id]: { 'fa:16:3e:00:00:99': { network: 'tenant-web', fixed_ips: null } } };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Remove the overrides' }));
+    await waitFor(() => expect(m.vm.source_id in plan.nic_overrides).toBe(false));
+    expect(plan.status).toBe('draft');
+    await waitFor(() => expect(within(panel).queryByRole('button', { name: 'Remove the overrides' })).not.toBeInTheDocument());
+  });
+
+  it('says why a VMware VM cannot have its overrides removed now, and removes nothing (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.status = 'validated';
+    for (const x of server.migrations.filter((y) => y.plan_id === plan.id)) Object.assign(x, { phase: 'ready', downtime_started_at: null, downtime_ended_at: null });
+    const entries = { 'fa:16:3e:00:00:99': { network: 'tenant-web', fixed_ips: null } };
+    plan.nic_overrides = { [m.vm.source_id]: entries };
+    // a viewer: the role says why
+    const viewer = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    let panel = await screen.findByRole('region', { name: 'Network' });
+    let remove = await within(panel).findByRole('button', { name: 'Remove the overrides' });
+    await waitFor(() => expect(remove).toHaveAccessibleDescription('Requires the operator role.'));
+    await user.click(remove);
+    expect(plan.nic_overrides[m.vm.source_id]).toEqual(entries);
+    viewer.unmount();
+    // an operator while a migration of the plan is in flight: the plan's edit rule says why
+    m.phase = 'syncing';
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    panel = await screen.findByRole('region', { name: 'Network' });
+    remove = await within(panel).findByRole('button', { name: 'Remove the overrides' });
+    await waitFor(() => expect(remove).toHaveAccessibleDescription(expect.stringContaining(m.vm.name)));
+    await user.click(remove);
+    expect(plan.nic_overrides[m.vm.source_id]).toEqual(entries);
+  });
+
+  it("keeps an override's network that RHOSO no longer lists selected, marked so (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const [nic] = m.vm.nics;
+    plan.nic_overrides = { [m.vm.source_id]: { [nic!.mac!]: { network: 'rhoso-gone', fixed_ips: null } } };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    const select = within(dialog).getByRole('combobox', { name: `RHOSO network of ${nic!.mac}` });
+    expect(await within(select).findByRole('option', { name: 'rhoso-gone (not in RHOSO)' })).toBeInTheDocument();
+    expect(select).toHaveValue('rhoso-gone');
+    // said under the field too: a narrow select cuts its option's text
+    expect(select).toHaveAccessibleDescription('RHOSO does not list rhoso-gone: validation refuses it.');
+    await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
+    await waitFor(() => expect(plan.status).toBe('draft'));
+    expect(plan.nic_overrides[m.vm.source_id]).toEqual({ [nic!.mac!]: { network: 'rhoso-gone', fixed_ips: null } });
   });
 
   it('announces why Save probes was refused from a live region already in the dialog (SDD §16)', async () => {
