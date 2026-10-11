@@ -1043,7 +1043,11 @@ the smoke also checks that the requester's own approval is refused with 409): [`
 covers §14.6 plus the seeded demo flow, SSE replay, Jev through the sidecar, agentmemory and a Jev strategy
 decision when it validates its plan — the smoke plan of an earlier run, or a new one on a VM no plan holds (one
 VM, one migration across plans, SDD §5.4; the demo leaves `report-01` and `batch-01` unplanned for it and for a
-plan of your own) — so it can run again on the same stack without adding a plan (exit code = failed checks);
+plan of your own) — so it can run again on the same stack without adding a plan (exit code = failed checks). When
+no VM is free and no earlier smoke plan validates — a long-lived volume whose finance VMs are all completed and held
+until finalized — the free-VM check and the five advisor checks that need the plan print SKIP with that reason and
+the summary counts them as skipped, not failed (e6dab66): a fresh demo volume, or finalizing or rolling back a finance
+VM, brings them back;
 [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
 is the RBAC matrix — every route × role of SDD §12 (Security.md §5.2 shows the main ones), the plan policy fields included (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
 runs DEMO-04 and DEMO-06; [`tests/e2e/browser-demo.mjs`](../tests/e2e/browser-demo.mjs) (`TOKEN_FILE=…`) opens
