@@ -761,7 +761,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
   for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts.
 * Cold rollback passes `os_migrate_rollback_match_by_name: true` (the cold path does not record the
-  destination server id in a warm state file).
+  destination server id in a warm state file) only once the source was stopped (`downtime_started_at` set), as
+  the VMware rollback looks up the server by name only then: the cold role creates the server after the stop, so
+  before it a same-named destination server is not this migration's — a cutover refused for a name collision, or
+  skipped by the role for one, is rolled back by starting the source alone and deletes nothing.
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
