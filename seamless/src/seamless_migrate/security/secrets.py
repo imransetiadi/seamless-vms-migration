@@ -28,6 +28,12 @@ class SecretNotFound(LookupError):
     """The named secret (or a required key of it) is not configured."""
 
 
+def valid_secret_name(name: str) -> bool:
+    """A name this module reads (SDD §13.3): 1-128 letters, digits, ``.``, ``_`` or ``-``,
+    starting with a letter or digit - never a path."""
+    return bool(_NAME.match(name)) and name not in (".", "..")
+
+
 def _env_prefix(name: str) -> str:
     return "SEAMLESS_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_"
 
@@ -37,7 +43,7 @@ def read_secret(
 ) -> dict[str, str]:
     """All keys of secret ``name`` (SDD §13.3 order): mounted files under ``secrets_dir``, then
     the Kubernetes store, then ``SEAMLESS_SECRET_{NAME}_{KEY}`` variables. ``{}`` when absent."""
-    if not name or not _NAME.match(name) or name in (".", ".."):
+    if not name or not valid_secret_name(name):
         raise SecretNotFound(f"invalid secret name {name!r}")
     values: dict[str, str] = {}
     directory = Path(settings.secrets_dir) / name
@@ -93,7 +99,7 @@ def resolve_private_key(name: str, settings: Settings, env: Mapping[str, str] | 
 
     Read from ``{secrets_dir}/{name}/private_key`` or ``SEAMLESS_SECRET_{NAME}_PRIVATE_KEY``.
     """
-    if not name or not _NAME.match(name) or name in (".", ".."):
+    if not name or not valid_secret_name(name):
         raise SecretNotFound(f"invalid secret name {name!r}")
     path = Path(settings.secrets_dir) / name / "private_key"
     if path.is_file():

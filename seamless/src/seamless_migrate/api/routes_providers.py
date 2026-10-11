@@ -22,6 +22,7 @@ from ..security.secret_store import (
     credentials_secret_name,
     secret_store,
 )
+from ..security.secrets import valid_secret_name
 from ..store import ConflictError, NotFound
 from .deps import ApiError, require_role, services
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
@@ -105,11 +106,32 @@ async def list_providers(
     return await services(request).db.list("provider", Provider)
 
 
+def _check_secret_names(provider: Provider, fields: set[str]) -> None:
+    """SDD §13.3: a secret named for a provider must be one ``security.secrets`` can read; only
+    the fields the request sets are checked, so a provider stored before stays editable."""
+    names = {}
+    if "credentials_secret" in fields:
+        names["credentials_secret"] = provider.credentials_secret
+    if "conversion_host" in fields and provider.conversion_host is not None:
+        names["conversion_host.ssh_key_secret"] = provider.conversion_host.ssh_key_secret
+    bad = [
+        field for field, name in names.items() if name is not None and not valid_secret_name(name)
+    ]
+    if bad:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(bad)}: a secret name is 1-128 letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit",
+        )
+
+
 @router.post("/providers", response_model=Provider, status_code=201)
 async def create_provider(
     body: Provider, request: Request, principal: Principal = Depends(require_role(Role.admin))
 ) -> Provider:
     svc = services(request)
+    _check_secret_names(body, {"credentials_secret", "conversion_host"})
     provider = body.model_copy(
         update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
     )
@@ -158,6 +180,7 @@ async def update_provider(
         )
     except ValidationError as exc:
         raise ApiError(422, "validation_error", _summarize(exc)) from None
+    _check_secret_names(updated, set(body))
     await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,

@@ -317,6 +317,51 @@ def test_credential_validation_per_kind(api):
     }
 
 
+@pytest.mark.parametrize("bad", ["../etc", "-starts-with-dash", "has space", "a" * 129, ".", ".."])
+def test_a_secret_name_the_reader_could_not_use_is_refused(api, bad):
+    """SDD §13.3: credentials_secret and conversion_host.ssh_key_secret name a secret managed
+    outside Seamless; a name security.secrets would refuse to read is refused when written."""
+    created = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-named", "credentials_secret": bad}
+    )
+    assert created.status_code == 422, created.text
+    assert "credentials_secret" in created.json()["error"]["message"]
+    assert patch(api, "/api/v1/providers/src-osp", {"credentials_secret": bad}).status_code == 422
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": bad}
+    refused = patch(api, "/api/v1/providers/src-osp", {"conversion_host": host})
+    assert refused.status_code == 422 and "ssh_key_secret" in refused.json()["error"]["message"]
+
+
+def test_a_provider_stored_with_an_odd_secret_name_stays_editable(api):
+    """Only the fields a PATCH sets are checked: a provider stored before the rule stays usable."""
+    stored = api.store.get("provider", "src-osp", Provider)
+    api.store.put("provider", stored.model_copy(update={"credentials_secret": "old name"}))
+    renamed = patch(api, "/api/v1/providers/src-osp", {"name": "RHOSP 17.1 (finance, renamed)"})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["credentials_secret"] == "old name"
+    assert (
+        patch(api, "/api/v1/providers/src-osp", {"credentials_secret": "old name"}).status_code
+        == 422
+    )
+
+
+def test_a_secret_managed_outside_seamless_can_be_named(api):
+    """SDD §13.3, §16: the dialog names an existing secret; nothing is written to the store."""
+    created = api.post(
+        "/api/v1/providers",
+        json={**VCENTER, "id": "vc-named", "credentials_secret": "vcenter-dc2.prod_1"},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["credentials_secret"] == "vcenter-dc2.prod_1"
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "conv-key"}
+    patched = patch(
+        api, "/api/v1/providers/src-osp", {"conversion_host": host, "credentials_secret": "osp-src"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["conversion_host"]["ssh_key_secret"] == "conv-key"
+    assert patched.json()["credentials_secret"] == "osp-src"
+
+
 def test_conversion_key_is_write_only(api):
     bad = put(
         api, "/api/v1/providers/src-osp/conversion-key", {"private_key": "ssh-ed25519 " + "A" * 80}
