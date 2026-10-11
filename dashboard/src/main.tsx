@@ -5,6 +5,14 @@ import App from './App';
 import { clearStoredToken, getStoredToken } from './api/auth';
 import { ApiClient, DEFAULT_API_BASE, setDefaultClient } from './api/client';
 import { queryKeys } from './api/hooks';
+// SDD §16 fonts, bundled (Latin, the weights in use): an air-gapped install loads nothing from another host
+import '@fontsource/fira-code/latin-400.css';
+import '@fontsource/fira-code/latin-500.css';
+import '@fontsource/fira-code/latin-600.css';
+import '@fontsource/fira-sans/latin-400.css';
+import '@fontsource/fira-sans/latin-500.css';
+import '@fontsource/fira-sans/latin-600.css';
+import '@fontsource/fira-sans/latin-700.css';
 import './index.css';
 
 async function bootstrap() {

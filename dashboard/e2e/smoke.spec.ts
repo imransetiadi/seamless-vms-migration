@@ -65,6 +65,26 @@ test('chart code loads with the overview that draws charts, not with the sign-in
   expect(scripts.filter((path) => path.includes('/charts-'))).toHaveLength(1);
 });
 
+test('the fonts come with the dashboard: nothing loads from another host (SDD §16)', async ({ page, baseURL }) => {
+  const foreign: string[] = [];
+  page.on('request', (request) => {
+    if (new URL(request.url()).origin !== new URL(baseURL ?? '').origin) foreign.push(request.url());
+  });
+  await signIn(page);
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  const loaded = await page.evaluate(async () => {
+    await document.fonts.ready;
+    const faces: string[] = [];
+    document.fonts.forEach((font) => {
+      if (font.status === 'loaded') faces.push(`${font.family.replaceAll('"', '')} ${font.weight}`);
+    });
+    return faces;
+  });
+  expect(foreign).toEqual([]);
+  expect(loaded).toEqual(expect.arrayContaining(['Fira Sans 400', 'Fira Code 600']));
+});
+
 test('a viewer sees operator and approver actions soft-disabled', async ({ page }) => {
   await signIn(page, 'viewer');
   await page.goto('/plans');
