@@ -430,7 +430,12 @@ SEAMLESS_DOCKER       = env -u DOCKER_HOST DOCKER_CONTEXT=$(SEAMLESS_DOCKER_CONT
 SEAMLESS_COMPOSE_CMD  = $(SEAMLESS_DOCKER) compose
 SEAMLESS_UP_WAIT      = --wait --wait-timeout 300
 endif
-SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
+# A Linux machine's own Docker Engine (SEAMLESS_DOCKER_CONTEXT=default) defines no host.docker.internal, the host in
+# the default agentmemory URL: compose.linux-host.yaml maps it to the host gateway (SDD 17.1). Colima and Docker
+# Desktop resolve it to the developer's machine themselves - the host gateway would be their VM - and never get it.
+SEAMLESS_HOST_OS ?= $(shell uname -s)
+SEAMLESS_HOST_GATEWAY_FILE = $(if $(and $(filter Linux,$(SEAMLESS_HOST_OS)),$(filter default,$(SEAMLESS_DOCKER_CONTEXT)),$(filter docker,$(SEAMLESS_ENGINE))),$(SEAMLESS_COMPOSE_DIR)/compose.linux-host.yaml)
+SEAMLESS_COMPOSE_BASE = $(SEAMLESS_COMPOSE_CMD) -p $(SEAMLESS_PROJECT) -f $(SEAMLESS_COMPOSE_FILE)$(if $(SEAMLESS_HOST_GATEWAY_FILE), -f $(SEAMLESS_HOST_GATEWAY_FILE))$(if $(SEAMLESS_EXTRA_COMPOSE_FILE), -f $(SEAMLESS_EXTRA_COMPOSE_FILE))
 # wait until the control plane answers (both engines; Docker's --wait already covers the healthchecks)
 SEAMLESS_WAIT_HEALTH  = for i in $$(seq 1 150); do curl -fsS -o /dev/null http://127.0.0.1:$(SEAMLESS_HOST_PORT)/api/v1/health && break; \
                         [ $$i = 150 ] && { echo "the control plane did not become healthy in 300 s: make seamless-logs"; exit 1; }; sleep 2; done

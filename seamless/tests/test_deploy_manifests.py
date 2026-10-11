@@ -5,6 +5,8 @@ result (``.github/workflows/ci.yml``, job manifests); this test reads the overla
 control-plane suite catches a regression without kustomize.
 """
 
+from pathlib import Path
+
 import yaml
 
 from seamless_migrate.config import find_repo_root
@@ -165,3 +167,30 @@ def test_the_route_tells_browsers_to_keep_to_https():
     age = re.search(r"max-age=(\d+)", hsts)
     assert age and int(age.group(1)) >= 31536000, hsts
     assert route["spec"]["tls"]["insecureEdgeTerminationPolicy"] == "Redirect"
+
+
+def _compose_files(**make_vars: str) -> list[str]:
+    """The Compose files `make seamless-up` passes for these Make variables (a dry run)."""
+    import re
+    import subprocess
+
+    args = ["make", "-n", "--no-print-directory", "seamless-up"]
+    args += [f"{name}={value}" for name, value in make_vars.items()]
+    out = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    line = next(ln for ln in out.splitlines() if " up -d " in ln)
+    return [Path(f).name for f in re.findall(r" -f (\S+)", line)]
+
+
+def test_a_linux_docker_engine_maps_host_docker_internal_to_the_host():
+    """SDD §17.1: only a Linux machine's own Docker Engine gets compose.linux-host.yaml; on Colima
+    and Docker Desktop the name already reaches the developer's machine (host-gateway would be
+    their VM)."""
+    override = "compose.linux-host.yaml"
+    linux = dict(SEAMLESS_HOST_OS="Linux", SEAMLESS_DOCKER_CONTEXT="default")
+    assert override in _compose_files(**linux)
+    assert override not in _compose_files(**{**linux, "SEAMLESS_DOCKER_CONTEXT": "colima-x"})
+    assert override not in _compose_files(**{**linux, "SEAMLESS_HOST_OS": "Darwin"})
+    assert override not in _compose_files(**{**linux, "SEAMLESS_ENGINE": "podman"})
+    mapped = yaml.safe_load((ROOT / "deploy" / "compose" / override).read_text())
+    hosts = mapped["services"]["seamless"]["extra_hosts"]
+    assert hosts == ["host.docker.internal:host-gateway"]
