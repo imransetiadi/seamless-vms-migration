@@ -1876,7 +1876,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
   heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
-  plan's heading, while Cancel returns focus to the button) or while its request runs (a busy button stays focusable,
+  plan's heading; the migration page's Use suggested probe, whose suggestion goes once the VM has probes → Edit probes
+  beside it; while Cancel returns focus to the button) or while its request runs (a busy button stays focusable,
   `aria-busy` and `aria-disabled`, and ignores further presses), `prefers-reduced-motion` honoured,
   44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
   over it — so Tab never hides the focused control under them (WCAG 2.4.11), and Escape closing the topmost dialog
