@@ -248,7 +248,9 @@ docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.i
 
 On a Linux machine's own Docker Engine (`SEAMLESS_DOCKER_CONTEXT=default`) the Make targets add
 `deploy/compose/compose.linux-host.yaml`, which maps `host.docker.internal` to the host gateway (SDD §17.1); pass it
-with `-f` when you run `docker compose` yourself. Colima and Docker Desktop resolve the name themselves.
+with `-f` when you run `docker compose` yourself. agentmemory on that host must then listen on an address the
+containers reach — the bridge's (`172.17.0.1` by default), or all addresses behind a firewall — not on `127.0.0.1`
+only. Colima and Docker Desktop resolve the name themselves.
 
 ### 4.3 OpenShift
 
