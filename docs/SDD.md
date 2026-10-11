@@ -1991,8 +1991,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (`/plans`, also current on a migration's page); Clouds — Providers, Inventory; Activity — Events; Advisor —
   Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
   trail (`/advisor/audit`). The current item is marked `aria-current="page"`. Plans carries the count of failed
-  migrations from `/stats` ("{n} failed", danger tone with its icon, part of the link's name; nothing while it is
-  0 or while the stats are unknown). Below 768 px a header holds the menu button, the brand, the live indicator
+  migrations from `/stats` ("{n} failed", danger tone with its icon; the link's description, so its name stays
+  "Plans"; nothing while it is 0 or while the stats are unknown). Below 768 px a header holds the menu button, the brand, the live indicator
   and the theme; the menu is a drawer sliding in from the left over the dimmed page (a modal dialog named
   "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
   menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
