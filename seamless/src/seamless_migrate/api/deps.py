@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -17,7 +16,7 @@ from ..domain.enums import Role
 from ..events import EventBus, emit
 from ..orchestrator import Orchestrator
 from ..security.auth import ANONYMOUS_ADMIN, Principal, TokenStore
-from ..store import AsyncStore, Store
+from ..store import AsyncStore, Store, VersionedDocuments
 
 log = logging.getLogger(__name__)
 
@@ -47,38 +46,16 @@ class Services:
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
-    #: per kind: (change stamp, the documents in creation order, {id: (version, document)}),
-    #: reused by /stats, /metrics and /advisor/recommendations (SDD §11)
-    _doc_cache: dict[str, tuple[tuple[int, int], list[Any], dict[str, tuple[int, Any]]]] = field(
-        default_factory=dict
-    )
-    _doc_cache_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: per kind, the documents /stats, /metrics and /advisor/recommendations read (SDD §11)
+    _doc_cache: dict[str, VersionedDocuments] = field(default_factory=dict)
 
     async def all_documents(self, kind: str, model_cls: type[Any]) -> list[Any]:
-        """Every document of ``kind`` in creation order. While the store's change stamp holds,
-        the cached list (one aggregate query); when it moved, only the documents whose version
-        changed or that are new are loaded — a run writes a migration every second (SDD §11)."""
-        stamp = await self.db.change_stamp(kind)
-        cached = self._doc_cache.get(kind)
-        if cached is not None and cached[0] == stamp:
-            return cached[1]
-        async with self._doc_cache_lock:
-            cached = self._doc_cache.get(kind)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
-            known = cached[2] if cached is not None else {}
-            versions = await self.db.versions(kind)
-            stale = {id_ for id_, version in versions if known.get(id_, (None,))[0] != version}
-            fresh = await self.db.get_many(kind, stale, model_cls) if stale else {}
-            by_id: dict[str, tuple[int, Any]] = {}
-            for id_, _ in versions:
-                # a stale document deleted between the two reads is left out
-                hit = fresh.get(id_) if id_ in stale else known.get(id_)
-                if hit is not None:
-                    by_id[id_] = hit
-            rows = [by_id[id_][1] for id_, _ in versions if id_ in by_id]
-            self._doc_cache[kind] = (stamp, rows, by_id)
-            return rows
+        """Every document of ``kind`` in creation order; only what changed is loaded again
+        (``VersionedDocuments``) - a run writes a migration every second (SDD §11)."""
+        cache = self._doc_cache.get(kind)
+        if cache is None:
+            cache = self._doc_cache[kind] = VersionedDocuments(self.db, kind, model_cls)
+        return await cache.get()
 
     @property
     def db(self) -> AsyncStore:

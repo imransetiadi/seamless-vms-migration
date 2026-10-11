@@ -508,3 +508,39 @@ __all__ = [
     "StoreError",
     "build_engine",
 ]
+
+
+class VersionedDocuments:
+    """Every document of one kind in creation order, kept between reads (SDD §11): while the
+    store's change stamp holds, the kept list (one aggregate query); when it moved, only the
+    documents whose version changed or that are new are loaded, and deleted ones dropped. The
+    documents are shared between callers: read them, never change them."""
+
+    def __init__(self, db: AsyncStore, kind: str, model_cls: type[Any]) -> None:
+        self.db, self.kind, self.model_cls = db, kind, model_cls
+        self.stamp: tuple[int, int] | None = None
+        self.rows: list[Any] = []
+        self.by_id: dict[str, tuple[int, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self) -> list[Any]:
+        stamp = await self.db.change_stamp(self.kind)
+        if stamp == self.stamp:
+            return self.rows
+        async with self._lock:
+            if stamp == self.stamp:
+                return self.rows
+            versions = await self.db.versions(self.kind)
+            known = self.by_id
+            stale = {id_ for id_, version in versions if known.get(id_, (None,))[0] != version}
+            fresh = await self.db.get_many(self.kind, stale, self.model_cls) if stale else {}
+            by_id: dict[str, tuple[int, Any]] = {}
+            for id_, _ in versions:
+                # a stale document deleted between the two reads is left out
+                hit = fresh.get(id_) if id_ in stale else known.get(id_)
+                if hit is not None:
+                    by_id[id_] = hit
+            self.rows = [by_id[id_][1] for id_, _ in versions if id_ in by_id]
+            self.by_id = by_id
+            self.stamp = stamp
+            return self.rows

@@ -101,7 +101,7 @@ from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError
-from .store import AsyncStore, ConflictError, NotFound, Store
+from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
 from .verification import VerificationResult, Verifier, review_reason
 
 log = logging.getLogger(__name__)
@@ -276,6 +276,9 @@ class Orchestrator:
     ) -> None:
         self.store = store
         self.db = AsyncStore(store)
+        # what the tick reads every second: only the migrations that changed are loaded again
+        # (SDD §11, Performance.md); read-only - every change goes through _load/_save
+        self._migrations = VersionedDocuments(self.db, "migration", Migration)
         self.bus = bus
         self.providers = providers
         self.executors = executors
@@ -1925,8 +1928,8 @@ class Orchestrator:
         # only the migrations of plans that can still have work: running ones, plus paused and
         # re-validated ones whose in-flight steps still count against the concurrency limits
         live = (PlanStatus.running, PlanStatus.paused, PlanStatus.validated)
-        active = [p.id for p in all_plans if p.status in live]
-        migrations = await self.db.list("migration", Migration, plan_id=active)
+        active = {p.id for p in all_plans if p.status in live}
+        migrations = [m for m in await self._migrations.get() if m.plan_id in active]
         by_plan: dict[str, list[Migration]] = defaultdict(list)
         for m in migrations:
             by_plan[m.plan_id].append(m)
@@ -2164,8 +2167,8 @@ class Orchestrator:
         """SDD §8: drive again a migration in a resumable phase whose driver task died — after a
         backoff while it keeps crashing, and never while its step task still runs."""
         now = time.monotonic()
-        resumable = await self.db.list("migration", Migration, phase=list(fsm.RESUMABLE_PHASES))
-        for m in resumable:
+        migrations = await self._migrations.get()
+        for m in (m for m in migrations if m.phase in fsm.RESUMABLE_PHASES):
             driver, step = self._drivers.get(m.id), self._steps.get(m.id)
             if (driver is not None and not driver.done()) or (step is not None and not step.done()):
                 continue

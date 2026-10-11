@@ -1037,6 +1037,43 @@ async def test_cold_flow(tmp_path, store):
     assert h.executor.prestaged == [plan.id]
 
 
+async def test_a_tick_loads_only_the_migrations_that_changed(tmp_path, store, monkeypatch):
+    """Performance.md, SDD §11: the tick reads (id, version) and loads only the migrations that
+    changed since the last tick - not every migration of the live plans once a second."""
+    vms = [vm(i) for i in range(1, 4)]
+    plan_kw = {"default_strategy": Strategy.warm, "require_approval": True}
+    h, plan = await setup(tmp_path, store, vms, {**plan_kw, "keep_warm_interval_s": 86400})
+    await run_plan(h, plan)
+    for i in range(1, 4):
+        await h.wait_phase((await h.by_vm(plan.id, f"vm-{i}")).id, P.awaiting_cutover)
+    await h.orch.stop()
+    await h.orch.tick()  # the cache holds every migration now
+    m2 = await h.by_vm(plan.id, "vm-2")
+    _, version = store.get_versioned("migration", m2.id, Migration)
+    store.put("migration", m2.model_copy(update={"progress_pct": 12.0}), expected_version=version)
+
+    listed: list[str] = []
+    loaded: list[str] = []
+    real_list, real_get_many = store.list, store.get_many
+
+    def counting_list(kind, *args, **kwargs):
+        listed.append(kind)
+        return real_list(kind, *args, **kwargs)
+
+    def counting_get_many(kind, ids, model_cls):
+        loaded.extend(ids)
+        return real_get_many(kind, ids, model_cls)
+
+    monkeypatch.setattr(store, "list", counting_list)
+    monkeypatch.setattr(store, "get_many", counting_get_many)
+    await h.orch.tick()
+    assert "migration" not in listed
+    assert loaded == [m2.id]
+    # still waiting for the approval: the tick saw the migrations as they are
+    phases = [(await h.by_vm(plan.id, f"vm-{i}")).phase for i in (1, 2, 3)]
+    assert phases == [P.awaiting_cutover] * 3
+
+
 async def test_requires_approval_waits(tmp_path, store):
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "require_approval": True}

@@ -303,13 +303,13 @@ def test_metrics_format(api, tmp_path):
 def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     svc = api.client.app.state.services
     assert api.get("/api/v1/stats").status_code == 200
-    migrations_list = svc._doc_cache["migration"][1]
-    plans_list = svc._doc_cache["plan"][1]
+    migrations_list = svc._doc_cache["migration"].rows
+    plans_list = svc._doc_cache["plan"].rows
     assert api.get("/api/v1/metrics").status_code == 200
     assert api.get("/api/v1/stats?plan_id=plan-x").status_code == 200
     # nothing changed: the same list objects served every call (no reload)
-    assert svc._doc_cache["migration"][1] is migrations_list
-    assert svc._doc_cache["plan"][1] is plans_list
+    assert svc._doc_cache["migration"].rows is migrations_list
+    assert svc._doc_cache["plan"].rows is plans_list
     # a new plan document moves the stamp of "plan" only
     assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
     assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
@@ -325,9 +325,9 @@ def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     )
     assert created.status_code == 201, created.text
     assert api.get("/api/v1/stats").status_code == 200
-    assert svc._doc_cache["plan"][1] is not plans_list
-    assert [p.id for p in svc._doc_cache["plan"][1]] == [created.json()["id"]]
-    assert svc._doc_cache["migration"][1] is migrations_list
+    assert svc._doc_cache["plan"].rows is not plans_list
+    assert [p.id for p in svc._doc_cache["plan"].rows] == [created.json()["id"]]
+    assert svc._doc_cache["migration"].rows is migrations_list
 
 
 def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeypatch):
@@ -337,7 +337,7 @@ def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeyp
     for m in (kept, changed, gone):
         api.store.put("migration", m)
     assert api.get("/api/v1/stats").json()["total"] == 3
-    before = {m.id: m for m in svc._doc_cache["migration"][1]}
+    before = {m.id: m for m in svc._doc_cache["migration"].rows}
 
     api.store.put(
         "migration", changed.model_copy(update={"phase": Phase.syncing}), expected_version=1
@@ -355,7 +355,7 @@ def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeyp
     monkeypatch.setattr(api.store, "get_many", counting_get_many)
     stats = api.get("/api/v1/stats").json()
 
-    after = svc._doc_cache["migration"][1]
+    after = svc._doc_cache["migration"].rows
     assert [m.id for m in after] == [kept.id, changed.id, added.id]  # creation order
     assert after[0] is before[kept.id]  # not reloaded
     assert after[1].phase == Phase.syncing
