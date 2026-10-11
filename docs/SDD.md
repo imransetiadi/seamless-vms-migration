@@ -1315,7 +1315,13 @@ PostgreSQL when `SEAMLESS_TEST_PG_URL` is set. Tables:
 documents(kind TEXT, id TEXT, version INTEGER, data JSON, created_at, updated_at, PK(kind,id))
   + expression indexes ix_documents_{plan_id,phase,wave_id,status,role} on (kind, data->>field)
 events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, message, data JSON)
+  + indexes ix_events_plan_id (plan_id), ix_events_migration_id (migration_id), ix_events_kind_seq (kind, seq)
 ```
+
+`ix_events_kind_seq` serves the `kinds` filter (`GET /events?audit=true`, its `before` pages): audit events are
+sparse, and without it the newest of them were found by reading the table backwards — 1,000,000 events took
+~0.3 s per page on SQLite, ~1 ms with it. `create_schema()` adds the events indexes to an existing table with
+`CREATE INDEX IF NOT EXISTS`, as it does the document indexes.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
 `advisor_policy` (§14.6).
