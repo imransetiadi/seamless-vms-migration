@@ -1591,9 +1591,19 @@ class Orchestrator:
 
     async def _watch_sources_once(self) -> None:
         clients: dict[str, Any] = {}
+        # each plan read once per pass, a plan that is gone too: a plan of 1,000 VMs is ~22 KB,
+        # and in demo the watch runs every few seconds
+        plans: dict[str, Plan | None] = {}
         for m in await self.db.list("migration", Migration, phase=P.completed):
             try:
-                plan = await self._plan(m.plan_id)
+                if m.plan_id not in plans:
+                    try:
+                        plans[m.plan_id] = await self._plan(m.plan_id)
+                    except NotFound:
+                        plans[m.plan_id] = None
+                plan = plans[m.plan_id]
+                if plan is None:
+                    continue
                 if plan.source_provider_id not in clients:
                     clients[plan.source_provider_id] = await self.source_client(plan)
                 vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)

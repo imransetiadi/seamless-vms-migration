@@ -5032,6 +5032,34 @@ async def test_a_rollback_clears_the_source_running_flag(tmp_path, store):
     assert (await h.migration(m.id)).source_running_at is None
 
 
+async def test_the_source_watch_reads_each_plan_once_per_pass(tmp_path, store, monkeypatch):
+    """SDD §8.1: one pass over a plan's completed VMs reads the plan once, not once per VM (it
+    ran every 5 s in demo and re-read a 22 KB plan per VM); a plan that is gone is asked once."""
+    h, plan = await _completed_plan(tmp_path, store, n=3, waves=[])
+    asked: list[str] = []
+    real_plan = h.orch._plan
+
+    async def counting_plan(plan_id):
+        asked.append(plan_id)
+        return await real_plan(plan_id)
+
+    monkeypatch.setattr(h.orch, "_plan", counting_plan)
+    h.source.vms["vm-2"] = h.source.vms["vm-2"].model_copy(update={"power_state": "running"})
+    await h.orch._watch_sources_once()
+    assert asked == [plan.id]
+    assert (await h.by_vm(plan.id, "vm-2")).source_running_at is not None
+
+    asked.clear()
+
+    async def gone(plan_id):
+        asked.append(plan_id)
+        raise NotFound("plan", plan_id)
+
+    monkeypatch.setattr(h.orch, "_plan", gone)
+    await h.orch._watch_sources_once()
+    assert asked == [plan.id]
+
+
 async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_path, store):
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
     del h.source.vms["vm-1"]  # finalized with delete_source, or rebuilt by a handover
