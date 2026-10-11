@@ -222,8 +222,9 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
                                         # export_<r>.yml/import_<r>.yml pair other than workloads (the
                                         # migrations themselves), else refused (422); "flavors" opt-in (§7.2)
-       port_creation_mode: "nova"|"neutron" = "nova",   # "neutron": OpenStack cold/warm recreate every port with its MAC,
-                                        # all its fixed IPs and its security groups (§6.6, §7.2, §9.2); "nova": one fixed IP, new MAC
+       port_creation_mode: "nova"|"neutron" = "nova",   # "neutron": OpenStack cold, warm and storage handover recreate every
+                                        # port with its MAC, all its fixed IPs and its security groups (§6.6, §7.2, §7.3, §9.2);
+                                        # "nova": one fixed IP per port, new MAC
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
@@ -882,7 +883,8 @@ volumes with their server, so the order is:
      source again on rollback.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
-   (network, MAC, fixed IPs, port id, whether Nova created it), and the volume attachments in device
+   (network, MAC, fixed IPs, port id, whether Nova created it; with `plan.port_creation_mode` `"neutron"` also its
+   security groups by name and its port-security flag), and the volume attachments in device
    order (volume id, device, boot index, bootable, type, size, Cinder host, the attachment's
    original `delete_on_termination`) and the resolved storage references (`storage`: per volume
    its family, source pool and destination host). The boot volume is the attachment at Nova's
@@ -907,11 +909,18 @@ volumes with their server, so the order is:
    on the managed volume with `POST /volumes/{id}/action {"os-set_image_metadata": {"metadata":
    …}}` (journaled per volume). Without it a UEFI or Windows guest would boot with defaults.
 8. Create the destination server from the managed volumes (BDM in journaled device order,
-   `delete_on_termination: false`).
+   `delete_on_termination: false`). Its NICs: with `plan.port_creation_mode` `"nova"` each port's mapped network
+   with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
+   address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
+   MAC, every fixed IP (by address: Neutron picks the subnet), its security groups found by name in the
+   destination credential's project, its port-security flag and the description `os-migrate:{source port id}`
+   (§6.6); it is journaled per port with its id, a resume uses again the journaled port or an unbound one with that
+   description, and Nova gets `{"port": id}` — the server's security groups apply only to ports Nova creates.
 
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
 it sets every attachment's journaled `delete_on_termination` back and starts the server. Otherwise:
-delete the destination server; unmanage at RHOSO; manage at the
+delete the destination server; delete the destination ports step 8 created through Neutron (journaled, or
+unbound with their description: a create sent before a crash), which Nova keeps; unmanage at RHOSO; manage at the
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
 journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
 metadata set back (step 7); recreate
@@ -1214,8 +1223,9 @@ strategy ineligible):
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
   `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
-  `storage_backends` — a destination pool that resolves (§7.3.1); no NIC with more than one fixed IP (the
-  destination server gets one fixed IP per port, so the others would be dropped without a word).
+  `storage_backends` — a destination pool that resolves (§7.3.1); with `plan.port_creation_mode` `"nova"`, no NIC
+  with more than one fixed IP (the destination server then gets one fixed IP per port, so the others would be
+  dropped without a word; `"neutron"` keeps them, §7.3 step 8).
 * `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
@@ -1254,7 +1264,7 @@ Finding catalog (code — severity — condition):
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
-| `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold and warm keep every address, and the handover's eligibility reason remains |
+| `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
@@ -2118,9 +2128,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   by default: the plan's flavors that RHOSO lacks, created with the same specs, `MAP_FLAVOR_PRESTAGED` — and
   Keypairs — off by default: the VMs' keypairs the migration user lacks at RHOSO, `MAP_KEYPAIR_PRESTAGED`; other
   entries a plan already has are kept; VMware sources pre-stage nothing, §7.2), Keep MAC addresses and every fixed IP
-  (`port_creation_mode` `"neutron"`, off by default: cold and warm recreate each port through Neutron with its MAC, all
-  its fixed IPs and its security groups, §6.6; the hint says the ports then outlive their server and that VMware
-  sources ignore it), the verification settings — TCP and Windows ports,
+  (`port_creation_mode` `"neutron"`, off by default: cold, warm and storage handover recreate each port through
+  Neutron with its MAC, all its fixed IPs and its security groups, §6.6, §7.3; the hint says the ports then outlive
+  their server and that VMware sources ignore it), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
