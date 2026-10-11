@@ -613,7 +613,23 @@ class HandoverExecutor:
         flavor: str,
         networks: list[dict[str, Any]],
         bdm: list[dict[str, Any]],
+        journal: _Journal,
+        sent: str,
     ) -> str:
+        """Create a server, journaled as ``sent`` with its id once Nova accepts it (SDD §7.3): after
+        a crash or a timeout while Nova builds it a resume waits for that server instead of
+        creating a second one on the same volumes; one Nova no longer knows is created again."""
+        if journal.done(sent):
+            server = _existing_server(conn, journal.get(sent)["server_id"])
+            if server is not None:
+                conn.compute.wait_for_server(
+                    server,
+                    status="ACTIVE",
+                    failures=["ERROR"],
+                    interval=self.poll_s,
+                    wait=self.wait_s,
+                )
+                return str(_attr(server, "id"))
         flavor_obj = conn.compute.find_flavor(flavor, ignore_missing=False)
         params: dict[str, Any] = {
             "name": definition["name"],
@@ -625,6 +641,7 @@ class HandoverExecutor:
         if definition.get("security_groups"):
             params["security_groups"] = [{"name": n} for n in definition["security_groups"]]
         server = conn.compute.create_server(**params)
+        journal.mark(sent, server_id=str(_attr(server, "id")))
         conn.compute.wait_for_server(
             server, status="ACTIVE", failures=["ERROR"], interval=self.poll_s, wait=self.wait_s
         )
@@ -779,7 +796,13 @@ class HandoverExecutor:
                     networks.append(net)
                 flavor = mappings.flavors.get(definition["flavor"], definition["flavor"])
                 return self._create_server(
-                    dst, definition, flavor, networks, self._bdm(attachments, dest_ids)
+                    dst,
+                    definition,
+                    flavor,
+                    networks,
+                    self._bdm(attachments, dest_ids),
+                    journal,
+                    "sent:create_server",
                 )
 
             new_id = await self._call("create the destination server", create)
@@ -810,8 +833,10 @@ class HandoverExecutor:
         definition = await asyncio.to_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
-        if journal.done("create_server") and not journal.done("rb:delete_destination"):
-            dest_server = journal.get("create_server")["server_id"]
+        # a create only sent before a crash or a timeout left a server too (SDD §7.3)
+        dest_created = journal.get("create_server") or journal.get("sent:create_server")
+        if dest_created and not journal.done("rb:delete_destination"):
+            dest_server = dest_created["server_id"]
 
             def delete_destination() -> None:
                 server = _existing_server(dst, dest_server)
@@ -916,6 +941,8 @@ class HandoverExecutor:
                         definition["flavor"],
                         networks,
                         self._bdm(attachments, new_ids, keep_original=True),
+                        journal,
+                        "sent:rb:create_source",
                     ),
                 )
                 await asyncio.to_thread(journal.mark, "rb:create_source", server_id=created)

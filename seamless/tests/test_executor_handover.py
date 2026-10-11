@@ -101,6 +101,8 @@ class FakeCompute:
 
     def get_server(self, server_id):
         self.c.record("get_server", server_id)
+        if server_id not in self.c.servers:
+            raise NotFoundException(f"No Server found for {server_id}")
         return self.c.servers[server_id]
 
     def stop_server(self, server):
@@ -111,6 +113,9 @@ class FakeCompute:
         self.c.record("start_server", server.id)
 
     def wait_for_server(self, server, status="ACTIVE", failures=None, interval=2, wait=120):
+        if self.c.crash_wait == "server":
+            self.c.crash_wait = None
+            raise Crash("wait_for_server")
         return server
 
     def volume_attachments(self, server):
@@ -297,7 +302,8 @@ class FakeCloud:
         self.servers = servers or {}
         self.volumes = volumes or {}
         self.crash_on = crash_on
-        self.crash_wait = None  # "delete" or "status": crash once inside that block-storage wait
+        # "delete" or "status": crash once inside that block-storage wait; "server": inside Nova's
+        self.crash_wait = None
         self.created = []
         self.managed = []
         self.ports = {}
@@ -768,6 +774,71 @@ async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_v
     ]
     bdm = clouds["dst"].created[0]["block_device_mapping"]
     assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_resume_after_a_crash_while_creating_waits_for_the_same_server(tmp_path):
+    """The control plane died while Nova built the destination server: the resume waits for that
+    server instead of creating a second one on the same volumes (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [op for op in ops(calls) if op[1] == "create_server"] == [
+        ("dst", "create_server", "web-01")
+    ]
+    assert sorted(clouds["dst"].servers) == ["dst-new-1"]
+
+
+async def test_handover_resume_creates_the_server_again_when_the_one_sent_is_gone(tmp_path):
+    """A server Nova accepted but lost (deleted while nobody waited) is created again."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["dst"].compute.delete_server("dst-new-1")
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-2"
+    assert sorted(clouds["dst"].servers) == ["dst-new-2"]
+
+
+async def test_handover_rollback_after_a_crash_while_creating_deletes_that_server(tmp_path):
+    """The destination server a crashed create left is known to the journal: the rollback deletes
+    it before it unmanages the volumes it holds (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls)[0] == ("dst", "delete_server", "dst-new-1")
+    assert clouds["dst"].servers == {}
+    assert ("dst", "unmanage", "dst-vol-1") in ops(calls)
+    assert result.details["source_running"] is True
+
+
+async def test_handover_rollback_resume_after_a_crash_while_recreating_the_source_waits_for_it(
+    tmp_path,
+):
+    """The rollback crashed while Nova built the recreated source server: its resume waits for
+    that server instead of creating a second one (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="recreate the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-1"
+    assert [op for op in ops(calls) if op[1] == "create_server"] == [
+        ("src", "create_server", "web-01")
+    ]
+    assert sorted(clouds["src"].servers) == ["src-new-1"]
 
 
 async def test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume(tmp_path):
