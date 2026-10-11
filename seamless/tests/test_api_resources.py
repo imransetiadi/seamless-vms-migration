@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import time
 
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
 from seamless_migrate.domain.models import Estimate, Migration, Plan, Provider, SyncPass, utcnow
-from seamless_migrate.store import Store
+from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
 from tests.orch_support import build_harness, make_settings
@@ -270,6 +271,40 @@ def test_plans_carry_their_derived_status_and_finalize_reminder(api):
         json={"derived_status": "finalized"},
     )
     assert patched.status_code == 422
+
+
+def test_plan_routes_derive_the_status_without_loading_migrations(api, monkeypatch):
+    """SDD §8.1, §11: GET /plans and /plans/{id} take the phases from Store.plan_phases."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "phases",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    assert api.post(f"/api/v1/plans/{plan_id}/validate", Role.operator).status_code == 200
+    [m] = [x for x in api.store.list("migration", Migration) if x.plan_id == plan_id]
+    api.store.put("migration", m.model_copy(update={"phase": Phase.completed}))
+
+    # what the plan routes list (the orchestrator's tick, in the same app, lists migrations too)
+    listed_kinds: list[str] = []
+    real_list = AsyncStore.list
+
+    async def counting_list(self, kind, *args, **kwargs):
+        if any(f.filename.endswith("routes_plans.py") for f in inspect.stack(0)):
+            listed_kinds.append(kind)
+        return await real_list(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncStore, "list", counting_list)
+    one = api.get(f"/api/v1/plans/{plan_id}", Role.viewer).json()
+    many = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert one["derived_status"] == many[plan_id]["derived_status"] == "completed"
+    assert "migration" not in listed_kinds
 
 
 def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):

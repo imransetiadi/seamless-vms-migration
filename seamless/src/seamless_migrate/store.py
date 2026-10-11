@@ -21,6 +21,7 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
+from .domain.enums import Phase
 from .domain.models import Event
 
 log = logging.getLogger(__name__)
@@ -305,6 +306,26 @@ class Store:
             out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
         return out
 
+    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+        """Each plan's distinct migration phases (SDD §8.1, §11): one ``SELECT DISTINCT`` over the
+        indexed ``plan_id`` and ``phase`` expressions; no document is loaded or validated. A plan
+        without migrations is absent from the result."""
+        wanted = list(plan_ids)
+        if not wanted:
+            return {}
+        plan_col = documents.c.data["plan_id"].as_string()
+        phase_col = documents.c.data["phase"].as_string()
+        query = (
+            sa.select(plan_col, phase_col)
+            .distinct()
+            .where(documents.c.kind == "migration", plan_col.in_(wanted))
+        )
+        out: dict[str, set[Phase]] = {}
+        with self.engine.connect() as conn:
+            for plan_id, phase in conn.execute(query):
+                out.setdefault(plan_id, set()).add(Phase(phase))
+        return out
+
     def delete(self, kind: str, id_: str) -> None:
         with self.engine.begin() as conn:
             result = conn.execute(
@@ -418,6 +439,9 @@ class AsyncStore:
         return await asyncio.to_thread(
             lambda: self.sync.list(kind, model_cls, limit=limit, offset=offset, **filters)
         )
+
+    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+        return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
 
     async def delete(self, kind: str, id_: str) -> None:
         await asyncio.to_thread(self.sync.delete, kind, id_)

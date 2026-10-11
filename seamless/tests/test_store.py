@@ -55,6 +55,22 @@ def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     assert any_store.change_stamp("plan") == (0, 0)  # per kind
 
 
+def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
+    """SDD §8.1, §11: the set of each plan's phases, in one query, without loading a document."""
+    for plan_id, phase in (
+        ("plan-a", Phase.ready),
+        ("plan-a", Phase.blocked),
+        ("plan-a", Phase.ready),
+        ("plan-b", Phase.completed),
+        ("plan-c", Phase.syncing),
+    ):
+        any_store.put("migration", make_migration(plan_id=plan_id, phase=phase))
+    got = any_store.plan_phases(["plan-a", "plan-b", "plan-x"])
+    assert got == {"plan-a": {Phase.ready, Phase.blocked}, "plan-b": {Phase.completed}}
+    assert all(isinstance(p, Phase) for phases in got.values() for p in phases)
+    assert any_store.plan_phases([]) == {}
+
+
 def test_list_filters(any_store: Store):
     a = make_migration(plan_id="plan-a", phase=Phase.ready, wave_id="wave-1")
     b = make_migration(plan_id="plan-a", phase=Phase.blocked, wave_id="wave-2")

@@ -20,7 +20,7 @@ from ..domain.models import (
 from ..events import emit
 from ..orchestrator import in_flight_refusal
 from ..plan_checks import PlanSpecError, check_plan_spec
-from ..plan_status import derive_plan_status
+from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
 from .deps import ApiError, _audit_denied, require_role, services
@@ -85,14 +85,16 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
 
 
 async def _out(request: Request, plans: list[Plan]) -> list[PlanOut]:
-    """The plans with their derived status (SDD §8.1), from one read of their migrations."""
+    """The plans with their derived status (SDD §8.1), from one query for their phases (§11)."""
     if not plans:
         return []
-    migrations = await services(request).db.list(
-        "migration", Migration, plan_id=[p.id for p in plans]
-    )
+    phases = await services(request).db.plan_phases([p.id for p in plans])
     return [
-        PlanOut(**p.model_dump(), derived_status=derive_plan_status(p, migrations)) for p in plans
+        PlanOut(
+            **p.model_dump(),
+            derived_status=derive_plan_status_from_phases(p, phases.get(p.id, set())),
+        )
+        for p in plans
     ]
 
 
