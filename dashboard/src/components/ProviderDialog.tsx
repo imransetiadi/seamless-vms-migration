@@ -547,7 +547,21 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               <ul className="mt-1 list-disc pl-6 text-foreground">
                 {errorEntries.map(([key, message]) => (
                   <li key={key}>
-                    <a href={`#${id(key)}`} className="inline-block py-1 underline underline-offset-2">
+                    <a
+                      href={`#${id(key)}`}
+                      className="inline-block py-1 underline underline-offset-2"
+                      onClick={(e) => {
+                        // to the field itself, as in the plan and policy dialogs; a field of the closed host section opens it first
+                        e.preventDefault();
+                        const field = document.getElementById(id(key));
+                        if (field) {
+                          field.focus();
+                          return;
+                        }
+                        setHostOpen(true);
+                        requestAnimationFrame(() => document.getElementById(id(key))?.focus());
+                      }}
+                    >
                       {message}
                     </a>
                   </li>

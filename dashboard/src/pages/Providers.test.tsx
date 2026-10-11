@@ -150,6 +150,9 @@ describe('Providers page', () => {
       expect(summary).toHaveTextContent(text);
     }
     await waitFor(() => expect(summary).toHaveFocus());
+    // each line takes the operator to its field, as in the plan and policy dialogs
+    await user.click(within(summary).getByRole('link', { name: /full url/i }));
+    expect(within(dialog).getByLabelText(/keystone url/i)).toHaveFocus();
   });
 
   it('connects a Kolla-Ansible source: the preset fills the form, credentials stay write-only', async () => {
@@ -207,6 +210,21 @@ describe('Providers page', () => {
     expect(created?.conversion_host).toMatchObject({ manage: false, address: '198.51.100.77', ssh_key_secret: 'provider-vcenter-dc3-ssh' });
     expect(created?.conversion_key_updated_at).not.toBeNull();
     expect(await screen.findByRole('status')).toHaveTextContent(/vcenter dc3 added/i);
+  });
+
+  it('opens the closed conversion-host section when a summary line leads to one of its fields', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    const summary = await within(dialog).findByRole('alert');
+    // the save opened the section for its errors; close it again
+    await user.click(within(dialog).getByRole('button', { name: /existing host/i }));
+    expect(within(dialog).queryByLabelText(/^address/i)).not.toBeInTheDocument();
+    await user.click(within(summary).getByRole('link', { name: /ssh private key/i }));
+    await waitFor(() => expect(dialog.querySelector('#provider-dialog-privateKey')).toHaveFocus());
+    expect(within(dialog).getByLabelText(/^address/i)).toBeInTheDocument();
   });
 
   it('connects vCenter with secrets managed outside Seamless: it names them and writes none (SDD §13.3, §16)', async () => {
