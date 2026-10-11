@@ -160,7 +160,8 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 * Source/destination OpenStack APIs reachable from the control plane; conversion hosts reachable
   over SSH from the control plane and from each other (dst → src).
 * Tenant credentials (or admin with role assignment) on both clouds; admin required for storage
-  handover and some pre-staging resources.
+  handover and some pre-staging resources, and at RHOSO for a VM whose NIC goes to another project's
+  shared or external network (Neutron's port policy, SDD §6.6).
 * VMware: VDDK available on the RHOSO conversion host; CBT enabled for warm.
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
