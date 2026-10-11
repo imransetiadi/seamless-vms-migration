@@ -1316,7 +1316,9 @@ pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kin
 other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
 aggregate over the kind; moves on every insert, update or delete — `GET /stats`, `GET /metrics`,
 `GET /advisor/recommendations` and the orchestrator's tick (§8) keep their document lists while it holds, and when it
-moved reload only the documents that changed), `versions(kind) -> [(id, version)]` (in creation order, no document read),
+moved reload only the documents that changed — sound because those kinds are never deleted: a delete, an insert and an
+update between two reads could leave count and sum as they were; a route that deletes them must first give the stamp
+a value that only grows), `versions(kind) -> [(id, version)]` (in creation order, no document read),
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
 `SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` from it, §8.1), `delete(kind, id)`,
