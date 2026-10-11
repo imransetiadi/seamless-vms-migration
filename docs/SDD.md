@@ -867,7 +867,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     the networks the credential sees (a shared provider network that another project owns works).
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A name that does not resolve stops the cutover there, before the
-  source stops: a permanent failure naming the port.
+  source stops: a permanent failure naming the port. When the destination's networks cannot be read, the run logs
+  it and keeps the references as exported; the destination check (§6.6) still looks them up before the source
+  stops.
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
