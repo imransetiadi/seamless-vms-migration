@@ -1,5 +1,5 @@
 import { Activity, CircleCheck, CircleMinus, CircleX, Pencil } from 'lucide-react';
-import { useId, useState, type FormEvent } from 'react';
+import { useId, useRef, useState, type FormEvent } from 'react';
 import { useMigrations, usePatchPlan } from '../api/hooks';
 import type { Migration, Plan, Role, VerificationCheck } from '../api/types';
 import { cn } from '../lib/cn';
@@ -21,13 +21,18 @@ function VmProbes({ m, plan, edit, onSaved }: { m: Migration; plan: Plan; edit: 
   const [drafts, setDrafts] = useState<ProbeDraft[] | null>(null);
   const [tried, setTried] = useState(false);
   const [suggesting, setSuggesting] = useState(false);
+  const editRef = useRef<HTMLButtonElement>(null);
+  // read by the suggestion's dialog as it closes: empty on Cancel, Edit probes once the suggestion was used and went
+  // with its button (SDD §16)
+  const afterSuggestionRef = useRef<HTMLElement | null>(null);
   const { probes, source } = probesFor(m.vm.source_id, plan);
   const parsed = drafts ? parseDrafts(drafts) : null;
-  const save = (next: Parameters<typeof withVmProbes>[2], said: string) =>
+  const save = (next: Parameters<typeof withVmProbes>[2], said: string, after?: () => void) =>
     patch.mutate(
       { probe_overrides: withVmProbes(plan, m.vm.source_id, next) },
       {
         onSuccess: () => {
+          after?.();
           setDrafts(null);
           setSuggesting(false);
           onSaved(`${said} The plan is a draft again: validate it before starting.`);
@@ -52,14 +57,23 @@ function VmProbes({ m, plan, edit, onSaved }: { m: Migration; plan: Plan; edit: 
         <p className="min-w-0 text-sm text-foreground">
           {probes.length ? `${label}: ${describeProbes(probes)}` : source === 'override' ? "No application probe: this VM's own list is empty." : 'No application probe: verification checks the boot only.'}
         </p>
-        <Button size="sm" icon={Pencil} disabledReason={edit.reason} onClick={open}>
+        <Button ref={editRef} size="sm" icon={Pencil} disabledReason={edit.reason} onClick={open}>
           Edit probes
         </Button>
       </div>
       {probes.length === 0 && m.suggested_probes.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-dashed border-border px-3 py-2 text-sm">
           <span className="text-muted-foreground">Suggested: {describeProbes(m.suggested_probes)}</span>
-          <Button size="sm" icon={Activity} disabledReason={edit.reason} onClick={() => (patch.reset(), setSuggesting(true))}>
+          <Button
+            size="sm"
+            icon={Activity}
+            disabledReason={edit.reason}
+            onClick={() => {
+              patch.reset();
+              afterSuggestionRef.current = null;
+              setSuggesting(true);
+            }}
+          >
             Use suggested probe
           </Button>
         </div>
@@ -71,7 +85,12 @@ function VmProbes({ m, plan, edit, onSaved }: { m: Migration; plan: Plan; edit: 
         confirmLabel="Use suggested probe"
         pending={patch.isPending}
         error={suggesting ? patch.error : null}
-        onConfirm={() => save(m.suggested_probes, `${m.vm.name} is probed on ${describeProbes(m.suggested_probes)}.`)}
+        returnFocusRef={afterSuggestionRef}
+        onConfirm={() =>
+          save(m.suggested_probes, `${m.vm.name} is probed on ${describeProbes(m.suggested_probes)}.`, () => {
+            afterSuggestionRef.current = editRef.current;
+          })
+        }
         onCancel={() => setSuggesting(false)}
       />
       <Modal open={drafts !== null} onClose={() => setDrafts(null)} labelledBy={titleId} dismissible={!patch.isPending}>

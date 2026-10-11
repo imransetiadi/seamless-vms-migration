@@ -563,6 +563,36 @@ describe('MigrationDetail', () => {
     expect(plan.probe_overrides).toEqual(before);
   });
 
+  it('moves focus to Edit probes when Use suggested probe takes its suggestion away (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-node-1')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.verification = { ...plan.verification, app_probes: [] };
+    m.suggested_probes = [{ kind: 'tcp', port: 5432, path: '/', expect_status: null }];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Verification' });
+    const use = await within(panel).findByRole('button', { name: 'Use suggested probe' });
+    await user.click(use);
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Probe analytics-node-1 on TCP 5432?' })).getByRole('button', { name: 'Cancel' }));
+    expect(use).toHaveFocus();
+    await user.click(use);
+    const dialog = await screen.findByRole('alertdialog', { name: 'Probe analytics-node-1 on TCP 5432?' });
+    await user.click(within(dialog).getByRole('button', { name: 'Use suggested probe' }));
+    await waitFor(() => expect(plan.probe_overrides[m.vm.source_id]).toEqual(m.suggested_probes));
+    await waitFor(() => expect(use).not.toBeInTheDocument());
+    const edit = within(panel).getByRole('button', { name: 'Edit probes' });
+    expect(edit).toHaveFocus();
+
+    // back to the plan's (none): the suggestion returns, and a Cancel keeps focus on its button
+    await user.click(edit);
+    await user.click(within(await screen.findByRole('dialog', { name: 'Application probes of analytics-node-1' })).getByRole('button', { name: "Use the plan's probes" }));
+    const again = await within(panel).findByRole('button', { name: 'Use suggested probe' });
+    await user.click(again);
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Probe analytics-node-1 on TCP 5432?' })).getByRole('button', { name: 'Cancel' }));
+    expect(again).toHaveFocus();
+  });
+
   it('keeps Edit probes from a viewer, saying which role it needs', async () => {
     renderMigration('mig-5d7e2b4a11');
     const panel = await screen.findByRole('region', { name: 'Verification' });
