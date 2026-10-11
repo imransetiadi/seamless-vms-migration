@@ -31,7 +31,10 @@ export async function exportEventTrail(api: ApiClient, { planId, pageSize = PAGE
   }
 }
 
-/** JSON lines, one event per line: the format of `seamless events export`. */
-export function toJsonLines(events: Event[]): string {
-  return events.map((event) => `${JSON.stringify(event)}\n`).join('');
+/**
+ * JSON lines, one event per line — the format of `seamless events export` — as one part per event for a Blob: a
+ * trail of millions of events is longer than one string may be.
+ */
+export function jsonLineParts(events: Event[]): string[] {
+  return events.map((event) => `${JSON.stringify(event)}\n`);
 }

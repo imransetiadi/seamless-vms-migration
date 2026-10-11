@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createTestClient, createTestServer } from '../test/utils';
-import { exportEventTrail, toJsonLines } from './eventExport';
+import { exportEventTrail, jsonLineParts } from './eventExport';
 
 describe('exportEventTrail (SDD §16: the whole audit trail, like `seamless events export`)', () => {
   it('reads every persisted event page by page, in seq order', async () => {
@@ -33,9 +33,10 @@ describe('exportEventTrail (SDD §16: the whole audit trail, like `seamless even
     await expect(run).rejects.toThrow();
   });
 
-  it('writes JSON lines, one event per line, like the command', () => {
+  it('writes JSON lines, one event per line, like the command, as one part per event', () => {
     const server = createTestServer();
     const [a, b] = server.events;
-    expect(toJsonLines([a!, b!])).toBe(`${JSON.stringify(a)}\n${JSON.stringify(b)}\n`);
+    // parts, never one string: a trail of millions of events is longer than a string may be (security re-audit)
+    expect(jsonLineParts([a!, b!])).toEqual([`${JSON.stringify(a)}\n`, `${JSON.stringify(b)}\n`]);
   });
 });

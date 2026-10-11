@@ -306,6 +306,17 @@ describe('Events page', () => {
   it('exports the whole trail, every persisted event and not only the shown ones, like `seamless events export` (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const blobs: Blob[] = [];
+    const parts: number[] = [];
+    const RealBlob = globalThis.Blob;
+    vi.stubGlobal(
+      'Blob',
+      class extends RealBlob {
+        constructor(content?: BlobPart[], options?: BlobPropertyBag) {
+          super(content, options);
+          parts.push(content?.length ?? 0);
+        }
+      },
+    );
     const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
       blobs.push(b as Blob);
       return 'blob:events';
@@ -335,7 +346,10 @@ describe('Events page', () => {
       const seqs = text.trim().split('\n').map((l) => (JSON.parse(l) as { seq: number }).seq);
       expect(seqs).toEqual(persisted.map((e) => e.seq));
       expect(blobs[0]!.type).toBe('application/x-ndjson');
+      // built from one part per event, never one string: millions of events exceed a string's maximum length
+      expect(parts.at(-1)).toBe(persisted.length);
     } finally {
+      vi.unstubAllGlobals();
       create.mockRestore();
       revoke.mockRestore();
       click.mockRestore();

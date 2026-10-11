@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { exportEventTrail, toJsonLines } from '../api/eventExport';
+import { exportEventTrail, jsonLineParts } from '../api/eventExport';
 import { useApi, useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
@@ -147,8 +147,8 @@ const EventRow = memo(function EventRow({ event, planName }: { event: Event; pla
 });
 
 /** Saves JSON lines as a file, the format of `seamless events export`. */
-function saveJsonLines(text: string, name: string): void {
-  const blob = new Blob([text], { type: 'application/x-ndjson' });
+function saveJsonLines(lines: string[], name: string): void {
+  const blob = new Blob(lines, { type: 'application/x-ndjson' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -244,7 +244,7 @@ export default function Events() {
   /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
     const events = shownAudit.map(({ event }) => event).sort((a, b) => a.seq - b.seq);
-    saveJsonLines(toJsonLines(events), `seamless-events-${stamp()}.jsonl`);
+    saveJsonLines(jsonLineParts(events), `seamless-events-${stamp()}.jsonl`);
   };
 
   // the whole trail (SDD §16): every persisted event, the chosen plan's when one is, paged like
@@ -266,7 +266,7 @@ export default function Events() {
     setExportError(null);
     try {
       const events = await exportEventTrail(api, { planId: planId || undefined, signal: run.signal, onProgress: setExported });
-      saveJsonLines(toJsonLines(events), `seamless-events-${planId ? `${planId}-` : ''}all-${stamp()}.jsonl`);
+      saveJsonLines(jsonLineParts(events), `seamless-events-${planId ? `${planId}-` : ''}all-${stamp()}.jsonl`);
       setAnnouncement(`Exported ${events.length} events.`);
     } catch (error) {
       if (run.signal.aborted) setAnnouncement('Export stopped: nothing was saved.');
