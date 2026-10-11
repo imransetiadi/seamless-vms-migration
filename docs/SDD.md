@@ -1872,7 +1872,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   for progress, for the outcome of an action (a plan started, resumed, paused, saved or validated — with
   the report's counts — or its waves planned; a migration's action or strategy change) and for what a list's
   filters show ("Showing 3 of 12 plans", also when none match; on Events only that none match, as its count moves
-  with every live event), announced from a live
+  with every live event) and for the live event stream once it has been live — lost (reconnecting), back, stopped or
+  signed out, said once for the page, not by each Live indicator, and not its first connection —, announced from a live
   region already on the page (a region inserted together with its text is not reliably read),
   a form error announced when it appears (not only shown next to its field), focus that never drops to the
   page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
