@@ -576,6 +576,7 @@ describe('Plans page', () => {
     expect(keep).not.toBeChecked();
     expect(keep).toHaveAccessibleDescription(/through neutron with its mac address, all its fixed ips and its security groups/i);
     expect(keep).toHaveAccessibleDescription(/outlive their server/i);
+    expect(keep).toHaveAccessibleDescription(/cold, warm and storage handover/i);
     await user.click(keep);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 

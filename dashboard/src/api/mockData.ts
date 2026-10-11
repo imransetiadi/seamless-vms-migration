@@ -753,8 +753,9 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    // through Nova the destination keeps one address per port; through Neutron every one (SDD §7.3 step 8)
     const several = vm.nics.filter((n) => n.fixed_ips.length > 1);
-    if (several.length) handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
+    if (several.length && plan.port_creation_mode !== 'neutron') handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
     if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
     handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');

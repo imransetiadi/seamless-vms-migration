@@ -79,13 +79,14 @@ describe('mock eligibility and preflight follow port_creation_mode (SDD §9.2/§
   const neutron = { ...base, port_creation_mode: 'neutron' as const };
   const disks = [{ size_gb: 20 }];
 
-  it('keeps cold and warm for any number of fixed IPs through Neutron; the handover keeps one address', () => {
+  it('keeps every strategy for any number of fixed IPs through Neutron (SDD §7.3 step 8)', () => {
     expect(base.port_creation_mode).toBe('nova');
     const dual = makeVm({ id: 'os-q1', name: 'dual-02', disks, nics: [{ network: 'app-net', fixed_ips: ['10.0.0.5', 'fd00::5'] }] });
     const reasons = eligibility(dual, 'openstack', neutron, source, destination, []);
     expect(reasons.cold).toEqual([]);
     expect(reasons.warm).toEqual([]);
-    expect(reasons.storage_handover?.some((r) => r.includes('app-net (10.0.0.5, fd00::5)'))).toBe(true);
+    expect(reasons.storage_handover).toEqual([]);
+    expect(eligibility(dual, 'openstack', base, source, destination, []).storage_handover?.some((r) => r.includes('app-net (10.0.0.5, fd00::5)'))).toBe(true);
     expect(preflight(dual, 'openstack', neutron, { 'app-net': 1450 }, [dual.name]).some((f) => f.code === 'NET_PORT_IPS')).toBe(false);
     const nova = preflight(dual, 'openstack', base, { 'app-net': 1450 }, [dual.name]).find((f) => f.code === 'NET_PORT_IPS');
     expect(nova?.remediation).toMatch(/keep mac addresses and every fixed ip/i);

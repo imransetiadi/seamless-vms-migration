@@ -46,7 +46,9 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
       'NET_PORT_IPS',
       'Port IPs',
       'warning',
-      `Cold and warm recreate ${describePorts(oddPorts)} only with the plan option "Keep MAC addresses and every fixed IP"; storage handover keeps one address per port.`,
+      oddPorts.length === 1
+        ? `Port ${describePorts(oddPorts)} keeps every address only with the plan option "Keep MAC addresses and every fixed IP": without it, cold and warm cannot recreate it and storage handover keeps one of its addresses.`
+        : `Ports ${describePorts(oddPorts)} keep every address only with the plan option "Keep MAC addresses and every fixed IP": without it, cold and warm cannot recreate them and storage handover keeps one address per port.`,
     );
   }
   if (kind === 'vmware') {

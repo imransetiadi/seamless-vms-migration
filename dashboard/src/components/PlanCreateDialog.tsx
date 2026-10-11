@@ -1035,7 +1035,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   <p id={id('ports-note')} className="pl-7 text-xs text-muted-foreground">
                     {source?.kind === 'vmware'
                       ? 'VMware sources ignore this: the migration kit recreates the NICs.'
-                      : 'Off by default. Cold and warm migrations recreate each port through Neutron with its MAC address, all its fixed IPs and its security groups, instead of one fixed IP and a new MAC. The ports then outlive their server: delete them with it.'}
+                      : 'Off by default. Cold, warm and storage handover migrations recreate each port through Neutron with its MAC address, all its fixed IPs and its security groups, instead of one fixed IP and a new MAC. The ports then outlive their server: delete them with it.'}
                   </p>
                 </div>
               </Fieldset>
