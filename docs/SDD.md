@@ -1868,7 +1868,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   header and the sign-in page; `public/favicon.svg` draws the same mark and `public/apple-touch-icon.png` is it
   at 180 px on a full-bleed tile. Each instance names its own tile gradient: the sidebar and the mobile header
   are both in the page, one of them hidden, and a gradient defined inside a hidden element does not paint.
-* Accessibility: WCAG 2.2 AA contrast, visible focus rings, keyboard reachable actions, `aria-live`
+* Accessibility: WCAG 2.2 AA contrast — figures shown while newer ones load too: the Overview greys them to the muted
+  foreground and marks them `aria-busy`, never fades them with opacity —, visible focus rings, keyboard reachable
+  actions, `aria-live`
   for progress, for the outcome of an action (a plan started, resumed, paused, saved or validated — with
   the report's counts — or its waves planned; a migration's action or strategy change) and for what a list's
   filters show ("Showing 3 of 12 plans", also when none match; on Events only that none match, as its count moves
