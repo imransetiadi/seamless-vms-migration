@@ -1,3 +1,4 @@
+import ast
 import copy
 import logging
 import os
@@ -24,6 +25,7 @@ from seamless_migrate.executors.ansible import (
     build_vars,
     classify_failure,
     effective_mappings,
+    workload_file_stem,
     workload_filter,
 )
 from seamless_migrate.executors.ansible import _inventory as build_inventory_doc
@@ -545,6 +547,37 @@ async def test_progress_tail_reports_pct(env, monkeypatch):
     pcts = [p[0] for p in rec.progress]
     assert 75.0 in pcts, pcts  # mean of {"/dev/vda": 50, "/dev/vdb": 100}
     assert any(line.startswith("TASK [") for line in rec.logs)
+
+
+async def test_progress_tail_reads_the_state_file_named_by_the_escaped_stem(env, monkeypatch):
+    """SDD §7.2: the progress file of a VM whose name holds a / is workload_logs/{stem}.state,
+    as import_workload_prelim names it — never a path the tenant's name chose."""
+    name = "../x/web%01"
+    monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.5")
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", name)
+    ctx, rec = ctx_for(env, strategy=Strategy.cold, name=name)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert 75.0 in [p[0] for p in rec.progress]
+    osm = run_dir(env) / "osm"
+    assert (osm / "workload_logs" / "..%2Fx%2Fweb%2501.state").exists()
+    assert not (osm / "x").exists()
+
+
+def test_workload_file_stem_matches_the_collection():
+    """SDD §7.2: the executor reads the file import_workload_prelim writes, so both apply the
+    collection's rule (plugins/module_utils/filesystem.py, loaded without its imports)."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/filesystem.py"
+    ).read_text()
+    tree = ast.parse(source)
+    func = next(n for n in tree.body if getattr(n, "name", None) == "workload_file_stem")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), "filesystem.py", "exec"), namespace)
+    names = ["web-01", "web 01", "../../x", "/etc/shadow", "50%/x", "a\0b", "a%2Fb", "%%//"]
+    assert [workload_file_stem(n) for n in names] == [
+        namespace["workload_file_stem"](n) for n in names
+    ]
+    assert all("/" not in workload_file_stem(n) for n in names)
 
 
 def test_transient_vs_permanent_failure_classifier():

@@ -115,7 +115,9 @@ SCRIPT = textwrap.dedent(
                 "import_workloads_cutover.yml"):
         logs = osm / "workload_logs"
         logs.mkdir(exist_ok=True)
-        (logs / (name + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
+        # named as import_workload_prelim names it (SDD §7.2)
+        stem = name.replace("%", "%25").replace("/", "%2F").replace("\\0", "%00")
+        (logs / (stem + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
         time.sleep(float(os.environ.get("ANSIBLE_FAKE_SLEEP", "0.3")))
 
     if base in ("import_workloads_precopy.yml", "import_workloads_cutover.yml"):

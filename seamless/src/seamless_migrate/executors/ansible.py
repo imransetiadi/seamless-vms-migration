@@ -375,6 +375,12 @@ def build_secret_vars(
         raise PermanentStepError(f"credentials unavailable: {exc}") from None
 
 
+def workload_file_stem(name: str) -> str:
+    """The stem of a VM's progress and log files, as ``import_workload_prelim`` names them
+    (SDD §7.2): ``%`` -> ``%25``, ``/`` -> ``%2F``, NUL -> ``%00``, nothing else changes."""
+    return name.replace("%", "%25").replace("/", "%2F").replace("\0", "%00")
+
+
 def _read_progress(path: Path) -> float | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -904,7 +910,7 @@ class AnsibleExecutor:
     async def _tail(self, ctx: StepContext | None, osm: Path) -> None:
         if ctx is None:
             return
-        state_file = osm / "workload_logs" / f"{ctx.migration.vm.name}.state"
+        state_file = osm / "workload_logs" / f"{workload_file_stem(ctx.migration.vm.name)}.state"
         total = ctx.migration.bytes_total or ctx.migration.vm.used_bytes
         last: float | None = None
         while True:
