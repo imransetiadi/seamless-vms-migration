@@ -991,19 +991,21 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     />
                   ))}
                 </div>
-                {OPTIONAL_PRESTAGE.map((resource) => (
-                  <Checkbox
-                    key={resource}
-                    label={PRESTAGE_LABEL[resource] ?? resource}
-                    checked={form.prestage.includes(resource)}
-                    disabled={source?.kind === 'vmware'}
-                    describedBy={id('prestage-flavors-note')}
-                    onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
-                  />
-                ))}
-                <p id={id('prestage-flavors-note')} className="-mt-1 text-xs text-muted-foreground">
-                  Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.
-                </p>
+                <div>
+                  {OPTIONAL_PRESTAGE.map((resource) => (
+                    <Checkbox
+                      key={resource}
+                      label={PRESTAGE_LABEL[resource] ?? resource}
+                      checked={form.prestage.includes(resource)}
+                      disabled={source?.kind === 'vmware'}
+                      describedBy={id('prestage-flavors-note')}
+                      onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
+                    />
+                  ))}
+                  <p id={id('prestage-flavors-note')} className="pl-7 text-xs text-muted-foreground">
+                    Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.
+                  </p>
+                </div>
                 {plan && plan.prestage_resources.some((r) => !isOfferedPrestage(r)) && (
                   <p className="text-xs text-muted-foreground">
                     Also pre-staged: {plan.prestage_resources.filter((r) => !isOfferedPrestage(r)).join(', ')} (set through the API; kept).
