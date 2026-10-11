@@ -2049,7 +2049,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   live updates stops everything that updates on its own — the list and that count — until Resume live updates, so only
   pausing and resuming are announced, the resume with the number of held events it adds: WCAG 2.2.2, 4.1.3),
   `/advisor` (Jev/agentmemory status,
-  the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence" and "Decision:
+  the recommendations feed — filtered by plan and by decision type, both kept in the address (`?plan=`, `?type=`) and
+  sent as `GET /advisor/recommendations?plan_id=&decision_type=`, a change going back to its first page; each entry
+  shows "Recommended: <option> · <confidence>% confidence" and "Decision:
   <final option> — <why>" (applied automatically by policy <policy>; below threshold, default kept; advisor
   unavailable, decided by rules; no usable recommendation, decided by rules; …), never the word "Selected". A
   decision taken against the threshold ends its why with that comparison — "below threshold (57% < 60%), default
