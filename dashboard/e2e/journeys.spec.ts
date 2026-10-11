@@ -208,3 +208,67 @@ test('on a phone the demo power note sits under its button, not squeezed beside 
   expect(n!.width).toBeGreaterThan(200);
   expect(n!.y).toBeGreaterThanOrEqual(b!.y + b!.height);
 });
+
+// The control with the focus, unless another element covers its centre (WCAG 2.4.11 Focus Not Obscured).
+async function coveredFocus(page: Page): Promise<string | null> {
+  return page.evaluate(() => {
+    const focused = document.activeElement as HTMLElement | null;
+    if (!focused || focused === document.body) return null;
+    const box = focused.getBoundingClientRect();
+    const top = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    if (!top || top === focused || focused.contains(top) || top.contains(focused)) return null;
+    return (focused.getAttribute('aria-label') || focused.id || focused.textContent || focused.tagName).trim().slice(0, 60);
+  });
+}
+
+// How far the dialog's panel scrolls past its content: a body that scrolls on its own leaves it nothing to scroll.
+async function panelOverflow(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const panel = document.querySelector('[role="dialog"]');
+    return panel ? panel.scrollHeight - panel.clientHeight : -1;
+  });
+}
+
+async function tabCovered(page: Page, stops: number): Promise<string[]> {
+  const covered: string[] = [];
+  for (let i = 0; i < stops; i += 1) {
+    await page.keyboard.press('Tab');
+    const hit = await coveredFocus(page);
+    if (hit) covered.push(hit);
+  }
+  return covered;
+}
+
+for (const [width, height] of [
+  [1280, 800],
+  [375, 700],
+] as const) {
+  test(`at ${width}×${height} the plan, policy and provider dialogs keep the focused control clear of their actions (WCAG 2.4.11, SDD §16)`, async ({ page }) => {
+    await page.setViewportSize({ width, height });
+    await signIn(page, 'admin');
+    await page.goto('/plans');
+    await page.getByRole('button', { name: 'New plan' }).click();
+    const plan = page.getByRole('dialog', { name: 'New migration plan' });
+    await plan.getByLabel(/source provider/i).selectOption('rhosp17-dc1');
+    await expect(plan.getByRole('table', { name: /^VMs on/ })).toBeVisible();
+    await plan.getByLabel(/^name/i).focus();
+    expect(await tabCovered(page, 60)).toEqual([]);
+    expect(await panelOverflow(page)).toBeLessThanOrEqual(1);
+    await page.keyboard.press('Escape');
+
+    await page.goto('/advisor/policies');
+    await page.getByRole('button', { name: 'New policy' }).click();
+    const policy = page.getByRole('dialog', { name: 'New policy' });
+    await policy.getByLabel(/^name/i).focus();
+    expect(await tabCovered(page, 30)).toEqual([]);
+    expect(await panelOverflow(page)).toBeLessThanOrEqual(1);
+    await page.keyboard.press('Escape');
+
+    await page.goto('/providers');
+    await page.getByRole('button', { name: /^add provider$/i }).first().click();
+    const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+    await provider.getByLabel(/^name/i).focus();
+    expect(await tabCovered(page, 30)).toEqual([]);
+    expect(await panelOverflow(page)).toBeLessThanOrEqual(1);
+  });
+}

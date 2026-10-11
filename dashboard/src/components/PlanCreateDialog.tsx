@@ -551,7 +551,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
-      <form onSubmit={submit} noValidate className="flex flex-col">
+      <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
             {plan ? 'Edit plan' : 'New migration plan'}
@@ -565,7 +565,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </p>
         </div>
 
-        <div className="flex flex-col gap-6 px-5 py-4">
+        {/* the body scrolls between the title and the actions: they never cover the focused control (SDD §16) */}
+        <div className="relative flex min-h-0 flex-col gap-6 overflow-y-auto px-5 py-4">
           {errorEntries.length > 0 && (
             <div ref={summaryRef} tabIndex={-1} role="alert" aria-labelledby={id('summary')} className="rounded-md border border-status-danger/40 bg-status-danger/10 p-3 outline-hidden">
               <p id={id('summary')} className="flex items-center gap-2 font-medium text-foreground">
@@ -1112,7 +1113,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} />}
         </div>
 
-        <div className="sticky bottom-0 flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
+        <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
           <Button size="lg" onClick={onClose} disabled={saving.isPending}>
             Cancel
           </Button>

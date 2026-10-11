@@ -493,7 +493,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           </p>
         </div>
 
-        <div className="flex min-h-0 flex-col gap-5 overflow-y-auto px-5 py-4">
+        <div className="relative flex min-h-0 flex-col gap-5 overflow-y-auto px-5 py-4">
           {errorEntries.length > 0 && (
             <div ref={summaryRef} tabIndex={-1} role="alert" className="rounded-md border border-status-danger/60 bg-status-danger/10 px-3 py-2 text-sm outline-none">
               <p className="flex items-center gap-1.5 font-medium text-foreground">

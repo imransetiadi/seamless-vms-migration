@@ -106,7 +106,9 @@ export function Modal({
         tabIndex={-1}
         onKeyDown={onKeyDown}
         className={cn(
-          'card animate-dialog-in relative max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto shadow-xl outline-hidden',
+          // a column: a form with min-h-0 shrinks to the panel and scrolls its own body between a header and its
+          // actions, which then never cover the focused control (WCAG 2.4.11, SDD §16); other content scrolls the panel
+          'card animate-dialog-in relative flex max-h-[calc(100dvh-1.5rem)] w-full flex-col overflow-y-auto shadow-xl outline-hidden',
           size === 'md' ? 'max-w-lg' : 'max-w-3xl',
         )}
       >
