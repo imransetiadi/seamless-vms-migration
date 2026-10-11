@@ -881,8 +881,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `_migration_params.nic_override: true`. A warm cutover exports the workload again first when the VM has an entry,
   or when its `workloads.yml` holds a port so marked (an entry removed since the export).
 * Network references: after the mappings and the NIC overrides, and again before each run on an existing export
-  (a warm cutover without a new export), the executor resolves the name of each server port's `network_ref` and
-  of each floating IP's `floating_network_ref`. It uses the rule of §7.3 step 0 against the destination's networks
+  that the run does not replace (a warm pre-copy, sync or cutover without a new export), the executor resolves the
+  name of each server port's `network_ref` and of each floating IP's `floating_network_ref`. It uses the rule of §7.3 step 0 against the destination's networks
   (`DestinationProvider.inventory().network_details`, read for that run):
   * the credential's own network keeps `%auth%` as the reference's project and domain;
   * another project's network that is the only one of its name gets neither, so os-migrate looks it up by name among
@@ -894,7 +894,19 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   network's subnets whatever their names. A name that does not resolve stops the cutover there, before the
   source stops: a permanent failure naming the port. When the destination's networks cannot be read, the run logs
   it and keeps the references as exported; the destination check (§6.6) still looks them up before the source
-  stops.
+  stops. A run that exports again — the cold cutover always, a warm run by the rules here — never resolves the
+  export it is about to replace: a name that no longer resolves there (a mapping fixed since) must not hold up
+  the new export, whose references are resolved after it.
+* Export record: once the rewrite after an export has finished, the executor records beside the export
+  (`osm/rewrite.json`) the mappings it applied — the plan's, overlaid with the migration's resolved mappings — and
+  the VM's `plan.nic_overrides` entries. It removes the record before each export, so an export whose rewrite did
+  not finish has none. A warm pre-copy, sync or cutover on an existing export exports the workload again first when
+  the record differs from what the plan holds now — a plan edited after a failed attempt (§12 `PATCH
+  /plans/{id}`), so that the retry uses the fixed mapping — or when the export has none (written before this rule,
+  or by a rewrite that failed). A warm cutover whose warm state records the destination server (a re-run that
+  finishes it, `import_workloads_cutover.yml`) runs on the export as it is: no rule here exports it again, and its
+  references are not resolved — the server and its ports exist, and the plan cannot change while the source is
+  stopped (§12).
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
@@ -916,7 +928,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 | Strategy | precopy / sync | cutover | rollback |
 |---|---|---|---|
 | `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` | `rollback_workloads.yml` |
-| `warm` | `export_workloads.yml` (first time) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml` | `rollback_workloads.yml` |
+| `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
 | `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
