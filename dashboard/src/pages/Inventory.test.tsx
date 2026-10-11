@@ -13,6 +13,33 @@ function NavigationType() {
 const REFUSED = { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
 
 describe('Inventory', () => {
+  it('keeps a failed inventory said, with Retry busy and focused, while it is read again (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    let hold: Promise<void> | null = null;
+    let release: () => void = () => {};
+    // the inventory read always fails (a 4xx, which the hook does not retry on its own); a hold keeps a retry running
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (!String(input).includes('/providers/rhosp17-dc1/inventory')) return fetchImpl(input, init);
+      if (hold) await hold;
+      return new Response(JSON.stringify(REFUSED.body), { status: REFUSED.status, headers: { 'Content-Type': 'application/json' } });
+    };
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1', path: '/inventory/:providerId', token: 'viewer', wrapFetch });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/cannot read the inventory/i);
+    hold = new Promise<void>((resolve) => (release = resolve));
+    const retry = within(alert).getByRole('button', { name: /retry/i });
+    await user.click(retry);
+    // read again: the failure stays said, Retry is busy and keeps the focus, no loading placeholder
+    await waitFor(() => expect(within(screen.getByRole('alert')).getByRole('button', { name: /retry/i })).toHaveAttribute('aria-busy', 'true'));
+    expect(screen.getByRole('alert')).toHaveTextContent(/cannot read the inventory/i);
+    expect(screen.queryByText(/reading inventory/i)).not.toBeInTheDocument();
+    expect(within(screen.getByRole('alert')).getByRole('button', { name: /retry/i })).toHaveFocus();
+    release();
+    // it failed again: Retry is ready for another try, still focused
+    await waitFor(() => expect(within(screen.getByRole('alert')).getByRole('button', { name: /retry/i })).not.toHaveAttribute('aria-busy'));
+    expect(within(screen.getByRole('alert')).getByRole('button', { name: /retry/i })).toHaveFocus();
+  });
+
   it('opens searching for the VM a link names by its source id (SDD §16, ADV-02)', async () => {
     renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1?vm=os-0a14', path: '/inventory/:providerId', token: 'viewer' });
     const search = await screen.findByLabelText('Search VMs');

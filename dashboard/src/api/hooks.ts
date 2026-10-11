@@ -4,13 +4,13 @@
 import {
   keepPreviousData,
   useMutation,
-  useQuery,
   useQueryClient,
   type QueryClient,
   type QueryKey,
 } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
+import { useApiQuery } from './stickyQuery';
 import type {
   AdvisorPolicy,
   AdvisorPolicySpec,
@@ -96,7 +96,7 @@ function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
 
 export function useMe() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.me,
     queryFn: ({ signal }) => api.get<Me>('/me', { signal }),
     retry: noRetryOnClientErrors,
@@ -106,7 +106,7 @@ export function useMe() {
 
 export function useHealth() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.health,
     queryFn: ({ signal }) => api.get<Health>('/health', { signal }),
     refetchInterval: 60_000,
@@ -122,7 +122,7 @@ export function useDemoSpeed(): number | null {
 
 export function useProviders() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.providers,
     queryFn: ({ signal }) => api.get<Provider[]>('/providers', { signal }),
     retry: noRetryOnClientErrors,
@@ -131,7 +131,7 @@ export function useProviders() {
 
 export function useInventory(providerId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.inventory(providerId ?? ''),
     queryFn: ({ signal }) => api.get<ProviderInventory>(`/providers/${enc(providerId ?? '')}/inventory`, { signal }),
     enabled: Boolean(providerId),
@@ -142,7 +142,7 @@ export function useInventory(providerId: string | undefined) {
 
 export function usePlans() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.plans,
     queryFn: ({ signal }) => api.get<Plan[]>('/plans', { signal }),
     retry: noRetryOnClientErrors,
@@ -151,7 +151,7 @@ export function usePlans() {
 
 export function usePlan(planId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.plan(planId ?? ''),
     queryFn: ({ signal }) => api.get<Plan>(`/plans/${enc(planId ?? '')}`, { signal }),
     enabled: Boolean(planId),
@@ -167,7 +167,7 @@ export interface ListOptions {
 
 export function useMigrations(query: MigrationListQuery = {}, options: ListOptions = {}) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.migrations(query),
     queryFn: ({ signal }) =>
       api.get<Migration[]>('/migrations', {
@@ -188,7 +188,7 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
 
 export function useMigration(migrationId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.migration(migrationId ?? ''),
     queryFn: ({ signal }) => api.get<Migration>(`/migrations/${enc(migrationId ?? '')}`, { signal }),
     enabled: Boolean(migrationId),
@@ -198,7 +198,7 @@ export function useMigration(migrationId: string | undefined) {
 
 export function useStats(planId?: string | null) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.stats(planId),
     queryFn: ({ signal }) => api.get<Stats>('/stats', { signal, query: { plan_id: planId ?? undefined } }),
     refetchInterval: 15_000,
@@ -209,7 +209,7 @@ export function useStats(planId?: string | null) {
 
 export function useAdvisorStatus() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.advisorStatus,
     queryFn: ({ signal }) => api.get<AdvisorStatus>('/advisor/status', { signal }),
     refetchInterval: 30_000,
@@ -220,7 +220,7 @@ export function useAdvisorStatus() {
 /** `GET /advisor/data-sent`: what each decision type sends to Jev (SDD §13.4, ADV-06). */
 export function useDataSent() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.dataSent,
     queryFn: ({ signal }) => api.get<DataSentList>('/advisor/data-sent', { signal }),
   });
@@ -229,7 +229,7 @@ export function useDataSent() {
 /** `GET /advisor/recommendations`: stored and legacy recommendations, newest first (SDD §12, §14.4). */
 export function useRecommendations(query: RecommendationListQuery = {}, options: ListOptions = {}) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.recommendations(query),
     queryFn: ({ signal }) =>
       api.get<RecommendationPage>('/advisor/recommendations', {
@@ -251,7 +251,7 @@ export function useRecommendations(query: RecommendationListQuery = {}, options:
 /** `GET /advisor/recommendations/{id}`: one recommendation, a legacy one too (SDD §12). */
 export function useRecommendation(recId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.recommendation(recId ?? ''),
     queryFn: ({ signal }) => api.get<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId ?? '')}`, { signal }),
     enabled: Boolean(recId),
@@ -262,7 +262,7 @@ export function useRecommendation(recId: string | undefined) {
 /** `GET /advisor/policies`: the stored policies and the built-in default (SDD §12, §14.6). */
 export function usePolicies() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.policies,
     queryFn: ({ signal }) => api.get<PolicyList>('/advisor/policies', { signal }),
     retry: noRetryOnClientErrors,
@@ -272,7 +272,7 @@ export function usePolicies() {
 /** `GET /advisor/snapshots/{sha256}`: a redacted advisor input; it never changes (SDD §14.5). */
 export function useSnapshot(sha256: string | null | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.snapshot(sha256 ?? ''),
     queryFn: ({ signal }) => api.get<AdvisorSnapshot>(`/advisor/snapshots/${enc(sha256 ?? '')}`, { signal }),
     enabled: Boolean(sha256),
@@ -302,7 +302,7 @@ export async function fetchEventTail(
 
 export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}, keep = 500) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.eventTail(query),
     queryFn: ({ signal }) => fetchEventTail(api, query, keep, signal),
     retry: noRetryOnClientErrors,
