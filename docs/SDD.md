@@ -2054,7 +2054,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
   plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
   Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
-  actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — finalize
+  actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — those available now
+  first, the next step's action first and primary, then the unavailable ones in a quieter, smaller row under
+  "Unavailable now", each still focusable and saying why (a button that changes rows as the migration moves keeps
+  the focus) — finalize
   requires typing the VM name; Cancel says that the data copied so far is removed when the migration
   has a data path (§5.1: it recorded passes or is in `precopy`/`syncing`); Retry says, when the plan has
   completed, that the retry reopens it (§5.1); the approvals list the cutover request and each approval in time
