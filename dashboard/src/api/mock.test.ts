@@ -960,6 +960,9 @@ describe('mock API', () => {
     expect(call('POST', '/providers', { ...vcenter, id: 'vc-w', credentials_secret: 'provider-vc-x' })).toMatchObject({ status: 422 });
     expect(call('POST', '/providers', { ...vcenter, id: 'vc-v', credentials_secret: 'provider-vc-v' })).toMatchObject({ status: 201 });
     expect(call('POST', '/providers', { ...vcenter, id: 'vc-u', credentials_secret: 'name\n' })).toMatchObject({ status: 422 });
+    // an id whose managed names are another provider's is refused (SDD §13.3)
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-x-ssh' })).toMatchObject({ status: 409 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-x-sshd' })).toMatchObject({ status: 201 });
     // only the fields a PATCH sets are checked
     server.providers.find((p) => p.id === 'vc-x')!.credentials_secret = 'old name';
     expect(call('PATCH', '/providers/vc-x', { name: 'vCenter X2' })).toMatchObject({ status: 200 });

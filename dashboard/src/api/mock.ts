@@ -1470,6 +1470,11 @@ export class MockServer {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
+    // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
+    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
+    if (clash) {
+      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
+    }
     checkDistribution(input);
     checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
