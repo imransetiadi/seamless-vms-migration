@@ -132,3 +132,13 @@ def test_external_egress_reaches_the_verification_ports_the_plan_form_proposes()
     }
     assert proposed == {22, 3389}
     assert proposed <= allowed, sorted(proposed - allowed)
+
+
+def test_the_secret_recipe_keeps_the_database_password_off_command_lines():
+    """Security.md §7.2: never a secret on a command line (`ps`, /proc and shell history keep
+    them). The recipe feeds the database Secret through stdin from the printf builtin."""
+    recipe = (ROOT / "deploy" / "openshift" / "secret-example.yaml").read_text(encoding="utf-8")
+    lines = [line.lstrip("#").strip() for line in recipe.splitlines() if line.startswith("#")]
+    assert not [line for line in lines if "from-literal" in line and "PGPW" in line]
+    assert any("--from-env-file=/dev/stdin" in line for line in lines)
+    assert any(line.startswith("printf") and "$PGPW" in line for line in lines)
