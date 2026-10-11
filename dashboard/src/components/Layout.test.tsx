@@ -25,6 +25,15 @@ describe('Layout health notice', () => {
     expect(status).toHaveTextContent(/orchestrator running · last tick 0 s ago/i);
   });
 
+  it('names the control plane version in the session footer, not only on the sign-in page', async () => {
+    const server = createTestServer();
+    const version = (server.handle('GET', '/health', new URLSearchParams(), undefined, null).body as { version: string }).version;
+    // no token: the anonymous admin of auth-disabled demo mode, who never sees the sign-in page (SDD §13.1)
+    renderWithApp(<Layout />, { route: '/', path: '/', server, token: null });
+    expect(await screen.findByText(`Control plane ${version}`)).toBeInTheDocument();
+    expect(await screen.findByText('anonymous')).toBeInTheDocument();
+  });
+
   it('names the degraded parts: database and a stalled orchestrator', async () => {
     const server = createTestServer();
     server.health = {

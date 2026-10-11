@@ -179,6 +179,10 @@ function SessionFooter() {
               : 'stopped'}
         </p>
       )}
+      {health.data?.version && (
+        // the sign-in page names it too, but with auth disabled nobody sees that page
+        <p className="px-1 text-xs text-muted-foreground">Control plane {health.data.version}</p>
+      )}
       {me.data && (
         <p className="px-1 text-sm">
           <span className="block truncate font-medium text-foreground">{me.data.name}</span>
