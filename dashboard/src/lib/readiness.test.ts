@@ -18,6 +18,8 @@ describe('readinessFlags', () => {
     expect(flag).toMatchObject({ label: 'Port IPs', severity: 'warning' });
     expect(flag!.detail).toContain('app-net (10.0.0.5, fd00::5), l2-net (no fixed IP)');
     expect(flag!.detail).not.toContain('10.0.0.6');
+    // the way out the plan offers (SDD §16 port_creation_mode)
+    expect(flag!.detail).toMatch(/keep mac addresses and every fixed ip/i);
     expect(readinessLevel(readinessFlags(vm, 'openstack'))).toBe('attention');
   });
 

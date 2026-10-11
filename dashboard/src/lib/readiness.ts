@@ -42,7 +42,12 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
   if (vm.nics.some((n) => SRIOV.has(n.vnic_type))) add('NET_SRIOV_PORT', 'SR-IOV port', 'warning', 'SR-IOV ports must be re-created manually.');
   const oddPorts = portsWithoutOneFixedIp(vm);
   if (kind !== 'vmware' && oddPorts.length > 0) {
-    add('NET_PORT_IPS', 'Port IPs', 'warning', `Cold and warm cannot recreate ${describePorts(oddPorts)}; storage handover keeps one address per port.`);
+    add(
+      'NET_PORT_IPS',
+      'Port IPs',
+      'warning',
+      `Cold and warm recreate ${describePorts(oddPorts)} only with the plan option "Keep MAC addresses and every fixed IP"; storage handover keeps one address per port.`,
+    );
   }
   if (kind === 'vmware') {
     if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'CBT off', 'warning', 'Changed Block Tracking is off: only cold migration.');
