@@ -601,8 +601,11 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
   Re-estimation after a completed pass (calibration, §1) is one more write per pass and a pure function.
-* **Orchestrator tick** (`SEAMLESS_TICK_S` = 1 s): must not re-read all migrations every tick. PERF-CP-02
-  measures tick duration with a 1,000-VM plan; as a stopgap at ≥ 500 migrations use `SEAMLESS_TICK_S=2–5`.
+* **Orchestrator tick** (`SEAMLESS_TICK_S` = 1 s): must not re-read all migrations every tick — it reads them
+  through `VersionedDocuments` (SDD §11, 08ec435): the change stamp, then `(id, version)`, then only the migrations that
+  changed. Measured on SQLite with nothing changed between ticks: 1,000 migrations 72.8 → 1.5 ms CPU, 2 × 1,000
+  174.8 → 2.5 ms; a tick after a write also loads the changed documents. PERF-CP-02 measures tick duration with a
+  1,000-VM plan; the old stopgap (`SEAMLESS_TICK_S=2–5` at ≥ 500 migrations) is no longer needed for the reads.
 * **Concurrency model:** store calls run in worker threads (`asyncio.to_thread`); the engine pool is 5 (+5
   overflow) connections per process, `pool_pre_ping=True` — a PostgreSQL restart is absorbed on the next call.
 * **Redaction (SDD §4, §13.4):** text from outside the control plane is redacted over its cut plus 16 KiB and
