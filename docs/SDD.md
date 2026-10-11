@@ -1034,7 +1034,9 @@ source with the reference for the source's family and pool, named `volume-<rhoso
 journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
 metadata set back (step 7); recreate
 the source ports with their journaled MAC, fixed IPs, security group ids and port-security flag (admin is already
-required; Nova applies a server's groups only to the ports it creates); recreate the
+required; Nova applies a server's groups only to the ports it creates). The fixed IPs leave out those on a SLAAC or
+DHCPv6-stateless subnet of the source network, whose EUI-64 address of the kept MAC the source's Neutron derives
+itself (§6.6): sent, that address is refused, or allocated twice. Then recreate the
 source server from the journaled definition with the volumes in device order and their journaled
 `delete_on_termination`; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
