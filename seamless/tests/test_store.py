@@ -1,9 +1,11 @@
 import threading
 
 import pytest
+import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
+from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.store import ConflictError, NotFound, Store
 from tests.factories import make_migration, make_plan, make_provider
 
@@ -193,6 +195,47 @@ def test_events_before_pages_back_from_the_oldest_shown(any_store: Store):
     assert [e.message for e in plan_a] == ["2", "4"]
     # without tail: the first events after since, below before
     assert [e.seq for e in any_store.events(since_seq=seqs[0], before_seq=seqs[3])] == seqs[1:3]
+
+
+def test_create_schema_adds_the_events_indexes_to_an_existing_table(any_store: Store):
+    """SDD §11: an events table from before ix_events_kind_seq gets it at the next startup;
+    create_all alone skips the indexes of a table that exists."""
+    with any_store.engine.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS ix_events_kind_seq")
+    any_store.append_event(Event(kind="plan.created", plan_id="plan-a", message="kept"))
+    any_store.create_schema()
+    any_store.create_schema()
+    indexes = {
+        i["name"]: i["column_names"] for i in sa.inspect(any_store.engine).get_indexes("events")
+    }
+    assert indexes["ix_events_kind_seq"] == ["kind", "seq"]
+    assert indexes["ix_events_plan_id"] == ["plan_id"]
+    assert indexes["ix_events_migration_id"] == ["migration_id"]
+    assert [e.message for e in any_store.events()] == ["kept"]
+
+
+def test_the_audit_filter_reads_the_kind_index_not_the_whole_table(store: Store):
+    """SDD §11, §12: GET /events?audit=true (and its ``before`` pages) finds the sparse audit
+    events through ix_events_kind_seq instead of reading the events table backwards."""
+    statements: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append((statement, params))
+
+    sa.event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        store.events(kinds=AUDIT_KINDS, tail=True, limit=500)
+        store.events(kinds=AUDIT_KINDS, tail=True, limit=500, before_seq=1000)
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", capture)
+    assert len(statements) == 2
+    with store.engine.connect() as conn:
+        for statement, params in statements:
+            plan = [
+                row[-1] for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+            ]
+            assert any("ix_events_kind_seq" in step for step in plan), plan
 
 
 def test_ping(any_store: Store, tmp_path):

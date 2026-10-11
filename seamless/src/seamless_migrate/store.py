@@ -68,6 +68,9 @@ events = sa.Table(
     sa.Column("actor", sa.String(128), nullable=False),
     sa.Column("message", sa.Text, nullable=False),
     sa.Column("data", JSONType, nullable=False),
+    # the kinds filter (GET /events?audit=true, SDD §11): audit events are sparse, and a scan
+    # of the primary key backwards reads the whole table to find the newest of them
+    sa.Index("ix_events_kind_seq", "kind", "seq"),
     sqlite_autoincrement=True,
 )
 
@@ -164,7 +167,7 @@ class Store:
         # create_all skips the indexes of tables that already exist, and expression indexes
         # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
         with self.engine.begin() as conn:
-            for index in documents.indexes:
+            for index in (*documents.indexes, *events.indexes):
                 conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
