@@ -855,9 +855,19 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   the port's new address of the same IP version; os-migrate attaches it by that address, and fails after Nova
   created the server when no port holds it. With no such address, or with several, the cutover stops after the
   export: a permanent failure naming the port, before the source stops. An entry whose MAC no exported port has
-  stops it the same way (the VM's NICs changed since validation). A warm cutover exports the workload again first
-  when the VM has an entry, or when its `workloads.yml` holds an address-only reference (an entry removed since
-  the export).
+  stops it the same way (the VM's NICs changed since validation). The port is marked
+  `_migration_params.nic_override: true`. A warm cutover exports the workload again first when the VM has an entry,
+  or when its `workloads.yml` holds a port so marked (an entry removed since the export).
+* Network references: after the mappings and the NIC overrides, and again before each run on an existing export
+  (a warm cutover without a new export), the executor resolves the name of each server port's `network_ref` and
+  of each floating IP's `floating_network_ref`. It uses the rule of §7.3 step 0 against the destination's networks
+  (`DestinationProvider.inventory().network_details`, read for that run):
+  * the credential's own network keeps `%auth%` as the reference's project and domain;
+  * another project's network that is the only one of its name gets neither, so os-migrate looks it up by name among
+    the networks the credential sees (a shared provider network that another project owns works).
+  Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
+  network's subnets whatever their names. A name that does not resolve stops the cutover there, before the
+  source stops: a permanent failure naming the port.
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
@@ -873,7 +883,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
   volumes[].params.volume_type, `_migration_params.boot_volume_params.volume_type`,
-  project names in refs).
+  project names in refs); the network references are then resolved as above.
 * Step → playbook map:
 
 | Strategy | precopy / sync | cutover | rollback |
@@ -1311,10 +1321,12 @@ Finding catalog (code — severity — condition):
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
-| `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one) |
+| `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one, as the rule of §7.3 step 0 resolves it) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
+| `MAP_NETWORK_AMBIGUOUS` | blocker | an OpenStack VM's NIC goes to a RHOSO network name (its `plan.nic_overrides` entry's network, else the mapped one, else its own name) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
+| `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
-| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one; `DestinationInventory.subnets`) or is no host address there — as Neutron's `check_subnet_ip` rules, an IPv4 subnet's network address (at any prefix length), its broadcast address below a /31 (a /31 or /32 has none) and an IPv6 subnet's first address; or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
+| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules, an IPv4 subnet's network address (at any prefix length), its broadcast address below a /31 (a /31 or /32 has none) and an IPv6 subnet's first address; on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
@@ -1418,9 +1430,12 @@ the source credential's own keypairs — what `export_keypairs.yml` can export)}
 extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
 list[str], keypairs: list[str] (the destination credential's own keypairs: the server is created as that user, and
-a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped), subnets:
-list[{name, network, cidr}] (the subnets the destination credential sees, by network name: where a NIC override's
-addresses must lie, §9.3)}`.
+a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped),
+network_details: list[{id, name, mtu, project_id, own, shared}] (every network the destination credential sees;
+`own` when the credential's project owns it: what a NIC's RHOSO network name resolves to, §7.3 step 0, §9.3),
+subnets: list[{name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
+credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
+§9.3)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
@@ -2245,7 +2260,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
   a Network panel — each NIC with its source network, MAC and addresses and where it goes in RHOSO (the mapped
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
-  the VM's `nic_overrides` entry, a plan edit (§12). Per NIC a destination network (the plan's mapping by default)
+  the VM's `nic_overrides` entry, a plan edit (§12). Per NIC a destination network (the plan's mapping by default;
+  a name only another project's network carries is marked "another project's", one the rule of §7.3 step 0 cannot
+  resolve "several networks")
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
   edited. A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
