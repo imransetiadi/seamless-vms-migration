@@ -181,6 +181,9 @@ GuestOS { family: "linux"|"windows"|"unknown", distro: str|null, version: str|nu
 Mappings { networks: dict[str,str] = {}, flavors: dict[str,str] = {},
            volume_types: dict[str,str] = {}, projects: dict[str,str] = {} }
 
+NicOverride { network: str|null = null,          # a RHOSO network name; null = where the plan maps the NIC's network
+              fixed_ips: list[str]|null = null }  # the NIC's addresses at RHOSO; null = its own; never empty
+
 HandoverConfig { enabled: bool = false, backend_map: dict[str,str] = {} }
         # source volume_type -> RHOSO cinder host "hostgroup@backend#pool", or "hostgroup@backend"
         # to resolve the pool per volume (§7.3.1)
@@ -218,6 +221,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        link_bps: float = 131072000.0, estimator_overrides: dict[str, float] = {},
        handover: HandoverConfig, verification: VerificationConfig,
        probe_overrides: dict[str, list[AppProbe]] = {},   # per VM (source id): replaces verification.app_probes; [] = none (§7.5, ADV-18)
+       nic_overrides: dict[str, dict[str, NicOverride]] = {},   # per VM (source id), per NIC MAC (lower case): its RHOSO
+                                        # network and addresses; OpenStack sources (§7.2, §7.3, §9.2, §9.3)
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
                                         # export_<r>.yml/import_<r>.yml pair other than workloads (the
@@ -728,6 +733,10 @@ since a cutover can fail between creating the ports and creating the server. Nov
 is deleted later, so a migrated server's ports outlive it: delete them with the server when it is decommissioned
 (only then does Neutron free their addresses).
 
+A fixed IP reference without `subnet_ref` names only its address; the control plane writes such references for a NIC
+override (§7.2). `ServerPort` then gives Nova the address as `fixed_ip` and Neutron `{"ip_address": …}`, and Neutron
+picks the subnet of the port's network that holds it.
+
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
 network partition ends the ssh about a minute later and the pass fails — a transient failure, retried — instead of
@@ -822,6 +831,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   well. A mode chosen after a warm migration's export therefore applies at its cutover. In `neutron` mode, a warm
   cutover whose `workloads.yml` lists a port without `security_group_refs` (exported before §6.6's rule) exports the
   workload again first.
+* `nic_overrides`: after the mappings, each port of the planned server whose `mac_address` (lower case) has an entry
+  in `plan.nic_overrides[vm.source_id]` gets the entry's `network` as its `network_ref` name. Its addresses — the
+  entry's `fixed_ips`, else the port's own — become address-only fixed IP references (no `subnet_ref`, §6.6), so
+  Neutron finds them in that network's subnets. A warm cutover exports the workload again first when the VM has an
+  entry, or when its `workloads.yml` holds an address-only reference (an entry removed since the export).
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
@@ -916,6 +930,8 @@ volumes with their server, so the order is:
    destination credential's project, its port-security flag and the description `os-migrate:{source port id}`
    (§6.6); it is journaled per port with its id, a resume uses again the journaled port or an unbound one with that
    description, and Nova gets `{"port": id}` — the server's security groups apply only to ports Nova creates.
+   A port whose MAC has an entry in `plan.nic_overrides` goes to the entry's network instead of the mapped one,
+   with the entry's addresses when it lists them (in `"nova"` mode its one address).
 
 Rollback walks the journal backwards. While the source server still exists (a failure before step 4)
 it sets every attachment's journaled `delete_on_termination` back and starts the server. Otherwise:
@@ -1213,6 +1229,7 @@ strategy ineligible):
 
 * OpenStack sources consider `cold`, `warm`, `storage_handover`; VMware sources consider
   `vmware_cold`, `vmware_warm`.
+* A NIC's addresses below are its `plan.nic_overrides` entry's `fixed_ips` when the entry lists them, else its own.
 * `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side,
   or — with `plan.port_creation_mode` `"nova"` — a NIC has no fixed IP or more than one (a dual-stack port included):
   os-migrate then recreates each port through Nova with exactly one fixed IP and refuses any other, after the source
@@ -1262,9 +1279,11 @@ Finding catalog (code — severity — condition):
 | `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
 | `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
-| `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
+| `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
+| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one; `DestinationInventory.subnets`); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
+| `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
@@ -1367,7 +1386,9 @@ the source credential's own keypairs — what `export_keypairs.yml` can export)}
 extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
 list[str], keypairs: list[str] (the destination credential's own keypairs: the server is created as that user, and
-a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped)}`.
+a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped), subnets:
+list[{name, network, cidr}] (the subnets the destination credential sees, by network name: where a NIC override's
+addresses must lie, §9.3)}`.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
@@ -1471,7 +1492,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (it matches the destination server by name on the cold path) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
@@ -2142,7 +2163,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   the counts) and no Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
   `source_running_at` is set; settings summary — with "Ports: MAC and fixed IPs kept" when `port_creation_mode` is
-  `"neutron"`, and "Advisor policy: {name}", its mode and threshold, the policy
+  `"neutron"`, "Network overrides: {n} VMs" when `nic_overrides` has entries, and "Advisor policy: {name}", its mode
+  and threshold, the policy
   in force for `migration_strategy` (`resolve_policy`, the built-in default when none applies) linking to it on
   `/advisor/policies` (ADV-20) —, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
@@ -2189,6 +2211,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
   the alert can be shown,
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
+  a Network panel — each NIC with its source network, MAC and addresses and where it goes in RHOSO (the mapped
+  network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
+  the VM's `nic_overrides` entry, a plan edit (§12). Per NIC a destination network (the plan's mapping by default)
+  and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
+  edited. A VMware source says the migration kit keeps the guest's network settings —, a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
   plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
   Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
