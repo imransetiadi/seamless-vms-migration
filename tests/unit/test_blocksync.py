@@ -600,11 +600,25 @@ def test_progress_callback_error_in_the_stderr_pump_is_raised(tmp_path, reap):
     def progress(done, total):
         if threading.get_ident() != caller["ident"]:
             raise Boom("callback failed in the stderr pump")
+        # the caller's own updates are slow (64 frames take about 3 s), so a send_progress line
+        # is always ahead of them
+        time.sleep(0.05)
+
+    # The sender reports progress at most once a second: on a fast transfer its lines race the
+    # frames and the pump's update can find nothing new to report. Lines ahead of anything
+    # applied, written once the header is read, make the pump call back from its own thread.
+    ahead = shlex.quote(json.dumps(
+        {"event": "send_progress", "bytes_done": len(data), "bytes_total": len(data)}
+    ))
+    emit = "printf '%s\\n' " + ahead + " >&2"
+    sender = shell_sender(
+        "(sleep 0.5; %s; sleep 0.5; %s; sleep 0.5; %s) & exec SEND" % (emit, emit, emit), src
+    )
 
     def call():
         caller["ident"] = threading.get_ident()
         return blocksync.run_receiver(
-            dst, CHUNK, 2, sender_cmd(src), progress_cb=progress, progress_interval=0
+            dst, CHUNK, 2, sender, progress_cb=progress, progress_interval=0
         )
 
     outcome = {}
