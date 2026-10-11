@@ -838,6 +838,21 @@ Twenty-three further iterations after the integration run, each verified with th
   validation never marks `validated` a plan another process edited meanwhile (409,
   `test_a_validation_never_marks_validated_a_plan_another_process_edited`, SDD §8), and `plan validate`
   waits for the cleanups of the migrations it cancelled (`test_plan_validate_waits_for_the_cleanups_it_started`).
+* Deploy and operations review wave (2026-10-11, independent reviewer, static): the egress policy lets the
+  verification checks the plan form proposes through (TCP 3389 was blocked: a Windows check timed out, failed and
+  rolled a working migration back); the database Secret recipe feeds the password through stdin, never a command
+  line; the control-plane pod shares its process namespace so Ansible's ssh `ControlPersist` masters are reaped
+  (Compose has `init: true`); the Route sends HSTS; on a Linux machine's own Docker Engine the Make targets map
+  `host.docker.internal` to the host gateway (`compose.linux-host.yaml`, never on Colima or Docker Desktop);
+  `make vendor-links` uses a portable `sed -i.bak` (SDD §7.5, §17, §17.1; Security.md §7.2, §8, §12). Tests:
+  `test_external_egress_reaches_the_verification_ports_the_plan_form_proposes`,
+  `test_the_secret_recipe_keeps_the_database_password_off_command_lines`,
+  `test_the_control_plane_pod_reaps_the_processes_ansible_leaves`, `test_the_route_tells_browsers_to_keep_to_https`,
+  `test_a_linux_docker_engine_maps_host_docker_internal_to_the_host`,
+  `test_makefile_recipes_edit_files_in_place_portably`. Also 2026-10-11: SDD §15.1 parsed against
+  `Settings.from_env` (`test_settings_read_exactly_the_variables_sdd_15_1_documents`,
+  `test_each_literal_default_of_sdd_15_1_is_the_effective_one`), and a live event about one migration splices it
+  into the cached lists instead of reading every list again (`live.test.ts`, SDD §16).
 
 ### 13.2 Exit criteria — release 0.1.0
 
