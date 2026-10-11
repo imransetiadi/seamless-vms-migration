@@ -2221,7 +2221,10 @@ bind mount; `.env` is 0600.
 against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
 collection, dashboard).
 
-Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host, and
+Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host — on a Linux machine's own
+Docker Engine, which defines no `host.docker.internal`, the targets add `deploy/compose/compose.linux-host.yaml`,
+mapping that name to the host gateway so the default agentmemory URL reaches the host (Colima and Docker Desktop
+resolve the name to the developer's machine themselves, where the host gateway would be their VM) — and
 `SEAMLESS_ENGINE=podman` runs them with `podman compose` (Podman 4.7+; it drives docker-compose when
 installed, podman-compose otherwise). Without `--wait` there, the targets poll `/api/v1/health` for up to
 300 s. The read-only token-file bind mount sets `selinux: z`, so SELinux hosts (RHEL, Fedora) relabel it.
