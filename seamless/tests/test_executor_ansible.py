@@ -625,7 +625,8 @@ def test_build_vars_safety_pins_and_volume_types(env):
     assert "os_migrate_conversion_secgroup_remote_ip_prefix" not in v
     assert v["os_migrate_workloads_preserve_volume_type"] is True  # MAPPINGS maps ceph-hdd
     assert "os_migrate_rollback_match_by_name" not in v
-    rollback = build_vars(StepName.ROLLBACK, ctx)
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    rollback = build_vars(StepName.ROLLBACK, stopped)
     assert rollback["os_migrate_rollback_match_by_name"] is True
     assert rollback["os_migrate_workload_stop_before_migration"] is False
 
@@ -903,6 +904,21 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
     ctx, rec = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
     result = await executor.run(StepName.CUTOVER, ctx)
     assert result.destination_server_id == "dst-web-01"
+
+
+def test_cold_rollback_before_any_stop_never_matches_by_name(env):
+    """SDD §7.2: the cold role creates the destination server after it stops the source, so
+    before a stop a same-named server is not this migration's — a cutover refused or skipped
+    for a name collision is rolled back without deleting it (or, after a cancel, its volumes)."""
+    for options in ({}, {"delete_dest_volumes": True}):
+        ctx, _ = ctx_for(env, strategy=Strategy.cold)
+        ctx.options.update(options)
+        assert ctx.migration.downtime_started_at is None
+        rollback = build_vars(StepName.ROLLBACK, ctx)
+        assert "os_migrate_rollback_match_by_name" not in rollback
+        stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+        stopped.options.update(options)
+        assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
 
 
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):

@@ -239,8 +239,10 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
     )
     # SDD §6.4: keep mapped volume types (apply_mappings rewrote them to RHOSO types)
     out["os_migrate_workloads_preserve_volume_type"] = bool(ctx.plan.mappings.volume_types)
-    if m.strategy == Strategy.cold and step == StepName.ROLLBACK:
-        # the cold path records no destination server id: the rollback matches by name
+    if m.strategy == Strategy.cold and step == StepName.ROLLBACK and m.downtime_started_at:
+        # the cold path records no destination server id: the rollback matches by name — only
+        # after the stop, since the role creates the server after it; before it a same-named
+        # server is not this migration's (a cutover refused or skipped for a collision, SDD §7.2)
         out["os_migrate_rollback_match_by_name"] = True
     if step == StepName.ROLLBACK and ctx.options.get("delete_dest_volumes"):
         # cleanup after a cancel: the destination volumes of the abandoned pass go too
