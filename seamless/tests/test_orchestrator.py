@@ -3723,6 +3723,29 @@ async def test_validation_blocks_a_vm_whose_port_cold_and_warm_cannot_recreate(t
     assert (await h.by_vm(plan.id, "vm-2")).phase != P.blocked
 
 
+async def test_validation_blocks_a_vm_whose_nic_override_cannot_be_applied(tmp_path, store):
+    """SDD §9.3: a NIC override to a network RHOSO lacks is found at validation, before anything
+    stops; the VM is blocked with MAP_NIC_OVERRIDE_INVALID, the plan's other VMs are not."""
+    from seamless_migrate.domain.models import Nic
+
+    nic = Nic(network="app-net", mac="fa:16:3e:00:00:0a", mtu=1500, fixed_ips=["10.0.0.1"])
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1, nics=[nic]), vm(2)],
+        {
+            "default_strategy": Strategy.cold,
+            "nic_overrides": {"vm-1": {"FA:16:3E:00:00:0A": {"network": "rhoso-missing"}}},
+        },
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    blocked = await h.by_vm(plan.id, "vm-1")
+    assert blocked.phase == P.blocked
+    [f] = [f for f in blocked.findings if f.code == "MAP_NIC_OVERRIDE_INVALID"]
+    assert "fa:16:3e:00:00:0a: RHOSO has no network 'rhoso-missing'" in f.message
+    assert (await h.by_vm(plan.id, "vm-2")).phase != P.blocked
+
+
 async def test_prestage_names_the_keypairs_the_destination_user_lacks(tmp_path, store):
     """SDD §7.2: with "keypairs" pre-staged the orchestrator passes the VMs' key_names the
     source credential owns and the destination credential lacks."""

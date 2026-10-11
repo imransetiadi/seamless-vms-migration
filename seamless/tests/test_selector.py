@@ -292,3 +292,33 @@ def test_neutron_port_mode_keeps_every_strategy_for_any_number_of_fixed_ips():
     assert all(
         r == [] for r in eligibility(no_ip, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS).values()
     )
+
+
+def test_a_nic_override_decides_the_address_count_the_port_rules_see():
+    """SDD §9.2: the port rules count the addresses a NIC gets - its override's, else its own: a
+    dual-stack NIC given one address keeps cold, warm and handover in nova mode; a one-address NIC
+    given two loses them."""
+    from seamless_migrate.domain.models import Nic
+
+    disks = [make_disk(id="v1", volume_type="ceph-ssd")]
+    handover = HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"})
+    dual = make_vm(
+        source_id="vm-1",
+        disks=disks,
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5", "fd00::5"])],
+    )
+    one = make_plan(
+        handover=handover,
+        nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"fixed_ips": ["10.0.0.5"]}}},
+    )
+    reasons = eligibility(dual, ProviderKind.openstack, one, OK_CAPS, OK_CAPS)
+    assert all(r == [] for r in reasons.values()), reasons
+
+    single = make_vm(source_id="vm-1", disks=disks)  # fa:16:3e:00:00:01, 10.0.0.5
+    two = make_plan(
+        handover=handover,
+        nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"fixed_ips": ["10.0.0.5", "10.0.0.8"]}}},
+    )
+    reasons = eligibility(single, ProviderKind.openstack, two, OK_CAPS, OK_CAPS)
+    for strategy in (Strategy.cold, Strategy.warm, Strategy.storage_handover):
+        assert any("10.0.0.5, 10.0.0.8" in r for r in reasons[strategy]), (strategy, reasons)

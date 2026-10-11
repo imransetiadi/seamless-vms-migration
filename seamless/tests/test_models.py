@@ -125,6 +125,55 @@ def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():
         make_plan(port_creation_mode="ovs")
 
 
+def test_plan_nic_overrides_keep_lower_case_macs_and_canonical_addresses():
+    """SDD §4.2: per VM and NIC MAC (stored lower case) a RHOSO network and addresses; null keeps
+    the mapping or the NIC's own; the addresses in their canonical form."""
+    from seamless_migrate.domain.models import invalid_plan_settings
+
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {
+                "FA:16:3E:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["fd00:0::0005"]},
+                "fa:16:3e:00:00:02": {"network": "rhoso-dmz"},
+            }
+        }
+    )
+    entries = plan.nic_overrides["vm-1"]
+    assert sorted(entries) == ["fa:16:3e:00:00:01", "fa:16:3e:00:00:02"]
+    assert entries["fa:16:3e:00:00:01"].fixed_ips == ["fd00::5"]
+    assert entries["fa:16:3e:00:00:02"].fixed_ips is None
+    assert invalid_plan_settings(plan) == []
+    assert make_plan().nic_overrides == {}
+
+
+def test_plan_nic_overrides_refuse_what_cannot_be_applied():
+    """SDD §12: a key that is no MAC, an entry with neither field, an empty address list, a value
+    that is no IP address and the same address twice are refused (422)."""
+    from seamless_migrate.domain.models import invalid_plan_settings
+
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {
+                "not-a-mac": {"network": "rhoso-dmz"},
+                "fa:16:3e:00:00:01": {},
+                "fa:16:3e:00:00:02": {"fixed_ips": []},
+                "fa:16:3e:00:00:03": {"fixed_ips": ["10.0.0.300", "10.0.0.5", "10.0.0.5"]},
+                "fa:16:3e:00:00:04": {"network": ""},
+            }
+        }
+    )
+    problems = invalid_plan_settings(plan)
+    assert problems == [
+        "nic_overrides[vm-1][fa:16:3e:00:00:01]: give a network, addresses or both",
+        "nic_overrides[vm-1][fa:16:3e:00:00:02]: fixed_ips must list at least one address "
+        "(leave it out to keep the NIC's own)",
+        "nic_overrides[vm-1][fa:16:3e:00:00:03]: not an IP address: 10.0.0.300",
+        "nic_overrides[vm-1][fa:16:3e:00:00:03]: 10.0.0.5 given twice",
+        "nic_overrides[vm-1][fa:16:3e:00:00:04]: network must not be empty",
+        "nic_overrides[vm-1][not-a-mac]: not a MAC address",
+    ]
+
+
 def test_plan_defaults_match_sdd():
     plan = make_plan()
     assert plan.default_strategy == "auto"

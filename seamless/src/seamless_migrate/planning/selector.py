@@ -12,7 +12,7 @@ from ..domain.enums import (
     Strategy,
     strategies_for,
 )
-from ..domain.models import Estimate, Finding, Nic, Plan, VMRef
+from ..domain.models import Estimate, Finding, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
 
 #: Two downtimes tie when they differ by less than 10 % (of the smaller one) or less than 60 s.
@@ -65,7 +65,9 @@ def eligibility(
         # through Nova os-migrate recreates each port with exactly one fixed IP and raises for any
         # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses.
         # Through Neutron every port keeps all its fixed IPs, none included (§6.6).
-        odd_ports = [n for n in vm.nics if len(n.fixed_ips) != 1]
+        # the addresses a NIC gets: its override's, else its own (SDD §9.2)
+        nics = [(n.network, plan.nic_target(vm.source_id, n)[1]) for n in vm.nics]
+        odd_ports = [(net, ips) for net, ips in nics if len(ips) != 1]
         if odd_ports and plan.port_creation_mode == "nova":
             copy_reasons.append(
                 "port(s) without exactly one fixed IP, which Nova cannot recreate: "
@@ -98,7 +100,7 @@ def eligibility(
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
         # through Nova the destination server gets one fixed IP per port and the others would be
         # dropped; through Neutron every one is kept (SDD §7.3 step 8)
-        several = [n for n in vm.nics if len(n.fixed_ips) > 1]
+        several = [(net, ips) for net, ips in nics if len(ips) > 1]
         if several and plan.port_creation_mode == "nova":
             handover.append(
                 f"port(s) with several fixed IPs, of which one would be kept: {_ports(several)}"
@@ -119,9 +121,9 @@ def eligibility(
     return out
 
 
-def _ports(nics: Sequence[Nic]) -> str:
+def _ports(nics: Sequence[tuple[str, list[str]]]) -> str:
     """Each NIC by its network and addresses, e.g. "app-net (10.0.0.5, fd00::5)"."""
-    return ", ".join(f"{n.network} ({', '.join(n.fixed_ips) or 'no fixed IP'})" for n in nics)
+    return ", ".join(f"{network} ({', '.join(ips) or 'no fixed IP'})" for network, ips in nics)
 
 
 def _storage_reasons(

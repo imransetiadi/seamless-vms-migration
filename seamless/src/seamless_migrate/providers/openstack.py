@@ -229,7 +229,8 @@ class OpenStackProvider:
 
     def _inventory(self) -> SourceInventory | DestinationInventory:
         conn = self._connection()
-        networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in conn.network.networks()}
+        visible = list(conn.network.networks())
+        networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in visible}
         project = self._project_name(conn)
         # the credential's own keypairs: what it can export, or owns as the creator (SDD §11)
         keypairs = sorted(str(_attr(k, "name")) for k in conn.compute.keypairs())
@@ -249,6 +250,17 @@ class OpenStackProvider:
         ]
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
+        # where a NIC override's addresses must lie, by network name (SDD §11, §9.3)
+        names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
+        subnets = [
+            {
+                "name": str(_attr(s, "name")),
+                "network": names[_attr(s, "network_id")],
+                "cidr": str(_attr(s, "cidr")),
+            }
+            for s in conn.network.subnets()
+            if _attr(s, "network_id") in names
+        ]
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
@@ -256,6 +268,7 @@ class OpenStackProvider:
             quotas=quotas,
             projects=[project] if project else [],
             keypairs=keypairs,
+            subnets=subnets,
         )
 
     @staticmethod

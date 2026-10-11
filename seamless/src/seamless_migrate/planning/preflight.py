@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..domain.enums import ProviderKind, Severity, Strategy
-from ..domain.models import Finding, Mappings, Plan, Provider, VMRef
+from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 
 S = Strategy
@@ -36,6 +37,8 @@ class DestinationInventory:
     projects: list[str] = field(default_factory=list)
     #: the destination credential's own keypairs: the server is created as that user (SDD §11)
     keypairs: list[str] = field(default_factory=list)
+    #: [{name, network, cidr}]: where a NIC override's addresses must lie (SDD §11, §9.3)
+    subnets: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -143,6 +146,17 @@ CATALOG: dict[str, CatalogEntry] = {
         'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode '
         '"neutron"), give each such port exactly one fixed IP before the cutover, or migrate the '
         "VM by storage handover when its ports have at most one address each.",
+    ),
+    "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Fix the VM's network overrides on its migration page: an existing RHOSO network, "
+        "addresses inside its subnets, each given once in the plan. VMware VMs take none.",
+    ),
+    "MAP_NIC_OVERRIDE": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: each NIC goes where its override says.",
     ),
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
@@ -407,6 +421,100 @@ def _names(items: Iterable[str]) -> str:
     return ", ".join(sorted(set(items)))
 
 
+def _canonical_ip(address: str) -> str:
+    try:
+        return str(ipaddress.ip_address(address))
+    except ValueError:
+        return address
+
+
+def _in_subnets(address: str, cidrs: Sequence[str]) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    for cidr in cidrs:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _nic_override_findings(
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    selected: Sequence[VMRef],
+    source: Provider | None,
+) -> list[Finding]:
+    """MAP_NIC_OVERRIDE_INVALID / MAP_NIC_OVERRIDE (SDD §9.3): every entry checked before
+    anything stops - its MAC, its network, its addresses in the target network's subnets and
+    given to no other NIC of the plan."""
+    entries = plan.nic_overrides.get(vm.source_id) or {}
+    if not entries:
+        return []
+    if source is not None and source.kind == ProviderKind.vmware:
+        return [
+            finding(
+                "MAP_NIC_OVERRIDE_INVALID",
+                f"{vm.name} is a VMware VM: the migration kit keeps the guest's network "
+                f"settings, so its NIC overrides cannot be applied ({_names(sorted(entries))}).",
+            )
+        ]
+    # every address the plan's NICs get, on the network each goes to
+    holders: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for other in selected:
+        for n in other.nics:
+            network, addresses = plan.nic_target(other.source_id, n)
+            for a in addresses:
+                key = (network, _canonical_ip(a))
+                holders.setdefault(key, []).append(
+                    (other.source_id, (n.mac or "").lower(), other.name)
+                )
+    nics = {n.mac.lower(): n for n in vm.nics if n.mac}
+    problems: list[str] = []
+    applied: list[str] = []
+    for mac in sorted(entries):
+        nic = nics.get(mac)
+        if nic is None:
+            problems.append(f"{mac}: the VM has no NIC with this MAC")
+            continue
+        network, addresses = plan.nic_target(vm.source_id, nic)
+        if network not in dst_inv.networks:
+            # the entry's network, or the mapped one pre-staging would create later: its subnets
+            # cannot be checked before anything stops
+            problems.append(
+                f"{mac}: RHOSO has no network {network!r}"
+                + (
+                    ""
+                    if entries[mac].network
+                    else " yet: pre-staging would create it, but its subnets cannot be checked "
+                    "before; name an existing RHOSO network"
+                )
+            )
+            continue
+        cidrs = [str(s.get("cidr")) for s in dst_inv.subnets if s.get("network") == network]
+        outside = [a for a in addresses if not _in_subnets(a, cidrs)]
+        if outside:
+            verb = "lies" if len(outside) == 1 else "lie"
+            problems.append(f"{mac}: {', '.join(outside)} {verb} in no subnet of {network!r}")
+        for a in addresses:
+            for vm_id, other_mac, name in holders.get((network, _canonical_ip(a)), []):
+                if (vm_id, other_mac) != (vm.source_id, mac):
+                    problems.append(f"{mac}: {a} also goes to {name} ({other_mac})")
+        applied.append(f"{mac} ({nic.network}) -> {network}: {', '.join(addresses)}")
+    if problems:
+        return [
+            finding(
+                "MAP_NIC_OVERRIDE_INVALID",
+                f"NIC override(s) of {vm.name} cannot be applied: {'; '.join(problems)}.",
+            )
+        ]
+    return [finding("MAP_NIC_OVERRIDE", f"NIC override(s): {'; '.join(applied)}.")]
+
+
 def run_preflight(
     vm: VMRef,
     plan: Plan,
@@ -458,15 +566,21 @@ def run_preflight(
             finding("SRC_VM_EPHEMERAL_ROOT", f"The root disk is {root.kind.replace('_', ' ')}.")
         )
 
+    # a NIC its override sends to another network is checked by MAP_NIC_OVERRIDE_INVALID
+    mapped_nics = [
+        nic
+        for nic in vm.nics
+        if not (plan.nic_override(vm.source_id, nic.mac) or NicOverride()).network
+    ]
     missing_nets = [
         nic.network
-        for nic in vm.nics
+        for nic in mapped_nics
         if nic.network not in maps.networks and nic.network not in dst_inv.networks
     ]
     # a mapped target must exist: nothing creates a network under the *mapped* name
     bad_net_targets = [
         f"{nic.network} -> {maps.networks[nic.network]}"
-        for nic in vm.nics
+        for nic in mapped_nics
         if nic.network in maps.networks and maps.networks[nic.network] not in dst_inv.networks
     ]
     # pre-staging creates same-named networks for OpenStack sources only: the VMware kit has
@@ -664,9 +778,14 @@ def run_preflight(
     shrinks = []
     for nic in vm.nics:
         src_mtu = nic.mtu if nic.mtu is not None else src_inv.networks.get(nic.network)
-        dst_mtu = dst_inv.networks.get(maps.networks.get(nic.network, nic.network))
+        target = plan.nic_target(vm.source_id, nic)[0]
+        dst_mtu = dst_inv.networks.get(target)
         if src_mtu is not None and dst_mtu is not None and dst_mtu < src_mtu:
-            shrinks.append(f"{nic.network} {src_mtu} -> {dst_mtu}")
+            shrinks.append(
+                f"{nic.network} {src_mtu} -> {dst_mtu}"
+                if target == maps.networks.get(nic.network, nic.network)
+                else f"{nic.network} {src_mtu} -> {target} {dst_mtu}"
+            )
     if shrinks:
         out.append(finding("NET_MTU_SHRINK", f"Destination MTU is smaller: {_names(shrinks)}."))
 
@@ -677,14 +796,16 @@ def run_preflight(
     # through Nova os-migrate recreates each port with exactly one fixed IP; the handover keeps one
     # per port (SDD §9.2, §9.3). Through Neutron every address is kept, so nothing is said; VMware
     # NICs go through the migration kit.
-    odd_ports = [nic for nic in vm.nics if len(nic.fixed_ips) != 1]
+    # the addresses a NIC gets: its override's, else its own (SDD §9.2)
+    addresses = {id(nic): plan.nic_target(vm.source_id, nic)[1] for nic in vm.nics}
+    odd_ports = [nic for nic in vm.nics if len(addresses[id(nic)]) != 1]
     if (
         odd_ports
         and plan.port_creation_mode == "nova"
         and (source is None or source.kind != ProviderKind.vmware)
     ):
         listed = ", ".join(
-            f"{n.network} ({', '.join(n.fixed_ips) or 'no fixed IP'})" for n in odd_ports
+            f"{n.network} ({', '.join(addresses[id(n)]) or 'no fixed IP'})" for n in odd_ports
         )
         out.append(
             finding(
@@ -693,6 +814,8 @@ def run_preflight(
                 "recreate them; storage handover keeps one address per port.",
             )
         )
+
+    out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source))
 
     if "pci_passthrough:alias" in vm.flavor_extra_specs:
         out.append(

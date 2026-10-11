@@ -91,6 +91,8 @@ def test_catalog_is_complete():
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
         "NET_PORT_IPS",
+        "MAP_NIC_OVERRIDE_INVALID",
+        "MAP_NIC_OVERRIDE",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         "VOL_ENCRYPTED",
@@ -381,6 +383,110 @@ def test_finding_net_port_ips_only_in_nova_port_mode():
     assert "neutron" in (nova.remediation or "").lower()
     neutron = make_plan(port_creation_mode="neutron")
     assert all(x.code != "NET_PORT_IPS" for x in check(vm, plan=neutron))
+
+
+def override_dst(**kw):
+    """A destination with a DMZ network beside app-net, and their subnets (SDD §11)."""
+    return dst_inv(
+        networks={"app-net": 1500, "rhoso-dmz": 1442},
+        subnets=[
+            {"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"},
+            {"name": "dmz-v4", "network": "rhoso-dmz", "cidr": "192.168.10.0/24"},
+            {"name": "dmz-v6", "network": "rhoso-dmz", "cidr": "fd00:10::/64"},
+        ],
+        **kw,
+    )
+
+
+def test_finding_map_nic_override_names_where_each_nic_goes():
+    """SDD §9.3: an applicable entry is info naming the NIC, its RHOSO network and addresses; the
+    MTU check and the port rule look at where the NIC goes."""
+    vm = make_vm(source_id="vm-1")
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+        }
+    )
+    found = check(vm, plan=plan, dst=override_dst())
+    info = only(found, "MAP_NIC_OVERRIDE")
+    assert info.severity == Severity.info
+    assert "fa:16:3e:00:00:01 (app-net) -> rhoso-dmz: 192.168.10.5" in info.message
+    assert all(f.code != "MAP_NIC_OVERRIDE_INVALID" for f in found)
+    # rhoso-dmz has MTU 1442: smaller than the NIC's 1500
+    assert "rhoso-dmz" in only(found, "NET_MTU_SHRINK").message
+
+
+def test_a_nic_override_settles_the_network_and_address_count():
+    """A NIC sent elsewhere is not a MAP_NETWORK_MISSING; a dual-stack NIC given one address is no
+    NET_PORT_IPS in nova mode; a network-only entry keeps the NIC's own addresses."""
+    from seamless_migrate.domain.models import Nic
+
+    nic = Nic(network="lost-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5", "fd00::5"])
+    vm = make_vm(source_id="vm-1", nics=[nic])
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+        }
+    )
+    codes = [f.code for f in check(vm, plan=plan, dst=override_dst())]
+    assert "MAP_NETWORK_MISSING" not in codes and "MAP_NETWORK_PRESTAGED" not in codes
+    assert "NET_PORT_IPS" not in codes
+    kept = make_plan(
+        nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz"}}},
+        port_creation_mode="neutron",
+    )
+    found = check(vm, plan=kept, dst=override_dst())
+    # its own 10.0.0.5 lies in no subnet of rhoso-dmz
+    invalid = only(found, "MAP_NIC_OVERRIDE_INVALID")
+    assert "10.0.0.5" in invalid.message and "rhoso-dmz" in invalid.message
+
+
+def test_finding_map_nic_override_invalid_names_each_problem():
+    """SDD §9.3: an unknown MAC, a network RHOSO lacks, an address in no subnet of the target
+    network and an address another NIC of the plan gets block the VM; on a VMware source any entry
+    does - the migration kit keeps the guest's network settings."""
+    from seamless_migrate.domain.models import Nic
+
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"]),
+            Nic(network="app-net", mac="fa:16:3e:00:00:02", fixed_ips=["10.0.0.6"]),
+            Nic(network="app-net", mac="fa:16:3e:00:00:03", fixed_ips=["10.0.0.7"]),
+        ],
+    )
+    other = make_vm(source_id="vm-2", name="db-01")  # keeps 10.0.0.5 on app-net
+    plan = make_plan(
+        vm_ids=["vm-1", "vm-2"],
+        nic_overrides={
+            "vm-1": {
+                "fa:16:3e:00:00:99": {"network": "rhoso-dmz"},
+                "fa:16:3e:00:00:01": {"network": "rhoso-missing"},
+                "fa:16:3e:00:00:02": {"fixed_ips": ["172.16.0.9"]},
+                "fa:16:3e:00:00:03": {"fixed_ips": ["10.0.0.5"]},
+            }
+        },
+    )
+    f = only(
+        check(vm, plan=plan, dst=override_dst(), all_vms=[vm, other]), "MAP_NIC_OVERRIDE_INVALID"
+    )
+    assert f.severity == Severity.blocker
+    assert "fa:16:3e:00:00:99: the VM has no NIC with this MAC" in f.message
+    assert "fa:16:3e:00:00:01: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:02: 172.16.0.9 lies in no subnet of 'app-net'" in f.message
+    assert "fa:16:3e:00:00:03: 10.0.0.5 also goes to db-01" in f.message
+    # addresses only, on a network pre-staging would create: its subnets cannot be checked yet
+    lost = make_vm(
+        source_id="vm-3",
+        nics=[Nic(network="lost-net", mac="fa:16:3e:00:00:05", fixed_ips=["10.9.0.5"])],
+    )
+    later = make_plan(nic_overrides={"vm-3": {"fa:16:3e:00:00:05": {"fixed_ips": ["10.9.0.6"]}}})
+    f = only(check(lost, plan=later, dst=override_dst()), "MAP_NIC_OVERRIDE_INVALID")
+    assert "fa:16:3e:00:00:05: RHOSO has no network 'lost-net' yet" in f.message
+    assert "name an existing RHOSO network" in f.message
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    vmw = only(check(vm, plan=plan, dst=override_dst(), source=vmware), "MAP_NIC_OVERRIDE_INVALID")
+    assert "migration kit keeps the guest's network settings" in vmw.message
 
 
 def test_vmware_sources_are_never_prestaged():

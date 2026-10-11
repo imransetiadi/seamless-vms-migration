@@ -404,6 +404,98 @@ async def test_neutron_mode_refuses_ports_exported_without_security_groups_befor
     assert rec.downtime_marks == 0
 
 
+def nic_ctx(env, strategy, overrides):
+    plan = make_plan(
+        id="plan-00c0ffee",
+        mappings=MAPPINGS,
+        nic_overrides={"srv-1": overrides} if overrides else {},
+    )
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy)
+    return make_ctx(plan, mig, SRC, DST, env.settings)
+
+
+def test_apply_nic_overrides_sends_a_port_elsewhere_by_address():
+    """SDD §7.2: the port with an entry (by MAC) goes to the entry's network; its addresses -
+    the entry's, else its own - become address-only references Neutron places by subnet."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    port = {
+        "mac_address": "FA:16:3E:00:00:01",
+        "network_ref": {"name": "app-net", "project_name": "finance", "domain_name": "Default"},
+        "fixed_ips_refs": [{"ip_address": "10.0.0.5", "subnet_ref": {"name": "app-subnet"}}],
+    }
+    other = {**port, "mac_address": "fa:16:3e:00:00:02"}
+    doc = {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {"ports": [{"params": port}, {"params": other}]},
+            }
+        ]
+    }
+    both = apply_nic_overrides(
+        doc, {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5"])}
+    )
+    first, second = (p["params"] for p in both["resources"][0]["params"]["ports"])
+    assert first["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "finance",
+        "domain_name": "Default",
+    }
+    assert first["fixed_ips_refs"] == [{"ip_address": "192.168.10.5"}]
+    assert second == other  # no entry: untouched
+    assert doc["resources"][0]["params"]["ports"][0]["params"] == port  # a copy
+    kept = apply_nic_overrides(doc, {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz")})
+    assert kept["resources"][0]["params"]["ports"][0]["params"]["fixed_ips_refs"] == [
+        {"ip_address": "10.0.0.5"}
+    ]
+
+
+async def test_a_cutover_writes_the_vms_nic_overrides_into_workloads(env):
+    """SDD §7.2: after the export the planned server's overridden port is rewritten."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    cold, _ = nic_ctx(env, Strategy.cold, entry)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"]["name"] == "rhoso-dmz"
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "192.168.10.5"}]
+
+
+async def test_a_warm_cutover_exports_again_for_the_vms_nic_overrides(env):
+    """The export of the first pre-copy predates the entry: the cutover exports again and the
+    overridden port goes where the entry says."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    plain, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.PRECOPY, plain)
+    warm, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.CUTOVER, warm)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["fixed_ips_refs"] == [
+        {"ip_address": "192.168.10.5"}
+    ]
+
+
+async def test_a_warm_cutover_exports_again_when_an_override_was_removed(env):
+    """An entry removed after the export left address-only references: the cutover exports the
+    workload again, so the port goes back to its mapped network and subnet."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    with_entry, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.PRECOPY, with_entry)
+    removed, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.CUTOVER, removed)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    refs = exported_server(env)["params"]["ports"][0]["params"]["fixed_ips_refs"]
+    assert refs[0]["subnet_ref"]["name"] == "app-subnet"
+
+
 async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
     """os-migrate exports workloads by name: a same-named server of the project that is not in
     the plan must never be imported, stopped or migrated (SDD §7.2)."""

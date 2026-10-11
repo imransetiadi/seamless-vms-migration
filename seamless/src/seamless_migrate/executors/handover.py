@@ -24,7 +24,7 @@ from typing import Any, TypeVar
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
-from ..domain.models import Mappings, Plan, Provider, utcnow
+from ..domain.models import Plan, Provider, utcnow
 from ..storage import (
     StorageError,
     manage_reference,
@@ -623,8 +623,26 @@ class HandoverExecutor:
         return nics
 
     @staticmethod
+    def _destination_nic(plan: Plan, vm_id: str, n: dict[str, Any]) -> tuple[str, list[str]]:
+        """A journaled port's RHOSO network and addresses (SDD §7.3 step 8): its NIC override's
+        network, else the mapped one; the override's addresses, else its own."""
+        entry = plan.nic_override(vm_id, n.get("mac_address"))
+        network = (entry.network if entry is not None else None) or plan.mappings.networks.get(
+            n["network"], n["network"]
+        )
+        if entry is not None and entry.fixed_ips is not None:
+            return network, list(entry.fixed_ips)
+        own = [ip["ip_address"] for ip in n.get("fixed_ips") or []]
+        # a definition journaled before every address was: its first one
+        return network, own or ([n["fixed_ip"]] if n.get("fixed_ip") else [])
+
+    @staticmethod
     def _destination_ports(
-        conn: Any, definition: dict[str, Any], mappings: Mappings, journal: _Journal
+        conn: Any,
+        definition: dict[str, Any],
+        plan: Plan,
+        vm_id: str,
+        journal: _Journal,
     ) -> list[dict[str, str]]:
         """Each port created first through Neutron on the mapped network with its MAC, every fixed
         IP, its security groups and its port-security flag (SDD §7.3 step 8), journaled: a resume
@@ -643,14 +661,14 @@ class HandoverExecutor:
                 if earlier:
                     port = earlier[0]
                 else:
-                    mapped = mappings.networks.get(n["network"], n["network"])
-                    network = conn.network.find_network(mapped, ignore_missing=False)
+                    target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
+                    network = conn.network.find_network(target, ignore_missing=False)
                     project_id = conn.current_project_id
                     attrs: dict[str, Any] = {
                         "network_id": _attr(network, "id"),
                         "mac_address": n["mac_address"],
                         # by address: Neutron picks the destination subnet that holds it
-                        "fixed_ips": [{"ip_address": ip["ip_address"]} for ip in n["fixed_ips"]],
+                        "fixed_ips": [{"ip_address": a} for a in addresses],
                         "security_group_ids": [
                             _attr(
                                 conn.network.find_security_group(
@@ -851,16 +869,18 @@ class HandoverExecutor:
 
             def create() -> str:
                 # the mode the definition was recorded in (step 2), as a resume must keep it
+                vm_id = ctx.migration.vm.source_id
                 if definition.get("port_creation_mode") == "neutron":
-                    networks = self._destination_ports(dst, definition, mappings, journal)
+                    networks = self._destination_ports(dst, definition, ctx.plan, vm_id, journal)
                 else:
                     networks = []
                     for n in definition["networks"]:
-                        mapped = mappings.networks.get(n["network"], n["network"])
-                        network = dst.network.find_network(mapped, ignore_missing=False)
+                        target, addresses = self._destination_nic(ctx.plan, vm_id, n)
+                        network = dst.network.find_network(target, ignore_missing=False)
                         net = {"uuid": _attr(network, "id")}
-                        if n.get("fixed_ip"):
-                            net["fixed_ip"] = n["fixed_ip"]
+                        # Nova keeps one address per port: its override's, else its first
+                        if addresses:
+                            net["fixed_ip"] = addresses[0]
                         networks.append(net)
                 flavor = mappings.flavors.get(definition["flavor"], definition["flavor"])
                 return self._create_server(

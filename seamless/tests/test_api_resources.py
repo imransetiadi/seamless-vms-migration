@@ -72,6 +72,7 @@ def test_provider_crud(api):
         "quotas",
         "projects",
         "keypairs",  # SDD §11
+        "subnets",  # SDD §11: where NIC override addresses must lie
     }
 
     # a provider used by a non-terminal plan cannot be deleted
@@ -166,6 +167,35 @@ def test_plan_port_creation_mode_round_trips_and_refuses_other_modes(api):
     bad = api.post("/api/v1/plans", Role.operator, json={**body, "port_creation_mode": "ovs"})
     assert bad.status_code == 422, bad.text
     assert "port_creation_mode" in bad.json()["error"]["message"]
+
+
+def test_plan_nic_overrides_round_trip_and_refuse_bad_entries(api):
+    """SDD §12: nic_overrides are stored with lower-case MACs; a bad entry is a 422 naming it."""
+    body = {
+        "name": "nics",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["nic_overrides"] == {}
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"nic_overrides": {"vm-1": {"FA:16:3E:00:00:01": {"network": "rhoso-dmz"}}}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["nic_overrides"] == {
+        "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": None}}
+    }
+    bad = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={**body, "nic_overrides": {"vm-1": {"fa:16:3e:00:00:01": {"fixed_ips": []}}}},
+    )
+    assert bad.status_code == 422, bad.text
+    assert "nic_overrides[vm-1][fa:16:3e:00:00:01]" in bad.json()["error"]["message"]
 
 
 def test_plan_rejects_out_of_range_tcp_port(api):

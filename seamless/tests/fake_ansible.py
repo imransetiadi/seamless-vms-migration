@@ -83,6 +83,7 @@ SCRIPT = textwrap.dedent(
                 "flavor_ref": {{"name": "m1.small", "project_name": "finance",
                                "domain_name": "Default"}},
                 "ports": [{{"params": {{
+                    "mac_address": "fa:16:3e:00:00:01",
                     "network_ref": {{"name": "app-net", "project_name": "finance",
                                     "domain_name": "Default"}},
                     "fixed_ips_refs": [{{"ip_address": "10.0.0.5", "subnet_ref": {{

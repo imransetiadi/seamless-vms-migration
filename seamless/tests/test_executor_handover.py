@@ -923,6 +923,56 @@ async def test_handover_rollback_deletes_only_its_own_ports_even_if_the_filter_i
     assert set(clouds["dst"].ports) == {"foreign", "other-vm"}
 
 
+def overridden(plan, entry, **kw):
+    """The plan with a NIC override for the handover VM's port (SDD §4.2)."""
+    return plan.model_copy(update={"nic_overrides": {"srv-1": {"fa:16:3e:00:00:01": entry}}, **kw})
+
+
+async def test_handover_step_8_sends_an_overridden_nic_where_its_entry_says(tmp_path):
+    """SDD §7.3 step 8: the port's entry decides its network and addresses - Nova gets its one
+    address in "nova" mode, Neutron every address in "neutron" mode; a network-only entry keeps
+    the port's own addresses."""
+    from seamless_migrate.domain.models import NicOverride
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5"])
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "nova")
+    await executor.run(
+        StepName.CUTOVER, make_ctx(overridden(plan, entry), mig, SRC, DST, settings)[0]
+    )
+    assert clouds["dst"].created[0]["networks"] == [
+        {"uuid": "dst-net-rhoso-dmz", "fixed_ip": "192.168.10.5"}
+    ]
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "neutron")
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)[
+        0
+    ]
+    await executor.run(StepName.CUTOVER, ctx)
+    [attrs] = clouds["dst"].port_attrs
+    assert (attrs["network_id"], attrs["fixed_ips"]) == (
+        "dst-net-rhoso-dmz",
+        [{"ip_address": "192.168.10.5"}],
+    )
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "network-only")
+    only_net = overridden(plan, NicOverride(network="rhoso-dmz"), port_creation_mode="neutron")
+    await executor.run(StepName.CUTOVER, make_ctx(only_net, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["dst"].port_attrs
+    assert (attrs["network_id"], attrs["fixed_ips"]) == (
+        "dst-net-rhoso-dmz",
+        [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+    )
+
+
+def test_destination_nic_of_a_definition_journaled_with_its_first_address_only():
+    """A definition from before every address was journaled keeps its first address."""
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-app"}))
+    port = {"network": "app-net", "fixed_ip": "10.0.0.5", "mac_address": "fa:16:3e:00:00:01"}
+    assert HandoverExecutor._destination_nic(plan, "srv-1", port) == ("rhoso-app", ["10.0.0.5"])
+    bare = {"network": "app-net", "fixed_ip": None}
+    assert HandoverExecutor._destination_nic(plan, "srv-1", bare) == ("rhoso-app", [])
+
+
 async def test_handover_in_nova_mode_records_no_port_groups(tmp_path):
     """The default mode is unchanged: no security-group lookups, Nova creates the port."""
     executor, calls, clouds, plan, mig, settings = setup(tmp_path)

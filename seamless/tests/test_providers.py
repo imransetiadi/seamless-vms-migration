@@ -192,6 +192,13 @@ class FakeNetwork:
     def networks(self, **_):
         return list(self._networks.values())
 
+    def subnets(self, **_):
+        return [
+            NS(name="app-subnet", network_id="net-1", cidr="10.0.0.0/24"),
+            NS(name="app-v6", network_id="net-1", cidr="fd00::/64"),
+            NS(name="orphan", network_id="net-gone", cidr="192.0.2.0/24"),
+        ]
+
     def agents(self, **_):
         binary = "ovn-controller" if self._ovn else "neutron-openvswitch-agent"
         return [
@@ -592,6 +599,11 @@ async def test_openstack_destination_inventory(stub_openstack):
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
     # SDD §11: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
     assert inv.keypairs == ["old-key", "ops-key"]
+    # SDD §11: the subnets it sees, by network name, where NIC override addresses must lie
+    assert inv.subnets == [
+        {"name": "app-subnet", "network": "app-net", "cidr": "10.0.0.0/24"},
+        {"name": "app-v6", "network": "app-net", "cidr": "fd00::/64"},
+    ]
 
 
 async def test_openstack_source_inventory_lists_the_credentials_keypairs(stub_openstack):

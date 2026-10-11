@@ -402,6 +402,13 @@ class FakeDestinationProvider:
             volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
+            # the demo VMs' addresses lie in these (SDD §11): NIC overrides validate against them
+            subnets=[
+                {"name": "finance-app-v4", "network": "finance-app", "cidr": "10.20.1.0/24"},
+                {"name": "finance-db-v4", "network": "finance-db", "cidr": "10.20.2.0/24"},
+                {"name": "dc2-prod-v4", "network": "dc2-prod", "cidr": "10.2.0.0/24"},
+                {"name": "dc2-dmz-v4", "network": "dc2-dmz", "cidr": "10.2.9.0/24"},
+            ],
         )
 
     async def get_server(self, server_id: str) -> dict[str, Any]:

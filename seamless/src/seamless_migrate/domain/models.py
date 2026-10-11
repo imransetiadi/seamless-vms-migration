@@ -6,7 +6,9 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import ipaddress
 import math
+import re
 import secrets
 from collections import Counter
 from collections.abc import Sequence
@@ -257,6 +259,35 @@ DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached ta
 ProbeKind = Literal["tcp", "http", "https"]
 
 
+#: a NIC override's key: six hex pairs, lower case (SDD §4.2, §12)
+_MAC = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}")
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+class NicOverride(_Model):
+    """A VM NIC's network and addresses at RHOSO (SDD §4.2): None keeps where the plan maps its
+    network, or its own addresses."""
+
+    network: str | None = None
+    fixed_ips: list[str] | None = None
+
+    @field_validator("fixed_ips")
+    @classmethod
+    def _canonical(cls, value: list[str] | None) -> list[str] | None:
+        """Valid addresses in their canonical form ("fd00:0::0005" is "fd00::5"); the others stay
+        as given, for invalid_plan_settings to name."""
+        if value is None:
+            return None
+        return [str(ipaddress.ip_address(a)) if _is_ip(a) else a for a in value]
+
+
 class AppProbe(_Model):
     """An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of ``path``."""
 
@@ -373,6 +404,35 @@ class PlanSpec(_Model):
     #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its
     #: security groups (SDD §6.6, §7.2, §9.2); "nova": one fixed IP per port and a new MAC
     port_creation_mode: Literal["nova", "neutron"] = "nova"
+    #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
+    #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
+    nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
+
+    def nic_override(self, vm_id: str, mac: str | None) -> NicOverride | None:
+        """The plan's override of a VM's NIC, by its MAC (SDD §4.2)."""
+        if not mac:
+            return None
+        return (self.nic_overrides.get(vm_id) or {}).get(mac.lower())
+
+    def nic_target(self, vm_id: str, nic: Nic) -> tuple[str, list[str]]:
+        """Where a VM's NIC goes at RHOSO (SDD §9.2, §9.3): its override's network, else the
+        plan's mapping of its network; its override's addresses, else its own."""
+        entry = self.nic_override(vm_id, nic.mac)
+        network = (entry.network if entry is not None else None) or self.mappings.networks.get(
+            nic.network, nic.network
+        )
+        if entry is not None and entry.fixed_ips is not None:
+            return network, list(entry.fixed_ips)
+        return network, list(nic.fixed_ips)
+
+    @field_validator("nic_overrides")
+    @classmethod
+    def _lower_case_macs(
+        cls, value: dict[str, dict[str, NicOverride]]
+    ) -> dict[str, dict[str, NicOverride]]:
+        return {
+            vm: {mac.lower(): entry for mac, entry in nics.items()} for vm, nics in value.items()
+        }
 
 
 PlanCreate = PlanSpec
@@ -380,6 +440,34 @@ PlanCreate = PlanSpec
 #: SDD §12: what one probe list may hold, and the longest http(s) path
 MAX_PROBES_PER_VM = 10
 MAX_PROBE_PATH = 200
+
+
+def _nic_override_problems(overrides: dict[str, dict[str, NicOverride]]) -> list[str]:
+    """What makes a NIC override unusable before any cloud is asked (SDD §12)."""
+    problems: list[str] = []
+    for vm_id, nics in overrides.items():
+        for mac in sorted(nics):
+            entry, where = nics[mac], f"nic_overrides[{vm_id}][{mac}]"
+            if not _MAC.fullmatch(mac):
+                problems.append(f"{where}: not a MAC address")
+            if entry.network is None and entry.fixed_ips is None:
+                problems.append(f"{where}: give a network, addresses or both")
+            if entry.network is not None and not entry.network.strip():
+                problems.append(f"{where}: network must not be empty")
+            if entry.fixed_ips is None:
+                continue
+            if not entry.fixed_ips:
+                problems.append(
+                    f"{where}: fixed_ips must list at least one address "
+                    "(leave it out to keep the NIC's own)"
+                )
+            bad = [a for a in entry.fixed_ips if not _is_ip(a)]
+            if bad:
+                problems.append(f"{where}: not an IP address: {', '.join(bad)}")
+            twice = sorted({a for a in entry.fixed_ips if entry.fixed_ips.count(a) > 1})
+            if twice:
+                problems.append(f"{where}: {', '.join(twice)} given twice")
+    return problems
 
 
 def _probe_problems(where: str, probes: Sequence[AppProbe]) -> list[str]:
@@ -426,6 +514,7 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     problems += _probe_problems("verification.app_probes", verification.app_probes)
     for vm_id, probes in spec.probe_overrides.items():
         problems += _probe_problems(f"probe_overrides[{vm_id}]", probes)
+    problems += _nic_override_problems(spec.nic_overrides)
     unknown = [r for r in spec.prestage_resources if r not in PRESTAGE_RESOURCES]
     if unknown:
         problems.append(f"prestage_resources: cannot pre-stage {', '.join(map(repr, unknown))}")
