@@ -1322,9 +1322,8 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
 `SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` from it, §8.1), `delete(kind, id)`,
-`append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, before_seq=None)`.
-Kinds: `provider`, `plan`,
-`migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
+`append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
+before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
 callers. `Store.ping() -> bool` backs the health routes (`GET /api/v1/health` reports
 `"db": "ok"|"error"` and the orchestrator loop; `GET /api/v1/ready` answers 503 while degraded).
@@ -1358,9 +1357,9 @@ such lists again on persisted migration events.
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider` |
+| POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
-| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider | `Provider` |
+| PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
 | DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
@@ -1412,7 +1411,8 @@ A plan's `name` holds at most 200 characters and its `description` 2000: `POST /
 `GET /events` pages forward: it returns the first `limit` matching events after `since`, and a client
 continues from the last `seq`. With `tail=true` it returns the newest `limit` matching events after
 `since` instead, still in ascending `seq`, so a history of the latest events is one request however
-many events are persisted (§16).
+many events are persisted (§16); `before` keeps only events below a `seq`, so `tail=true&before=` is the page
+before the oldest one a client shows, and the trail reads back to its start.
 
 Outside `/api/v1`: `GET /api/openapi.json` and `GET /api/docs` (Swagger UI) are public in demo mode
 and need the viewer role otherwise; FastAPI's default `/docs`, `/redoc` and `/openapi.json` are
@@ -1502,13 +1502,13 @@ Resolution order for a secret name: mounted files under `SEAMLESS_SECRETS_DIR`, 
 is `kubernetes`), then `SEAMLESS_SECRET_{NAME}_{KEY}` variables. A secret name is 1–128 letters, digits, `.`, `_` or `-`, starting with a
 letter or digit; `POST /providers` and `PATCH /providers/{id}` refuse (422) a `credentials_secret` or
 `conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. The whole name
-must match (a trailing newline does not), and it never starts with `provider-` unless it is the provider's own
-(`provider-{id}`, `provider-{id}-ssh`): those name other providers' secrets, which a check would send to this provider's
+must match (a trailing newline does not), and it never starts with `provider-` unless it is the provider's own for that
+field (`credentials_secret`: `provider-{id}`; `ssh_key_secret`: `provider-{id}-ssh`): those name other providers' secrets, which a check would send to this provider's
 endpoint. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
 (its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
 deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
 looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
-provider reads (`credentials_secret`, `conversion_host.ssh_key_secret`), never their values. An **OpenStack/RHOSO provider with a
+provider reads (data keys `credentials_secret` and `ssh_key_secret`), never their values. An **OpenStack/RHOSO provider with a
 `credentials_secret`** builds its connection from that secret — keys `auth_url` (default: the
 provider endpoint), `username`/`password`/`project_name`/`user_domain_name`/`project_domain_name`
 (`Default` when absent) for password auth, or `application_credential_id`/`application_credential_secret`
