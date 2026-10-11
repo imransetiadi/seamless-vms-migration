@@ -1,3 +1,4 @@
+import inspect
 import re
 
 import pytest
@@ -5,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
-from seamless_migrate.store import Store
+from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
 from tests.factories import make_migration
 
@@ -345,14 +346,16 @@ def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeyp
     api.store.delete("migration", gone.id)
     added = make_migration()
     api.store.put("migration", added)
+    # what the API's cache loads (the orchestrator's tick, in the same app, has a cache of its own)
     loaded: list[str] = []
-    real_get_many = api.store.get_many
+    real_get_many = AsyncStore.get_many
 
-    def counting_get_many(kind, ids, model_cls):
-        loaded.extend(ids)
-        return real_get_many(kind, ids, model_cls)
+    async def counting_get_many(self, kind, ids, model_cls):
+        if any(f.filename.endswith("deps.py") for f in inspect.stack(0)):
+            loaded.extend(ids)
+        return await real_get_many(self, kind, ids, model_cls)
 
-    monkeypatch.setattr(api.store, "get_many", counting_get_many)
+    monkeypatch.setattr(AsyncStore, "get_many", counting_get_many)
     stats = api.get("/api/v1/stats").json()
 
     after = svc._doc_cache["migration"].rows
