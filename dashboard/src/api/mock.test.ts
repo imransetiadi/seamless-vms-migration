@@ -729,6 +729,27 @@ describe('mock API', () => {
     expect(server.plans.find((p) => p.id === plan.id)!.status).toBe('draft');
   });
 
+  it('refuses the plans the API refuses on create and on edit, with its words (SDD §12)', async () => {
+    const { client } = setup('approver');
+    const base = { name: 'Checked', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['vm-b', 'vm-a'] };
+    const refused = async (body: Record<string, unknown>, message: string) =>
+      expect(client.post('/plans', { ...base, ...body })).rejects.toMatchObject({ status: 422, message });
+    await refused({ vm_ids: ['vm-b', 'vm-a', 'vm-b', 'vm-a', 'vm-c'] }, 'vm_ids lists a VM more than once: vm-a, vm-b');
+    await refused({ cutover_window: { start: '2026-10-08T14:00:00Z', end: '2026-10-08T12:00:00Z' } }, 'cutover_window: end must be after start');
+    await refused({ verification: { tcp_ports: [22, 0, 70000] } }, 'verification.tcp_ports [0, 70000] outside 1-65535');
+    await refused(
+      { verification: { windows_tcp_ports: [3389, 65536], timeout_s: -5 } },
+      'verification.windows_tcp_ports [65536] outside 1-65535; verification.timeout_s must not be negative (got -5)',
+    );
+    // an edit is checked on the plan it would store, kept fields included
+    const plan = await client.post<Plan>('/plans', base);
+    await expect(client.patch(`/plans/${plan.id}`, { cutover_window: { start: '2026-10-08T14:00:00Z', end: '2026-10-08T14:00:00Z' } })).rejects.toMatchObject({
+      status: 422,
+      message: 'cutover_window: end must be after start',
+    });
+    await expect(client.patch(`/plans/${plan.id}`, { vm_ids: ['vm-a', 'vm-a'] })).rejects.toMatchObject({ status: 422, message: 'vm_ids lists a VM more than once: vm-a' });
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;

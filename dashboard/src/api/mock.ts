@@ -267,13 +267,37 @@ function probeProblemsOf(where: string, value: unknown): string[] {
   return problems;
 }
 
-function refuseBadProbes(input: Record<string, unknown>): void {
-  const verification = input.verification as { app_probes?: unknown } | undefined;
-  const overrides = (input.probe_overrides ?? {}) as Record<string, unknown>;
-  const problems = [
-    ...probeProblemsOf('verification.app_probes', verification?.app_probes),
-    ...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)),
-  ];
+/** Python's `repr` of a list of numbers, as the API's messages print one. */
+function pyList(values: number[]): string {
+  return `[${values.join(', ')}]`;
+}
+
+/**
+ * The API's `check_plan_spec` after the text lengths (SDD §12), on the plan it would store: a VM listed twice, then
+ * the settings that would fail every verification or never open the cutover gate (`invalid_plan_settings`), in its
+ * order and words.
+ */
+function refusePlanSpec(spec: Record<string, unknown>): void {
+  const ids = Array.isArray(spec.vm_ids) ? (spec.vm_ids as string[]) : [];
+  const counts = new Map<string, number>();
+  for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+  const repeated = [...counts].filter(([, n]) => n > 1).map(([id]) => id).sort();
+  if (repeated.length) throw new HttpError(422, 'validation_error', `vm_ids lists a VM more than once: ${repeated.slice(0, 10).join(', ')}`);
+  const verification = (spec.verification ?? {}) as { tcp_ports?: unknown; windows_tcp_ports?: unknown; timeout_s?: unknown; app_probes?: unknown };
+  const problems: string[] = [];
+  for (const name of ['tcp_ports', 'windows_tcp_ports'] as const) {
+    const ports = Array.isArray(verification[name]) ? (verification[name] as number[]) : [];
+    const bad = ports.filter((port) => !(port >= 1 && port <= 65535));
+    if (bad.length) problems.push(`verification.${name} ${pyList(bad)} outside 1-65535`);
+  }
+  if (typeof verification.timeout_s === 'number' && verification.timeout_s < 0) {
+    problems.push(`verification.timeout_s must not be negative (got ${verification.timeout_s})`);
+  }
+  problems.push(...probeProblemsOf('verification.app_probes', verification.app_probes));
+  const overrides = (spec.probe_overrides ?? {}) as Record<string, unknown>;
+  problems.push(...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)));
+  const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
+  if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
 }
 
@@ -1706,12 +1730,12 @@ export class MockServer {
   private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
-    refuseBadProbes(input);
     const body = input as unknown as PlanCreate;
     if (!body.name || !String(body.name).trim()) throw new HttpError(422, 'validation_error', 'name is required.');
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
     // like the API (SDD §12): vm_ids is required; an empty list is a plan to fill later (the form asks for a VM)
     if (!Array.isArray(body.vm_ids)) throw new HttpError(422, 'validation_error', 'vm_ids: Field required');
+    refusePlanSpec({ ...defaultPlanFields(this.now()), ...input });
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
@@ -1757,7 +1781,6 @@ export class MockServer {
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     this.refuseLongPlanTexts(input);
-    refuseBadProbes(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
     // like the API (SDD §12): a failed migration's rollback acts on the clouds its attempt used
@@ -1773,6 +1796,8 @@ export class MockServer {
         );
       }
     }
+    // like the API (SDD §12): the plan it would store is checked, kept fields included
+    refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
     for (const key of Object.keys(input)) {
       if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
       (plan as unknown as Record<string, unknown>)[key] = input[key];
