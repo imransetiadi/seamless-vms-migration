@@ -3,19 +3,25 @@ import type { DerivedPlanStatus, Phase, ProviderStatus, Severity } from '../api/
 import { cn } from '../lib/cn';
 import { phaseMeta, type Tone } from '../lib/phase';
 import { planStatusMeta, providerStatusMeta, severityMeta, TONE_CLASSES } from '../lib/status';
+import { Term } from './Term';
 
 export interface StatusBadgeProps {
   tone: Tone;
   icon: LucideIcon;
   label: string;
-  /** Longer explanation shown as a tooltip. */
+  /** Longer explanation shown as a tooltip, for detail the label already conveys (a phase's description). */
   title?: string;
+  /**
+   * What the status asks for or why — a readiness flag's guidance: the label becomes a term that gives it on hover,
+   * focus and tap, never only in a title (SDD §16).
+   */
+  detail?: string;
   size?: 'sm' | 'md';
   className?: string;
 }
 
 /** Status is always icon + text + colour — never colour alone (SDD §16). */
-export function StatusBadge({ tone, icon: Icon, label, title, size = 'sm', className }: StatusBadgeProps) {
+export function StatusBadge({ tone, icon: Icon, label, title, detail, size = 'sm', className }: StatusBadgeProps) {
   return (
     <span
       title={title}
@@ -27,7 +33,8 @@ export function StatusBadge({ tone, icon: Icon, label, title, size = 'sm', class
       )}
     >
       <Icon aria-hidden className={cn('shrink-0', size === 'sm' ? 'size-3.5' : 'size-4')} />
-      <span className="truncate">{label}</span>
+      {/* the term is not in the truncating span: its overflow would clip the focus ring */}
+      {detail ? <Term definition={detail}>{label}</Term> : <span className="truncate">{label}</span>}
     </span>
   );
 }

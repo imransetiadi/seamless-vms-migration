@@ -655,7 +655,13 @@ export default function MigrationDetail() {
           <>
             <PhaseBadge phase={m.phase} size="md" />
             {m.data_issues.length > 0 && (
-              <StatusBadge tone="warning" icon={TriangleAlert} label="Data inconsistent" title="The numbers of this migration do not hold together (SDD §5.5)" size="md" />
+              <StatusBadge
+                tone="warning"
+                icon={TriangleAlert}
+                label="Data inconsistent"
+                detail="The numbers of this migration do not hold together: the downtime statistics leave it out."
+                size="md"
+              />
             )}
             <span className="text-sm text-foreground">{strategyLabel(m.strategy)}</span>
             {wave && <span className="text-sm text-muted-foreground">Wave {wave.order}: {wave.name}</span>}

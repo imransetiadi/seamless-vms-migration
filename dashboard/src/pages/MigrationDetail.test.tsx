@@ -427,6 +427,10 @@ describe('MigrationDetail', () => {
     m.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync', 'BYTES_MISMATCH: 1 bytes transferred, the passes add up to 2'];
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
     expect(await screen.findByText('Data inconsistent')).toBeInTheDocument();
+    // the header's badge says why on hover, focus and tap, never only in a title (SDD §16)
+    expect(screen.getByRole('button', { name: 'Data inconsistent' })).toHaveAccessibleDescription(
+      'The numbers of this migration do not hold together: the downtime statistics leave it out.',
+    );
     const notice = screen.getByRole('note', { name: 'Data inconsistent' });
     expect(notice).toHaveTextContent('The numbers of this migration do not hold together, so the downtime statistics leave it out.');
     const issues = within(notice).getAllByRole('listitem');

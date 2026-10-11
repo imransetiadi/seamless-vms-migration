@@ -320,6 +320,19 @@ describe('PlanDetail', () => {
     expect(await screen.findByText('1 VM finalized.')).toBeInTheDocument();
   });
 
+  it('says why a VM in the finalize queue needs a look on hover, focus and tap, never only in a title (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const cache = server.migrations.find((m) => m.vm.name === 'web-cache-01')!;
+    cache.source_running_at = '2026-10-08T11:00:00Z';
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    const row = within(queue).getByRole('listitem', { name: 'web-cache-01' });
+    expect(within(row).getByRole('button', { name: 'Source VM running' })).toHaveAccessibleDescription(/^Running again since .+: its data diverges from RHOSO$/);
+    expect(within(row).getByRole('button', { name: 'Finalize overdue' })).toHaveAccessibleDescription(`In Completed longer than the plan's ${plan.finalize_warning_h} h`);
+    expect(row.querySelector('[title]')).toBeNull();
+  });
+
   it('names each VM a bulk finalize skipped, with why, until dismissed (SDD §8.1, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

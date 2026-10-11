@@ -67,7 +67,7 @@ function ReadinessCell({ flags, level }: { flags: ReadinessFlag[]; level: Readin
       {level === 'ready' && <StatusBadge tone="success" icon={CircleCheck} label="Ready" />}
       {shown.map((flag) => {
         const meta = severityMeta(flag.severity);
-        return <StatusBadge key={flag.code} tone={meta.tone} icon={meta.icon} label={flag.label} title={`${flag.code}: ${flag.detail}`} />;
+        return <StatusBadge key={flag.code} tone={meta.tone} icon={meta.icon} label={flag.label} detail={`${flag.code}: ${flag.detail}`} />;
       })}
     </div>
   );

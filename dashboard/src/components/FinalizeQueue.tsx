@@ -99,11 +99,11 @@ export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize 
                           tone="danger"
                           icon={Power}
                           label="Source VM running"
-                          title={`Running again since ${formatDateTime(m.source_running_at)}: its data diverges from RHOSO`}
+                          detail={`Running again since ${formatDateTime(m.source_running_at)}: its data diverges from RHOSO`}
                         />
                       )}
                       {isOverdue(m, plan.finalize_warning_h, now) && (
-                        <StatusBadge tone="warning" icon={AlarmClock} label="Finalize overdue" title={`In Completed longer than the plan's ${plan.finalize_warning_h} h`} />
+                        <StatusBadge tone="warning" icon={AlarmClock} label="Finalize overdue" detail={`In Completed longer than the plan's ${plan.finalize_warning_h} h`} />
                       )}
                     </div>
                   </li>
