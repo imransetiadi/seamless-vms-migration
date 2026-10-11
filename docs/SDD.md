@@ -1598,7 +1598,9 @@ fixtures live in `seamless/tests/fixtures/jev_*_response.json`):
 The advisor is **advisory and bounded**: it never makes an ineligible strategy eligible, never
 skips approval, never triggers rollback or finalize.
 
-* `recommend_strategy(vm, estimates, plan) -> AdvisorNote | None` — called only when the
+* `recommend_strategy(vm, estimates, plan, findings=()) -> Advice | None` — `Advice` is Jev's answer (option,
+  confidence, distribution, scope, status) or why there is none (`unavailable`), which the orchestrator records as
+  an `AdvisorRecommendation` (§14.4) — called only when the
   deterministic selector reports a tie set of size ≥ 2 (`min_downtime`; under `simplest_meeting_slo`
   the choice has no tie, §9.2) or no eligible strategy meets the SLO.
   Calls `jev_decide` with candidate ids = eligible strategy names, evidence = disks, change rate,
