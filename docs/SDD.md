@@ -2018,7 +2018,10 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
   loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
-  lines, the format of `seamless events export`), `/advisor` (Jev/agentmemory status,
+  lines, the format of `seamless events export`; its stream line counts the new events without announcing each, and Pause
+  live updates stops everything that updates on its own — the list and that count — until Resume live updates, so only
+  pausing and resuming are announced, the resume with the number of held events it adds: WCAG 2.2.2, 4.1.3),
+  `/advisor` (Jev/agentmemory status,
   the recommendations feed — each entry shows "Recommended: <option> · <confidence>% confidence" and "Decision:
   <final option> — <why>" (applied automatically by policy <policy>; below threshold, default kept; advisor
   unavailable, decided by rules; no usable recommendation, decided by rules; …), never the word "Selected". A
