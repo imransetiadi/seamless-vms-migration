@@ -834,8 +834,13 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * `nic_overrides`: after the mappings, each port of the planned server whose `mac_address` (lower case) has an entry
   in `plan.nic_overrides[vm.source_id]` gets the entry's `network` as its `network_ref` name. Its addresses — the
   entry's `fixed_ips`, else the port's own — become address-only fixed IP references (no `subnet_ref`, §6.6), so
-  Neutron finds them in that network's subnets. A warm cutover exports the workload again first when the VM has an
-  entry, or when its `workloads.yml` holds an address-only reference (an entry removed since the export).
+  Neutron finds them in that network's subnets. A floating IP on one of the port's former addresses moves to
+  the port's new address of the same IP version; os-migrate attaches it by that address, and fails after Nova
+  created the server when no port holds it. With no such address, or with several, the cutover stops after the
+  export: a permanent failure naming the port, before the source stops. An entry whose MAC no exported port has
+  stops it the same way (the VM's NICs changed since validation). A warm cutover exports the workload again first
+  when the VM has an entry, or when its `workloads.yml` holds an address-only reference (an entry removed since
+  the export).
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
@@ -897,8 +902,8 @@ volumes with their server, so the order is:
      source again on rollback.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
-   (network, MAC, fixed IPs, port id, whether Nova created it; with `plan.port_creation_mode` `"neutron"` also its
-   security groups by name and its port-security flag), and the volume attachments in device
+   (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
+   `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
    order (volume id, device, boot index, bootable, type, size, Cinder host, the attachment's
    original `delete_on_termination`) and the resolved storage references (`storage`: per volume
    its family, source pool and destination host). The boot volume is the attachment at Nova's
@@ -928,8 +933,11 @@ volumes with their server, so the order is:
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
    MAC, every fixed IP (by address: Neutron picks the subnet), its security groups found by name in the
    destination credential's project, its port-security flag and the description `os-migrate:{source port id}`
-   (§6.6); it is journaled per port with its id, a resume uses again the journaled port or an unbound one with that
-   description, and Nova gets `{"port": id}` — the server's security groups apply only to ports Nova creates.
+   (§6.6). Each port is journaled with its id. A resume uses again the journaled port, or an unbound port that
+   carries that description and is on the target network, in the destination credential's project, with the MAC
+   and exactly the addresses step 8 would give it. The handover's admin credential sees every project's ports, and
+   a cold or warm migration of the same VM may have left one: any other port is never used. Nova gets `{"port": id}`,
+   since the server's security groups apply only to ports Nova creates.
    A port whose MAC has an entry in `plan.nic_overrides` goes to the entry's network instead of the mapped one,
    with the entry's addresses when it lists them (in `"nova"` mode its one address).
 
@@ -940,7 +948,8 @@ unbound with their description: a create sent before a crash), which Nova keeps;
 source with the reference for the source's family and pool, named `volume-<rhoso_volume_id>`, and the
 journaled source host/type (a definition journaled without `storage` is RBD), with the journaled image
 metadata set back (step 7); recreate
-the source ports with their journaled MAC and fixed IPs (admin is already required); recreate the
+the source ports with their journaled MAC, fixed IPs, security group ids and port-security flag (admin is already
+required; Nova applies a server's groups only to the ports it creates); recreate the
 source server from the journaled definition with the volumes in device order and their journaled
 `delete_on_termination`; start it. Every step is
 a metadata operation — data never moves — and each sub-step is journaled
@@ -954,7 +963,7 @@ is journaled as *sent* with the new server's id as soon as Nova accepts it: a cr
 it resumes by waiting for that server instead of creating a second one on the same volumes (one Nova no longer
 knows is created again), and the rollback deletes a sent destination server before it unmanages the volumes it
 holds. A recreated source server has a new id, and the plan follows it — `vm_ids`, the waves'
-`vm_ids`, `strategy_overrides` and `probe_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
+`vm_ids`, `strategy_overrides`, `probe_overrides` and `nic_overrides` (event `plan.updated`, data `{"vm_id_changed": {"from",
 "to"}}`) — before the migration becomes `rolled_back` (it then carries the new `vm`): a stop in between resumes
 `rolling_back` and repeats the rewrite, which changes nothing once done, so a rolled-back migration's plan never
 names a VM that no longer exists. QASuite marks handover as **lab-verification required** before production use.
@@ -1282,7 +1291,7 @@ Finding catalog (code — severity — condition):
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU (the destination network: the NIC's `plan.nic_overrides` entry's network, else the mapped one) |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
-| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one; `DestinationInventory.subnets`); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
+| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one; `DestinationInventory.subnets`) or is no host address there — as Neutron rules, an IPv4 subnet's network and broadcast addresses (below a /31) and an IPv6 subnet's first address; or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
@@ -2215,7 +2224,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
   the VM's `nic_overrides` entry, a plan edit (§12). Per NIC a destination network (the plan's mapping by default)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
-  edited. A VMware source says the migration kit keeps the guest's network settings —, a Verification panel — the VM's
+  edited. A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
+  address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
+  migration kit keeps the guest's network settings, and a VMware VM that still has entries offers "Remove the
+  overrides" (the same plan edit) —, a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
   plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
   Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
