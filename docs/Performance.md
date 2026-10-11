@@ -588,11 +588,12 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   migration, so 10 active migrations produce ≤ 10 messages/s fanned out to *N* clients (500 msg/s for 50
   dashboards) — negligible. Heartbeat every 15 s keeps proxies open; resume with `?since=<seq>` replays from
   the `events` table (`limit` ≤ 1,000).
-* **Reads:** `GET /migrations` filters and pages in SQL (expression indexes, SDD §11). `GET /stats` and
-  `GET /metrics` need every migration: they keep the last loaded list and reload it only when the store's
-  `change_stamp` (count + sum of versions, one aggregate query) moved — measured on SQLite with 1,000
-  migrations: a full load + validation 19 ms, the stamp 0.2 ms, so a 15 s Prometheus scrape or an idle
-  overview costs one aggregate query. `GET /plans` filters by `status` and pages like `/migrations`; it and
+* **Reads:** `GET /migrations` filters and pages in SQL (expression indexes, SDD §11). `GET /stats`,
+  `GET /metrics` and `GET /advisor/recommendations` need every migration: they keep the last loaded list while
+  the store's `change_stamp` (count + sum of versions, one aggregate query) holds, so a 15 s Prometheus scrape or
+  an idle overview costs one aggregate query; when it moved — a running plan writes a migration about every
+  second — they read `(id, version)` and load only the documents that changed (`Store.versions`, `get_many`,
+  61483aa): with 2 × 1,000 migrations on SQLite a call after one write fell from ≈ 220 ms to ≈ 7 ms CPU. `GET /plans` filters by `status` and pages like `/migrations`; it and
   `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one `SELECT DISTINCT` over the indexed
   `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
   226 → 39 ms and 153 → 32 ms CPU. Prefer SSE-triggered
