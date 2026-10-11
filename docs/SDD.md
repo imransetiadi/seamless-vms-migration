@@ -1881,7 +1881,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   `aria-busy` and `aria-disabled`, and ignores further presses), `prefers-reduced-motion` honoured,
   44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
   over it — so Tab never hides the focused control under them (WCAG 2.4.11), and Escape closing the topmost dialog
-  wherever the focus is, unless its request runs. An
+  wherever the focus is, unless its request runs or a note or definition is shown: that Escape dismisses only the
+  note or definition (WCAG 1.4.13), the next one the dialog. An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover). A status badge whose detail
   says what to do or why — a readiness flag's guidance, why a VM in the finalize queue needs a look, a migration
