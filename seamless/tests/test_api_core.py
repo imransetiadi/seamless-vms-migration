@@ -443,6 +443,26 @@ def test_spa_fallback_serves_index(tmp_path):
     store.dispose()
 
 
+def test_a_wrong_method_on_an_api_route_is_405_where_the_dashboard_is_served(tmp_path):
+    """SDD §12: 405 `method_not_allowed` for a method an API route does not take - the
+    dashboard's GET fallback must not turn a GET on a POST-only route into a 404."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa405.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/api/v1/plans/plan-00000001/start", "/api/v1/migrations/mig-1/cutover"):
+            res = client.get(path)
+            assert (res.status_code, res.json()["error"]["code"]) == (405, "method_not_allowed")
+        # an unknown API path stays 404, the dashboard's own routes stay the dashboard
+        missing = client.get("/api/v1/does-not-exist")
+        assert (missing.status_code, missing.json()["error"]["code"]) == (404, "not_found")
+        assert client.get("/plans/plan-00000001").status_code == 200
+    store.dispose()
+
+
 def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
     settings, _ = api_settings(tmp_path, auth_disabled=True, tokens_file=None)
     store = Store(f"sqlite:///{tmp_path / 'anon.db'}")

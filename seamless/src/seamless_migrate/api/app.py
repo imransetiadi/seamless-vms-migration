@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.routing import Match
 
 from .. import __version__
 from ..ai.advisor import Advisor
@@ -257,6 +258,16 @@ def _install_api_docs(app: FastAPI, settings: Settings) -> None:
 _DISABLED_DOCS = ("docs", "redoc", "openapi.json")
 
 
+def _api_path_takes_another_method(request: Request) -> bool:
+    """Whether a route other than this fallback matches the request's path for another method
+    (``Match.PARTIAL``); the API's routes sit in included routers, which answer it too."""
+    fallback = request.scope.get("route")
+    return any(
+        route is not fallback and route.matches(request.scope)[0] == Match.PARTIAL
+        for route in request.app.router.routes
+    )
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -264,8 +275,11 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
         app.mount("/assets", StaticFiles(directory=root / "assets"), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def spa(full_path: str) -> Any:
+    async def spa(full_path: str, request: Request) -> Any:
         first = full_path.split("/", 1)[0]
+        if first == "api" and _api_path_takes_another_method(request):
+            # the GET fallback must not turn a wrong method on an API route into a 404 (SDD §12)
+            return _error(405, "method_not_allowed", "Method Not Allowed")
         if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
         candidate = (root / full_path).resolve()
