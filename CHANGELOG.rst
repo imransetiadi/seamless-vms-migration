@@ -93,3 +93,6 @@ This project follows a simple changelog to satisfy collection metadata validatio
   a destination server of the same name (``re.escape``, then only an equal
   name counts): ``web.01`` was skipped as already migrated because of an
   unrelated ``web-01``, and a name such as ``app(`` failed.
+- The conversion-host SSH runs with ``ServerAliveInterval=15`` and
+  ``ServerAliveCountMax=4``: a silent network partition fails a pass after
+  about a minute instead of keeping the source stopped for about two hours.

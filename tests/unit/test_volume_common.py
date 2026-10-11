@@ -248,3 +248,22 @@ def test_a_live_owner_another_hosts_lock_and_a_bare_pid_keep_their_locks():
         assert not transfer.check_and_cleanup_lockfiles()
         assert transfer.shell.removed() == [], owner
         assert not any(c[:2] == ["sudo", "kill"] for c in transfer.shell.commands)
+
+
+def test_conversion_host_ssh_keeps_the_link_alive():
+    """SDD §6.6: a silent partition ends the ssh in about a minute (audit COL-09), for module
+    commands and for the data link a warm pass opens from the destination to the source."""
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
+
+    preamble = volume_common.RemoteShell("10.0.0.10", "cloud-user", "/keys/k").ssh_preamble()
+    pairs = list(zip(preamble, preamble[1:]))
+    assert ("-o", "ServerAliveInterval=15") in pairs
+    assert ("-o", "ServerAliveCountMax=4") in pairs
+    assert ("-o", "ConnectTimeout=10") in pairs
+    assert preamble[-1] == "cloud-user@10.0.0.10"
+
+    words = warm_migration.blocksync_receive_command(
+        "uuid-1", "/dev/vdb", "/dev/vdc", preamble, "cloud-user"
+    )
+    sender = words[words.index("--") + 1:]
+    assert "ServerAliveInterval=15" in sender and "ServerAliveCountMax=4" in sender

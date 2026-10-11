@@ -661,6 +661,12 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
             "StrictHostKeyChecking=no",
             "-o",
             "ConnectTimeout=10",
+            # a silent partition ends the ssh in about a minute, not the
+            # kernel's ~2 h TCP keepalive, while the source may be stopped (SDD §6.6)
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
         ]
         if self.key_path:
             options.extend(["-i", self.key_path])
