@@ -221,6 +221,8 @@ class TestServerPort(unittest.TestCase):
 
 
 MARKER = "os-migrate:uuid-test-server-port"
+# what SLAAC gives MAC fa:16:3e:ab:cd:ef on fd00:20::/64
+SLAAC_EUI64 = "fd00:20::f816:3eff:feab:cdef"
 TWO_IPS = [
     {"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.11"},
     {"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.12"},
@@ -342,6 +344,80 @@ class TestServerPortNeutron(unittest.TestCase):
         [(_, created)] = self.dst.calls_to("create_port")
         self.assertIs(created["is_port_security_enabled"], False)
         self.assertEqual(created["security_group_ids"], [])
+
+    def _auto_address_network(self):
+        """The port's network: an IPv4, a SLAAC, a DHCPv6-stateless and a stateful DHCPv6 subnet."""
+        for subnet in (
+            {"id": "uuid-test-subnet", "cidr": "192.168.0.0/24", "ipv6_address_mode": None, "ipv6_ra_mode": None},
+            {"id": "sub-slaac", "cidr": "fd00:20::/64", "ipv6_address_mode": "slaac", "ipv6_ra_mode": "slaac"},
+            {"id": "sub-stateless", "cidr": "fd00:30::/64", "ipv6_address_mode": None,
+             "ipv6_ra_mode": "dhcpv6-stateless"},
+            {"id": "sub-stateful", "cidr": "fd00:40::/64", "ipv6_address_mode": "dhcpv6-stateful",
+             "ipv6_ra_mode": "dhcpv6-stateful"},
+        ):
+            self.dst.subnets[subnet["id"]] = fake.Obj(network_id="uuid-test-net", **subnet)
+
+    def test_never_sends_an_address_neutron_derives_on_a_slaac_or_dhcpv6_stateless_subnet(self):
+        """SDD 6.6, review NC-01: Neutron 2023.1 allocates such a subnet's EUI-64 address of the
+        MAC on every port it creates, also when the address is sent, and the second allocation
+        fails (IpAddressAlreadyAllocated); with the MAC kept it derives the same address."""
+        self._auto_address_network()
+        ipv4 = {"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.11"}
+        stateful = {"ip_address": "fd00:40::5"}
+        sent = [
+            ipv4,
+            {"subnet_id": "sub-slaac", "ip_address": SLAAC_EUI64},
+            # address-only, on the DHCPv6-stateless subnet
+            {"ip_address": "fd00:30::f816:3eff:feab:cdef"},
+            stateful,
+        ]
+        sp = ServerPort.from_sdk(None, sdk_server_port())
+        sp._refs_from_ser = lambda conn: dict(server_port_refs(), fixed_ips=sent, fixed_ips_refs=[])
+        sp.create_or_update(self.dst)
+        [(_, created)] = self.dst.calls_to("create_port")
+        self.assertEqual(created["fixed_ips"], [ipv4, stateful])
+
+        # an IPv6-only SLAAC port: an explicit empty list, so Neutron adds that address and no other
+        self.dst = fake.FakeCloud("dst")
+        self._auto_address_network()
+        sp._refs_from_ser = lambda conn: dict(
+            server_port_refs(), fixed_ips=[sent[1]], fixed_ips_refs=[]
+        )
+        sp.create_or_update(self.dst)
+        [(_, created)] = self.dst.calls_to("create_port")
+        self.assertEqual(created["fixed_ips"], [])
+
+    def test_uses_again_the_earlier_port_with_the_addresses_neutron_derived(self):
+        """SDD 6.6, review NC-09: the earlier port holds what was asked for and the EUI-64
+        addresses Neutron added on SLAAC and DHCPv6-stateless subnets; a resumed cutover uses it
+        again, and still refuses one with another address."""
+        self._auto_address_network()
+        ipv4 = {"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.11"}
+        self.dst.add_port(
+            "p-earlier",
+            "fa:16:3e:ab:cd:ef",
+            network_id="uuid-test-net",
+            description=MARKER,
+            fixed_ips=[
+                ipv4,
+                {"subnet_id": "sub-slaac", "ip_address": SLAAC_EUI64},
+                {"subnet_id": "sub-stateless", "ip_address": "fd00:30::f816:3eff:feab:cdef"},
+            ],
+        )
+        sp = ServerPort.from_sdk(None, sdk_server_port())
+        sp._refs_from_ser = lambda conn: dict(
+            server_port_refs(),
+            fixed_ips=[ipv4, {"subnet_id": "sub-slaac", "ip_address": SLAAC_EUI64}],
+            fixed_ips_refs=[],
+        )
+        self.assertEqual(sp.create_or_update(self.dst), {"port": "p-earlier"})
+        self.assertEqual(self.dst.calls_to("create_port"), [])
+        self.dst.ports["p-earlier"]["fixed_ips"][0] = {
+            "subnet_id": "uuid-test-subnet",
+            "ip_address": "192.168.0.99",
+        }
+        with self.assertRaises(exc.InconsistentState):
+            sp.create_or_update(self.dst)
 
     def test_a_port_without_a_fixed_ip_is_created_without_one(self):
         # an explicit empty list: Neutron allocates no address, as at the source

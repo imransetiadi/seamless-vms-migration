@@ -610,9 +610,9 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.assertEqual(check("10.0.0.5", subnet="sub-app-v4"), [])
         self.assertIn("is no host address of subnet 10.0.0.0/24", check("10.0.1.5", subnet="sub-app-v4")[0])
         self.assertIn("not on the port's network", check("10.0.0.5", subnet="sub-p2p")[0])
-        # an IPv6 subnet's first address: refused for a port Nova creates, not for one
-        # created through Neutron, which has no owner yet
-        self.assertIn("is no host address", check("fd00:10::")[0])
+        # an IPv6 subnet's first address: Nova and the import create ports with no owner, and
+        # check_subnet_ip takes it for one (review NC-08)
+        self.assertEqual(check("fd00:10::"), [])
         self.assertEqual(check("fd00:10::", mode="neutron"), [])
 
     def test_follows_neutron_on_slaac_and_dhcpv6_stateless_subnets(self):
@@ -712,6 +712,22 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             [held] = self.errors([network_port("p1", "app", app)], mode=mode)
             self.assertIn("port p1 on network 'app': 10.0.0.5 is held by port taken", held)
         del self.dst.ports["taken"]
+        # an earlier attempt's port also holds what Neutron derived on a SLAAC subnet: still the
+        # one create_or_update uses again (SDD 6.6, review NC-09)
+        self.dst.subnets["sub-app-slaac"] = fake.Obj(
+            id="sub-app-slaac", network_id="net-app", cidr="fd00:50::/64",
+            ipv6_address_mode="slaac", ipv6_ra_mode="slaac",
+        )
+        self.dst.ports["mine"] = fake.Obj(
+            id="mine", network_id="net-app", mac_address="fa:16:3e:00:00:01",
+            fixed_ips=[
+                {"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"},
+                {"ip_address": "fd00:50::f816:3eff:fe00:1", "subnet_id": "sub-app-slaac"},
+            ],
+            device_id="", description="os-migrate:p1",
+        )
+        self.assertEqual(self.errors([network_port("p1", "app", app)], mode="neutron"), [])
+        del self.dst.ports["mine"], self.dst.subnets["sub-app-slaac"]
         # the earlier attempt's own unbound port holds it: used again, nothing to refuse
         self.dst.ports["mine"] = fake.Obj(
             id="mine", network_id="net-app", mac_address="fa:16:3e:00:00:01",

@@ -169,6 +169,12 @@ class ServerPort(osm_resource.Resource):
         if params.get("is_port_security_enabled") is not None:
             sdk_params["is_port_security_enabled"] = params["is_port_security_enabled"]
         sdk_params["description"] = port_description(info["id"])
+        # Neutron allocates a SLAAC or DHCPv6-stateless subnet's EUI-64 address of the MAC on
+        # every port it creates, also when it is sent, and a second allocation of one address
+        # fails: the address is left out, and an explicit list (maybe empty) keeps Neutron from
+        # adding an address of any other subnet (SDD 6.6)
+        subnets = list(conn.network.subnets(network_id=sdk_params["network_id"]))
+        sdk_params["fixed_ips"] = _requested_ips(sdk_params.get("fixed_ips") or [], subnets)
 
         sdk_port = self._earlier_port(conn, sdk_params)
         if sdk_port is None:
@@ -183,11 +189,18 @@ class ServerPort(osm_resource.Resource):
         mac = sdk_params.get("mac_address")
         if not mac:
             return None
-        wanted = sorted(ip["ip_address"] for ip in sdk_params.get("fixed_ips") or [])
+        # not counting the addresses Neutron derives itself on SLAAC or DHCPv6-stateless
+        # subnets: it adds them to every port it creates (SDD 6.6)
+        subnets = list(conn.network.subnets(network_id=sdk_params["network_id"]))
+        wanted = sorted(
+            ip["ip_address"] for ip in _requested_ips(sdk_params.get("fixed_ips") or [], subnets)
+        )
         for sdk_port in conn.network.ports(network_id=sdk_params["network_id"], mac_address=mac):
             if sdk_port["mac_address"] != mac or sdk_port["network_id"] != sdk_params["network_id"]:
                 continue
-            have = sorted(ip.get("ip_address") for ip in sdk_port["fixed_ips"] or [])
+            have = sorted(
+                ip.get("ip_address") for ip in _requested_ips(sdk_port["fixed_ips"] or [], subnets)
+            )
             if (
                 sdk_port["description"] == sdk_params["description"]
                 and not sdk_port["device_id"]
@@ -326,10 +339,11 @@ class ServerPort(osm_resource.Resource):
         return refs
 
 
-def _host_address(ip, cidr, created_by_nova):
-    """Neutron's check_subnet_ip (2023.1): an IPv4 subnet's network address is never a
-    port's, nor its broadcast address below a /31 (netaddr gives a /31 or /32 none); an
-    IPv6 subnet's first address is refused only to a port with an owner, one Nova creates."""
+def _host_address(ip, cidr):
+    """Neutron's check_subnet_ip (2023.1) for a port created with no owner, as Nova and the
+    import create theirs: an IPv4 subnet's network address is never a port's, nor its
+    broadcast address below a /31 (netaddr gives a /31 or /32 none); an IPv6 subnet's first
+    address is taken from a port without an owner (SDD 6.6)."""
     net = ipaddress.ip_network(cidr, strict=False)
     if ip.version != net.version or ip not in net:
         return False
@@ -337,7 +351,39 @@ def _host_address(ip, cidr, created_by_nova):
         return ip != net.network_address and (
             net.prefixlen >= 31 or ip != net.broadcast_address
         )
-    return not created_by_nova or ip != net.network_address
+    return True
+
+
+def _auto_address(subnet):
+    """Whether Neutron derives a port's address on `subnet` from its MAC (SLAAC or
+    DHCPv6-stateless, by address or RA mode)."""
+    return (
+        subnet.get("ipv6_address_mode") in AUTO_ADDRESS_MODES
+        or subnet.get("ipv6_ra_mode") in AUTO_ADDRESS_MODES
+    )
+
+
+def _subnet_of(fixed_ip, subnets):
+    """The subnet of the port's network that `fixed_ip` goes to: the one it names, else the
+    first that holds its address, as Neutron picks it; None when none does."""
+    if fixed_ip.get("subnet_id"):
+        return next((s for s in subnets if s["id"] == fixed_ip["subnet_id"]), None)
+    try:
+        ip = ipaddress.ip_address(fixed_ip["ip_address"])
+    except (KeyError, ValueError):
+        return None
+    return next((s for s in subnets if _host_address(ip, s["cidr"])), None)
+
+
+def _requested_ips(fixed_ips, subnets):
+    """The fixed IPs a port is created with through Neutron: all but those on a SLAAC or
+    DHCPv6-stateless subnet, whose EUI-64 address of the MAC Neutron adds itself (SDD 6.6)."""
+    out = []
+    for fixed_ip in fixed_ips:
+        subnet = _subnet_of(fixed_ip, subnets)
+        if subnet is None or not _auto_address(subnet):
+            out.append(fixed_ip)
+    return out
 
 
 def _eui64(cidr, mac):
@@ -359,24 +405,16 @@ def _address_refusal(fixed_ip, subnets, neutron, mac):
         ip = ipaddress.ip_address(fixed_ip["ip_address"])
     except ValueError:
         return "is not an IP address"
-    created_by_nova = not neutron
+    # an address alone: Neutron takes the first subnet of the network that holds it
+    subnet = _subnet_of(fixed_ip, subnets)
     if fixed_ip.get("subnet_id"):
-        subnet = next((s for s in subnets if s["id"] == fixed_ip["subnet_id"]), None)
         if subnet is None:
             return f"names subnet {fixed_ip['subnet_id']}, which is not on the port's network"
-        if not _host_address(ip, subnet["cidr"], created_by_nova):
+        if not _host_address(ip, subnet["cidr"]):
             return f"is no host address of subnet {subnet['cidr']}"
-    else:
-        # an address alone: Neutron takes the first subnet of the network that holds it
-        subnet = next(
-            (s for s in subnets if _host_address(ip, s["cidr"], created_by_nova)), None
-        )
-        if subnet is None:
-            return "is no host address of any subnet of the port's network"
-    if (
-        subnet.get("ipv6_address_mode") in AUTO_ADDRESS_MODES
-        or subnet.get("ipv6_ra_mode") in AUTO_ADDRESS_MODES
-    ):
+    elif subnet is None:
+        return "is no host address of any subnet of the port's network"
+    if _auto_address(subnet):
         # Neutron takes an explicit address there only if it derives the same one
         if not neutron or not mac:
             return (

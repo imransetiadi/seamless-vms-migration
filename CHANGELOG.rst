@@ -152,3 +152,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   import chooses them for every port: Nova creates the port with the user's
   token and its fixed IP, and ``port_creation_mode: neutron`` sends the MAC,
   every address and the port-security flag.
+- A port recreated through Neutron is created without its addresses on SLAAC
+  or DHCPv6-stateless subnets. Neutron 2023.1 allocates such a subnet's EUI-64
+  address of the MAC on every port it creates, also when the address is sent,
+  and a second allocation of one address fails (``IpAddressAlreadyAllocated``)
+  after the source has stopped. With the MAC kept Neutron derives the same
+  address, which ``import_workload_dst_check`` makes sure of. An explicit,
+  possibly empty, list keeps Neutron from adding an address of any other
+  subnet. Using again the port an earlier attempt created no longer counts the
+  addresses Neutron added on those subnets.
+- An IPv6 subnet's first address is no longer refused for a port Nova creates:
+  Nova creates its ports with no owner, and Neutron's ``check_subnet_ip`` takes
+  that address for a port without one.
