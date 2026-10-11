@@ -98,14 +98,14 @@ Server: the developer's host agentmemory at `http://localhost:3111` (`AGENTMEMOR
 ```bash
 # Collection (Track A)
 make test-ansible-units                      # CI path (podman container, ansible-test)
-python3 -m pytest tests/unit/test_blocksync.py -v   # stdlib-only blocksync engine
+PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # blocksync engine; $COLL: QASuite §14.2
 python3 tests/perf/bench_blocksync.py --size-gib 1  # throughput benchmark
 
 # Control plane (Track B)
 cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 make seamless-test                           # = cd seamless && .venv/bin/pytest -q
 SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db>' make seamless-test   # + PostgreSQL store tests
-cd seamless && .venv/bin/ruff check .
+cd seamless && .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests   # as CI runs it
 
 # Dashboard (Track C)
 make dashboard-build                         # npm ci + npm run build  (cd dashboard && npm test / npm run typecheck)

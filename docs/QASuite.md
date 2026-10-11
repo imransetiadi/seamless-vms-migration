@@ -899,7 +899,7 @@ mkdir -p "$COLL/ansible_collections/os_migrate" && ln -s "$PWD" "$COLL/ansible_c
 # unit tests: the whole directory, as CI and `make seamless-check` run it — no test may skip (the hypervisor
 # NBD-export tests of SEC-01 build their own collection tree; 216 passed on 2026-10-09, ansible-core 2.18 and 2.21)
 PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit -q -rs
-.venv/bin/python -m pytest tests/unit/test_blocksync.py -v          # stdlib-only engine, no collection needed
+PYTHONPATH="$COLL" ANSIBLE_COLLECTIONS_PATH="$COLL" .venv/bin/python -m pytest tests/unit/test_blocksync.py -v   # the engine alone; it imports through the collection layout
 python3 plugins/module_utils/blocksync.py --help
 
 # playbook syntax checks (Tasks A3, A4)
@@ -919,7 +919,7 @@ make test-ansible-lint test-ansible-sanity test-ansible-units
 cd seamless
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                                   # unit suites; SQLite store tests; live tests skip
-.venv/bin/ruff check .
+.venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests   # as CI and `make seamless-check` run it
 
 # PostgreSQL 16 for the store tests - an own container; the standing seamless-pg-test is left alone
 PGPW=$(openssl rand -hex 12)
@@ -967,7 +967,7 @@ Test conventions that keep the suite deterministic: `renderWithApp` seeds `GET /
 `/me` request and land on a soft-disabled button); an assertion on what an effect sets — `document.title`,
 focus — waits for it; and user-event runs without a timer turn per keystroke (`userEvent.setup({ delay: null })`):
 an idle run is no faster, but under six parallel full runs it cut the failures from 10-13 to 6-9 per run (what
-is left there are 15 s timeouts of a starved CPU).
+was left there were 15 s timeouts of a starved CPU; since e94e50e a local run uses 4 workers and allows 30 s per test).
 
 ### 14.5 Deployment artifacts (Track D)
 
@@ -1087,7 +1087,7 @@ DOCKER_HOST=unix://$HOME/.colima/seamless/docker.sock trivy image --severity HIG
 DOCKER_HOST=unix://$HOME/.colima/seamless/docker.sock trivy image --format cyclonedx --output sbom.cdx.json seamless-migrate:0.1.0
 trivy config deploy/                                  # manifests and compose
 
-VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash rbac-live.sh        # S-01 on the live stack (§14.7)
+VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash tests/e2e/rbac-live.sh        # S-01 on the live stack (§14.7)
 # ZAP baseline (S-23): see the command in §10 - demo stack only
 ```
 
