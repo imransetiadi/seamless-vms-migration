@@ -1,5 +1,6 @@
-import { screen } from '@testing-library/react';
+import { act, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import { LiveContext, LiveEventHub } from '../api/live';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { Layout } from './Layout';
 
@@ -34,7 +35,7 @@ describe('Layout health notice', () => {
     };
     renderWithApp(<Layout />, { route: '/', path: '/', server });
     expect(await screen.findByTestId('orchestrator-status')).toHaveTextContent(/stalled/i);
-    const notice = await screen.findByRole('status', { name: '' });
+    const notice = await screen.findByTestId('health-notice');
     expect(notice).toHaveTextContent(
       /control plane degraded: the database is unreachable; the orchestrator loop is unhealthy \(last tick 42 s ago\)/i,
     );
@@ -47,6 +48,32 @@ describe('Layout health notice', () => {
     expect(region).toHaveAttribute('role', 'status');
     expect(region).toHaveAttribute('aria-live', 'polite');
     expect(region).toBeEmptyDOMElement();
+  });
+
+  it('says once for the page when the live stream drops, comes back or stops, not its first connection (SDD §16)', async () => {
+    const hub = new LiveEventHub();
+    renderWithApp(
+      <LiveContext.Provider value={hub}>
+        <Layout />
+      </LiveContext.Provider>,
+      { route: '/', path: '/' },
+    );
+    await screen.findByRole('navigation', { name: /primary/i });
+    const regions = screen.getAllByRole('status');
+    const said = () => regions.map((r) => r.textContent ?? '').filter((t) => /live updates|signed out/i.test(t));
+    // the first connection, failed attempts before it included, is not news
+    act(() => hub.setStatus('connecting'));
+    act(() => hub.setStatus('reconnecting'));
+    act(() => hub.setStatus('open'));
+    expect(said()).toEqual([]);
+    act(() => hub.setStatus('reconnecting'));
+    expect(said()).toEqual(['Live updates lost: reconnecting.']);
+    act(() => hub.setStatus('open'));
+    expect(said()).toEqual(['Live updates back.']);
+    act(() => hub.setStatus('closed'));
+    expect(said()).toEqual(['Live updates stopped: the page shows what it last received.']);
+    act(() => hub.setStatus('unauthorized'));
+    expect(said()).toEqual(['Signed out: live updates stopped.']);
   });
 
   it('reports a dead orchestrator loop', async () => {

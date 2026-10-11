@@ -14,6 +14,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
 import { useHealth, useMe } from '../api/hooks';
+import { useLiveSnapshot, type LiveStatus } from '../api/live';
 import { useSignOut } from '../api/session';
 import { cn } from '../lib/cn';
 import { keepsFocus } from '../lib/navigation';
@@ -117,6 +118,37 @@ function HealthNotice() {
         tone === 'warning' && 'mb-4 rounded-md border border-status-warning/50 bg-status-warning/10 px-3 py-2 text-sm text-foreground',
       )}
     >
+      {text}
+    </p>
+  );
+}
+
+/**
+ * The live event stream's changes once it has been live — lost, back, stopped, signed out — said once for the
+ * page from a region already on it; the Live indicators only show them, and the first connection is not news
+ * (SDD §16).
+ */
+function StreamNotice() {
+  const { status } = useLiveSnapshot();
+  const [text, setText] = useState('');
+  const wasOpen = useRef(false);
+  const last = useRef<LiveStatus>(status);
+  useEffect(() => {
+    const previous = last.current;
+    last.current = status;
+    if (status === previous) return;
+    if (status === 'open') {
+      if (wasOpen.current) setText('Live updates back.');
+      wasOpen.current = true;
+      return;
+    }
+    if (!wasOpen.current) return;
+    if (status === 'reconnecting') setText('Live updates lost: reconnecting.');
+    else if (status === 'unauthorized') setText('Signed out: live updates stopped.');
+    else if (status === 'closed' || status === 'idle') setText('Live updates stopped: the page shows what it last received.');
+  }, [status]);
+  return (
+    <p role="status" className="sr-only">
       {text}
     </p>
   );
@@ -254,6 +286,7 @@ export function Layout() {
           className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
         >
           <HealthNotice />
+          <StreamNotice />
           <Outlet />
         </main>
       </div>
