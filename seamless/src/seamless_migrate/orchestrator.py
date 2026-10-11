@@ -662,8 +662,17 @@ class Orchestrator:
         # a memory outage is met once per validation: the search is not repeated for every VM
         memory_up = True
         for vm in vms:
+            # dst_caps: what the check above just read (its token's roles, SDD §9.3), not the
+            # capabilities `destination` held before it
             findings = run_preflight(
-                vm, plan, src_inv, dst_inv, vms, source=source, destination=destination
+                vm,
+                plan,
+                src_inv,
+                dst_inv,
+                vms,
+                source=source,
+                destination=destination,
+                dst_caps=dst_caps,
             )
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(vm, source.kind, plan, src_caps, dst_caps, findings)

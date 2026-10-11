@@ -203,8 +203,14 @@ class OpenStackProvider:
                     }
                 )
             storage.sort(key=lambda b: b["pool"])
+        # the role names of its token: what Neutron's port policy names (SDD §10, §6.6); left out
+        # when the token cannot tell, so that half of NET_PORT_NOT_PERMITTED is not judged
+        roles = _try(
+            lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
+        )
         return {
             "admin": admin,
+            **({"roles": roles} if roles is not None else {}),
             "compute_microversion": microversion,
             "ovn": ovn,
             "volume_backends": [b["pool"] for b in storage],
@@ -250,7 +256,8 @@ class OpenStackProvider:
         ]
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
-        # every network it sees with its owner: what a NIC's network name resolves to (SDD §11)
+        # every network it sees with its owner: what a NIC's network name resolves to; shared and
+        # external: whether the credential may put a port on another project's (SDD §10, §6.6)
         own_project = _attr(conn, "current_project_id", default=None)
         network_details = [
             {
@@ -260,10 +267,11 @@ class OpenStackProvider:
                 "project_id": _attr(n, "project_id", default=None),
                 "own": _attr(n, "project_id", default=None) == own_project,
                 "shared": bool(_attr(n, "is_shared", default=False)),
+                "external": bool(_attr(n, "is_router_external", default=False)),
             }
             for n in visible
         ]
-        # where a NIC's addresses must lie, by network name and id (SDD §11, §9.3)
+        # where a NIC's addresses must lie, by network name and id (SDD §10, §9.3)
         names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
         subnets = [
             {

@@ -378,6 +378,9 @@ class FakeCloud:
         self.security_groups = {}
         self.group_lookups = []
         self.current_project_id = f"{name}-project"
+        # keystoneauth: the role names of the token (the handover's admin credential)
+        self.roles = ["admin", "member", "reader"]
+        self.session = NS(auth=NS(get_access=lambda session: NS(role_names=list(self.roles))))
         self.network_list = None
         self.subnet_list = None
         self.image_metadata = {}
@@ -1690,7 +1693,7 @@ async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
     projects, and a shared one another project owns when it is the only one of that name."""
     own = NS(id="own-net", name="rhoso-app", project_id="dst-project")
     other = NS(id="other-net", name="rhoso-app", project_id="tenant-b")
-    shared = NS(id="shared-net", name="rhoso-app", project_id="admin-project")
+    shared = NS(id="shared-net", name="rhoso-app", project_id="admin-project", is_shared=True)
     for name, listed, expected in (
         ("own", [other, own], "own-net"),
         ("shared", [shared], "shared-net"),
@@ -1706,6 +1709,68 @@ async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
         await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
         [attrs] = clouds["dst"].port_attrs
         assert attrs["network_id"] == expected, name
+
+
+async def test_handover_step_0_refuses_a_network_the_credential_may_not_put_a_port_on(tmp_path):
+    """SDD §7.3 step 0, §6.6: another project's network takes the port only when it is shared with
+    the credential's project or external, and from a token with the admin or advsvc role. The
+    admin credential sees every project's private networks: step 8 must never use one."""
+    private = NS(
+        id="private-net",
+        name="rhoso-app",
+        project_id="tenant-b",
+        is_shared=False,
+        is_router_external=False,
+    )
+    shared = NS(
+        id="shared-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=True,
+        is_router_external=False,
+    )
+    external = NS(
+        id="ext-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=False,
+        is_router_external=True,
+    )
+    for name, listed, roles, refusal in (
+        (
+            "private",
+            [private],
+            ["admin", "member", "reader"],
+            "'rhoso-app' (project tenant-b): it is neither shared with the credential's project "
+            "nor external",
+        ),
+        (
+            "member",
+            [shared],
+            ["member", "reader"],
+            "'rhoso-app' (project admin-project): Neutron lets only the admin or advsvc role, or "
+            "that project, choose a port's address or MAC there",
+        ),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        clouds["dst"].roles = roles
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert refusal in str(refused.value), name
+        assert "port-1" in str(refused.value), name
+        # the VM keeps running: nothing was stopped
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+    for name, listed, roles in (
+        ("shared", [shared], ["admin"]),
+        ("external", [external], ["admin"]),
+        ("advsvc", [shared], ["advsvc"]),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        clouds["dst"].roles = roles
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["networks"][0]["uuid"] == listed[0].id, name
 
 
 async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):

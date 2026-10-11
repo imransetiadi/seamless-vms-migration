@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -146,6 +147,49 @@ async def test_validate_creates_migrations_with_findings_and_estimates(tmp_path,
     assert len(await h.migrations(plan.id)) == 3
     with pytest.raises(NotFound):
         await h.orch.validate_plan("plan-unknown0", "alice")
+
+
+async def test_validation_judges_a_network_with_the_roles_its_check_just_read(tmp_path, store):
+    """SDD §9.3, §10: NET_PORT_NOT_PERMITTED judges the roles the destination's check reports at
+    this validation, not the capabilities an earlier check stored."""
+
+    class MemberDestination(StaticDestination):
+        """A member's token; its app-net belongs to another project, which shares it."""
+
+        async def check(self):
+            return {**await super().check(), "roles": ["member", "reader"]}
+
+        async def inventory(self):
+            shared = {
+                "id": "net-app",
+                "name": "app-net",
+                "mtu": 1500,
+                "project_id": "project-admin",
+                "own": False,
+                "shared": True,
+                "external": False,
+            }
+            subnet = {
+                "name": "app-v4",
+                "network": "app-net",
+                "network_id": "net-app",
+                "cidr": "10.0.0.0/24",
+            }
+            return dataclasses.replace(
+                await super().inventory(), network_details=[shared], subnets=[subnet]
+            )
+
+    h, plan = await setup(tmp_path, store, [vm(1)], destination=MemberDestination())
+    # an earlier check stored an admin token's roles
+    store.put(
+        "provider",
+        DST_PROVIDER.model_copy(update={"capabilities": {"admin": True, "roles": ["admin"]}}),
+    )
+    await h.orch.validate_plan(plan.id, "alice")
+    web = await h.by_vm(plan.id, "vm-1")
+    assert [f.code for f in web.findings] == ["NET_PORT_NOT_PERMITTED"]
+    assert "'app-net' (project project-admin)" in web.findings[0].message
+    assert web.phase == P.blocked
 
 
 async def test_validation_records_resolved_flavor_mapping(tmp_path, store):

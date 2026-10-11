@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -11,7 +11,7 @@ from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
-from .networks import resolve_network
+from .networks import port_refusal, resolve_network
 
 S = Strategy
 
@@ -165,6 +165,13 @@ CATALOG: dict[str, CatalogEntry] = {
         "Give the NIC an address its RHOSO network takes: map its network to one whose subnets "
         "hold it, or set the address in a NIC override; for a SLAAC address keep the MAC "
         '(port_creation_mode "neutron").',
+    ),
+    "NET_PORT_NOT_PERMITTED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Send the NIC to a network of the credential's project: map its network to one, or set "
+        "a NIC override on the VM's migration page. Another project's shared or external "
+        "network takes it once the RHOSO credential has the admin role.",
     ),
     "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
         Severity.blocker,
@@ -604,11 +611,13 @@ def run_preflight(
     *,
     source: Provider | None = None,
     destination: Provider | None = None,
+    dst_caps: Mapping[str, Any] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
     ``all_vms`` are the plan's selected VMs (for duplicate names and cumulative quotas);
-    ``source``/``destination`` enable the conversion-host check.
+    ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
+    destination's capabilities as validation's check just reported them (its token's roles).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -714,6 +723,28 @@ def run_preflight(
             finding(
                 "MAP_NETWORK_AMBIGUOUS",
                 "The cutover cannot tell these RHOSO networks apart: " + "; ".join(ambiguous) + ".",
+            )
+        )
+
+    # whether the credential may put each NIC's port on its resolved network: another project's
+    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3)
+    roles = (dst_caps or {}).get("roles")
+    denied = []
+    for nic in vm.nics if openstack_source else ():
+        network = resolved.get(id(nic))
+        why = None if network is None else port_refusal(network, roles)
+        if network is not None and why:
+            denied.append(
+                f"{(nic.mac or '?').lower()} on {network['name']!r} "
+                f"(project {network.get('project_id')}): {why}"
+            )
+    if denied:
+        out.append(
+            finding(
+                "NET_PORT_NOT_PERMITTED",
+                "The RHOSO credential may not put these NICs on their network: "
+                + "; ".join(denied)
+                + ".",
             )
         )
 

@@ -51,7 +51,9 @@ def dst_inv(**kw) -> DestinationInventory:
     return DestinationInventory(**data)
 
 
-def check(vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, destination=DST):
+def check(
+    vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, destination=DST, dst_caps=None
+):
     vm = vm or make_vm()
     return run_preflight(
         vm,
@@ -61,6 +63,7 @@ def check(vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, dest
         all_vms if all_vms is not None else [vm],
         source=source,
         destination=destination,
+        dst_caps=dst_caps,
     )
 
 
@@ -93,6 +96,7 @@ def test_catalog_is_complete():
         "NET_PORT_IPS",
         "MAP_NETWORK_AMBIGUOUS",
         "NET_ADDRESS_REFUSED",
+        "NET_PORT_NOT_PERMITTED",
         "MAP_NIC_OVERRIDE_INVALID",
         "MAP_NIC_OVERRIDE",
         "VM_PCI_PASSTHROUGH",
@@ -884,15 +888,17 @@ def test_catalog_matches_sdd_9_3():
         assert CATALOG[code].severity == severity, code
 
 
-def net(network_id, name, own=True, mtu=1500, project_id=None):
-    """A DestinationInventory.network_details entry (SDD §11)."""
+def net(network_id, name, own=True, mtu=1500, project_id=None, shared=None, external=False):
+    """A DestinationInventory.network_details entry (SDD §10); another project's is shared
+    unless said otherwise."""
     return {
         "id": network_id,
         "name": name,
         "mtu": mtu,
         "project_id": project_id or ("finance-id" if own else f"{network_id}-owner"),
         "own": own,
-        "shared": not own,
+        "shared": (not own) if shared is None else shared,
+        "external": external,
     }
 
 
@@ -1011,6 +1017,63 @@ def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network(
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, dst=resolved_dst(details))]
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, dst=gone, source=vmware)]
+
+
+def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
+    """SDD §9.3, §6.6: another project's network takes a NIC only when it is shared with the
+    credential's project or external, and from a token with the admin or advsvc role - Neutron's
+    policy lets only those, or the network's project, choose the address or MAC the cutover asks
+    for after the source stops. Without reported roles only the first half is judged."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="FA:16:3E:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-net"}))
+    member = {"admin": False, "roles": ["member", "reader"]}
+
+    def found(network, caps, plan=plan, **kw):
+        dst = resolved_dst([network], [subnet_of(network["id"], "rhoso-net", "10.0.0.0/24")])
+        return check(vm, plan=plan, dst=dst, dst_caps=caps, **kw)
+
+    shared = net("p", "rhoso-net", own=False, project_id="project-admin")
+    external = net(
+        "e", "rhoso-net", own=False, project_id="project-admin", shared=False, external=True
+    )
+    private = net("b", "rhoso-net", own=False, project_id="project-b", shared=False)
+    f = only(found(shared, member), "NET_PORT_NOT_PERMITTED")
+    assert f.severity == Severity.blocker and f.remediation
+    assert f.message == (
+        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+        "'rhoso-net' (project project-admin): Neutron lets only the admin or advsvc role, or that "
+        "project, choose a port's address or MAC there, and the credential's token has neither."
+    )
+    assert only(found(external, member), "NET_PORT_NOT_PERMITTED").message == f.message
+    # with the admin or advsvc role a shared or external network takes it
+    for roles in (["admin", "member", "reader"], ["advsvc"]):
+        for network in (shared, external):
+            assert "NET_PORT_NOT_PERMITTED" not in [
+                x.code for x in found(network, {"roles": roles})
+            ]
+    # another project's private network never does: the admin sees it, the VM must not land there
+    for caps in (member, {"admin": True, "roles": ["admin"]}, None, {}):
+        f = only(found(private, caps), "NET_PORT_NOT_PERMITTED")
+        assert f.message == (
+            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+            "'rhoso-net' (project project-b): it is neither shared with the credential's project "
+            "nor external."
+        )
+    # no reported roles (a destination checked by another implementation): that half is not judged
+    for caps in (None, {"admin": True}):
+        assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, caps)]
+    # the credential's own network, whatever the roles
+    own = net("o", "rhoso-net")
+    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own, member)]
+    # a NIC override's network is judged the same way
+    moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-net"}}})
+    assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, plan=moved)]
+    # VMware NICs go through the migration kit, which this rule does not cover
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, member, source=vmware)]
 
 
 def test_mtu_and_nic_override_subnets_follow_the_resolved_network():

@@ -329,6 +329,7 @@ class FakeSourceProvider:
             }
         return {
             "admin": True,
+            "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.88",
             "ovn": True,
             **_storage_caps(_SOURCE_POOLS.values()),
@@ -368,8 +369,10 @@ class FakeDestinationProvider:
         self.deleted: set[str] = set()
 
     async def check(self) -> dict[str, Any]:
+        # an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
         return {
             "admin": True,
+            "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.95",
             "ovn": True,
             **_storage_caps(_DESTINATION_POOLS),
@@ -391,7 +394,7 @@ class FakeDestinationProvider:
             "volumes": 1000,
             "gigabytes": 200_000,
         }
-        # the credential's own networks, and a provider network another project shares (SDD §11)
+        # the credential's own networks, and a provider network another project shares (SDD §10)
         networks = [
             ("finance-app", 1500, True, "10.20.1.0/24"),
             ("finance-db", 8942, True, "10.20.2.0/24"),
@@ -413,10 +416,11 @@ class FakeDestinationProvider:
                     "project_id": "project-demo" if own else "project-admin",
                     "own": own,
                     "shared": not own,
+                    "external": False,
                 }
                 for name, mtu, own, _ in networks
             ],
-            # the demo VMs' addresses lie in these (SDD §11): NIC addresses validate against them
+            # the demo VMs' addresses lie in these (SDD §10): NIC addresses validate against them
             subnets=[
                 {
                     "name": f"{name}-v4",

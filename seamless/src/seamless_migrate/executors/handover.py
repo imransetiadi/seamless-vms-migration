@@ -26,6 +26,7 @@ from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Plan, Provider, utcnow
 from ..planning.ipam import address_refusal
+from ..planning.networks import port_refusal
 from ..storage import (
     StorageError,
     manage_reference,
@@ -151,6 +152,15 @@ def _destination_network(conn: Any, name: str) -> Any:
         f"RHOSO has {len(seen)} networks named {name!r}, none in the credential's project "
         f"(projects {projects})"
     )
+
+
+def _token_roles(conn: Any) -> set[str] | None:
+    """The role names of the credential's token, or None when it cannot tell (SDD §6.6)."""
+    try:
+        return set(conn.session.auth.get_access(conn.session).role_names or [])
+    except Exception:  # an auth plugin without access info: that half is not judged
+        log.debug("could not read the token's roles", exc_info=True)
+        return None
 
 
 def port_description(source_port_id: str) -> str:
@@ -487,10 +497,12 @@ class HandoverExecutor:
     def _port_problems(
         dst: Any, networks: list[dict[str, Any]], plan: Plan, vm_id: str
     ) -> list[str]:
-        """What would make step 8 fail on a port, found while the VM still runs (§7.3 step 0): its
-        RHOSO network does not resolve with step 8's lookup, or an address step 8 would give it is
-        one Neutron refuses there (§6.6)."""
+        """What would make step 8 fail on a port, or put it where it must not go, found while the
+        VM still runs (§7.3 step 0): its RHOSO network does not resolve with step 8's lookup, the
+        credential may not put a port there, or an address step 8 would give it is one Neutron
+        refuses there (§6.6)."""
         neutron = plan.port_creation_mode == "neutron"
+        roles = _token_roles(dst)
         problems: list[str] = []
         for n in networks:
             target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
@@ -500,6 +512,19 @@ class HandoverExecutor:
             except PermanentStepError as exc:
                 problems.append(f"{where}: {exc}")
                 continue
+            # another project's network only when shared or external, and from the admin or advsvc
+            # role: the admin credential sees every project's private networks (§6.6)
+            project = _attr(network, "project_id")
+            why_not = port_refusal(
+                {
+                    "own": project == dst.current_project_id,
+                    "shared": bool(_attr(network, "is_shared", False)),
+                    "external": bool(_attr(network, "is_router_external", False)),
+                },
+                roles,
+            )
+            if why_not:
+                problems.append(f"{where} on {target!r} (project {project}): {why_not}")
             net_id = _attr(network, "id")
             subnets = list(dst.network.subnets(network_id=net_id))
             # Nova keeps one address per port (step 8)

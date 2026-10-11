@@ -272,15 +272,33 @@ def fake_conn(admin=True, ovn=True):
         )
     ]
     networks = [
-        NS(id="net-1", name="app-net", mtu=1442, project_id="proj-1", is_shared=False),
-        NS(id="net-9", name="provider-vlan9", mtu=1500, project_id="admin-proj", is_shared=True),
+        NS(
+            id="net-1",
+            name="app-net",
+            mtu=1442,
+            project_id="proj-1",
+            is_shared=False,
+            is_router_external=False,
+        ),
+        NS(
+            id="net-9",
+            name="provider-vlan9",
+            mtu=1500,
+            project_id="admin-proj",
+            is_shared=True,
+            is_router_external=False,
+        ),
     ]
+    # keystoneauth: conn.session.auth.get_access(conn.session).role_names (SDD §10)
+    roles = ["admin", "member", "reader"] if admin else ["member", "reader"]
+    auth = NS(get_access=lambda session: NS(role_names=roles))
     return NS(
         compute=FakeCompute([server], admin=admin),
         block_storage=FakeBlockStorage(volumes),
         network=FakeNetwork(ports, networks, ovn=ovn),
         identity=NS(get_project=lambda pid: NS(id=pid, name="finance")),
         current_project_id="proj-1",
+        session=NS(auth=auth),
     )
 
 
@@ -534,6 +552,7 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps == {
         "admin": True,
+        "roles": ["admin", "member", "reader"],
         "compute_microversion": "2.95",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
@@ -549,6 +568,26 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["admin"] is False and caps["ovn"] is False
+    assert caps["roles"] == ["member", "reader"]
+
+
+async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):
+    """SDD §10, §9.3: the token's role names are what NET_PORT_NOT_PERMITTED judges; a token
+    whose roles cannot be read reports none, so that half of the rule is not judged."""
+    conn = fake_conn()
+
+    def unreadable(session):
+        raise RuntimeError("the auth plugin keeps no access info")
+
+    conn.session = NS(auth=NS(get_access=unreadable))
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert "roles" not in caps and caps["admin"] is True
+    conn.session = NS(
+        auth=NS(get_access=lambda session: NS(role_names=["reader", "admin", "admin"]))
+    )
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["roles"] == ["admin", "reader"]
 
 
 async def test_openstack_check_reports_storage_backends_with_family(stub_openstack):
@@ -595,7 +634,8 @@ async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
 
 
 async def test_openstack_destination_inventory(stub_openstack):
-    stub_openstack(fake_conn())
+    conn = fake_conn()
+    stub_openstack(conn)
     dst = OpenStackProvider(
         make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination),
         settings(),
@@ -606,9 +646,10 @@ async def test_openstack_destination_inventory(stub_openstack):
         {"name": "m1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": {}}
     ]
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
-    # SDD §11: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
+    # SDD §10: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
     assert inv.keypairs == ["old-key", "ops-key"]
-    # SDD §11: every network it sees, with its owner: what a NIC's network name resolves to
+    # SDD §10: every network it sees, with its owner: what a NIC's network name resolves to;
+    # shared and external: whether the credential may put a port on another project's (§6.6)
     assert inv.network_details == [
         {
             "id": "net-1",
@@ -617,6 +658,7 @@ async def test_openstack_destination_inventory(stub_openstack):
             "project_id": "proj-1",
             "own": True,
             "shared": False,
+            "external": False,
         },
         {
             "id": "net-9",
@@ -625,8 +667,11 @@ async def test_openstack_destination_inventory(stub_openstack):
             "project_id": "admin-proj",
             "own": False,
             "shared": True,
+            "external": False,
         },
     ]
+    conn.network.get_network("net-9").is_router_external = True
+    assert (await dst.inventory()).network_details[1]["external"] is True
     # the subnets it sees, by network name and id, where a NIC's addresses must lie
     assert inv.subnets == [
         {
@@ -1328,12 +1373,15 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
 
 
 async def test_fake_destination_inventory_resolves_every_demo_nic():
-    """SDD §11, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
-    subnets take its addresses - the demo plans are not blocked by MAP_NETWORK_AMBIGUOUS or
-    NET_ADDRESS_REFUSED - and the shared provider network is another project's."""
+    """SDD §10, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
+    subnets take its addresses, and that the demo's admin credential may use - the demo plans are
+    not blocked by MAP_NETWORK_AMBIGUOUS, NET_ADDRESS_REFUSED or NET_PORT_NOT_PERMITTED - and the
+    shared provider network is another project's."""
     from seamless_migrate.planning.preflight import run_preflight
     from tests.factories import make_plan
 
+    caps = await FakeDestinationProvider(seed=42).check()
+    assert "admin" in caps["roles"]
     dst = await FakeDestinationProvider(seed=42).inventory()
     ids = {n["id"] for n in dst.network_details}
     assert all(s["network_id"] in ids for s in dst.subnets)
@@ -1347,6 +1395,7 @@ async def test_fake_destination_inventory_resolves_every_demo_nic():
         for mode in ("nova", "neutron"):
             plan = make_plan(port_creation_mode=mode)
             for vm in vms:
-                codes = [f.code for f in run_preflight(vm, plan, src, dst, vms)]
+                codes = [f.code for f in run_preflight(vm, plan, src, dst, vms, dst_caps=caps)]
                 assert "MAP_NETWORK_AMBIGUOUS" not in codes, (vm.name, codes)
                 assert "NET_ADDRESS_REFUSED" not in codes, (seed, vm.name, mode, codes)
+                assert "NET_PORT_NOT_PERMITTED" not in codes, (seed, vm.name, mode, codes)
