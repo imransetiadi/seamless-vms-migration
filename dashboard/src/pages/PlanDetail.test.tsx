@@ -282,6 +282,46 @@ describe('PlanDetail', () => {
     expect(plan.status).toBe('draft');
   });
 
+  it('leaves a VM the plan now probes out of the probe warning, focus moving to the plan heading (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.verification = { ...plan.verification, app_probes: [] };
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    node.findings = [...node.findings, { code: 'APP_PROBE_MISSING', severity: 'warning', message: 'analytics-node-1 is a database VM without an application probe.', remediation: null, strategies: [] }];
+    node.suggested_probes = [{ kind: 'tcp', port: 5432, path: '/', expect_status: null }];
+    const other = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    other.findings = [...other.findings, { code: 'APP_PROBE_MISSING', severity: 'warning', message: 'analytics-node-2 is a database VM without an application probe.', remediation: null, strategies: [] }];
+    other.suggested_probes = [{ kind: 'tcp', port: 5432, path: '/', expect_status: null }];
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Application probes' });
+    expect(panel).toHaveTextContent('3 database VMs have no application probe.');
+    const row = within(panel).getByRole('listitem', { name: 'analytics-node-1' });
+    await user.click(within(row).getByRole('button', { name: 'Use suggested probe' }));
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Probe analytics-node-1 on TCP 5432?' })).getByRole('button', { name: 'Use suggested probe' }));
+    // probed now: the warning leaves it out, though its finding stays until the next validation
+    await waitFor(() => expect(row).not.toBeInTheDocument());
+    expect(panel).toHaveTextContent('2 database VMs have no application probe.');
+    expect(screen.getByRole('heading', { level: 1, name: plan.name })).toHaveFocus();
+    // a later Cancel keeps focus on the button that opened the dialog
+    const next = within(within(panel).getByRole('listitem', { name: 'analytics-node-2' })).getByRole('button', { name: 'Use suggested probe' });
+    await user.click(next);
+    await user.click(within(await screen.findByRole('alertdialog', { name: 'Probe analytics-node-2 on TCP 5432?' })).getByRole('button', { name: 'Cancel' }));
+    expect(next).toHaveFocus();
+  });
+
+  it('shows no probe warning when the plan probes every VM (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.verification = { ...plan.verification, app_probes: [{ kind: 'tcp', port: 5432, path: '/', expect_status: null }] };
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    expect(db.findings.map((f) => f.code)).toContain('APP_PROBE_MISSING');
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('region', { name: /^migrations$/i });
+    await screen.findByRole('table', { name: /migrations in/i });
+    expect(screen.queryByRole('region', { name: 'Application probes' })).not.toBeInTheDocument();
+  });
+
   it('keeps Use suggested probe from a viewer, and from a plan that cannot be edited, saying why', async () => {
     const server = createTestServer();
     const running = server.plans.find((p) => p.status === 'running')!;

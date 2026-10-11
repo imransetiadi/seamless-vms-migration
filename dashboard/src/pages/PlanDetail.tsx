@@ -465,7 +465,7 @@ export default function PlanDetail() {
           />
         )}
         <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
-        <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} />
+        <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} focusAfterRef={headingRef} />
 
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
           <SettingsSummary plan={p} providers={providers.data ?? []} policy={policy?.policy} builtIn={policy?.builtIn} />

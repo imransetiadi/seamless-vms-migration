@@ -1,10 +1,10 @@
 import { Activity, ShieldQuestion } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { usePatchPlan } from '../api/hooks';
 import type { AppProbe, Migration, Plan } from '../api/types';
 import type { Availability } from '../lib/planActions';
-import { describeProbes, withVmProbes } from '../lib/probes';
+import { describeProbes, probesFor, withVmProbes } from '../lib/probes';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Panel } from './Panel';
@@ -15,16 +15,23 @@ export interface ProbeWarningsProps {
   /** The plan's Edit availability (SDD §12): using a suggestion edits the plan. */
   edit: Availability;
   onSaved?: (text: string) => void;
+  /** Where focus goes once Use suggested probe saved and its row went (the plan's heading, SDD §16). */
+  focusAfterRef?: RefObject<HTMLElement>;
 }
 
 /**
  * "{n} database VMs have no application probe." (SDD §9.3, §16, ADV-18): each one with the rules'
  * suggestion and Use suggested probe, which saves it as the VM's own probe — a plan edit.
  */
-export function ProbeWarnings({ plan, migrations, edit, onSaved }: ProbeWarningsProps) {
+export function ProbeWarnings({ plan, migrations, edit, onSaved, focusAfterRef }: ProbeWarningsProps) {
   const patch = usePatchPlan(plan.id);
   const [asking, setAsking] = useState<{ m: Migration; probes: AppProbe[] } | null>(null);
-  const missing = migrations.filter((m) => m.phase !== 'cancelled' && m.findings.some((f) => f.code === 'APP_PROBE_MISSING'));
+  // read by the dialog as it closes: empty on Cancel, the plan's heading once the probe was saved (SDD §16)
+  const afterRef = useRef<HTMLElement | null>(null);
+  // a VM the plan now probes is left out: its finding stays until the next validation (SDD §16)
+  const missing = migrations.filter(
+    (m) => m.phase !== 'cancelled' && m.findings.some((f) => f.code === 'APP_PROBE_MISSING') && probesFor(m.vm.source_id, plan).probes.length === 0,
+  );
   if (missing.length === 0) return null;
   const close = () => {
     setAsking(null);
@@ -37,6 +44,8 @@ export function ProbeWarnings({ plan, migrations, edit, onSaved }: ProbeWarnings
       { probe_overrides: withVmProbes(plan, m.vm.source_id, probes) },
       {
         onSuccess: () => {
+          // probed now, its row goes with its button
+          afterRef.current = focusAfterRef?.current ?? null;
           setAsking(null);
           onSaved?.(`${m.vm.name} is probed on ${describeProbes(probes)}. The plan is a draft again: validate it before starting.`);
         },
@@ -63,7 +72,15 @@ export function ProbeWarnings({ plan, migrations, edit, onSaved }: ProbeWarnings
                 </p>
               </div>
               {m.suggested_probes.length > 0 && (
-                <Button size="sm" icon={Activity} disabledReason={edit.reason} onClick={() => setAsking({ m, probes: m.suggested_probes })}>
+                <Button
+                  size="sm"
+                  icon={Activity}
+                  disabledReason={edit.reason}
+                  onClick={() => {
+                    afterRef.current = null;
+                    setAsking({ m, probes: m.suggested_probes });
+                  }}
+                >
                   Use suggested probe
                 </Button>
               )}
@@ -78,6 +95,7 @@ export function ProbeWarnings({ plan, migrations, edit, onSaved }: ProbeWarnings
         confirmLabel="Use suggested probe"
         pending={patch.isPending}
         error={asking !== null ? patch.error : null}
+        returnFocusRef={afterRef}
         onConfirm={confirm}
         onCancel={close}
       />
