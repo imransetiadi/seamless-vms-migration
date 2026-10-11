@@ -1844,6 +1844,11 @@ the plan is in flight — with the same message, naming what releases each VM �
 only if the plan did not change since it was read (a server that started or validated it meanwhile), and
 otherwise fails and asks to run it again, so it never overwrites a change it did not see.
 
+A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
+errors the API answers with a status (§12). A provider SDK's message is redacted and cut at 500
+characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race with a running server
+(`ConflictError`: the document changed since it was read) says so and asks to run the command again.
+
 ### 15.1 Configuration (environment)
 
 | Variable | Default | Meaning |
