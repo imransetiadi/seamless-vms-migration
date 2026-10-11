@@ -1007,7 +1007,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 
 `Plan.status` stays the lifecycle the orchestrator drives (above). What every view shows is
 `derive_plan_status(plan, migrations) -> DerivedPlanStatus`, returned as `Plan.derived_status` by every plan
-route and never stored — a re-validation of a finished plan stores `validated` although its migrations completed
+route and never stored (the rules read only the set of the plan's phases: the routes take it from `Store.plan_phases`,
+§11, and never load the migrations for it) — a re-validation of a finished plan stores `validated` although its migrations completed
 (seen on the demo after 10 October), and a stored status cannot tell a finished plan from a finalized one. Over the
 migrations that are not `cancelled`, in this order:
 
@@ -1314,7 +1315,9 @@ top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`
 pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
 other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
 aggregate over the kind; moves on every insert, update or delete — `GET /stats` and `GET /metrics`
-reload their full document lists only when it moved), `delete(kind, id)`,
+reload their full document lists only when it moved), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
+`SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
+`derived_status` from it, §8.1), `delete(kind, id)`,
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`.
 Kinds: `provider`, `plan`,
 `migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
