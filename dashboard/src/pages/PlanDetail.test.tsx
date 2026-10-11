@@ -1113,7 +1113,7 @@ describe('PlanDetail', () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
     plan.keep_warm_interval_s = 600;
-    plan.prestage_resources = ['networks', 'subnets', 'flavors', 'keypairs'];
+    plan.prestage_resources = ['networks', 'subnets', 'flavors', 'images'];
     renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
 
     await user.click(await actionButton(/^edit plan$/i));
@@ -1125,13 +1125,13 @@ describe('PlanDetail', () => {
     expect(within(prestage).getByRole('checkbox', { name: /^networks/i })).toBeChecked();
     expect(within(prestage).getByRole('checkbox', { name: /^routers/i })).not.toBeChecked();
     expect(within(prestage).getByRole('checkbox', { name: /^flavors/i })).toBeChecked();
-    expect(prestage).toHaveTextContent(/also pre-staged: keypairs/i);
+    expect(prestage).toHaveTextContent(/also pre-staged: images/i);
     await user.clear(keepWarm);
     await user.type(keepWarm, '20');
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(plan.keep_warm_interval_s).toBe(1200);
-    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'flavors', 'keypairs']);
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'flavors', 'images']);
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['keep_warm_interval_s'] });
 
     // turning a default on keeps the canonical order and the extra entry
@@ -1141,7 +1141,7 @@ describe('PlanDetail', () => {
     await user.click(within(within(dialog).getByRole('group', { name: /pre-staged at the destination/i })).getByRole('checkbox', { name: /^routers/i }));
     await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'flavors', 'keypairs']);
+    expect(plan.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'flavors', 'images']);
     expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['prestage_resources'] });
   });
 

@@ -159,9 +159,16 @@ const PRESTAGE_LABEL: Record<string, string> = {
   security_groups: 'Security groups',
   security_group_rules: 'Security group rules',
   flavors: 'Flavors',
+  keypairs: 'Keypairs',
 };
-/** Offered as well but off by default: only the plan's flavors RHOSO lacks are created (SDD §7.2, §16). */
-const OPTIONAL_PRESTAGE = ['flavors'];
+/** Offered as well but off by default, each scoped to the plan (SDD §7.2, §16), with what it does. */
+const OPTIONAL_PRESTAGE_NOTE: Record<string, string> = {
+  flavors:
+    "Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.",
+  keypairs:
+    "Off by default. Imports the VMs' keypairs the migration user lacks at RHOSO (name and public key), when the source migration user owns them; otherwise the VM is blocked until the keypair exists.",
+};
+const OPTIONAL_PRESTAGE = Object.keys(OPTIONAL_PRESTAGE_NOTE);
 /** Every resource the form offers, in the order they are created. */
 const OFFERED_PRESTAGE = [...DEFAULT_PRESTAGE, ...OPTIONAL_PRESTAGE];
 const isOfferedPrestage = (resource: string): boolean => OFFERED_PRESTAGE.includes(resource);
@@ -991,21 +998,20 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     />
                   ))}
                 </div>
-                <div>
-                  {OPTIONAL_PRESTAGE.map((resource) => (
+                {OPTIONAL_PRESTAGE.map((resource) => (
+                  <div key={resource}>
                     <Checkbox
-                      key={resource}
                       label={PRESTAGE_LABEL[resource] ?? resource}
                       checked={form.prestage.includes(resource)}
                       disabled={source?.kind === 'vmware'}
-                      describedBy={id('prestage-flavors-note')}
+                      describedBy={id(`prestage-${resource}-note`)}
                       onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
                     />
-                  ))}
-                  <p id={id('prestage-flavors-note')} className="pl-7 text-xs text-muted-foreground">
-                    Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.
-                  </p>
-                </div>
+                    <p id={id(`prestage-${resource}-note`)} className="pl-7 text-xs text-muted-foreground">
+                      {OPTIONAL_PRESTAGE_NOTE[resource]}
+                    </p>
+                  </div>
+                ))}
                 {plan && plan.prestage_resources.some((r) => !isOfferedPrestage(r)) && (
                   <p className="text-xs text-muted-foreground">
                     Also pre-staged: {plan.prestage_resources.filter((r) => !isOfferedPrestage(r)).join(', ')} (set through the API; kept).

@@ -425,10 +425,11 @@ describe('Plans page', () => {
     await user.clear(keepWarm);
     await user.type(keepWarm, '30');
     const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
-    expect(within(prestage).getAllByRole('checkbox')).toHaveLength(7);
+    expect(within(prestage).getAllByRole('checkbox')).toHaveLength(8);
     expect(within(prestage).getByRole('checkbox', { name: /^security group rules/i })).toBeChecked();
-    // flavors are opt-in (SDD §16)
+    // flavors and keypairs are opt-in (SDD §16)
     expect(within(prestage).getByRole('checkbox', { name: /^flavors/i })).not.toBeChecked();
+    expect(within(prestage).getByRole('checkbox', { name: /^keypairs/i })).not.toBeChecked();
     await user.click(within(prestage).getByRole('checkbox', { name: /^security group rules/i }));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 
@@ -453,11 +454,14 @@ describe('Plans page', () => {
     const flavors = within(prestage).getByRole('checkbox', { name: /^flavors/i });
     expect(flavors).toHaveAccessibleDescription(/flavors of the plan's vms that rhoso lacks/i);
     await user.click(flavors);
+    const keypairs = within(prestage).getByRole('checkbox', { name: /^keypairs/i });
+    expect(keypairs).toHaveAccessibleDescription(/keypairs the migration user lacks at rhoso/i);
+    await user.click(keypairs);
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 
     await waitFor(() => expect(server.plans.some((p) => p.name === 'Flavors too')).toBe(true));
     expect(server.plans.find((p) => p.name === 'Flavors too')!.prestage_resources).toEqual([
-      'networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules', 'flavors',
+      'networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules', 'flavors', 'keypairs',
     ]);
   });
 

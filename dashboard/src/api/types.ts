@@ -222,6 +222,8 @@ export interface VMRef {
   snapshot_count: number;
   tools_ok: boolean | null;
   change_rate_bps: number | null;
+  /** The Nova keypair the server boots with (OpenStack); absent or null for VMware (SDD §4.1). */
+  key_name?: string | null;
   /** Derived and serialized: Σ size_gb · 2^30. */
   disk_bytes: number;
   /** Derived and serialized: Σ used_gb · 2^30 when every disk has used_gb, else ⌊disk_bytes · 0.6⌋. */
