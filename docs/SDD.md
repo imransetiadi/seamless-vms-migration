@@ -1907,7 +1907,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
 * Downtime against the SLO: Overview's Downtime now and the migration page's clock use one rule — calm
   below 80 % of the plan's downtime SLO, a warning (amber, hourglass icon) from 80 %, a breach (red,
   warning icon) past 100 % — so a VM never reads differently on the two pages, and the warning is never
-  colour alone; the time left or over reads as a clock (m:ss) on both, the SLO itself as a duration.
+  colour alone; the time left or over reads as a clock (m:ss) on both, the SLO itself as a duration. On the
+  migration page the crossings seen while it is open — into the warning, past the SLO — are announced once each from
+  a region already on the page, never the clock's every tick.
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
   Finalized, Failed — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
   showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
