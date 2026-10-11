@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
-import { createMockFetch, MockServer } from './mock';
+import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
 import { streamEvents } from './stream';
 import {
   ADVISOR_NOTE_KINDS,
@@ -727,6 +727,44 @@ describe('mock API', () => {
     });
     expect(server.migrations.filter((m) => m.plan_id === plan.id)).toEqual([]);
     expect(server.plans.find((p) => p.id === plan.id)!.status).toBe('draft');
+  });
+
+  it('refuses an edit naming a field a plan cannot change, before anything else, like the API (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'draft' || p.status === 'validated')!;
+    const before = JSON.stringify(plan);
+    await expect(client.patch(`/plans/${plan.id}`, { description: 'x', status: 'running', waves: [], id: 'plan-00000000' })).rejects.toMatchObject({
+      status: 422,
+      message: 'fields cannot be changed: id, status, waves',
+    });
+    expect(JSON.stringify(plan)).toBe(before);
+    // the API's PLAN_EDITABLE_FIELDS, field for field
+    expect([...PLAN_EDITABLE_FIELDS].sort()).toEqual([
+      'auto_cutover',
+      'convergence_threshold_bytes',
+      'cutover_window',
+      'default_strategy',
+      'description',
+      'destination_provider_id',
+      'downtime_slo_s',
+      'estimator_overrides',
+      'finalize_warning_h',
+      'handover',
+      'keep_warm_interval_s',
+      'link_bps',
+      'mappings',
+      'max_sync_passes',
+      'name',
+      'prestage_resources',
+      'probe_overrides',
+      'require_approval',
+      'require_distinct_approver',
+      'selection_policy',
+      'source_provider_id',
+      'strategy_overrides',
+      'verification',
+      'vm_ids',
+    ]);
   });
 
   it('refuses the plans the API refuses on create and on edit, with its words (SDD §12)', async () => {

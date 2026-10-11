@@ -267,6 +267,15 @@ function probeProblemsOf(where: string, value: unknown): string[] {
   return problems;
 }
 
+/** The API's `PLAN_EDITABLE_FIELDS` (SDD §12): what a `PlanCreate` and a PATCH may carry. */
+export const PLAN_EDITABLE_FIELDS: ReadonlySet<string> = new Set([
+  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'created_at', 'updated_at'].includes(key)),
+  'name',
+  'source_provider_id',
+  'destination_provider_id',
+  'vm_ids',
+]);
+
 /** Python's `repr` of a list of numbers, as the API's messages print one. */
 function pyList(values: number[]): string {
   return `[${values.join(', ')}]`;
@@ -1779,6 +1788,9 @@ export class MockServer {
   }
 
   private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    // like the API (SDD §12): the body is a partial PlanCreate, a field it cannot change is refused first
+    const unknown = Object.keys(input).filter((key) => !PLAN_EDITABLE_FIELDS.has(key)).sort();
+    if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     this.refuseLongPlanTexts(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
@@ -1798,10 +1810,7 @@ export class MockServer {
     }
     // like the API (SDD §12): the plan it would store is checked, kept fields included
     refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
-    for (const key of Object.keys(input)) {
-      if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
-      (plan as unknown as Record<string, unknown>)[key] = input[key];
-    }
+    for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" updated`, data: { fields: Object.keys(input) } });
