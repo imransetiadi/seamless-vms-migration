@@ -1,4 +1,4 @@
-import { QueryClient } from '@tanstack/react-query';
+import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
@@ -246,6 +246,48 @@ describe('createBatchedInvalidator', () => {
       batch.invalidate(['stats']);
       vi.advanceTimersByTime(100);
       expect(spy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a slow refetch finish while events keep arriving, instead of cancelling it at every flush', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      let finished = 0;
+      const starts: number[] = [];
+      // an API that answers in 800 ms, slower than the 400 ms flush
+      const observer = new QueryObserver(queryClient, {
+        queryKey: ['migrations'],
+        queryFn: ({ signal }) =>
+          new Promise<number>((resolve, reject) => {
+            starts.push(Date.now());
+            const timer = setTimeout(() => resolve(++finished), 800);
+            signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              reject(new DOMException('aborted', 'AbortError'));
+            });
+          }),
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(finished).toBe(1);
+      const batch = createBatchedInvalidator(queryClient, 400);
+      // an event every 300 ms for 6 s
+      for (let i = 0; i < 20; i++) {
+        batch.invalidate(['migrations']);
+        await vi.advanceTimersByTimeAsync(300);
+      }
+      // the list still refreshed while the events went on
+      expect(finished).toBeGreaterThanOrEqual(4);
+      // and once they stop, a fetch that began after the last event shows its change
+      const lastEvent = Date.now() - 300;
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(Math.max(...starts)).toBeGreaterThanOrEqual(lastEvent);
+      expect(queryClient.isFetching({ queryKey: ['migrations'] })).toBe(0);
+      unsubscribe();
+      batch.dispose();
     } finally {
       vi.useRealTimers();
     }

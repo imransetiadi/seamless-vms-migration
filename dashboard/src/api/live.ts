@@ -104,9 +104,16 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
   let timer: ReturnType<typeof setTimeout> | null = null;
   const flush = () => {
     timer = null;
-    const keys = [...pending.values()];
+    const keys = [...pending.entries()];
     pending.clear();
-    for (const queryKey of keys) void queryClient.invalidateQueries({ queryKey });
+    for (const [id, queryKey] of keys) {
+      // a refresh under way is neither cancelled — with events faster than a slow API none would ever finish —
+      // nor trusted to show this event, which may have come after its request: the key waits for the next batch,
+      // and is refreshed once the running request is done (SDD §16)
+      if (queryClient.isFetching({ queryKey }) > 0) pending.set(id, queryKey);
+      else void queryClient.invalidateQueries({ queryKey });
+    }
+    if (pending.size > 0) timer ??= setTimeout(flush, delayMs);
   };
   return {
     invalidate(queryKey: QueryKey) {
