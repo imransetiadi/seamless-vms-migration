@@ -1314,8 +1314,10 @@ Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `adv
 top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
 pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
 other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
-aggregate over the kind; moves on every insert, update or delete — `GET /stats` and `GET /metrics`
-reload their full document lists only when it moved), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
+aggregate over the kind; moves on every insert, update or delete — `GET /stats`, `GET /metrics` and
+`GET /advisor/recommendations` keep their document lists while it holds, and when it moved reload only the documents
+that changed), `versions(kind) -> [(id, version)]` (in creation order, no document read),
+`get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
 `SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` from it, §8.1), `delete(kind, id)`,
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`.
