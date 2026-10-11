@@ -49,6 +49,22 @@ test('the main journey renders: overview, plans, plan detail, migration detail',
   await expect(page.getByRole('heading', { name: /^estimates$/i })).toBeVisible();
 });
 
+test('chart code loads with the overview that draws charts, not with the sign-in page (SDD §16)', async ({ page }) => {
+  const scripts: string[] = [];
+  page.on('request', (request) => {
+    if (request.resourceType() === 'script') scripts.push(new URL(request.url()).pathname);
+  });
+  await page.goto('/login');
+  await expect(page.getByRole('button', { name: /sign in/i })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  expect(scripts.filter((path) => path.includes('/charts-'))).toEqual([]);
+
+  await page.getByLabel(/token/i).fill('admin');
+  await page.getByRole('button', { name: /sign in/i }).click();
+  await expect(page.locator('.recharts-surface').first()).toBeVisible();
+  expect(scripts.filter((path) => path.includes('/charts-'))).toHaveLength(1);
+});
+
 test('a viewer sees operator and approver actions soft-disabled', async ({ page }) => {
   await signIn(page, 'viewer');
   await page.goto('/plans');

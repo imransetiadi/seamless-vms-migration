@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "dev:mock": "VITE_SEAMLESS_MOCK=1 vite",
-    "build": "npm run typecheck:app && vite build",
+    "build": "npm run typecheck:app && vite build && node scripts/check-bundle.mjs",
     "build:mock": "VITE_SEAMLESS_MOCK=1 vite build",
     "preview": "vite preview",
     "test": "vitest run",

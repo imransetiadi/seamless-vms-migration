@@ -26,19 +26,26 @@ export default defineConfig({
     outDir: 'dist',
     target: 'es2022',
     sourcemap: false,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        // Framework code in `vendor` (needed at start); Recharts and its d3/lodash dependencies in
-        // `charts`, loaded only with the pages that draw charts. Pinning React explicitly keeps
-        // Rollup from hoisting it into the chart chunk (which would make the entry preload charts).
-        manualChunks(id) {
-          if (/node_modules\/(react|react-dom|scheduler|react-router|react-router-dom|@remix-run|@tanstack)\//.test(id)) {
-            return 'vendor';
-          }
-          if (/node_modules\/(recharts|recharts-scale|react-smooth|react-is|react-transition-group|dom-helpers|victory-vendor|d3-[^/]+|internmap|lodash|decimal\.js-light|eventemitter3|clsx|tiny-invariant|fast-equals)\//.test(id)) {
-            return 'charts';
-          }
-          return undefined;
+        // Framework code in `vendor` (needed at start); Recharts and its d3/lodash dependencies in `charts`, loaded
+        // only with the pages that draw charts. A group also takes the dependencies of what it captures, so
+        // `vendor` goes first (higher priority) and keeps React: otherwise `charts` took React in through Recharts
+        // and the entry preloaded every chart library. `scripts/check-bundle.mjs` (run by `npm run build`) fails
+        // the build if the start-up chunks include `charts` again.
+        codeSplitting: {
+          groups: [
+            {
+              name: 'vendor',
+              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|@remix-run|@tanstack)[\\/]/,
+              priority: 2,
+            },
+            {
+              name: 'charts',
+              test: /node_modules[\\/](recharts|recharts-scale|react-smooth|react-is|react-transition-group|dom-helpers|victory-vendor|d3-[^\\/]+|internmap|lodash|decimal\.js-light|eventemitter3|clsx|tiny-invariant|fast-equals)[\\/]/,
+              priority: 1,
+            },
+          ],
         },
       },
     },
