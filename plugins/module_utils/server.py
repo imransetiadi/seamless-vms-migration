@@ -124,8 +124,9 @@ class Server(osm_resource.Resource):
         sdk_params = self.sdk_params(conn)
         port_creation_mode = self.migration_params()["port_creation_mode"]
 
-        # Simple port creation via Nova. Subsequently we may add
-        # support for advanced port creation via Neutron.
+        # Nova creates each port with one fixed IP, or (port_creation_mode
+        # neutron) Neutron with its MAC, every fixed IP and its security
+        # groups (SDD 6.6).
         self.update_sdk_params_networks_simple(conn, sdk_params, port_creation_mode)
 
         if not self.migration_params()["data_copy"]:

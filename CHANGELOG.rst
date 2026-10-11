@@ -101,3 +101,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``ACTIVE`` and adds the floating IPs it lacks (a first attempt may have
   failed after Nova created the server). Floating IP creation keeps one
   already on the server's port for that fixed address, never a second.
+- ``port_creation_mode: neutron`` recreates each port with its MAC, every fixed
+  IP and its security groups. The export records each port's
+  ``security_group_refs`` and ``is_port_security_enabled``, and the port is
+  created with them and with the description ``os-migrate:{source port id}``,
+  never with ``binding_profile`` (admin-only, host-specific). A re-run uses
+  again the unbound port an earlier attempt created, and refuses any other port
+  with the MAC or a port exported without its security groups (Nova applies a
+  server's security groups only to the ports it creates). The default ``nova``
+  mode is unchanged, and data exported before stays valid.
+  ``import_workload_rollback`` deletes those ports
+  (``deleted_port_ids``), also when the cutover failed before the server
+  existed. Nova keeps such ports when their server is deleted later.
