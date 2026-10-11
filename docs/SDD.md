@@ -2172,7 +2172,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, liveness
   `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS), NetworkPolicy (ingress from router only;
-  egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory).
+  egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory, and the migrated VMs' verification ports
+  that the dashboard's plan form proposes, TCP 22 for Linux and 3389 for Windows, §7.5 — a `tcp:<port>` check
+  the policy blocks times out and fails the verification, which `auto_rollback` rolls back; another verification
+  port, or an application probe's, needs its own egress rule).
 * Kubernetes 1.28+ (`deploy/kubernetes/`, a kustomize overlay of `../openshift`) replaces what OpenShift
   provides by itself: an Ingress (`ingress.yaml`, ingress-nginx, TLS Secret `seamless-tls`) instead of the
   Route; explicit `runAsUser`/`runAsGroup`/`fsGroup` (1001/0/0 for the control plane, 26 for PostgreSQL)
