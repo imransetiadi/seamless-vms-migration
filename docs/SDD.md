@@ -693,6 +693,13 @@ PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`
 export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
+Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conversion host with `flock` and a
+`{lock}.lock` file that names its owner as `{migrator hostname}:{pid}`. Before it waits, a module removes such a file
+whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
+releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
+it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
+host, or one in the earlier bare-pid form, is never removed by this check.
+
 ---
 
 ## 7. Control plane executors
