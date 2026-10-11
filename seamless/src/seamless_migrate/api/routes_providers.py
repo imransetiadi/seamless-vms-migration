@@ -163,10 +163,28 @@ async def create_provider(
     provider = body.model_copy(
         update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
     )
-    try:
-        await svc.db.put("provider", provider, expected_version=0)
-    except ConflictError:
-        raise ApiError(409, "conflict", f"provider {provider.id!r} already exists") from None
+    # the store names a provider's secrets provider-{id} and provider-{id}-ssh: an id that makes
+    # them another provider's would overwrite (and on deletion remove) its key (SDD §13.3)
+    async with svc.orchestrator.provider_lock():
+        clash = next(
+            (
+                other.id
+                for other in await svc.db.list("provider", Provider)
+                if provider.id == f"{other.id}-ssh" or other.id == f"{provider.id}-ssh"
+            ),
+            None,
+        )
+        if clash is not None:
+            raise ApiError(
+                409,
+                "conflict",
+                f"provider id {provider.id!r} would share a secret with provider {clash!r}: "
+                "Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh",
+            )
+        try:
+            await svc.db.put("provider", provider, expected_version=0)
+        except ConflictError:
+            raise ApiError(409, "conflict", f"provider {provider.id!r} already exists") from None
     await emit(
         svc.store,
         svc.bus,

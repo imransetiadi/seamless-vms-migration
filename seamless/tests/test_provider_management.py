@@ -347,6 +347,19 @@ def test_a_provider_stored_with_an_odd_secret_name_stays_editable(api):
     )
 
 
+def test_an_id_whose_secret_names_are_another_providers_is_refused(api):
+    """SDD §13.3: provider-{id} and provider-{id}-ssh must stay apart: 'src-osp-ssh' would store its
+    credentials over src-osp's conversion key, and deleting it would remove that key."""
+    clash = api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-ssh"})
+    assert clash.status_code == 409, clash.text
+    assert "src-osp" in clash.json()["error"]["message"]
+    # the other way round: 'vc-a-ssh' first, then 'vc-a'
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-a-ssh"}).status_code == 201
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-a"}).status_code == 409
+    # ids that only look alike are fine
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-sshd"}).status_code == 201
+
+
 def test_a_provider_may_not_name_another_providers_secret(api):
     """SDD §13.3: provider-* names belong to the providers the store writes them for; a check would
     send another provider's credentials to this provider's endpoint."""
