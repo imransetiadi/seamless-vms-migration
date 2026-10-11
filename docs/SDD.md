@@ -222,6 +222,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
                                         # export_<r>.yml/import_<r>.yml pair other than workloads (the
                                         # migrations themselves), else refused (422); "flavors" opt-in (§7.2)
+       port_creation_mode: "nova"|"neutron" = "nova",   # "neutron": OpenStack cold/warm recreate every port with its MAC,
+                                        # all its fixed IPs and its security groups (§6.6, §7.2, §9.2); "nova": one fixed IP, new MAC
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
@@ -708,6 +710,23 @@ exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name
 keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
 `web-01` and the workload was skipped as already migrated, and a name like `app(` was an invalid expression.
 
+Ports recreated through Neutron (`_migration_params.port_creation_mode: neutron`, which the executor sets from
+`plan.port_creation_mode`, §7.2). The export records each port's security groups (`security_group_refs`, references
+like the server's, so `plan.mappings.projects` applies to them) and `is_port_security_enabled`, next to its MAC and
+fixed IPs. `ServerPort.create_or_update` creates the destination port with the network, the MAC, every fixed IP
+(subnets by reference), the security groups found in the destination, the port-security flag, the vnic type and the
+description `os-migrate:{source port id}`. It never sends `binding_profile`, which Neutron's policy reserves for admins
+and which is host-specific. Before creating a port it lists the destination network's ports with that MAC. It uses
+again an unbound one that carries that description and the same fixed IPs (a resumed or retried cutover). It refuses
+any other port with the MAC (`InconsistentState`, naming the port) before Nova is asked for the server. It also refuses
+a port exported without `security_group_refs` (an export from before this rule) rather than create it with the
+project's default group: Nova applies a server's security groups only to the ports it creates itself. The rollback
+(`WarmRollback`) deletes, after the destination server, every destination port whose description names one of the
+workload's source ports and that is unbound or bound to the deleted server. It does so also when there is no server,
+since a cutover can fail between creating the ports and creating the server. Nova keeps such ports when their server
+is deleted later, so a migrated server's ports outlive it: delete them with the server when it is decommissioned
+(only then does Neutron free their addresses).
+
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
 network partition ends the ssh about a minute later and the pass fails — a transient failure, retried — instead of
@@ -797,6 +816,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   skipped by the role for one, is rolled back by starting the source alone and deletes nothing.
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
+* `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
+  `plan.port_creation_mode` into the planned server's `_migration_params` in `workloads.yml`, after an export as
+  well. A mode chosen after a warm migration's export therefore applies at its cutover. In `neutron` mode, a warm
+  cutover whose `workloads.yml` lists a port without `security_group_refs` (exported before §6.6's rule) exports the
+  workload again first.
 * Safety pins in every generated vars file: `os_migrate_conversion_host_ssh_user_enable_password_access:
   false` (Security.md SEC-04) and, when the provider's `conversion_host` config carries
   `ssh_allowed_cidr`, `os_migrate_conversion_secgroup_remote_ip_prefix` set to it (SEC-03).
@@ -1181,8 +1205,9 @@ strategy ineligible):
 * OpenStack sources consider `cold`, `warm`, `storage_handover`; VMware sources consider
   `vmware_cold`, `vmware_warm`.
 * `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side,
-  or a NIC has no fixed IP or more than one (a dual-stack port included): os-migrate recreates each port through
-  Nova with exactly one fixed IP and refuses any other, after the source is stopped.
+  or — with `plan.port_creation_mode` `"nova"` — a NIC has no fixed IP or more than one (a dual-stack port included):
+  os-migrate then recreates each port through Nova with exactly one fixed IP and refuses any other, after the source
+  is stopped. In `"neutron"` mode every port is recreated with all its fixed IPs, none included (§6.6).
 * `warm`: as `cold`, plus any disk `multiattach`.
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
@@ -1229,7 +1254,7 @@ Finding catalog (code — severity — condition):
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
-| `NET_PORT_IPS` | warning | an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses |
+| `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold and warm keep every address, and the handover's eligibility reason remains |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
@@ -2092,7 +2117,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   the resources pre-staged at the destination (any of the six defaults of §4.2, in that order, then Flavors — off
   by default: the plan's flavors that RHOSO lacks, created with the same specs, `MAP_FLAVOR_PRESTAGED` — and
   Keypairs — off by default: the VMs' keypairs the migration user lacks at RHOSO, `MAP_KEYPAIR_PRESTAGED`; other
-  entries a plan already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
+  entries a plan already has are kept; VMware sources pre-stage nothing, §7.2), Keep MAC addresses and every fixed IP
+  (`port_creation_mode` `"neutron"`, off by default: cold and warm recreate each port through Neutron with its MAC, all
+  its fixed IPs and its security groups, §6.6; the hint says the ports then outlive their server and that VMware
+  sources ignore it), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
@@ -2103,7 +2131,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
   the counts) and no Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
-  `source_running_at` is set; settings summary — with "Advisor policy: {name}", its mode and threshold, the policy
+  `source_running_at` is set; settings summary — with "Ports: MAC and fixed IPs kept" when `port_creation_mode` is
+  `"neutron"`, and "Advisor policy: {name}", its mode and threshold, the policy
   in force for `migration_strategy` (`resolve_policy`, the built-in default when none applies) linking to it on
   `/advisor/policies` (ADV-20) —, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
