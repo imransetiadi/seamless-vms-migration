@@ -877,6 +877,14 @@ Twenty-three further iterations after the integration run, each verified with th
   keeps naming the failed checks while Retry runs; an Overview `?plan=` naming no plan says so; Start/Resume name
   the blocked VMs; failed provider, plan and migration lookups are named with Retry; the phone menu keeps the focus
   and closes on Escape.
+* Review of the day's own commits (2026-10-11, independent reviewer, failing repros): a validation also compares
+  the plan's waves and status, so a start, a pause or auto-waves by another process is never overwritten
+  (`test_a_validation_never_marks_validated_a_plan_another_process_started`, `…rewaved`, `…_never_hides_waves…`);
+  `useApiQuery` keeps the failure with `keepPreviousData` and while a Retry waits offline; the live splice reads the
+  one migration outside its query (a 502 never fails the migration page) and refreshes lists with no data; the
+  actions' focus keeping never takes the focus back from the page; a successful Retry hands the focus to the page's
+  heading; the CLI refuses unusable prune cutoffs and non-string plan keys without a traceback, and token names with
+  a colon; on Linux Docker Engine the host's agentmemory must listen beyond loopback.
 
 ### 13.2 Exit criteria — release 0.1.0
 
