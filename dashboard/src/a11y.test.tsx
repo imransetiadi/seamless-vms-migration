@@ -105,6 +105,19 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it("a migration's network editor (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    // mounted in #root as main.tsx mounts the app: the open dialog makes #root inert
+    const root = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'root' }));
+    renderAt('/migrations/mig-b2c4d6e873', 'operator', undefined, root);
+    expect(await screen.findByRole('heading', { level: 1, name: 'analytics-db' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    const panel = screen.getByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    expect(await screen.findByRole('dialog', { name: 'Network of analytics-db' })).toBeInTheDocument();
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it("a recommendation's input tab", async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/advisor/recommendations/rec-d4e6f8a09001');

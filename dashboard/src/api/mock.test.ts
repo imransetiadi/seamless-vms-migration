@@ -784,6 +784,7 @@ describe('mock API', () => {
       'mappings',
       'max_sync_passes',
       'name',
+      'nic_overrides',
       'port_creation_mode',
       'prestage_resources',
       'probe_overrides',
@@ -2198,6 +2199,20 @@ describe('mock plans: port_creation_mode (SDD §4.2, §12)', () => {
     await expect(client.post('/plans', { ...body, port_creation_mode: 'ovs' })).rejects.toMatchObject({
       status: 422,
       message: "port_creation_mode: Input should be 'nova' or 'neutron'",
+    });
+  });
+});
+
+describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
+  it('stores lower-case MACs with both fields, and refuses what the API refuses with its messages', async () => {
+    const { client } = setup('operator');
+    const body = { name: 'nics', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', { ...body, nic_overrides: { 'vm-1': { 'FA:16:3E:00:00:01': { network: 'tenant-web' } } } });
+    expect(created.nic_overrides).toEqual({ 'vm-1': { 'fa:16:3e:00:00:01': { network: 'tenant-web', fixed_ips: null } } });
+    await expect(client.post('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: [] }, 'not-a-mac': { network: 'x' } } } })).rejects.toMatchObject({
+      status: 422,
+      message:
+        "nic_overrides[vm-1][fa:16:3e:00:00:01]: fixed_ips must list at least one address (leave it out to keep the NIC's own); nic_overrides[vm-1][not-a-mac]: not a MAC address",
     });
   });
 });

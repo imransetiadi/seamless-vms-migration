@@ -11,6 +11,7 @@ import type {
   AdvisorSnapshot,
   ConvergedBy,
   DestinationInventory,
+  DestinationSubnet,
   Disk,
   Estimate,
   Event,
@@ -33,6 +34,7 @@ import type {
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
+import { ipInCidr, nicOverride, nicTarget } from '../lib/nics';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -376,7 +378,7 @@ export function makeVm(spec: VmSpec): VMRef {
     disks,
     nics: (spec.nics ?? [{ network: 'tenant-app' }]).map((n, i) => ({
       network: n.network ?? 'tenant-app',
-      mac: n.mac ?? `fa:16:3e:${(i + 10).toString(16)}:${spec.id.slice(-4, -2)}:${spec.id.slice(-2)}`,
+      mac: n.mac ?? `fa:16:3e:${(i + 10).toString(16).padStart(2, '0')}:${spec.id.slice(-4, -2)}:${spec.id.slice(-2)}`,
       fixed_ips: n.fixed_ips ?? [`10.20.${i + 1}.${(parseInt(spec.id.slice(-2), 16) % 200) + 10}`],
       vnic_type: n.vnic_type ?? 'normal',
       mtu: n.mtu === undefined ? 1450 : n.mtu,
@@ -595,6 +597,11 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       erp: { cores: 64, ram_mb: 262144, instances: 20, volumes: 40, gigabytes: 9000 },
     },
     projects: ['shop', 'finance', 'platform', 'analytics', 'erp', 'media'],
+    // where a NIC override's addresses must lie (SDD §11): the mock VMs' addresses are in 10.20.0.0/16
+    subnets: [
+      ...['tenant-web', 'tenant-app', 'tenant-db', 'tenant-infra', 'analytics', 'erp-net'].map((network) => ({ name: `${network}-v4`, network, cidr: '10.20.0.0/16' })),
+      { name: 'provider-ext-v4', network: 'provider-ext', cidr: '203.0.113.0/24' },
+    ],
   };
   return {
     'rhosp17-dc1': OS_VMS.map(makeVm),
@@ -721,6 +728,11 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
 }
 
 
+/** The VM with each NIC's addresses as the plan gives them (SDD §9.2): its override's, else its own. */
+function withPlannedAddresses(plan: Plan, vm: VMRef): VMRef {
+  return { ...vm, nics: vm.nics.map((nic) => ({ ...nic, fixed_ips: nicTarget(plan, vm.source_id, nic).addresses })) };
+}
+
 export function eligibility(
   vm: VMRef,
   sourceKind: ProviderKind,
@@ -743,7 +755,8 @@ export function eligibility(
     if (vm.power_state === 'error') cold.push('Source VM is in error state');
     if (!source.conversion_host || !destination.conversion_host) cold.push('No conversion host configured on both clouds');
     // through Nova os-migrate recreates each port with exactly one fixed IP; through Neutron every one (SDD §9.2)
-    const oddPorts = portsWithoutOneFixedIp(vm);
+    const planned = withPlannedAddresses(plan, vm);
+    const oddPorts = portsWithoutOneFixedIp(planned);
     if (oddPorts.length && plan.port_creation_mode !== 'neutron') cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
     result.cold = cold;
     result.warm = [...cold, ...(multiattach ? ['VM has a multi-attach volume'] : [])];
@@ -754,7 +767,7 @@ export function eligibility(
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
     // through Nova the destination keeps one address per port; through Neutron every one (SDD §7.3 step 8)
-    const several = vm.nics.filter((n) => n.fixed_ips.length > 1);
+    const several = planned.nics.filter((n) => n.fixed_ips.length > 1);
     if (several.length && plan.port_creation_mode !== 'neutron') handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
     if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
     handover.push(...storageReasons(vm, plan, source, destination));
@@ -771,12 +784,70 @@ export function eligibility(
 // Pre-flight findings (subset of SDD §9.3)
 // -------------------------------------------------------------------------------------------
 
+const NIC_OVERRIDE_REMEDIATION: Record<string, string> = {
+  MAP_NIC_OVERRIDE_INVALID:
+    "Fix the VM's network overrides on its migration page: an existing RHOSO network, addresses inside its subnets, each given once in the plan. VMware VMs take none.",
+  MAP_NIC_OVERRIDE: 'Nothing to do: each NIC goes where its override says.',
+};
+
+/** Like the API (SDD §9.3): every entry of the VM checked before anything stops, with the API's messages. */
+function nicOverrideFindings(
+  vm: VMRef,
+  sourceKind: ProviderKind,
+  plan: Plan,
+  destinationNetworks: Record<string, number | null>,
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[] },
+): Array<['MAP_NIC_OVERRIDE' | 'MAP_NIC_OVERRIDE_INVALID', string]> {
+  const entries = plan.nic_overrides?.[vm.source_id] ?? {};
+  const macs = Object.keys(entries).sort();
+  if (!macs.length) return [];
+  if (sourceKind === 'vmware')
+    return [['MAP_NIC_OVERRIDE_INVALID', `${vm.name} is a VMware VM: the migration kit keeps the guest's network settings, so its NIC overrides cannot be applied (${macs.join(', ')}).`]];
+  const holders = new Map<string, Array<{ vmId: string; mac: string; name: string }>>();
+  for (const other of context.selected ?? [vm]) {
+    for (const n of other.nics) {
+      const target = nicTarget(plan, other.source_id, n);
+      for (const a of target.addresses) {
+        const key = `${target.network}|${a}`;
+        holders.set(key, [...(holders.get(key) ?? []), { vmId: other.source_id, mac: (n.mac ?? '').toLowerCase(), name: other.name }]);
+      }
+    }
+  }
+  const problems: string[] = [];
+  const applied: string[] = [];
+  for (const mac of macs) {
+    const nic = vm.nics.find((n) => n.mac?.toLowerCase() === mac);
+    if (!nic) {
+      problems.push(`${mac}: the VM has no NIC with this MAC`);
+      continue;
+    }
+    const { network, addresses } = nicTarget(plan, vm.source_id, nic);
+    if (!(network in destinationNetworks)) {
+      problems.push(
+        `${mac}: RHOSO has no network '${network}'` +
+          (entries[mac]?.network ? '' : ' yet: pre-staging would create it, but its subnets cannot be checked before; name an existing RHOSO network'),
+      );
+      continue;
+    }
+    const cidrs = (context.subnets ?? []).filter((s) => s.network === network).map((s) => s.cidr);
+    const outside = addresses.filter((a) => !cidrs.some((c) => ipInCidr(a, c)));
+    if (outside.length) problems.push(`${mac}: ${outside.join(', ')} ${outside.length === 1 ? 'lies' : 'lie'} in no subnet of '${network}'`);
+    for (const a of addresses)
+      for (const h of holders.get(`${network}|${a}`) ?? []) if (h.vmId !== vm.source_id || h.mac !== mac) problems.push(`${mac}: ${a} also goes to ${h.name} (${h.mac})`);
+    applied.push(`${mac} (${nic.network}) -> ${network}: ${addresses.join(', ')}`);
+  }
+  if (problems.length) return [['MAP_NIC_OVERRIDE_INVALID', `NIC override(s) of ${vm.name} cannot be applied: ${problems.join('; ')}.`]];
+  return [['MAP_NIC_OVERRIDE', `NIC override(s): ${applied.join('; ')}.`]];
+}
+
 export function preflight(
   vm: VMRef,
   sourceKind: ProviderKind,
   plan: Plan,
   destinationNetworks: Record<string, number | null>,
   selectedNames: string[],
+  /** The destination's subnets and the plan's VMs, for NIC overrides (SDD §9.3). */
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[] } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
@@ -792,15 +863,16 @@ export function preflight(
     add('SRC_VM_EPHEMERAL_ROOT', 'info', 'Root disk is image-backed; each warm pass snapshots the server to Glance.', 'Expect slower pre-copy passes (boot_disk_copy).', ['warm']);
   for (const nic of vm.nics) {
     const mapped = plan.mappings.networks[nic.network] ?? nic.network;
-    if (sourceKind !== 'vmware' && !(mapped in destinationNetworks))
+    // a NIC its override sends elsewhere is checked by MAP_NIC_OVERRIDE_INVALID (SDD §9.3)
+    if (sourceKind !== 'vmware' && !nicOverride(plan, vm.source_id, nic.mac)?.network && !(mapped in destinationNetworks))
       add('MAP_NETWORK_MISSING', 'blocker', `Network ${nic.network} has no mapping and no same-named RHOSO network.`, 'Add a network mapping in the plan.');
-    const dstMtu = destinationNetworks[mapped];
+    const dstMtu = destinationNetworks[nicTarget(plan, vm.source_id, nic).network];
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
       add('NET_MTU_SHRINK', 'warning', `Destination MTU ${dstMtu} is smaller than the source NIC MTU ${nic.mtu} on ${nic.network}.`, 'Lower the guest MTU or enable jumbo frames on the OVN underlay.');
     if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
       add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'Re-create SR-IOV ports on RHOSO manually.');
   }
-  const oddPorts = portsWithoutOneFixedIp(vm);
+  const oddPorts = portsWithoutOneFixedIp(withPlannedAddresses(plan, vm));
   if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
     add(
       'NET_PORT_IPS',
@@ -808,6 +880,8 @@ export function preflight(
       `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
       'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
     );
+  for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
+    add(code, code === 'MAP_NIC_OVERRIDE' ? 'info' : 'blocker', message, NIC_OVERRIDE_REMEDIATION[code] ?? null);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'Provide an equivalent PCI alias on RHOSO compute nodes.');
   if ('resources:VGPU' in vm.flavor_extra_specs)
@@ -884,6 +958,7 @@ export function defaultPlanFields(now: number) {
     finalize_warning_h: 72,
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
     port_creation_mode: 'nova' as const,
+    nic_overrides: {} as Plan['nic_overrides'],
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,

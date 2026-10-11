@@ -601,6 +601,54 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.probe_overrides).toBe(false));
   });
 
+  it("shows where each NIC goes and lets an operator send it to another network with other addresses (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const [nic] = m.vm.nics;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    const table = within(panel).getByRole('table', { name: `NICs of ${m.vm.name}` });
+    const row = within(table).getByRole('row', { name: new RegExp(nic!.mac!) });
+    expect(row).toHaveTextContent(`${nic!.network}`);
+    expect(row).toHaveTextContent(nic!.fixed_ips[0]!);
+
+    await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    expect(dialog).toHaveTextContent('Saving edits the plan: it returns to draft and is validated again.');
+    await user.selectOptions(within(dialog).getByRole('combobox', { name: `RHOSO network of ${nic!.mac}` }), 'tenant-web');
+    await user.type(within(dialog).getByRole('textbox', { name: `Addresses of ${nic!.mac}` }), '10.20.9.9');
+    await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
+    await waitFor(() => expect(plan.nic_overrides[m.vm.source_id]).toEqual({ [nic!.mac!]: { network: 'tenant-web', fixed_ips: ['10.20.9.9'] } }));
+    expect(plan.status).toBe('draft');
+    await waitFor(() => expect(within(panel).getByRole('row', { name: new RegExp(nic!.mac!) })).toHaveTextContent('tenant-web'));
+    expect(within(panel).getByRole('row', { name: new RegExp(nic!.mac!) })).toHaveTextContent('10.20.9.9');
+    expect(within(panel).getByRole('row', { name: new RegExp(nic!.mac!) })).toHaveTextContent('Override');
+
+    // a bad address is named before anything is sent
+    await user.click(within(panel).getByRole('button', { name: 'Edit network' }));
+    const bad = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    const addresses = within(bad).getByRole('textbox', { name: `Addresses of ${nic!.mac}` });
+    await user.clear(addresses);
+    await user.type(addresses, '10.20.9.300');
+    await user.click(within(bad).getByRole('button', { name: 'Save network' }));
+    expect(await within(bad).findByText(`${nic!.mac}: not an IP address: 10.20.9.300`)).toBeInTheDocument();
+
+    // back to the plan's mapping: the VM's entry goes
+    await user.click(within(bad).getByRole('button', { name: "Use the plan's mapping" }));
+    await waitFor(() => expect(m.vm.source_id in plan.nic_overrides).toBe(false));
+  });
+
+  it('says a VMware VM keeps its network settings, with no editor (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await waitFor(() => expect(panel).toHaveTextContent("The migration kit keeps the guest's network settings"));
+    expect(within(panel).queryByRole('button', { name: 'Edit network' })).not.toBeInTheDocument();
+  });
+
   it('announces why Save probes was refused from a live region already in the dialog (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

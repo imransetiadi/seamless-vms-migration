@@ -27,6 +27,7 @@ import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
 import { Unavailable } from '../components/Unavailable';
+import { NetworkPanel } from '../components/NetworkPanel';
 import { VerificationPanel } from '../components/VerificationPanel';
 import { decidable, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
 import { approvalKindLabel } from '../lib/approvals';
@@ -737,6 +738,9 @@ export default function MigrationDetail() {
           </Panel>
         )}
 
+        <Panel title="Network" description="Where each NIC goes in RHOSO: the plan's mapping, or this VM's override (SDD §9.3)">
+          <NetworkPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
+        </Panel>
         <Panel title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
           <VerificationPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
         </Panel>

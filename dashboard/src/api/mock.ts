@@ -14,6 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
+import { isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
@@ -311,6 +312,25 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
   problems.push(...probeProblemsOf('verification.app_probes', verification.app_probes));
   const overrides = (spec.probe_overrides ?? {}) as Record<string, unknown>;
   problems.push(...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)));
+  // like the API (SDD §12): what makes a NIC override unusable, named by VM and MAC
+  const nicOverrides = (spec.nic_overrides ?? {}) as Record<string, Record<string, { network?: string | null; fixed_ips?: string[] | null }>>;
+  for (const [vmId, nics] of Object.entries(nicOverrides)) {
+    for (const mac of Object.keys(nics ?? {}).sort()) {
+      const entry = nics[mac] ?? {};
+      const where = `nic_overrides[${vmId}][${mac}]`;
+      const network = entry.network ?? null;
+      const ips = entry.fixed_ips ?? null;
+      if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) problems.push(`${where}: not a MAC address`);
+      if (network === null && ips === null) problems.push(`${where}: give a network, addresses or both`);
+      if (network !== null && !network.trim()) problems.push(`${where}: network must not be empty`);
+      if (ips === null) continue;
+      if (!ips.length) problems.push(`${where}: fixed_ips must list at least one address (leave it out to keep the NIC's own)`);
+      const bad = ips.filter((a) => !isIpAddress(a));
+      if (bad.length) problems.push(`${where}: not an IP address: ${bad.join(', ')}`);
+      const twice = [...new Set(ips.filter((a, i) => ips.indexOf(a) !== i))].sort();
+      if (twice.length) problems.push(`${where}: ${twice.join(', ')} given twice`);
+    }
+  }
   const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
   const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
   if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
@@ -319,6 +339,21 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
   const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
   if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+}
+
+/** Like the API's model (SDD §4.2): NIC override keys are stored lower case, each entry with both fields. */
+function withLowerCaseMacs(input: Record<string, unknown>): Record<string, unknown> {
+  if (!input.nic_overrides || typeof input.nic_overrides !== 'object') return input;
+  const overrides = input.nic_overrides as Record<string, Record<string, object>>;
+  return {
+    ...input,
+    nic_overrides: Object.fromEntries(
+      Object.entries(overrides).map(([vm, nics]) => [
+        vm,
+        Object.fromEntries(Object.entries(nics ?? {}).map(([mac, entry]) => [mac.toLowerCase(), { network: null, fixed_ips: null, ...entry }])),
+      ]),
+    ),
+  };
 }
 
 /**
@@ -998,7 +1033,9 @@ export class MockServer {
     const dst = this.inventories[destination.id];
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
     const names = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm.name);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names);
+    const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
+    const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1753,7 +1790,8 @@ export class MockServer {
     }
   }
 
-  private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
+  private createPlan(me: Me, raw: Record<string, unknown>): MockResponse {
+    const input = withLowerCaseMacs(raw);
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
     const body = input as unknown as PlanCreate;
@@ -1804,7 +1842,8 @@ export class MockServer {
     if (busy.length) throw new HttpError(409, 'conflict', inFlightRefusal(busy, before));
   }
 
-  private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+  private patchPlan(me: Me, plan: Plan, raw: Record<string, unknown>): MockResponse {
+    const input = withLowerCaseMacs(raw);
     // like the API (SDD §12): the body is a partial PlanCreate, a field it cannot change is refused first
     const unknown = Object.keys(input).filter((key) => !PLAN_EDITABLE_FIELDS.has(key)).sort();
     if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);

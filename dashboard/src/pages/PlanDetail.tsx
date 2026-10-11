@@ -202,6 +202,11 @@ function SettingsSummary({
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
       {plan.port_creation_mode === 'neutron' && <Setting label="Ports">MAC and fixed IPs kept</Setting>}
+      {Object.keys(plan.nic_overrides ?? {}).length > 0 && (
+        <Setting label="Network overrides">
+          {Object.keys(plan.nic_overrides).length === 1 ? '1 VM' : `${Object.keys(plan.nic_overrides).length} VMs`}
+        </Setting>
+      )}
       {mappingCount > 0 && (
         <div className="min-w-0 sm:col-span-2 xl:col-span-4">
           <dt className="text-xs uppercase tracking-wide text-muted-foreground">Mappings</dt>

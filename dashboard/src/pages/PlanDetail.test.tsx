@@ -49,6 +49,19 @@ describe('PlanDetail', () => {
     expect(await within(screen.getByRole('region', { name: /settings/i })).findByText(/mac and fixed ips kept/i)).toBeInTheDocument();
   });
 
+  it('counts the VMs with network overrides in the settings summary (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    plan.nic_overrides = {
+      'vm-a': { 'fa:16:3e:00:00:01': { network: 'tenant-web', fixed_ips: null } },
+      'vm-b': { 'fa:16:3e:00:00:02': { network: null, fixed_ips: ['10.20.9.9'] } },
+    };
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    expect(await within(settings).findByText('2 VMs')).toBeInTheDocument();
+    expect(settings).toHaveTextContent(/network overrides/i);
+  });
+
   it('formats the estimator overrides and marks link_bps as ignored', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e');

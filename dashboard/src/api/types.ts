@@ -319,6 +319,13 @@ export interface Wave {
 
 export type PortCreationMode = 'nova' | 'neutron';
 
+/** A VM NIC's network and addresses at RHOSO (SDD §4.2): null keeps the plan's mapping, or the NIC's own addresses. */
+export interface NicOverride {
+  network: string | null;
+  /** Never empty. */
+  fixed_ips: string[] | null;
+}
+
 export interface Plan {
   /** `plan-<8 hex>`. */
   id: string;
@@ -355,6 +362,8 @@ export interface Plan {
    * groups (SDD §6.6); `nova`: one fixed IP per port and a new MAC.
    */
   port_creation_mode: PortCreationMode;
+  /** Per VM (source id), per NIC MAC (lower case): its RHOSO network and addresses; OpenStack sources (SDD §4.2). */
+  nic_overrides: Record<string, Record<string, NicOverride>>;
   waves: Wave[];
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
@@ -773,6 +782,14 @@ export interface DestinationInventory {
   /** project -> free amounts */
   quotas: Record<string, ProjectQuota>;
   projects: string[];
+  /** The subnets the destination credential sees: where a NIC override's addresses must lie (SDD §11). */
+  subnets?: DestinationSubnet[];
+}
+
+export interface DestinationSubnet {
+  name: string;
+  network: string;
+  cidr: string;
 }
 
 /** `VMRef[]` for a source provider, `DestinationInventory` for a destination provider. */

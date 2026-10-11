@@ -92,3 +92,46 @@ describe('mock eligibility and preflight follow port_creation_mode (SDD §9.2/§
     expect(nova?.remediation).toMatch(/keep mac addresses and every fixed ip/i);
   });
 });
+
+describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
+  const providers = buildProviders(now);
+  const source = providers.find((p) => p.id === 'rhosp17-dc1')!;
+  const vcenter = providers.find((p) => p.id === 'vcenter-hq')!;
+  const destination = providers.find((p) => p.id === 'rhoso-prod')!;
+  const nets = { 'tenant-app': 1442, 'tenant-web': 1442 };
+  const subnets = [
+    { name: 'app-v4', network: 'tenant-app', cidr: '10.20.0.0/16' },
+    { name: 'web-v4', network: 'tenant-web', cidr: '10.30.0.0/16' },
+  ];
+  const vm = makeVm({ id: 'os-o1', name: 'nic-01', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:01', fixed_ips: ['10.20.1.5'] }] });
+  const other = makeVm({ id: 'os-o2', name: 'nic-02', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:02', fixed_ips: ['10.20.1.6'] }] });
+  const plan = (entry: { network?: string | null; fixed_ips?: string[] | null }) => ({
+    ...buildFixtures(now).plans[0]!,
+    mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} },
+    nic_overrides: { 'os-o1': { 'fa:16:3e:00:00:01': { network: null, fixed_ips: null, ...entry } } },
+  });
+  const codes = (found: { code: string }[]) => found.map((f) => f.code);
+
+  it('names where an applicable override sends the NIC', () => {
+    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.1.5'] }), nets, [vm.name], { subnets, selected: [vm, other] });
+    expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE')?.message).toBe('NIC override(s): fa:16:3e:00:00:01 (tenant-app) -> tenant-web: 10.30.1.5.');
+    expect(codes(found)).not.toContain('MAP_NIC_OVERRIDE_INVALID');
+  });
+
+  it('blocks an address outside the target subnets, one another NIC gets, and any override on VMware', () => {
+    const outside = preflight(vm, 'openstack', plan({ network: 'tenant-web' }), nets, [vm.name], { subnets, selected: [vm] });
+    expect(outside.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
+      "NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: 10.20.1.5 lies in no subnet of 'tenant-web'.",
+    );
+    const twice = preflight(vm, 'openstack', plan({ fixed_ips: ['10.20.1.6'] }), nets, [vm.name], { subnets, selected: [vm, other] });
+    expect(twice.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain('fa:16:3e:00:00:01: 10.20.1.6 also goes to nic-02 (fa:16:3e:00:00:02)');
+    const vmw = preflight(vm, 'vmware', plan({ network: 'tenant-web' }), nets, [vm.name], { subnets, selected: [vm] });
+    expect(vmw.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toContain("the migration kit keeps the guest's network settings");
+    expect(eligibility(vm, 'vmware', plan({ network: 'tenant-web' }), vcenter, destination, vmw).vmware_cold?.some((r) => r.includes('MAP_NIC_OVERRIDE_INVALID'))).toBe(true);
+  });
+
+  it('counts the addresses a NIC gets for the port rules', () => {
+    const dual = makeVm({ id: 'os-o1', name: 'nic-01', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:01', fixed_ips: ['10.20.1.5', 'fd00::5'] }] });
+    expect(eligibility(dual, 'openstack', plan({ fixed_ips: ['10.20.1.5'] }), source, destination, []).cold).toEqual([]);
+  });
+});
