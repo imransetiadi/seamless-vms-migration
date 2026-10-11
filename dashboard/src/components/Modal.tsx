@@ -49,6 +49,10 @@ export interface ModalProps {
   /** When false, Escape does nothing (e.g. while a request is in flight). */
   dismissible?: boolean;
   size?: 'md' | 'lg';
+  /** `left`: a drawer along the left edge, the full height of the window (the phone navigation, SDD §16). */
+  placement?: 'center' | 'left';
+  /** A tap on the dimmed page closes the dialog (when it is dismissible). */
+  closeOnBackdrop?: boolean;
   children: ReactNode;
 }
 
@@ -66,6 +70,8 @@ export function Modal({
   returnFocusRef,
   dismissible = true,
   size = 'md',
+  placement = 'center',
+  closeOnBackdrop = false,
   children,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -135,8 +141,18 @@ export function Modal({
   };
 
   return createPortal(
-    <div className="fixed inset-0 z-modal flex items-end justify-center p-3 sm:items-center sm:p-6">
-      <div aria-hidden className="absolute inset-0 bg-black/60" />
+    <div
+      className={cn(
+        'fixed inset-0 z-modal flex',
+        placement === 'left' ? 'items-stretch justify-start' : 'items-end justify-center p-3 sm:items-center sm:p-6',
+      )}
+    >
+      <div
+        aria-hidden
+        data-testid="modal-backdrop"
+        className="absolute inset-0 bg-black/60"
+        onClick={closeOnBackdrop && dismissible ? onClose : undefined}
+      />
       <div
         ref={panelRef}
         role={role}
@@ -148,8 +164,10 @@ export function Modal({
         className={cn(
           // a column: a form with min-h-0 shrinks to the panel and scrolls its own body between a header and its
           // actions, which then never cover the focused control (WCAG 2.4.11, SDD §16); other content scrolls the panel
-          'card animate-dialog-in relative flex max-h-[calc(100dvh-1.5rem)] w-full flex-col overflow-y-auto shadow-xl outline-hidden',
-          size === 'md' ? 'max-w-lg' : 'max-w-3xl',
+          'relative flex flex-col overflow-y-auto shadow-xl outline-hidden',
+          placement === 'left'
+            ? 'animate-drawer-in h-dvh w-72 max-w-[85vw] border-r border-border bg-card'
+            : cn('card animate-dialog-in max-h-[calc(100dvh-1.5rem)] w-full', size === 'md' ? 'max-w-lg' : 'max-w-3xl'),
         )}
       >
         {children}

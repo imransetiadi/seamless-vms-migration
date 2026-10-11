@@ -46,13 +46,13 @@ async function violations(): Promise<Array<{ id: string; impact: string | null |
   }));
 }
 
-function renderAt(path: string, token = 'admin', prepare?: (server: MockServer) => void) {
+function renderAt(path: string, token = 'admin', prepare?: (server: MockServer) => void, container?: HTMLElement) {
   window.history.pushState({}, '', path);
   const server = createTestServer();
   prepare?.(server);
   const client = new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
-  render(<App client={client} queryClient={queryClient} />);
+  render(<App client={client} queryClient={queryClient} />, container ? { container } : undefined);
 }
 
 async function settled() {
@@ -76,6 +76,32 @@ describe('axe-core: no WCAG violations', () => {
     renderAt(path);
     expect(await screen.findByRole('heading', { level: 1, name: heading }, { timeout: 8_000 })).toBeInTheDocument();
     await settled();
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the full sidebar navigation (SDD §16)', async () => {
+    window.localStorage.setItem('seamless.nav', 'full');
+    try {
+      renderAt('/');
+      expect(await screen.findByRole('heading', { level: 1, name: 'Overview' }, { timeout: 8_000 })).toBeInTheDocument();
+      await settled();
+      expect(screen.getByTestId('app-navigation')).toHaveAttribute('data-nav', 'full');
+      expect(await violations()).toEqual([]);
+    } finally {
+      window.localStorage.removeItem('seamless.nav');
+    }
+  }, 30_000);
+
+  it('the phone navigation drawer (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    // mounted in #root as main.tsx mounts the app: an open dialog makes #root inert, the column's navigation with it
+    const root = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'root' }));
+    renderAt('/', 'admin', undefined, root);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Overview' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await user.click(screen.getByRole('button', { name: 'Open navigation' }));
+    expect(root).toHaveAttribute('inert');
+    expect(await screen.findByRole('dialog', { name: 'Navigation' })).toBeInTheDocument();
     expect(await violations()).toEqual([]);
   }, 30_000);
 

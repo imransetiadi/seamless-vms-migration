@@ -1,19 +1,24 @@
 import {
   Activity,
   Bot,
+  CircleX,
   ClipboardList,
   HardDrive,
   KeyRound,
   LayoutDashboard,
   LogOut,
   Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  ScrollText,
   Server,
+  SlidersHorizontal,
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { useHealth, useMe } from '../api/hooks';
+import { useHealth, useMe, useStats } from '../api/hooks';
 import { useLiveSnapshot, type LiveStatus } from '../api/live';
 import { useSignOut } from '../api/session';
 import { cn } from '../lib/cn';
@@ -21,6 +26,7 @@ import { keepsFocus } from '../lib/navigation';
 import { ROLE_LABELS } from '../lib/roles';
 import { BrandMark } from './BrandMark';
 import { LiveIndicator } from './LiveIndicator';
+import { Modal } from './Modal';
 import { ThemeToggle } from './ThemeToggle';
 
 interface NavItem {
@@ -30,20 +36,91 @@ interface NavItem {
   match: (pathname: string) => boolean;
 }
 
-const NAV: NavItem[] = [
-  { to: '/', label: 'Overview', icon: LayoutDashboard, match: (p) => p === '/' },
-  { to: '/plans', label: 'Plans', icon: ClipboardList, match: (p) => p.startsWith('/plans') || p.startsWith('/migrations') },
-  { to: '/providers', label: 'Providers', icon: Server, match: (p) => p.startsWith('/providers') },
-  { to: '/inventory', label: 'Inventory', icon: HardDrive, match: (p) => p.startsWith('/inventory') },
-  { to: '/events', label: 'Events', icon: Activity, match: (p) => p.startsWith('/events') },
-  { to: '/advisor', label: 'Advisor', icon: Bot, match: (p) => p.startsWith('/advisor') },
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+/** The navigation's groups and items, in this order (SDD §16). */
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: 'Migrations',
+    items: [
+      { to: '/', label: 'Overview', icon: LayoutDashboard, match: (p) => p === '/' },
+      { to: '/plans', label: 'Plans', icon: ClipboardList, match: (p) => p.startsWith('/plans') || p.startsWith('/migrations') },
+    ],
+  },
+  {
+    label: 'Clouds',
+    items: [
+      { to: '/providers', label: 'Providers', icon: Server, match: (p) => p.startsWith('/providers') },
+      { to: '/inventory', label: 'Inventory', icon: HardDrive, match: (p) => p.startsWith('/inventory') },
+    ],
+  },
+  {
+    label: 'Activity',
+    items: [{ to: '/events', label: 'Events', icon: Activity, match: (p) => p.startsWith('/events') }],
+  },
+  {
+    label: 'Advisor',
+    items: [
+      { to: '/advisor', label: 'Recommendations', icon: Bot, match: (p) => p === '/advisor' || p.startsWith('/advisor/recommendations') },
+      { to: '/advisor/policies', label: 'Policies', icon: SlidersHorizontal, match: (p) => p.startsWith('/advisor/policies') },
+      { to: '/advisor/audit', label: 'Audit trail', icon: ScrollText, match: (p) => p.startsWith('/advisor/audit') },
+    ],
+  },
 ];
 
-function Brand() {
+type NavMode = 'full' | 'rail';
+const NAV_STORAGE_KEY = 'seamless.nav';
+const WIDE_QUERY = '(min-width: 1280px)';
+
+function readStoredMode(): NavMode | null {
+  try {
+    const value = window.localStorage.getItem(NAV_STORAGE_KEY);
+    return value === 'full' || value === 'rail' ? value : null;
+  } catch {
+    return null; // storage refused (private window, blocked site data): the width decides
+  }
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const list = window.matchMedia(query);
+    const update = () => setMatches(list.matches);
+    update();
+    list.addEventListener('change', update);
+    return () => list.removeEventListener('change', update);
+  }, [query]);
+  return matches;
+}
+
+/**
+ * The rail (labelled icons) or the full sidebar: the viewer's stored choice, else the width — the full sidebar from
+ * 1280 px (SDD §16). The choice is remembered in this browser; a storage that refuses it only forgets it.
+ */
+function useNavMode(): [NavMode, () => void] {
+  const wide = useMediaQuery(WIDE_QUERY);
+  const [stored, setStored] = useState<NavMode | null>(readStoredMode);
+  const mode: NavMode = stored ?? (wide ? 'full' : 'rail');
+  const toggle = () => {
+    const next: NavMode = mode === 'full' ? 'rail' : 'full';
+    setStored(next);
+    try {
+      window.localStorage.setItem(NAV_STORAGE_KEY, next);
+    } catch {
+      // kept for this page only
+    }
+  };
+  return [mode, toggle];
+}
+
+function Brand({ compact = false }: { compact?: boolean }) {
   return (
-    <Link to="/" className="flex min-h-11 items-center gap-2 rounded-md">
-      <BrandMark className="size-7" />
-      <span className="flex flex-col leading-tight">
+    <Link to="/" className={cn('flex min-h-11 items-center gap-2 rounded-md', compact && 'justify-center')}>
+      <BrandMark className="size-7 shrink-0" />
+      <span className={cn('flex flex-col leading-tight', compact && 'sr-only')}>
         <span className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</span>
         <span className="text-xs text-muted-foreground">to RHOSO 18.0</span>
       </span>
@@ -51,31 +128,78 @@ function Brand() {
   );
 }
 
-function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: (to: string) => void }) {
+/**
+ * The grouped items (SDD §16): in the full sidebar each label beside its icon under the group's heading, in the rail
+ * each label under its icon and the groups apart by a rule. Plans is described by the failed count from /stats.
+ */
+function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: NavMode; onNavigate?: (to: string) => void }) {
+  const prefix = useId();
+  const stats = useStats();
+  const failed = stats.data?.failed ?? 0;
+  const rail = mode === 'rail';
   return (
-    <ul className="flex flex-col gap-0.5">
-      {NAV.map((item) => {
-        const active = item.match(pathname);
+    <div className={cn('flex flex-col', rail ? 'gap-2' : 'gap-4')}>
+      {NAV_GROUPS.map((group, index) => {
+        const headingId = `${prefix}-group-${index}`;
         return (
-          <li key={item.to}>
-            <Link
-              to={item.to}
-              onClick={onNavigate ? () => onNavigate(item.to) : undefined}
-              aria-current={active ? 'page' : undefined}
-              className={cn(
-                'flex min-h-11 items-center gap-3 rounded-md border-l-2 px-3 text-sm transition-colors duration-200',
-                active
-                  ? 'border-accent bg-primary font-semibold text-primary-foreground'
-                  : 'border-transparent text-muted-foreground hover:bg-muted hover:text-foreground',
-              )}
-            >
-              <item.icon aria-hidden className="size-4 shrink-0" />
-              {item.label}
-            </Link>
-          </li>
+          <div key={group.label} role="group" aria-labelledby={headingId} className={cn(rail && index > 0 && 'border-t border-border pt-2')}>
+            <p id={headingId} className={rail ? 'sr-only' : 'px-3 pb-1 text-xs font-medium text-muted-foreground'}>
+              {group.label}
+            </p>
+            <ul className="flex flex-col gap-0.5">
+              {group.items.map((item) => {
+                const active = item.match(pathname);
+                const pillId = `${prefix}-failed`;
+                const pill = item.to === '/plans' && failed > 0;
+                return (
+                  <li key={item.to} className="relative">
+                    <Link
+                      to={item.to}
+                      onClick={onNavigate ? () => onNavigate(item.to) : undefined}
+                      aria-current={active ? 'page' : undefined}
+                      aria-describedby={pill ? pillId : undefined}
+                      className={cn(
+                        'flex min-h-11 rounded-md transition-colors duration-200',
+                        rail
+                          ? 'flex-col items-center justify-center gap-1 border-l-2 px-1 py-1.5 text-center text-[11px] leading-tight'
+                          : 'items-center gap-3 border-l-2 px-3 text-sm',
+                        // room for the failed count under the label
+                        rail && pill && 'pb-6',
+                        active
+                          ? 'border-accent bg-primary font-semibold text-primary-foreground'
+                          : 'border-transparent text-muted-foreground hover:bg-muted hover:text-foreground',
+                      )}
+                    >
+                      <item.icon aria-hidden className="size-4 shrink-0" />
+                      {/* in the rail a long label wraps, hyphenated, never cut off (SDD §16) */}
+                      <span className={rail ? 'max-w-full hyphens-auto [overflow-wrap:anywhere]' : undefined}>{item.label}</span>
+                    </Link>
+                    {pill && (
+                      // the link's description, so its name stays "Plans" (SDD §16); shown over the link, which keeps
+                      // the clicks
+                      <span
+                        id={pillId}
+                        aria-hidden
+                        className={cn(
+                          'pointer-events-none absolute inline-flex items-center gap-1 rounded-sm border border-status-danger/50 bg-card font-medium text-status-danger',
+                          // in the rail under the label, inside the item; in the sidebar at the item's right end
+                          rail
+                            ? 'bottom-1.5 left-1/2 -translate-x-1/2 whitespace-nowrap px-1 text-[10px]'
+                            : 'right-2 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-xs',
+                        )}
+                      >
+                        <CircleX aria-hidden className="size-3 shrink-0" />
+                        {failed} failed
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         );
       })}
-    </ul>
+    </div>
   );
 }
 
@@ -154,6 +278,32 @@ function StreamNotice() {
   );
 }
 
+/** The rail's foot: the live indicator, the theme and sign out as labelled icons (SDD §16). */
+function RailSession() {
+  const me = useMe();
+  const signOut = useSignOut();
+  const anonymous = me.data?.name === 'anonymous';
+  const railButton =
+    'flex min-h-11 w-full cursor-pointer flex-col items-center justify-center gap-1 rounded-md px-1 py-1.5 text-center text-[11px] leading-tight text-foreground transition-colors duration-200 hover:bg-muted';
+  return (
+    <div className="flex flex-col items-center gap-1 border-t border-border pt-2">
+      <LiveIndicator stacked className="py-1" />
+      <ThemeToggle stacked className="w-full" />
+      {anonymous ? (
+        <Link to="/login" className={railButton}>
+          <KeyRound aria-hidden className="size-4" />
+          Use a token
+        </Link>
+      ) : (
+        <button type="button" onClick={signOut} className={railButton}>
+          <LogOut aria-hidden className="size-4" />
+          Sign out
+        </button>
+      )}
+    </div>
+  );
+}
+
 function SessionFooter() {
   const me = useMe();
   const health = useHealth();
@@ -214,32 +364,29 @@ function SessionFooter() {
   );
 }
 
-/** App shell: skip link, sidebar navigation (≥1024 px) or a disclosure menu, and the main region. */
+/**
+ * App shell (SDD §16): skip link, the navigation on the left — from 768 px a column, the rail or the full sidebar, from
+ * below 768 px a drawer from the left behind the header's menu button — and the main region.
+ */
 export function Layout() {
   const { pathname, hash, state } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [mode, toggleMode] = useNavMode();
   const mainRef = useRef<HTMLElement>(null);
-  const menuButtonRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  // Escape closes the open menu and returns the focus to its button (disclosure pattern, SDD §16), when the focus
-  // is in the menu or on its button - never a key meant for something else on the page
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      const focus = document.activeElement;
-      if (event.key !== 'Escape' || !(focus === menuButtonRef.current || menuRef.current?.contains(focus))) return;
-      setMenuOpen(false);
-      menuButtonRef.current?.focus();
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [menuOpen]);
+  // where the focus goes when the drawer closes: its button, or the page when the choice was the page already shown
+  const drawerReturnRef = useRef<HTMLElement | null>(null);
+  const drawerTitleId = useId();
+  const columnNavId = useId();
   const lastPath = useRef(pathname);
-  // the phone menu closes on a choice; the link goes with it, so the focus goes where a navigation puts it — the
-  // page — even when the choice is the page already shown, which moves nowhere (SDD §16)
-  const navigateFromMenu = (to: string) => {
+  const closeMenu = () => {
+    drawerReturnRef.current = null;
     setMenuOpen(false);
-    if (to === pathname) mainRef.current?.focus({ preventScroll: true });
+  };
+  // the drawer closes on a choice; the link goes with it, so the focus goes where a navigation puts it — the page —
+  // even when the choice is the page already shown, which moves nowhere (SDD §16)
+  const navigateFromMenu = (to: string) => {
+    drawerReturnRef.current = to === pathname ? mainRef.current : null;
+    setMenuOpen(false);
   };
 
   // Move focus to the main region after client-side navigation (screen readers announce the page).
@@ -261,32 +408,53 @@ export function Layout() {
     window.scrollTo(0, 0);
   }, [pathname, hash, state]);
 
+  const full = mode === 'full';
   return (
-    <div className="min-h-dvh lg:grid lg:grid-cols-[15rem_minmax(0,1fr)]">
+    <div className="min-h-dvh md:grid md:grid-cols-[auto_minmax(0,1fr)]">
       <a href="#main" className="skip-link">
         Skip to main content
       </a>
 
-      <aside className="sticky top-0 hidden h-dvh flex-col gap-4 border-r border-border bg-card px-3 py-4 lg:flex">
-        <Brand />
-        <nav aria-label="Primary" className="flex-1 overflow-y-auto">
-          <NavLinks pathname={pathname} />
+      <aside
+        data-testid="app-navigation"
+        data-nav={mode}
+        className={cn(
+          'sticky top-0 hidden h-dvh flex-col gap-3 border-r border-border bg-card py-4 md:flex',
+          full ? 'w-60 px-3' : 'w-20 px-1.5',
+        )}
+      >
+        <Brand compact={!full} />
+        <nav id={columnNavId} aria-label="Primary" className="flex-1 overflow-y-auto">
+          <NavGroups pathname={pathname} mode={mode} />
         </nav>
-        <SessionFooter />
+        {full ? <SessionFooter /> : <RailSession />}
+        <button
+          type="button"
+          onClick={toggleMode}
+          aria-expanded={full}
+          aria-controls={columnNavId}
+          aria-label={full ? 'Collapse navigation' : 'Expand navigation'}
+          className={cn(
+            'flex min-h-11 cursor-pointer items-center rounded-md text-muted-foreground transition-colors duration-200 hover:bg-muted hover:text-foreground',
+            full ? 'gap-2 px-2 text-sm' : 'flex-col justify-center gap-1 px-1 py-1.5 text-[11px] leading-tight',
+          )}
+        >
+          {full ? <PanelLeftClose aria-hidden className="size-4 shrink-0" /> : <PanelLeftOpen aria-hidden className="size-4 shrink-0" />}
+          {full ? 'Collapse navigation' : 'Expand'}
+        </button>
       </aside>
 
       <div className="flex min-w-0 flex-col">
-        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm lg:hidden">
+        <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm md:hidden">
           <button
-            ref={menuButtonRef}
             type="button"
-            onClick={() => setMenuOpen((open) => !open)}
+            onClick={() => setMenuOpen(true)}
+            aria-haspopup="dialog"
             aria-expanded={menuOpen}
-            aria-controls="mobile-navigation"
-            aria-label={menuOpen ? 'Close navigation' : 'Open navigation'}
+            aria-label="Open navigation"
             className="inline-flex min-h-11 min-w-11 cursor-pointer items-center justify-center rounded-md text-foreground transition-colors duration-200 hover:bg-muted"
           >
-            {menuOpen ? <X aria-hidden className="size-5" /> : <Menu aria-hidden className="size-5" />}
+            <Menu aria-hidden className="size-5" />
           </button>
           <Brand />
           <div className="ml-auto flex items-center gap-1">
@@ -294,16 +462,35 @@ export function Layout() {
             <ThemeToggle />
           </div>
         </header>
-        {menuOpen && (
-          <div id="mobile-navigation" ref={menuRef} className="border-b border-border bg-card px-3 py-3 lg:hidden">
-            <nav aria-label="Primary">
-              <NavLinks pathname={pathname} onNavigate={navigateFromMenu} />
-            </nav>
-            <div className="mt-3">
-              <SessionFooter />
+        <Modal
+          open={menuOpen}
+          onClose={closeMenu}
+          labelledBy={drawerTitleId}
+          placement="left"
+          closeOnBackdrop
+          returnFocusRef={drawerReturnRef}
+        >
+          <div className="flex min-h-full flex-col gap-4 px-3 py-4">
+            <div className="flex items-center justify-between gap-2">
+              <h2 id={drawerTitleId} className="sr-only">
+                Navigation
+              </h2>
+              <Brand />
+              <button
+                type="button"
+                onClick={closeMenu}
+                aria-label="Close navigation"
+                className="inline-flex min-h-11 min-w-11 cursor-pointer items-center justify-center rounded-md text-foreground transition-colors duration-200 hover:bg-muted"
+              >
+                <X aria-hidden className="size-5" />
+              </button>
             </div>
+            <nav aria-label="Primary" className="flex-1">
+              <NavGroups pathname={pathname} mode="full" onNavigate={navigateFromMenu} />
+            </nav>
+            <SessionFooter />
           </div>
-        )}
+        </Modal>
 
         <main
           id="main"

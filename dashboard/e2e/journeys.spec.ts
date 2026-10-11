@@ -107,8 +107,8 @@ test('an admin approves a decision the Finance policy holds; the audit trail nam
   await expect(panel.getByText('Waiting for advisor approval')).toBeFocused();
 
   // in-app navigation keeps the in-browser mock state that a page load would reset
-  await page.getByRole('link', { name: 'Advisor', exact: true }).click();
-  await page.getByRole('link', { name: 'Audit trail' }).click();
+  // the Advisor's pages are items of the navigation (SDD §16)
+  await page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Audit trail' }).click();
   const approved = page
     .getByRole('row')
     .filter({ hasText: 'Decision: approved' })
@@ -295,3 +295,37 @@ test('on a phone the lifecycle reads down two columns, half the height of one (S
   expect(new Set(row).size).toBe(1);
 });
 
+
+test('the navigation is on the left at every width: sidebar, rail, then a drawer from the left (SDD §16)', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await signIn(page);
+  const column = page.getByTestId('app-navigation');
+  await expect(column).toHaveAttribute('data-nav', 'full');
+  const primary = column.getByRole('navigation', { name: 'Primary' });
+  await expect(primary.getByRole('link', { name: 'Audit trail' })).toBeVisible();
+  expect((await column.boundingBox())?.x).toBe(0);
+  expect((await column.boundingBox())?.width).toBe(240);
+
+  await page.setViewportSize({ width: 900, height: 800 });
+  await expect(column).toHaveAttribute('data-nav', 'rail');
+  await expect(primary.getByRole('link', { name: 'Recommendations' })).toBeVisible();
+  expect((await column.boundingBox())?.width).toBe(80);
+  // the rail keeps the whole label: it wraps, it is not cut off
+  const label = primary.getByRole('link', { name: 'Recommendations' });
+  const box = await label.boundingBox();
+  expect(await label.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  expect(box && box.x >= 0 && box.x + box.width <= 80).toBe(true);
+  await expect(page.getByRole('button', { name: 'Open navigation' })).toBeHidden();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(column).toBeHidden();
+  await page.getByRole('button', { name: 'Open navigation' }).click();
+  const drawer = page.getByRole('dialog', { name: 'Navigation' });
+  await expect(drawer).toBeVisible();
+  // it slides in from the left edge, then rests against it
+  await expect.poll(async () => (await drawer.boundingBox())?.x).toBe(0);
+  await expect(drawer.getByRole('link', { name: 'Policies' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(drawer).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Open navigation' })).toBeFocused();
+});
