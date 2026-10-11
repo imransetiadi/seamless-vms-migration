@@ -655,6 +655,67 @@ def test_sync_recreates_a_destination_volume_that_is_gone(tmp_path, caplog):
     assert "is gone, creating a new one" in caplog.text
 
 
+def test_sync_marks_a_reused_boot_volume_bootable_again(tmp_path):
+    """A first pass interrupted between the create and the bootable flag left the boot
+    volume non-bootable: the next pass sets the flag, or Nova would refuse to boot from it
+    after the source was stopped (SDD §6.4)."""
+    scenario = Scenario(tmp_path)
+    block_storage = scenario.dst.block_storage
+    real_wait = block_storage.wait_for_status
+    waits = {"n": 0}
+
+    def first_wait_times_out(res, **kwargs):
+        waits["n"] += 1
+        if waits["n"] == 1:
+            raise RuntimeError("Timeout waiting for the volume to become available")
+        return real_wait(res, **kwargs)
+
+    block_storage.wait_for_status = first_wait_times_out
+    scenario.snapshot("uuid-1").create()
+    with pytest.raises(RuntimeError, match="Timeout"):
+        scenario.sync("uuid-1").sync("auto")
+    scenario.snapshot("uuid-1").cleanup()
+    boot_id = scenario.state().dest_volumes["/dev/vda"]["dest_id"]
+    assert scenario.dst.volumes[boot_id].bootable is False
+
+    scenario.run_pass("uuid-2")
+
+    assert scenario.dst.volumes[boot_id].bootable is True
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    assert scenario.dst.volumes[data_id].bootable is False
+
+
+def test_sync_waits_for_a_reused_volume_still_being_created(tmp_path):
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    data_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    scenario.dst.volumes[data_id].status = "creating"
+    scenario.dst.calls.clear()
+
+    scenario.run_pass("uuid-2")
+
+    waits = [c[1] for c in scenario.dst.calls_to("wait_for_status")]
+    assert {"id": data_id, "status": "available"} in waits
+
+
+def test_sync_replaces_a_reused_volume_in_error(tmp_path, caplog):
+    """A volume Cinder failed to create never becomes usable: it is deleted and created
+    again, like one that is gone (SDD §6.4)."""
+    scenario = Scenario(tmp_path)
+    scenario.run_pass("uuid-1")
+    old_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    scenario.dst.volumes[old_id].status = "error"
+
+    with caplog.at_level(logging.WARNING, logger="osp-osp"):
+        scenario.run_pass("uuid-2")
+
+    new_id = scenario.state().dest_volumes["/dev/vdb"]["dest_id"]
+    assert new_id != old_id and new_id in scenario.dst.volumes
+    assert old_id not in scenario.dst.volumes
+    assert ("delete_volume", {"name_or_id": old_id}) in scenario.dst.calls
+    assert "is in error" in caplog.text
+
+
 def test_sync_scans_in_full_after_a_failed_first_pass_even_with_assume_zero(tmp_path):
     """The volumes created by a failed pass are partially written: the next
     pass must not assume they read as zeros."""

@@ -74,3 +74,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_rollback``); a cutover re-run fails instead of skipping a
   recorded destination server that is in ``ERROR`` or gone; recorded
   destination volumes without a source device are reported.
+- ``import_workload_warm_sync`` reuses a recorded destination volume safely: a
+  bootable one is marked bootable again (a pass interrupted between the create
+  and the flag left it non-bootable, and every cutover then failed after the
+  source was stopped), one still ``creating`` is waited for, and one in
+  ``error`` is deleted and created again.

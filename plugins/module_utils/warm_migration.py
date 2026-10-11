@@ -770,15 +770,32 @@ class OpenstackWarmSync(_WarmVolumeBase):
             recorded = self.state.dest_volumes.get(dev)
             if recorded is not None:
                 volume = self._get_volume_maybe(recorded.get("dest_id"))
-                if volume is not None:
+                if volume is not None and volume.status == "error":
+                    # Cinder failed to create it: it never becomes usable
+                    self.log.warning(
+                        "Destination volume %s of %s is in error, deleting it and "
+                        "creating a new one",
+                        volume.id,
+                        dev,
+                    )
+                    self.conn.delete_volume(volume.id, wait=True, timeout=self.timeout)
+                elif volume is not None:
+                    if volume.status == "creating":
+                        # a pass interrupted while Cinder created it
+                        volume = self._wait_volume_available(volume)
                     if source["size"] and source["size"] > recorded["size"]:
                         self._extend_dest_volume(dev, volume, source["size"])
+                    if recorded.get("bootable"):
+                        # set again: a pass interrupted between the create and the flag
+                        # left it unset, and Nova refuses to boot from such a volume
+                        self.conn.block_storage.set_volume_bootable_status(volume, True)
                     continue
-                self.log.warning(
-                    "Destination volume %s of %s is gone, creating a new one",
-                    recorded.get("dest_id"),
-                    dev,
-                )
+                else:
+                    self.log.warning(
+                        "Destination volume %s of %s is gone, creating a new one",
+                        recorded.get("dest_id"),
+                        dev,
+                    )
             self._create_dest_volume(dev, source)
             created.add(dev)
         return created
