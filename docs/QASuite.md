@@ -947,7 +947,8 @@ SEAMLESS_LIVE_JEV=1 SEAMLESS_LIVE_MEMORY=1 SEAMLESS_MEMORY_URL=http://127.0.0.1:
 ```bash
 cd dashboard
 npm ci
-npm test                      # Vitest (jsdom)
+npm test                      # Vitest (jsdom): 4 workers and 30 s per test locally, so a machine busy with other
+                              # work does not time the plan-form tests out; CI (CI set) keeps the default workers
 npm run typecheck             # src, the Vite/Tailwind configs and the Playwright specs (tsconfig.e2e.json)
 npm run build                 # same as `make dashboard-build`; type-checks the app only (typecheck:app), so a broken
                               # test spec never blocks a build; CI also runs `npm run lint` and `npm run typecheck`
