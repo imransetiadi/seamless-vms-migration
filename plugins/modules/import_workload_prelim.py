@@ -159,6 +159,7 @@ state_file:
 
 from ansible.module_utils.basic import AnsibleModule
 
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import filesystem
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
 
@@ -214,8 +215,10 @@ def run_module():
             msg=f"VM '{server_name}' already exists on destination, skipping.", **result
         )
 
-    result["log_file"] = os.path.join(log_dir, server_name) + ".log"
-    result["state_file"] = os.path.join(log_dir, server_name) + ".state"
+    # the VM name is the tenant's: never a path (SDD §7.2)
+    stem = filesystem.workload_file_stem(server_name)
+    result["log_file"] = os.path.join(log_dir, stem) + ".log"
+    result["state_file"] = os.path.join(log_dir, stem) + ".state"
     result["changed"] = True
 
     module.exit_json(**result)

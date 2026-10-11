@@ -59,8 +59,11 @@ again once the failure is handled.
 pass in progress. Every resource is recorded before it is waited on, so a
 pass interrupted at any point is cleaned up by the rescue of the role, by the
 next pass, or by the rollback. Per-disk progress of a pass is written to the
-usual os-migrate progress file `workload_logs/{name}.state` (`{device: pct}`),
-and the module log to `workload_logs/{name}.log`.
+usual os-migrate progress file `workload_logs/{stem}.state` (`{device: pct}`),
+and the module log to `workload_logs/{stem}.log`, where `{stem}` is the VM
+name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
+(`filesystem.workload_file_stem`), so a VM name never names a file outside
+`workload_logs`.
 
 ## Variables
 

@@ -79,3 +79,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   and the flag left it non-bootable, and every cutover then failed after the
   source was stopped), one still ``creating`` is waited for, and one in
   ``error`` is deleted and created again.
+- ``import_workload_prelim`` names the progress and log files after the VM
+  through ``filesystem.workload_file_stem`` (``%``, ``/`` and NUL written
+  ``%25``, ``%2F``, ``%00``): a VM name such as ``../x`` or ``/etc/x`` no
+  longer makes the modules write outside ``workload_logs``. Other names keep
+  their file names.
