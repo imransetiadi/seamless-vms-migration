@@ -174,6 +174,27 @@ def test_events_tail_returns_the_newest_matching_events_in_seq_order(any_store: 
     assert [e.seq for e in any_store.events(since_seq=base, limit=2)] == seqs[:2]
 
 
+def test_events_before_pages_back_from_the_oldest_shown(any_store: Store):
+    """SDD §12: ``before`` keeps events below a seq; with ``tail`` the newest ``limit`` of them."""
+    stored = [
+        any_store.append_event(Event(kind="migration.phase", plan_id=plan, message=str(i)))
+        for i, plan in enumerate(["plan-a", "plan-b", "plan-a", "plan-b", "plan-a", "plan-a"])
+    ]
+    seqs = [e.seq for e in stored]
+    newest = any_store.events(limit=2, tail=True)
+    assert [e.seq for e in newest] == seqs[4:]
+    older = any_store.events(limit=2, tail=True, before_seq=newest[0].seq)
+    assert [e.seq for e in older] == seqs[2:4]
+    oldest = any_store.events(limit=2, tail=True, before_seq=older[0].seq)
+    assert [e.seq for e in oldest] == seqs[:2]
+    assert any_store.events(limit=2, tail=True, before_seq=oldest[0].seq) == []
+    # with a plan: that plan's events below the seq
+    plan_a = any_store.events(plan_id="plan-a", limit=2, tail=True, before_seq=seqs[5])
+    assert [e.message for e in plan_a] == ["2", "4"]
+    # without tail: the first events after since, below before
+    assert [e.seq for e in any_store.events(since_seq=seqs[0], before_seq=seqs[3])] == seqs[1:3]
+
+
 def test_ping(any_store: Store, tmp_path):
     assert any_store.ping() is True
     broken = Store("postgresql+psycopg://nobody:nothing@127.0.0.1:1/none")

@@ -55,6 +55,7 @@ async def sse_frames(
 async def list_events(
     request: Request,
     since: int = Query(default=0, ge=0, le=MAX_SEQ),
+    before: int | None = Query(default=None, ge=1, le=MAX_SEQ),
     plan_id: str | None = None,
     migration_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
@@ -63,9 +64,11 @@ async def list_events(
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> list[Event]:
     # tail: the newest ``limit`` matching events instead of the first (SDD §12), still ascending;
+    # before: only events below that seq, so tail + before is the page before the oldest shown;
     # audit: only the audit events (SDD §14.5)
     return await services(request).db.events(
         since_seq=since,
+        before_seq=before,
         plan_id=plan_id,
         migration_id=migration_id,
         limit=limit,

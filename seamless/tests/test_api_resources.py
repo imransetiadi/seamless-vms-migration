@@ -942,6 +942,18 @@ def test_events_tail_returns_the_newest_limit_events_ascending(api):
     assert api.get("/api/v1/events?limit=2").json() == every[:2]
 
 
+def test_events_before_reads_the_page_before_the_oldest_shown(api):
+    """SDD §12, §16: Load older events asks for the newest page below the oldest event shown."""
+    seed_migrations(api.store)
+    api.post("/api/v1/migrations/mig-0000000000/approve", Role.approver, json={})
+    every = api.get("/api/v1/events?limit=1000").json()
+    assert len(every) >= 3
+    newest = api.get("/api/v1/events?tail=true&limit=1").json()
+    older = api.get(f"/api/v1/events?tail=true&limit=1&before={newest[0]['seq']}").json()
+    assert [e["seq"] for e in newest + older] == [every[-1]["seq"], every[-2]["seq"]]
+    assert api.get("/api/v1/events?tail=true&before=0").status_code == 422
+
+
 def test_auto_waves_takes_a_wave_size_from_1_to_1000(api):
     """SDD §12: max_wave_size is 1-1000; outside it the API answers 422 validation_error, the
     shape the dashboard mock copies."""

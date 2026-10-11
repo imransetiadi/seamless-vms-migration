@@ -389,10 +389,14 @@ class Store:
         limit: int = 500,
         kinds: Iterable[str] | None = None,
         tail: bool = False,
+        before_seq: int | None = None,
     ) -> list[Event]:
-        """Matching events after ``since_seq`` in ascending ``seq``: the first ``limit`` of them,
-        or with ``tail`` the newest ``limit`` (SDD §12)."""
+        """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
+        first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
+        page before an event (SDD §12)."""
         query = sa.select(events).where(events.c.seq > since_seq)
+        if before_seq is not None:
+            query = query.where(events.c.seq < before_seq)
         if plan_id is not None:
             query = query.where(events.c.plan_id == plan_id)
         if migration_id is not None:
