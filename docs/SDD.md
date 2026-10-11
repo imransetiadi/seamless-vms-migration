@@ -1476,7 +1476,9 @@ is resolved the same way by `security.secrets.resolve_private_key(name) -> str` 
 
 **Credentials entered in the dashboard** (`PUT /providers/{id}/credentials`, `PUT …/conversion-key`,
 admin) are written to the platform's **secret store** — never to the database, never returned — under
-the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key). The
+the secret name `provider-{id}` (credentials) and `provider-{id}-ssh` (conversion-host key) — so `POST /providers`
+refuses (409) an id whose names would be another provider's (`{id}` is `{other}-ssh`, or `{other}` is `{id}-ssh`):
+its credentials would overwrite, and its deletion remove, the other's key. The
 provider then records only the name (`credentials_secret`, `conversion_host.ssh_key_secret`) and the
 time (`credentials_updated_at`, `conversion_key_updated_at`) with a versioned write, retried when a provider
 check or another write changed the provider meanwhile (they touch other fields): once the secret is written,
