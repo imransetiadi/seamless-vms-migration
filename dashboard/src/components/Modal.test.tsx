@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Modal } from './Modal';
 
 function Dialog() {
@@ -49,6 +49,62 @@ describe('Modal (SDD §16)', () => {
     expect(save).toHaveFocus();
     await user.keyboard('{Tab}');
     expect(checked).toHaveFocus();
+  });
+
+  it('closes the topmost dialog on Escape wherever the focus is, unless its request runs (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const outer = vi.fn();
+    const inner = vi.fn();
+    const view = render(
+      <>
+        <Modal open onClose={outer} labelledBy="outer">
+          <h2 id="outer">Outer</h2>
+          <button type="button">Outer action</button>
+        </Modal>
+        <Modal open onClose={inner} labelledBy="inner">
+          <h2 id="inner">Inner</h2>
+          <button type="button">Inner action</button>
+        </Modal>
+      </>,
+    );
+    // focus inside: closed once, not by the panel and the page both
+    expect(screen.getByRole('button', { name: 'Inner action' })).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(inner).toHaveBeenCalledTimes(1);
+    // focus dropped to the page: the topmost dialog still closes, the one below does not
+    (document.activeElement as HTMLElement).blur();
+    expect(document.body).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(inner).toHaveBeenCalledTimes(2);
+    expect(outer).not.toHaveBeenCalled();
+    // once the inner dialog is gone, the outer one is the topmost again
+    view.rerender(
+      <>
+        <Modal open onClose={outer} labelledBy="outer">
+          <h2 id="outer">Outer</h2>
+          <button type="button">Outer action</button>
+        </Modal>
+        <Modal open={false} onClose={inner} labelledBy="inner">
+          <h2 id="inner">Inner</h2>
+        </Modal>
+      </>,
+    );
+    (document.activeElement as HTMLElement).blur();
+    await user.keyboard('{Escape}');
+    expect(outer).toHaveBeenCalledTimes(1);
+    expect(inner).toHaveBeenCalledTimes(2);
+    view.unmount();
+
+    const busy = vi.fn();
+    render(
+      <Modal open onClose={busy} labelledBy="busy" dismissible={false}>
+        <h2 id="busy">Saving</h2>
+        <button type="button">Wait</button>
+      </Modal>,
+    );
+    (document.activeElement as HTMLElement).blur();
+    await user.keyboard('{Escape}');
+    expect(busy).not.toHaveBeenCalled();
   });
 
   it('wraps to the summary of a closed <details> at its end, not to what the <details> hides', async () => {

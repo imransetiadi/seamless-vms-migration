@@ -30,6 +30,9 @@ function focusables(container: HTMLElement | null): HTMLElement[] {
   });
 }
 
+// the open dialogs, the topmost last: Escape on the page closes that one only (SDD §16)
+const openDialogs: symbol[] = [];
+
 export interface ModalProps {
   open: boolean;
   onClose: () => void;
@@ -66,6 +69,9 @@ export function Modal({
   children,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  // read by the page's Escape listener, which is set up once per opening
+  const closeRef = useRef({ onClose, dismissible });
+  closeRef.current = { onClose, dismissible };
 
   useEffect(() => {
     if (!open) return;
@@ -80,7 +86,21 @@ export function Modal({
     // read at close on purpose: the element the ref points to then takes the focus
     const returnTo = returnFocusRef;
 
+    // Escape closes the topmost dialog wherever the focus is — one that dropped to the page included; inside the
+    // panel its own handler does (SDD §16)
+    const token = Symbol('dialog');
+    openDialogs.push(token);
+    const onPageKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape' || openDialogs[openDialogs.length - 1] !== token) return;
+      if (event.target instanceof Node && panelRef.current?.contains(event.target)) return;
+      if (closeRef.current.dismissible) closeRef.current.onClose();
+    };
+    document.addEventListener('keydown', onPageKeyDown);
+
     return () => {
+      document.removeEventListener('keydown', onPageKeyDown);
+      const index = openDialogs.indexOf(token);
+      if (index >= 0) openDialogs.splice(index, 1);
       appRoot?.removeAttribute('inert');
       document.body.style.overflow = previousOverflow;
       (returnTo?.current ?? previouslyFocused)?.focus();
