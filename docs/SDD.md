@@ -219,7 +219,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        probe_overrides: dict[str, list[AppProbe]] = {},   # per VM (source id): replaces verification.app_probes; [] = none (§7.5, ADV-18)
        prestage_resources: list[str] = ["networks","subnets","routers","router_interfaces",
                                         "security_groups","security_group_rules"],   # each names os-migrate resources with an
-                                        # export_<r>.yml/import_<r>.yml pair, else refused (422); "flavors" opt-in (§7.2)
+                                        # export_<r>.yml/import_<r>.yml pair other than workloads (the
+                                        # migrations themselves), else refused (422); "flavors" opt-in (§7.2)
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
