@@ -309,7 +309,7 @@ export default function Overview() {
       ) : (
         <MetricStrip
           label="Key metrics"
-          className={cn(stats.isPlaceholderData && 'opacity-60')}
+          busy={stats.isPlaceholderData}
           metrics={[
             { label: 'Migrations', value: formatNumber(s.total), hint: plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },

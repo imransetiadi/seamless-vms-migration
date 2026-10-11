@@ -7,6 +7,24 @@ import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
 describe('Overview page (mock data)', () => {
+  it("keeps the figures readable while another plan's statistics load: greyed and busy, never faded (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    let hold = false;
+    renderWithApp(<Overview />, {
+      // once a plan is chosen, its statistics never answer: the previous figures stay on show
+      wrapFetch: (mock) => (input, init) => (hold && String(input).split('?')[0]!.endsWith('/api/v1/stats') ? new Promise<Response>(() => {}) : mock(input, init)),
+    });
+    const strip = await screen.findByRole('region', { name: 'Key metrics' });
+    expect(strip).not.toHaveAttribute('aria-busy');
+    hold = true;
+    await user.selectOptions(screen.getByLabelText('Plan'), 'plan-4f2a9c1e');
+    await waitFor(() => expect(strip).toHaveAttribute('aria-busy', 'true'));
+    expect(strip.className).not.toMatch(/opacity-/);
+    const values = Array.from(strip.querySelectorAll('.num'));
+    expect(values.length).toBeGreaterThan(0);
+    for (const value of values) expect(value).toHaveClass('text-muted-foreground');
+  });
+
   it('renders KPI tiles from /stats', async () => {
     const { server } = renderWithApp(<Overview />);
 
