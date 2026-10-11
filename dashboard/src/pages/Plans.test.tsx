@@ -52,6 +52,24 @@ describe('Plans page', () => {
     expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
+  it("puts the focus on the page's heading when a successful Retry takes the failure away (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    let failing = true;
+    server.handle = (method, path, query, body, token) =>
+      failing && method === 'GET' && path === '/plans'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused once for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    failing = false;
+    await user.click(within(alert).getByRole('button', { name: /retry/i }));
+    await screen.findByRole('table', { name: /migration plans/i });
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Plans' })).toHaveFocus());
+  });
+
   it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
