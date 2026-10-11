@@ -763,6 +763,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   copy as a `full` pass when it ends — the VM's used bytes (`bytes_total`, what the state file's 100 % stands
   for) changed and transferred, its disks' size scanned, the step's duration, which the copy dominates — so
   `bytes_transferred` stays its listed passes (§4.3, §5.5 invariant 2), as in the simulator (§7.4).
+* A `warm` pass that records no new pass in the warm state is a permanent failure — the role skipped the workload
+  and re-reporting the previous pass would feed a phantom pass into convergence — except a `cutover` re-run whose
+  warm state records the destination server: the role finished that server (§6.5), so the cutover is done; the
+  executor returns that server and, when the state's last pass is `final` and the migration does not list its
+  number yet (the attempt that ran it failed afterwards), that pass. A `cold` cutover the role skipped stays a
+  permanent failure: the cold role skips the whole workload on a re-run, its floating IPs included.
 * Name filter: `os_migrate_workloads_filter: [{regex: "^" + re.escape(vm.name) + "$"}]`.
 * Every string in `vars.yml`, `secrets.yml` and the inventory is written with the YAML tag `!unsafe`
   (`ansible_yaml`): every value and every key of a nested mapping (a source network's name keys
