@@ -131,6 +131,34 @@ def test_patch_is_refused_while_a_running_plan_uses_the_provider(api):
     assert patch(api, "/api/v1/providers/src-osp", {"name": "x"}).status_code == 200
 
 
+def test_credentials_are_recorded_however_often_a_check_races_the_record(api, monkeypatch):
+    """SDD §13.3: once the secret is written the change is recorded - never a 409 that leaves a
+    replaced secret unaudited, however many checks land between the route's read and its write."""
+    from seamless_migrate.store import AsyncStore
+
+    db_put = AsyncStore.put
+    raced: list[int] = []
+
+    async def put_after_a_check(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None and len(raced) < 8:
+            raced.append(expected_version)
+            provider = api.store.get("provider", model.id, Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", put_after_a_check)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    assert len(raced) == 8
+    assert api.store.get("provider", "src-osp", Provider).credentials_updated_at is not None
+    events = api.store.events(since_seq=0)
+    assert [e.kind for e in events].count("provider.credentials_updated") == 1
+
+
 def test_credentials_written_while_a_check_updates_the_provider_are_recorded(api, monkeypatch):
     """SDD §13.3: a provider check finishing while the credentials are written bumps the
     provider's version; the route retries its versioned write, so the change is recorded —

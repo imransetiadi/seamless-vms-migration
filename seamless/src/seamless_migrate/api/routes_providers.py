@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections import Counter
 from collections.abc import Callable
 from typing import Any
@@ -263,7 +264,13 @@ async def _record_secret(
     written secret is always recorded; a provider deleted meanwhile answers 404 and the secret
     goes again."""
     svc = services(request)
-    for _ in range(5):
+    attempt = 0
+    # until it lands: a conflict means another write landed, so each retry makes progress; giving up
+    # would leave a secret the store already holds unrecorded and unaudited (SDD §13.3)
+    while True:
+        if attempt:
+            await asyncio.sleep(min(0.5, 0.01 * 2**attempt) * random.uniform(0.5, 1.0))
+        attempt += 1
         try:
             provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
         except NotFound:
@@ -279,7 +286,6 @@ async def _record_secret(
         except ConflictError:
             continue
         return updated
-    raise ApiError(409, "conflict", f"provider {provider_id!r} kept changing; try again")
 
 
 @router.put("/providers/{provider_id}/credentials", response_model=Provider)
