@@ -733,7 +733,7 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 | Delta unit is the chunk | random-write workloads amplify the delta (§5.4) | adaptive chunk size per VM from the first pass |
 | One conversion-host pair per provider; attach/detach serialized | many small VMs are attach-bound | multiple host pairs / host pool |
 | Single replica orchestrator (D2) | no HA | **0.2.0** leader election |
-| Whole-kind reads for `/stats` and `/metrics` (cached on the change stamp, §9.1) | one full load per change | **0.2.0** store-side aggregates |
+| Whole-kind lists for `/stats`, `/metrics`, `/advisor/recommendations` and the tick (`VersionedDocuments`, §9.1) | only the documents that changed are loaded (61483aa, 08ec435), but every migration stays in memory, once for the API and once for the orchestrator | **0.2.0** store-side aggregates |
 | Image-booted VMs with `boot_disk_copy: true` re-image each pass | slow passes | use `false` when the image exists on the destination |
 | No LVM-thick detection finding | surprise slow passes | add a finding from `volume_backends` |
 | Page-cache pollution on conversion hosts from full-device reads | cache churn, no correctness issue | `posix_fadvise` sequential/don't-need hints |

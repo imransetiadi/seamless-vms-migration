@@ -31,7 +31,8 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
   with Jev off ([SDD §14](docs/SDD.md)). agentmemory recalls similar past incidents on failures.
 * **One dashboard for every hypervisor:** add and edit OpenStack Community, Kolla-Ansible, Red Hat OpenStack 17.1,
   VMware vCenter and RHOSO 18.0 providers from the UI with platform presets, write-only credentials kept in the
-  platform secret store (never in the database), the conversion-host SSH key, and a one-click connection test.
+  platform secret store (never in the database) or a named secret managed outside Seamless, the conversion-host
+  SSH key, and a one-click connection test.
 * **Every common guest OS:** RHEL 5–10, CentOS, Rocky, AlmaLinux, Oracle Linux, Ubuntu (every LTS and
   interim release), Debian 7–14, SLES/openSUSE, Windows Server 2003–2025 and Windows 7–11 are identified,
   shown with their support state and migrated — legacy releases get warnings with remediation, never a
@@ -40,7 +41,7 @@ learned). It runs on OpenShift or, for development and demos, on Docker Compose 
 * **Operable:** live dashboard (WCAG 2.2 AA), Prometheus metrics (incl. orchestrator tick timing),
   structured JSON logs (uvicorn's access lines included), `/health` and a `/ready` probe that answers
   503 while the database or the orchestrator loop is down, audit log export and retention
-  (`seamless events export|prune`), per-address lockout after repeated failed authentications, a
+  (`seamless events export|prune`; the dashboard's Events page reads the trail back to its start and exports it), per-address lockout after repeated failed authentications, a
   per-step wall-clock ceiling (`SEAMLESS_STEP_TIMEOUT_S`) so a hung playbook never holds a stopped
   source, cleanup of the data path when a pass is cancelled, PostgreSQL 16 as the system of record
   ([SDD §11, §12, §16, §18](docs/SDD.md)).
