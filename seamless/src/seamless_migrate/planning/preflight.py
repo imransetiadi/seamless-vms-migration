@@ -488,9 +488,10 @@ def _subnets_of(dst_inv: DestinationInventory, network: dict[str, Any]) -> list[
 
 def _no_host_address(address: str, cidrs: Sequence[str]) -> str | None:
     """What makes ``address`` no host address of the subnets that hold it, as Neutron's
-    check_subnet_ip rules (SDD §9.3): an IPv4 subnet's network address at any prefix length, its
-    broadcast address below a /31 (netaddr gives a /31 or /32 none), an IPv6 subnet's first
-    address. None for a host address of one of them, or an address none of them holds."""
+    check_subnet_ip rules for a port created with no owner (SDD §9.3): an IPv4 subnet's network
+    address at any prefix length, its broadcast address below a /31 (netaddr gives a /31 or /32
+    none); an IPv6 subnet's first address is taken. None for a host address of one of them, or an
+    address none of them holds."""
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
@@ -503,7 +504,7 @@ def _no_host_address(address: str, cidrs: Sequence[str]) -> str | None:
             continue
         if ip not in net:
             continue
-        if ip == net.network_address:
+        if net.version == 4 and ip == net.network_address:
             why = why or f"the network address of {net}"
         elif net.version == 4 and net.prefixlen < 31 and ip == net.broadcast_address:
             why = why or f"the broadcast address of {net}"

@@ -496,9 +496,10 @@ def test_finding_map_nic_override_invalid_names_each_problem():
 
 
 def test_finding_map_nic_override_invalid_refuses_what_neutron_gives_no_vm():
-    """SDD §9.3, as Neutron's check_subnet_ip: an IPv4 subnet's network address (at any prefix
-    length), its broadcast address below a /31 and an IPv6 subnet's first address are no host
-    addresses - a typo like 192.168.10.0 would otherwise fail after the source stops."""
+    """SDD §9.3, as Neutron's check_subnet_ip for a port created with no owner: an IPv4 subnet's
+    network address (at any prefix length) and its broadcast address below a /31 are no host
+    addresses - a typo like 192.168.10.0 would otherwise fail after the source stops - while an
+    IPv6 subnet's first address is taken (review NC-08)."""
     from seamless_migrate.domain.models import Nic
 
     dst = dst_inv(
@@ -542,10 +543,10 @@ def test_finding_map_nic_override_invalid_refuses_what_neutron_gives_no_vm():
     assert "fa:16:3e:00:00:02: 192.168.10.255 is the broadcast address of 192.168.10.0/24" in (
         f.message
     )
-    assert "fa:16:3e:00:00:02: fd00:10:: is the network address of fd00:10::/64" in f.message
+    assert "fd00:10::" not in f.message
     assert "fa:16:3e:00:00:04: 10.255.0.0 is the network address of 10.255.0.0/31" in f.message
     # one problem per address; the NIC with host addresses has none
-    assert f.message.count("not a host address") == 4
+    assert f.message.count("not a host address") == 3
     assert "fa:16:3e:00:00:03" not in f.message and "in no subnet" not in f.message
     # host addresses: a /31 and an IPv6 subnet have no broadcast address
     hosts = make_plan(

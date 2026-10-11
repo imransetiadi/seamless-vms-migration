@@ -25,7 +25,7 @@ from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Plan, Provider, utcnow
-from ..planning.ipam import address_refusal
+from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import port_refusal
 from ..storage import (
     StorageError,
@@ -743,10 +743,13 @@ class HandoverExecutor:
                     port_id = n["port_id"]
                 else:
                     fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
+                    # never an address the source's Neutron derives from the kept MAC itself:
+                    # sent, it is refused or allocated twice (SLAAC, DHCPv6-stateless, §7.3)
+                    subnets = list(conn.network.subnets(network_id=n["network_id"]))
                     attrs: dict[str, Any] = {
                         "network_id": n["network_id"],
                         "mac_address": n["mac_address"],
-                        "fixed_ips": fixed_ips,
+                        "fixed_ips": requested_ips(fixed_ips, subnets),
                     }
                     # a definition journaled before step 2 recorded them has none
                     if n.get("security_group_ids") is not None:
@@ -769,6 +772,13 @@ class HandoverExecutor:
         and a cold or warm migration of the same VM may have left one (§7.3)."""
         description = port_description(n["port_id"])
         mac = str(n.get("mac_address") or "").lower()
+        # not counting the addresses Neutron derives itself on SLAAC or DHCPv6-stateless subnets:
+        # it adds them to every port it creates (§6.6)
+        subnets = list(conn.network.subnets(network_id=_attr(network, "id")))
+        wanted = sorted(
+            ip["ip_address"]
+            for ip in requested_ips([{"ip_address": a} for a in addresses], subnets)
+        )
         return [
             p
             for p in conn.network.ports(description=description)
@@ -776,8 +786,11 @@ class HandoverExecutor:
             and not _attr(p, "device_id")
             and _attr(p, "network_id") == _attr(network, "id")
             and str(_attr(p, "mac_address") or "").lower() == mac
-            and sorted(ip.get("ip_address") for ip in _attr(p, "fixed_ips") or [])
-            == sorted(addresses)
+            and sorted(
+                ip.get("ip_address")
+                for ip in requested_ips(list(_attr(p, "fixed_ips") or []), subnets)
+            )
+            == wanted
             and _attr(p, "project_id") == conn.current_project_id
         ]
 
@@ -820,11 +833,13 @@ class HandoverExecutor:
                 if earlier:
                     port = earlier[0]
                 else:
+                    subnets = list(conn.network.subnets(network_id=_attr(network, "id")))
                     attrs: dict[str, Any] = {
                         "network_id": _attr(network, "id"),
                         "mac_address": n["mac_address"],
-                        # by address: Neutron picks the destination subnet that holds it
-                        "fixed_ips": [{"ip_address": a} for a in addresses],
+                        # by address: Neutron picks the destination subnet that holds it; never
+                        # one Neutron derives from the MAC itself (SLAAC, DHCPv6-stateless, §6.6)
+                        "fixed_ips": requested_ips([{"ip_address": a} for a in addresses], subnets),
                         "security_group_ids": [
                             _attr(
                                 conn.network.find_security_group(

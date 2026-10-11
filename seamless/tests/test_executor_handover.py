@@ -860,6 +860,76 @@ async def test_handover_in_neutron_mode_creates_each_port_with_its_mac_addresses
     ]
 
 
+async def test_handover_in_neutron_mode_leaves_out_the_addresses_neutron_derives(tmp_path):
+    """SDD §7.3 step 8, §6.6 (review NC-01, NC-09): Neutron 2023.1 allocates a SLAAC subnet's
+    EUI-64 address of the kept MAC on every port it creates, and a sent one is allocated twice;
+    step 8 never sends it, and a resume still knows the port Neutron gave such an address."""
+    eui = "fd00::f816:3eff:fe00:1"
+    net = "dst-net-rhoso-app"
+    slaac_network = [subnet(net, "10.0.0.0/24"), subnet(net, "fd00::/64", "slaac")]
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-1"].fixed_ips = [
+        {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+        {"subnet_id": "sub-v6", "ip_address": eui},
+    ]
+    clouds["dst"].subnet_list = slaac_network
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    [attrs] = clouds["dst"].port_attrs
+    assert attrs["fixed_ips"] == [{"ip_address": "10.0.0.5"}]
+
+    # a port created before a crash, to which Neutron added the EUI-64 address of a SLAAC
+    # subnet the source port had none on: still the one step 8 boots on
+    other, calls2, clouds2, plan2, mig2, settings2 = setup(tmp_path / "resume")
+    clouds2["src"].ports["port-1"].fixed_ips = [{"subnet_id": "sub-v4", "ip_address": "10.0.0.5"}]
+    clouds2["dst"].subnet_list = slaac_network
+    clouds2["dst"].ports["earlier"] = NS(
+        id="earlier",
+        network_id=net,
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": eui}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+        project_id="dst-project",
+    )
+    await other.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].port_attrs == []
+    assert clouds2["dst"].created[0]["networks"] == [{"port": "earlier"}]
+
+
+async def test_handover_rollback_leaves_out_the_slaac_address_of_a_source_port(tmp_path):
+    """SDD §7.3 rollback: the source port is recreated with its MAC and fixed IPs but the one on a
+    SLAAC subnet, which the source's Neutron derives from the MAC itself - sent, it is refused or
+    allocated twice, with the source server already deleted."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    clouds["src"].ports["port-1"].fixed_ips = [
+        {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+        {"subnet_id": "sub-v6", "ip_address": "fd00::f816:3eff:fe00:1"},
+    ]
+    clouds["src"].subnet_list = [
+        NS(
+            id="sub-v4",
+            network_id="net-1",
+            cidr="10.0.0.0/24",
+            ipv6_address_mode=None,
+            ipv6_ra_mode=None,
+        ),
+        NS(
+            id="sub-v6",
+            network_id="net-1",
+            cidr="fd00::/64",
+            ipv6_address_mode="slaac",
+            ipv6_ra_mode="slaac",
+        ),
+    ]
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert attrs["fixed_ips"] == [{"subnet_id": "sub-v4", "ip_address": "10.0.0.5"}]
+    assert attrs["mac_address"] == "fa:16:3e:00:00:01"
+
+
 async def test_handover_in_neutron_mode_resumes_on_the_port_it_created(tmp_path):
     """A crash after the port and before the server: the resume boots on the journaled port, and
     a port created but not yet journaled is found by its description, unbound."""
