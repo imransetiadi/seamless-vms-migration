@@ -72,6 +72,8 @@ class StaticDestination:
             volume_types=["ceph-ssd", "ceph-hdd"],
             quotas={},
             projects=["finance"],
+            # the test VMs' addresses (10.0.0.<i>): NIC overrides validate against it (SDD §11)
+            subnets=[{"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"}],
         )
 
     async def get_server(self, server_id: str) -> dict[str, Any]:

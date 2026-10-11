@@ -2837,6 +2837,9 @@ class Orchestrator:
                 plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
             if old in plan.probe_overrides:
                 plan.probe_overrides[new] = plan.probe_overrides.pop(old)
+            # its ports keep their MACs (the rollback recreates them with theirs, §7.3)
+            if old in plan.nic_overrides:
+                plan.nic_overrides[new] = plan.nic_overrides.pop(old)
             changed = plan.model_dump() != before
             return changed
 

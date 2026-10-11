@@ -4018,10 +4018,12 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
         settings, hooks={StepName.CUTOVER: failing_cutover, StepName.ROLLBACK: recreating_rollback}
     )
     probe = AppProbe(kind="tcp", port=5432)
+    nic = Nic(network="app-net", mac="fa:16:3e:00:00:0a", mtu=1500, fixed_ips=["10.0.0.1"])
     h, plan = await setup(
-        tmp_path, store, [vm(1), vm(2)],
+        tmp_path, store, [vm(1, nics=[nic]), vm(2)],
         {"default_strategy": Strategy.cold, "strategy_overrides": {"vm-1": Strategy.cold},
-         "probe_overrides": {"vm-1": [probe]}},
+         "probe_overrides": {"vm-1": [probe]},
+         "nic_overrides": {"vm-1": {"fa:16:3e:00:00:0a": {"fixed_ips": ["10.0.0.9"]}}}},
         executor=executor, settings=settings,
     )  # fmt: skip
     await h.orch.auto_waves(plan.id, 10, "alice")  # resets the plan to draft: validate after
@@ -4041,6 +4043,8 @@ async def test_rollback_with_new_source_ids_rewrites_the_plan(tmp_path, store):
     ]
     assert updated.strategy_overrides == {"vm-1-recreated": Strategy.cold}
     assert updated.probe_overrides == {"vm-1-recreated": [probe]}
+    # its NICs keep their MACs (the rollback recreates its ports with them): the overrides follow
+    assert list(updated.nic_overrides) == ["vm-1-recreated"]
     assert (await h.by_vm(plan.id, "vm-1-recreated")).id == m.id
     assert updated.status == PlanStatus.completed
 
