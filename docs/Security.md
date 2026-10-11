@@ -424,7 +424,7 @@ provider supports per-key budgets or scopes, create one key per environment.
 
 | Hop | Protocol | Verification / notes |
 |---|---|---|
-| Operator → control plane | HTTPS at the OpenShift Route (edge termination, HTTP redirected); loopback HTTP in Compose | Use a trusted certificate; add HSTS at the Route/ingress (the other security headers of C1-11 are set by the application). In Compose, reach it from elsewhere only through an SSH tunnel |
+| Operator → control plane | HTTPS at the OpenShift Route (edge termination, HTTP redirected); loopback HTTP in Compose | Use a trusted certificate; HSTS (`max-age=31536000`) is set at the Route (`hsts_header`) and sent by ingress-nginx by default on the Kubernetes overlay (the other security headers of C1-11 are set by the application). In Compose, reach it from elsewhere only through an SSH tunnel |
 | Control plane → OpenStack/RHOSO APIs | HTTPS | `verify_tls=true` by default; RHOSO is TLS-everywhere (SDD §1.2); provide the cloud CA through `ca_cert_path`/`cacert` |
 | Control plane → vCenter | HTTPS | verification on; `credentials_secret` resolution per SDD §13.3 |
 | Control plane → conversion hosts; dst → src | SSH | key auth, host-key policy in §6.3 |
@@ -707,7 +707,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 - [ ] `FORWARDED_ALLOW_IPS` on the control plane set to the router/ingress pod addresses (uvicorn then
       takes the client address from `X-Forwarded-For` for the auth lockout and the audit log); never `*`
       on a network where pods can reach the Service directly.
-- [ ] Route certificate trusted; HSTS and security headers added; ingress rate/connection limits configured.
+- [ ] Route certificate trusted; HSTS present on responses (the Route's `hsts_header`, or your ingress's); ingress rate/connection limits configured.
 - [ ] PostgreSQL TLS or managed DB; encrypted storage class; backups encrypted and restore-tested.
 - [ ] `replicas: 1` and `strategy: Recreate` unchanged.
 

@@ -14,6 +14,9 @@ metadata:
   annotations:
     # /api/v1/events/stream sends a heartbeat every 15 s (SDD 12); 2m tolerates short stalls
     haproxy.router.openshift.io/timeout: 2m
+    # the router adds no HSTS by default and the pod serves plain HTTP behind this edge Route (SDD 17,
+    # Security.md R-05); add includeSubDomains only if every subdomain of the host serves HTTPS
+    haproxy.router.openshift.io/hsts_header: max-age=31536000
 spec:
   # host: seamless.apps.<cluster-domain>   # omit to let the router generate one
   to:

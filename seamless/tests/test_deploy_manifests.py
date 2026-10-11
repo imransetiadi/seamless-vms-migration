@@ -153,3 +153,15 @@ def test_the_control_plane_pod_reaps_the_processes_ansible_leaves():
     assert deployment["spec"]["template"]["spec"].get("shareProcessNamespace") is True
     compose = yaml.safe_load((ROOT / "deploy" / "compose" / "compose.yaml").read_text())
     assert compose["services"]["seamless"].get("init") is True
+
+
+def test_the_route_tells_browsers_to_keep_to_https():
+    """SDD §17, Security.md R-05: the OpenShift router adds no HSTS by default and the pod serves
+    plain HTTP behind the edge Route, so the Route asks for it (at least a year)."""
+    import re
+
+    route = yaml.safe_load((ROOT / "deploy" / "openshift" / "route.yaml").read_text())
+    hsts = route["metadata"]["annotations"].get("haproxy.router.openshift.io/hsts_header", "")
+    age = re.search(r"max-age=(\d+)", hsts)
+    assert age and int(age.group(1)) >= 31536000, hsts
+    assert route["spec"]["tls"]["insecureEdgeTerminationPolicy"] == "Redirect"
