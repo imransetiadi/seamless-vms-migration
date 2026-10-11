@@ -1845,7 +1845,11 @@ settings as `serve` (they open the DB directly; a running server sees changes on
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
 the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
 only if the plan did not change since it was read (a server that started or validated it meanwhile), and
-otherwise fails and asks to run it again, so it never overwrites a change it did not see.
+otherwise fails and asks to run it again, so it never overwrites a change it did not see. The file's
+keys are that request's body: a field the file leaves out keeps its value, `updated_at` is set, and the
+events carry the API's data (`plan.created` `{name, vms}`, `plan.updated` `{fields}`, the file's keys)
+with actor `cli`. The CLI has no role: whoever can run it against the store owns the store, so the
+approver-only fields (§12) are not checked.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
 
