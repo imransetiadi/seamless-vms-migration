@@ -90,7 +90,7 @@ Phases 2–4 (PR-8 … PR-16) follow the spec's order after the review.
    about it.
 6. ADV-20 the two kinds of approval. Done — 19858f2, d7bc3f5 (SDD §16), 580ad25 (dashboard only: every approval entry
    names its kind, "Cutover approval" or "Advisor decision · {decision type}"; the Overview's "Pending approvals" lists
-   both with a kind filter — a cutover approval only at the cutover gate of a plan that requires one with no counted
+   both with a kind filter (eight rows of the chosen kind, the rest behind "Show all"; b40e523) — a cutover approval only at the cutover gate of a plan that requires one with no counted
    approval, an advisor decision while `advisor_hold` is set — and Needs attention no longer lists them; the migration
    page's Approvals adds the newest strategy decision a person gives or gave; the plan settings show "Cutover approval"
    and "Advisor policy" with mode, threshold and a link to `#policy-{id}` on `/advisor/policies`, which lands focus on
