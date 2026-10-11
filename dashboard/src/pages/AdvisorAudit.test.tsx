@@ -1,6 +1,7 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { AUDIT_EVENT_KINDS } from '../api/types';
 import { createTestServer, renderWithApp } from '../test/utils';
 import AdvisorAudit from './AdvisorAudit';
 
@@ -62,6 +63,33 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     await user.type(screen.getByLabelText('Search'), 'zzzz-no-match');
     expect(status).toHaveTextContent(`Showing 0 of ${total} audit events`);
     expect(screen.getByText('No audit events match')).toBeInTheDocument();
+  });
+
+  it('loads the audit events before the oldest shown, back to the start of the trail (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 1200; i += 1) {
+      server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'rina', message: `policy edit ${i}`, data: { target_id: 'pol-bulk' } });
+    }
+    const persisted = server.events.filter((e) => e.seq > 0 && (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind));
+    expect(persisted.length).toBeGreaterThan(1000);
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await auditTable();
+    expect(within(table).getAllByRole('row')).toHaveLength(1000 + 1);
+    const more = screen.getByRole('button', { name: 'Load older audit events' });
+    await user.click(more);
+    const rest = persisted.length - 1000;
+    expect(await screen.findByText(`Loaded ${rest} older audit events.`)).toBeInTheDocument();
+    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(persisted.length + 1));
+    // the start of the trail: the button goes and the table takes the focus, never the page (SDD §16)
+    expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Audit events' })).toContainElement(document.activeElement as HTMLElement));
+  });
+
+  it('offers no Load older audit events when every audit event is loaded', async () => {
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });
+    await auditTable();
+    expect(screen.queryByRole('button', { name: 'Load older audit events' })).not.toBeInTheDocument();
   });
 
   it('filters by action, actor and text', async () => {

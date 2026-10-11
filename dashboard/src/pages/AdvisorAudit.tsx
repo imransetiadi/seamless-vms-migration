@@ -1,7 +1,8 @@
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
-import { useId, useMemo, useState } from 'react';
+import { useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useEventTail } from '../api/hooks';
+import { fetchEventTail, useApi, useEventTail } from '../api/hooks';
+import type { Event } from '../api/types';
 import { AUDIT_EVENT_KINDS } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
@@ -39,7 +40,40 @@ export default function AdvisorAudit() {
   const [actor, setActor] = useState('all');
   const [query, setQuery] = useState('');
 
-  const events = useMemo(() => [...(audit.data ?? [])].sort((a, b) => b.seq - a.seq), [audit.data]);
+  // Load older audit events (SDD §12, §16): the page before the oldest loaded; the window it was read below stays
+  // loaded, so reading the newest audit events again leaves no gap; a full page may have more before it
+  const api = useApi();
+  const [older, setOlder] = useState<{ events: Event[]; more: boolean } | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState<unknown>(null);
+  const [announcement, setAnnouncement] = useState('');
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const tableRef = useRef<HTMLDivElement>(null);
+  const events = useMemo(() => {
+    const bySeq = new Map<number, Event>();
+    for (const e of [...(older?.events ?? []), ...(audit.data ?? [])]) bySeq.set(e.seq, e);
+    return [...bySeq.values()].sort((a, b) => b.seq - a.seq);
+  }, [older, audit.data]);
+  const canLoadOlder = Boolean(audit.data) && (older ? older.more : (audit.data?.length ?? 0) >= AUDIT_KEEP);
+  const loadOlder = async () => {
+    const oldest = events.at(-1)?.seq;
+    if (oldest === undefined) return;
+    setLoadingOlder(true);
+    setOlderError(null);
+    try {
+      const page = await fetchEventTail(api, { audit: true, before: oldest }, AUDIT_KEEP);
+      setOlder((prev) => ({ events: [...page, ...(prev?.events ?? []), ...(audit.data ?? [])], more: page.length >= AUDIT_KEEP }));
+      setAnnouncement(page.length ? `Loaded ${page.length} older audit events.` : 'This is the start of the audit trail.');
+      // the start of the trail removes the button: the table takes the focus, never the page (SDD §16)
+      requestAnimationFrame(() => {
+        if (!moreRef.current) tableRef.current?.focus();
+      });
+    } catch (error) {
+      setOlderError(error);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
   // the VM of a recommendation, as its recommendation.created event names it
   const names = useMemo(
     () =>
@@ -106,7 +140,10 @@ export default function AdvisorAudit() {
         <SelectField label="Actor" className="md:w-60" value={actor} onChange={(e) => setActor(e.target.value)} options={[{ value: 'all', label: 'All actors' }, ...actors.map((a) => ({ value: a, label: a }))]} />
       </div>
 
-      <Panel title="Audit events" description={`Newest first; the newest ${AUDIT_KEEP} events the API returns`}>
+      <Panel title="Audit events" description={`Newest first, ${AUDIT_KEEP} at a time; Load older audit events reads further back`}>
+        <p role="status" className="sr-only">
+          {announcement}
+        </p>
         {/* a live region already on the page: what the filters show is read out, none too (SDD §16) */}
         <p role="status" className="mb-2 text-xs text-muted-foreground empty:hidden">
           {events.length > 0 ? `Showing ${formatNumber(shown.length)} of ${formatNumber(events.length)} audit events` : ''}
@@ -120,7 +157,7 @@ export default function AdvisorAudit() {
         ) : shown.length === 0 ? (
           <EmptyState icon={SearchX} title="No audit events match" description="Change the search or the filters." />
         ) : (
-          <div className="table-wrap rounded-md border border-border">
+          <div ref={tableRef} tabIndex={-1} className="table-wrap rounded-md border border-border outline-hidden">
             <table className="data-table">
               <caption className="sr-only">Advisor audit events, newest first</caption>
               <thead>
@@ -175,6 +212,14 @@ export default function AdvisorAudit() {
             </table>
           </div>
         )}
+        {canLoadOlder && !audit.error && (
+          <div className="mt-3">
+            <Button ref={moreRef} disabledReason={loadingOlder ? 'Loading older audit events…' : null} onClick={() => void loadOlder()}>
+              Load older audit events
+            </Button>
+          </div>
+        )}
+        {olderError !== null && <ErrorBanner error={olderError} title="Older audit events could not be loaded" onRetry={() => void loadOlder()} />}
       </Panel>
     </>
   );
