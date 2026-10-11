@@ -1980,7 +1980,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request or a
   closed window once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
   is unknown (Pending approvals then says its cutover approvals are unavailable).
-* Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
+* Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
+  says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
+  distribution, throughput chart, downtime vs SLO,
   active cutovers, and "Pending approvals": both kinds in one list, each row with its kind, the VM, its plan and
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
   ADV-20), `/plans` (the list: each plan's status, VMs, migrations done, clouds, SLO and last change — on a phone the
