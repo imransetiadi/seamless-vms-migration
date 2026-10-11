@@ -1322,7 +1322,7 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
 `SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` from it, §8.1), `delete(kind, id)`,
-`append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500)`.
+`append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, before_seq=None)`.
 Kinds: `provider`, `plan`,
 `migration`. SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -1387,7 +1387,7 @@ such lists again on persisted migration events.
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
-| GET | `/events` | viewer | query `since` (seq), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
+| GET | `/events` | viewer | query `since` (seq), `before` (seq: only events below it — with `tail`, the newest `limit` of them, the page before the oldest one shown), `plan_id`, `migration_id`, `limit` (≤ 1000), `tail` (bool = false), `audit` (bool = false: only the audit events of §14.5) | `Event[]` (ascending `seq`); no route updates or deletes an event |
 | GET | `/events/stream` | viewer | query `since` | `text/event-stream` (below) |
 | GET | `/stats` | viewer | query `plan_id` | `Stats` |
 | GET | `/advisor/status` | viewer | — | `{"jev":{"mode":str,"available":bool,"last_error":str?,"deployment":"on_prem"\|"remote","endpoint_host":str?,"console_sent":bool},"memory":{"enabled":bool,"available":bool,"last_error":str?}}` (§13.4) |
@@ -2057,7 +2057,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
   project mappings point to, `DST_PROJECT_MISSING` §9.3), `/events` (live audit stream with category, plan and text filters — the plan, kept in the address (`?plan=`),
-  loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; the shown audit events download as JSON
+  loads that plan's history, `GET /events?plan_id=`, and keeps only its live events; once every loaded event is shown,
+  Load older events reads the 500 before the oldest (`GET /events?tail=true&before=`), so the trail reads back to its start
+  in place; the shown audit events download as JSON
   lines, the format of `seamless events export`; Export the whole trail writes every persisted event (the chosen plan's
   when one is) into one such file by paging `GET /events?since=` 1,000 at a time, as that command does — the trail an
   operator archives to write-once storage (Security.md) — saying how many events it has read and stoppable meanwhile; its stream line counts the new events without announcing each, and Pause
