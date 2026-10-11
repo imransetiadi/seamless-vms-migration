@@ -257,6 +257,8 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   const reasonFor = (strategy: Strategy, eligible: boolean): string | null => {
     if (!canChangeRole) return 'Requires the operator role.';
     if (!canChangePhase) return 'The strategy can change only while pending, ready or blocked.';
+    // the API refuses it while a decision waits (409, SDD §12, §14.6): say so instead of offering it
+    if (m.advisor_hold) return "The advisor's decision waits for approval: approve or override it first.";
     if (!eligible) return 'This strategy is not eligible for this VM.';
     if (strategy === m.strategy) return 'Already selected.';
     return null;

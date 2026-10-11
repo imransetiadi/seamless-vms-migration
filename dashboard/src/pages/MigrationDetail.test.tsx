@@ -390,6 +390,22 @@ describe('MigrationDetail', () => {
     expect(within(again).getByRole('button', { name: /^approve$/i })).not.toHaveAttribute('aria-disabled');
   });
 
+  it("does not offer another strategy while the advisor's decision waits for approval, and says why (SDD §12, §14.6, §16)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!;
+    expect(m.advisor_hold).toBeTruthy();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const estimates = await screen.findByRole('table', { name: /estimates per strategy/i });
+    const others = within(estimates)
+      .getAllByRole('button', { name: /^use /i })
+      .filter((b) => !b.getAttribute('aria-label')?.toLowerCase().includes('handover'));
+    expect(others.length).toBeGreaterThan(0);
+    for (const button of others) {
+      expect(button).toHaveAttribute('aria-disabled', 'true');
+      expect(button).toHaveAccessibleDescription(/advisor's decision waits for approval/i);
+    }
+  });
+
   it("keeps Approve and Override from the decision's requester, with the reason (SDD §14.6, ADV-17)", async () => {
     const server = createTestServer();
     const db = server.migrations.find((x) => x.vm.name === 'analytics-node-2')!;
