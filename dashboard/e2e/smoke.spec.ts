@@ -157,14 +157,23 @@ for (const width of [320, 375]) {
   });
 }
 
-for (const width of [320, 1280]) {
-  test(`no text is cut off with an ellipsis on a ${width} px wide screen (WCAG 1.4.10, SDD §16)`, async ({ page }) => {
+// With the web fonts and with the fallback an offline install keeps (Google Fonts unreachable): a name that fits
+// in Fira Sans can be a few pixels too wide in the system font. Each run measures once its fonts are settled.
+for (const [width, fonts] of [
+  [320, 'web'],
+  [1280, 'web'],
+  [320, 'fallback'],
+  [1280, 'fallback'],
+] as const) {
+  test(`no text is cut off with an ellipsis on a ${width} px wide screen${fonts === 'fallback' ? ' without the web fonts' : ''} (WCAG 1.4.10, SDD §16)`, async ({ page }) => {
+    if (fonts === 'fallback') await page.route(/fonts\.(googleapis|gstatic)\.com/, (route) => route.abort());
     await page.setViewportSize({ width, height: 800 });
     await signIn(page, 'viewer');
     for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
       await page.goto(path);
       await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
       await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+      await page.evaluate(() => document.fonts.ready);
       const cut = await page.evaluate(() =>
         Array.from(document.querySelectorAll<HTMLElement>('body *'))
           .filter((el) => getComputedStyle(el).textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth + 1 && el.getClientRects().length > 0)

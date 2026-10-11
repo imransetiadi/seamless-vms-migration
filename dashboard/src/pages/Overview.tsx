@@ -233,7 +233,7 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
         return (
           <li key={plan.id} className="flex min-w-0 flex-col gap-1.5 border-t border-border py-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <Link to={`/plans/${plan.id}`} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">
+              <Link to={`/plans/${plan.id}`} className="min-w-0 wrap-break-word font-medium text-foreground underline-offset-4 hover:underline">
                 {plan.name}
               </Link>
               <PlanStatusBadge status={plan.derived_status} />

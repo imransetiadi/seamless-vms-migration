@@ -53,7 +53,7 @@ export function PendingApprovals({ migrations, plans, plansUnknown }: PendingApp
                     <Link to={item.href} className="font-mono text-sm font-semibold text-foreground underline-offset-4 hover:underline">
                       {item.migration.vm.name}
                     </Link>
-                    {item.plan && <span className="truncate text-xs text-muted-foreground">{item.plan.name}</span>}
+                    {item.plan && <span className="min-w-0 wrap-break-word text-xs text-muted-foreground">{item.plan.name}</span>}
                   </div>
                   <p className="mt-0.5 wrap-break-word text-sm text-foreground">{item.waitsFor}</p>
                 </div>
