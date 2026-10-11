@@ -1485,7 +1485,8 @@ class Orchestrator:
             try:
                 result = await executor.run(StepName.FINALIZE, ctx)
             except (TransientStepError, PermanentStepError) as exc:
-                raise NotAllowed(f"finalize failed: {redact(str(exc))}") from exc
+                # redacted and cut like any reason a skipped VM reports (SDD §8.1)
+                raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
             m.checkpoint = "finalized"
             m, v = await self._transition(
                 m,

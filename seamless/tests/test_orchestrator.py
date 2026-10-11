@@ -4899,6 +4899,21 @@ async def test_finalize_plan_reports_the_vms_it_could_not_finalize(tmp_path, sto
     assert m2.phase == P.completed
 
 
+async def test_a_finalize_step_errors_reason_is_redacted_and_cut(tmp_path, store):
+    """SDD §8.1: a skipped VM's reason is 'finalize failed: ...', the error redacted and cut - a
+    step error too, not only an unexpected one."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+
+    async def long_failure(ctx):
+        raise PermanentStepError("source cleanup failed: " + "x" * 3000)
+
+    h.executor.hooks[StepName.FINALIZE] = long_failure
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    [skipped] = out["skipped"]
+    assert skipped["reason"].startswith("finalize failed: source cleanup failed: xxx")
+    assert len(skipped["reason"]) <= len("finalize failed: ") + 500
+
+
 async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_path, store):
     """SDD §8.1: the source VM of a migration awaiting finalize runs again: its data diverges."""
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
