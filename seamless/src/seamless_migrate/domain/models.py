@@ -201,6 +201,8 @@ class VMRef(_Model):
         return value
 
     change_rate_bps: float | None = None
+    #: the Nova keypair the server boots with (OpenStack); VMware: None (SDD §4.1)
+    key_name: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property

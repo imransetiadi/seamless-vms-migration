@@ -83,6 +83,8 @@ def test_catalog_is_complete():
         "MAP_FLAVOR_MISSING",
         "MAP_FLAVOR_AUTO",
         "MAP_FLAVOR_PRESTAGED",
+        "DST_KEYPAIR_MISSING",
+        "MAP_KEYPAIR_PRESTAGED",
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
@@ -257,6 +259,31 @@ def test_finding_map_flavor_prestaged():
     assert all(not x.code.startswith("MAP_FLAVOR") for x in check(vm, plan=mapped))
     # without "flavors" in the list the automatic match stays
     assert only(check(vm), "MAP_FLAVOR_AUTO")
+
+
+def test_finding_dst_keypair_missing_and_prestaged():
+    """SDD §9.3: a key_name the destination credential does not own fails the cutover's
+    destination check, so it blocks - unless pre-staging imports it, which needs "keypairs" in
+    the list and the source credential to own it (os-migrate exports only its own)."""
+    vm = make_vm(key_name="ops-key")
+    src = src_inv(keypairs=["ops-key"])
+    f = only(check(vm, src=src), "DST_KEYPAIR_MISSING")
+    assert f.severity == Severity.blocker and "'ops-key'" in f.message
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "keypairs"])
+    found = check(vm, plan=prestage, src=src)
+    assert only(found, "MAP_KEYPAIR_PRESTAGED").severity == Severity.info
+    assert all(x.code != "DST_KEYPAIR_MISSING" for x in found)
+    # owned by another user: pre-staging cannot export it
+    other = check(vm, plan=prestage, src=src_inv(keypairs=[]))
+    f = only(other, "DST_KEYPAIR_MISSING")
+    assert "another user" in f.message.lower()
+    assert all(x.code != "MAP_KEYPAIR_PRESTAGED" for x in other)
+    # the destination credential owns it, or the VM has no keypair: nothing to say
+    for quiet in (
+        check(vm, src=src, dst=dst_inv(keypairs=["ops-key"])),
+        check(make_vm(key_name=None), plan=prestage, src=src),
+    ):
+        assert all("KEYPAIR" not in x.code for x in quiet)
 
 
 def test_finding_map_flavor_auto_records_resolved_mapping():

@@ -139,6 +139,10 @@ class FakeCompute:
     def flavors(self, details=True):
         return [NS(name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={})]
 
+    def keypairs(self, **_):
+        # the credential's own keypairs (Nova lists only those without user_id)
+        return [NS(name="ops-key"), NS(name="old-key")]
+
     def get_server_console_output(self, server_id, length=None):
         return {"output": "Booting...\nweb-01 login: "}
 
@@ -216,6 +220,7 @@ def fake_conn(admin=True, ovn=True):
         },
         image={},
         metadata={"os_type": "rhel9", "app": "shop"},
+        key_name="ops-key",
         compute_host="compute-0",
         attachments=[
             NS(volume_id="vol-root", device="/dev/vda"),
@@ -299,6 +304,7 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
         "finance",
         "m1.small",
     )
+    assert vm.key_name == "ops-key"  # SDD §4.1
     assert (vm.vcpus, vm.ram_mb, vm.power_state, vm.os_type, vm.host) == (
         2,
         4096,
@@ -584,6 +590,16 @@ async def test_openstack_destination_inventory(stub_openstack):
         {"name": "m1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": {}}
     ]
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
+    # SDD §11: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
+    assert inv.keypairs == ["old-key", "ops-key"]
+
+
+async def test_openstack_source_inventory_lists_the_credentials_keypairs(stub_openstack):
+    """SDD §11: what export_keypairs.yml can export - the source credential's own keypairs."""
+    stub_openstack(fake_conn())
+    inv = await OpenStackProvider(make_provider(), settings()).inventory()
+    assert isinstance(inv, SourceInventory)
+    assert inv.keypairs == ["old-key", "ops-key"]
 
 
 #: an SDK error whose 500-character cut falls inside the password of a URL

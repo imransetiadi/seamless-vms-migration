@@ -3674,6 +3674,83 @@ async def test_prestage_names_the_plans_flavors_rhoso_lacks(tmp_path, store):
     assert seen == [["c4.custom", "r8.(big)"]]
 
 
+async def test_validation_blocks_a_vm_whose_keypair_the_destination_user_lacks(tmp_path, store):
+    """SDD §9.3: before, such a VM validated and its cutover failed at the destination check,
+    right before the source was stopped; now validation blocks it, and pre-staging keypairs the
+    source user owns clears the blocker."""
+    import dataclasses
+
+    from seamless_migrate.domain.models import DEFAULT_PRESTAGE
+
+    h, plan = await setup(
+        tmp_path, store, [vm(1, key_name="ops-key"), vm(2)], {"default_strategy": Strategy.cold}
+    )
+    src_inventory = h.source.inventory
+
+    async def source_inventory():
+        return dataclasses.replace(await src_inventory(), keypairs=["ops-key"])
+
+    h.source.inventory = source_inventory
+    await h.orch.validate_plan(plan.id, "alice")
+    blocked = await h.by_vm(plan.id, "vm-1")
+    assert blocked.phase == P.blocked
+    assert [f.code for f in blocked.findings if f.code.endswith("KEYPAIR_MISSING")] == [
+        "DST_KEYPAIR_MISSING"
+    ]
+    assert (await h.by_vm(plan.id, "vm-2")).phase != P.blocked
+
+    current = await h.plan(plan.id)
+    current.prestage_resources = [*DEFAULT_PRESTAGE, "keypairs"]
+    store.put("plan", current)
+    await h.orch.validate_plan(plan.id, "alice")
+    cleared = await h.by_vm(plan.id, "vm-1")
+    assert cleared.phase != P.blocked
+    assert "MAP_KEYPAIR_PRESTAGED" in [f.code for f in cleared.findings]
+
+
+async def test_prestage_names_the_keypairs_the_destination_user_lacks(tmp_path, store):
+    """SDD §7.2: with "keypairs" pre-staged the orchestrator passes the VMs' key_names the
+    source credential owns and the destination credential lacks."""
+    import dataclasses
+
+    from seamless_migrate.domain.models import DEFAULT_PRESTAGE
+
+    vms = [
+        vm(1, key_name="ops-key"),
+        vm(2, key_name="shared-key"),
+        vm(3),
+        vm(4, key_name="ops-key"),
+    ]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {"default_strategy": Strategy.cold, "prestage_resources": [*DEFAULT_PRESTAGE, "keypairs"]},
+    )
+    src_inventory, dst_inventory = h.source.inventory, h.destination.inventory
+
+    async def source_inventory():
+        return dataclasses.replace(await src_inventory(), keypairs=["ops-key", "shared-key"])
+
+    async def destination_inventory():
+        return dataclasses.replace(await dst_inventory(), keypairs=["shared-key"])
+
+    h.source.inventory, h.destination.inventory = source_inventory, destination_inventory
+    seen: list[list[str] | None] = []
+
+    async def prestage(plan, source, destination, *, prestage_keypairs=None):
+        seen.append(prestage_keypairs)
+        h.executor.prestaged.append(plan.id)
+
+    h.executor.prestage = prestage
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert seen == [["ops-key"]]
+
+
 def recent_base():
     """A base time within the 900 s keep-warm interval, so keep-warm passes stay idle."""
     from seamless_migrate.domain.models import utcnow

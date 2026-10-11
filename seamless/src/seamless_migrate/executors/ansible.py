@@ -451,6 +451,7 @@ class AnsibleExecutor:
         *,
         deploy_conversion_hosts: bool | None = None,
         prestage_flavors: list[str] | None = None,
+        prestage_keypairs: list[str] | None = None,
     ) -> None:
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
@@ -464,6 +465,8 @@ class AnsibleExecutor:
                 # only the plan's flavors RHOSO lacks, never os-migrate's every-flavor default:
                 # its import rewrites a same-named destination flavor's extra specs (SDD §7.2)
                 continue
+            if resource == "keypairs" and not prestage_keypairs:
+                continue  # only the plan's keypairs the destination credential lacks (SDD §7.2)
             playbooks += [_Playbook(f"export_{resource}.yml"), _Playbook(f"import_{resource}.yml")]
         if deploy_conversion_hosts is None:
             hosts = [source.conversion_host, destination.conversion_host]
@@ -471,10 +474,12 @@ class AnsibleExecutor:
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
         variables = _common_openstack_vars(source, destination, osm, osm)
-        if prestage_flavors:
-            variables["os_migrate_flavors_filter"] = [
-                {"regex": "^" + re.escape(name) + "$"} for name in prestage_flavors
-            ]
+        for key, names in (
+            ("os_migrate_flavors_filter", prestage_flavors),
+            ("os_migrate_keypairs_filter", prestage_keypairs),
+        ):
+            if names:
+                variables[key] = [{"regex": "^" + re.escape(name) + "$"} for name in names]
         await self._execute(
             pdir, osm, variables, source, destination, _inventory(), playbooks, None, None
         )

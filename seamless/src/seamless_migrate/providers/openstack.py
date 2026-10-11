@@ -231,8 +231,12 @@ class OpenStackProvider:
         conn = self._connection()
         networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in conn.network.networks()}
         project = self._project_name(conn)
+        # the credential's own keypairs: what it can export, or owns as the creator (SDD §11)
+        keypairs = sorted(str(_attr(k, "name")) for k in conn.compute.keypairs())
         if self.provider.role == ProviderRole.source:
-            return SourceInventory(networks=networks, projects=[project] if project else [])
+            return SourceInventory(
+                networks=networks, projects=[project] if project else [], keypairs=keypairs
+            )
         flavors = [
             {
                 "name": str(_attr(f, "name")),
@@ -251,6 +255,7 @@ class OpenStackProvider:
             volume_types=volume_types,
             quotas=quotas,
             projects=[project] if project else [],
+            keypairs=keypairs,
         )
 
     @staticmethod
@@ -546,4 +551,5 @@ class _MapContext:
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,
             flavor_extra_specs={str(k): str(v) for k, v in extra_specs.items()},
+            key_name=_attr(server, "key_name", default=None) or None,
         )

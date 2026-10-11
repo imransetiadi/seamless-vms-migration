@@ -18,6 +18,8 @@ class SourceInventory:
     #: network name -> MTU (None when unknown)
     networks: dict[str, int | None] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
+    #: the source credential's own keypairs: what export_keypairs.yml can export (SDD §11)
+    keypairs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -32,6 +34,8 @@ class DestinationInventory:
     #: project -> free {cores, ram_mb, instances, volumes, gigabytes}; None/-1 = unlimited
     quotas: dict[str, dict[str, int | None]] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
+    #: the destination credential's own keypairs: the server is created as that user (SDD §11)
+    keypairs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -86,6 +90,18 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Nothing to do: pre-staging creates the flavor in RHOSO with the same name, size and "
         "extra specs. Add a flavor mapping to use an existing RHOSO flavor instead.",
+    ),
+    "DST_KEYPAIR_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Create the keypair (its public key) for the RHOSO migration user, or pre-stage keypairs "
+        "when the source migration user owns it.",
+    ),
+    "MAP_KEYPAIR_PRESTAGED": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: pre-staging imports the keypair (name and public key) for the RHOSO "
+        "migration user.",
     ),
     "MAP_FLAVOR_MISSING": CatalogEntry(
         Severity.blocker,
@@ -345,6 +361,23 @@ def flavor_prestaged(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> bo
     )
 
 
+def keypair_missing(vm: VMRef, dst_inv: DestinationInventory) -> bool:
+    """Whether ``vm`` boots with a keypair the destination credential lacks (SDD §9.3)."""
+    return bool(vm.key_name and vm.key_name not in dst_inv.keypairs)
+
+
+def keypair_prestaged(
+    vm: VMRef, plan: Plan, src_inv: SourceInventory, dst_inv: DestinationInventory
+) -> bool:
+    """Whether pre-staging imports ``vm``'s keypair (SDD §7.2, ``MAP_KEYPAIR_PRESTAGED``):
+    "keypairs" is pre-staged, the destination lacks it and the source credential owns it."""
+    return bool(
+        keypair_missing(vm, dst_inv)
+        and "keypairs" in plan.prestage_resources
+        and vm.key_name in src_inv.keypairs
+    )
+
+
 def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Mappings:
     """Mappings preflight matched automatically for ``vm`` (``Migration.resolved_mappings``).
 
@@ -460,6 +493,29 @@ def run_preflight(
                 "MAP_NETWORK_MISSING",
                 f"Network mapping target(s) do not exist in RHOSO: {_names(bad_net_targets)}.",
                 remediation="Fix the mapping: the destination network must exist.",
+            )
+        )
+
+    if keypair_prestaged(vm, plan, src_inv, dst_inv):
+        out.append(
+            finding(
+                "MAP_KEYPAIR_PRESTAGED",
+                f"Pre-staging imports keypair {vm.key_name!r} for the RHOSO migration user.",
+            )
+        )
+    elif keypair_missing(vm, dst_inv):
+        owned = vm.key_name in src_inv.keypairs
+        out.append(
+            finding(
+                "DST_KEYPAIR_MISSING",
+                f"The VM boots with keypair {vm.key_name!r}, which the RHOSO migration user does "
+                "not have: the cutover would stop at its destination check."
+                + (
+                    " Pre-stage keypairs to import it."
+                    if owned
+                    else " Another user owns it at the source, so pre-staging cannot export it: "
+                    "create it, its public key, for the RHOSO migration user."
+                ),
             )
         )
 

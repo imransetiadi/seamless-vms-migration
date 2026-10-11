@@ -670,6 +670,21 @@ async def test_prestage_scopes_flavors_to_the_plan(env):
         ]
 
 
+async def test_prestage_scopes_keypairs_to_the_plan(env):
+    """SDD §7.2: keypairs are scoped like flavors - only the key_names the orchestrator names;
+    without any, the keypair playbooks are skipped."""
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["keypairs"])
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=False, prestage_keypairs=["ops.key"]
+    )
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == ["export_keypairs.yml", "import_keypairs.yml"]
+    assert all(c["vars"]["os_migrate_keypairs_filter"] == [{"regex": "^ops\\.key$"}] for c in calls)
+    before = len(calls)
+    await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False)
+    assert read_log(env.log)[before:] == []
+
+
 def test_build_vars_and_inventory_are_pure(env):
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
     v1 = build_vars(StepName.CUTOVER, ctx)

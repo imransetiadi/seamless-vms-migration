@@ -97,7 +97,13 @@ from .planning.estimator import (
     observed_scan_rate,
     params_for_plan,
 )
-from .planning.preflight import flavor_prestaged, has_blocker, resolve_mappings, run_preflight
+from .planning.preflight import (
+    flavor_prestaged,
+    has_blocker,
+    keypair_prestaged,
+    resolve_mappings,
+    run_preflight,
+)
 from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
@@ -2175,19 +2181,30 @@ class Orchestrator:
                     kwargs["deploy_conversion_hosts"] = any(
                         m.strategy in (Strategy.cold, Strategy.warm) for m in migs
                     )
-                if "flavors" in plan.prestage_resources and (
-                    "prestage_flavors" in inspect.signature(executor.prestage).parameters
-                ):
-                    # only the plan's flavors RHOSO lacks: a destination flavor is shared by
-                    # every project and never pre-staged over (SDD §7.2)
+                params = inspect.signature(executor.prestage).parameters
+                scoped = {"flavors": "prestage_flavors", "keypairs": "prestage_keypairs"}
+                if any(r in plan.prestage_resources and scoped[r] in params for r in scoped):
+                    # only the plan's flavors RHOSO lacks (a destination flavor is shared by every
+                    # project and never pre-staged over) and the keypairs the destination user
+                    # lacks and the source user owns (SDD §7.2)
+                    src_inv = await self.providers.get(source).inventory()
                     dst_inv = await self.providers.get(destination).inventory()
-                    kwargs["prestage_flavors"] = sorted(
-                        {
-                            m.vm.flavor
-                            for m in migs
-                            if m.vm.flavor and flavor_prestaged(m.vm, plan, dst_inv)
-                        }
-                    )
+                    if "flavors" in plan.prestage_resources and "prestage_flavors" in params:
+                        kwargs["prestage_flavors"] = sorted(
+                            {
+                                m.vm.flavor
+                                for m in migs
+                                if m.vm.flavor and flavor_prestaged(m.vm, plan, dst_inv)
+                            }
+                        )
+                    if "keypairs" in plan.prestage_resources and "prestage_keypairs" in params:
+                        kwargs["prestage_keypairs"] = sorted(
+                            {
+                                m.vm.key_name
+                                for m in migs
+                                if m.vm.key_name and keypair_prestaged(m.vm, plan, src_inv, dst_inv)
+                            }
+                        )
                 await executor.prestage(plan, source, destination, **kwargs)
             self._prestage_done.add(plan.id)
             await self._emit(

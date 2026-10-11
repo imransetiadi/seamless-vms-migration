@@ -65,7 +65,14 @@ def test_provider_crud(api):
     inventory = api.get("/api/v1/providers/src-osp/inventory").json()
     assert len(inventory) == 24 and {"source_id", "disk_bytes", "used_bytes"} <= set(inventory[0])
     dst_inventory = api.get("/api/v1/providers/dst-rhoso/inventory").json()
-    assert set(dst_inventory) == {"networks", "flavors", "volume_types", "quotas", "projects"}
+    assert set(dst_inventory) == {
+        "networks",
+        "flavors",
+        "volume_types",
+        "quotas",
+        "projects",
+        "keypairs",  # SDD §11
+    }
 
     # a provider used by a non-terminal plan cannot be deleted
     plan = api.post(
