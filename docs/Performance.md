@@ -490,7 +490,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
 | `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each) and the overview refetches it on live events; `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
+| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each); since 376eec7 a live event about one migration reads only that one (`GET /migrations/{id}`) and splices it into the cached lists, and only new migrations, plan and wave events read the lists again (SDD §16); `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -597,7 +597,9 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one `SELECT DISTINCT` over the indexed
   `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
   226 → 39 ms and 153 → 32 ms CPU. Prefer SSE-triggered
-  cache invalidation in the dashboard over short-interval polling.
+  cache invalidation in the dashboard over short-interval polling; an event about one existing migration
+  re-reads that migration alone and splices it into the cached lists (SDD §16, 376eec7): at 1,000 VMs a plan a
+  full list is ≈ 4.5 MB (≈ 0.5 MB gzipped) per page and event, one migration ≈ 4.5 KB.
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
   Re-estimation after a completed pass (calibration, §1) is one more write per pass and a pure function.
