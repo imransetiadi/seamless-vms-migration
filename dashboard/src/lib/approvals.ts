@@ -8,6 +8,9 @@ import { isWaveActive } from './waves';
 /** The two kinds of approval (SDD §16, ADV-20): the plan's cutover approval and an advisor decision (§14.6). */
 export type ApprovalKind = 'cutover' | 'advisor_decision';
 
+/** How many rows Pending approvals shows before "Show all", as many as Needs attention (SDD §16). */
+export const APPROVALS_SHOWN = 8;
+
 export const APPROVAL_KIND_LABELS: Record<ApprovalKind, string> = {
   cutover: 'Cutover approval',
   advisor_decision: 'Advisor decision',
