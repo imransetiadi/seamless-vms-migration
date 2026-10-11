@@ -309,7 +309,8 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
         existing, version = store.get_versioned("plan", existing.id, Plan)
         # the file's keys are the PATCH body, refused first as PATCH refuses them (§12)
-        unknown = sorted(set(document) - PLAN_EDITABLE_FIELDS)
+        # a YAML key that is no string (`1:`, `yes:`) is a field the plan cannot change too
+        unknown = sorted(str(key) for key in document if key not in PLAN_EDITABLE_FIELDS)
         if unknown:
             raise CliError(f"fields cannot be changed: {', '.join(unknown)}")
         if str(existing.status) not in ("draft", "validated"):
@@ -571,7 +572,11 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
 
     now = utcnow()
     if args.before:
-        before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+        try:
+            before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+        except ValueError:
+            print(f"error: --before {args.before!r} is no ISO date and time", file=sys.stderr)
+            return 2
         if before.tzinfo is None:
             before = before.replace(tzinfo=UTC)  # a --before without an offset is UTC
     elif args.older_than_days is not None:
@@ -579,7 +584,12 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
         if not math.isfinite(days) or days < 0:
             print("error: --older-than-days must be a number of days, 0 or more", file=sys.stderr)
             return 2
-        before = now - timedelta(days=days)
+        try:
+            before = now - timedelta(days=days)
+        except OverflowError:
+            # an age reaching back before year 1: a refused argument, never a traceback (SDD §15)
+            print(f"error: --older-than-days {days:g} reaches back before year 1", file=sys.stderr)
+            return 2
     else:
         print("error: give --before <ISO datetime> or --older-than-days N", file=sys.stderr)
         return 2

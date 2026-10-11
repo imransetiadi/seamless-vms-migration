@@ -789,3 +789,29 @@ def test_events_prune_reads_a_before_without_an_offset_as_utc(env, capsys):
         )  # fmt: skip
     assert cli.main(["events", "prune", "--before", "2026-10-01T02:00:00", "--confirm"]) == 0
     assert "deleted 1 event(s) before 2026-10-01T02:00:00+00:00" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        ["--older-than-days", "1000000"],
+        ["--before", "last tuesday"],
+    ],
+)
+def test_events_prune_refuses_a_cutoff_it_cannot_use_without_a_traceback(env, capsys, bound):
+    """SDD §15: a refused cutoff is one error line and exit 2, never a traceback (an age past year
+    1 overflows the date; text that is no ISO date and time cannot be read)."""
+    store_for(env)
+    assert cli.main(["events", "prune", *bound, "--confirm"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and "Traceback" not in err
+
+
+def test_plan_apply_names_a_non_string_key_it_cannot_change(env, capsys):
+    """SDD §15: a YAML key that is no string (`1:`) is a field the plan cannot change - one error
+    line, not a traceback."""
+    _applied_plan(env, capsys)
+    path = env / "plan.yaml"
+    path.write_text(path.read_text() + "1: typo\n")
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert capsys.readouterr().err == "error: fields cannot be changed: 1\n"
