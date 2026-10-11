@@ -1950,9 +1950,11 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   `/advisor/policies` (ADV-20) —, waves board, migrations table with
   strategy/estimate/findings — a plan without migrations says that validation creates one per VM and runs the
   pre-flight checks, with Validate there too; "{n} database VMs have no application probe." from the
-  `APP_PROBE_MISSING` findings, listing each VM with its suggested probe (§9.6) and Use suggested probe — operator, a
-  plan edit, unavailable with the reason while the plan cannot be edited (§12) — or that it has no suggestion and
-  takes a probe by hand; the findings say pre-flight passed only once every VM of `vm_ids`
+  `APP_PROBE_MISSING` findings, leaving out a VM the plan now probes (its own probes or the plan's: the finding
+  itself stays until the next validation), listing each VM with its suggested probe (§9.6) and Use suggested probe —
+  operator, a plan edit, unavailable with the reason while the plan cannot be edited (§12); once saved its row goes
+  and focus moves to the plan's heading — or that it has no suggestion and takes a probe by hand; the findings say
+  pre-flight passed only once every VM of `vm_ids`
   has a migration whose pre-flight ran and the plan is not a draft again (an edited plan is validated again),
   and until then that it runs at validation — Validate/Start/Pause/Auto-waves/Edit actions — Auto-waves (on a
   paused plan too) says before it runs that the plan returns to draft and must be validated again, which clears
