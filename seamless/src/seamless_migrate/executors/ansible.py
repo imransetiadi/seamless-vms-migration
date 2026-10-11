@@ -304,33 +304,64 @@ def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]
     return out
 
 
+#: Beside the export: what its rewrite applied (SDD §7.2 export record).
+EXPORT_RECORD = "rewrite.json"
+
+
+def export_record(
+    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None
+) -> dict[str, Any]:
+    """The export record (SDD §7.2): the mappings a rewrite applies - the plan's overlaid with the
+    migration's resolved ones - and the VM's NIC override entries."""
+    return {
+        "mappings": mappings.model_dump(mode="json"),
+        "nic_overrides": {
+            mac: entry.model_dump(mode="json") for mac, entry in (nic_overrides or {}).items()
+        },
+    }
+
+
+def _read_export_record(osm: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads((osm / EXPORT_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _apply_port_mode(
     osm: Path,
     mode: str,
     cutover: bool,
     nic_overrides: bool = False,
     networks: Sequence[dict[str, Any]] | None = None,
+    record: dict[str, Any] | None = None,
+    exports: bool = False,
 ) -> bool:
     """Write the plan's port_creation_mode into an existing export before a run, and resolve its
-    network references again with the destination's ``networks`` when given (SDD §7.2).
+    network references again with the destination's ``networks`` when given, unless the run
+    replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
 
-    True when a cutover must export the workload again: in "neutron" mode its ports were exported
-    without their security groups, or the VM has NIC overrides, or had some at the export (a port
-    marked ``nic_override``: an entry removed since). The export replaces the server in place, so
-    the file stays for a rollback should the new export fail.
+    True when the run must export the workload again: a cutover in "neutron" mode whose ports were
+    exported without their security groups, or of a VM with NIC overrides, or that had some at the
+    export (a port marked ``nic_override``: an entry removed since); or, given the plan's
+    ``record``, an export whose record differs from it or that has none. The export replaces the
+    server in place, so the file stays for a rollback should the new export fail.
     """
     path = osm / "workloads.yml"
     if not path.exists():
         return False
     doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    reexport = cutover and (
-        (mode == "neutron" and bool(ports_without_security_groups(doc)))
-        or nic_overrides
-        or _overridden_ports(doc)
-    )
+    reexport = (
+        cutover
+        and (
+            (mode == "neutron" and bool(ports_without_security_groups(doc)))
+            or nic_overrides
+            or _overridden_ports(doc)
+        )
+    ) or (record is not None and _read_export_record(osm) != record)
     doc = set_port_creation_mode(doc, mode)
-    # a new export is resolved after it instead
-    if networks and not reexport:
+    # a new export is resolved after it instead: the one it replaces may no longer resolve
+    if networks and not (reexport or exports):
         doc = resolve_network_refs(doc, networks)
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     return reexport
@@ -732,15 +763,33 @@ class AnsibleExecutor:
         reexport = False
         networks: list[dict[str, Any]] | None = None
         if strategy in (Strategy.cold, Strategy.warm):
-            if step != StepName.ROLLBACK:
+            vm_id = ctx.migration.vm.source_id
+            nics = ctx.plan.nic_overrides.get(vm_id)
+            # a warm cutover re-run that finishes the recorded destination server runs on the
+            # export as it is: its ports exist, and the plan cannot change while the source is
+            # stopped (SDD §7.2)
+            finishing = (
+                strategy == Strategy.warm
+                and step == StepName.CUTOVER
+                and bool(
+                    ((await asyncio.to_thread(_read_warm_state, osm, vm_id)) or {}).get(
+                        "destination_server_id"
+                    )
+                )
+            )
+            judged = step != StepName.ROLLBACK and not finishing
+            if judged:
                 networks = await self._destination_networks(ctx)
+            mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
             reexport = await asyncio.to_thread(
                 _apply_port_mode,
                 osm,
                 ctx.plan.port_creation_mode,
-                step == StepName.CUTOVER,
-                bool(ctx.plan.nic_overrides.get(ctx.migration.vm.source_id)),
+                step == StepName.CUTOVER and not finishing,
+                bool(nics),
                 networks,
+                export_record(mappings, nics) if judged else None,
+                any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
             )
         playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
         if not playbooks:
@@ -1069,6 +1118,9 @@ class AnsibleExecutor:
             await asyncio.to_thread(prepare)
             env = await asyncio.to_thread(self._env)
             for playbook in playbooks:
+                if playbook.name == "export_workloads.yml":
+                    # written again once the rewrite of the new export finishes (SDD §7.2)
+                    remove_quietly(osm / EXPORT_RECORD)
                 stop_skipped |= await self._run_playbook(
                     playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
                 )
@@ -1095,7 +1147,8 @@ class AnsibleExecutor:
     ) -> None:
         """Keep only the planned server of the export, apply the mappings, the VM's NIC
         overrides and the plan's port_creation_mode, and resolve the network references against
-        the destination's ``networks`` (SDD §7.2)."""
+        the destination's ``networks``; once all of it succeeded, write the export record (SDD
+        §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -1139,6 +1192,8 @@ class AnsibleExecutor:
                 "security groups: recreated through Neutron they would get the project's default "
                 "group. Update the os-migrate collection, or recreate the ports with Nova."
             )
+        record = export_record(mappings or Mappings(), nic_overrides)
+        (osm / EXPORT_RECORD).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
 
     def _playbook_arg(self, name: str) -> str:
         if name.endswith(".yml"):

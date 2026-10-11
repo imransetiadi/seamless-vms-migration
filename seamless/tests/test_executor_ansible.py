@@ -443,16 +443,18 @@ async def test_neutron_mode_refuses_ports_exported_without_security_groups_befor
         await env.executor.run(StepName.CUTOVER, cold)
     assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
     assert rec.downtime_marks == 0
+    # the rewrite did not finish: no export record, so the next run exports again (SDD §7.2)
+    assert not (run_dir(env) / "osm" / "rewrite.json").exists()
 
 
-def nic_ctx(env, strategy, overrides):
+def nic_ctx(env, strategy, overrides, mappings=MAPPINGS, **mig_kw):
     plan = make_plan(
         id="plan-00c0ffee",
-        mappings=MAPPINGS,
+        mappings=mappings,
         nic_overrides={"srv-1": overrides} if overrides else {},
     )
     vm = make_vm(source_id="srv-1", name="web-01")
-    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
     return make_ctx(plan, mig, SRC, DST, env.settings)
 
 
@@ -1857,6 +1859,195 @@ async def test_a_cutover_that_exports_again_resolves_only_the_new_export(env):
     ]
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+def _edited(**changes):
+    """MAPPINGS as the operator edited them after a failed attempt (SDD §12 PATCH /plans/{id})."""
+    return Mappings(**{**MAPPINGS.model_dump(), **changes})
+
+
+def _ambiguous(env, name):
+    """``name`` no longer resolves: two networks of the credential's project carry it."""
+    env.registry.networks = [n for n in env.registry.networks if n["name"] != name] + [
+        dst_net(name),
+        {**dst_net(name), "id": f"net-{name}-second"},
+    ]
+
+
+async def test_a_cold_retry_with_a_fixed_mapping_never_resolves_the_export_it_replaces(env):
+    """SDD §7.2, review NC-02: the mapped name did not resolve; the operator maps the network
+    elsewhere and retries. The cutover exports again, so the name in the previous export must not
+    hold it up."""
+    _ambiguous(env, "rhoso-app")
+    first, _ = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, first)
+    fixed = _edited(networks={"app-net": "rhoso-dmz", "DC2-Prod": "dc2-prod"})
+    retry, _ = ctx_for(env, strategy=Strategy.cold, mappings=fixed)
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][1:] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-dmz"
+
+
+async def test_a_cold_cutover_never_resolves_the_export_it_replaces(env, monkeypatch):
+    """SDD §7.2: the cold cutover always exports again, so the export it replaces is never
+    resolved - even when its record matches the plan, a name in it that no longer resolves must
+    not hold up the new export."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "import_workloads.yml")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", "Could not find a flavor named rhoso.small")
+    first, _ = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="flavor"):
+        await env.executor.run(StepName.CUTOVER, first)
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    osm = run_dir(env) / "osm"
+    assert (osm / "rewrite.json").exists()
+    doc = yaml.safe_load((osm / "workloads.yml").read_text())
+    doc["resources"][0]["params"]["ports"][0]["params"]["network_ref"]["name"] = "gone-net"
+    (osm / "workloads.yml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    retry, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-app"
+
+
+async def test_a_warm_run_exports_again_once_the_plans_mappings_changed(env):
+    """SDD §7.2, review NC-02: a warm pass on an unchanged plan works on the export as it is; once
+    the mappings differ from the export record (a plan edited after a failed attempt), the next
+    pass exports again and the new mapping reaches the export."""
+    warm, _ = ctx_for(env)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    same, _ = ctx_for(env, sync_passes=[first.sync_pass])
+    await env.executor.run(StepName.SYNC, same)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+        "import_workloads_precopy.yml",
+    ]
+    fixed = _edited(networks={"app-net": "rhoso-dmz", "DC2-Prod": "dc2-prod"})
+    edited, _ = ctx_for(env, mappings=fixed, sync_passes=[first.sync_pass])
+    await env.executor.run(StepName.SYNC, edited)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-dmz"
+
+
+async def test_a_warm_cutover_exports_again_for_a_flavor_matched_anew(env):
+    """SDD §7.2: the record holds the mappings the rewrite applied - the plan's overlaid with the
+    migration's resolved ones - so a flavor that a re-validation matched anew reaches the
+    cutover."""
+    unmapped = _edited(flavors={})
+    matched = Mappings(flavors={"m1.small": "rhoso.small"})
+    warm, _ = ctx_for(env, mappings=unmapped, resolved_mappings=matched)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "rhoso.small"
+    # the same match: the export as it is
+    same, _ = ctx_for(
+        env, mappings=unmapped, resolved_mappings=matched, sync_passes=[first.sync_pass]
+    )
+    await env.executor.run(StepName.SYNC, same)
+    later, _ = ctx_for(
+        env, mappings=unmapped, resolved_mappings=Mappings(flavors={"m1.small": "rhoso.medium"})
+    )
+    await env.executor.run(StepName.CUTOVER, later)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "import_workloads_precopy.yml",
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "rhoso.medium"
+
+
+async def test_the_export_record_holds_what_the_rewrite_applied(env):
+    """SDD §7.2: beside the export, the mappings the rewrite applied and the VM's NIC override
+    entries; removed before each export, so an export whose rewrite fails has none."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    warm, _ = nic_ctx(
+        env, Strategy.warm, entry, resolved_mappings=Mappings(flavors={"m1.large": "rhoso.large"})
+    )
+    await env.executor.run(StepName.PRECOPY, warm)
+    record = run_dir(env) / "osm" / "rewrite.json"
+    assert json.loads(record.read_text()) == {
+        "mappings": {
+            "networks": MAPPINGS.networks,
+            "flavors": {"m1.large": "rhoso.large", "m1.small": "rhoso.small"},
+            "volume_types": MAPPINGS.volume_types,
+            "projects": MAPPINGS.projects,
+        },
+        "nic_overrides": {
+            "fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}
+        },
+    }
+    # an entry whose MAC no exported port has: the rewrite fails after the export, before the stop
+    gone, _ = nic_ctx(env, Strategy.warm, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        await env.executor.run(StepName.CUTOVER, gone)
+    assert not record.exists()
+
+
+async def test_an_export_without_a_record_is_exported_again(env):
+    """SDD §7.2, review NC-03: an export written before the record - here also before the
+    nic_override marker - whose override was removed since. The next warm run exports again, so
+    the port goes back to its mapped network."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    with_entry, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.PRECOPY, with_entry)
+    osm = run_dir(env) / "osm"
+    doc = yaml.safe_load((osm / "workloads.yml").read_text())
+    for port in doc["resources"][0]["params"]["ports"]:
+        port.get("_migration_params", {}).pop("nic_override", None)
+    (osm / "workloads.yml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    (osm / "rewrite.json").unlink(missing_ok=True)
+    removed, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.CUTOVER, removed)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-app"
+    assert port["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+
+
+async def test_a_cutover_rerun_on_a_recorded_server_neither_exports_nor_resolves(env, monkeypatch):
+    """SDD §7.2, review NC-07: the re-run only finishes the server the failed attempt created -
+    its ports exist, and the plan cannot change while the source is stopped. It runs on the export
+    as it is: the VM's NIC override does not export it again, and a network name that stopped
+    resolving does not fail it (§8's automatic rollback would undo a finished cutover)."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    warm, _ = nic_ctx(env, Strategy.warm, entry)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    _finished_cutover_state(env)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")  # the role finishes the server, no pass
+    _ambiguous(env, "rhoso-dmz")
+    reads = env.registry.calls.count(("inventory",))
+    retry, _ = nic_ctx(
+        env,
+        Strategy.warm,
+        entry,
+        sync_passes=[first.sync_pass],
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.CUTOVER, retry)
+    assert result.destination_server_id == "dst-srv-1"
+    assert [c["playbook"] for c in read_log(env.log)][2:] == ["import_workloads_cutover.yml"]
+    assert env.registry.calls.count(("inventory",)) == reads
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"] == {
         "name": "rhoso-dmz",
         "project_name": "%auth%",
         "domain_name": "%auth%",
