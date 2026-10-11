@@ -1450,8 +1450,8 @@ Static bearer tokens: `SEAMLESS_TOKENS_FILE` (YAML `tokens: [{name, role, sha256
 hashes are stored; comparison uses `hmac.compare_digest`. `seamless token create --name N --role R`
 prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry. It refuses a name
 the tokens file refuses (empty, or longer than 128 characters) and the names the control plane records
-as actors itself — `anonymous`, `unauthenticated`, `cli`, `system` — so no token's audit events pass
-for theirs.
+as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
+blanks around them too — so no token's audit events pass for theirs.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
 Demo mode on loopback disables auth by default. Every request refused for its role emits
