@@ -115,7 +115,7 @@ unless the name ends in `_gb`. Durations are float seconds (`_s`).
 
 ```text
 ProviderKind   = openstack | vmware | rhoso
-Distribution   = openstack_community | kolla | rhosp | rhoso | vmware   # presets and display only;
+Distribution   = openstack_community | kolla | rhosp | rhoso | vmware   # a Literal in domain.models, not an enum; presets and display only;
                  # kind decides the code path: openstack_community|kolla|rhosp → openstack, rhoso → rhoso, vmware → vmware
 ProviderRole   = source | destination
 Strategy       = cold | warm | storage_handover | vmware_cold | vmware_warm
@@ -2027,7 +2027,7 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   enter write-only credentials and the conversion-host SSH key; a provider added before a later step of
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
-  `/inventory/:providerId`
+  `/inventory/:providerId` — `/inventory` opens the first source provider's —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
@@ -2142,7 +2142,7 @@ bind mount; `.env` is 0600.
 `Makefile` targets: `seamless-colima-up` (`colima start seamless --activate=false --cpu 4 --memory 6
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
 `seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
-(all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `--demo`
+(all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
 against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
 collection, dashboard).
 
