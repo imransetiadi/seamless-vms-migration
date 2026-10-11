@@ -59,6 +59,18 @@ type FieldKey = 'name' | 'id' | 'endpoint' | 'cloud' | 'username' | 'password' |
 /** A secret name the control plane reads (SDD §13.3); never a path. */
 const SECRET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const SECRET_NAME_RULE = '1–128 letters, digits, ., _ or -, starting with a letter or digit.';
+/** On OpenShift a Secret read through the API (not mounted) must say it is meant for providers (SDD §13.3). */
+const OPENSHIFT_LABEL = 'On OpenShift, a Secret Seamless reads through the API needs the label seamless.io/provider-secret: "true".';
+
+/** Why a named secret is refused, or null (SDD §13.3): the name rule, and no other provider's provider-* secret. */
+function secretNameError(name: string, own: string, what: string): string | null {
+  const trimmed = name.trim();
+  if (!SECRET_NAME.test(trimmed)) return `Enter ${what}: ${SECRET_NAME_RULE}`;
+  if (trimmed.startsWith('provider-') && trimmed !== own) {
+    return 'This names another provider’s secret: provider-* names are the ones Seamless stores for each provider.';
+  }
+  return null;
+}
 
 /** A secret the dashboard wrote (`provider-{id}`, `provider-{id}-ssh`) is Seamless's own; any other name is managed outside it. */
 function outside(name: string | null | undefined, managed: string): string | null {
@@ -323,7 +335,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     if (form.mode === 'clouds_yaml') {
       if (!form.cloud.trim()) e.cloud = 'Enter the cloud name of the entry in the mounted clouds.yaml.';
     } else if (form.mode === 'external_secret') {
-      if (!SECRET_NAME.test(form.secretName.trim())) e.secretName = `Enter the secret name: ${SECRET_NAME_RULE}`;
+      const why = secretNameError(form.secretName, `provider-${form.id}`, 'the secret name');
+      if (why) e.secretName = why;
     } else if (required && form.mode === 'application_credential') {
       if (!form.appId.trim()) e.appId = 'Enter the application credential ID.';
       if (!form.appSecret) e.appSecret = 'Enter the application credential secret.';
@@ -336,7 +349,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       if (!form.hostName.trim() && !form.hostAddress.trim()) e.hostAddress = 'Enter the address (or name) of the existing conversion host.';
       const keyStored = editing && Boolean(current?.conversion_key_updated_at);
       if (form.keySource === 'external') {
-        if (!SECRET_NAME.test(form.keySecretName.trim())) e.keySecretName = `Enter the name of the secret holding the key: ${SECRET_NAME_RULE}`;
+        const why = secretNameError(form.keySecretName, `provider-${form.id}-ssh`, 'the name of the secret holding the key');
+        if (why) e.keySecretName = why;
       } else if (!keyStored && !form.privateKey) e.privateKey = 'Add the SSH private key Seamless uses to reach the conversion host.';
     }
     if (form.keySource === 'upload' && form.privateKey && !/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(form.privateKey.trim())) {
@@ -676,7 +690,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 value={form.secretName}
                 onChange={(e) => set('secretName', e.target.value)}
                 placeholder={preset.kind === 'vmware' ? 'e.g. vcenter-dc2' : 'e.g. rhosp17-dc1'}
-                hint={`A secret already there for Seamless — files under SEAMLESS_SECRETS_DIR/<name>/, the Secret seamless-<name> on OpenShift, or SEAMLESS_SECRET_<NAME>_* variables; ${preset.kind === 'vmware' ? 'keys username, password and optional datacenter' : 'keys username, password and project_name, or an application credential'}. Seamless reads it and never writes it. ${SECRET_NAME_RULE}`}
+                hint={`A secret already there for Seamless — files under SEAMLESS_SECRETS_DIR/<name>/, the Secret seamless-<name> on OpenShift, or SEAMLESS_SECRET_<NAME>_* variables; ${preset.kind === 'vmware' ? 'keys username, password and optional datacenter' : 'keys username, password and project_name, or an application credential'}. Seamless reads it and never writes it. ${SECRET_NAME_RULE} ${OPENSHIFT_LABEL}`}
                 error={errors.secretName}
                 inputClassName="font-mono"
                 spellCheck={false}
@@ -863,7 +877,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                     value={form.keySecretName}
                     onChange={(e) => set('keySecretName', e.target.value)}
                     placeholder="e.g. conversion-dc2-key"
-                    hint={`A secret holding the key under private_key (SEAMLESS_SECRETS_DIR/<name>/private_key, the Secret seamless-<name>, or SEAMLESS_SECRET_<NAME>_PRIVATE_KEY). Seamless reads it and never writes it. ${SECRET_NAME_RULE}`}
+                    hint={`A secret holding the key under private_key (SEAMLESS_SECRETS_DIR/<name>/private_key, the Secret seamless-<name>, or SEAMLESS_SECRET_<NAME>_PRIVATE_KEY). Seamless reads it and never writes it. ${SECRET_NAME_RULE} ${OPENSHIFT_LABEL}`}
                     error={errors.keySecretName}
                     inputClassName="font-mono"
                     spellCheck={false}

@@ -956,6 +956,10 @@ describe('mock API', () => {
     const host = { manage: false, address: '10.0.0.5', ssh_key_secret: 'has space' };
     expect(call('PATCH', '/providers/vc-x', { conversion_host: host })).toMatchObject({ status: 422 });
     expect(call('PATCH', '/providers/vc-x', { conversion_host: { ...host, ssh_key_secret: 'conv-key' } })).toMatchObject({ status: 200 });
+    // another provider's managed secret is refused, the own allowed (SDD §13.3)
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-w', credentials_secret: 'provider-vc-x' })).toMatchObject({ status: 422 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-v', credentials_secret: 'provider-vc-v' })).toMatchObject({ status: 201 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-u', credentials_secret: 'name\n' })).toMatchObject({ status: 422 });
     // only the fields a PATCH sets are checked
     server.providers.find((p) => p.id === 'vc-x')!.credentials_secret = 'old name';
     expect(call('PATCH', '/providers/vc-x', { name: 'vCenter X2' })).toMatchObject({ status: 200 });

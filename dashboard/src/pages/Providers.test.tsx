@@ -249,6 +249,22 @@ describe('Providers page', () => {
     expect(server.providers.some((p) => p.id === 'vcenter-dc5')).toBe(false);
   });
 
+  it('refuses another provider’s secret, which a check would send to this provider’s endpoint (SDD §13.3)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC6');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc6.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    // the hint says what an OpenShift Secret read through the API needs
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveAccessibleDescription(/seamless\.io\/provider-secret: "true"/);
+    await user.type(within(dialog).getByLabelText(/^secret name/i), 'provider-community-lab');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/another provider/i);
+    expect(server.providers.some((p) => p.id === 'vcenter-dc6')).toBe(false);
+  });
+
   it('opens a provider that names a secret managed outside Seamless in that sign-in method', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
