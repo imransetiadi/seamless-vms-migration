@@ -33,6 +33,15 @@ describe('planActions', () => {
     expect(planActions(planWith('draft'), 'operator', ready).start.reason).toMatch(/validate/i);
   });
 
+  it('names the blocked VMs when Start or Resume is unavailable, as the API does (SDD §16)', () => {
+    const blocked = ready.map((m, i) => (i < 2 ? { ...m, phase: 'blocked' as const } : m));
+    for (const status of ['validated', 'paused'] as const) {
+      const start = planActions(planWith(status), 'operator', blocked).start;
+      expect(start.enabled).toBe(false);
+      expect(start.reason).toBe(`2 migrations are blocked: ${blocked[0]!.vm.name}, ${blocked[1]!.vm.name} — fix the findings and re-validate.`);
+    }
+  });
+
   it('refuses to start while a migration is blocked (the API answers 409)', () => {
     const blocked = ready.map((m, i) => (i === 0 ? { ...m, phase: 'blocked' as const } : m));
     const start = planActions(planWith('validated'), 'operator', blocked).start;

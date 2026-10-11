@@ -31,7 +31,9 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
     return ok ? { enabled: true, reason: null } : { enabled: false, reason };
   };
   const status = plan.status;
-  const blocked = migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked').length;
+  // Start and Resume name the VMs that hold them back, as the API's 409 does (SDD §16)
+  const blockedVms = migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked').map((m) => m.vm.name);
+  const blocked = blockedVms.length;
   // SDD §12: a migration in flight depends on the plan as it was — no edit, no re-planned waves meanwhile;
   // each VM is named with what releases it (a completed one is finalized or rolled back, never cancelled)
   const groups = releaseGroups(migrations.filter((m) => m.plan_id === plan.id && blocksPlanChange(m)));
@@ -61,7 +63,7 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
       // 'failed': pre-staging failed; Start pre-stages the plan again (SDD §8)
       default:
         if (blocked > 0) {
-          return gate(false, `${blocked} migration${blocked === 1 ? ' is' : 's are'} blocked — fix the findings and re-validate.`);
+          return gate(false, `${blocked} migration${blocked === 1 ? ' is' : 's are'} blocked: ${names(blockedVms)} — fix the findings and re-validate.`);
         }
         if (stray.length > 0) {
           const one = stray.length === 1;
