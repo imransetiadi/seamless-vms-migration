@@ -286,6 +286,12 @@ function pyList(values: number[]): string {
  * the settings that would fail every verification or never open the cutover gate (`invalid_plan_settings`), in its
  * order and words.
  */
+/** What a plan may pre-stage, as the API's PRESTAGE_RESOURCES (SDD §4.2): the collection's playbook pairs, never workloads. */
+const PRESTAGE_RESOURCES = [
+  'networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules',
+  'flavors', 'keypairs', 'images', 'projects', 'users', 'users_keypairs', 'user_project_role_assignments', 'detached_volumes',
+];
+
 function refusePlanSpec(spec: Record<string, unknown>): void {
   const ids = Array.isArray(spec.vm_ids) ? (spec.vm_ids as string[]) : [];
   const counts = new Map<string, number>();
@@ -305,6 +311,9 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
   problems.push(...probeProblemsOf('verification.app_probes', verification.app_probes));
   const overrides = (spec.probe_overrides ?? {}) as Record<string, unknown>;
   problems.push(...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)));
+  const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
+  const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
+  if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
   const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
   if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));

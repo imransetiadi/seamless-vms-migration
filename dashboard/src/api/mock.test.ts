@@ -808,6 +808,9 @@ describe('mock API', () => {
       { verification: { windows_tcp_ports: [3389, 65536], timeout_s: -5 } },
       'verification.windows_tcp_ports [65536] outside 1-65535; verification.timeout_s must not be negative (got -5)',
     );
+    // a pre-stage name without an export/import playbook pair, or the workloads themselves (SDD §4.2)
+    await refused({ prestage_resources: ['networks', 'flavours', 'workloads'] }, "prestage_resources: cannot pre-stage 'flavours', 'workloads'");
+    await expect(client.post('/plans', { ...base, name: 'Flavors', prestage_resources: ['networks', 'flavors'] })).resolves.toMatchObject({ prestage_resources: ['networks', 'flavors'] });
     // an edit is checked on the plan it would store, kept fields included
     const plan = await client.post<Plan>('/plans', base);
     await expect(client.patch(`/plans/${plan.id}`, { cutover_window: { start: '2026-10-08T14:00:00Z', end: '2026-10-08T14:00:00Z' } })).rejects.toMatchObject({

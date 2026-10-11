@@ -158,8 +158,13 @@ const PRESTAGE_LABEL: Record<string, string> = {
   router_interfaces: 'Router interfaces',
   security_groups: 'Security groups',
   security_group_rules: 'Security group rules',
+  flavors: 'Flavors',
 };
-const isDefaultPrestage = (resource: string): boolean => DEFAULT_PRESTAGE.includes(resource);
+/** Offered as well but off by default: only the plan's flavors RHOSO lacks are created (SDD §7.2, §16). */
+const OPTIONAL_PRESTAGE = ['flavors'];
+/** Every resource the form offers, in the order they are created. */
+const OFFERED_PRESTAGE = [...DEFAULT_PRESTAGE, ...OPTIONAL_PRESTAGE];
+const isOfferedPrestage = (resource: string): boolean => OFFERED_PRESTAGE.includes(resource);
 
 /** Estimator overrides the form does not edit (it edits those of SDD §16); they are kept. */
 function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
@@ -192,7 +197,7 @@ function formFromPlan(plan: Plan): FormState {
     thresholdGiB: plain(plan.convergence_threshold_bytes / GiB),
     maxPasses: String(plan.max_sync_passes),
     keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
-    prestage: plan.prestage_resources.filter(isDefaultPrestage),
+    prestage: plan.prestage_resources.filter(isOfferedPrestage),
     scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
@@ -465,7 +470,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         keep_warm_interval_s: Math.round(keepWarm * 60),
         finalize_warning_h: finalizeWarningH,
         // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
-        prestage_resources: [...DEFAULT_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isDefaultPrestage(r))],
+        prestage_resources: [...OFFERED_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isOfferedPrestage(r))],
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
           ...DEFAULT_VERIFICATION,
@@ -986,9 +991,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     />
                   ))}
                 </div>
-                {plan && plan.prestage_resources.some((r) => !isDefaultPrestage(r)) && (
+                {OPTIONAL_PRESTAGE.map((resource) => (
+                  <Checkbox
+                    key={resource}
+                    label={PRESTAGE_LABEL[resource] ?? resource}
+                    checked={form.prestage.includes(resource)}
+                    disabled={source?.kind === 'vmware'}
+                    describedBy={id('prestage-flavors-note')}
+                    onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
+                  />
+                ))}
+                <p id={id('prestage-flavors-note')} className="-mt-1 text-xs text-muted-foreground">
+                  Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.
+                </p>
+                {plan && plan.prestage_resources.some((r) => !isOfferedPrestage(r)) && (
                   <p className="text-xs text-muted-foreground">
-                    Also pre-staged: {plan.prestage_resources.filter((r) => !isDefaultPrestage(r)).join(', ')} (set through the API; kept).
+                    Also pre-staged: {plan.prestage_resources.filter((r) => !isOfferedPrestage(r)).join(', ')} (set through the API; kept).
                   </p>
                 )}
               </Fieldset>
