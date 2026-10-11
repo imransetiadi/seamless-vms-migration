@@ -101,7 +101,7 @@ class PlanOut(Plan):
 class PlanFinalizeRequest(_Body):
     """Finalize a wave, or the whole plan, with one approval (SDD §8.1, ADV-19)."""
 
-    wave_id: str | None = Field(default=None, max_length=64)
+    wave_id: str | None = Field(default=None, max_length=_TEXT)  # unknown: 404 (SDD §12)
     #: the wave's name, or the plan's without wave_id
     confirm: str = Field(max_length=_TEXT)
     delete_source: bool = False

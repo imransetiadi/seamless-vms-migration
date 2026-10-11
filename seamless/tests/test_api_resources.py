@@ -364,6 +364,12 @@ def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):
         api.post(url, Role.approver, json={"confirm": "Pilot", "wave_id": "wave-9"}).status_code
         == 404
     )
+    # any id that is no wave of the plan is an unknown wave, however long; only the API's
+    # general free-text bound (2000) is a validation error (SDD §12)
+    long_id = {"confirm": "Pilot", "wave_id": "w" * 200}
+    assert api.post(url, Role.approver, json=long_id).status_code == 404
+    huge_id = {"confirm": "Pilot", "wave_id": "w" * 2001}
+    assert api.post(url, Role.approver, json=huge_id).status_code == 422
     nothing = api.post(url, Role.approver, json={"confirm": "to finalize"})
     assert (
         nothing.status_code == 409
