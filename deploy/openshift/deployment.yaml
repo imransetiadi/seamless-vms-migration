@@ -3,7 +3,8 @@
 # * One replica, strategy Recreate: the orchestrator is a singleton (SDD 17, open decision D2); a rolling
 #   update would briefly run two orchestrators against one database and one PVC.
 # * Security context follows SDD 17: non-root (UID assigned by the restricted SCC), readOnlyRootFilesystem,
-#   all capabilities dropped, seccomp RuntimeDefault, no service-account token.
+#   all capabilities dropped, seccomp RuntimeDefault, shareProcessNamespace (the pause process reaps what
+#   Ansible leaves); the service-account token only for the dashboard's Secret store (secret-store-rbac.yaml).
 # * Writable paths are explicit: /data (PVC) and /tmp (emptyDir). HOME points at /tmp so that Ansible, SSH
 #   and npx (Jev stdio mode) can write their caches without a writable root filesystem.
 # * Secrets (create them from secret-example.yaml or an external secret store):

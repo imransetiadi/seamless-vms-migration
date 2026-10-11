@@ -1,11 +1,13 @@
 # Default-deny with explicit allows (SDD 17): ingress to the control plane from the OpenShift router only;
 # egress to DNS, PostgreSQL and the external systems a migration needs (cloud APIs, vCenter, conversion
-# hosts over SSH, Jev provider, agentmemory). PostgreSQL accepts connections from the control plane only.
+# hosts over SSH, Jev provider, agentmemory, the migrated VMs' verification checks). PostgreSQL accepts
+# connections from the control plane only.
 #
 # TIGHTEN BEFORE PRODUCTION: seamless-allow-egress-external allows the listed ports to any address outside
 # the cluster networks. Replace 0.0.0.0/0 with the CIDRs of your source/destination clouds, vCenter,
-# conversion hosts, Jev provider and agentmemory (Security.md 8). The "except" ranges are the OpenShift
-# defaults for the pod and service networks; adjust them to your cluster.
+# conversion hosts, Jev provider, agentmemory and the destination's tenant networks - the migrated VMs, whose
+# verification checks fail and roll back a working migration when blocked (SDD 7.5, 17; Security.md 8). The
+# "except" ranges are the OpenShift defaults for the pod and service networks; adjust them to your cluster.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

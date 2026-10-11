@@ -246,8 +246,9 @@ inside the VM network:
 docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.internal:3111/agentmemory/livez
 ```
 
-On a Linux Docker host add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `seamless` service (via
-`SEAMLESS_EXTRA_COMPOSE_FILE`).
+On a Linux machine's own Docker Engine (`SEAMLESS_DOCKER_CONTEXT=default`) the Make targets add
+`deploy/compose/compose.linux-host.yaml`, which maps `host.docker.internal` to the host gateway (SDD §17.1); pass it
+with `-f` when you run `docker compose` yourself. Colima and Docker Desktop resolve the name themselves.
 
 ### 4.3 OpenShift
 

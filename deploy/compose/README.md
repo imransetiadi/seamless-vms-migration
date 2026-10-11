@@ -60,7 +60,7 @@ After `--force`, recreate the stack so the control plane reloads the files: `mak
 | Engine | How | Notes |
 |---|---|---|
 | Docker via Colima (default) | `make seamless-up` | context `colima-seamless`; your active context is never changed |
-| Any Docker host | `make seamless-up SEAMLESS_DOCKER_CONTEXT=default` | Docker Desktop, Docker Engine on Linux, a remote context |
+| Any Docker host | `make seamless-up SEAMLESS_DOCKER_CONTEXT=default` | Docker Desktop, Docker Engine on Linux, a remote context; on a Linux machine's own engine the targets add `compose.linux-host.yaml` so `host.docker.internal` (the default agentmemory host) reaches the host (SDD §17.1) |
 | Podman 4.7+ | `make seamless-up SEAMLESS_ENGINE=podman` | `podman compose` with docker-compose as provider (recommended) or podman-compose; the targets poll `/api/v1/health` instead of `--wait` |
 
 Every target takes the same variables (`make seamless-logs SEAMLESS_ENGINE=podman`, `make seamless-down …`).
