@@ -133,6 +133,26 @@ describe('MigrationDetail', () => {
     expect(chart).toHaveTextContent(`Pass ${next} (delta) is running.`);
   });
 
+  it('keeps Cutover unavailable while its plan loads: the window and approval policy are not known yet (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    if (!m) throw new Error('fixture: a warm migration awaiting cutover');
+    m.cutover_requested = false;
+    // the plan's answer waits until the test lets it through
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (String(input).endsWith(`/plans/${m.plan_id}`)) await held;
+      return fetchImpl(input, init);
+    };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server, wrapFetch });
+    const cutover = await screen.findByRole('button', { name: /^cut over$/i });
+    expect(cutover).toHaveAttribute('aria-disabled', 'true');
+    expect(cutover).toHaveAccessibleDescription(/the plan is loading/i);
+    release();
+    await waitFor(() => expect(screen.getByRole('button', { name: /^cut over$/i })).not.toHaveAttribute('aria-disabled'));
+  });
+
   it('says when its plan cannot be loaded and keeps Cutover unavailable until it can (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
@@ -355,6 +375,8 @@ describe('MigrationDetail', () => {
     expect([plan.require_approval, plan.require_distinct_approver]).toEqual([true, true]);
     const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
     const group = await screen.findByRole('group', { name: /migration actions/i });
+    // Cut over waits for the plan: its window and approval policy decide what the dialog says (SDD §16)
+    await waitFor(() => expect(within(group).getByRole('button', { name: /^cut over/i })).not.toHaveAttribute('aria-disabled'));
     await user.click(within(group).getByRole('button', { name: /^cut over/i }));
     const dialog = await screen.findByRole('alertdialog');
     expect(dialog).toHaveTextContent('Your request is not an approval: another approver approves the cutover.');

@@ -70,6 +70,8 @@ export interface MigrationActionsProps {
   role: Role | undefined;
   /** The plan failed to load: its cutover window and approval policy are unknown (SDD §16). */
   planUnavailable?: boolean;
+  /** The plan is still loading: its cutover window and approval policy are not known yet (SDD §16). */
+  planLoading?: boolean;
 }
 
 /**
@@ -78,13 +80,15 @@ export interface MigrationActionsProps {
  * first; destructive ones use the danger tone and Finalize requires typing the VM name. Force cutover
  * belongs to warm strategies alone: a single-shot one has no passes to skip (SDD §5.4).
  */
-export function MigrationActions({ migration: m, plan, role, planUnavailable = false }: MigrationActionsProps) {
+export function MigrationActions({ migration: m, plan, role, planUnavailable = false, planLoading = false }: MigrationActionsProps) {
   // the cutover's requester does not approve it (maker-checker, SDD §5.4)
   const me = useMe().data?.name;
   const availability = migrationActions(m, role, plan, undefined, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   if (planUnavailable && availability.cutover.enabled) {
     availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
+  } else if (planLoading && availability.cutover.enabled) {
+    availability.cutover = { enabled: false, reason: 'The plan is loading: its cutover window and approval policy are not known yet.' };
   }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
   const forcing = waitsOnClosedWindow(m, plan, Date.now());

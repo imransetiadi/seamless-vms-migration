@@ -649,6 +649,8 @@ export default function MigrationDetail() {
   const p = plan.data;
   // SDD §16: without its plan the cutover window and approval policy are unknown
   const planUnavailable = Boolean(plan.error) && !p;
+  // until the plan is known the Cutover dialog could promise an approval the plan does not grant (SDD §16)
+  const planLoading = !p && !plan.error;
   const warm = isWarmStrategy(m.strategy);
   const wave = p?.waves.find((w) => w.id === m.wave_id);
 
@@ -686,7 +688,7 @@ export default function MigrationDetail() {
         <Alerts m={m} />
 
         <Panel title="Next step">
-          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} />
+          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} planLoading={planLoading} />
           <DemoSourcePower key={m.id} migration={m} role={role} />
         </Panel>
 
