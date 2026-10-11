@@ -134,3 +134,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
     Nova, which gives the port a new MAC.
 
   The floating IP the import would attach or create is looked up too.
+- ``import_workload_dst_check`` also refuses, before the source stops, an
+  address of a port that another port of the destination network holds
+  (Neutron's ``IpAddressAlreadyAllocated``), and with
+  ``port_creation_mode: neutron`` another port with its MAC on the network.
+  The unbound port an earlier attempt created is the one exception, since
+  the import uses it again.

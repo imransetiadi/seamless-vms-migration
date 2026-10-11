@@ -644,3 +644,35 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.assertTrue(any("port lost on network 'gone'" in e for e in errors), errors)
         self.assertTrue(any("floating IP 172.20.9.135 on network 'gone'" in e for e in errors), errors)
         self.assertFalse(any("port ok" in e for e in errors), errors)
+
+    def test_refuses_an_address_or_mac_another_port_holds(self):
+        """SDD 6.6: Neutron refuses an address another port of the network holds, and with the MAC
+        kept the MAC too; only the unbound port an earlier attempt created is used again."""
+        app = [{"ip_address": "10.0.0.5"}]
+        self.dst.ports["taken"] = fake.Obj(
+            id="taken", network_id="net-app", mac_address="fa:16:3e:99:99:99",
+            fixed_ips=[{"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"}],
+            device_id="other-vm", description="",
+        )
+        for mode in ("nova", "neutron"):
+            [held] = self.errors([network_port("p1", "app", app)], mode=mode)
+            self.assertIn("port p1 on network 'app': 10.0.0.5 is held by port taken", held)
+        del self.dst.ports["taken"]
+        # the earlier attempt's own unbound port holds it: used again, nothing to refuse
+        self.dst.ports["mine"] = fake.Obj(
+            id="mine", network_id="net-app", mac_address="fa:16:3e:00:00:01",
+            fixed_ips=[{"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"}],
+            device_id="", description="os-migrate:p1",
+        )
+        self.assertEqual(self.errors([network_port("p1", "app", app)], mode="neutron"), [])
+        del self.dst.ports["mine"]
+        # another port with the MAC: Neutron refuses the MAC when it is kept, Nova gives a new one
+        self.dst.ports["same-mac"] = fake.Obj(
+            id="same-mac", network_id="net-app", mac_address="fa:16:3e:00:00:01",
+            fixed_ips=[{"ip_address": "10.0.0.77", "subnet_id": "sub-app-v4"}],
+            device_id="other-vm", description="",
+        )
+        [mac] = self.errors([network_port("p1", "app", app)], mode="neutron")
+        self.assertIn("port p1 on network 'app'", mac)
+        self.assertIn("already has MAC fa:16:3e:00:00:01", mac)
+        self.assertEqual(self.errors([network_port("p1", "app", app)], mode="nova"), [])

@@ -323,10 +323,19 @@ class _FakeNetwork:
 
     def ports(self, **query):
         self.cloud.record("ports", **query)
+
+        def matches(port, key, value):
+            # Neutron's fixed_ips filter: "ip_address=X" entries a port must hold
+            if key == "fixed_ips":
+                held = {ip.get("ip_address") for ip in port.get("fixed_ips") or []}
+                wanted = [v.split("=", 1)[1] for v in value if v.startswith("ip_address=")]
+                return all(address in held for address in wanted)
+            return port.get(key) == value
+
         return [
             port
             for port in list(self.cloud.ports.values())
-            if all(port.get(key) == value for key, value in query.items())
+            if all(matches(port, key, value) for key, value in query.items())
         ]
 
     def subnets(self, **query):

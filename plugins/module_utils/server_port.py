@@ -214,6 +214,37 @@ class ServerPort(osm_resource.Resource):
                     f"Destination prerequisites not met: {where}: "
                     f"{fixed_ip['ip_address']} {problem}"
                 )
+        # what another port of the network holds: Neutron refuses its address, and with the MAC
+        # kept the MAC - all but the unbound port an earlier attempt created (SDD 6.6)
+        mine = None
+        if neutron and params.get("mac_address"):
+            try:
+                mine = self._earlier_port(
+                    conn,
+                    {
+                        "network_id": refs["network_id"],
+                        "mac_address": params["mac_address"],
+                        "fixed_ips": refs["fixed_ips"],
+                        "description": port_description(info["id"]),
+                    },
+                )
+            except exc.InconsistentState as e:
+                errors.append(f"Destination prerequisites not met: {where}: {e}")
+        for fixed_ip in refs["fixed_ips"]:
+            address = fixed_ip["ip_address"]
+            holders = [
+                sdk_port["id"]
+                for sdk_port in conn.network.ports(
+                    network_id=refs["network_id"], fixed_ips=[f"ip_address={address}"]
+                )
+                if any(ip.get("ip_address") == address for ip in sdk_port["fixed_ips"] or [])
+                and (mine is None or sdk_port["id"] != mine["id"])
+            ]
+            if holders:
+                errors.append(
+                    f"Destination prerequisites not met: {where}: {address} is held by port "
+                    f"{holders[0]}"
+                )
         return errors
 
     @staticmethod
