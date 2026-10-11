@@ -1990,6 +1990,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   distribution, throughput chart, downtime vs SLO,
   active cutovers, and "Pending approvals": both kinds in one list, each row with its kind, the VM, its plan and
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
+  the first eight rows of the chosen kind, as many as Needs attention shows, the rest behind "Show all ({n})" and
+  folded back by "Show fewer" or by choosing another kind, so a plan of hundreds of VMs awaiting approval never stretches the Overview;
   ADV-20), `/plans` (the list: each plan's status, VMs, migrations done, clouds, SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
   scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
