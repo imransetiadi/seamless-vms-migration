@@ -59,6 +59,11 @@ def test_token_create_prints_token_and_yaml_hash(env, capsys):
         "System",
         " CLI ",
         "ANONYMOUS",
+        # the advisor's actors and deciders (SDD §14.4)
+        "system:advisor",
+        "system:fallback",
+        "policy:pol-finance",
+        "user:sari",
     ],
 )
 def test_token_create_refuses_names_the_file_or_the_audit_trail_own(env, capsys, name):

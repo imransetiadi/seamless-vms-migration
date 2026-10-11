@@ -241,6 +241,9 @@ def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
         raise CliError(f"a token name has 1 to {MAX_TOKEN_NAME} characters")
     if args.name.strip().casefold() in RESERVED_TOKEN_NAMES:
         raise CliError(f"{args.name!r} is an actor the control plane records itself; pick another")
+    if ":" in args.name:
+        # the form of the advisor's actors and deciders: policy:<id>, user:<name>, system:… (§14.4)
+        raise CliError(f"{args.name!r} has a colon, the form of the advisor's actors; pick another")
     token = generate_token()
     print(token)
     print(TokenStore.yaml_entry(args.name, Role(args.role), token), end="")
