@@ -81,6 +81,12 @@ CATALOG: dict[str, CatalogEntry] = {
         "Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a "
         "network mapping to use an existing RHOSO network instead.",
     ),
+    "MAP_FLAVOR_PRESTAGED": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: pre-staging creates the flavor in RHOSO with the same name, size and "
+        "extra specs. Add a flavor mapping to use an existing RHOSO flavor instead.",
+    ),
     "MAP_FLAVOR_MISSING": CatalogEntry(
         Severity.blocker,
         (),
@@ -327,6 +333,18 @@ def fitting_flavor(vm: VMRef, dst_inv: DestinationInventory) -> dict[str, Any] |
     return same or min(fits, key=_flavor_size)
 
 
+def flavor_prestaged(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> bool:
+    """Whether pre-staging creates ``vm``'s flavor (SDD §7.2, §9.3 ``MAP_FLAVOR_PRESTAGED``):
+    "flavors" is pre-staged and the flavor has no mapping and no same-named destination flavor
+    (an existing destination flavor is never pre-staged over)."""
+    return bool(
+        vm.flavor
+        and "flavors" in plan.prestage_resources
+        and vm.flavor not in plan.mappings.flavors
+        and vm.flavor not in {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
+    )
+
+
 def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Mappings:
     """Mappings preflight matched automatically for ``vm`` (``Migration.resolved_mappings``).
 
@@ -334,7 +352,11 @@ def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Ma
     same-named destination flavor fits, the smallest fitting flavor is recorded.
     """
     out = Mappings()
-    if vm.flavor and vm.flavor not in plan.mappings.flavors:
+    if (
+        vm.flavor
+        and vm.flavor not in plan.mappings.flavors
+        and not flavor_prestaged(vm, plan, dst_inv)
+    ):
         chosen = fitting_flavor(vm, dst_inv)
         if chosen is not None and chosen["name"] != vm.flavor:
             out.flavors[vm.flavor] = str(chosen["name"])
@@ -442,7 +464,17 @@ def run_preflight(
         )
 
     dst_flavor_names = {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
-    if vm.flavor and vm.flavor in maps.flavors:
+    if flavor_prestaged(vm, plan, dst_inv) and (
+        source is None or source.kind != ProviderKind.vmware
+    ):
+        out.append(
+            finding(
+                "MAP_FLAVOR_PRESTAGED",
+                f"Pre-staging creates RHOSO flavor {vm.flavor!r} with the source's size and "
+                "extra specs.",
+            )
+        )
+    elif vm.flavor and vm.flavor in maps.flavors:
         target = maps.flavors[vm.flavor]
         if target not in dst_flavor_names:
             out.append(

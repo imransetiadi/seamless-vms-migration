@@ -3636,6 +3636,44 @@ async def test_prestage_runs_even_if_a_vm_was_cancelled_before_start(tmp_path, s
     assert h.executor.prestaged == [plan.id]
 
 
+async def test_prestage_names_the_plans_flavors_rhoso_lacks(tmp_path, store):
+    """SDD §7.2: with "flavors" pre-staged the orchestrator passes the flavors of the plan's
+    VMs that have no mapping and no same-named destination flavor - the destination flavor
+    m1.small and a mapped flavor are never pre-staged over."""
+    from seamless_migrate.domain.models import DEFAULT_PRESTAGE, Mappings
+
+    vms = [
+        vm(1, flavor="c4.custom"),
+        vm(2, flavor="m1.small"),  # exists in RHOSO
+        vm(3, flavor="g2.mapped"),  # mapped by the plan
+        vm(4, flavor="c4.custom"),
+        vm(5, flavor="r8.(big)"),
+    ]
+    h, plan = await setup(
+        tmp_path,
+        store,
+        vms,
+        {
+            "default_strategy": Strategy.cold,
+            "prestage_resources": [*DEFAULT_PRESTAGE, "flavors"],
+            "mappings": Mappings(flavors={"g2.mapped": "m1.small"}),
+        },
+    )
+    seen: list[list[str] | None] = []
+
+    async def prestage(plan, source, destination, *, prestage_flavors=None):
+        seen.append(prestage_flavors)
+        h.executor.prestaged.append(plan.id)
+
+    h.executor.prestage = prestage
+    await h.orch.validate_plan(plan.id, "alice")
+    await h.orch.start_plan(plan.id, "alice")
+    await h.orch.start()
+    await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert seen == [["c4.custom", "r8.(big)"]]
+
+
 def recent_base():
     """A base time within the 900 s keep-warm interval, so keep-warm passes stay idle."""
     from seamless_migrate.domain.models import utcnow

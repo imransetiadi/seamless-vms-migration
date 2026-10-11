@@ -97,7 +97,7 @@ from .planning.estimator import (
     observed_scan_rate,
     params_for_plan,
 )
-from .planning.preflight import has_blocker, resolve_mappings, run_preflight
+from .planning.preflight import flavor_prestaged, has_blocker, resolve_mappings, run_preflight
 from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
@@ -2174,6 +2174,19 @@ class Orchestrator:
                 if "deploy_conversion_hosts" in inspect.signature(executor.prestage).parameters:
                     kwargs["deploy_conversion_hosts"] = any(
                         m.strategy in (Strategy.cold, Strategy.warm) for m in migs
+                    )
+                if "flavors" in plan.prestage_resources and (
+                    "prestage_flavors" in inspect.signature(executor.prestage).parameters
+                ):
+                    # only the plan's flavors RHOSO lacks: a destination flavor is shared by
+                    # every project and never pre-staged over (SDD §7.2)
+                    dst_inv = await self.providers.get(destination).inventory()
+                    kwargs["prestage_flavors"] = sorted(
+                        {
+                            m.vm.flavor
+                            for m in migs
+                            if m.vm.flavor and flavor_prestaged(m.vm, plan, dst_inv)
+                        }
                     )
                 await executor.prestage(plan, source, destination, **kwargs)
             self._prestage_done.add(plan.id)

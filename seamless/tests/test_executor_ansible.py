@@ -639,6 +639,37 @@ async def test_prestage_runs_resources_in_order(env):
     assert len(read_log(env.log)) == before, "VMware sources need no prestage"
 
 
+async def test_prestage_scopes_flavors_to_the_plan(env):
+    """SDD §7.2: only the flavors the orchestrator names (the plan's, which RHOSO lacks) are
+    exported and imported, each anchored and escaped; without any, the flavor playbooks are
+    skipped - os-migrate's default filter is every flavor, and its import rewrites the extra
+    specs of a same-named destination flavor."""
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["networks", "flavors"])
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=False, prestage_flavors=["m1.custom", "c4.x(1)"]
+    )
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_networks.yml",
+        "import_networks.yml",
+        "export_flavors.yml",
+        "import_flavors.yml",
+    ]
+    assert all(
+        c["vars"]["os_migrate_flavors_filter"]
+        == [{"regex": "^m1\\.custom$"}, {"regex": "^c4\\.x\\(1\\)$"}]
+        for c in calls
+    )
+    for flavors in ([], None):
+        before = len(read_log(env.log))
+        kwargs = {} if flavors is None else {"prestage_flavors": flavors}
+        await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False, **kwargs)
+        assert [c["playbook"] for c in read_log(env.log)[before:]] == [
+            "export_networks.yml",
+            "import_networks.yml",
+        ]
+
+
 def test_build_vars_and_inventory_are_pure(env):
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
     v1 = build_vars(StepName.CUTOVER, ctx)

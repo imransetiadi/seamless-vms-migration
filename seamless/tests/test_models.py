@@ -188,3 +188,29 @@ def test_keep_sync_history_drops_the_oldest_passes_between_the_first_and_the_lat
     assert next_pass_number(m) == 31
     keep_sync_history(m, keep_first=5)  # at the bound nothing more is dropped
     assert len(m.sync_passes) == 25 and m.sync_bytes_dropped == sum(range(6, 11))
+
+
+def test_prestage_resources_name_resources_os_migrate_can_pre_stage():
+    """SDD §4.2: an entry without an export/import playbook pair (a typo) or naming the
+    workloads themselves is refused; the defaults and "flavors" pass."""
+    from seamless_migrate.domain.models import DEFAULT_PRESTAGE, invalid_plan_settings
+
+    assert invalid_plan_settings(make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors"])) == []
+    assert invalid_plan_settings(make_plan(prestage_resources=[])) == []
+    assert invalid_plan_settings(
+        make_plan(prestage_resources=["networks", "flavours", "workloads"])
+    ) == ["prestage_resources: cannot pre-stage 'flavours', 'workloads'"]
+
+
+def test_prestage_resources_are_the_playbook_pairs_of_the_collection():
+    from pathlib import Path
+
+    from seamless_migrate.domain.models import PRESTAGE_RESOURCES
+
+    playbooks = Path(__file__).resolve().parents[2] / "playbooks"
+    pairs = {
+        p.stem.removeprefix("export_")
+        for p in playbooks.glob("export_*.yml")
+        if (playbooks / ("import_" + p.stem.removeprefix("export_") + ".yml")).exists()
+    }
+    assert set(PRESTAGE_RESOURCES) == pairs - {"workloads"}

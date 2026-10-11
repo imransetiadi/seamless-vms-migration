@@ -320,6 +320,19 @@ DEFAULT_PRESTAGE = [
     "security_groups",
     "security_group_rules",
 ]
+#: What a plan may pre-stage (SDD §4.2): the collection's export_<r>/import_<r> playbook pairs,
+#: never the workloads themselves; the defaults first, then the others in their creation order
+PRESTAGE_RESOURCES = (
+    *DEFAULT_PRESTAGE,
+    "flavors",
+    "keypairs",
+    "images",
+    "projects",
+    "users",
+    "users_keypairs",
+    "user_project_role_assignments",
+    "detached_volumes",
+)
 
 
 class PlanSpec(_Model):
@@ -408,6 +421,9 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
     problems += _probe_problems("verification.app_probes", verification.app_probes)
     for vm_id, probes in spec.probe_overrides.items():
         problems += _probe_problems(f"probe_overrides[{vm_id}]", probes)
+    unknown = [r for r in spec.prestage_resources if r not in PRESTAGE_RESOURCES]
+    if unknown:
+        problems.append(f"prestage_resources: cannot pre-stage {', '.join(map(repr, unknown))}")
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")

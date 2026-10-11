@@ -1,5 +1,6 @@
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
 from seamless_migrate.domain.models import (
+    DEFAULT_PRESTAGE,
     AppProbe,
     HandoverConfig,
     Mappings,
@@ -81,6 +82,7 @@ def test_catalog_is_complete():
         "MAP_NETWORK_PRESTAGED",
         "MAP_FLAVOR_MISSING",
         "MAP_FLAVOR_AUTO",
+        "MAP_FLAVOR_PRESTAGED",
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
@@ -228,6 +230,33 @@ def test_finding_map_flavor_missing():
     assert only(check(big_root), "MAP_FLAVOR_MISSING")
     mapped = make_plan(mappings=Mappings(flavors={"m1.huge": "m1.large"}))
     assert all(x.code != "MAP_FLAVOR_MISSING" for x in check(vm, plan=mapped))
+
+
+def test_finding_map_flavor_prestaged():
+    """SDD §9.3: with "flavors" pre-staged a flavor RHOSO lacks is created with the same name
+    and specs: an info finding, no automatic match, no blocker."""
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors"])
+    for vm in (
+        make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192),  # would be auto-matched
+        make_vm(flavor="m1.huge", vcpus=64, ram_mb=262144),  # nothing fits
+    ):
+        found = check(vm, plan=prestage)
+        f = only(found, "MAP_FLAVOR_PRESTAGED")
+        assert f.severity == Severity.info and repr(vm.flavor) in f.message
+        assert all(x.code not in ("MAP_FLAVOR_MISSING", "MAP_FLAVOR_AUTO") for x in found)
+        assert resolve_mappings(vm, prestage, dst_inv()) == Mappings()
+    # a same-named destination flavor is used as it is: never pre-staged over
+    same = make_vm(flavor="m1.large", vcpus=4, ram_mb=8192)
+    assert all(not x.code.startswith("MAP_FLAVOR") for x in check(same, plan=prestage))
+    # an explicit mapping wins
+    mapped = make_plan(
+        prestage_resources=[*DEFAULT_PRESTAGE, "flavors"],
+        mappings=Mappings(flavors={"custom.4x8": "m1.large"}),
+    )
+    vm = make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192)
+    assert all(not x.code.startswith("MAP_FLAVOR") for x in check(vm, plan=mapped))
+    # without "flavors" in the list the automatic match stays
+    assert only(check(vm), "MAP_FLAVOR_AUTO")
 
 
 def test_finding_map_flavor_auto_records_resolved_mapping():

@@ -747,3 +747,34 @@ def test_the_advisor_says_where_its_model_runs_and_what_it_receives(tmp_path, wh
         verify_keys = [f["key"] for f in items["verification_review"]["fields"]]
         assert ("console" in verify_keys) is console
     store.dispose()
+
+
+def test_plans_refuse_a_resource_they_cannot_pre_stage(api):
+    """SDD §4.2, §12: POST and PATCH /plans refuse a pre-stage name without an export/import
+    playbook pair (422); "flavors" is accepted."""
+    assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+    assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
+    body = {
+        "name": "prestage",
+        "source_provider_id": SOURCE["id"],
+        "destination_provider_id": DESTINATION["id"],
+        "vm_ids": ["vm-1"],
+    }
+    refused = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "prestage_resources": ["flavours"]}
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"] == {
+        "code": "validation_error",
+        "message": "prestage_resources: cannot pre-stage 'flavours'",
+    }
+    created = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "prestage_resources": ["networks", "flavors"]}
+    )
+    assert created.status_code == 201, created.text
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"prestage_resources": ["workloads"]},
+    )
+    assert patched.status_code == 422 and "'workloads'" in patched.json()["error"]["message"]

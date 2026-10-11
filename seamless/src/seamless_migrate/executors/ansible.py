@@ -450,6 +450,7 @@ class AnsibleExecutor:
         destination: Provider,
         *,
         deploy_conversion_hosts: bool | None = None,
+        prestage_flavors: list[str] | None = None,
     ) -> None:
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
@@ -459,6 +460,10 @@ class AnsibleExecutor:
         for resource in plan.prestage_resources:
             if not _RESOURCE.match(resource):
                 raise PermanentStepError(f"invalid prestage resource {resource!r}")
+            if resource == "flavors" and not prestage_flavors:
+                # only the plan's flavors RHOSO lacks, never os-migrate's every-flavor default:
+                # its import rewrites a same-named destination flavor's extra specs (SDD §7.2)
+                continue
             playbooks += [_Playbook(f"export_{resource}.yml"), _Playbook(f"import_{resource}.yml")]
         if deploy_conversion_hosts is None:
             hosts = [source.conversion_host, destination.conversion_host]
@@ -466,6 +471,10 @@ class AnsibleExecutor:
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
         variables = _common_openstack_vars(source, destination, osm, osm)
+        if prestage_flavors:
+            variables["os_migrate_flavors_filter"] = [
+                {"regex": "^" + re.escape(name) + "$"} for name in prestage_flavors
+            ]
         await self._execute(
             pdir, osm, variables, source, destination, _inventory(), playbooks, None, None
         )
