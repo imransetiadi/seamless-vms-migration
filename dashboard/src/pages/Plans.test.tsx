@@ -39,6 +39,19 @@ describe('Plans page', () => {
     expect(screen.queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
   });
 
+  it('says the providers are unavailable when the list shows provider ids instead of names (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/providers'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/providers are unavailable/i);
+    expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
   it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);

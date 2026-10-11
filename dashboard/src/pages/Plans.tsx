@@ -134,6 +134,10 @@ export default function Plans() {
       {migrations.error && (
         <ErrorBanner error={migrations.error} title="Migration progress is unavailable" onRetry={() => void migrations.refetch()} />
       )}
+      {/* without the providers each plan shows its provider ids, not their names (SDD §16) */}
+      {providers.error && (
+        <ErrorBanner error={providers.error} title="Providers are unavailable: the plans show provider ids" onRetry={() => void providers.refetch()} />
+      )}
       {plans.data && plans.data.length === 0 && (
         <EmptyState
           icon={ClipboardList}

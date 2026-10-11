@@ -176,6 +176,14 @@ function DetailActions({ rec }: { rec: AdvisorRecommendation }) {
       <p role="status" aria-live="polite" className="sr-only">
         {decided}
       </p>
+      {/* whether it can still be decided depends on the migration: never hide the actions without saying why (SDD §16) */}
+      {allowed && migration.error && (
+        <ErrorBanner
+          error={migration.error}
+          title="The migration could not be loaded: approve and override wait for it"
+          onRetry={() => void migration.refetch()}
+        />
+      )}
       {allowed && decidable(rec, migration.data, newest.data?.items.find((r) => !r.legacy)?.id) && (
         <RecommendationActions rec={rec} migration={migration.data} onDecided={setDecided} />
       )}

@@ -437,6 +437,8 @@ export default function Events() {
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
+      {/* the plan filter is built from the plans: without them it lists only the chosen one (SDD §16) */}
+      {plans.error && <ErrorBanner error={plans.error} title="Plans are unavailable: the plan filter lists only the chosen plan" onRetry={() => void plans.refetch()} />}
       {exportError !== null && <ErrorBanner error={exportError} title="The export failed: nothing was saved" onRetry={() => void exportTrail()} />}
       {/* "No events match" only once the trail is known: a failed load is not an empty trail; read out from a live
           region already on the page — the count is not, as it moves with every live event (SDD §16) */}

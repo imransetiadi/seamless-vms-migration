@@ -153,6 +153,21 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
     expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
 
+  it('says Approve and Override wait for the migration when it cannot be loaded, with Retry (SDD §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!;
+    const id = m.advisor_hold!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === `/migrations/${m.id}`
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<RecommendationDetail />, { route: `/advisor/recommendations/${id}`, path: '/advisor/recommendations/:recId', token: 'admin', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/the migration could not be loaded: approve and override wait for it/i);
+    expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
   it('offers no action on a recommendation whose migration has started', async () => {
     const { queryClient } = renderWithApp(<RecommendationDetail />, { route: '/advisor/recommendations/rec-d4e6f8a09001', path: '/advisor/recommendations/:recId', token: 'admin' });
     await screen.findByText('Decision: Cold migration — below threshold (57% < 60%), default kept');

@@ -24,6 +24,19 @@ function emitPhase(server: MockServer, message: string) {
 }
 
 describe('Events page', () => {
+  it('says the plans are unavailable when the plan filter cannot list them (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/plans'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/plans are unavailable/i);
+    expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
   it('shows the newest history first', async () => {
     renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
