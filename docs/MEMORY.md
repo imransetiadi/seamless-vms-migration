@@ -15,7 +15,8 @@ may and may not enter it, how it is configured, how agents are expected to use i
 
 The one rule that governs everything below: **memory never decides and never blocks.** A migration's
 state is derived only from PostgreSQL and deterministic rules; memory can add an advisory note to a failed
-migration and nothing else. With agentmemory switched off, down, wrong or poisoned, migrations behave
+migration and similar past incidents to the evidence of an advisor recommendation (read at validation), and
+nothing else. With agentmemory switched off, down, wrong or poisoned, migrations behave
 identically (§7).
 
 ---
@@ -27,7 +28,7 @@ identically (§7).
 | Purpose | Reuse operational experience: lessons on completion, failure and rollback; *similar-incident recall* when a migration fails | Authoritative state and a complete, ordered audit trail | Keep the team's and their agents' engineering knowledge across sessions |
 | Store | **agentmemory** server (REST), project `seamless-migrate` | **PostgreSQL 16**: `documents` (providers, plans, migrations) and `events` (SDD §11) | agentmemory (same server, MCP) + `CLAUDE.md` (versioned in git) |
 | Written by | `KnowledgeService` (`ai/knowledge.py`) on `on_completed`, `on_failure`, `on_rolled_back` (SDD §14.3) | Orchestrator and API on **every** state change and mutating call (`emit`, `Store.put`) | Contributors and their coding agents via the `agentmemory` MCP server (`.mcp.json`); reviewers via pull requests to `CLAUDE.md` |
-| Read by | `KnowledgeService.search` on failure; operators via `POST /api/v1/advisor/similar-incidents` and the dashboard *Advisor* page | API, dashboard, CLI, reports; the orchestrator resumes from it after a restart (FR-16) | Agents at session start (`memory_smart_search`, `memory_lesson_recall`); humans via the agentmemory viewer |
+| Read by | `KnowledgeService.on_failure` (a failed migration's note) and `similar_for` (a validation's advisor evidence, `similar_incidents`, SDD §14.4); operators via `POST /api/v1/advisor/similar-incidents` and the dashboard *Advisor* page | API, dashboard, CLI, reports; the orchestrator resumes from it after a restart (FR-16) | Agents at session start (`memory_smart_search`, `memory_lesson_recall`); humans via the agentmemory viewer |
 | Content | Short lessons built from *profile buckets*, strategy, step, error class and outcome — redacted (§3) | Full typed documents, `phase_history`, `sync_passes`, `AdvisorNote`s with `source`/`confidence`, approvals, events with `actor` | Decisions with reasons, root-caused bugs, procedures, measurements, gotchas (§5) |
 | Trust | **Advisory.** Shown as `AdvisorNote(kind="similar_incidents", source="memory")`; never drives a transition | **Authoritative.** The only input to state transitions | **Unverified.** Verify against the code before acting on it |
 | Retention | Server-side decay and auto-forget; Seamless sets no TTL in 0.1.0 (§3.4) | No automatic purge in 0.1.0; recommended: keep ≥ 13 months of events, archive beyond (§3.4) | Same server policy as L1 |
