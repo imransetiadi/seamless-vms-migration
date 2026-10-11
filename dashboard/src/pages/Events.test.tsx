@@ -32,7 +32,7 @@ describe('Events page', () => {
     expect(items.length).toBeGreaterThan(20);
   });
 
-  it('appends streamed events at the top and announces them', async () => {
+  it('appends streamed events at the top and counts them without announcing each (SDD §16)', async () => {
     const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
     const list = await screen.findByRole('list', { name: /events, newest first/i });
     await within(list).findByText(/paused: vCenter degraded/i);
@@ -42,7 +42,9 @@ describe('Events page', () => {
 
     expect(await within(list).findByText('web-03: cutover → verifying (streamed)')).toBeInTheDocument();
     expect(within(list).getAllByRole('listitem')[0]).toHaveTextContent('web-03: cutover → verifying (streamed)');
-    expect(screen.getByRole('status', { name: /event stream/i })).toHaveTextContent(/1 new event/i);
+    // the count is plain text: a live region would read every event out, flooding a screen reader (WCAG 4.1.3)
+    const count = screen.getByText('Live · 1 new event since you opened this page');
+    expect(count.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull();
   });
 
   it('holds new events while paused and shows them on resume', async () => {
@@ -54,13 +56,18 @@ describe('Events page', () => {
 
     // Scope button queries to the page header: role queries over ~160 rendered events are slow.
     const header = screen.getByRole('heading', { level: 1, name: 'Events' }).closest('header') as HTMLElement;
-    await user.click(within(header).getByRole('button', { name: /pause live updates/i }));
+    const regions = screen.getAllByRole('status');
+    await user.click(within(header).getByRole('button', { name: 'Pause live updates' }));
+    expect(regions).toContain(screen.getByText('Live updates paused: new events wait until you resume.'));
     emitPhase(server, 'held while paused');
-    expect(await within(header).findByRole('button', { name: /resume \(1 new\)/i })).toBeInTheDocument();
     expect(within(list).queryByText('held while paused')).not.toBeInTheDocument();
+    // Pause stops everything that updates on its own, the count and the button's label too (WCAG 2.2.2)
+    expect(screen.getByText('Paused · new events wait until you resume')).toBeInTheDocument();
+    const resume = within(header).getByRole('button', { name: 'Resume live updates' });
 
-    await user.click(within(header).getByRole('button', { name: /resume \(1 new\)/i }));
+    await user.click(resume);
     expect(await within(list).findByText('held while paused')).toBeInTheDocument();
+    expect(regions).toContain(screen.getByText('Live updates resumed: 1 held event added.'));
   });
 
   it('ignores replayed events it already has (a server that replays history on connect)', async () => {
@@ -80,7 +87,7 @@ describe('Events page', () => {
     act(() => hub.publish({ ...replayed }));
 
     expect(within(list).getAllByRole('listitem')).toHaveLength(before);
-    expect(screen.getByRole('status', { name: /event stream/i })).toHaveTextContent(/waiting for new events/i);
+    expect(screen.getByText('Live · waiting for new events')).toBeInTheDocument();
   });
 
   it('never says no events match when the history cannot be loaded (SDD §16)', async () => {

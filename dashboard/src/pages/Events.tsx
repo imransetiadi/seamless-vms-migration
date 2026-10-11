@@ -113,6 +113,8 @@ export default function Events() {
   const [held, setHeld] = useState<Item[]>([]);
   const [paused, setPaused] = useState(false);
   const [received, setReceived] = useState(0);
+  // only pausing and resuming are announced: a region that read every event out would flood a screen reader (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
   const [showProgress, setShowProgress] = useState(false);
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
@@ -189,14 +191,25 @@ export default function Events() {
     URL.revokeObjectURL(url);
   };
 
+  const pause = () => {
+    setPaused(true);
+    setAnnouncement('Live updates paused: new events wait until you resume.');
+  };
+
   const resume = () => {
     setLive((l) => [...l, ...held].slice(-MAX_LIVE));
     setHeld([]);
     setPaused(false);
+    setAnnouncement(
+      held.length === 0
+        ? 'Live updates resumed: no new event arrived while paused.'
+        : `Live updates resumed: ${held.length} held event${held.length === 1 ? '' : 's'} added.`,
+    );
   };
 
+  // Pause stops everything that updates on its own — the list and this count — until Resume (WCAG 2.2.2, SDD §16)
   const statusText = paused
-    ? `Paused · ${held.length} new event${held.length === 1 ? '' : 's'} held`
+    ? 'Paused · new events wait until you resume'
     : received === 0
       ? 'Live · waiting for new events'
       : `Live · ${received} new event${received === 1 ? '' : 's'} since you opened this page`;
@@ -218,10 +231,10 @@ export default function Events() {
             </Button>
             {paused ? (
               <Button size="lg" variant="primary" icon={Play} onClick={resume}>
-                Resume ({held.length} new)
+                Resume live updates
               </Button>
             ) : (
-              <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
+              <Button size="lg" icon={Pause} onClick={pause}>
                 Pause live updates
               </Button>
             )}
@@ -282,8 +295,9 @@ export default function Events() {
 
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
         <LiveIndicator />
-        <p role="status" aria-label="Event stream" className="text-muted-foreground">
-          {statusText}
+        <p className="text-muted-foreground">{statusText}</p>
+        <p role="status" className="sr-only">
+          {announcement}
         </p>
       </div>
 
