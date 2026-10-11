@@ -615,6 +615,25 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.assertEqual(check("fd00:10::"), [])
         self.assertEqual(check("fd00:10::", mode="neutron"), [])
 
+    def test_refuses_a_nova_port_without_exactly_one_fixed_ip(self):
+        """SDD 6.6, review NC-05: Nova creates each port with one address, and the import
+        refuses any other count only after the source stopped; the check refuses it before."""
+        two = [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00:10::5"}]
+        [several] = self.errors([network_port("p1", "app", two)])
+        self.assertIn("Destination prerequisites not met: port p1 on network 'app'", several)
+        self.assertIn(
+            "Nova creates a port with exactly one fixed IP, and this one has 2: "
+            "10.0.0.5, fd00:10::5",
+            several,
+        )
+        [none] = self.errors([network_port("p2", "app", [])])
+        self.assertIn("port p2 on network 'app'", none)
+        self.assertIn("exactly one fixed IP, and this one has none", none)
+        self.assertEqual(self.errors([network_port("p3", "app", two[:1])]), [])
+        # through Neutron every address is kept, none included
+        self.assertEqual(self.errors([network_port("p1", "app", two)], mode="neutron"), [])
+        self.assertEqual(self.errors([network_port("p2", "app", [])], mode="neutron"), [])
+
     def test_follows_neutron_on_slaac_and_dhcpv6_stateless_subnets(self):
         def check(address, mode, mac="fa:16:3e:00:00:01"):
             port = network_port("p1", "slaac", [{"ip_address": address}], mac=mac)

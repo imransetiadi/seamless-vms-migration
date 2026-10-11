@@ -255,9 +255,18 @@ class ServerPort(osm_resource.Resource):
         if refused:
             errors.append(f"Destination prerequisites not met: {where}: {refused}")
         subnets = list(conn.network.subnets(network_id=refs["network_id"]))
-        # Nova creates its ports with a compute owner and a new MAC; a port created
-        # through Neutron has no owner yet and keeps the source MAC
+        # Nova creates its ports with a new MAC; a port created through Neutron keeps the
+        # source MAC
         neutron = port_creation_mode == "neutron"
+        if not neutron and len(refs["fixed_ips"]) != 1:
+            # nova_sdk_params refuses any other count, after the stop (SDD 6.6)
+            addresses = ", ".join(fixed_ip["ip_address"] for fixed_ip in refs["fixed_ips"])
+            count = f"{len(refs['fixed_ips'])}: {addresses}" if addresses else "none"
+            errors.append(
+                f"Destination prerequisites not met: {where}: Nova creates a port with exactly "
+                f"one fixed IP, and this one has {count}; keep one address, or recreate the "
+                "ports through Neutron (port_creation_mode: neutron)"
+            )
         for fixed_ip in refs["fixed_ips"]:
             problem = _address_refusal(fixed_ip, subnets, neutron, params.get("mac_address"))
             if problem:

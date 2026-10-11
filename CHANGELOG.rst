@@ -164,3 +164,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - An IPv6 subnet's first address is no longer refused for a port Nova creates:
   Nova creates its ports with no owner, and Neutron's ``check_subnet_ip`` takes
   that address for a port without one.
+- ``import_workload_dst_check`` refuses a port without exactly one fixed IP
+  when the ports are recreated through Nova (``port_creation_mode: nova``).
+  Nova creates each port with one address, and the import refused any other
+  count only after the source had stopped. A port whose addresses changed
+  after validation is now refused while the source still runs.
