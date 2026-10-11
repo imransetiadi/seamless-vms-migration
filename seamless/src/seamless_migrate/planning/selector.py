@@ -96,9 +96,10 @@ def eligibility(
             )
         if multiattach:
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
-        # the destination server gets one fixed IP per port: the other addresses would be dropped
+        # through Nova the destination server gets one fixed IP per port and the others would be
+        # dropped; through Neutron every one is kept (SDD §7.3 step 8)
         several = [n for n in vm.nics if len(n.fixed_ips) > 1]
-        if several:
+        if several and plan.port_creation_mode == "nova":
             handover.append(
                 f"port(s) with several fixed IPs, of which one would be kept: {_ports(several)}"
             )

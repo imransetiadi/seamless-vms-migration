@@ -274,9 +274,9 @@ def test_ports_without_exactly_one_fixed_ip_rule_out_the_strategies_that_cannot_
     assert all(r == [] for r in eligibility(vmw, ProviderKind.vmware, make_plan(), {}, {}).values())
 
 
-def test_neutron_port_mode_keeps_cold_and_warm_for_any_number_of_fixed_ips():
-    """SDD §9.2: recreated through Neutron, a port keeps every fixed IP, none included, so the
-    cold/warm port rule applies to "nova" mode only; the handover still keeps one address."""
+def test_neutron_port_mode_keeps_every_strategy_for_any_number_of_fixed_ips():
+    """SDD §9.2: recreated through Neutron, a port keeps every fixed IP, none included - by cold,
+    warm (§6.6) and storage handover (§7.3 step 8) - so the port rules apply to "nova" mode only."""
     from seamless_migrate.domain.models import Nic
 
     plan = make_plan(
@@ -287,7 +287,7 @@ def test_neutron_port_mode_keeps_cold_and_warm_for_any_number_of_fixed_ips():
     dual = make_vm(disks=disks, nics=[Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"])])
     reasons = eligibility(dual, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS)
     assert reasons[Strategy.cold] == [] and reasons[Strategy.warm] == []
-    assert any("app-net (10.0.0.5, fd00::5)" in r for r in reasons[Strategy.storage_handover])
+    assert reasons[Strategy.storage_handover] == []
     no_ip = make_vm(disks=disks, nics=[Nic(network="l2-net", fixed_ips=[])])
     assert all(
         r == [] for r in eligibility(no_ip, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS).values()

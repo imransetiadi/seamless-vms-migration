@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -12,6 +14,7 @@ from seamless_migrate.executors.handover import (
     HandoverExecutor,
     _cinder_bootable,
     _mark_boot,
+    port_description,
 )
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
@@ -261,8 +264,13 @@ class FakeNetwork:
     def __init__(self, cloud):
         self.c = cloud
 
-    def ports(self, device_id=None):
-        return [p for p in self.c.ports.values() if device_id is None or p.device_id == device_id]
+    def ports(self, device_id=None, description=None):
+        return [
+            p
+            for p in self.c.ports.values()
+            if (device_id is None or p.device_id == device_id)
+            and (description is None or getattr(p, "description", "") == description)
+        ]
 
     def get_port(self, port_id):
         if port_id not in self.c.ports:
@@ -271,16 +279,32 @@ class FakeNetwork:
 
     def create_port(self, **attrs):
         self.c.record("create_port", attrs.get("mac_address"))
+        self.c.port_attrs.append(attrs)
         port = NS(
-            id=f"{self.c.name}-port-{len(self.c.ports) + 1}",
+            id=f"{self.c.name}-port-{len(self.c.port_attrs)}",
             network_id=attrs["network_id"],
             mac_address=attrs.get("mac_address") or "fa:16:3e:ff:ff:ff",
             fixed_ips=list(attrs.get("fixed_ips") or []),
             device_id="",
             created_by_nova=False,
+            description=attrs.get("description", ""),
+            security_group_ids=list(attrs.get("security_group_ids") or []),
+            is_port_security_enabled=attrs.get("is_port_security_enabled", True),
         )
         self.c.ports[port.id] = port
         return port
+
+    def delete_port(self, port, ignore_missing=True):
+        port_id = getattr(port, "id", port)
+        self.c.record("delete_port", port_id)
+        self.c.ports.pop(port_id, None)
+
+    def get_security_group(self, group_id):
+        return NS(id=group_id, name=self.c.security_groups[group_id])
+
+    def find_security_group(self, name, ignore_missing=True, project_id=None):
+        self.c.group_lookups.append((name, project_id))
+        return NS(id=f"{self.c.name}-sg-{name}", name=name)
 
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
@@ -307,6 +331,10 @@ class FakeCloud:
         self.created = []
         self.managed = []
         self.ports = {}
+        self.port_attrs = []
+        self.security_groups = {}
+        self.group_lookups = []
+        self.current_project_id = f"{name}-project"
         self.image_metadata = {}
         self.deleted_by_nova = []
         self.refuse_metadata = False
@@ -374,7 +402,10 @@ def source_cloud(calls, crash_on=None):
         ],
         device_id="srv-1",
         created_by_nova=True,
+        security_group_ids=["sg-1"],
+        is_port_security_enabled=True,
     )
+    cloud.security_groups["sg-1"] = "web"
     return cloud
 
 
@@ -740,6 +771,166 @@ async def test_handover_keeps_a_port_without_addresses(tmp_path):
     saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
     assert [(n["port_id"], n["fixed_ips"]) for n in saved["networks"]] == [("port-1", [])]
     assert clouds["dst"].created[0]["networks"] == [{"uuid": "dst-net-rhoso-app"}]
+
+
+def neutron(plan):
+    """The plan keeping each port's MAC, every fixed IP and its security groups (SDD §4.2)."""
+    return plan.model_copy(update={"port_creation_mode": "neutron"})
+
+
+async def test_handover_in_neutron_mode_creates_each_port_with_its_mac_addresses_and_groups(
+    tmp_path,
+):
+    """SDD §7.3 steps 2 and 8: the definition records the port's security groups by name and its
+    port-security flag; the destination port is created first, through Neutron, with the MAC,
+    both addresses, the groups found in the destination project and the §6.6 description, and
+    Nova boots the server on it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    result = await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    [port] = saved["networks"]
+    assert (port["security_groups"], port["port_security_enabled"]) == (["web"], True)
+    assert clouds["dst"].port_attrs == [
+        {
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:00:00:01",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+            "security_group_ids": ["dst-sg-web"],
+            "is_port_security_enabled": True,
+            "description": "os-migrate:port-1",
+        }
+    ]
+    assert clouds["dst"].group_lookups == [("web", "dst-project")]
+    [dst_port] = clouds["dst"].ports.values()
+    assert clouds["dst"].created[0]["networks"] == [{"port": dst_port.id}]
+    assert dst_port.device_id == result.destination_server_id
+    steps = [op for op in ops(calls) if op[0] == "dst"]
+    assert steps[-2:] == [
+        ("dst", "create_port", "fa:16:3e:00:00:01"),
+        ("dst", "create_server", "web-01"),
+    ]
+
+
+async def test_handover_in_neutron_mode_resumes_on_the_port_it_created(tmp_path):
+    """A crash after the port and before the server: the resume boots on the journaled port, and
+    a port created but not yet journaled is found by its description, unbound."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "create_port"] == [
+        ("dst", "create_port", "fa:16:3e:00:00:01")
+    ]
+    [dst_port] = clouds["dst"].ports.values()
+    assert clouds["dst"].created[-1]["networks"] == [{"port": dst_port.id}]
+
+    other, calls2, clouds2, plan2, mig2, settings2 = setup(tmp_path / "unjournaled")
+    clouds2["dst"].ports["earlier"] = NS(
+        id="earlier",
+        network_id="dst-net-rhoso-app",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+    )
+    await other.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].port_attrs == []
+    assert clouds2["dst"].created[0]["networks"] == [{"port": "earlier"}]
+
+
+async def test_handover_rollback_in_neutron_mode_deletes_the_destination_ports(tmp_path):
+    """SDD §7.3 rollback: Nova keeps the ports it did not create; the rollback deletes them after
+    the destination server - also when the cutover failed before the server existed."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    cut = await executor.run(StepName.CUTOVER, ctx)
+    [dst_port] = clouds["dst"].ports
+    calls.clear()
+    mig.destination_server_id = cut.destination_server_id
+    await executor.run(StepName.ROLLBACK, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert ops(calls)[:3] == [
+        ("dst", "delete_server", "dst-new-1"),
+        ("dst", "delete_port", dst_port),
+        ("dst", "unmanage", "dst-vol-2"),
+    ]
+    assert clouds["dst"].ports == {}
+
+    early, _, clouds2, plan2, mig2, settings2 = setup(
+        tmp_path / "early", dst_crash_on="create_server"
+    )
+    with pytest.raises(PermanentStepError):
+        await early.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert len(clouds2["dst"].ports) == 1
+    await early.run(StepName.ROLLBACK, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].ports == {}
+
+
+async def test_handover_in_neutron_mode_keeps_port_security_off_and_a_port_without_address(
+    tmp_path,
+):
+    """A second port with port security off, no group and no address: created as it was, with
+    an explicit empty address list (Neutron allocates none) and port security off."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-2"] = NS(
+        id="port-2",
+        network_id="net-1",
+        mac_address="fa:16:3e:00:00:02",
+        fixed_ips=[],
+        device_id="srv-1",
+        created_by_nova=True,
+        security_group_ids=[],
+        is_port_security_enabled=False,
+    )
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    second = clouds["dst"].port_attrs[1]
+    assert (second["mac_address"], second["fixed_ips"]) == ("fa:16:3e:00:00:02", [])
+    assert (second["security_group_ids"], second["is_port_security_enabled"]) == ([], False)
+    assert [n["port"] for n in clouds["dst"].created[0]["networks"]] == list(clouds["dst"].ports)
+
+
+async def test_handover_rollback_deletes_only_its_own_ports_even_if_the_filter_is_ignored(
+    tmp_path,
+):
+    """A Neutron that ignored the description filter would list every port: the rollback still
+    deletes only the port step 8 created for this migration."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    clouds["dst"].ports["foreign"] = NS(
+        id="foreign",
+        network_id="x",
+        mac_address="fa:16:3e:99:99:99",
+        fixed_ips=[],
+        device_id="",
+        created_by_nova=False,
+        description="",
+    )
+    clouds["dst"].ports["other-vm"] = NS(
+        id="other-vm",
+        network_id="x",
+        mac_address="fa:16:3e:99:99:98",
+        fixed_ips=[],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-9",
+    )
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    unfiltered = clouds["dst"].network.ports
+    clouds["dst"].network.ports = lambda device_id=None, description=None: unfiltered()
+    await executor.run(StepName.ROLLBACK, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert set(clouds["dst"].ports) == {"foreign", "other-vm"}
+
+
+async def test_handover_in_nova_mode_records_no_port_groups(tmp_path):
+    """The default mode is unchanged: no security-group lookups, Nova creates the port."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert "security_groups" not in saved["networks"][0]
+    assert clouds["dst"].port_attrs == [] and clouds["dst"].group_lookups == []
 
 
 async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_failing(tmp_path):
@@ -1210,3 +1401,18 @@ def test_existing_server_and_write_json_helpers(tmp_path):
         _write_json(target, {"bad": object()})
     assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}, "atomic: old content kept"
     assert [p.name for p in target.parent.iterdir()] == ["journal.json"], "temp file removed"
+
+
+def test_port_description_matches_the_collection():
+    """SDD §6.6/§7.3: the handover marks the ports it creates through Neutron as the collection
+    does - one convention for every such port (plugins/module_utils/server_port.py, loaded
+    without its imports)."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/server_port.py"
+    ).read_text()
+    tree = ast.parse(source)
+    func = next(n for n in tree.body if getattr(n, "name", None) == "port_description")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), "server_port.py", "exec"), namespace)
+    for port_id in ("port-1", "8b0c01a1-205f-490b-a4fc-ee8f44711bc7"):
+        assert port_description(port_id) == namespace["port_description"](port_id)
