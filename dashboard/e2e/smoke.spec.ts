@@ -1,4 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
+
+const AXE = readFileSync(new URL('../node_modules/axe-core/axe.min.js', import.meta.url), 'utf8');
 
 // Mock mode accepts the role names as tokens (src/api/mock.ts).
 async function signIn(page: Page, token = 'admin') {
@@ -118,3 +121,22 @@ test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)
     expect(overflow, `${path} is ${overflow} px wider than the screen`).toBe(0);
   }
 });
+
+for (const width of [320, 375]) {
+  test(`every target is 24 px or spaced from the next on a ${width} px wide screen (WCAG 2.5.8)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await signIn(page, 'viewer');
+    for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
+      await page.goto(path);
+      await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+      await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+      await page.addScriptTag({ content: AXE });
+      const failures = await page.evaluate(async () => {
+        const axe = (window as unknown as { axe: { run: (context: Document, options: object) => Promise<{ violations: Array<{ nodes: Array<{ target: string[] }> }> }> } }).axe;
+        const result = await axe.run(document, { runOnly: { type: 'rule', values: ['target-size'] } });
+        return result.violations.flatMap((v) => v.nodes.map((n) => n.target.join(' ')));
+      });
+      expect(failures, `${path}: ${failures.length} targets too small and too close`).toEqual([]);
+    }
+  });
+}

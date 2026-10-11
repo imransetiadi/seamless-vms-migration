@@ -327,7 +327,7 @@ export default function Events() {
                 </span>
                 <div className="min-w-0">
                   <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
-                  <p className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
+                  <p className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                     <span>by {event.actor}</span>
                     {event.plan_id && (
                       <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
