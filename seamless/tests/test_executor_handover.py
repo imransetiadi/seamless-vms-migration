@@ -290,6 +290,8 @@ class FakeNetwork:
             description=attrs.get("description", ""),
             security_group_ids=list(attrs.get("security_group_ids") or []),
             is_port_security_enabled=attrs.get("is_port_security_enabled", True),
+            # Neutron's: the token's project unless an admin names another
+            project_id=attrs.get("project_id") or self.c.current_project_id,
         )
         self.c.ports[port.id] = port
         return port
@@ -835,10 +837,88 @@ async def test_handover_in_neutron_mode_resumes_on_the_port_it_created(tmp_path)
         device_id="",
         created_by_nova=False,
         description="os-migrate:port-1",
+        project_id="dst-project",
     )
     await other.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
     assert clouds2["dst"].port_attrs == []
     assert clouds2["dst"].created[0]["networks"] == [{"port": "earlier"}]
+
+
+async def test_handover_in_neutron_mode_never_boots_on_a_port_that_is_not_its_own(tmp_path):
+    """SDD §7.3 step 8: the admin credential sees every project's ports, and an earlier cold or
+    warm migration of the same VM may have left one with the description: only an unbound port
+    on the target network, in the credential's project, with the MAC and exactly the addresses
+    is used."""
+    leftovers = {
+        "other-net": {"network_id": "dst-net-elsewhere"},
+        "other-mac": {"mac_address": "fa:16:3e:99:99:99"},
+        "other-ips": {"fixed_ips": [{"ip_address": "10.0.0.77"}]},
+        "other-project": {"project_id": "someone-else"},
+        "bound": {"device_id": "another-server"},
+    }
+    for name, change in leftovers.items():
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        port = {
+            "id": name,
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:00:00:01",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+            "device_id": "",
+            "created_by_nova": False,
+            "description": "os-migrate:port-1",
+            "project_id": "dst-project",
+        }
+        clouds["dst"].ports[name] = NS(**{**port, **change})
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+        [created] = clouds["dst"].port_attrs
+        assert created["network_id"] == "dst-net-rhoso-app", name
+        assert clouds["dst"].created[0]["networks"] != [{"port": name}], name
+
+
+async def test_handover_rollback_recreates_source_ports_with_their_security_groups(tmp_path):
+    """SDD §7.3 step 2 and rollback: every port's security group ids and port-security flag are
+    journaled, and a recreated source port gets them back - Nova applies a server's groups only
+    to ports it creates, so it would land in the project's default group."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert (
+        saved["networks"][0]["security_group_ids"],
+        saved["networks"][0]["port_security_enabled"],
+    ) == (
+        ["sg-1"],
+        True,
+    )
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert (attrs["security_group_ids"], attrs["is_port_security_enabled"]) == (["sg-1"], True)
+
+
+async def test_handover_rollback_of_a_definition_without_port_groups_recreates_the_port(tmp_path):
+    """A run journaled before §7.3 step 2 recorded the port's groups: its rollback recreates the
+    port with its MAC and addresses and leaves the groups to Neutron, as before."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    definition = executor.run_dir(ctx) / "source-server.json"
+    legacy = json.loads(definition.read_text())
+    for n in legacy["networks"]:
+        n.pop("security_group_ids")
+        n.pop("port_security_enabled")
+    definition.write_text(json.dumps(legacy))
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert attrs == {
+        "network_id": "net-1",
+        "mac_address": "fa:16:3e:00:00:01",
+        "fixed_ips": [
+            {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+            {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
+        ],
+    }
 
 
 async def test_handover_rollback_in_neutron_mode_deletes_the_destination_ports(tmp_path):
@@ -962,6 +1042,45 @@ async def test_handover_step_8_sends_an_overridden_nic_where_its_entry_says(tmp_
         "dst-net-rhoso-dmz",
         [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
     )
+
+
+async def test_handover_in_neutron_mode_resumes_on_the_port_its_nic_override_gives(tmp_path):
+    """SDD §7.3 step 8: a resume compares an earlier port with what step 8 would create - the
+    override's network and addresses, in any order, the MAC in any case; a port with the NIC's
+    own addresses, or on the mapped network, is not its port."""
+    from seamless_migrate.domain.models import NicOverride
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5", "fd00:10::5"])
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    leftover = {
+        "mac_address": "fa:16:3e:00:00:01",
+        "device_id": "",
+        "created_by_nova": False,
+        "description": "os-migrate:port-1",
+        "project_id": "dst-project",
+    }
+    clouds["dst"].ports["own-addresses"] = NS(
+        id="own-addresses",
+        network_id="dst-net-rhoso-dmz",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        **leftover,
+    )
+    clouds["dst"].ports["mapped-network"] = NS(
+        id="mapped-network",
+        network_id="dst-net-rhoso-app",
+        fixed_ips=[{"ip_address": "192.168.10.5"}, {"ip_address": "fd00:10::5"}],
+        **leftover,
+    )
+    clouds["dst"].ports["its-own"] = NS(
+        id="its-own",
+        network_id="dst-net-rhoso-dmz",
+        fixed_ips=[{"ip_address": "fd00:10::5"}, {"ip_address": "192.168.10.5"}],
+        **{**leftover, "mac_address": "FA:16:3E:00:00:01"},
+    )
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx[0])
+    assert clouds["dst"].port_attrs == []
+    assert clouds["dst"].created[0]["networks"] == [{"port": "its-own"}]
 
 
 def test_destination_nic_of_a_definition_journaled_with_its_first_address_only():

@@ -258,9 +258,10 @@ class HandoverExecutor:
                 {"subnet_id": ip.get("subnet_id"), "ip_address": ip.get("ip_address")}
                 for ip in _attr(port, "fixed_ips") or []
             ]
-            # every port with its id, MAC and addresses, for the rollback (SDD §7.3 step 2); the
-            # destination keeps the first address on the mapped network, or every one through
-            # Neutron (step 8)
+            # every port with its id, MAC, addresses, security group ids and port-security flag,
+            # for the rollback (SDD §7.3 step 2): Nova applies a server's groups only to the ports
+            # it creates. The destination keeps the first address on the mapped network, or every
+            # one through Neutron (step 8)
             entry = {
                 "network_id": _attr(port, "network_id"),
                 "network": _attr(network, "name"),
@@ -268,13 +269,17 @@ class HandoverExecutor:
                 "port_id": _attr(port, "id"),
                 "mac_address": _attr(port, "mac_address"),
                 "fixed_ips": fixed_ips,
+                "security_group_ids": list(_attr(port, "security_group_ids") or []),
+                "port_security_enabled": _attr(port, "is_port_security_enabled"),
             }
             if port_creation_mode == "neutron":
-                groups = _attr(port, "security_group_ids") or []
+                # the destination looks them up by name in its own project (step 8)
                 entry["security_groups"] = sorted(
-                    {str(_attr(conn.network.get_security_group(g), "name")) for g in groups}
+                    {
+                        str(_attr(conn.network.get_security_group(g), "name"))
+                        for g in entry["security_group_ids"]
+                    }
                 )
-                entry["port_security_enabled"] = _attr(port, "is_port_security_enabled")
             networks.append(entry)
         attachments = []
         for att in conn.compute.volume_attachments(server):
@@ -595,8 +600,9 @@ class HandoverExecutor:
     ) -> list[dict[str, str]]:
         """The source server's NICs for its recreation (SDD §7.3 rollback): a port a user created
         survives the server's deletion unbound and is used again; a port Nova created is gone and
-        is recreated with its MAC and every fixed IP (journaled, so a resume does not create it
-        twice). A definition journaled without ports keeps its network and first address."""
+        is recreated with its MAC, every fixed IP, its security groups and its port-security flag
+        (journaled, so a resume does not create it twice). A definition journaled without ports
+        keeps its network and first address."""
         nics: list[dict[str, str]] = []
         for n in networks:
             if not n.get("port_id"):
@@ -612,11 +618,17 @@ class HandoverExecutor:
                     port_id = n["port_id"]
                 else:
                     fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
-                    created = conn.network.create_port(
-                        network_id=n["network_id"],
-                        mac_address=n["mac_address"],
-                        fixed_ips=fixed_ips,
-                    )
+                    attrs: dict[str, Any] = {
+                        "network_id": n["network_id"],
+                        "mac_address": n["mac_address"],
+                        "fixed_ips": fixed_ips,
+                    }
+                    # a definition journaled before step 2 recorded them has none
+                    if n.get("security_group_ids") is not None:
+                        attrs["security_group_ids"] = n["security_group_ids"]
+                    if n.get("port_security_enabled") is not None:
+                        attrs["is_port_security_enabled"] = n["port_security_enabled"]
+                    created = conn.network.create_port(**attrs)
                     port_id = str(_attr(created, "id"))
                 journal.mark(key, port_id=port_id)
             nics.append({"port": journal.get(key)["port_id"]})
@@ -646,24 +658,34 @@ class HandoverExecutor:
     ) -> list[dict[str, str]]:
         """Each port created first through Neutron on the mapped network with its MAC, every fixed
         IP, its security groups and its port-security flag (SDD §7.3 step 8), journaled: a resume
-        boots on the journaled port, or on an unbound one with its description (a create sent
-        before a crash). Nova applies a server's security groups only to ports it creates."""
+        boots on the journaled port, or on the one a create sent before a crash made - unbound,
+        with its description, on the target network, in the credential's project, with the MAC and
+        exactly the addresses. Nova applies a server's security groups only to ports it creates."""
         nics: list[dict[str, str]] = []
         for n in definition["networks"]:
             key = f"dst_port:{n['port_id']}"
             if not journal.done(key):
                 description = port_description(n["port_id"])
+                target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
+                network = conn.network.find_network(target, ignore_missing=False)
+                project_id = conn.current_project_id
+                mac = str(n["mac_address"] or "").lower()
+                # only the port step 8 would create: the admin credential sees every project's
+                # ports, and a cold or warm migration of the same VM may have left one (§7.3)
                 earlier = [
                     p
                     for p in conn.network.ports(description=description)
-                    if _attr(p, "description") == description and not _attr(p, "device_id")
+                    if _attr(p, "description") == description
+                    and not _attr(p, "device_id")
+                    and _attr(p, "network_id") == _attr(network, "id")
+                    and str(_attr(p, "mac_address") or "").lower() == mac
+                    and sorted(ip.get("ip_address") for ip in _attr(p, "fixed_ips") or [])
+                    == sorted(addresses)
+                    and _attr(p, "project_id") == project_id
                 ]
                 if earlier:
                     port = earlier[0]
                 else:
-                    target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
-                    network = conn.network.find_network(target, ignore_missing=False)
-                    project_id = conn.current_project_id
                     attrs: dict[str, Any] = {
                         "network_id": _attr(network, "id"),
                         "mac_address": n["mac_address"],
