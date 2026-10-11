@@ -1495,7 +1495,9 @@ written is removed again. `SEAMLESS_SECRET_STORE` selects it:
   through the API as well, so no pod restart is needed. Needs the Role of §17.
 
 Resolution order for a secret name: mounted files under `SEAMLESS_SECRETS_DIR`, then the store (when it
-is `kubernetes`), then `SEAMLESS_SECRET_{NAME}_{KEY}` variables. An **OpenStack/RHOSO provider with a
+is `kubernetes`), then `SEAMLESS_SECRET_{NAME}_{KEY}` variables. A secret name is 1–128 letters, digits, `.`, `_` or `-`, starting with a
+letter or digit; `POST /providers` and `PATCH /providers/{id}` refuse (422) a `credentials_secret` or
+`conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. An **OpenStack/RHOSO provider with a
 `credentials_secret`** builds its connection from that secret — keys `auth_url` (default: the
 provider endpoint), `username`/`password`/`project_name`/`user_domain_name`/`project_domain_name`
 (`Default` when absent) for password auth, or `application_credential_id`/`application_credential_secret`
@@ -2031,7 +2033,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
-  enter write-only credentials and the conversion-host SSH key; a provider added before a later step of
+  enter write-only credentials and the conversion-host SSH key, or name instead a secret managed outside Seamless
+  (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
+  `SEAMLESS_SECRET_*` variables), which the dashboard then never writes; a provider added before a later step of
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
   `/inventory/:providerId` — `/inventory` opens the first source provider's —
