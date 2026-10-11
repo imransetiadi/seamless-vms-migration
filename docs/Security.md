@@ -720,7 +720,8 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 - [ ] agentmemory bound to loopback or protected by secret + TLS; project id per environment.
 
 **Operations**
-- [ ] Logs forwarded; `events` exported to write-once storage (`seamless events export -o …`, then
+- [ ] Logs forwarded; `events` exported to write-once storage (`seamless events export -o …`, or Export the whole trail on
+      the dashboard's Events page — the same JSON lines, 5bdfe79 — then
       `seamless events prune --older-than-days N --confirm`); alerting on `auth.denied` bursts.
 - [ ] Dependency and image scans run monthly and before releases (QASuite §10).
 - [ ] Incident contacts and the playbooks in §13 rehearsed once per release.
