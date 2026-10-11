@@ -202,6 +202,8 @@ export interface Nic {
   fixed_ips: string[];
   vnic_type: string;
   mtu: number | null;
+  /** VMware: what the migration kit maps the NIC by, its distributed port group's key or device summary (SDD §4, §7.2). */
+  network_key?: string | null;
 }
 
 export interface VMRef {
@@ -789,6 +791,8 @@ export interface DestinationInventory {
 }
 
 export interface DestinationSubnet {
+  /** What a VMware NIC's network_map value names (SDD §10, §7.2); an inventory from before it lacks it. */
+  id?: string;
   name: string;
   network: string;
   /** The network the subnet belongs to (an inventory from before it lacks it). */

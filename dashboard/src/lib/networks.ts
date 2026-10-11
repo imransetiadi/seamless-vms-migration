@@ -1,4 +1,5 @@
-import type { DestinationInventory, DestinationNetwork, DestinationSubnet } from '../api/types';
+import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Nic } from '../api/types';
+import { addressRefusal, kitIpv4 } from './nics';
 
 /**
  * The network a NIC's RHOSO network name resolves to, as the API's resolve_network (SDD §7.3 step 0, §9.3): the destination
@@ -49,4 +50,22 @@ export function capabilityRoles(capabilities: Record<string, unknown> | undefine
 export function subnetsOf(subnets: DestinationSubnet[], network: DestinationNetwork): DestinationSubnet[] {
   if (network.id !== null) return subnets.filter((s) => s.network_id === network.id);
   return subnets.filter((s) => s.network === network.name);
+}
+
+/**
+ * The subnet of its network the VMware migration kit gives `nic`'s port, as the API's kit_subnet (SDD §7.2): the one
+ * that holds every IPv4 guest address of the NIC as a host address (the kit sends them all with one subnet), any of them
+ * (an IPv4 one first) when it has none, none when the network has no subnet; else why the kit's port could not take them.
+ */
+export function kitSubnet(nic: Nic, subnets: DestinationSubnet[]): { subnet: DestinationSubnet | null; why: string | null } {
+  const addresses = kitIpv4(nic.fixed_ips);
+  const v4 = subnets.filter((s) => s.cidr.includes('.'));
+  if (!addresses.length) return { subnet: (v4.length ? v4 : subnets)[0] ?? null, why: null };
+  const holder = v4.find((s) => addresses.every((a) => addressRefusal(a, [s], { neutron: true, mac: nic.mac }) === null));
+  if (holder) return { subnet: holder, why: null };
+  for (const address of addresses) {
+    const why = addressRefusal(address, subnets, { neutron: true, mac: nic.mac });
+    if (why) return { subnet: null, why: `${address} ${why}` };
+  }
+  return { subnet: null, why: `${addresses.join(', ')} lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet` };
 }

@@ -646,14 +646,40 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.nic_overrides).toBe(false));
   });
 
-  it('says a VMware VM keeps its network settings, with no editor (SDD §16)', async () => {
+  it('says a VMware VM keeps its network settings, with no editor, and names where each NIC goes (SDD §16, §7.2)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
     const panel = await screen.findByRole('region', { name: 'Network' });
     await waitFor(() => expect(panel).toHaveTextContent("The migration kit keeps the guest's network settings"));
     expect(within(panel).queryByRole('button', { name: 'Edit network' })).not.toBeInTheDocument();
     expect(within(panel).queryByRole('button', { name: 'Remove the overrides' })).not.toBeInTheDocument();
+    // Seamless gives the kit the RHOSO network each port group maps to, and the kit keeps the guest's addresses
+    const [nic] = m.vm.nics;
+    const [row] = within(panel).getAllByRole('row').slice(1);
+    const cells = within(row!).getAllByRole('cell');
+    expect(cells.at(-1)).toHaveTextContent(plan.mappings.networks[nic!.network] ?? nic!.network);
+    expect(cells.at(-1)).toHaveTextContent(nic!.fixed_ips.join(', ') || 'no fixed IP');
+    expect(panel).not.toHaveTextContent('As the migration kit maps it');
+  });
+
+  it("names a VMware NIC's mapped network and guest addresses even when an override names others (SDD §16, §7.2)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.strategy?.startsWith('vmware'))!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    const [nic] = m.vm.nics;
+    // the kit keeps the guest's network settings: an override (which blocks the VM) moves nothing
+    plan.nic_overrides = { [m.vm.source_id]: { [nic!.mac!.toLowerCase()]: { network: 'tenant-web', fixed_ips: ['10.20.9.99'] } } };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await within(panel).findByRole('button', { name: 'Remove the overrides' });
+    const [row] = within(panel).getAllByRole('row').slice(1);
+    const where = within(row!).getAllByRole('cell').at(-1)!;
+    expect(where).toHaveTextContent(plan.mappings.networks[nic!.network] ?? nic!.network);
+    expect(where).toHaveTextContent(nic!.fixed_ips.join(', ') || 'no fixed IP');
+    expect(where).not.toHaveTextContent('tenant-web');
+    expect(where).not.toHaveTextContent('10.20.9.99');
   });
 
   it('offers to remove the overrides a VMware VM still has, which block it (SDD §16)', async () => {

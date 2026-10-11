@@ -128,7 +128,11 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
             </thead>
             <tbody>
               {nics.map((nic, i) => {
-                const target = nicTarget(plan, m.vm.source_id, nic);
+                // a VMware NIC goes where the plan maps its port group, with the guest's addresses: the migration kit keeps
+                // the guest's network settings, so no override moves it (SDD §7.2)
+                const target = vmware
+                  ? { network: plan.mappings.networks[nic.network] ?? nic.network, addresses: nic.fixed_ips, overridden: false }
+                  : nicTarget(plan, m.vm.source_id, nic);
                 return (
                   <tr key={nic.mac ?? i}>
                     <th scope="row" className="font-mono text-xs">
@@ -140,10 +144,10 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                     </td>
                     <td>
                       <span className="block">
-                        {vmware ? 'As the migration kit maps it' : target.network}
-                        {target.overridden && !vmware && <span className="ml-2 rounded-sm bg-status-info/15 px-1.5 py-0.5 text-xs font-medium text-status-info">Override</span>}
+                        {target.network}
+                        {target.overridden && <span className="ml-2 rounded-sm bg-status-info/15 px-1.5 py-0.5 text-xs font-medium text-status-info">Override</span>}
                       </span>
-                      {!vmware && <span className="block font-mono text-xs text-muted-foreground">{target.addresses.join(', ') || 'no fixed IP'}</span>}
+                      <span className="block font-mono text-xs text-muted-foreground">{target.addresses.join(', ') || 'no fixed IP'}</span>
                     </td>
                   </tr>
                 );

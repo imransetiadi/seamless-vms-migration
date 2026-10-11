@@ -171,10 +171,10 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }).find((f) => f.code === 'MAP_NETWORK_AMBIGUOUS')?.message).toBe(
       "The cutover cannot tell these RHOSO networks apart: fa:16:3e:00:00:01 (tenant-app): 2 networks of other projects are named 'tenant-web' (p1, p2), none of the credential's project.",
     );
-    // the credential's own among others, or another project's alone, resolves; VMware never asks
+    // the credential's own among others, or another project's alone, resolves; a VMware NIC is judged too (SDD §7.2)
     for (const details of [[net('x', 'tenant-web', false, 'p1'), net('a', 'tenant-web', true, 'shop')], [net('x', 'tenant-web', false, 'p1')]])
       expect(codes(preflight(vm, 'openstack', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: details }))).not.toContain('MAP_NETWORK_AMBIGUOUS');
-    expect(codes(preflight(vm, 'vmware', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }))).not.toContain('MAP_NETWORK_AMBIGUOUS');
+    expect(codes(preflight(vm, 'vmware', base, { 'tenant-web': 1442 }, [vm.name], { selected: [vm], networkDetails: twoOther }))).toContain('MAP_NETWORK_AMBIGUOUS');
   });
 
   it('blocks an own address Neutron would refuse on the resolved network, with the API\'s message', () => {
@@ -221,8 +221,32 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
         "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-b): it is neither shared with the credential's project nor external.",
       );
     for (const roles of [['admin', 'member', 'reader'], ['advsvc'], undefined]) expect(codes(run(shared, roles))).not.toContain('NET_PORT_NOT_PERMITTED');
-    // VMware NICs go through the migration kit, which this rule does not cover
-    expect(codes(run(shared, member, 'vmware'))).not.toContain('NET_PORT_NOT_PERMITTED');
+    // a VMware NIC too: the migration kit creates every port with the NIC's MAC (SDD §7.2)
+    expect(codes(run(shared, member, 'vmware'))).toContain('NET_PORT_NOT_PERMITTED');
+  });
+
+  it("checks a VMware NIC's IPv4 guest addresses by the migration kit's rule, with the API's message (SDD §9.3, §7.2)", () => {
+    const plan = { ...base, mappings: { ...base.mappings, networks: { 'DC2-Prod': 'dc2-prod' } } };
+    const details = [net('prod', 'dc2-prod', true, 'shop')];
+    const subnets = ['10.2.0.0/24', '10.2.1.0/24'].map((cidr, i) => ({ id: `sub-${i}`, name: `s${i}`, network: 'dc2-prod', network_id: 'prod', cidr, ipv6_address_mode: null, ipv6_ra_mode: null }));
+    const found = (...fixed_ips: string[]) => {
+      const v = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC2-Prod', mac: '00:50:56:AA:BB:CC', fixed_ips }] });
+      return preflight(v, 'vmware', plan, { 'dc2-prod': 1500 }, [v.name], { selected: [v], networkDetails: details, subnets });
+    };
+    // one subnet holds them; an IPv6 address the kit never sends is not judged
+    expect(codes(found('10.2.1.5', '10.2.1.6', 'fd00::5'))).not.toContain('NET_ADDRESS_REFUSED');
+    expect(found('10.2.0.5', '10.2.1.5').find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toBe(
+      "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet.",
+    );
+    expect(found('10.2.0.255').find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toContain("00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.255 is no host address of any subnet");
+    expect(codes(found('fe80::1'))).not.toContain('NET_ADDRESS_REFUSED');
+    // the kit keeps the guest's network settings: an override (itself refused) never moves a VMware NIC, as the API
+    const v = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC2-Prod', mac: '00:50:56:aa:bb:cc', fixed_ips: ['10.2.0.5'] }] });
+    const moved = { ...plan, nic_overrides: { 'vm-x1': { '00:50:56:aa:bb:cc': { network: 'twice', fixed_ips: null } } } };
+    const twice = [...details, net('t1', 'twice', true, 'shop'), net('t2', 'twice', true, 'shop')];
+    const all = codes(preflight(v, 'vmware', moved, { 'dc2-prod': 1500, twice: 1500 }, [v.name], { selected: [v], networkDetails: twice, subnets }));
+    expect(all).toContain('MAP_NIC_OVERRIDE_INVALID');
+    expect(all).not.toContain('MAP_NETWORK_AMBIGUOUS');
   });
 
   it('takes the MTU and an override\'s subnets from the resolved network, not same-named ones', () => {
@@ -288,6 +312,13 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
         expect(found, `${v.name} ${mode}`).not.toContain('NET_ADDRESS_REFUSED');
         expect(found, `${v.name} ${mode}`).not.toContain('NET_PORT_NOT_PERMITTED');
       }
+    }
+    // the mock's VMware plan sends its VMs' NICs to erp-net: none is blocked either (SDD §7.2)
+    const vmware = inventories['vcenter-hq'] as VMRef[];
+    const erp = { ...base, mappings: { networks: { 'VM Network ERP': 'erp-net' }, flavors: {}, volume_types: {}, projects: {} } };
+    for (const v of vmware) {
+      const found = codes(preflight(v, 'vmware', erp, dst.networks, [v.name], { selected: vmware, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
+      for (const code of ['MAP_NETWORK_AMBIGUOUS', 'NET_ADDRESS_REFUSED', 'NET_PORT_NOT_PERMITTED']) expect(found, `${v.name} ${code}`).not.toContain(code);
     }
     // a member's token could not keep it there
     const jump = vms.find((v) => v.name === 'jump-host-01')!;

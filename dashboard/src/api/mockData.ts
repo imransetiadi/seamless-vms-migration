@@ -36,7 +36,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
-import { networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
+import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -601,9 +601,10 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       erp: { cores: 64, ram_mb: 262144, instances: 20, volumes: 40, gigabytes: 9000 },
     },
     projects: ['shop', 'finance', 'platform', 'analytics', 'erp', 'media'],
-    // where a NIC's addresses must lie (SDD §11): the mock VMs' addresses are in 10.20.0.0/16
+    // where a NIC's addresses must lie (SDD §10): the mock VMs' addresses are in 10.20.0.0/16
     subnets: [
       ...['tenant-web', 'tenant-app', 'tenant-db', 'tenant-infra', 'analytics', 'erp-net'].map((network) => ({
+        id: `sub-${network}-v4`,
         name: `${network}-v4`,
         network,
         network_id: `net-${network}`,
@@ -611,7 +612,7 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
         ipv6_address_mode: null,
         ipv6_ra_mode: null,
       })),
-      { name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
+      { id: 'sub-provider-ext-v4', name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
     ],
   };
   // what a NIC's network name resolves to (SDD §11): the credential's own networks, and a provider network another project shares
@@ -906,20 +907,24 @@ export function preflight(
     add('SRC_VM_MULTIATTACH', 'warning', 'A multi-attach volume is attached; warm and storage handover are not possible.', 'Detach the shared volume or migrate cold during a window.', ['warm', 'storage_handover']);
   if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
     add('SRC_VM_EPHEMERAL_ROOT', 'info', 'Root disk is image-backed; each warm pass snapshots the server to Glance.', 'Expect slower pre-copy passes (boot_disk_copy).', ['warm']);
-  // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); the VMware kit maps port groups its own way
+  // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
+  // the migration kit the network it resolves (§7.2)
   const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
   const resolved = new Map<Nic, DestinationNetwork>();
   const ambiguous: string[] = [];
   for (const nic of vm.nics) {
-    const { network, why } = resolveNetwork(seen, nicTarget(plan, vm.source_id, nic).network);
+    // the VMware kit keeps the guest's network settings: no NIC override moves its NICs (SDD §7.2)
+    const target = sourceKind === 'vmware' ? (plan.mappings.networks[nic.network] ?? nic.network) : nicTarget(plan, vm.source_id, nic).network;
+    const { network, why } = resolveNetwork(seen, target);
     if (network) resolved.set(nic, network);
-    else if (why && sourceKind !== 'vmware') ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
+    else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
   }
   if (ambiguous.length)
     add('MAP_NETWORK_AMBIGUOUS', 'blocker', `The cutover cannot tell these RHOSO networks apart: ${ambiguous.join('; ')}.`, NETWORK_REMEDIATION.MAP_NETWORK_AMBIGUOUS);
-  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3)
+  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3); the VMware
+  // migration kit creates every port with the NIC's MAC (§7.2)
   const denied: string[] = [];
-  for (const nic of sourceKind === 'vmware' ? [] : vm.nics) {
+  for (const nic of vm.nics) {
     const network = resolved.get(nic);
     const why = network ? portRefusal(network, context.roles) : null;
     if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}' (project ${network.project_id}): ${why}`);
@@ -957,6 +962,17 @@ export function preflight(
         const why = addressRefusal(address, subnets, { neutron, mac: nic.mac });
         if (why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}': ${address} ${why}`);
       }
+    }
+    if (refused.length)
+      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their RHOSO network: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+  }
+  // the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its network (SDD §7.2, §9.3)
+  if (sourceKind === 'vmware' && context.subnets?.length) {
+    const refused: string[] = [];
+    for (const nic of vm.nics) {
+      const network = resolved.get(nic);
+      const why = network ? kitSubnet(nic, subnetsOf(context.subnets, network)).why : null;
+      if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}': ${why}`);
     }
     if (refused.length)
       add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their RHOSO network: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);

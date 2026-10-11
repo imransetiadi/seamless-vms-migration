@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { DestinationNetwork } from '../api/types';
-import { capabilityRoles, portRefusal, resolveNetwork } from './networks';
+import type { DestinationNetwork, DestinationSubnet, Nic } from '../api/types';
+import { capabilityRoles, kitSubnet, portRefusal, resolveNetwork } from './networks';
+import { kitIpv4 } from './nics';
 
 const net = (id: string, name: string, own: boolean, project_id = own ? 'shop' : `${id}-owner`): DestinationNetwork => ({
   id,
@@ -56,5 +57,32 @@ describe('portRefusal (SDD §6.6, §9.3)', () => {
     expect(capabilityRoles({ admin: true, roles: ['admin', 'reader'] })).toEqual(['admin', 'reader']);
     expect(capabilityRoles({ admin: true })).toBeUndefined();
     expect(capabilityRoles(undefined)).toBeUndefined();
+  });
+});
+
+describe('the VMware migration kit (SDD §7.2)', () => {
+  const subnet = (id: string, cidr: string): DestinationSubnet => ({ id, name: id, network: 'dc2-prod', network_id: 'net-prod', cidr });
+  const nic = (...fixed_ips: string[]): Nic => ({ network: 'DC2-Prod', mac: '00:50:56:aa:bb:cc', fixed_ips, vnic_type: 'normal', mtu: null });
+
+  it('sends Neutron the IPv4 guest addresses only, an IPv4-mapped IPv6 one as its IPv4, as the API reads it', () => {
+    expect(kitIpv4(['10.2.0.15', 'fe80::1', '::ffff:10.2.0.16', 'not-an-ip', 'fd00::5'])).toEqual(['10.2.0.15', '10.2.0.16']);
+  });
+
+  it("gives a NIC's port the subnet holding its IPv4 addresses, as the API's kit_subnet", () => {
+    const v6 = subnet('sub-v6', 'fd00::/64');
+    const first = subnet('sub-a', '10.2.0.0/24');
+    const second = subnet('sub-b', '10.2.1.0/24');
+    expect(kitSubnet(nic('10.2.1.5', 'fe80::1'), [v6, first, second])).toEqual({ subnet: second, why: null });
+    // no IPv4 address: any of its subnets, an IPv4 one first; none at all: no subnet
+    expect(kitSubnet(nic('fe80::1'), [v6, first])).toEqual({ subnet: first, why: null });
+    expect(kitSubnet(nic(), [v6])).toEqual({ subnet: v6, why: null });
+    expect(kitSubnet(nic(), [])).toEqual({ subnet: null, why: null });
+    for (const address of ['192.0.2.5', '10.2.0.0', '10.2.0.255'])
+      expect(kitSubnet(nic(address), [first, second])).toEqual({ subnet: null, why: `${address} is no host address of any subnet of the port's network` });
+    expect(kitSubnet(nic('10.2.0.5', '10.2.1.5'), [first, second])).toEqual({
+      subnet: null,
+      why: "10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the migration kit gives a NIC's IPv4 addresses one subnet",
+    });
+    expect(kitSubnet(nic('10.2.0.5', '10.2.0.6'), [first, second])).toEqual({ subnet: first, why: null });
   });
 });

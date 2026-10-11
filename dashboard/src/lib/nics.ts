@@ -96,6 +96,32 @@ function toBits(address: string): { value: bigint; bits: 32 | 128 } | null {
   return { value: groups.reduce((n, g) => (n << 16n) + BigInt(parseInt(g, 16)), 0n), bits: 128 };
 }
 
+/** An IPv6 address whose last 32 bits are written as an IPv4 address, with them as two hex groups instead. */
+function withHexTail(address: string): string {
+  const cut = address.lastIndexOf(':');
+  const tail = address.slice(cut + 1);
+  if (cut < 0 || !IPV4.test(tail)) return address;
+  const [a, b, c, d] = tail.split('.').map(Number) as [number, number, number, number];
+  return `${address.slice(0, cut + 1)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+}
+
+/**
+ * The guest addresses the VMware migration kit sends Neutron, as its FixedIPsForNeutron and the API's kit_ipv4 (SDD §7.2):
+ * IPv4 ones only, an IPv4-mapped IPv6 address as its IPv4.
+ */
+export function kitIpv4(addresses: string[]): string[] {
+  const out: string[] = [];
+  for (const address of addresses) {
+    if (IPV4.test(address)) {
+      out.push(address);
+      continue;
+    }
+    const ip = toBits(withHexTail(address));
+    if (ip && ip.bits === 128 && ip.value >> 32n === 0xffffn) out.push(fromBits(ip.value & 0xffffffffn, 32));
+  }
+  return out;
+}
+
 /** A 32- or 128-bit value written as an address, as the API writes it. */
 function fromBits(value: bigint, bits: 32 | 128): string {
   if (bits === 32) return [24n, 16n, 8n, 0n].map((shift) => String((value >> shift) & 255n)).join('.');
