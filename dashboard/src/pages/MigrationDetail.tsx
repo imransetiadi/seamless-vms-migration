@@ -209,7 +209,13 @@ function ProgressPanel({ m }: { m: Migration }) {
           <dt className="text-muted-foreground">Checkpoint</dt>
           <dd className="num text-right">{m.checkpoint ?? '—'}</dd>
           <dt className="text-muted-foreground">Attempts</dt>
-          <dd className="num text-right">{m.attempts}</dd>
+          <dd className="num text-right">
+            {m.attempts}
+            {m.attempt_strategies.length > 0 && (
+              // a retry records the strategy of the attempt it retries (SDD §4.2, §14.4)
+              <span className="block text-xs text-muted-foreground">earlier: {m.attempt_strategies.map(strategyLabel).join(', then ')}</span>
+            )}
+          </dd>
         </dl>
       </div>
     </Panel>

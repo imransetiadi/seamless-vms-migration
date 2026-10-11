@@ -25,6 +25,28 @@ describe('MigrationDetail', () => {
     expect(screen.getByText('Approved by approver-1')).toBeInTheDocument();
   });
 
+  it('names the strategy of each earlier attempt beside the attempts count (SDD §4.2, §14.4)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    m.attempts = 2;
+    m.attempt_strategies = ['warm', 'cold'];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const term = await screen.findByText('Attempts');
+    const value = term.nextElementSibling as HTMLElement;
+    expect(value).toHaveTextContent('2');
+    expect(value).toHaveTextContent(`earlier: ${STRATEGY_LABELS.warm}, then ${STRATEGY_LABELS.cold}`);
+  });
+
+  it('shows the attempts count alone when nothing was retried', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
+    m.attempts = 0;
+    m.attempt_strategies = [];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const term = await screen.findByText('Attempts');
+    expect((term.nextElementSibling as HTMLElement).textContent).toBe('0');
+  });
+
   it('shows a cutover request in a plan that needs no approval (SDD §16)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
