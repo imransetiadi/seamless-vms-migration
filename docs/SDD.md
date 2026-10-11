@@ -1497,7 +1497,14 @@ written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 Resolution order for a secret name: mounted files under `SEAMLESS_SECRETS_DIR`, then the store (when it
 is `kubernetes`), then `SEAMLESS_SECRET_{NAME}_{KEY}` variables. A secret name is 1–128 letters, digits, `.`, `_` or `-`, starting with a
 letter or digit; `POST /providers` and `PATCH /providers/{id}` refuse (422) a `credentials_secret` or
-`conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. An **OpenStack/RHOSO provider with a
+`conversion_host.ssh_key_secret` that is not one, instead of the connection check failing on it later. The whole name
+must match (a trailing newline does not), and it never starts with `provider-` unless it is the provider's own
+(`provider-{id}`, `provider-{id}-ssh`): those name other providers' secrets, which a check would send to this provider's
+endpoint. The `kubernetes` store reads only a Secret that carries `app.kubernetes.io/managed-by: seamless-migrate`
+(its own writes) or `seamless.io/provider-secret: "true"` (one an operator made for providers), never the
+deployment's own (`seamless-db`, `seamless-tokens`, …); a name that store cannot hold (upper-case, `_`) is not
+looked up there, and the variables are read next. `provider.created` and `provider.updated` name the secrets the
+provider reads (`credentials_secret`, `conversion_host.ssh_key_secret`), never their values. An **OpenStack/RHOSO provider with a
 `credentials_secret`** builds its connection from that secret — keys `auth_url` (default: the
 provider endpoint), `username`/`password`/`project_name`/`user_domain_name`/`project_domain_name`
 (`Default` when absent) for password auth, or `application_credential_id`/`application_credential_secret`
