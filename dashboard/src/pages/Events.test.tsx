@@ -303,6 +303,123 @@ describe('Events page', () => {
     }
   });
 
+  it('exports the whole trail, every persisted event and not only the shown ones, like `seamless events export` (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const blobs: Blob[] = [];
+    const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      blobs.push(b as Blob);
+      return 'blob:events';
+    });
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    try {
+      const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer' });
+      const list = await screen.findByRole('list', { name: /events, newest first/i });
+      await within(list).findByText(/paused: vCenter degraded/i);
+      await user.selectOptions(screen.getByLabelText('Category'), 'security');
+      const regions = screen.getAllByRole('status');
+
+      const exportButton = screen.getByRole('button', { name: 'Export the whole trail' });
+      await user.click(exportButton);
+      const persisted = server.events.filter((e) => e.seq > 0);
+      // the result is said once, from a region already on the page; focus stays on the button
+      const said = await screen.findByText(`Exported ${persisted.length} events.`);
+      expect(regions).toContain(said.closest('[role="status"]'));
+      expect(exportButton).toHaveFocus();
+      expect(click).toHaveBeenCalledTimes(1);
+      const text = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsText(blobs[0]!);
+      });
+      const seqs = text.trim().split('\n').map((l) => (JSON.parse(l) as { seq: number }).seq);
+      expect(seqs).toEqual(persisted.map((e) => e.seq));
+      expect(blobs[0]!.type).toBe('application/x-ndjson');
+    } finally {
+      create.mockRestore();
+      revoke.mockRestore();
+      click.mockRestore();
+    }
+  });
+
+  it('stops an export from the same button, saves nothing and says so', async () => {
+    const user = userEvent.setup({ delay: null });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    try {
+      // the export's paging request stays open until it is aborted
+      const held: typeof fetch = (_input, init) =>
+        new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
+      renderWithApp(<Events />, {
+        route: '/events',
+        token: 'viewer',
+        wrapFetch: (mock) => (input, init) => (String(input).includes('since=') ? held(input, init) : mock(input, init)),
+      });
+      await screen.findByRole('list', { name: /events, newest first/i });
+      const button = screen.getByRole('button', { name: 'Export the whole trail' });
+      await user.click(button);
+      expect(await screen.findByText(/Exporting the whole trail: 0 events read/)).toBeInTheDocument();
+      expect(button).toHaveAccessibleName('Stop export');
+      await user.click(button);
+      expect(await screen.findByText('Export stopped: nothing was saved.')).toBeInTheDocument();
+      expect(button).toHaveAccessibleName('Export the whole trail');
+      expect(button).toHaveFocus();
+      expect(click).not.toHaveBeenCalled();
+      expect(screen.queryByText(/The export failed/)).not.toBeInTheDocument();
+    } finally {
+      click.mockRestore();
+    }
+  });
+
+  it('stops a running export when the page is left', async () => {
+    const user = userEvent.setup({ delay: null });
+    let aborted = false;
+    const held: typeof fetch = (_input, init) =>
+      new Promise((_, reject) =>
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        }),
+      );
+    const { unmount } = renderWithApp(<Events />, {
+      route: '/events',
+      token: 'viewer',
+      wrapFetch: (mock) => (input, init) => (String(input).includes('since=') ? held(input, init) : mock(input, init)),
+    });
+    await screen.findByRole('list', { name: /events, newest first/i });
+    await user.click(screen.getByRole('button', { name: 'Export the whole trail' }));
+    await screen.findByText(/Exporting the whole trail/);
+    unmount();
+    await waitFor(() => expect(aborted).toBe(true));
+  });
+
+  it('exports only the chosen plan’s trail when a plan is chosen', async () => {
+    const user = userEvent.setup({ delay: null });
+    const blobs: Blob[] = [];
+    const create = vi.spyOn(URL, 'createObjectURL').mockImplementation((b) => {
+      blobs.push(b as Blob);
+      return 'blob:events';
+    });
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    try {
+      const { server } = renderWithApp(<Events />, { route: '/events?plan=plan-4f2a9c1e', token: 'viewer' });
+      await screen.findByRole('list', { name: /events, newest first/i });
+      await user.click(screen.getByRole('button', { name: 'Export the whole trail' }));
+      const mine = server.events.filter((e) => e.seq > 0 && e.plan_id === 'plan-4f2a9c1e');
+      await screen.findByText(`Exported ${mine.length} events.`);
+      const text = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsText(blobs[0]!);
+      });
+      expect(text.trim().split('\n').map((l) => (JSON.parse(l) as { seq: number }).seq)).toEqual(mine.map((e) => e.seq));
+    } finally {
+      create.mockRestore();
+      revoke.mockRestore();
+      click.mockRestore();
+    }
+  });
+
   it('lists the audit events under Advisor and memory (SDD §14.5)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Events />, { route: '/events', token: 'viewer' });

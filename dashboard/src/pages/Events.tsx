@@ -1,10 +1,12 @@
 import {
   Activity,
+  Archive,
   ArrowRightLeft,
   Bot,
   Download,
   BrainCircuit,
   Gavel,
+  CircleStop,
   CircleX,
   ClipboardList,
   Hand,
@@ -21,9 +23,10 @@ import {
   TimerOff,
   type LucideIcon,
 } from 'lucide-react';
-import { memo, useId, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useEventTail, usePlans } from '../api/hooks';
+import { exportEventTrail, toJsonLines } from '../api/eventExport';
+import { useApi, useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
 import { Button } from '../components/Button';
@@ -34,7 +37,7 @@ import { LiveIndicator } from '../components/LiveIndicator';
 import { PageHeader } from '../components/PageHeader';
 import { LoadingBlock } from '../components/Skeleton';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatTime } from '../lib/format';
+import { formatDateTime, formatNumber, formatTime } from '../lib/format';
 import type { Tone } from '../lib/phase';
 import { TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -143,6 +146,21 @@ const EventRow = memo(function EventRow({ event, planName }: { event: Event; pla
   );
 });
 
+/** Saves JSON lines as a file, the format of `seamless events export`. */
+function saveJsonLines(text: string, name: string): void {
+  const blob = new Blob([text], { type: 'application/x-ndjson' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function stamp(): string {
+  return new Date().toISOString().slice(0, 19).replace(/:/g, '');
+}
+
 /** Audit trail plus the live stream: history first, streamed events appended at the top. */
 export default function Events() {
   usePageTitle('Events');
@@ -226,13 +244,37 @@ export default function Events() {
   /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
     const events = shownAudit.map(({ event }) => event).sort((a, b) => a.seq - b.seq);
-    const blob = new Blob(events.map((event) => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `seamless-events-${new Date().toISOString().slice(0, 19).replace(/:/g, '')}.jsonl`;
-    link.click();
-    URL.revokeObjectURL(url);
+    saveJsonLines(toJsonLines(events), `seamless-events-${stamp()}.jsonl`);
+  };
+
+  // the whole trail (SDD §16): every persisted event, the chosen plan's when one is, paged like
+  // `seamless events export`; the same button stops it, so the focus stays where it is
+  const api = useApi();
+  const [exported, setExported] = useState<number | null>(null);
+  const [exportError, setExportError] = useState<unknown>(null);
+  const exportRun = useRef<AbortController | null>(null);
+  // leaving the page stops an export: nothing is saved behind the operator's back
+  useEffect(() => () => exportRun.current?.abort(), []);
+  const exportTrail = async () => {
+    if (exportRun.current) {
+      exportRun.current.abort();
+      return;
+    }
+    const run = new AbortController();
+    exportRun.current = run;
+    setExported(0);
+    setExportError(null);
+    try {
+      const events = await exportEventTrail(api, { planId: planId || undefined, signal: run.signal, onProgress: setExported });
+      saveJsonLines(toJsonLines(events), `seamless-events-${planId ? `${planId}-` : ''}all-${stamp()}.jsonl`);
+      setAnnouncement(`Exported ${events.length} events.`);
+    } catch (error) {
+      if (run.signal.aborted) setAnnouncement('Export stopped: nothing was saved.');
+      else setExportError(error);
+    } finally {
+      exportRun.current = null;
+      setExported(null);
+    }
   };
 
   const pause = () => {
@@ -272,6 +314,9 @@ export default function Events() {
               disabledReason={downloadReason}
             >
               Download shown events
+            </Button>
+            <Button size="lg" icon={exported === null ? Archive : CircleStop} onClick={() => void exportTrail()}>
+              {exported === null ? 'Export the whole trail' : 'Stop export'}
             </Button>
             {paused ? (
               <Button size="lg" variant="primary" icon={Play} onClick={resume}>
@@ -340,6 +385,10 @@ export default function Events() {
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
         <LiveIndicator />
         <p className="text-muted-foreground">{statusText}</p>
+        {exported !== null && (
+          // plain text: read on demand, never announced page by page; the result is (SDD §16)
+          <p className="text-muted-foreground">Exporting the whole trail: {formatNumber(exported)} events read</p>
+        )}
         <p role="status" className="sr-only">
           {announcement}
         </p>
@@ -347,6 +396,7 @@ export default function Events() {
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
+      {exportError !== null && <ErrorBanner error={exportError} title="The export failed: nothing was saved" onRetry={() => void exportTrail()} />}
       {/* "No events match" only once the trail is known: a failed load is not an empty trail; read out from a live
           region already on the page — the count is not, as it moves with every live event (SDD §16) */}
       <div role="status">
