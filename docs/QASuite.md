@@ -831,8 +831,10 @@ Twenty-three further iterations after the integration run, each verified with th
   set, the API's event data); `token create` refuses names the tokens file refuses and the control plane's
   own actor names in any case; `estimate` refuses `--slo`/`--max-passes` below 1; `events prune` refuses a
   cutoff after now and records `events.pruned`, filed under Security on the Events page (SDD §4.3, §13.1,
-  §15). Open, a design decision: `plan validate`/`plan start` from the CLI take their locks in their own
-  process, so beside a running server two claims of one VM are not excluded.
+  §15). The VM-claim lock of validations and retries now holds across processes (PostgreSQL advisory lock,
+  SQLite `flock`, dropped with its process, SDD §5.4): `test_two_processes_cannot_claim_one_vm_at_once`,
+  `test_validate_and_retry_wait_for_another_process_holding_the_claims`,
+  `test_cross_process_lock_dies_with_its_process` (a SIGKILLed holder), on SQLite and PostgreSQL 16.
 
 ### 13.2 Exit criteria — release 0.1.0
 
