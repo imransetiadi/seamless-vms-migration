@@ -1180,14 +1180,17 @@ strategy ineligible):
 
 * OpenStack sources consider `cold`, `warm`, `storage_handover`; VMware sources consider
   `vmware_cold`, `vmware_warm`.
-* `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side.
+* `cold`: ineligible if `power_state` is `"error"` or `"transitioning"`, or no conversion host configured on either side,
+  or a NIC has no fixed IP or more than one (a dual-stack port included): os-migrate recreates each port through
+  Nova with exactly one fixed IP and refuses any other, after the source is stopped.
 * `warm`: as `cold`, plus any disk `multiattach`.
 * `storage_handover`: requires `plan.handover.enabled`, every disk `kind == "volume"`, every
   `volume_type` in `plan.handover.backend_map`, no `multiattach`, no `encrypted` disk (Cinder
   cannot unmanage encrypted volumes), and `src_caps["admin"]` and
   `dst_caps["admin"]` truthy; for every volume disk whose `pool` is known and listed in
   `src_caps["storage_backends"]`: a family other than `other`, and — when `dst_caps` lists
-  `storage_backends` — a destination pool that resolves (§7.3.1).
+  `storage_backends` — a destination pool that resolves (§7.3.1); no NIC with more than one fixed IP (the
+  destination server gets one fixed IP per port, so the others would be dropped without a word).
 * `vmware_cold`: ineligible if `power_state` is `"error"` or `"transitioning"`.
 * `vmware_warm`: requires `cbt_enabled is True` and no `independent` disk.
 * Blocker findings (§9.3) make **all** strategies ineligible.
@@ -1226,6 +1229,7 @@ Finding catalog (code — severity — condition):
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
+| `NET_PORT_IPS` | warning | an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
 | `VOL_ENCRYPTED` | warning | encrypted disk (Barbican key must be re-created) |
