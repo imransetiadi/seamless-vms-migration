@@ -273,3 +273,25 @@ for (const [width, height] of [
     expect(await panelOverflow(page)).toBeLessThanOrEqual(1);
   });
 }
+
+test('on a phone the lifecycle reads down two columns, half the height of one (SDD §16)', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'viewer');
+  await page.goto('/migrations/mig-3c1a0f9e21');
+  const steps = page.getByRole('list', { name: 'Migration lifecycle' }).getByRole('listitem');
+  await expect(steps.first()).toBeVisible();
+  const boxes = await steps.evaluateAll((items) => items.map((el) => el.getBoundingClientRect()).map((r) => ({ x: r.x, y: r.y, bottom: r.bottom })));
+  const half = Math.ceil(boxes.length / 2);
+  // step 2 is below step 1; the second column starts beside step 1 and runs down as well
+  expect(boxes[1].y).toBeGreaterThan(boxes[0].y);
+  expect(Math.abs(boxes[half].y - boxes[0].y)).toBeLessThan(2);
+  expect(boxes[half].x).toBeGreaterThan(boxes[0].x + 100);
+  expect(boxes[half + 1].y).toBeGreaterThan(boxes[half].y);
+  // half the rows of the single column it replaces
+  expect(Math.max(...boxes.map((b) => b.bottom)) - boxes[0].y).toBeLessThan(half * 40);
+  // the desktop row is unchanged: every step on one line
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const row = await steps.evaluateAll((items) => items.map((el) => Math.round(el.getBoundingClientRect().y)));
+  expect(new Set(row).size).toBe(1);
+});
+
