@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from ..domain.enums import Phase, PlanStatus, ProviderRole, Role
 from ..domain.models import (
@@ -60,11 +60,27 @@ def _non_default_policy_fields(body: PlanCreate) -> set[str]:
     }
 
 
+#: how the plan holds each policy field, to compare a PATCH value with the current one
+_POLICY_TYPES = {
+    name: TypeAdapter(PlanSpec.model_fields[name].annotation) for name in POLICY_FIELDS
+}
+
+
 def _changed_policy_fields(body: dict[str, Any], plan: Plan) -> set[str]:
     """PATCH counterpart of :func:`_non_default_policy_fields`: policy fields whose value
-    differs from the plan's current one (re-sending the current value changes nothing)."""
-    current = plan.model_dump(mode="json", include=POLICY_FIELDS)
-    return {name for name in set(body) & POLICY_FIELDS if body[name] != current.get(name)}
+    differs from the plan's current one (re-sending the current value changes nothing). The
+    values are compared as the plan holds them, so the same window written another way
+    (``.000Z``, ``+00:00``) is no change; a value that does not parse is one."""
+    changed = set()
+    for name in set(body) & POLICY_FIELDS:
+        try:
+            value = _POLICY_TYPES[name].validate_python(body[name])
+        except ValidationError:
+            changed.add(name)
+            continue
+        if value != getattr(plan, name):
+            changed.add(name)
+    return changed
 
 
 async def _check_providers(request: Request, spec: PlanCreate) -> None:

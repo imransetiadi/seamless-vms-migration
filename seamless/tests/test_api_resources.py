@@ -1369,3 +1369,33 @@ def test_a_force_cutover_needs_an_approver_a_reason_and_a_warm_pass_in_progress(
     assert api.post(ready, Role.operator, json=body).status_code == 403
     assert api.post(ready, Role.approver, json={"reason": "short"}).status_code == 422
     assert api.post(ready, Role.approver, json=body).status_code == 409  # not in a pass
+
+
+def test_an_operator_may_resend_the_current_cutover_window_in_any_spelling(api):
+    """SDD §12: a policy field at the plan's current value is no change - a window written
+    as JavaScript's toISOString writes it (milliseconds, `Z`) is the same window; another one
+    still needs the approver."""
+    window = {"start": "2026-10-08T12:00:00+00:00", "end": "2026-10-08T14:00:00+00:00"}
+    created = api.post(
+        "/api/v1/plans",
+        Role.approver,
+        json={
+            "name": "Windowed",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": [],
+            "cutover_window": window,
+        },
+    )
+    assert created.status_code == 201, created.text
+    url = f"/api/v1/plans/{created.json()['id']}"
+    same = {"start": "2026-10-08T12:00:00.000Z", "end": "2026-10-08T14:00:00.000Z"}
+    resent = api.client.patch(
+        url, headers=api.h(Role.operator), json={"description": "d", "cutover_window": same}
+    )
+    assert resent.status_code == 200, resent.text
+    moved = {"start": "2026-10-08T12:30:00.000Z", "end": "2026-10-08T14:00:00.000Z"}
+    changed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": moved})
+    assert changed.status_code == 403
+    malformed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": 5})
+    assert malformed.status_code in (403, 422)
