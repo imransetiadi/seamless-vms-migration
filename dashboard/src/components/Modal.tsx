@@ -3,11 +3,31 @@ import { createPortal } from 'react-dom';
 import { cn } from '../lib/cn';
 
 const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
 
+/** Inside a closed <details>, only its own summary is shown. */
+function inClosedDetails(el: HTMLElement): boolean {
+  for (let details = el.closest('details'); details; details = details.parentElement?.closest('details') ?? null) {
+    const ownSummary = el.tagName === 'SUMMARY' && el.parentElement === details;
+    if (!details.open && !ownSummary) return true;
+  }
+  return false;
+}
+
+/**
+ * What Tab reaches, in order: the trap wraps from the last to the first of these (SDD §16). A radio group is one
+ * stop — its checked radio, or its first while none is — and an element with tabindex -1, an inert or hidden one,
+ * or one in a closed <details> is none.
+ */
 function focusables(container: HTMLElement | null): HTMLElement[] {
   if (!container) return [];
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.hasAttribute('inert'));
+  const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])'));
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
+    if (el.tabIndex < 0 || el.closest('[inert], [hidden]') || inClosedDetails(el)) return false;
+    if (!(el instanceof HTMLInputElement) || el.type !== 'radio' || !el.name) return true;
+    const group = radios.filter((radio) => radio.name === el.name && radio.form === el.form);
+    return el === (group.find((radio) => radio.checked) ?? group[0]);
+  });
 }
 
 export interface ModalProps {
