@@ -432,15 +432,19 @@ provider supports per-key budgets or scopes, create one key per environment.
 | Control plane → Jev sidecar | HTTP + bearer on an internal network (Compose) | jev-mcp serves plain HTTP: keep it internal or terminate TLS in front; the token is mandatory for non-loopback binds |
 | Control plane → provider API | HTTPS | provider TLS; egress allowed only to the provider |
 | Control plane → agentmemory | HTTP(S) | loopback/host gateway in Compose; TLS and bearer for any remote server |
-| Control plane → migrated VMs (verification probes, SDD §7.5) | TCP connect; HTTP(S) `GET` of the configured path | No credentials are sent; only the status is read. HTTPS certificates are **not** verified — the probe targets an address the certificate does not name — so a passed probe proves the service answers, not who answered (C2-08). Egress to the destination's tenant networks must be allowed for probes to reach them; otherwise they report *Unreachable* and the migration needs review, never a rollback |
+| Control plane → migrated VMs (verification probes, SDD §7.5) | TCP connect; HTTP(S) `GET` of the configured path | No credentials are sent; only the status is read. HTTPS certificates are **not** verified — the probe targets an address the certificate does not name — so a passed probe proves the service answers, not who answered (C2-08). Egress to the destination's tenant networks must be allowed for probes to reach them; otherwise an application probe reports *Unreachable* and the migration needs review, never a rollback — but a deterministic `tcp:<port>` check (`tcp_ports`, `windows_tcp_ports`) that cannot connect **fails** the verification, and `auto_rollback` rolls the VM back. The shipped NetworkPolicy allows the ports the plan form proposes (22, 3389); add every other port your plans verify |
 
 **NetworkPolicy** (`deploy/openshift/networkpolicy.yaml`): default-deny for ingress and egress; ingress to the
 control plane only from the OpenShift ingress namespace (label `policy-group.network.openshift.io/ingress`);
 PostgreSQL accepts only `seamless` pods; egress limited to DNS, PostgreSQL and a port list towards networks
 outside the cluster, excluding the pod/service networks and `169.254.0.0/16` (the Kubernetes overlay excepts the
 cluster's own networks — kubeadm/kind defaults `10.244.0.0/16` and `10.96.0.0/12`, to adjust per cluster — and
-keeps them out of the 6443 rule too). **Tighten** `0.0.0.0/0` to the
-CIDRs of your clouds, vCenter, conversion hosts, Jev provider and agentmemory before production.
+keeps them out of the 6443 rule too). The port list includes the verification checks the plan form proposes —
+TCP 22 (Linux) and 3389 (Windows), SDD §7.5, §17 — as a blocked check fails the verification and rolls a working
+migration back; a plan that verifies other ports, or application probes on them, needs those ports added.
+**Tighten** `0.0.0.0/0` to the
+CIDRs of your clouds, vCenter, conversion hosts, Jev provider, agentmemory and the destination's tenant networks
+(the migrated VMs) before production.
 **DNS:** the conversion subnets default to the public resolver `8.8.8.8`
 (`roles/conversion_host/defaults/main.yml:15-16`, SEC-08); override
 `os_migrate_{src,dst}_conversion_subnet_dns_nameservers` with internal resolvers.
@@ -699,7 +703,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 **OpenShift**
 - [ ] Secrets created from a secret manager or `oc create secret` — `secret-example.yaml` not applied.
 - [ ] Images pinned by digest; namespace carries the `restricted` pod-security labels.
-- [ ] `networkpolicy.yaml` egress tightened from `0.0.0.0/0` to your CIDRs; default-deny present.
+- [ ] `networkpolicy.yaml` egress tightened from `0.0.0.0/0` to your CIDRs (the destination's tenant networks included); every verification and application-probe port your plans use is in the port list (22 and 3389 ship; SDD §7.5, §17); default-deny present.
 - [ ] `FORWARDED_ALLOW_IPS` on the control plane set to the router/ingress pod addresses (uvicorn then
       takes the client address from `X-Forwarded-For` for the auth lockout and the audit log); never `*`
       on a network where pods can reach the Service directly.

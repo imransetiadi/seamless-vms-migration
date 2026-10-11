@@ -103,3 +103,32 @@ def test_security_md_describes_the_api_token_the_deployment_mounts():
     assert f"`automountServiceAccountToken: {str(mounted).lower()}`" in row, row
     if mounted:
         assert "service account has no Kubernetes API token" not in " ".join(text.split())
+
+
+def test_external_egress_reaches_the_verification_ports_the_plan_form_proposes():
+    """SDD §17, §7.5: a `tcp:<port>` check the policy blocks times out and fails the verification,
+    so auto_rollback would roll back a migration that worked: the dashboard's defaults pass."""
+    import re
+
+    policies = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "networkpolicy.yaml").read_text(encoding="utf-8")
+    )
+    external = next(
+        p for p in policies if p and p["metadata"]["name"] == "seamless-allow-egress-external"
+    )
+    allowed = {
+        port["port"]
+        for rule in external["spec"]["egress"]
+        for port in rule.get("ports", [])
+        if port.get("protocol", "TCP") == "TCP"
+    }
+    form = (ROOT / "dashboard" / "src" / "components" / "PlanCreateDialog.tsx").read_text(
+        encoding="utf-8"
+    )
+    proposed = {
+        int(port)
+        for field in ("tcpPorts", "windowsTcpPorts")
+        for port in re.findall(r"\d+", re.search(rf"{field}: '([^']*)'", form).group(1))
+    }
+    assert proposed == {22, 3389}
+    assert proposed <= allowed, sorted(proposed - allowed)

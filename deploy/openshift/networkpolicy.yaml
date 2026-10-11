@@ -108,7 +108,11 @@ spec:
               - 169.254.0.0/16  # link-local, including cloud metadata endpoints
       ports:
         - protocol: TCP
-          port: 22      # SSH to conversion hosts (Ansible)
+          port: 22      # SSH to conversion hosts (Ansible); the Linux verification check (SDD 7.5)
+        - protocol: TCP
+          port: 3389    # the Windows verification check the plan form proposes (SDD 7.5, 17): blocked,
+                        # it times out, fails the verification and auto_rollback rolls the VM back. Add any
+                        # other verification or application-probe port of your plans here (Security.md 8).
         - protocol: TCP
           port: 443     # RHOSO/OpenStack APIs, vCenter, Jev provider API, npm registry (Jev stdio)
         - protocol: TCP
