@@ -1480,9 +1480,9 @@ network_details: list[{id, name, mtu, project_id, own, shared, external}] (every
 sees; `own` when the credential's project owns it: what a NIC's RHOSO network name resolves to, §7.3 step 0, §9.3;
 `shared` and `external` as Neutron's `shared` and `router:external` read for the credential: whether it may put a
 port on another project's network, §6.6),
-subnets: list[{name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
+subnets: list[{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
 credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
-§9.3)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
+§9.3; `id` is what a VMware NIC's `network_map` value names, §7.2)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
