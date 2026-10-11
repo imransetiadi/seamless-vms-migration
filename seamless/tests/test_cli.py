@@ -47,6 +47,54 @@ def test_token_create_prints_token_and_yaml_hash(env, capsys):
         cli.main(["token", "create", "--name", "x", "--role", "root"])
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "n" * 129,
+        "anonymous",
+        "unauthenticated",
+        "cli",
+        "system",
+        "System",
+        " CLI ",
+        "ANONYMOUS",
+    ],
+)
+def test_token_create_refuses_names_the_file_or_the_audit_trail_own(env, capsys, name):
+    """SDD §13.1: no entry the tokens file refuses, no token acting as the control plane."""
+    assert cli.main(["token", "create", "--name", name, "--role", "admin"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "", "no token is printed"
+    assert captured.err.startswith("error: ")
+    assert cli.main(["token", "create", "--name", "n" * 128, "--role", "viewer"]) == 0
+
+
+@pytest.mark.parametrize("knob", [["--slo", "0"], ["--slo", "-5"], ["--max-passes", "0"]])
+def test_estimate_refuses_what_a_plan_refuses(env, capsys, knob):
+    """SDD §15: --slo and --max-passes below 1 are what a plan refuses (§4.2)."""
+    path = env / "vms.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "vms": [
+                    {
+                        "source_id": "vm-1",
+                        "name": "web-01",
+                        "vcpus": 2,
+                        "ram_mb": 4096,
+                        "disks": [{"id": "d1", "size_gb": 10, "used_gb": 1.0}],
+                    }
+                ]
+            }
+        )
+    )
+    assert cli.main(["estimate", "-f", str(path), *knob]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err.startswith("error: ")
+    assert cli.main(["estimate", "-f", str(path), "--slo", "1", "--max-passes", "1"]) == 0
+
+
 def test_plan_apply_from_yaml(env, capsys):
     store = store_for(env)
     store.put("provider", make_provider(id="src-osp"))

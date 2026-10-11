@@ -21,6 +21,8 @@ from ..domain.enums import Role
 TOKEN_PREFIX = "smg_"
 #: Token names become the ``actor`` of audit events (String(128) in the events table).
 MAX_TOKEN_NAME = 128
+#: actors the control plane records itself (SDD §13.1): no token is created under these names
+RESERVED_TOKEN_NAMES = frozenset({"anonymous", "unauthenticated", "cli", "system"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LOOPBACK_NAMES = frozenset({"localhost"})
 

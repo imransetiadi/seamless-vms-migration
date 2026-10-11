@@ -22,7 +22,14 @@ from .config import Settings
 from .domain.enums import Phase, ProviderKind, Role, Strategy, strategies_for
 from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
-from .security.auth import TokenStore, auth_disabled_allowed, generate_token, is_loopback
+from .security.auth import (
+    MAX_TOKEN_NAME,
+    RESERVED_TOKEN_NAMES,
+    TokenStore,
+    auth_disabled_allowed,
+    generate_token,
+    is_loopback,
+)
 
 log = logging.getLogger("seamless_migrate")
 
@@ -220,6 +227,11 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
+    # SDD §13.1: never an entry the tokens file refuses, nor a token acting as the control plane
+    if not args.name or len(args.name) > MAX_TOKEN_NAME:
+        raise CliError(f"a token name has 1 to {MAX_TOKEN_NAME} characters")
+    if args.name.strip().casefold() in RESERVED_TOKEN_NAMES:
+        raise CliError(f"{args.name!r} is an actor the control plane records itself; pick another")
     token = generate_token()
     print(token)
     print(TokenStore.yaml_entry(args.name, Role(args.role), token), end="")
@@ -396,6 +408,11 @@ def cmd_estimate(args: argparse.Namespace, settings: Settings) -> int:
     problems = invalid_estimator_overrides(
         {k: v for k, v in overrides.items() if k != "max_passes"}
     )
+    # SDD §15: what a plan refuses (downtime_slo_s, max_sync_passes >= 1, §4.2)
+    if not args.slo >= 1:
+        problems.append("--slo: must be at least 1")
+    if args.max_passes is not None and args.max_passes < 1:
+        problems.append("--max-passes: must be at least 1")
     if problems:
         print("error: " + "; ".join(problems), file=sys.stderr)
         return 2
