@@ -1981,7 +1981,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 * Routes: `/` Overview (KPI tiles, phase distribution, throughput chart, downtime vs SLO,
   active cutovers, and "Pending approvals": both kinds in one list, each row with its kind, the VM, its plan and
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
-  ADV-20), `/plans` (New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
+  ADV-20), `/plans` (the list: each plan's status, VMs, migrations done, clouds, SLO and last change — on a phone the
+  done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
+  scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
   strategy overrides (`strategy_overrides`, for selected VMs only: any strategy of the source kind — one that is
   not eligible for the VM is ignored at validation, with the reason, §9.2), SLO,
