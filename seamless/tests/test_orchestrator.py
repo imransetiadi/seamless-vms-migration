@@ -1009,6 +1009,72 @@ async def test_a_validation_never_marks_validated_a_plan_another_process_edited(
     assert report.ok and store.get("plan", plan.id, Plan).status == PlanStatus.validated
 
 
+async def test_a_validation_never_marks_validated_a_plan_another_process_started(tmp_path, store):
+    """SDD §8: a start by the server during a CLI validation stands; the validation fails (409)."""
+    server = build_harness(tmp_path, store, [vm(1)])
+    cli = build_harness(tmp_path, store, [vm(1)])
+    plan = plan_for([vm(1)])
+    store.put("plan", plan)
+    await cli.orch.validate_plan(plan.id, "cli")
+    original = cli.source.inventory
+
+    async def inventory():
+        await server.orch.start_plan(plan.id, "alice")  # POST /plans/{id}/start on the server
+        return await original()
+
+    cli.source.inventory = inventory
+    with pytest.raises(ConflictError, match="changed while it was being validated"):
+        await cli.orch.validate_plan(plan.id, "cli")
+    assert store.get("plan", plan.id, Plan).status == PlanStatus.running
+
+
+async def test_a_validation_never_marks_validated_a_plan_another_process_rewaved(tmp_path, store):
+    """SDD §8: auto-waves by the server during a CLI validation (new waves, draft) stands."""
+    server = build_harness(tmp_path, store, [vm(1), vm(2)])
+    cli = build_harness(tmp_path, store, [vm(1), vm(2)])
+    plan = plan_for([vm(1), vm(2)])
+    store.put("plan", plan)
+    await cli.orch.validate_plan(plan.id, "cli")
+    original = cli.source.inventory
+
+    async def inventory():
+        await server.orch.auto_waves(
+            plan.id, 1, "alice"
+        )  # POST /plans/{id}/waves/auto on the server
+        return await original()
+
+    cli.source.inventory = inventory
+    with pytest.raises(ConflictError, match="changed while it was being validated"):
+        await cli.orch.validate_plan(plan.id, "cli")
+    after = store.get("plan", plan.id, Plan)
+    assert after.waves and after.status == PlanStatus.draft
+
+
+async def test_a_validation_of_a_draft_never_hides_waves_another_process_planned(tmp_path, store):
+    """SDD §8: a draft re-waved by the server during a CLI validation stays a draft with its new
+    waves; only the waves changed (the status was draft already), and the validation fails (409)."""
+    vms = [vm(i) for i in range(1, 6)]
+    server = build_harness(tmp_path, store, vms)
+    cli = build_harness(tmp_path, store, vms)
+    plan = plan_for(vms)
+    store.put("plan", plan)
+    await cli.orch.validate_plan(plan.id, "cli")
+    await server.orch.auto_waves(plan.id, 2, "alice")  # a draft again: a pilot of 3, a wave of 2
+    before = store.get("plan", plan.id, Plan)
+    assert before.status == PlanStatus.draft
+    original = cli.source.inventory
+
+    async def inventory():
+        await server.orch.auto_waves(plan.id, 1, "alice")  # re-waved meanwhile: still a draft
+        return await original()
+
+    cli.source.inventory = inventory
+    with pytest.raises(ConflictError, match="changed while it was being validated"):
+        await cli.orch.validate_plan(plan.id, "cli")
+    after = store.get("plan", plan.id, Plan)
+    assert after.status == PlanStatus.draft and len(after.waves) > len(before.waves)
+
+
 async def test_concurrent_validations_of_two_plans_claim_a_vm_once(tmp_path, store):
     h, first = await setup(tmp_path, store, [vm(1), vm(2)])
     second = plan_for([vm(2)], name="Second wave")

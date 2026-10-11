@@ -162,6 +162,10 @@ def blocks_plan_change(m: Migration) -> bool:
     return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
 
 
+#: what a validation compares before it marks the plan `validated` (SDD §8): another process may
+#: have edited, re-waved, started or paused the plan meanwhile under its own plan lock
+_VALIDATION_WATCHES = PLAN_EDITABLE_FIELDS | {"waves", "status"}
+
 #: a plan's clouds: a failed migration's rollback acts on the ones its attempt used (SDD §12)
 PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
 
@@ -570,9 +574,10 @@ class Orchestrator:
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
-        # SDD §8: the settings this validation assesses - an edit from another process (its own
-        # plan lock) must not end up `validated` with settings no validation saw
-        seen = plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS)
+        # SDD §8: the settings, waves and status this validation assesses - a change by another
+        # process (its own plan lock: an edit, auto-waves, a start, a pause) must never end up
+        # `validated` with settings no validation saw, nor lose its status to this one
+        seen = plan.model_dump(mode="json", include=_VALIDATION_WATCHES)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
         repeated = repeated_vm_ids(plan.vm_ids)
@@ -771,16 +776,17 @@ class Orchestrator:
 
         def mark_validated(fresh: Plan) -> bool | None:
             nonlocal edited
-            edited = fresh.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS) != seen
+            edited = fresh.model_dump(mode="json", include=_VALIDATION_WATCHES) != seen
             if edited:
-                return False  # as the edit left it
+                return False  # as that change left it
             fresh.status = PlanStatus.validated
             return None
 
         plan = await self._update_plan(plan_id, mark_validated)
         if edited:
             raise ConflictError(
-                f"plan {plan_id} changed while it was being validated; validate it again"
+                f"plan {plan_id} changed while it was being validated (now {plan.status}); "
+                "it was left as that change left it"
             )
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
