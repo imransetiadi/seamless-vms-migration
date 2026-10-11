@@ -1,7 +1,8 @@
-import { Pencil, Trash2, TriangleAlert } from 'lucide-react';
+import { Info, Pencil, Trash2, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { useInventory, useMigrations, usePatchPlan, useProviders } from '../api/hooks';
 import type { Migration, Plan, Role } from '../api/types';
+import { resolveNetwork } from '../lib/networks';
 import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
 import { planActions } from '../lib/planActions';
 import { Button } from './Button';
@@ -39,6 +40,14 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
   const edit = planActions(plan, role, siblings.data ?? [m]).edit;
   const listed = Boolean(inventory.data && !Array.isArray(inventory.data));
   const networks = inventory.data && !Array.isArray(inventory.data) ? Object.keys(inventory.data.networks).sort() : [];
+  const details = inventory.data && !Array.isArray(inventory.data) ? (inventory.data.network_details ?? []) : [];
+  // a name only another project's network carries, or one the cutover cannot resolve (SDD §16, §7.3 step 0)
+  const networkLabel = (name: string) => {
+    if (!details.length) return name;
+    const { network, why } = resolveNetwork(details, name);
+    if (why) return `${name} (several networks)`;
+    return network && !network.own ? `${name} (another project's)` : name;
+  };
   const nics = m.vm.nics;
   const hasEntry = Object.keys(plan.nic_overrides?.[m.vm.source_id] ?? {}).length > 0;
 
@@ -159,6 +168,16 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
               // an entry's network RHOSO no longer lists stays selected, marked so (SDD §16)
               const unlisted = Boolean(draft.network) && !networks.includes(draft.network);
               const note = `${titleId}-net-${i}-note`;
+              // said under the field too: a narrow select cuts its option's text
+              const chosen = draft.network && details.length ? resolveNetwork(details, draft.network) : null;
+              const said =
+                unlisted && listed
+                  ? { warn: true, text: `RHOSO does not list ${draft.network}: validation refuses it.` }
+                  : chosen?.why
+                    ? { warn: true, text: `Several RHOSO networks are named ${draft.network}: validation refuses it.` }
+                    : chosen?.network && !chosen.network.own
+                      ? { warn: false, text: `${draft.network} is another project's network: the cutover finds it by its name.` }
+                      : null;
               return (
                 <fieldset key={draft.mac} className="flex flex-col gap-2 rounded-md border border-border p-3">
                   <legend className="px-1 text-sm font-medium text-foreground">
@@ -171,7 +190,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                       </label>
                       <select
                         id={`${titleId}-net-${i}`}
-                        aria-describedby={unlisted && listed ? note : undefined}
+                        aria-describedby={said ? note : undefined}
                         className="input"
                         value={draft.network}
                         onChange={(e) => setDraft(i, { network: e.target.value })}
@@ -180,15 +199,18 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
                         {unlisted && <option value={draft.network}>{listed ? `${draft.network} (not in RHOSO)` : draft.network}</option>}
                         {networks.map((name) => (
                           <option key={name} value={name}>
-                            {name}
+                            {networkLabel(name)}
                           </option>
                         ))}
                       </select>
-                      {/* said under the field too: a narrow select cuts its option's text */}
-                      {unlisted && listed && (
+                      {said && (
                         <p id={note} className="mt-1 flex items-start gap-1 text-xs text-muted-foreground">
-                          <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0 text-status-warning" />
-                          RHOSO does not list {draft.network}: validation refuses it.
+                          {said.warn ? (
+                            <TriangleAlert aria-hidden className="mt-0.5 size-3.5 shrink-0 text-status-warning" />
+                          ) : (
+                            <Info aria-hidden className="mt-0.5 size-3.5 shrink-0 text-status-info" />
+                          )}
+                          {said.text}
                         </p>
                       )}
                     </div>

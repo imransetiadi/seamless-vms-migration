@@ -1039,8 +1039,9 @@ export class MockServer {
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
     const names = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm.name);
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
+    const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
     const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected });
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);

@@ -782,14 +782,30 @@ export interface DestinationInventory {
   /** project -> free amounts */
   quotas: Record<string, ProjectQuota>;
   projects: string[];
-  /** The subnets the destination credential sees: where a NIC override's addresses must lie (SDD §11). */
+  /** The subnets the destination credential sees: where a NIC's addresses must lie (SDD §11). */
   subnets?: DestinationSubnet[];
+  /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §11). */
+  network_details?: DestinationNetwork[];
 }
 
 export interface DestinationSubnet {
   name: string;
   network: string;
+  /** The network the subnet belongs to (an inventory from before it lacks it). */
+  network_id?: string;
   cidr: string;
+  ipv6_address_mode?: string | null;
+  ipv6_ra_mode?: string | null;
+}
+
+export interface DestinationNetwork {
+  id: string | null;
+  name: string;
+  mtu: number | null;
+  project_id: string | null;
+  /** The destination credential's project owns it. */
+  own: boolean;
+  shared: boolean;
 }
 
 /** `VMRef[]` for a source provider, `DestinationInventory` for a destination provider. */

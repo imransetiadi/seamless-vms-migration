@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeVm, buildFixtures } from '../api/mockData';
 import type { Plan } from '../api/types';
-import { canonicalIp, isIpAddress, nicTarget, noHostAddress, parseNicDrafts, toNicDraft, withVmNicOverrides } from './nics';
+import { addressRefusal, canonicalIp, eui64, isIpAddress, nicTarget, noHostAddress, parseNicDrafts, toNicDraft, withVmNicOverrides } from './nics';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 const base: Plan = { ...buildFixtures(now).plans[0]!, mappings: { networks: { 'tenant-app': 'tenant-web' }, flavors: {}, volume_types: {}, projects: {} }, nic_overrides: {} };
@@ -108,5 +108,38 @@ describe('ipInCidr', () => {
     expect(ipInCidr('fd00:11::5', 'fd00:10::/64')).toBe(false);
     expect(ipInCidr('10.20.1.5', 'fd00:10::/64')).toBe(false);
     expect(ipInCidr('nonsense', '10.0.0.0/8')).toBe(false);
+  });
+});
+
+describe('addressRefusal (SDD §6.6: what Neutron 2023.1 refuses on a port, as the API rules it)', () => {
+  const subnet = (cidr: string, mode: string | null = null) => ({ name: `sub-${cidr}`, network: 'n', network_id: 'n', cidr, ipv6_address_mode: mode, ipv6_ra_mode: null });
+  const mac = 'fa:16:3e:00:00:01';
+
+  it("writes the address SLAAC derives from a MAC as the API's eui64 does", () => {
+    expect(eui64('fd00:20::/64', mac)).toBe('fd00:20::f816:3eff:fe00:1');
+    expect(eui64('fd00:20::/64', 'FA:16:3E:00:00:01')).toBe('fd00:20::f816:3eff:fe00:1');
+  });
+
+  it("follows check_subnet_ip for the port's owner", () => {
+    const subnets = [subnet('10.0.0.0/24'), subnet('10.255.0.0/31'), subnet('fd00:10::/64')];
+    for (const host of ['10.0.0.5', '10.0.0.254', '10.255.0.1', 'fd00:10::5']) expect(addressRefusal(host, subnets, { neutron: false, mac: null }), host).toBeNull();
+    for (const refused of ['10.0.0.0', '10.0.0.255', '10.255.0.0', '10.9.0.5', 'fd00:10::'])
+      expect(addressRefusal(refused, subnets, { neutron: false, mac: null }), refused).toBe("is no host address of any subnet of the port's network");
+    // a port created through Neutron has no owner yet: an IPv6 subnet's first address is taken
+    expect(addressRefusal('fd00:10::', subnets, { neutron: true, mac })).toBeNull();
+    expect(addressRefusal('nonsense', subnets, { neutron: false, mac: null })).toBe('is not an IP address');
+  });
+
+  it('on a SLAAC or DHCPv6-stateless subnet takes the kept MAC\'s EUI-64 address only, and none through Nova', () => {
+    for (const mode of ['slaac', 'dhcpv6-stateless']) {
+      const subnets = [subnet('fd00:20::/64', mode)];
+      expect(addressRefusal('fd00:20::f816:3eff:fe00:1', subnets, { neutron: true, mac })).toBeNull();
+      expect(addressRefusal('fd00:20::5', subnets, { neutron: true, mac })).toBe(
+        'is not fd00:20::f816:3eff:fe00:1, the address the SLAAC or DHCPv6-stateless subnet fd00:20::/64 gives MAC fa:16:3e:00:00:01',
+      );
+      expect(addressRefusal('fd00:20::f816:3eff:fe00:1', subnets, { neutron: false, mac })).toBe(
+        'lies on fd00:20::/64, a SLAAC or DHCPv6-stateless subnet: through Nova the port gets a new MAC, and Neutron takes no explicit address there',
+      );
+    }
   });
 });

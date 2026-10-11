@@ -2,7 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { queryKeys } from '../api/hooks';
-import type { Migration } from '../api/types';
+import type { DestinationInventory, Migration } from '../api/types';
 import { STRATEGY_LABELS } from '../lib/status';
 import { createTestClient, createTestServer, renderWithApp } from '../test/utils';
 import MigrationDetail from './MigrationDetail';
@@ -698,6 +698,30 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(remove).toHaveAccessibleDescription(expect.stringContaining(m.vm.name)));
     await user.click(remove);
     expect(plan.nic_overrides[m.vm.source_id]).toEqual(entries);
+  });
+
+  it("marks a network name another project's network carries, and one the cutover cannot resolve (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
+    const own = inventory.network_details!.find((n) => n.name === 'tenant-web')!;
+    inventory.network_details = [...inventory.network_details!, { ...own, id: 'net-tenant-web-2' }];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    const select = within(dialog).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: "provider-ext (another project's)" })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'tenant-web (several networks)' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'tenant-app' })).toBeInTheDocument();
+    // said under the field too: a narrow select cuts its option's text
+    await user.selectOptions(select, 'provider-ext');
+    expect(select).toHaveAccessibleDescription("provider-ext is another project's network: the cutover finds it by its name.");
+    await user.selectOptions(select, 'tenant-web');
+    expect(select).toHaveAccessibleDescription('Several RHOSO networks are named tenant-web: validation refuses it.');
+    await user.selectOptions(select, 'tenant-app');
+    expect(select).not.toHaveAccessibleDescription();
   });
 
   it("keeps an override's network that RHOSO no longer lists selected, marked so (SDD §16)", async () => {

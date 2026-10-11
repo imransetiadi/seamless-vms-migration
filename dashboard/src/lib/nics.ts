@@ -1,4 +1,4 @@
-import type { Nic, NicOverride, Plan } from '../api/types';
+import type { DestinationSubnet, Nic, NicOverride, Plan } from '../api/types';
 
 /** The plan's override of a VM's NIC, by its MAC (SDD §4.2). */
 export function nicOverride(plan: Plan, vmId: string, mac: string | null): NicOverride | null {
@@ -126,6 +126,59 @@ export function noHostAddress(address: string, cidrs: string[]): string | null {
     else return null;
   }
   return why;
+}
+
+/** Subnets whose addresses Neutron derives from the port's MAC. */
+const AUTO_ADDRESS_MODES = ['slaac', 'dhcpv6-stateless'];
+
+/**
+ * Neutron's check_subnet_ip (2023.1), as the API's ipam.host_address: an IPv4 subnet's network address is never a port's,
+ * nor its broadcast address below a /31; an IPv6 subnet's first address is refused only to a port Nova creates.
+ */
+function hostAddress(ip: { value: bigint; bits: 32 | 128 }, cidr: string, createdByNova: boolean): boolean {
+  const [base, prefix] = cidr.split('/');
+  const net = base ? toBits(base) : null;
+  const length = Number(prefix);
+  if (!net || net.bits !== ip.bits || !Number.isInteger(length) || length < 0 || length > ip.bits) return false;
+  const host = BigInt(ip.bits - length);
+  const first = (net.value >> host) << host;
+  if (ip.value >> host !== first >> host) return false;
+  if (ip.bits === 32) return ip.value !== first && (length >= 31 || ip.value !== (first | ((1n << host) - 1n)));
+  return !createdByNova || ip.value !== first;
+}
+
+/** The address SLAAC gives `mac` on `cidr` (oslo's get_ipv6_addr_by_EUI64), written as the API writes it. */
+export function eui64(cidr: string, mac: string): string {
+  const octets = mac.split(':').map((part) => parseInt(part, 16));
+  const iface = [...octets.slice(0, 3), 0xff, 0xfe, ...octets.slice(3)];
+  iface[0] = iface[0]! ^ 0x02;
+  const [base, prefix] = cidr.split('/');
+  const host = BigInt(128 - Number(prefix));
+  const first = (toBits(base!)!.value >> host) << host;
+  return fromBits(first + iface.reduce((n, byte) => (n << 8n) + BigInt(byte), 0n), 128);
+}
+
+/**
+ * Why Neutron refuses `address` alone on a port of the network whose subnets are `subnets`, in the API's words (SDD §6.6,
+ * ipam.address_refusal), or null. The port is created through Neutron with `mac` when `neutron`, else by Nova with a new MAC.
+ */
+export function addressRefusal(
+  address: string,
+  subnets: Array<Pick<DestinationSubnet, 'cidr' | 'ipv6_address_mode' | 'ipv6_ra_mode'>>,
+  { neutron, mac }: { neutron: boolean; mac: string | null },
+): string | null {
+  const ip = toBits(address);
+  if (!ip) return 'is not an IP address';
+  // an address alone: Neutron takes the first subnet of the network that holds it
+  const subnet = subnets.find((s) => hostAddress(ip, s.cidr, !neutron));
+  if (!subnet) return "is no host address of any subnet of the port's network";
+  if (AUTO_ADDRESS_MODES.includes(subnet.ipv6_address_mode ?? '') || AUTO_ADDRESS_MODES.includes(subnet.ipv6_ra_mode ?? '')) {
+    // Neutron takes an explicit address there only if it derives the same one
+    if (!neutron || !mac) return `lies on ${subnet.cidr}, a SLAAC or DHCPv6-stateless subnet: through Nova the port gets a new MAC, and Neutron takes no explicit address there`;
+    const expected = eui64(subnet.cidr, mac);
+    if (canonicalIp(address) !== expected) return `is not ${expected}, the address the SLAAC or DHCPv6-stateless subnet ${subnet.cidr} gives MAC ${mac}`;
+  }
+  return null;
 }
 
 /** Whether `address` lies in `cidr` ("10.20.0.0/16", "fd00:10::/64"), like the API's ipaddress check. */
