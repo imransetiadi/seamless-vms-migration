@@ -263,11 +263,13 @@ function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider
   const checkAll = useCheckAllProviders();
   const counts = SUMMARY_ORDER.map((status) => ({ status, count: providers.filter((p) => p.status === status).length })).filter((c) => c.count > 0);
   const missing = providers.filter((p) => !p.credentials_secret && !p.cloud).length;
-  // a check request that failed is named and counted, never left out (SDD §16)
-  const failed = checkAll.data?.failed ?? [];
+  // a check request that failed is named and counted, never left out (SDD §16); the names stay while a retry runs,
+  // until its answer replaces them, so Retry keeps the focus
+  const [failed, setFailed] = useState<Array<{ id: string; error: unknown }>>([]);
   const check = (ids: string[]) =>
     checkAll.mutate(ids, {
       onSuccess: ({ checked, failed: notChecked }) => {
+        setFailed(notChecked);
         const healthy = checked.filter((p) => p.status === 'ok').length;
         const count = notChecked.length ? `${checked.length} of ${ids.length}` : `${checked.length}`;
         onAnnounce(

@@ -139,6 +139,40 @@ describe('Providers page', () => {
     expect(screen.getByText(`Checked ${total - count} of ${total} providers: ${healthy} healthy; ${count} could not be checked.`)).toBeInTheDocument();
   });
 
+  it('keeps the failed checks named while Retry runs, and Retry keeps the focus (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const failing = server.providers[0]!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'POST' && path === `/providers/${failing.id}/check`
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    // the retried check waits until the test lets it through
+    let hold: Promise<void> | null = null;
+    let release: () => void = () => {};
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (hold && String(input).endsWith(`/providers/${failing.id}/check`)) await hold;
+      return fetchImpl(input, init);
+    };
+    renderWithApp(<Providers />, { route: '/providers', path: '/providers', token: 'operator', server, wrapFetch });
+    await user.click(await screen.findByRole('button', { name: /check all/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(`Could not check ${failing.name}`);
+    const retry = within(alert).getByRole('button', { name: /retry/i });
+    hold = new Promise<void>((resolve) => (release = resolve));
+    await user.click(retry);
+    // while it runs, the failure stays named and Retry is busy with the focus
+    await waitFor(() => expect(retry).toHaveAttribute('aria-busy', 'true'));
+    expect(screen.getByRole('alert')).toHaveTextContent(`Could not check ${failing.name}`);
+    expect(retry).toHaveFocus();
+    release();
+    // it failed again: the same banner, Retry ready again and still focused
+    await waitFor(() => expect(retry).not.toHaveAttribute('aria-busy'));
+    expect(screen.getByRole('alert')).toBe(alert);
+    expect(retry).toHaveFocus();
+  });
+
   it('summarises what is missing and focuses the summary', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage();
