@@ -1885,7 +1885,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   short note under it when it is clicked or tapped (touch screens have no hover). A status badge whose detail
   says what to do or why — a readiness flag's guidance, why a VM in the finalize queue needs a look, a migration
   whose numbers do not hold — gives it on hover, focus and tap (its label is a focusable term), never only in a
-  `title`.
+  `title`. A name, label or value that does not fit wraps; it is never cut off with an ellipsis, at 320 px
+  (WCAG 1.4.10 reflow) or wider.
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
   Retry, and a panel or figure built from it says it is unavailable (or shows "—") instead of its empty
   state or a zero ("No VM is down", "Failed 0").
