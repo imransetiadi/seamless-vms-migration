@@ -29,7 +29,7 @@ import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
 import { FinalizePlanDialog, FinalizeQueue, FinalizeSkippedNotice, type FinalizeScope } from '../components/FinalizeQueue';
-import { FindingGroupsList, type FindingRow } from '../components/FindingsList';
+import { FindingGroupsList } from '../components/FindingsList';
 import { KpiTile } from '../components/KpiTile';
 import { MigrationsTable } from '../components/MigrationsTable';
 import { PageHeader } from '../components/PageHeader';
@@ -42,7 +42,6 @@ import { WavesBoard } from '../components/WavesBoard';
 import { DECISION_TYPE_LABELS, thresholdDecimals } from '../lib/advisor';
 import { cn } from '../lib/cn';
 import { finalizedText, finalizeQueue, isOverdue, skippedVms, type SkippedVm } from '../lib/finalize';
-import { groupFindings } from '../lib/findings';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
@@ -51,6 +50,7 @@ import { planActions } from '../lib/planActions';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
+import { usePlanFindings } from '../lib/usePlanFindings';
 
 type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
 
@@ -285,10 +285,7 @@ export default function PlanDetail() {
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
-  const findings = useMemo<FindingRow[]>(
-    () => list.flatMap((m) => m.findings.map((f) => ({ ...f, vmName: m.vm.name, migrationId: m.id }))),
-    [list],
-  );
+  const { rows: findings, groups: findingGroups } = usePlanFindings(list);
 
   if (plan.isPending) return <LoadingBlock label="Loading plan…" rows={6} />;
   if (plan.error || !plan.data) {
@@ -520,7 +517,7 @@ export default function PlanDetail() {
               <Unavailable what="findings" />
             ) : (
               <FindingGroupsList
-                groups={groupFindings(findings)}
+                groups={findingGroups}
                 emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
               />
             )}

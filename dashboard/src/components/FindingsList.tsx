@@ -1,4 +1,5 @@
 import { CircleCheck } from 'lucide-react';
+import { memo } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Finding, type Severity } from '../api/types';
 import { cn } from '../lib/cn';
@@ -75,7 +76,15 @@ export function FindingsList({ findings, emptyText = 'No findings — pre-flight
 }
 
 /** Plan-wide findings grouped by code: one entry per problem with the affected VMs. */
-export function FindingGroupsList({ groups, emptyText = 'No findings — pre-flight passed.' }: { groups: FindingGroup[]; emptyText?: string }) {
+// memoized: the plan page passes the same groups until a finding changes (usePlanFindings), so a live event that
+// redraws the page does not redraw a list of every VM's findings
+export const FindingGroupsList = memo(function FindingGroupsList({
+  groups,
+  emptyText = 'No findings — pre-flight passed.',
+}: {
+  groups: FindingGroup[];
+  emptyText?: string;
+}) {
   if (groups.length === 0) return <EmptyState icon={CircleCheck} title={emptyText} />;
   return (
     <ul className="-my-2 divide-y divide-border">
@@ -129,4 +138,4 @@ export function FindingGroupsList({ groups, emptyText = 'No findings — pre-fli
       ))}
     </ul>
   );
-}
+});
