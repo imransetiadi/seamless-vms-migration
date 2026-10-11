@@ -632,7 +632,9 @@ by kind, and its advisor decision opens the recommendation; UI-20 a plan's setti
 its link lands focus on the policy's card (ADV-20, SDD §16); UI-21 a recommendation's Evidence card lists six facts with
 Show all, and a fact's Inventory link opens the VM searched for (ADV-02); UI-22 tabbing through New plan, New policy and
 Connect a cloud at 1280×800 and 375×700 never leaves the focused control under their actions, and no dialog panel scrolls
-past its content (WCAG 2.4.11, SDD §16); each was checked to fail when the behaviour it
+past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule finds nothing on seven pages at 320 and 375 px
+(WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
+320 and 1280 px (WCAG 1.4.10, SDD §16); each was checked to fail when the behaviour it
 guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
 Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
