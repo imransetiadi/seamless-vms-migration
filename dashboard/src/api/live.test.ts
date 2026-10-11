@@ -325,3 +325,89 @@ describe('refetchAfterReconnect', () => {
     expect(invalidate).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('one migration spliced into the cached lists (SDD §16)', () => {
+  const other = fx.migrations.find((m) => m.id !== migration.id && m.plan_id === migration.plan_id) as Migration;
+
+  it('asks for the one migration instead of every list, for an event about an existing migration', () => {
+    const { queryClient, invalidate } = setup();
+    const refresh = vi.fn();
+    for (const kind of ['migration.phase', 'migration.error', 'migration.sync_pass', 'advisor.classification', 'decision.approved']) {
+      invalidate.mockClear();
+      refresh.mockClear();
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 60, kind }, invalidate, refresh);
+      expect(refresh, kind).toHaveBeenCalledWith(migration.id);
+      expect(invalidate, kind).not.toHaveBeenCalledWith(['migrations']);
+    }
+    // a new migration is in no cached list yet: the lists are read again
+    invalidate.mockClear();
+    refresh.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 61, kind: 'migration.created' }, invalidate, refresh);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+    // a decision that names no migration
+    invalidate.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 62, kind: 'decision.approved', migration_id: null }, invalidate, refresh);
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+  });
+
+  async function flushed(fetchMigration: (id: string) => Promise<Migration>, lists: Array<[object, Migration[]]>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    for (const [query, list] of lists) queryClient.setQueryData(['migrations', query], list);
+    const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+    const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+    batch.refreshMigration(migration.id);
+    batch.refreshMigration(migration.id);
+    await vi.advanceTimersByTimeAsync(400);
+    // what the read queued for the next batch
+    await vi.advanceTimersByTimeAsync(400);
+    const invalidated = spy.mock.calls.map(([filters]) => filters?.queryKey);
+    batch.dispose();
+    return { queryClient, invalidated };
+  }
+
+  it('reads the migration once per batch and puts it into the lists that hold it, reading the others again', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing', progress_pct: 3 };
+      const fetchMigration = vi.fn(async () => fresh);
+      const { queryClient, invalidated } = await flushed(fetchMigration, [
+        [{}, [other, migration]],
+        [{ plan_id: migration.plan_id }, [migration]],
+        [{ phase: 'precopy' }, [migration]],
+        [{ plan_id: 'plan-00000000' }, []],
+        [{ plan_id: migration.plan_id, limit: 1 }, [other]],
+      ]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      expect(fetchMigration).toHaveBeenCalledWith(migration.id);
+      expect(queryClient.getQueryData<Migration[]>(['migrations', {}])).toEqual([other, fresh]);
+      expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])).toEqual([fresh]);
+      expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toEqual(fresh);
+      // a list filtered by phase may lose or gain it, a paged one may shift: read again
+      expect(invalidated).toContainEqual(['migrations', { phase: 'precopy' }]);
+      expect(invalidated).toContainEqual(['migrations', { plan_id: migration.plan_id, limit: 1 }]);
+      // another plan's list neither holds it nor could
+      expect(invalidated).not.toContainEqual(['migrations', { plan_id: 'plan-00000000' }]);
+      expect(invalidated).not.toContainEqual(['migrations', {}]);
+      expect(invalidated).not.toContainEqual(['migrations']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a list again that should hold the migration but does not, and every list when the read fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const missing = await flushed(async () => migration, [[{ plan_id: migration.plan_id }, [other]]]);
+      expect(missing.invalidated).toContainEqual(['migrations', { plan_id: migration.plan_id }]);
+
+      const failed = await flushed(async () => {
+        throw new Error('502');
+      }, [[{}, [migration]]]);
+      expect(failed.invalidated).toContainEqual(['migrations']);
+      expect(failed.queryClient.getQueryData<Migration[]>(['migrations', {}])).toEqual([migration]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

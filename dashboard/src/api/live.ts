@@ -7,7 +7,7 @@ import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration, SyncPass } from './types';
+import type { Event, Migration, MigrationListQuery, SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -98,12 +98,51 @@ export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveSt
   };
 }
 
-/** Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. */
-export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400) {
+/**
+ * Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. With `fetchMigration`,
+ * `refreshMigration(id)` reads that one migration once per flush and puts it into the cached lists that hold it
+ * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise.
+ */
+export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400, fetchMigration?: (id: string) => Promise<Migration>) {
   const pending = new Map<string, QueryKey>();
+  const migrations = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let disposed = false;
+  const invalidate = (queryKey: QueryKey) => {
+    if (disposed) return;
+    pending.set(JSON.stringify(queryKey), queryKey);
+    timer ??= setTimeout(flush, delayMs);
+  };
+  const splice = async (id: string, read: (id: string) => Promise<Migration>) => {
+    let fresh: Migration;
+    try {
+      fresh = await queryClient.fetchQuery({ queryKey: ['migration', id], queryFn: () => read(id), staleTime: 0 });
+    } catch {
+      invalidate(['migrations']);
+      return;
+    }
+    if (disposed) return;
+    for (const query of queryClient.getQueryCache().findAll({ queryKey: ['migrations'] })) {
+      const list = query.state.data as Migration[] | undefined;
+      if (list === undefined) continue;
+      const filter = (query.queryKey[1] ?? {}) as MigrationListQuery;
+      const index = list.findIndex((m) => m.id === id);
+      const narrowed = filter.phase !== undefined || filter.wave_id !== undefined || filter.limit !== undefined || filter.offset !== undefined;
+      if (!narrowed && index < 0 && filter.plan_id !== undefined && filter.plan_id !== fresh.plan_id) continue;
+      // filtered by phase, wave or page it may gain, lose or shift; a missing member, or a read under way, is read again
+      if (narrowed || index < 0 || query.state.fetchStatus === 'fetching') invalidate(query.queryKey);
+      else queryClient.setQueryData<Migration[]>(query.queryKey, list.map((m, i) => (i === index ? fresh : m)));
+    }
+  };
   const flush = () => {
     timer = null;
+    const ids = [...migrations];
+    migrations.clear();
+    for (const id of ids) {
+      // a read of it under way may have started before the event: it waits for the next batch
+      if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
+      else if (fetchMigration) void splice(id, fetchMigration);
+    }
     const keys = [...pending.entries()];
     pending.clear();
     for (const [id, queryKey] of keys) {
@@ -113,17 +152,25 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
       if (queryClient.isFetching({ queryKey }) > 0) pending.set(id, queryKey);
       else void queryClient.invalidateQueries({ queryKey });
     }
-    if (pending.size > 0) timer ??= setTimeout(flush, delayMs);
+    if (pending.size > 0 || migrations.size > 0) timer ??= setTimeout(flush, delayMs);
   };
   return {
-    invalidate(queryKey: QueryKey) {
-      pending.set(JSON.stringify(queryKey), queryKey);
+    invalidate,
+    refreshMigration(id: string) {
+      if (!fetchMigration) {
+        invalidate(['migrations']);
+        invalidate(['migration', id]);
+        return;
+      }
+      migrations.add(id);
       timer ??= setTimeout(flush, delayMs);
     },
     dispose() {
+      disposed = true;
       if (timer) clearTimeout(timer);
       timer = null;
       pending.clear();
+      migrations.clear();
     },
   };
 }
@@ -133,6 +180,7 @@ export function applyEventToCache(
   queryClient: QueryClient,
   event: Event,
   invalidate: (queryKey: QueryKey) => void,
+  refreshMigration?: (id: string) => void,
 ): void {
   const kind = event.kind;
   if (kind === 'heartbeat' || kind === 'migration.log') return;
@@ -182,17 +230,25 @@ export function applyEventToCache(
     // an audit event (SDD §14.5): the feed, a recommendation's detail and the audit lists
     invalidate(['advisor', 'recommendations']);
     invalidate(['events', 'tail']);
-    if (event.migration_id) invalidate(['migration', event.migration_id]);
     // a decision sets or clears a hold the plan page lists (SDD §14.6), even when the strategy stays
-    if (kind.startsWith('decision.')) invalidate(['migrations']);
+    if (kind.startsWith('decision.') && event.migration_id && refreshMigration) refreshMigration(event.migration_id);
+    else {
+      if (event.migration_id) invalidate(['migration', event.migration_id]);
+      if (kind.startsWith('decision.')) invalidate(['migrations']);
+    }
     return;
   }
   if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {
     // advisor.strategy announces a recorded recommendation (SDD §14.4)
     if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);
-    invalidate(['migrations']);
+    // one migration that exists already: read it alone and put it into the lists (SDD §16)
+    const one = kind !== 'migration.created' && kind !== 'memory.lesson_saved' ? event.migration_id : null;
+    if (one && refreshMigration) refreshMigration(one);
+    else {
+      invalidate(['migrations']);
+      if (event.migration_id) invalidate(['migration', event.migration_id]);
+    }
     invalidate(['stats']);
-    if (event.migration_id) invalidate(['migration', event.migration_id]);
     if (event.plan_id && (kind === 'migration.phase' || kind === 'migration.created')) invalidate(['plans', event.plan_id]);
     return;
   }
