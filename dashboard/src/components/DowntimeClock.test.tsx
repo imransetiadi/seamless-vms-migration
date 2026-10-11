@@ -25,6 +25,40 @@ describe('DowntimeClock', () => {
     expect(screen.getByText(/3:20 left in the SLO/i)).toBeInTheDocument();
   });
 
+  it('announces crossing into the warning and past the SLO once each, never every tick (SDD §16)', () => {
+    // 230 s of a 300 s SLO: calm, 10 s before the warning
+    render(<DowntimeClock startedAt="2026-10-08T11:56:10Z" endedAt={null} actualS={null} sloS={300} />);
+    const regions = screen.getAllByRole('status');
+    const said = () => regions.map((r) => r.textContent ?? '').filter(Boolean);
+    expect(said()).toEqual([]);
+    act(() => {
+      vi.advanceTimersByTime(12_000);
+    });
+    expect(said()).toEqual(['Downtime reached 80 % of the SLO: 0:58 left.']);
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+    // the clock moved on; the announcement did not
+    expect(said()).toEqual(['Downtime reached 80 % of the SLO: 0:58 left.']);
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(said()).toEqual(['Downtime is over the SLO.']);
+  });
+
+  it('says nothing for a crossing that happened before the page opened or before it knew (SDD §16)', () => {
+    const view = render(<DowntimeClock startedAt="2026-10-08T11:53:00Z" endedAt={null} actualS={null} sloS={300} />);
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.getAllByRole('status').map((r) => r.textContent ?? '').filter(Boolean)).toEqual([]);
+    view.unmount();
+    // the page opened before the downtime was known; the data then says it began 7 minutes ago
+    const late = render(<DowntimeClock startedAt={null} endedAt={null} actualS={null} sloS={300} />);
+    late.rerender(<DowntimeClock startedAt="2026-10-08T11:53:00Z" endedAt={null} actualS={null} sloS={300} />);
+    expect(screen.getAllByRole('status').map((r) => r.textContent ?? '').filter(Boolean)).toEqual([]);
+  });
+
   it('warns from 80 % of the SLO with an hourglass, not a check mark (SDD §16)', () => {
     // 240 s of a 300 s SLO: exactly 80 %, where the warning starts
     render(<DowntimeClock startedAt="2026-10-08T11:56:00Z" endedAt={null} actualS={null} sloS={300} />);
