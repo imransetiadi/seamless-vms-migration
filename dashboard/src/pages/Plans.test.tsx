@@ -13,6 +13,17 @@ describe('Plans page', () => {
     expect(screen.getByRole('button', { name: /new plan/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it("keeps each plan's done count and clouds under its name for a phone, where their columns are hidden (SDD §16)", async () => {
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
+    const link = await screen.findByRole('link', { name: 'DC1 → RHOSO production rollout' });
+    const header = link.closest('th')!;
+    await waitFor(() => expect(within(header).getByText(/^\d+\/10 done$/)).toBeInTheDocument());
+    expect(within(header).getByText(/RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production/)).toBeInTheDocument();
+    // shown only below the sm breakpoint, where the Done and clouds columns are hidden; no minimum width there
+    expect(within(header).getByText(/done$/).closest('.sm\\:hidden')).not.toBeNull();
+    expect(header.className).not.toMatch(/(^|\s)min-w-48/);
+  });
+
   it('shows each plan with the status its migrations tell, and filters by it (SDD §8.1, ADV-19)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

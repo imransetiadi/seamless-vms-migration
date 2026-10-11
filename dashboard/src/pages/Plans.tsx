@@ -171,11 +171,34 @@ export default function Plans() {
                 const pr = progress.get(p.id) ?? { total: p.vm_ids.length, done: 0 };
                 return (
                   <tr key={p.id}>
-                    <th scope="row" className="min-w-48">
+                    <th scope="row" className="sm:min-w-48">
                       <Link to={`/plans/${p.id}`} className="font-medium underline-offset-4 hover:underline">
                         {p.name}
                       </Link>
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>
+                      {/* on a phone the Done and clouds columns are hidden: their facts stand under the name (SDD §16) */}
+                      <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal sm:hidden">
+                        {migrations.error ? (
+                          <span className="text-xs text-muted-foreground">progress unknown</span>
+                        ) : (
+                          <>
+                            {/* never a dot on a 320 px screen: the count wraps under the bar instead */}
+                            <ProgressBar
+                              value={pr.total ? (pr.done / pr.total) * 100 : 0}
+                              label={`${p.name}: migrations done`}
+                              tone="success"
+                              size="sm"
+                              className="min-w-16 flex-1"
+                            />
+                            <span className="num shrink-0 text-xs">
+                              {pr.done}/{pr.total} done
+                            </span>
+                          </>
+                        )}
+                      </span>
+                      <span className="mt-0.5 block text-xs font-normal text-muted-foreground sm:hidden">
+                        {providerName.get(p.source_provider_id) ?? p.source_provider_id} → {providerName.get(p.destination_provider_id) ?? p.destination_provider_id}
+                      </span>
                     </th>
                     <td>
                       <PlanStatusBadge status={p.derived_status} />

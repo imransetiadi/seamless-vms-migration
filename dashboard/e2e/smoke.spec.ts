@@ -135,6 +135,20 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await expect(page.locator('body')).not.toContainText('browser-secret');
 });
 
+test("the plans list keeps each plan's progress and clouds on a phone, without scrolling sideways (SDD §16)", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'viewer');
+  await page.goto('/plans');
+  const table = page.getByRole('table', { name: /migration plans/i });
+  await expect(table).toBeVisible();
+  const sideways = await page.locator('.table-wrap').first().evaluate((el) => el.scrollWidth - el.clientWidth);
+  expect(sideways).toBeLessThanOrEqual(1);
+  const row = table.getByRole('row').nth(1);
+  await expect(row.getByText(/^\d+\/\d+ done$/)).toBeVisible();
+  // the clouds column is hidden on a phone: the same text stands under the name, visible
+  await expect(row.getByText(/^RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production$/).filter({ visible: true })).toHaveCount(1);
+});
+
 test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
   // a viewer sees the most soft-disabled controls, each with a visually hidden reason
