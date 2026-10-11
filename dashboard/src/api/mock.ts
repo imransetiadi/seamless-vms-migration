@@ -314,6 +314,8 @@ function refusePlanSpec(spec: Record<string, unknown>): void {
   const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
   const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
   if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
+  if (spec.port_creation_mode !== undefined && !['nova', 'neutron'].includes(spec.port_creation_mode as string))
+    problems.push("port_creation_mode: Input should be 'nova' or 'neutron'");
   const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
   if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
   if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));

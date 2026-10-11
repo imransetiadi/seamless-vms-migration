@@ -560,6 +560,29 @@ describe('Plans page', () => {
     }
   });
 
+  it('keeps MAC addresses and every fixed IP when asked, off by default (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Ports kept');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const ports = within(dialog).getByRole('group', { name: /^ports$/i });
+    const keep = within(ports).getByRole('checkbox', { name: /^keep mac addresses and every fixed ip/i });
+    expect(keep).not.toBeChecked();
+    expect(keep).toHaveAccessibleDescription(/through neutron with its mac address, all its fixed ips and its security groups/i);
+    expect(keep).toHaveAccessibleDescription(/outlive their server/i);
+    await user.click(keep);
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Ports kept')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Ports kept')!.port_creation_mode).toBe('neutron');
+  });
+
   it('says a VMware source pre-stages nothing (SDD §7.2)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
@@ -570,6 +593,10 @@ describe('Plans page', () => {
     const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
     expect(prestage).toHaveTextContent(/vmware sources pre-stage nothing/i);
     for (const box of within(prestage).getAllByRole('checkbox')) expect(box).toBeDisabled();
+    // the migration kit recreates the NICs (SDD §16)
+    const keep = within(within(dialog).getByRole('group', { name: /^ports$/i })).getByRole('checkbox', { name: /^keep mac addresses/i });
+    expect(keep).toBeDisabled();
+    expect(keep).toHaveAccessibleDescription(/vmware sources ignore this/i);
   });
 
   it('refuses a negative verification timeout and a malformed project mapping, and opens the advanced section', async () => {

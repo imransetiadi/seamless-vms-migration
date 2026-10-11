@@ -30,6 +30,25 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it('names kept ports in the settings summary, and the edit form sends only that change (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'operator', server });
+    const settings = await screen.findByRole('region', { name: /settings/i });
+    expect(within(settings).queryByText(/mac and fixed ips kept/i)).not.toBeInTheDocument();
+
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    await user.click(within(within(dialog).getByRole('group', { name: /^ports$/i })).getByRole('checkbox', { name: /^keep mac addresses/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(plan.port_creation_mode).toBe('neutron');
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)?.data).toEqual({ fields: ['port_creation_mode'] });
+    expect(await within(screen.getByRole('region', { name: /settings/i })).findByText(/mac and fixed ips kept/i)).toBeInTheDocument();
+  });
+
   it('formats the estimator overrides and marks link_bps as ignored', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e');

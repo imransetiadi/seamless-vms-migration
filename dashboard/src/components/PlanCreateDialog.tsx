@@ -50,6 +50,8 @@ interface FormState {
   keepWarmMinutes: string;
   /** Which of the default resources are pre-staged at the destination (SDD §4.2, §7.2). */
   prestage: string[];
+  /** Recreate ports through Neutron with their MAC, every fixed IP and their security groups (SDD §4.2 port_creation_mode). */
+  keepPorts: boolean;
   /** Optional estimator overrides (SDD §9.1): empty = planning default. */
   scanMiBps: string;
   parallelDisks: string;
@@ -114,6 +116,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     maxPasses: '5',
     keepWarmMinutes: '15',
     prestage: [...DEFAULT_PRESTAGE],
+    keepPorts: false,
     scanMiBps: '',
     parallelDisks: '',
     changeMiBps: '',
@@ -205,6 +208,7 @@ function formFromPlan(plan: Plan): FormState {
     maxPasses: String(plan.max_sync_passes),
     keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
     prestage: plan.prestage_resources.filter(isOfferedPrestage),
+    keepPorts: plan.port_creation_mode === 'neutron',
     scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
@@ -478,6 +482,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         finalize_warning_h: finalizeWarningH,
         // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
         prestage_resources: [...OFFERED_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isOfferedPrestage(r))],
+        port_creation_mode: f.keepPorts ? 'neutron' : 'nova',
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
           ...DEFAULT_VERIFICATION,
@@ -1017,6 +1022,22 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     Also pre-staged: {plan.prestage_resources.filter((r) => !isOfferedPrestage(r)).join(', ')} (set through the API; kept).
                   </p>
                 )}
+              </Fieldset>
+              <Fieldset legend="Ports">
+                <div>
+                  <Checkbox
+                    label="Keep MAC addresses and every fixed IP"
+                    checked={form.keepPorts}
+                    disabled={source?.kind === 'vmware'}
+                    describedBy={id('ports-note')}
+                    onChange={(on) => set('keepPorts', on)}
+                  />
+                  <p id={id('ports-note')} className="pl-7 text-xs text-muted-foreground">
+                    {source?.kind === 'vmware'
+                      ? 'VMware sources ignore this: the migration kit recreates the NICs.'
+                      : 'Off by default. Cold and warm migrations recreate each port through Neutron with its MAC address, all its fixed IPs and its security groups, instead of one fixed IP and a new MAC. The ports then outlive their server: delete them with it.'}
+                  </p>
+                </div>
               </Fieldset>
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Linux and other guests. Comma separated, e.g. 22, 443." />

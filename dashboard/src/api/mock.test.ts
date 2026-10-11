@@ -784,6 +784,7 @@ describe('mock API', () => {
       'mappings',
       'max_sync_passes',
       'name',
+      'port_creation_mode',
       'prestage_resources',
       'probe_overrides',
       'require_approval',
@@ -2185,5 +2186,18 @@ describe('mock evidence, like the API (SDD §14.4, ADV-02)', () => {
       expect(rec.evidence_option, rec.id).not.toBeNull();
       expect(rec.evidence.some((i) => i.key === 'disk_total'), rec.id).toBe(true);
     }
+  });
+});
+
+describe('mock plans: port_creation_mode (SDD §4.2, §12)', () => {
+  it('is nova unless chosen, and refuses any other mode with the API 422', async () => {
+    const { client } = setup('operator');
+    const body = { name: 'ports', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    await expect(client.post('/plans', body)).resolves.toMatchObject({ port_creation_mode: 'nova' });
+    await expect(client.post('/plans', { ...body, port_creation_mode: 'neutron' })).resolves.toMatchObject({ port_creation_mode: 'neutron' });
+    await expect(client.post('/plans', { ...body, port_creation_mode: 'ovs' })).rejects.toMatchObject({
+      status: 422,
+      message: "port_creation_mode: Input should be 'nova' or 'neutron'",
+    });
   });
 });

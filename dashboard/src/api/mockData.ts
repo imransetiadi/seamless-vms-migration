@@ -742,9 +742,9 @@ export function eligibility(
     const cold: string[] = [];
     if (vm.power_state === 'error') cold.push('Source VM is in error state');
     if (!source.conversion_host || !destination.conversion_host) cold.push('No conversion host configured on both clouds');
-    // os-migrate recreates each port through Nova with exactly one fixed IP (SDD §9.2)
+    // through Nova os-migrate recreates each port with exactly one fixed IP; through Neutron every one (SDD §9.2)
     const oddPorts = portsWithoutOneFixedIp(vm);
-    if (oddPorts.length) cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
+    if (oddPorts.length && plan.port_creation_mode !== 'neutron') cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
     result.cold = cold;
     result.warm = [...cold, ...(multiattach ? ['VM has a multi-attach volume'] : [])];
     const handover: string[] = [];
@@ -800,12 +800,12 @@ export function preflight(
       add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'Re-create SR-IOV ports on RHOSO manually.');
   }
   const oddPorts = portsWithoutOneFixedIp(vm);
-  if (sourceKind !== 'vmware' && oddPorts.length)
+  if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
     add(
       'NET_PORT_IPS',
       'warning',
       `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
-      'Give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
+      'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
     );
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'Provide an equivalent PCI alias on RHOSO compute nodes.');
@@ -882,6 +882,7 @@ export function defaultPlanFields(now: number) {
     probe_overrides: {},
     finalize_warning_h: 72,
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
+    port_creation_mode: 'nova' as const,
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,

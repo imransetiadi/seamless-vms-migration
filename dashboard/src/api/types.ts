@@ -317,6 +317,8 @@ export interface Wave {
   max_parallel: number;
 }
 
+export type PortCreationMode = 'nova' | 'neutron';
+
 export interface Plan {
   /** `plan-<8 hex>`. */
   id: string;
@@ -348,6 +350,11 @@ export interface Plan {
   /** Hours a migration may wait in Completed before it is flagged for finalize (SDD §8.1, ADV-19). */
   finalize_warning_h: number;
   prestage_resources: string[];
+  /**
+   * `neutron`: OpenStack cold and warm migrations recreate every port with its MAC, all its fixed IPs and its security
+   * groups (SDD §6.6); `nova`: one fixed IP per port and a new MAC.
+   */
+  port_creation_mode: PortCreationMode;
   waves: Wave[];
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */

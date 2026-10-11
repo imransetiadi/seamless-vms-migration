@@ -201,6 +201,7 @@ function SettingsSummary({
         auto-rollback {v.auto_rollback ? 'on' : 'off'} · advisor {v.use_advisor ? 'on' : 'off'}
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
+      {plan.port_creation_mode === 'neutron' && <Setting label="Ports">MAC and fixed IPs kept</Setting>}
       {mappingCount > 0 && (
         <div className="min-w-0 sm:col-span-2 xl:col-span-4">
           <dt className="text-xs uppercase tracking-wide text-muted-foreground">Mappings</dt>
