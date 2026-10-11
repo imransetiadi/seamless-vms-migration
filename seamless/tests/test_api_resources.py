@@ -72,7 +72,8 @@ def test_provider_crud(api):
         "quotas",
         "projects",
         "keypairs",  # SDD §11
-        "subnets",  # SDD §11: where NIC override addresses must lie
+        "subnets",  # SDD §11: where a NIC's addresses must lie
+        "network_details",  # SDD §11: what a NIC's network name resolves to
     }
 
     # a provider used by a non-terminal plan cannot be deleted

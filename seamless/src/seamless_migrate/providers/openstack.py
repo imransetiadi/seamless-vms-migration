@@ -250,13 +250,29 @@ class OpenStackProvider:
         ]
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
-        # where a NIC override's addresses must lie, by network name (SDD §11, §9.3)
+        # every network it sees with its owner: what a NIC's network name resolves to (SDD §11)
+        own_project = _attr(conn, "current_project_id", default=None)
+        network_details = [
+            {
+                "id": str(_attr(n, "id")),
+                "name": str(_attr(n, "name")),
+                "mtu": _attr(n, "mtu"),
+                "project_id": _attr(n, "project_id", default=None),
+                "own": _attr(n, "project_id", default=None) == own_project,
+                "shared": bool(_attr(n, "is_shared", default=False)),
+            }
+            for n in visible
+        ]
+        # where a NIC's addresses must lie, by network name and id (SDD §11, §9.3)
         names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
         subnets = [
             {
                 "name": str(_attr(s, "name")),
                 "network": names[_attr(s, "network_id")],
+                "network_id": str(_attr(s, "network_id")),
                 "cidr": str(_attr(s, "cidr")),
+                "ipv6_address_mode": _attr(s, "ipv6_address_mode", default=None),
+                "ipv6_ra_mode": _attr(s, "ipv6_ra_mode", default=None),
             }
             for s in conn.network.subnets()
             if _attr(s, "network_id") in names
@@ -269,6 +285,7 @@ class OpenStackProvider:
             projects=[project] if project else [],
             keypairs=keypairs,
             subnets=subnets,
+            network_details=network_details,
         )
 
     @staticmethod

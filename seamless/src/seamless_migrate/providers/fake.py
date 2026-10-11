@@ -391,23 +391,42 @@ class FakeDestinationProvider:
             "volumes": 1000,
             "gigabytes": 200_000,
         }
+        # the credential's own networks, and a provider network another project shares (SDD §11)
+        networks = [
+            ("finance-app", 1500, True, "10.20.1.0/24"),
+            ("finance-db", 8942, True, "10.20.2.0/24"),
+            ("dc2-prod", 1500, True, "10.2.0.0/24"),
+            ("dc2-dmz", 1442, True, "10.2.9.0/24"),
+            ("provider-vlan100", 1500, False, "172.16.100.0/24"),
+        ]
         return DestinationInventory(
-            networks={
-                "finance-app": 1500,
-                "finance-db": 8942,
-                "dc2-prod": 1500,
-                "dc2-dmz": 1442,
-            },
+            networks={name: mtu for name, mtu, _, _ in networks},
             flavors=flavors,
             volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
-            # the demo VMs' addresses lie in these (SDD §11): NIC overrides validate against them
+            network_details=[
+                {
+                    "id": f"net-{name}",
+                    "name": name,
+                    "mtu": mtu,
+                    "project_id": "project-demo" if own else "project-admin",
+                    "own": own,
+                    "shared": not own,
+                }
+                for name, mtu, own, _ in networks
+            ],
+            # the demo VMs' addresses lie in these (SDD §11): NIC addresses validate against them
             subnets=[
-                {"name": "finance-app-v4", "network": "finance-app", "cidr": "10.20.1.0/24"},
-                {"name": "finance-db-v4", "network": "finance-db", "cidr": "10.20.2.0/24"},
-                {"name": "dc2-prod-v4", "network": "dc2-prod", "cidr": "10.2.0.0/24"},
-                {"name": "dc2-dmz-v4", "network": "dc2-dmz", "cidr": "10.2.9.0/24"},
+                {
+                    "name": f"{name}-v4",
+                    "network": name,
+                    "network_id": f"net-{name}",
+                    "cidr": cidr,
+                    "ipv6_address_mode": None,
+                    "ipv6_ra_mode": None,
+                }
+                for name, _, _, cidr in networks
             ],
         )
 

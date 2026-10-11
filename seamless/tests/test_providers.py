@@ -195,7 +195,13 @@ class FakeNetwork:
     def subnets(self, **_):
         return [
             NS(name="app-subnet", network_id="net-1", cidr="10.0.0.0/24"),
-            NS(name="app-v6", network_id="net-1", cidr="fd00::/64"),
+            NS(
+                name="app-v6",
+                network_id="net-1",
+                cidr="fd00::/64",
+                ipv6_address_mode="slaac",
+                ipv6_ra_mode="slaac",
+            ),
             NS(name="orphan", network_id="net-gone", cidr="192.0.2.0/24"),
         ]
 
@@ -265,7 +271,10 @@ def fake_conn(admin=True, ovn=True):
             status="ACTIVE",
         )
     ]
-    networks = [NS(id="net-1", name="app-net", mtu=1442)]
+    networks = [
+        NS(id="net-1", name="app-net", mtu=1442, project_id="proj-1", is_shared=False),
+        NS(id="net-9", name="provider-vlan9", mtu=1500, project_id="admin-proj", is_shared=True),
+    ]
     return NS(
         compute=FakeCompute([server], admin=admin),
         block_storage=FakeBlockStorage(volumes),
@@ -347,7 +356,7 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
     assert "login:" in await provider.console_log("srv-1")
     assert await provider.find_server("web-01") == "srv-1"
     inv = await provider.inventory()
-    assert inv.networks == {"app-net": 1442}
+    assert inv.networks == {"app-net": 1442, "provider-vlan9": 1500}
 
 
 def _fleet_conn(count=3):
@@ -599,10 +608,43 @@ async def test_openstack_destination_inventory(stub_openstack):
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
     # SDD §11: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
     assert inv.keypairs == ["old-key", "ops-key"]
-    # SDD §11: the subnets it sees, by network name, where NIC override addresses must lie
+    # SDD §11: every network it sees, with its owner: what a NIC's network name resolves to
+    assert inv.network_details == [
+        {
+            "id": "net-1",
+            "name": "app-net",
+            "mtu": 1442,
+            "project_id": "proj-1",
+            "own": True,
+            "shared": False,
+        },
+        {
+            "id": "net-9",
+            "name": "provider-vlan9",
+            "mtu": 1500,
+            "project_id": "admin-proj",
+            "own": False,
+            "shared": True,
+        },
+    ]
+    # the subnets it sees, by network name and id, where a NIC's addresses must lie
     assert inv.subnets == [
-        {"name": "app-subnet", "network": "app-net", "cidr": "10.0.0.0/24"},
-        {"name": "app-v6", "network": "app-net", "cidr": "fd00::/64"},
+        {
+            "name": "app-subnet",
+            "network": "app-net",
+            "network_id": "net-1",
+            "cidr": "10.0.0.0/24",
+            "ipv6_address_mode": None,
+            "ipv6_ra_mode": None,
+        },
+        {
+            "name": "app-v6",
+            "network": "app-net",
+            "network_id": "net-1",
+            "cidr": "fd00::/64",
+            "ipv6_address_mode": "slaac",
+            "ipv6_ra_mode": "slaac",
+        },
     ]
 
 
@@ -1283,3 +1325,28 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     )
     with pytest.raises(ProviderError, match="timed out"):
         await provider.power_on("5012-abcd")
+
+
+async def test_fake_destination_inventory_resolves_every_demo_nic():
+    """SDD §11, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
+    subnets take its addresses - the demo plans are not blocked by MAP_NETWORK_AMBIGUOUS or
+    NET_ADDRESS_REFUSED - and the shared provider network is another project's."""
+    from seamless_migrate.planning.preflight import run_preflight
+    from tests.factories import make_plan
+
+    dst = await FakeDestinationProvider(seed=42).inventory()
+    ids = {n["id"] for n in dst.network_details}
+    assert all(s["network_id"] in ids for s in dst.subnets)
+    [shared] = [n for n in dst.network_details if not n["own"]]
+    assert (shared["name"], shared["shared"]) == ("provider-vlan100", True)
+    # the demo's seed (Settings.demo_seed) and another
+    for seed in (Settings().demo_seed, 7):
+        source = FakeSourceProvider(ProviderKind.openstack, seed=seed)
+        vms = await source.list_vms()
+        src = await source.inventory()
+        for mode in ("nova", "neutron"):
+            plan = make_plan(port_creation_mode=mode)
+            for vm in vms:
+                codes = [f.code for f in run_preflight(vm, plan, src, dst, vms)]
+                assert "MAP_NETWORK_AMBIGUOUS" not in codes, (vm.name, codes)
+                assert "NET_ADDRESS_REFUSED" not in codes, (seed, vm.name, mode, codes)

@@ -10,6 +10,8 @@ from typing import Any
 from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
+from .ipam import address_refusal
+from .networks import resolve_network
 
 S = Strategy
 
@@ -37,8 +39,12 @@ class DestinationInventory:
     projects: list[str] = field(default_factory=list)
     #: the destination credential's own keypairs: the server is created as that user (SDD §11)
     keypairs: list[str] = field(default_factory=list)
-    #: [{name, network, cidr}]: where a NIC override's addresses must lie (SDD §11, §9.3)
-    subnets: list[dict[str, str]] = field(default_factory=list)
+    #: [{name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}]: where a NIC's
+    #: addresses must lie (SDD §11, §9.3)
+    subnets: list[dict[str, Any]] = field(default_factory=list)
+    #: [{id, name, mtu, project_id, own, shared}]: every network the credential sees, what a NIC's
+    #: network name resolves to (SDD §11, §7.3 step 0)
+    network_details: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -146,6 +152,19 @@ CATALOG: dict[str, CatalogEntry] = {
         'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode '
         '"neutron"), give each such port exactly one fixed IP before the cutover, or migrate the '
         "VM by storage handover when its ports have at most one address each.",
+    ),
+    "MAP_NETWORK_AMBIGUOUS": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the "
+        "only one of that name - map its network to such a name, or rename one of the networks.",
+    ),
+    "NET_ADDRESS_REFUSED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Give the NIC an address its RHOSO network takes: map its network to one whose subnets "
+        "hold it, or set the address in a NIC override; for a SLAAC address keep the MAC "
+        '(port_creation_mode "neutron").',
     ),
     "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
         Severity.blocker,
@@ -442,6 +461,24 @@ def _in_subnets(address: str, cidrs: Sequence[str]) -> bool:
     return False
 
 
+def _network_list(dst_inv: DestinationInventory) -> list[dict[str, Any]]:
+    """The networks the destination credential sees (SDD §11); an inventory from before
+    network_details lists each name once, as the credential's own network."""
+    if dst_inv.network_details:
+        return dst_inv.network_details
+    return [
+        {"id": None, "name": name, "mtu": mtu, "project_id": None, "own": True, "shared": False}
+        for name, mtu in dst_inv.networks.items()
+    ]
+
+
+def _subnets_of(dst_inv: DestinationInventory, network: dict[str, Any]) -> list[dict[str, Any]]:
+    """A resolved network's subnets: by its id, else (an inventory from before it) by name."""
+    if network.get("id") is not None:
+        return [s for s in dst_inv.subnets if s.get("network_id") == network["id"]]
+    return [s for s in dst_inv.subnets if s.get("network") == network["name"]]
+
+
 def _no_host_address(address: str, cidrs: Sequence[str]) -> str | None:
     """What makes ``address`` no host address of the subnets that hold it, as Neutron's
     check_subnet_ip rules (SDD §9.3): an IPv4 subnet's network address at any prefix length, its
@@ -521,15 +558,26 @@ def _nic_override_findings(
                 )
             )
             continue
-        cidrs = [str(s.get("cidr")) for s in dst_inv.subnets if s.get("network") == network]
+        resolved, _ = resolve_network(_network_list(dst_inv), network)
+        if resolved is None:
+            # MAP_NETWORK_AMBIGUOUS names it
+            continue
+        subnets = _subnets_of(dst_inv, resolved)
+        cidrs = [str(s.get("cidr")) for s in subnets]
         outside = [a for a in addresses if not _in_subnets(a, cidrs)]
         if outside:
             verb = "lies" if len(outside) == 1 else "lie"
             problems.append(f"{mac}: {', '.join(outside)} {verb} in no subnet of {network!r}")
+        neutron = plan.port_creation_mode == "neutron"
         for a in addresses:
-            why = _no_host_address(a, cidrs)
-            if why:
-                problems.append(f"{mac}: {a} is {why}, not a host address")
+            reserved = _no_host_address(a, cidrs)
+            if reserved:
+                problems.append(f"{mac}: {a} is {reserved}, not a host address")
+            elif a not in outside:
+                # on a SLAAC or DHCPv6-stateless subnet only what Neutron derives (§6.6)
+                why = address_refusal(a, subnets, neutron=neutron, mac=mac)
+                if why:
+                    problems.append(f"{mac}: {a} {why}")
         for a in addresses:
             for vm_id, other_mac, name in holders.get((network, _canonical_ip(a)), []):
                 if (vm_id, other_mac) != (vm.source_id, mac):
@@ -542,6 +590,8 @@ def _nic_override_findings(
                 f"NIC override(s) of {vm.name} cannot be applied: {'; '.join(problems)}.",
             )
         ]
+    if not applied:
+        return []
     return [finding("MAP_NIC_OVERRIDE", f"NIC override(s): {'; '.join(applied)}.")]
 
 
@@ -644,6 +694,26 @@ def run_preflight(
                 "MAP_NETWORK_MISSING",
                 f"Network mapping target(s) do not exist in RHOSO: {_names(bad_net_targets)}.",
                 remediation="Fix the mapping: the destination network must exist.",
+            )
+        )
+
+    # every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); the
+    # VMware migration kit maps port groups its own way
+    openstack_source = source is None or source.kind != ProviderKind.vmware
+    seen = _network_list(dst_inv)
+    resolved: dict[int, dict[str, Any]] = {}
+    ambiguous: list[str] = []
+    for nic in vm.nics:
+        network, why = resolve_network(seen, plan.nic_target(vm.source_id, nic)[0])
+        if network is not None:
+            resolved[id(nic)] = network
+        elif why and openstack_source:
+            ambiguous.append(f"{(nic.mac or '?').lower()} ({nic.network}): {why}")
+    if ambiguous:
+        out.append(
+            finding(
+                "MAP_NETWORK_AMBIGUOUS",
+                "The cutover cannot tell these RHOSO networks apart: " + "; ".join(ambiguous) + ".",
             )
         )
 
@@ -809,7 +879,9 @@ def run_preflight(
     for nic in vm.nics:
         src_mtu = nic.mtu if nic.mtu is not None else src_inv.networks.get(nic.network)
         target = plan.nic_target(vm.source_id, nic)[0]
-        dst_mtu = dst_inv.networks.get(target)
+        dst_mtu = (
+            resolved[id(nic)].get("mtu") if id(nic) in resolved else dst_inv.networks.get(target)
+        )
         if src_mtu is not None and dst_mtu is not None and dst_mtu < src_mtu:
             shrinks.append(
                 f"{nic.network} {src_mtu} -> {dst_mtu}"
@@ -844,6 +916,33 @@ def run_preflight(
                 "recreate them; storage handover keeps one address per port.",
             )
         )
+
+    # a NIC without an override keeps its own addresses: Neutron must take them on its resolved
+    # network (an override's are MAP_NIC_OVERRIDE_*'s); a network pre-staging creates, or an
+    # inventory without subnets, cannot be checked (SDD §9.3, §6.6)
+    if openstack_source and dst_inv.subnets:
+        neutron = plan.port_creation_mode == "neutron"
+        refused: list[str] = []
+        for nic in vm.nics:
+            network = resolved.get(id(nic))
+            if network is None or plan.nic_override(vm.source_id, nic.mac) is not None:
+                continue
+            subnets = _subnets_of(dst_inv, network)
+            for address in nic.fixed_ips if neutron else nic.fixed_ips[:1]:
+                why = address_refusal(address, subnets, neutron=neutron, mac=nic.mac)
+                if why:
+                    refused.append(
+                        f"{(nic.mac or '?').lower()} on {network['name']!r}: {address} {why}"
+                    )
+        if refused:
+            out.append(
+                finding(
+                    "NET_ADDRESS_REFUSED",
+                    "Neutron would refuse these addresses on their RHOSO network: "
+                    + "; ".join(refused)
+                    + ".",
+                )
+            )
 
     out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source))
 
