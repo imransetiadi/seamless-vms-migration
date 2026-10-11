@@ -458,9 +458,11 @@ function intParam(query: URLSearchParams, name: string, fallback: number, min: n
   const raw = query.get(name);
   if (raw === null) return fallback;
   const value = Number(raw);
-  if (!/^-?\d+$/.test(raw.trim()) || value < min || value > max) {
-    throw new HttpError(422, 'validation_error', `${name}: must be an integer from ${min}${max < Number.MAX_SAFE_INTEGER ? ` to ${max}` : ''}.`);
-  }
+  // the API's words for a query parameter it refuses (FastAPI's validation, SDD §12)
+  const refuse = (why: string) => new HttpError(422, 'validation_error', `query.${name}: Input should be ${why}`);
+  if (!/^-?\d+$/.test(raw.trim())) throw refuse('a valid integer, unable to parse string as an integer');
+  if (value < min) throw refuse(`greater than or equal to ${min}`);
+  if (value > max) throw refuse(`less than or equal to ${max}`);
   return value;
 }
 
@@ -1173,7 +1175,9 @@ export class MockServer {
       } else {
         const provider = this.providers.find((p) => p.id === id);
         if (!provider) {
-          this.require(token, 'viewer', path);
+          // like the API (SDD §12, §13.2): the route's role first, then the lookup
+          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
+          this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
         }
         if (!sub && method === 'GET') {
@@ -1243,8 +1247,9 @@ export class MockServer {
             (!query.get('phase') || m.phase === query.get('phase')) &&
             (!query.get('wave_id') || m.wave_id === query.get('wave_id')),
         );
-        const offset = Number(query.get('offset') ?? 0);
-        const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+        // the API's bounds (SDD §12): limit 1…5000, default all; offset from 0
+        const limit = intParam(query, 'limit', rows.length, 1, 5000);
+        const offset = intParam(query, 'offset', 0, 0);
         return ok(rows.slice(offset, offset + limit));
       }
       if (id && !sub && method === 'GET') {
@@ -1268,7 +1273,7 @@ export class MockServer {
       // before: only events below that seq, so tail + before is the page before the oldest shown (SDD §12)
       const before = query.has('before') ? Number(query.get('before')) : Infinity;
       if (!(before >= 1)) throw new HttpError(422, 'validation_error', 'before: Input should be greater than or equal to 1.');
-      const limit = Math.min(1000, Math.max(1, Number(query.get('limit') ?? 500) || 500));
+      const limit = intParam(query, 'limit', 500, 1, 1000); // the API's bounds, never clamped (SDD §12)
       const planId = query.get('plan_id');
       const migrationId = query.get('migration_id');
       // audit: only the audit events (SDD §14.5)
@@ -1631,8 +1636,9 @@ export class MockServer {
         this.require(token, 'viewer', path);
         // SDD §12: status filter and limit/offset paging, like the migrations list
         const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
-        const offset = Number(query.get('offset') ?? 0);
-        const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+        // the API's bounds (SDD §12): limit 1…1000, default all; offset from 0
+        const limit = intParam(query, 'limit', rows.length, 1, 1000);
+        const offset = intParam(query, 'offset', 0, 0);
         return ok(rows.slice(offset, offset + limit));
       }
       if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);

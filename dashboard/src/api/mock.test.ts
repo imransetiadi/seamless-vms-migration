@@ -729,6 +729,35 @@ describe('mock API', () => {
     expect(server.plans.find((p) => p.id === plan.id)!.status).toBe('draft');
   });
 
+  it('refuses a list page outside the bounds the API takes, with its words (SDD §12)', async () => {
+    const { client } = setup('viewer');
+    const refused = (path: string, message: string) => expect(client.get(path)).rejects.toMatchObject({ status: 422, message });
+    await refused('/plans?limit=0', 'query.limit: Input should be greater than or equal to 1');
+    await refused('/plans?limit=1001', 'query.limit: Input should be less than or equal to 1000');
+    await refused('/plans?offset=-1', 'query.offset: Input should be greater than or equal to 0');
+    await refused('/migrations?limit=5001', 'query.limit: Input should be less than or equal to 5000');
+    await refused('/migrations?limit=two', 'query.limit: Input should be a valid integer, unable to parse string as an integer');
+    await refused('/events?limit=1001', 'query.limit: Input should be less than or equal to 1000');
+    await refused('/events?limit=0', 'query.limit: Input should be greater than or equal to 1');
+    // in bounds, a page
+    expect(await client.get<unknown[]>('/plans?limit=1000')).toEqual(expect.any(Array));
+    expect((await client.get<unknown[]>('/migrations?limit=2&offset=1')).length).toBe(2);
+    expect((await client.get<unknown[]>('/events?limit=3')).length).toBe(3);
+  });
+
+  it("checks a provider route's role before it looks the provider up, like the API (SDD §12, §13.2)", async () => {
+    const as = (token: string) => setup(token).client;
+    const refused = (call: Promise<unknown>, status: number) => expect(call).rejects.toMatchObject({ status });
+    await refused(as('operator').delete('/providers/nope'), 403);
+    await refused(as('operator').patch('/providers/nope', { name: 'x' }), 403);
+    await refused(as('operator').put('/providers/nope/credentials', { username: 'u' }), 403);
+    await refused(as('viewer').post('/providers/nope/check'), 403);
+    // with the role, an unknown provider is 404
+    await refused(as('admin').delete('/providers/nope'), 404);
+    await refused(as('operator').post('/providers/nope/check'), 404);
+    await refused(as('viewer').get('/providers/nope'), 404);
+  });
+
   it('refuses an edit naming a field a plan cannot change, before anything else, like the API (SDD §12)', async () => {
     const { server, client } = setup('operator');
     const plan = server.plans.find((p) => p.status === 'draft' || p.status === 'validated')!;
