@@ -380,7 +380,7 @@ while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at`
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
 it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
-granted with it (`cutover_requested` with its requester, `force_window`, §5.4) — a new attempt is requested anew, and a
+granted with it (`cutover_requested` with its requester, `force_window`, `force_cutover`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change); and it clears what the
 earlier attempt found about itself — the invariants it broke (`data_issues`, §5.5) and the rule that ended its passes
 (`converged_by`, §5.3): the new attempt records its own, and a migration back in `ready` reads neither. All of it is
@@ -962,7 +962,8 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   a late failure must not turn an edited draft into a `failed` plan that `start_plan` accepts unvalidated.
 * Each active migration is driven by one `asyncio.Task` (`_drive(migration_id)`); it persists the
   migration after **every** state change, emits events, and records `checkpoint` (last completed
-  step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed, and
+  step). On startup, migrations in `precopy|syncing|cutover|verifying|rolling_back` are resumed — and a `cancelled`
+  one whose checkpoint is `cleanup` runs its cleanup again (§5.1) — and
   every tick resumes the same way any of them whose driver task died (an unexpected error outside a
   step, e.g. a database error while persisting after a successful step — the VM may be stopped):
   the crash is emitted as `migration.error` (`step: driver`, redacted message, crash count), and while
@@ -2049,7 +2050,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   `SEAMLESS_SECRET_*` variables), which the dashboard then never writes; a provider added before a later step of
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
   the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
-  `/inventory/:providerId` — `/inventory` opens the first source provider's —
+  `/inventory/:providerId` — `/inventory` opens the first source provider's, or the first provider when there is no
+  source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
