@@ -521,7 +521,12 @@ naming the VM, that plan — its name and its id, as plan names need not be uniq
 (`web-01 (plan "Finance", plan-1a2b3c4d, ready)`) — finish, roll back or cancel it there, or remove the VM from
 `vm_ids`; two plans would both stop the source and cut it over. For the same reason a retry (`failed` or
 `rolled_back` → `ready`) is refused (409) while another plan holds the VM. Validations and retries take one
-shared lock for this check, so two plans cannot claim a VM at the same time.
+shared lock for this check, so two plans cannot claim a VM at the same time — across processes too, as
+`seamless plan validate` may run beside the server (§15): inside the process's own lock they take a
+database-wide one, a session advisory lock on a connection of its own on PostgreSQL and an exclusive `flock`
+on `{database}.vm-claims.lock` on SQLite (none for an in-memory database), which the database or the
+operating system drops when the process ends, so a crash never strands a VM. A claimer that finds it held
+waits for it, polling.
 `vmware_warm` passes carry no byte counts (CBT): the byte-count convergence rule does not apply to
 them; the SLO estimate and `max_sync_passes` decide.
 
