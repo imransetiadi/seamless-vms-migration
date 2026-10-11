@@ -834,7 +834,10 @@ Twenty-three further iterations after the integration run, each verified with th
   §15). The VM-claim lock of validations and retries now holds across processes (PostgreSQL advisory lock,
   SQLite `flock`, dropped with its process, SDD §5.4): `test_two_processes_cannot_claim_one_vm_at_once`,
   `test_validate_and_retry_wait_for_another_process_holding_the_claims`,
-  `test_cross_process_lock_dies_with_its_process` (a SIGKILLed holder), on SQLite and PostgreSQL 16.
+  `test_cross_process_lock_dies_with_its_process` (a SIGKILLed holder), on SQLite and PostgreSQL 16. A
+  validation never marks `validated` a plan another process edited meanwhile (409,
+  `test_a_validation_never_marks_validated_a_plan_another_process_edited`, SDD §8), and `plan validate`
+  waits for the cleanups of the migrations it cancelled (`test_plan_validate_waits_for_the_cleanups_it_started`).
 
 ### 13.2 Exit criteria — release 0.1.0
 
