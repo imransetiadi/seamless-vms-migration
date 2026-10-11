@@ -116,15 +116,23 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
   const splice = async (id: string, read: (id: string) => Promise<Migration>) => {
     let fresh: Migration;
     try {
-      fresh = await queryClient.fetchQuery({ queryKey: ['migration', id], queryFn: () => read(id), staleTime: 0 });
+      // read outside the migration's own query: one failed read never puts a loaded migration page into a failure;
+      // on a failure the page's query reads it again with its own retries, and every list is read again
+      fresh = await read(id);
     } catch {
       invalidate(['migrations']);
+      invalidate(['migration', id]);
       return;
     }
     if (disposed) return;
+    queryClient.setQueryData<Migration>(['migration', id], fresh);
     for (const query of queryClient.getQueryCache().findAll({ queryKey: ['migrations'] })) {
       const list = query.state.data as Migration[] | undefined;
-      if (list === undefined) continue;
+      // no data yet - its load failed, or the first one is under way: read it again, as before the splice (SDD §16)
+      if (list === undefined) {
+        invalidate(query.queryKey);
+        continue;
+      }
       const filter = (query.queryKey[1] ?? {}) as MigrationListQuery;
       const index = list.findIndex((m) => m.id === id);
       const narrowed = filter.phase !== undefined || filter.wave_id !== undefined || filter.limit !== undefined || filter.offset !== undefined;

@@ -1,5 +1,6 @@
 import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
+import { ApiError } from './client';
 import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
 import type { Event, Migration } from './types';
@@ -406,6 +407,58 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       }, [[{}, [migration]]]);
       expect(failed.invalidated).toContainEqual(['migrations']);
       expect(failed.queryClient.getQueryData<Migration[]>(['migrations', {}])).toEqual([migration]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a list again that has no data yet - its load failed or is under way - as before the splice', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const key = ['migrations', { plan_id: migration.plan_id }];
+      let calls = 0;
+      const observer = new QueryObserver(client, {
+        queryKey: key,
+        queryFn: () => {
+          calls += 1;
+          return calls === 1 ? Promise.reject(new Error('503')) : Promise.resolve([migration]);
+        },
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('error'));
+      const batch = createBatchedInvalidator(client, 400, async () => migration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 70, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(500);
+      expect(calls).toBe(2);
+      unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never turns a loaded migration's page into a failure on one failed single read; its own query retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { staleTime: 5_000 } } });
+      const key = ['migration', migration.id];
+      let calls = 0;
+      const get = async (): Promise<Migration> => {
+        calls += 1;
+        if (calls === 2) throw new ApiError(502, 'provider_error', 'a router blip');
+        return { ...migration };
+      };
+      // useMigration's retry: a 5xx twice
+      const observer = new QueryObserver(client, { queryKey: key, queryFn: get, retry: (count: number, error: Error) => !(error instanceof ApiError && error.status < 500) && count < 2 });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('success'));
+      const batch = createBatchedInvalidator(client, 400, get);
+      applyEventToCache(client, { ...progressEvent({}), seq: 71, kind: 'migration.sync_pass' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(500);
+      expect(client.getQueryState(key)?.status).toBe('success');
+      unsubscribe();
+      batch.dispose();
     } finally {
       vi.useRealTimers();
     }
