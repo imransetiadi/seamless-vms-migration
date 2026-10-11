@@ -490,7 +490,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
 | `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | `/stats` and `/metrics` validate every migration when the change stamp moved; plans and migrations are read fully by the overview | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
+| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each) and the overview refetches it on live events; `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -633,7 +633,8 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 
 | Limit | Cause | Upgrade |
 |---|---|---|
-| `/stats` and `/metrics` validate every migration document when the change stamp moved | one load per change; a busy fleet with thousands of migrations re-validates often | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
+| `/stats`, `/metrics`, `/advisor/recommendations` and the tick keep every migration in memory | `VersionedDocuments` (SDD §11) reloads only changed documents, but holds the whole kind: ≈ 5 KB per migration as a model | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
+| `validate_plan` writes each VM separately | ≈ 10 SQL statements and as many worker-thread hops per VM (create, transitions, events): 1,000 VMs ≈ 7.9 s CPU, 14 s wall on a loaded laptop (SQLite, control-plane audit 2026-10-11), under the plan's lock; linear, within SM-2 | one transaction per VM for the migration and its events (a Store transaction API, SDD §11 first); deferred — validation runs once per plan change |
 | Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
 | Event table growth | append-only; bounded by `seamless events export` and `seamless events prune` (SDD §15) on a retention schedule | partition by month for very large estates |
 
