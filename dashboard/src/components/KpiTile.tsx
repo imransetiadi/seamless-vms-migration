@@ -23,7 +23,7 @@ export function KpiTile({ label, value, unit, hint, icon: Icon, tone, className 
         <span className="min-w-0 wrap-break-word text-sm text-muted-foreground">{label}</span>
         {Icon && <Icon aria-hidden className={cn('size-4 shrink-0', tone ? TONE_CLASSES[tone].text : 'text-muted-foreground')} />}
       </div>
-      <div className="num truncate text-2xl font-semibold leading-tight text-foreground">
+      <div className="num wrap-break-word text-2xl font-semibold leading-tight text-foreground">
         {value}
         {unit && <span className="ml-1 text-sm font-normal text-muted-foreground">{unit}</span>}
       </div>

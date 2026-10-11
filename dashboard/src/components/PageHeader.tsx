@@ -27,11 +27,11 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta, tit
               <li key={`${crumb.label}-${index}`} className="flex min-w-0 items-center gap-1">
                 {index > 0 && <ChevronRight aria-hidden className="size-3.5 shrink-0" />}
                 {crumb.to ? (
-                  <Link to={crumb.to} className="truncate rounded-sm underline-offset-4 hover:text-foreground hover:underline">
+                  <Link to={crumb.to} className="min-w-0 wrap-break-word rounded-sm underline-offset-4 hover:text-foreground hover:underline">
                     {crumb.label}
                   </Link>
                 ) : (
-                  <span aria-current="page" className="truncate text-foreground">
+                  <span aria-current="page" className="min-w-0 wrap-break-word text-foreground">
                     {crumb.label}
                   </span>
                 )}

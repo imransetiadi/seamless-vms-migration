@@ -26,15 +26,15 @@ export function StatusBadge({ tone, icon: Icon, label, title, detail, size = 'sm
     <span
       title={title}
       className={cn(
-        'inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-sm border font-medium',
+        'inline-flex items-center gap-1 whitespace-nowrap rounded-sm border font-medium',
         size === 'sm' ? 'px-1.5 py-0.5 text-xs' : 'px-2 py-1 text-sm',
         TONE_CLASSES[tone].badge,
         className,
       )}
     >
       <Icon aria-hidden className={cn('shrink-0', size === 'sm' ? 'size-3.5' : 'size-4')} />
-      {/* the term is not in the truncating span: its overflow would clip the focus ring */}
-      {detail ? <Term definition={detail}>{label}</Term> : <span className="truncate">{label}</span>}
+      {/* a short fixed label on one line, as wide as it needs: never cut off with an ellipsis (SDD §16) */}
+      {detail ? <Term definition={detail}>{label}</Term> : <span>{label}</span>}
     </span>
   );
 }

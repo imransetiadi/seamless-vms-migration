@@ -185,7 +185,7 @@ function SessionFooter() {
       )}
       {me.data && (
         <p className="px-1 text-sm">
-          <span className="block truncate font-medium text-foreground">{me.data.name}</span>
+          <span className="block wrap-break-word font-medium text-foreground">{me.data.name}</span>
           <span className="text-xs text-muted-foreground">{ROLE_LABELS[me.data.role] ?? me.data.role}</span>
         </p>
       )}
