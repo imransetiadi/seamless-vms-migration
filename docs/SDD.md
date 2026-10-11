@@ -1860,7 +1860,9 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   `#FFFFFF`. Light theme: background `#F8FAFC`, foreground `#1E293B`, card `#FFFFFF`, muted
   `#E9EFF8`, muted foreground `#475569`, border `#E2E8F0`, primary `#2563EB`, accent `#EA580C`,
   destructive `#DC2626`, ring `#2563EB`. Status colors are always paired with an icon and a text
-  label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids).
+  label (never color alone). Fonts: Fira Sans (body), Fira Code (headings, numbers, ids), bundled with the
+  dashboard (`@fontsource` woff2 files, Latin, the weights in use) and served by the control plane like the rest of
+  it: the page loads nothing from another host, so an air-gapped install renders the same and never waits on one.
   Tokens are CSS variables consumed by Tailwind (`bg-background`, `text-muted-foreground`, …).
 * Brand mark: one mark at every size — a slanted S drawn as one unbroken stroke whose upper half is the dark
   theme's foreground `#F8FAFC` and lower half the accent `#22C55E` (a VM leaves its source and lands live on
