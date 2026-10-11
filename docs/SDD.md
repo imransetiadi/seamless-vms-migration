@@ -743,6 +743,15 @@ the import will after the stop:
 * The port's network reference and every fixed IP's subnet reference (`reference.network_id`,
   `reference.subnet_id`). A `%auth%` reference searches only the credential's own project, so a shared network that
   another project owns is not found, and a name that two of the project's networks carry is ambiguous.
+* Whether the credential may put the port on that network. A network of the credential's own project: always.
+  Another project's network only when it is shared with the credential's project or is external (Neutron's `shared`
+  and `router:external`, as the credential sees them). An admin credential sees every project's networks, and a port
+  on another project's private network would put the VM on that tenant's network. There, also only when the token
+  carries the `admin` or `advsvc` role (`credential_roles`: the role names of the credential's token). Neutron's
+  policy (2023.1 `create_port:fixed_ips:ip_address`, `create_port:mac_address`, `create_port:port_security_enabled`)
+  lets only those roles, or the network's own project, choose a port's address, MAC or port security. The import
+  chooses them for every port: through Nova it asks for the port's address, and Nova creates the port with the
+  migration user's token; through Neutron it sends the MAC, every address and the port-security flag.
 * Every fixed IP must be one that Neutron's IPAM accepts on the port. It lies in the subnet its reference names, or,
   address-only, in a subnet of the port's network. It is a host address there as `check_subnet_ip` rules for the
   port's owner: not an IPv4 subnet's network address (at any prefix length) or its broadcast address below a /31,
@@ -868,7 +877,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   (`DestinationProvider.inventory().network_details`, read for that run):
   * the credential's own network keeps `%auth%` as the reference's project and domain;
   * another project's network that is the only one of its name gets neither, so os-migrate looks it up by name among
-    the networks the credential sees (a shared provider network that another project owns works).
+    the networks the credential sees (a shared provider network that another project owns is found). Whether the
+    credential may put a port there is the destination check's (§6.6): it refuses, before the source stops, another
+    project's network that is neither shared with the credential's project nor external, and any network of
+    another project when the credential's token carries neither the `admin` nor the `advsvc` role.
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A name that does not resolve stops the cutover there, before the
   source stops: a permanent failure naming the port. When the destination's networks cannot be read, the run logs
@@ -937,6 +949,9 @@ volumes with their server, so the order is:
      lookup takes the credential's own network of that name, else the only network of that name it sees. It fails
      when there is no such network, when there are several in the credential's project, or when there are several
      elsewhere and none in its project;
+   * that network is another project's and the credential may not put a port there, by §6.6's rule with the roles
+     of its token. The handover's admin credential sees every project's networks, so step 8 would otherwise put the
+     VM on another tenant's private network;
    * an address step 8 would give the port is one Neutron refuses on that network (§6.6's rules for a port Nova
      creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode);
    * another port of that network holds such an address, or in `"neutron"` mode the port's MAC. The exception is the
@@ -1334,6 +1349,7 @@ Finding catalog (code — severity — condition):
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
 | `MAP_NETWORK_AMBIGUOUS` | blocker | an OpenStack VM's NIC goes to a RHOSO network name (its `plan.nic_overrides` entry's network, else the mapped one, else its own name) that the rule of §7.3 step 0 cannot resolve to one network: several networks of the destination credential's project carry it, or none of them does and several of other projects do (`DestinationInventory.network_details`). The cutover would refuse it before the stop. The message names the NIC's MAC, the name and the projects |
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
+| `NET_PORT_NOT_PERMITTED` | blocker | an OpenStack VM's NIC resolves, by the rule of §7.3 step 0 (its `plan.nic_overrides` entry's network, else the mapped one, else its own name), to a network of another project (`DestinationInventory.network_details`, `own` false) where the destination credential may not put a port, by §6.6's rule. Either the network is neither `shared` with the credential's project nor `external`, or the credential's token carries neither the `admin` nor the `advsvc` role (the `roles` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, this half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops; the destination check refuses it before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
 | `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules, an IPv4 subnet's network address (at any prefix length), its broadcast address below a /31 (a /31 or /32 has none) and an IPv6 subnet's first address; on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
@@ -1440,17 +1456,21 @@ extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, in
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
 list[str], keypairs: list[str] (the destination credential's own keypairs: the server is created as that user, and
 a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped),
-network_details: list[{id, name, mtu, project_id, own, shared}] (every network the destination credential sees;
-`own` when the credential's project owns it: what a NIC's RHOSO network name resolves to, §7.3 step 0, §9.3),
+network_details: list[{id, name, mtu, project_id, own, shared, external}] (every network the destination credential
+sees; `own` when the credential's project owns it: what a NIC's RHOSO network name resolves to, §7.3 step 0, §9.3;
+`shared` and `external` as Neutron's `shared` and `router:external` read for the credential: whether it may put a
+port on another project's network, §6.6),
 subnets: list[{name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}] (the subnets the destination
 credential sees, by network name and by the id of the network they belong to: where a NIC's addresses must lie,
 §9.3)}`. `networks` keeps the name→MTU view; with two networks of one name its MTU is one of theirs.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
-"compute_microversion": str, "ovn": bool, "volume_backends": [pool names], "storage_backends":
-[{"pool": str, "vendor": str|null, "protocol": str|null, "family": "rbd"|"netapp_nfs"|
-"netapp_block"|"other"}]}`, both lists empty without admin; volume disks carry their Cinder `pool`;
+"roles": [the role names of the credential's token, sorted], "compute_microversion": str, "ovn": bool,
+"volume_backends": [pool names], "storage_backends": [{"pool": str, "vendor": str|null, "protocol": str|null,
+"family": "rbd"|"netapp_nfs"|"netapp_block"|"other"}]}`, both lists empty without admin (`roles` is what
+`NET_PORT_NOT_PERMITTED` judges, §9.3: Neutron's policy names roles, while `admin` is the compute probe);
+volume disks carry their Cinder `pool`;
 `os_type` is the most specific of the server metadata `os_type`/`os_distro`, the boot volume's
 `volume_image_metadata` or the boot image's properties (`os_distro` + `os_version`, then `os_type`)),
 `VMwareProvider` (pyVmomi,
@@ -2271,7 +2291,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   network or its override, with the addresses it keeps or gets). Edit is for an operator on an OpenStack source:
   the VM's `nic_overrides` entry, a plan edit (§12). Per NIC a destination network (the plan's mapping by default;
   a name only another project's network carries is marked "another project's", one the rule of §7.3 step 0 cannot
-  resolve "several networks")
+  resolve "several networks"; another project's network where the RHOSO credential may not put a port, by §6.6's
+  rule — neither shared with its project nor external, or no `admin` or `advsvc` in the destination's `roles` — is
+  marked "not allowed", and when selected a note under the field says why, as `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
   edited. A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
