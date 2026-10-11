@@ -712,6 +712,23 @@ describe('mock API', () => {
     });
   });
 
+  it('answers 502 for a VM the source no longer reports, before changing anything, like the API (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const [keep] = freeVms(server, 'rhosp17-dc1', 1);
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Vanished',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: [keep!.source_id, 'vm-gone-0001'],
+    });
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({
+      status: 502,
+      message: "VM 'vm-gone-0001': VM 'vm-gone-0001' not found",
+    });
+    expect(server.migrations.filter((m) => m.plan_id === plan.id)).toEqual([]);
+    expect(server.plans.find((p) => p.id === plan.id)!.status).toBe('draft');
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;

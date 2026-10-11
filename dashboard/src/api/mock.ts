@@ -1887,6 +1887,10 @@ export class MockServer {
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
     // the API's order of checks (orchestrator.validate_plan, SDD §5.4): nothing changes before they pass
+    // like the API (orchestrator._vms, SDD §12): a VM the source no longer reports is a provider error, before anything changes
+    const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
+    const gone = plan.vm_ids.find((id) => !known.has(id));
+    if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
       throw new HttpError(400, 'bad_request', `${cancelled.length} VM(s) have a cancelled migration: ${cancelled.slice(0, 10).join(', ')}; remove them from vm_ids or create a new plan for them`);
