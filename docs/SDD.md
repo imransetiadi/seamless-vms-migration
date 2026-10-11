@@ -2104,7 +2104,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   "Remote: {host}", or "Remote" until `SEAMLESS_JEV_ENDPOINT_HOST` names the host — and a "Data sent to advisor"
   panel lists, per decision type, the tool and the fields its serializer sends (`GET /advisor/data-sent`) and says
   when the console excerpt stays local (§13.4, ADV-06); the page links to
-  `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live) with action,
+  `/advisor/audit`: the audit events newest first (`GET /events?audit=true&tail=true`, live; Load older audit events
+  reads the 1,000 before the oldest loaded, `before`, back to the start of the trail) with action,
   actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
   model version — and as JSON —
   similar-incident search — the query field takes at most 2000 characters and the result count stays in
