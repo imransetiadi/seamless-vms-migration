@@ -177,6 +177,43 @@ for (const width of [320, 375]) {
   });
 }
 
+test('the error summaries of the plan, policy and provider dialogs keep their links 24 px or spaced (WCAG 2.5.8)', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await signIn(page, 'admin');
+  const targets = async () => {
+    await page.addScriptTag({ content: AXE });
+    return page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (context: Element, options: object) => Promise<{ violations: Array<{ nodes: Array<{ target: string[] }> }> }> } }).axe;
+      const dialog = document.querySelector('[role="dialog"]') as Element;
+      const result = await axe.run(dialog, { runOnly: { type: 'rule', values: ['target-size'] } });
+      return result.violations.flatMap((v) => v.nodes.map((n) => n.target.join(' ')));
+    });
+  };
+
+  await page.goto('/plans');
+  await page.getByRole('button', { name: 'New plan' }).click();
+  const plan = page.getByRole('dialog', { name: 'New migration plan' });
+  await plan.getByRole('button', { name: /^create plan/i }).click();
+  await expect(plan.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'plan dialog').toEqual([]);
+  await page.keyboard.press('Escape');
+
+  await page.goto('/advisor/policies');
+  await page.getByRole('button', { name: 'New policy' }).click();
+  const policy = page.getByRole('dialog', { name: 'New policy' });
+  await policy.getByRole('button', { name: 'Create policy' }).click();
+  await expect(policy.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'policy dialog').toEqual([]);
+  await page.keyboard.press('Escape');
+
+  await page.goto('/providers');
+  await page.getByRole('button', { name: /^add provider$/i }).first().click();
+  const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+  await provider.getByRole('button', { name: /^add provider$/i }).click();
+  await expect(provider.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'provider dialog').toEqual([]);
+});
+
 // With the web fonts and with the system font a browser shows until they arrive (font-display: swap), or when they
 // cannot load: a name that fits in Fira Sans can be a few pixels too wide in the system font. Each run measures once
 // its fonts are settled.

@@ -578,7 +578,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   <li key={key}>
                     <a
                       href={`#${targetFor[key]}`}
-                      className="text-foreground underline underline-offset-4"
+                      className="inline-block py-1 text-foreground underline underline-offset-4"
                       onClick={(e) => {
                         e.preventDefault();
                         if (advancedHasErrors) (document.getElementById(id('advanced')) as HTMLDetailsElement | null)?.setAttribute('open', '');

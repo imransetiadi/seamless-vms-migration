@@ -189,7 +189,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
                   <li key={key}>
                     <a
                       href={`#${id(key)}`}
-                      className="text-foreground underline underline-offset-4"
+                      className="inline-block py-1 text-foreground underline underline-offset-4"
                       onClick={(e) => {
                         e.preventDefault();
                         document.getElementById(id(key))?.focus();

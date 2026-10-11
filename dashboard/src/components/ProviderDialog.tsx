@@ -547,7 +547,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               <ul className="mt-1 list-disc pl-6 text-foreground">
                 {errorEntries.map(([key, message]) => (
                   <li key={key}>
-                    <a href={`#${id(key)}`} className="underline underline-offset-2">
+                    <a href={`#${id(key)}`} className="inline-block py-1 underline underline-offset-2">
                       {message}
                     </a>
                   </li>
