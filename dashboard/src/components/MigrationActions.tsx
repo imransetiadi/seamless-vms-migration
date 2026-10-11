@@ -11,7 +11,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState, type FocusEvent } from 'react';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
@@ -100,6 +100,19 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const [announcement, setAnnouncement] = useState('');
   const forceId = useId();
   const deleteId = useId();
+  // a button that changes rows as the migration moves keeps the focus (SDD §16): React moves the node, which
+  // drops the focus in the browser, so the focused action is remembered and focused again after the move
+  const buttons = useRef(new Map<MigrationActionKey, HTMLButtonElement>());
+  const focused = useRef<MigrationActionKey | null>(null);
+  const rows = useRef('');
+  const remember = (key: MigrationActionKey) => (node: HTMLButtonElement | null) => {
+    if (node) buttons.current.set(key, node);
+    else buttons.current.delete(key);
+  };
+  // focus that went to another element is not ours to take back; focus dropped to the page by a move is
+  const forget = (event: FocusEvent<HTMLButtonElement>) => {
+    if (event.relatedTarget) focused.current = null;
+  };
 
   const show = (key: MigrationActionKey) => {
     action.reset();
@@ -133,6 +146,23 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const closedWindow = !windowOpen(plan);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
 
+  // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
+  const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));
+  const available = offered
+    .filter((key) => availability[key].enabled)
+    .sort((a, b) => Number(b === step.action) - Number(a === step.action));
+  const unavailable = offered.filter((key) => !availability[key].enabled);
+  const layout = available.join(',');
+  useLayoutEffect(() => {
+    const moved = rows.current !== '' && rows.current !== layout;
+    rows.current = layout;
+    const key = focused.current;
+    const node = key ? buttons.current.get(key) : undefined;
+    if (moved && node && document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
+      node.focus({ preventScroll: true });
+    }
+  }, [layout]);
+
   return (
     <div className="flex flex-col gap-3">
       <p
@@ -144,24 +174,47 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         <ArrowRight aria-hidden className={cn('mt-0.5 size-4 shrink-0', step.action ? 'text-status-success' : 'text-muted-foreground')} />
         {step.text}
       </p>
-      <div role="group" aria-label="Migration actions" className="flex flex-wrap gap-2">
-        {MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy)).map((key) => {
-          const primary = key === step.action && availability[key].enabled;
+      <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
+        {available.map((key) => {
+          const primary = key === step.action;
           const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
           return (
             <Button
               key={key}
+              ref={remember(key)}
               size="lg"
               icon={ICON[key]}
               variant={primary ? (destructive && key !== 'finalize' ? 'danger' : 'primary') : 'secondary'}
-              disabledReason={availability[key].reason}
               onClick={() => show(key)}
-              className={cn(destructive && key === 'cancel' && 'sm:ml-auto')}
+              onFocus={() => (focused.current = key)}
+              onBlur={forget}
+              className={cn(key === 'cancel' && available.length > 1 && 'sm:ml-auto')}
             >
               {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
             </Button>
           );
         })}
+        {unavailable.length > 0 && (
+          <p key="unavailable" className="mt-1 basis-full text-xs text-muted-foreground">
+            Unavailable now
+          </p>
+        )}
+        {unavailable.map((key) => (
+          // quieter and smaller, still focusable and saying why (SDD §16)
+          <Button
+            key={key}
+            ref={remember(key)}
+            size="sm"
+            icon={ICON[key]}
+            variant="secondary"
+            disabledReason={availability[key].reason}
+            onClick={() => show(key)}
+            onFocus={() => (focused.current = key)}
+            onBlur={forget}
+          >
+            {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
+          </Button>
+        ))}
       </div>
       <p role="status" className="sr-only">
         {announcement}

@@ -1,5 +1,6 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { Migration, Role } from '../api/types';
 import { forcedDowntime } from '../lib/forcedEstimate';
@@ -18,6 +19,81 @@ function setup(vmName: string, token: string) {
 }
 
 describe('MigrationActions', () => {
+  it('lists the actions available now first, the next step first, and the others under "Unavailable now" (SDD §16)', () => {
+    const { button } = setup('web-01', 'approver');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const names = within(group)
+      .getAllByRole('button')
+      .map((b) => b.textContent?.trim());
+    expect(names.slice(0, 2)).toEqual(['Finalize', 'Roll back']);
+    const label = within(group).getByText('Unavailable now');
+    for (const name of [/approve/i, /^cut over/i, /sync/i, /retry/i, /cancel/i]) {
+      const unavailable = button(name);
+      // after the label, quieter and smaller, still focusable and saying why
+      expect(label.compareDocumentPosition(unavailable) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(unavailable).toHaveAttribute('aria-disabled', 'true');
+      expect(unavailable).toHaveAccessibleDescription(/.+/);
+      expect(unavailable.className).toMatch(/min-h-8/);
+    }
+    // the next step's action is the primary one, at the 44 px size of primary actions
+    expect(button(/finalize/i).className).toMatch(/bg-accent/);
+    expect(button(/finalize/i).className).toMatch(/min-h-11/);
+    expect(button(/roll back/i).className).toMatch(/min-h-11/);
+  });
+
+  it('puts every action of a viewer under "Unavailable now", each still saying why (SDD §16)', () => {
+    setup('app-billing-01', 'viewer');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    // a viewer has no action: all of them are in the quiet row, under its label
+    expect(within(group).getByText('Unavailable now')).toBeInTheDocument();
+    expect(within(group).getAllByRole('button').every((b) => b.getAttribute('aria-disabled') === 'true')).toBe(true);
+  });
+
+  it('sets Cancel apart from other available actions, never from nothing', () => {
+    const server = createTestServer();
+    const render = (id: string) => {
+      const m = server.migrations.find((x) => x.id === id) as Migration;
+      const operator: Role = 'operator';
+      const utils = renderWithApp(<MigrationActions migration={m} plan={server.plans.find((p) => p.id === m.plan_id) ?? null} role={operator} />, {
+        server,
+        token: 'operator',
+      });
+      const cancel = within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^cancel$/i });
+      return { utils, cancel };
+    };
+    // in pre-copy an operator can only cancel: alone, Cancel is not pushed to the far side of the row
+    const alone = render('mig-5d7e2b4a10');
+    expect(alone.cancel).not.toHaveAttribute('aria-disabled');
+    expect(alone.cancel.className).not.toMatch(/ml-auto/);
+    alone.utils.unmount();
+    // awaiting the cutover, Sync now comes first and Cancel keeps its distance from it
+    const apart = render('mig-5d7e2b4a12');
+    expect(apart.cancel.className).toMatch(/sm:ml-auto/);
+  });
+
+  it('keeps the focus on a button that changes rows as the migration moves (SDD §16)', () => {
+    const server = createTestServer();
+    const done = server.migrations.find((m) => m.vm.name === 'web-01') as Migration;
+    const plan = server.plans.find((p) => p.id === done.plan_id) ?? null;
+    let move: (m: Migration) => void = () => {};
+    function Moving() {
+      const [m, setM] = useState(done);
+      move = setM;
+      const approver: Role = 'approver';
+      return <MigrationActions migration={m} plan={plan} role={approver} />;
+    }
+    renderWithApp(<Moving />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const finalize = within(group).getByRole('button', { name: /^finalize$/i });
+    finalize.focus();
+    expect(finalize).not.toHaveAttribute('aria-disabled');
+    // finalized elsewhere: Finalize is no longer available and moves to the quiet row
+    act(() => move({ ...done, phase: 'finalized' }));
+    const moved = within(group).getByRole('button', { name: /^finalize$/i });
+    expect(moved).toHaveAttribute('aria-disabled', 'true');
+    expect(moved).toHaveFocus();
+  });
+
   it('enables Finalize and Rollback for an approver on a completed migration', () => {
     const { button } = setup('web-01', 'approver');
     expect(button(/finalize/i)).not.toHaveAttribute('aria-disabled');
