@@ -1358,8 +1358,8 @@ with a strategy override for each and 1,000 mapping entries is about 0.5 MB.
 A response of 1 KiB or more is gzip-compressed (level 6, `Content-Encoding: gzip`, `Vary:
 Accept-Encoding`) when the request's `Accept-Encoding` allows gzip; the event stream
 (`text/event-stream`) never is, so live events are not held back. A migration document is ~4.5 KB of
-JSON, so a list of 1,000 (NFR-03) is ~4.3 MiB raw and ~12× less compressed — the dashboard fetches
-such lists again on persisted migration events.
+JSON, so a list of 1,000 (NFR-03) is ~4.3 MiB raw and ~12× less compressed — on an event about one
+migration the dashboard puts that migration into such lists, reading a list again only as §16 says.
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
@@ -1404,7 +1404,7 @@ such lists again on persisted migration events.
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
-| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the policy in force requires a distinct approver; §14.6) |
+| POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the decision's recorded `require_override_reason` — or, for a decision that recorded none, the policy in force — requires one (§14.6), 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
 | GET | `/advisor/policies` | viewer | — | `{"items": [AdvisorPolicy], "default": AdvisorPolicy}` (`default`: the built-in `global-default`, read-only) |
 | POST | `/advisor/policies` | admin (`advisor.policy.manage`) | `AdvisorPolicy` without `id`, `created_at`, `updated_at`, `updated_by` (422: both scope lists set, an unknown provider or plan id, threshold outside 0..1) | `AdvisorPolicy` (201) |
@@ -1871,7 +1871,8 @@ whole trail; a `--before` without an offset is UTC.
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
 
 A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
-errors the API answers with a status (§12). A provider SDK's message is redacted and cut at 500
+errors the API answers with a status (§12); refused arguments — `estimate`'s knobs, `events prune`'s cutoff or a
+missing `--confirm` — exit 2, and `plan validate` exits 3 while a blocker remains. A provider SDK's message is redacted and cut at 500
 characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race with a running server
 (`ConflictError`: the document changed since it was read) says so and asks to run the command again.
 
@@ -1941,7 +1942,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
   over it — so Tab never hides the focused control under them (WCAG 2.4.11), and Escape closing the topmost dialog
   wherever the focus is, unless its request runs or a note or definition is shown: that Escape dismisses only the
-  note or definition (WCAG 1.4.13), the next one the dialog. An
+  note or definition (WCAG 1.4.13), the next one the dialog; the phone menu closes on Escape too, returning the
+  focus to its button, and choosing the page already shown puts the focus on the page, as a navigation does. An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
   short note under it when it is clicked or tapped (touch screens have no hover). A status badge whose detail
   says what to do or why — a readiness flag's guidance, why a VM in the finalize queue needs a look, a migration
@@ -1955,8 +1957,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   until an answer replaces it.
 * Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
   if it had not been asked — the result names each item whose request failed, with Retry for those
-  items, and the announcement counts them ("Checked 2 of 3 providers: 2 healthy; 1 could not be
-  checked"). A provider whose check ran but could not reach its cloud is a result (status `error`,
+  items, which stay named while their Retry runs, and the announcement counts them ("Checked 2 of 3 providers: 2
+  healthy; 1 could not be checked"). A provider whose check ran but could not reach its cloud is a result (status `error`,
   §4.2), not a failed request.
 * Sizes: IEC units everywhere (B, KiB, MiB, GiB, TiB, one formatter); OpenStack's "GB" — a flavor's disk,
   a Cinder quota's gigabytes — is GiB and is shown as such.
@@ -2035,7 +2037,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
   and Estimates panels addressable as `#findings` and `#estimates`, which the page scrolls to and focuses once
   loaded, ADV-02; phase
-  stepper, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
+  stepper — one row; on a phone two columns read top-down, half the height of one —, progress (the running step — named from the phase and the passes that ended: in `precopy` the full copy,
   pass 1; in `syncing` the next delta pass; in `cutover` the final pass of a warm migration, the full copy of a cold
   one or the volume handover — and its percentage, and the bytes transferred over all passes and the disk's used
   bytes as two figures, never one over the other — a warm migration transfers more than its disk holds; a
@@ -2082,7 +2084,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   loaded Cutover stays unavailable — its window and approval policy are unknown, and the dialog would promise an
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
-  request), `/providers` (status cards + Check,
+  request, and is unavailable, saying why, while the migration's advisor decision waits for approval (`advisor_hold`,
+  §14.6) — the API refuses it then (§12)), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
