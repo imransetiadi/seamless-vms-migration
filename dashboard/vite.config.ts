@@ -50,8 +50,11 @@ export default defineConfig({
     // CSS is not needed by component tests, except the token source read by contrast.test.ts.
     css: { include: [/src\/index\.css/] },
     restoreMocks: true,
-    // jsdom integration tests (mock API + SSE) need headroom on a busy machine.
-    testTimeout: 15_000,
+    // jsdom integration tests (mock API + SSE) take 1-5 s each; on a developer machine shared with other work
+    // (load averages of 16-100 measured) they slowed past 15 s and timed out. Four workers keep the suite from
+    // starving itself, and 30 s still catches a test that hangs; CI runs on a dedicated runner: default workers.
+    testTimeout: 30_000,
+    maxWorkers: process.env.CI ? undefined : 4,
     // Deterministic wall-clock formatting in tests.
     env: { TZ: 'UTC' },
   },
