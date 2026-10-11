@@ -82,9 +82,18 @@ export function formatPct(value: number | null | undefined, decimals = 1): strin
   return `${rounded.toFixed(decimals).replace(/\.0+$/, '')}%`;
 }
 
+// one formatter per precision: building an Intl.NumberFormat costs far more than using one, and tables and tiles
+// format thousands of numbers each time a live event redraws them
+const numberFormats = new Map<number, Intl.NumberFormat>();
+
 export function formatNumber(value: number | null | undefined, maximumFractionDigits = 0): string {
   if (!isNumber(value)) return DASH;
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits }).format(value);
+  let format = numberFormats.get(maximumFractionDigits);
+  if (!format) {
+    format = new Intl.NumberFormat('en-US', { maximumFractionDigits });
+    numberFormats.set(maximumFractionDigits, format);
+  }
+  return format.format(value);
 }
 
 /** Milliseconds since the epoch for an ISO timestamp / Date / epoch number, or null when invalid. */
