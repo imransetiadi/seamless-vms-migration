@@ -725,8 +725,12 @@ like the server's, so `plan.mappings.projects` applies to them) and `is_port_sec
 fixed IPs. `ServerPort.create_or_update` creates the destination port with the network, the MAC, every fixed IP
 (subnets by reference), the security groups found in the destination, the port-security flag, the vnic type and the
 description `os-migrate:{source port id}`. It never sends `binding_profile`, which Neutron's policy reserves for admins
-and which is host-specific. Before creating a port it lists the destination network's ports with that MAC. It uses
-again an unbound one that carries that description and the same fixed IPs (a resumed or retried cutover). It refuses
+and which is host-specific. Nor does it send an address on a SLAAC or DHCPv6-stateless subnet of the network. Neutron
+2023.1 allocates that subnet's EUI-64 address of the MAC on every port it creates, also when the address is sent, and
+the second allocation of one address fails (`IpAddressAlreadyAllocated`). With the MAC kept, Neutron derives the same
+address, which the destination check makes sure of. Before creating a port it lists the destination network's ports
+with that MAC. It uses again an unbound one that carries that description and the same fixed IPs, not counting the
+addresses on such subnets that Neutron added (a resumed or retried cutover). It refuses
 any other port with the MAC (`InconsistentState`, naming the port) before Nova is asked for the server. It also refuses
 a port exported without `security_group_refs` (an export from before this rule) rather than create it with the
 project's default group: Nova applies a server's security groups only to the ports it creates itself. The rollback
@@ -757,15 +761,17 @@ the import will after the stop:
   migration user's token; through Neutron it sends the MAC, every address and the port-security flag.
 * Every fixed IP must be one that Neutron's IPAM accepts on the port. It lies in the subnet its reference names, or,
   address-only, in a subnet of the port's network. It is a host address there as `check_subnet_ip` rules for the
-  port's owner: not an IPv4 subnet's network address (at any prefix length) or its broadcast address below a /31,
-  nor an IPv6 subnet's first address for a port that Nova creates (a port created through Neutron has no owner
-  yet). On a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the port's MAC is accepted: the kept MAC
-  with `port_creation_mode: neutron`; through Nova, which gives the port a new MAC, no explicit address at all.
+  port's owner: not an IPv4 subnet's network address (at any prefix length) or its broadcast address below a /31.
+  An IPv6 subnet's first address is accepted: Nova and the import create a port with no owner (Nova sets the
+  compute owner only afterwards), and `check_subnet_ip` takes it for a port without one. On a SLAAC or
+  DHCPv6-stateless subnet only the EUI-64 address of the port's MAC is accepted: the kept MAC with
+  `port_creation_mode: neutron`; through Nova, which gives the port a new MAC, no explicit address at all.
 * The network of a new floating IP (`floating_ip_mode` `new`, or `auto` when no detached floating IP has the address).
 * No other port of the network holds what the import will ask Neutron for. That covers an address of the port
   (`IpAddressAlreadyAllocated`), and with `port_creation_mode: neutron` also its MAC (`MacAddressInUse`, and
   `create_or_update` refuses any other port with the MAC). The exception is the unbound port an earlier attempt created
-  that `create_or_update` uses again: the description `os-migrate:{source port id}`, the MAC and the same addresses.
+  that `create_or_update` uses again: the description `os-migrate:{source port id}`, the MAC and the same addresses
+  (those on a SLAAC or DHCPv6-stateless subnet aside).
 
 Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
 cutover fails while the source still runs.
@@ -1009,11 +1015,12 @@ volumes with their server, so the order is:
    `delete_on_termination: false`). Each network is found with step 0's lookup. Its NICs: with
    `plan.port_creation_mode` `"nova"` each port's mapped network with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
-   MAC, every fixed IP (by address: Neutron picks the subnet), its security groups found by name in the
+   MAC, every fixed IP (by address: Neutron picks the subnet) except those on a SLAAC or DHCPv6-stateless subnet of
+   that network, which Neutron derives from the MAC itself (§6.6), its security groups found by name in the
    destination credential's project, its port-security flag and the description `os-migrate:{source port id}`
    (§6.6). Each port is journaled with its id. A resume uses again the journaled port, or an unbound port that
    carries that description and is on the target network, in the destination credential's project, with the MAC
-   and exactly the addresses step 8 would give it. The handover's admin credential sees every project's ports, and
+   and exactly the addresses step 8 asks for, not counting the addresses Neutron added on such subnets. The handover's admin credential sees every project's ports, and
    a cold or warm migration of the same VM may have left one: any other port is never used. Nova gets `{"port": id}`,
    since the server's security groups apply only to ports Nova creates.
    A port whose MAC has an entry in `plan.nic_overrides` goes to the entry's network instead of the mapped one,
@@ -1372,7 +1379,7 @@ Finding catalog (code — severity — condition):
 | `NET_ADDRESS_REFUSED` | blocker | an OpenStack VM's NIC without a `plan.nic_overrides` entry keeps an address that Neutron would refuse on its resolved RHOSO network, by §6.6's rules: a host address of one of the network's subnets, and on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode and no address in `"nova"` mode, where a port keeps its first address only. A VMware NIC's IPv4 guest addresses (the migration kit sends only those, with one subnet per NIC, §7.2) must all be host addresses of one subnet of its resolved network. A network that pre-staging would create is not checked. The message names the NIC's MAC, the address and the network |
 | `NET_PORT_NOT_PERMITTED` | blocker | a VM's NIC resolves, by the rule of §7.3 step 0 (an OpenStack VM's `plan.nic_overrides` entry's network, else the mapped one, else its own name; a VMware NIC's mapped port group, else its own name — the migration kit creates every port with the NIC's MAC, §7.2), to a network of another project (`DestinationInventory.network_details`, `own` false) where the destination credential may not put a port, by §6.6's rule. Either the network is neither `shared` with the credential's project nor `external`, or the credential's token carries neither the `admin` nor the `advsvc` role (the `roles` of the destination's capabilities, as validation's check reports them; when the destination reports no `roles`, this half is not judged). The cutover recreates every port with its address or MAC, which Neutron's policy would refuse after the source stops; the destination check refuses it before the stop. The message names the NIC's MAC, the network, its project and the half of the rule that fails |
 | `NET_PORT_IPS` | warning | `plan.port_creation_mode` is `"nova"` and an OpenStack VM's NIC has no fixed IP or more than one (dual-stack included): cold and warm cannot recreate it, storage handover keeps one address per port (§9.2), so the strategies that would fail after the stop or drop addresses are ineligible; the finding names each such NIC with its addresses, and its remediation offers `"neutron"` mode. In `"neutron"` mode it is not emitted: cold, warm and storage handover keep every address |
-| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules, an IPv4 subnet's network address (at any prefix length), its broadcast address below a /31 (a /31 or /32 has none) and an IPv6 subnet's first address; on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
+| `MAP_NIC_OVERRIDE_INVALID` | blocker | an entry of `plan.nic_overrides[vm.source_id]` cannot be applied: its MAC is none of the VM's NICs; its network is not a destination network; an address lies in no subnet of the NIC's target network (the entry's network, else the mapped one, resolved by the rule of §7.3 step 0; its `DestinationInventory.subnets` by `network_id`) or is no host address there — as Neutron's `check_subnet_ip` rules for a port created with no owner, an IPv4 subnet's network address (at any prefix length) and its broadcast address below a /31 (a /31 or /32 has none), while an IPv6 subnet's first address is taken (§6.6); on a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the kept MAC in `"neutron"` mode, and no address in `"nova"` mode (§6.6); or an address is also given to another NIC of the plan. The source is VMware and the VM has an entry: the migration kit keeps the guest's network settings. The message names each problem with the NIC's MAC |
 | `MAP_NIC_OVERRIDE` | info | the VM has `plan.nic_overrides` entries that apply: the message names each NIC (MAC, source network) with its RHOSO network and addresses. A NIC with a network entry is checked by `MAP_NIC_OVERRIDE_INVALID`, not by `MAP_NETWORK_MISSING` |
 | `VM_PCI_PASSTHROUGH` | blocker | flavor extra spec `pci_passthrough:alias` present (VMware: a `VirtualPCIPassthrough` device, reported by the provider as that extra spec) |
 | `VM_VGPU` | blocker | extra spec `resources:VGPU` present (VMware: a shared-PCI vGPU device, reported the same way) |
