@@ -36,12 +36,13 @@ export function MetricStrip({ metrics, label, busy = false, className }: { metri
           key={metric.label}
           role="group"
           aria-label={metric.label}
-          className="flex min-w-0 flex-col gap-0.5 bg-card px-4 py-3 outline-1 outline-border"
+          // tighter on a phone, so the live panels below start on the first screen; every figure and hint stays
+          className="flex min-w-0 flex-col gap-0.5 bg-card px-3 py-2 outline-1 outline-border sm:px-4 sm:py-3"
         >
-          <span className="text-sm text-muted-foreground">{metric.label}</span>
+          <span className="text-xs text-muted-foreground sm:text-sm">{metric.label}</span>
           <span
             className={cn(
-              'num text-2xl font-semibold leading-tight',
+              'num text-xl font-semibold leading-tight sm:text-2xl',
               busy ? 'text-muted-foreground' : metric.tone ? TONE_CLASSES[metric.tone].text : 'text-foreground',
             )}
           >

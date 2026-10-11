@@ -135,6 +135,25 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await expect(page.locator('body')).not.toContainText('browser-secret');
 });
 
+test("on a phone the Overview's first downtime clock is on the first screen, under compact key figures (SDD §16)", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'viewer');
+  await page.goto('/');
+  const strip = page.getByRole('region', { name: 'Key metrics' });
+  await expect(strip.getByRole('group', { name: 'Migrations' })).toBeVisible();
+  // every figure and its hint still shown, in less height
+  for (const name of ['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance']) {
+    await expect(strip.getByRole('group', { name })).toBeVisible();
+  }
+  // the first VM that is down shows its running clock and its SLO within the first screen
+  const first = page.getByRole('region', { name: 'Downtime now' }).getByRole('listitem').first();
+  const slo = first.getByText(/^of \d+:\d\d$/);
+  await expect(slo).toBeVisible();
+  const box = await slo.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+});
+
 test("the plans list keeps each plan's progress and clouds on a phone, without scrolling sideways (SDD §16)", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page, 'viewer');
