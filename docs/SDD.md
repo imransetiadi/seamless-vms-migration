@@ -2148,7 +2148,12 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
   event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
-  Persisted events refresh the queries they affect in one batch per 400 ms; a refresh already under way is not
+  Persisted events refresh the queries they affect in one batch per 400 ms. An event about one migration that
+  exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
+  it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
+  holds it and is filtered by plan at most, instead of reading those lists again — at 1,000 VMs a plan (NFR-03) a
+  list is megabytes; a list filtered otherwise, one that does not hold the migration and one being read are
+  refreshed as before, and every list is when that read fails. A refresh already under way is not
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
