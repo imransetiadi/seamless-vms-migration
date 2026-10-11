@@ -853,6 +853,14 @@ Twenty-three further iterations after the integration run, each verified with th
   `Settings.from_env` (`test_settings_read_exactly_the_variables_sdd_15_1_documents`,
   `test_each_literal_default_of_sdd_15_1_is_the_effective_one`), and a live event about one migration splices it
   into the cached lists instead of reading every list again (`live.test.ts`, SDD §16).
+* Route contract review wave (2026-10-11, independent reviewer, every SDD §12 row against the code and the mock, a
+  failing repro per finding): PATCH `/plans/{id}` compares a policy field by value, so an operator re-sending the
+  current window as JavaScript writes it is no change (`test_an_operator_may_resend_the_current_cutover_window_in_any_spelling`);
+  a wrong method on an API route is 405 where the dashboard is served
+  (`test_a_wrong_method_on_an_api_route_is_405_where_the_dashboard_is_served`); plan finalize answers 404 for any
+  unknown wave id up to the general text bound; the mock refuses what `check_plan_spec` refuses, a PATCH naming a
+  field a plan cannot change, a provider route below its role before the lookup, and list pages outside the API's
+  bounds, with the API's words (`mock.test.ts`).
 
 ### 13.2 Exit criteria — release 0.1.0
 
