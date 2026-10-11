@@ -1,5 +1,6 @@
 import ast
 import copy
+import json
 import logging
 import os
 import re
@@ -952,6 +953,56 @@ def test_cold_rollback_before_any_stop_never_matches_by_name(env):
         stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
         stopped.options.update(options)
         assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+
+
+def _finished_cutover_state(env, record_server=True):
+    """The warm state an attempt leaves when it ran the final pass and created the server, then
+    failed (a timeout while the server booted, an error adding its floating IPs)."""
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    state = json.loads(path.read_text())
+    state["passes"].append(dict(state["passes"][-1], number=2, kind="final"))
+    if record_server:
+        state["destination_server_id"] = "dst-srv-1"
+    path.write_text(json.dumps(state))
+
+
+async def test_warm_cutover_rerun_on_a_recorded_server_is_a_finished_cutover(env, monkeypatch):
+    """SDD §7.2 (audit COL-05): the role finished the recorded server (§6.5); the re-run returns
+    it and the final pass the failed attempt ran, instead of a permanent failure whose rollback
+    would delete the good server."""
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    _finished_cutover_state(env)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")  # the role finishes the server, no pass
+    retry, _ = ctx_for(
+        env, strategy=Strategy.warm, sync_passes=[first.sync_pass], downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.CUTOVER, retry)
+    assert result.destination_server_id == "dst-srv-1"
+    assert result.sync_pass is not None
+    assert (result.sync_pass.number, result.sync_pass.kind) == (2, SyncPassKind.final)
+
+    # the migration already lists the final pass: it is not reported twice
+    listed, _ = ctx_for(
+        env,
+        strategy=Strategy.warm,
+        sync_passes=[first.sync_pass, result.sync_pass],
+        downtime_started_at=utcnow(),
+    )
+    again = await env.executor.run(StepName.CUTOVER, listed)
+    assert again.destination_server_id == "dst-srv-1" and again.sync_pass is None
+
+
+async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_failure(
+    env, monkeypatch
+):
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    _finished_cutover_state(env, record_server=False)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")
+    retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
+    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+        await env.executor.run(StepName.CUTOVER, retry)
 
 
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):

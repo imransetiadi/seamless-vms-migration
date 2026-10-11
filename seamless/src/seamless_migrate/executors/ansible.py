@@ -28,7 +28,7 @@ import yaml
 from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
-from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
+from ..domain.models import Mappings, Migration, Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
@@ -375,6 +375,20 @@ def build_secret_vars(
         raise PermanentStepError(f"credentials unavailable: {exc}") from None
 
 
+def _warm_sync_pass(entry: dict[str, Any], m: Migration, started: Any) -> SyncPass:
+    """A pass of the warm state file as the migration records it."""
+    return SyncPass(
+        number=int(entry.get("number") or next_pass_number(m)),
+        kind=SyncPassKind(entry.get("kind") or "delta"),
+        started_at=entry.get("started_at") or started,
+        ended_at=entry.get("ended_at") or utcnow(),
+        bytes_scanned=int(entry.get("bytes_scanned") or 0),
+        bytes_changed=int(entry.get("bytes_changed") or 0),
+        bytes_transferred=int(entry.get("bytes_transferred") or 0),
+        duration_s=entry.get("duration_s"),
+    )
+
+
 def workload_file_stem(name: str) -> str:
     """The stem of a VM's progress and log files, as ``import_workload_prelim`` names them
     (SDD §7.2): ``%`` -> ``%25``, ``/`` -> ``%2F``, NUL -> ``%00``, nothing else changes."""
@@ -566,6 +580,22 @@ class AnsibleExecutor:
             state = await asyncio.to_thread(_read_warm_state, osm, m.vm.source_id)
             if not state or not state.get("passes"):
                 raise PermanentStepError("the warm state file has no recorded pass")
+            if (
+                len(state["passes"]) <= passes_before
+                and step == StepName.CUTOVER
+                and state.get("destination_server_id")
+            ):
+                # a re-run after an attempt that ran the final pass and created the server,
+                # then failed: the role finished that server (SDD §6.5), the cutover is done -
+                # with the final pass when the migration does not list it yet (SDD §7.2)
+                last = state["passes"][-1]
+                listed = {p.number for p in m.sync_passes}
+                final = None
+                if last.get("kind") == "final" and int(last.get("number") or 0) not in listed:
+                    final = _warm_sync_pass(last, m, started)
+                return StepResult(
+                    sync_pass=final, destination_server_id=state["destination_server_id"]
+                )
             if len(state["passes"]) <= passes_before:
                 # the role skipped the workload (prelim reported no change): re-reporting the
                 # previous pass would feed a phantom pass into convergence and the estimate
@@ -573,17 +603,7 @@ class AnsibleExecutor:
                     f"the playbook recorded no new pass for {m.vm.name} (the workload was "
                     "skipped); check the destination for a same-named server"
                 )
-            last = state["passes"][-1]
-            sync_pass = SyncPass(
-                number=int(last.get("number") or next_pass_number(m)),
-                kind=SyncPassKind(last.get("kind") or "delta"),
-                started_at=last.get("started_at") or started,
-                ended_at=last.get("ended_at") or utcnow(),
-                bytes_scanned=int(last.get("bytes_scanned") or 0),
-                bytes_changed=int(last.get("bytes_changed") or 0),
-                bytes_transferred=int(last.get("bytes_transferred") or 0),
-                duration_s=last.get("duration_s"),
-            )
+            sync_pass = _warm_sync_pass(state["passes"][-1], m, started)
             if step == StepName.CUTOVER:
                 server = state.get("destination_server_id") or await self._lookup_server(ctx)
                 return StepResult(sync_pass=sync_pass, destination_server_id=server)
