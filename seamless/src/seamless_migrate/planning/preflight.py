@@ -442,6 +442,32 @@ def _in_subnets(address: str, cidrs: Sequence[str]) -> bool:
     return False
 
 
+def _no_host_address(address: str, cidrs: Sequence[str]) -> str | None:
+    """What makes ``address`` no host address of the subnets that hold it, as Neutron's
+    check_subnet_ip rules (SDD §9.3): an IPv4 subnet's network address at any prefix length, its
+    broadcast address below a /31 (netaddr gives a /31 or /32 none), an IPv6 subnet's first
+    address. None for a host address of one of them, or an address none of them holds."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    why = None
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if ip not in net:
+            continue
+        if ip == net.network_address:
+            why = why or f"the network address of {net}"
+        elif net.version == 4 and net.prefixlen < 31 and ip == net.broadcast_address:
+            why = why or f"the broadcast address of {net}"
+        else:
+            return None
+    return why
+
+
 def _nic_override_findings(
     vm: VMRef,
     plan: Plan,
@@ -450,8 +476,8 @@ def _nic_override_findings(
     source: Provider | None,
 ) -> list[Finding]:
     """MAP_NIC_OVERRIDE_INVALID / MAP_NIC_OVERRIDE (SDD §9.3): every entry checked before
-    anything stops - its MAC, its network, its addresses in the target network's subnets and
-    given to no other NIC of the plan."""
+    anything stops - its MAC, its network, its addresses host addresses of the target network's
+    subnets and given to no other NIC of the plan."""
     entries = plan.nic_overrides.get(vm.source_id) or {}
     if not entries:
         return []
@@ -500,6 +526,10 @@ def _nic_override_findings(
         if outside:
             verb = "lies" if len(outside) == 1 else "lie"
             problems.append(f"{mac}: {', '.join(outside)} {verb} in no subnet of {network!r}")
+        for a in addresses:
+            why = _no_host_address(a, cidrs)
+            if why:
+                problems.append(f"{mac}: {a} is {why}, not a host address")
         for a in addresses:
             for vm_id, other_mac, name in holders.get((network, _canonical_ip(a)), []):
                 if (vm_id, other_mac) != (vm.source_id, mac):

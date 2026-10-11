@@ -489,6 +489,72 @@ def test_finding_map_nic_override_invalid_names_each_problem():
     assert "migration kit keeps the guest's network settings" in vmw.message
 
 
+def test_finding_map_nic_override_invalid_refuses_what_neutron_gives_no_vm():
+    """SDD §9.3, as Neutron's check_subnet_ip: an IPv4 subnet's network address (at any prefix
+    length), its broadcast address below a /31 and an IPv6 subnet's first address are no host
+    addresses - a typo like 192.168.10.0 would otherwise fail after the source stops."""
+    from seamless_migrate.domain.models import Nic
+
+    dst = dst_inv(
+        networks={"app-net": 1500, "rhoso-dmz": 1500, "rhoso-p2p": 1500},
+        subnets=[
+            {"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"},
+            {"name": "dmz-v4", "network": "rhoso-dmz", "cidr": "192.168.10.0/24"},
+            {"name": "dmz-v6", "network": "rhoso-dmz", "cidr": "fd00:10::/64"},
+            {"name": "p2p-v4", "network": "rhoso-p2p", "cidr": "10.255.0.0/31"},
+            {"name": "wide-v6", "network": "rhoso-p2p", "cidr": "fd99::/16"},
+        ],
+    )
+    macs = [f"fa:16:3e:00:00:0{i}" for i in range(1, 5)]
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac=m, fixed_ips=[f"10.0.0.{i + 5}"]) for i, m in enumerate(macs)
+        ],
+    )
+
+    def entries(*targets):
+        return {
+            "vm-1": {
+                m: {"network": n, "fixed_ips": a} for m, (n, a) in zip(macs, targets, strict=True)
+            }
+        }
+
+    reserved = make_plan(
+        nic_overrides=entries(
+            ("rhoso-dmz", ["192.168.10.0"]),
+            ("rhoso-dmz", ["192.168.10.255", "fd00:10::"]),
+            ("rhoso-dmz", ["192.168.10.7", "fd00:10::7"]),
+            ("rhoso-p2p", ["10.255.0.0"]),
+        )
+    )
+    f = only(check(vm, plan=reserved, dst=dst), "MAP_NIC_OVERRIDE_INVALID")
+    assert (
+        "fa:16:3e:00:00:01: 192.168.10.0 is the network address of 192.168.10.0/24, "
+        "not a host address" in f.message
+    )
+    assert "fa:16:3e:00:00:02: 192.168.10.255 is the broadcast address of 192.168.10.0/24" in (
+        f.message
+    )
+    assert "fa:16:3e:00:00:02: fd00:10:: is the network address of fd00:10::/64" in f.message
+    assert "fa:16:3e:00:00:04: 10.255.0.0 is the network address of 10.255.0.0/31" in f.message
+    # one problem per address; the NIC with host addresses has none
+    assert f.message.count("not a host address") == 4
+    assert "fa:16:3e:00:00:03" not in f.message and "in no subnet" not in f.message
+    # host addresses: a /31 and an IPv6 subnet have no broadcast address
+    hosts = make_plan(
+        nic_overrides=entries(
+            ("rhoso-dmz", ["192.168.10.1"]),
+            ("rhoso-dmz", ["192.168.10.254"]),
+            ("rhoso-dmz", ["fd00:10::1", "fd00:10::ffff:ffff:ffff:ffff"]),
+            ("rhoso-p2p", ["10.255.0.1", "fd99:ffff:ffff:ffff:ffff:ffff:ffff:ffff"]),
+        )
+    )
+    found = check(vm, plan=hosts, dst=dst)
+    assert all(x.code != "MAP_NIC_OVERRIDE_INVALID" for x in found), found
+    assert only(found, "MAP_NIC_OVERRIDE").severity == Severity.info
+
+
 def test_vmware_sources_are_never_prestaged():
     """The kit has no pre-stage step: an unmapped port group blocks instead of informing."""
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
