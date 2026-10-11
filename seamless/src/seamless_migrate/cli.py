@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from . import __version__
 from .ai.redaction import redact
 from .config import Settings
-from .domain.enums import ProviderKind, Role, Strategy, strategies_for
+from .domain.enums import Phase, ProviderKind, Role, Strategy, strategies_for
 from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
 from .security.auth import TokenStore, auth_disabled_allowed, generate_token, is_loopback
@@ -276,20 +276,27 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         store.put("plan", plan, expected_version=0)
         kind, verb = "plan.created", "created"
     else:
-        from .orchestrator import blocks_plan_change, in_flight_refusal
+        from .orchestrator import (
+            PROVIDER_FIELDS,
+            blocks_plan_change,
+            failed_provider_change_refusal,
+            in_flight_refusal,
+        )
         from .store import ConflictError
 
         # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
         existing, version = store.get_versioned("plan", existing.id, Plan)
         if str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
-        busy = [
-            m
-            for m in store.list("migration", Migration, plan_id=existing.id)
-            if blocks_plan_change(m)
-        ]
+        migrations = store.list("migration", Migration, plan_id=existing.id)
+        busy = [m for m in migrations if blocks_plan_change(m)]
         if busy:
             raise CliError(in_flight_refusal(busy, "editing the plan"))
+        if any(getattr(spec, f) != getattr(existing, f) for f in PROVIDER_FIELDS):
+            # SDD §12: a failed migration's rollback acts on the clouds its attempt used
+            failed = [m.vm.name for m in migrations if m.phase == Phase.failed]
+            if failed:
+                raise CliError(failed_provider_change_refusal(failed))
         plan = Plan.model_validate(
             {**existing.model_dump(mode="json"), **spec.model_dump(mode="json"), "status": "draft"}
         )

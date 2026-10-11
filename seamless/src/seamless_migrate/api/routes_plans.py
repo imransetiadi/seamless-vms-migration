@@ -18,7 +18,7 @@ from ..domain.models import (
     ValidationReport,
 )
 from ..events import emit
-from ..orchestrator import in_flight_refusal
+from ..orchestrator import PROVIDER_FIELDS, failed_provider_change_refusal, in_flight_refusal
 from ..plan_checks import PlanSpecError, check_plan_spec
 from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
@@ -33,7 +33,6 @@ POLICY_FIELDS = frozenset(
     {"require_approval", "require_distinct_approver", "auto_cutover", "cutover_window"}
 )
 #: a plan's clouds: they do not change while a failed migration's rollback may still need them (§12)
-PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
 
 
 async def _check_policy_fields(request: Request, fields: set[str], principal: Principal) -> None:
@@ -177,14 +176,7 @@ async def update_plan(
                 if m.phase == Phase.failed
             ]
             if failed:
-                noun = "migration" if len(failed) == 1 else "migrations"
-                raise ApiError(
-                    409,
-                    "conflict",
-                    f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before "
-                    "changing the plan's providers: its rollback acts on the clouds its attempt "
-                    "used",
-                )
+                raise ApiError(409, "conflict", failed_provider_change_refusal(failed))
         try:
             merged = PlanCreate.model_validate(
                 {**plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS), **body}

@@ -135,6 +135,33 @@ def test_plan_apply_refuses_an_update_while_a_migration_is_in_flight(env, capsys
     assert store.get("plan", plan_id, Plan).downtime_slo_s == 900
 
 
+def test_plan_apply_refuses_new_providers_while_a_migration_is_failed(env, capsys):
+    """SDD §15/§12: like PATCH /plans/{id}, an update may not change the plan's clouds while a
+    migration is failed - its rollback acts on the clouds its attempt used."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    store.put(
+        "provider",
+        make_provider(id="dst-two", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    failed = make_migration(
+        plan_id=plan_id, vm=make_vm(source_id="vm-1", name="web-01"), phase=Phase.failed
+    )
+    store.put("migration", failed)
+    moved = env / "moved.yaml"
+    moved.write_text(
+        yaml.safe_dump({**yaml.safe_load(path.read_text()), "destination_provider_id": "dst-two"})
+    )
+    assert cli.main(["plan", "apply", "-f", str(moved)]) == 1
+    assert capsys.readouterr().err.strip() == (
+        "error: roll back or cancel the failed migration (web-01) before changing the plan's "
+        "providers: its rollback acts on the clouds its attempt used"
+    )
+    assert store.get("plan", plan_id, Plan).destination_provider_id == "dst-rhoso"
+    # the same plan, other fields changed: allowed, as by the API
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 900
+
+
 def test_plan_apply_never_overwrites_a_change_it_did_not_see(env, capsys, monkeypatch):
     """SDD §15: a server that starts the plan between the CLI's read and its write wins; the CLI
     fails and asks to run it again instead of putting the plan back to draft."""

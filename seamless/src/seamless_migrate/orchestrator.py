@@ -161,6 +161,20 @@ def blocks_plan_change(m: Migration) -> bool:
     return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
 
 
+#: a plan's clouds: a failed migration's rollback acts on the ones its attempt used (SDD §12)
+PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
+
+
+def failed_provider_change_refusal(failed: list[str]) -> str:
+    """The 409 of a change of a plan's providers while migrations named ``failed`` are failed
+    (SDD §12), the same from PATCH /plans/{id} and from `seamless plan apply` (§15)."""
+    noun = "migration" if len(failed) == 1 else "migrations"
+    return (
+        f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before changing the "
+        "plan's providers: its rollback acts on the clouds its attempt used"
+    )
+
+
 def in_flight_refusal(busy: Iterable[Migration], before: str, limit: int = 10) -> str:
     """The 409 of an edit or re-wave while ``busy`` are in flight (SDD §12): each VM, at most
     ``limit`` per kind and how many are left out, with what releases it."""
