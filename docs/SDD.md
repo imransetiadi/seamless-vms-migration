@@ -1950,7 +1950,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (WCAG 1.4.10 reflow) or wider.
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
   Retry, and a panel or figure built from it says it is unavailable (or shows "—") instead of its empty
-  state or a zero ("No VM is down", "Failed 0").
+  state or a zero ("No VM is down", "Failed 0"). That stays while it is fetched again — by Retry, a live event or
+  the window regaining focus: Retry is busy and keeps the focus, and nothing turns back into a loading placeholder
+  until an answer replaces it.
 * Failed requests of a batch action (Check all on Providers): a request that fails is never left out as
   if it had not been asked — the result names each item whose request failed, with Retry for those
   items, and the announcement counts them ("Checked 2 of 3 providers: 2 healthy; 1 could not be
