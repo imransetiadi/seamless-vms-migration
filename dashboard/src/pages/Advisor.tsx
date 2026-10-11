@@ -1,9 +1,9 @@
 import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX, SlidersHorizontal } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
-import { useAdvisorStatus, useMigrations, useRecommendations, useSimilarIncidents } from '../api/hooks';
+import { useAdvisorStatus, useMigrations, usePlans, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
-import { ADVISOR_QUERY_MAX } from '../api/types';
+import { ADVISOR_QUERY_MAX, DECISION_TYPES, type DecisionType } from '../api/types';
 import { AdvisorNotes, type AdvisorNoteRow } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
@@ -17,7 +17,7 @@ import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList, RecommendationPager } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
-import { nonStrategyNotes } from '../lib/advisor';
+import { DECISION_TYPE_LABELS, nonStrategyNotes } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
 import { formatPct } from '../lib/format';
 import { can, hasRole } from '../lib/roles';
@@ -90,7 +90,23 @@ export default function Advisor() {
   const [limit, setLimit] = useState('5');
   const [touched, setTouched] = useState(false);
   const [feedOffset, setFeedOffset] = useState(0);
-  const recommendations = useRecommendations({ limit: FEED_PAGE, offset: feedOffset }, { keepPrevious: true });
+  // the feed's filters live in the address like the Events plan filter (SDD §16); a change goes back to page one
+  const [params, setParams] = useSearchParams();
+  const planFilter = params.get('plan') ?? '';
+  const typeParam = params.get('type') ?? '';
+  const typeFilter = (DECISION_TYPES as readonly string[]).includes(typeParam) ? (typeParam as DecisionType) : '';
+  const plans = usePlans();
+  const setFilter = (key: 'plan' | 'type', value: string) => {
+    const next = new URLSearchParams(params);
+    if (value) next.set(key, value);
+    else next.delete(key);
+    setParams(next, { replace: true });
+    setFeedOffset(0);
+  };
+  const recommendations = useRecommendations(
+    { limit: FEED_PAGE, offset: feedOffset, plan_id: planFilter || undefined, decision_type: typeFilter || undefined },
+    { keepPrevious: true },
+  );
 
   const s = status.data;
   const memoryEnabled = s?.memory.enabled ?? false;
@@ -188,9 +204,28 @@ export default function Advisor() {
             <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
           ) : (
             <>
+              <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <SelectField
+                  label="Plan"
+                  value={planFilter}
+                  onChange={(e) => setFilter('plan', e.target.value)}
+                  options={[
+                    { value: '', label: 'All plans' },
+                    ...(plans.data ?? []).map((p) => ({ value: p.id, label: p.name })),
+                    // a plan in the address that the list does not hold stays chosen
+                    ...(planFilter && !(plans.data ?? []).some((p) => p.id === planFilter) ? [{ value: planFilter, label: planFilter }] : []),
+                  ]}
+                />
+                <SelectField
+                  label="Decision"
+                  value={typeFilter}
+                  onChange={(e) => setFilter('type', e.target.value)}
+                  options={[{ value: '', label: 'All decisions' }, ...DECISION_TYPES.map((t) => ({ value: t, label: DECISION_TYPE_LABELS[t] }))]}
+                />
+              </div>
               <RecommendationList
                 items={recommendations.data.items}
-                emptyText="No recommendations yet."
+                emptyText={planFilter || typeFilter ? 'No recommendations match these filters.' : 'No recommendations yet.'}
                 actionsFor={(rec, focusAfterRef) => {
                   const m = rec.migration_id ? byId.get(rec.migration_id) : undefined;
                   return can(role, 'advisor.approve') && m && m.advisor_hold === rec.id ? (

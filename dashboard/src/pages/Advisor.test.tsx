@@ -1,7 +1,10 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useLocation } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { strategyRecommendation } from '../api/mockData';
+import type { MockServer } from '../api/mock';
+import type { RecommendationPage } from '../api/types';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Advisor from './Advisor';
 
@@ -14,6 +17,34 @@ function serverWithoutMigrations() {
       ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
       : handle(method, path, query, body, token);
   return server;
+}
+
+function Where() {
+  const location = useLocation();
+  return <output data-testid="where">{location.search}</output>;
+}
+
+function total(server: MockServer, query: Record<string, string>): number {
+  return (server.handle('GET', '/advisor/recommendations', new URLSearchParams(query), undefined, 'viewer').body as RecommendationPage).total;
+}
+
+function addRecommendations(server: MockServer, m: MockServer['migrations'][number], n: number) {
+  for (let i = 0; i < n; i += 1) {
+    server.recommendations.push(
+      strategyRecommendation({
+        id: `rec-b0000000${String(i).padStart(4, '0')}`,
+        at: new Date(Date.parse('2026-09-01T00:00:00Z') + i * 60_000).toISOString(),
+        migration: m,
+        providerId: 'rhosp17-dc1',
+        option: 'warm',
+        confidence: 0.9,
+        options: ['cold', 'warm'],
+        status: 'auto_applied',
+        deterministic: 'warm',
+        snapshotSha256: null,
+      }),
+    );
+  }
 }
 
 describe('Advisor page', () => {
@@ -175,6 +206,49 @@ describe('Advisor page', () => {
     expect(await within(feed).findByText(`21–${total} of ${total}`)).toBeInTheDocument();
     expect(within(feed).getAllByText(/^Decision: /)).toHaveLength(total - 20);
     expect(within(feed).getByRole('button', { name: /next/i })).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('filters the feed by plan and decision type, keeps both in the address and goes back to the first page (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    addRecommendations(server, m, 25);
+    renderWithApp(
+      <>
+        <Advisor />
+        <Where />
+      </>,
+      { token: 'viewer', server, route: '/advisor' },
+    );
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByText(/^1–20 of /);
+    await user.click(within(feed).getByRole('button', { name: /next/i }));
+    await within(feed).findByText(/^21–/);
+
+    const plan = screen.getByLabelText('Plan');
+    await user.selectOptions(plan, m.plan_id);
+    const inPlan = total(server, { plan_id: m.plan_id });
+    expect(await within(feed).findByText(`1–20 of ${inPlan}`)).toBeInTheDocument();
+    expect(screen.getByTestId('where')).toHaveTextContent(`plan=${m.plan_id}`);
+    expect(plan).toHaveFocus();
+
+    await user.selectOptions(screen.getByLabelText('Decision'), 'workload_tier');
+    const tiers = total(server, { plan_id: m.plan_id, decision_type: 'workload_tier' });
+    expect(tiers).toBeLessThan(inPlan);
+    await waitFor(() => expect(within(feed).queryAllByText(/^Decision: /)).toHaveLength(tiers));
+    expect(screen.getByTestId('where')).toHaveTextContent('type=workload_tier');
+  });
+
+  it('opens with the filters the address holds', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    addRecommendations(server, m, 25);
+    renderWithApp(<Advisor />, { token: 'viewer', server, route: `/advisor?plan=${m.plan_id}&type=migration_strategy` });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    const expected = total(server, { plan_id: m.plan_id, decision_type: 'migration_strategy' });
+    expect(await within(feed).findByText(`1–20 of ${expected}`)).toBeInTheDocument();
+    expect(screen.getByLabelText('Plan')).toHaveValue(m.plan_id);
+    expect(screen.getByLabelText('Decision')).toHaveValue('migration_strategy');
   });
 
   it('says the recommendations could not be loaded instead of that there are none', async () => {
