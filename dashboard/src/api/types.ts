@@ -685,6 +685,7 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.deleted',
   'provider.checked',
   'auth.denied',
+  'events.pruned',
   // audit events (SDD §14.5)
   'recommendation.created',
   'decision.auto_applied',

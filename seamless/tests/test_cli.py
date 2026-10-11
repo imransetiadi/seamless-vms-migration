@@ -696,6 +696,50 @@ def test_events_export_and_prune(env, capsys, tmp_path):
     assert cli.main(["events", "prune", "--confirm"]) == 2
     assert cli.main(["events", "prune", "--before", "2026-10-02T00:00:00Z", "--confirm"]) == 0
     assert "deleted 1 event(s)" in capsys.readouterr().out
+    # SDD §15: the trail keeps who cut it and where (events.pruned, written after the delete)
+    pruned = store.events(since_seq=0, limit=10)[-1]
+    assert (pruned.kind, pruned.actor) == ("events.pruned", "cli")
+    assert pruned.data == {"before": "2026-10-02T00:00:00+00:00", "deleted": 1}
     assert cli.main(["events", "prune", "--older-than-days", "0", "--confirm"]) == 0
-    assert "deleted 2 event(s)" in capsys.readouterr().out
-    assert store.events(since_seq=0, limit=10) == []
+    assert "deleted 3 event(s)" in capsys.readouterr().out  # e1, e2 and the first prune's record
+    left = store.events(since_seq=0, limit=10)
+    assert [(e.kind, e.data["deleted"]) for e in left] == [("events.pruned", 3)]
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        ["--older-than-days", "-1"],
+        ["--older-than-days", "nan"],
+        ["--older-than-days", "inf"],
+        ["--before", "2999-01-01T00:00:00Z"],
+    ],
+)
+def test_events_prune_refuses_a_cutoff_after_now(env, capsys, bound):
+    """SDD §15: a cutoff after now would delete the whole trail."""
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.models import Event
+
+    store = store_for(env)
+    store.append_event(
+        Event(ts=datetime(2026, 10, 1, tzinfo=UTC), kind="plan.updated", actor="t", message="e")
+    )
+    assert cli.main(["events", "prune", *bound, "--confirm"]) == 2
+    assert capsys.readouterr().err.startswith("error: ")
+    assert [e.message for e in store.events(since_seq=0, limit=10)] == ["e"]
+
+
+def test_events_prune_reads_a_before_without_an_offset_as_utc(env, capsys):
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.models import Event
+
+    store = store_for(env)
+    for hour in (1, 3):
+        store.append_event(
+            Event(ts=datetime(2026, 10, 1, hour, tzinfo=UTC), kind="plan.updated", actor="t",
+                  message=f"h{hour}")
+        )  # fmt: skip
+    assert cli.main(["events", "prune", "--before", "2026-10-01T02:00:00", "--confirm"]) == 0
+    assert "deleted 1 event(s) before 2026-10-01T02:00:00+00:00" in capsys.readouterr().out

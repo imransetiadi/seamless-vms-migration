@@ -544,17 +544,29 @@ def cmd_events_export(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
-    """Delete events older than a date or an age; refuses without ``--confirm``."""
-    from datetime import datetime, timedelta
+    """Delete events older than a date or an age; refuses without ``--confirm`` (SDD §15)."""
+    import math
+    from datetime import UTC, datetime, timedelta
 
-    from .domain.models import utcnow
+    from .events import EventBus, emit
 
+    now = utcnow()
     if args.before:
         before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)  # a --before without an offset is UTC
     elif args.older_than_days is not None:
-        before = utcnow() - timedelta(days=float(args.older_than_days))
+        days = float(args.older_than_days)
+        if not math.isfinite(days) or days < 0:
+            print("error: --older-than-days must be a number of days, 0 or more", file=sys.stderr)
+            return 2
+        before = now - timedelta(days=days)
     else:
         print("error: give --before <ISO datetime> or --older-than-days N", file=sys.stderr)
+        return 2
+    if before > now:
+        # a cutoff after now deletes the whole trail, the events still to come included
+        print(f"error: --before {before.isoformat()} is after now", file=sys.stderr)
         return 2
     if not args.confirm:
         print(
@@ -563,7 +575,19 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
             file=sys.stderr,
         )
         return 2
-    deleted = _store(settings).delete_events_before(before)
+    store = _store(settings)
+    deleted = store.delete_events_before(before)
+    # written after the delete, so the trail keeps who cut it and where (SDD §15)
+    asyncio.run(
+        emit(
+            store,
+            EventBus(store),
+            "events.pruned",
+            f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
+            actor="cli",
+            data={"before": before.isoformat(), "deleted": deleted},
+        )
+    )
     print(f"deleted {deleted} event(s) before {before.isoformat()}")
     return 0
 

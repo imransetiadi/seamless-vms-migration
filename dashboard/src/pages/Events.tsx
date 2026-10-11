@@ -4,6 +4,7 @@ import {
   ArrowRightLeft,
   Bot,
   Download,
+  Eraser,
   BrainCircuit,
   Gavel,
   CircleStop,
@@ -59,7 +60,8 @@ const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) =>
     match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.'),
   },
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
-  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') },
+  // a prune cuts the audit trail itself (SDD §15)
+  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') || k === 'events.pruned' },
 ];
 
 function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
@@ -86,6 +88,8 @@ function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
       return { icon: ScrollText, tone: 'neutral' };
     case 'auth.denied':
       return { icon: ShieldAlert, tone: 'danger' };
+    case 'events.pruned':
+      return { icon: Eraser, tone: 'warning' };
     default:
       if (kind.startsWith('plan.')) return { icon: ClipboardList, tone: 'info' };
       if (kind.startsWith('wave.')) return { icon: Rows3, tone: 'info' };

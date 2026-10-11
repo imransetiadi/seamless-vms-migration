@@ -172,6 +172,27 @@ describe('Events page', () => {
     for (const item of within(list).getAllByRole('listitem')) expect(item).toHaveTextContent(/legacy-rhel6-app/);
   });
 
+  it('files a prune of the audit trail under Security (SDD §4.3, §15)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    server.emit({
+      kind: 'events.pruned',
+      plan_id: null,
+      migration_id: null,
+      actor: 'cli',
+      message: '120 event(s) before 2026-09-01T00:00:00+00:00 deleted from the CLI',
+      data: { before: '2026-09-01T00:00:00+00:00', deleted: 120 },
+    });
+    renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText(/120 event\(s\) before/);
+
+    await user.selectOptions(screen.getByLabelText('Category'), 'security');
+    const items = within(list).getAllByRole('listitem');
+    expect(items.some((item) => item.textContent?.includes('events.pruned'))).toBe(true);
+    for (const item of items) expect(item).toHaveTextContent(/auth\.denied|events\.pruned/);
+  });
+
   it('moves focus to the list when its last Show older events button goes, never to the page (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
