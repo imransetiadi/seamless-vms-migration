@@ -4,6 +4,7 @@ import {
   CircleHelp,
   CircleX,
   ClipboardList,
+  SearchX,
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
@@ -11,6 +12,7 @@ import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useDemoSpeed, useMigrations, usePlans, useStats } from '../api/hooks';
 import type { Migration, Phase, Plan } from '../api/types';
+import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { DowntimeSloChart } from '../components/DowntimeSloChart';
@@ -270,6 +272,8 @@ export default function Overview() {
   const plansUnknown = Boolean(plansQuery.error) && !plansQuery.data;
   const statsUnknown = Boolean(stats.error) && !s;
   const migrationsUnknown = Boolean(migrationsQuery.error) && !migrationsQuery.data;
+  // a plan id in the address that the loaded plans do not hold (mistyped, or an old link)
+  const unknownPlan = Boolean(planId) && Boolean(plansQuery.data) && !plansById.has(planId);
 
   const setPlan = (value: string) => {
     const next = new URLSearchParams(params);
@@ -278,7 +282,7 @@ export default function Overview() {
     setParams(next, { replace: true });
   };
 
-  return (
+  const header = (
     <>
       <PageHeader
         title="Overview"
@@ -289,12 +293,42 @@ export default function Overview() {
             className="w-full sm:w-72"
             value={planId}
             onChange={(e) => setPlan(e.target.value)}
-            options={[{ value: '', label: 'All plans' }, ...plans.map((p) => ({ value: p.id, label: p.name }))]}
+            options={[
+              { value: '', label: 'All plans' },
+              ...plans.map((p) => ({ value: p.id, label: p.name })),
+              // a plan in the address that the list does not hold stays chosen (SDD §16), as on Events
+              ...(planId && !plansById.has(planId) ? [{ value: planId, label: planId }] : []),
+            ]}
           />
         }
       />
 
       {plansQuery.error && <ErrorBanner error={plansQuery.error} title="Plans are unavailable" onRetry={() => void plansQuery.refetch()} className="mb-4" />}
+    </>
+  );
+
+  if (unknownPlan) {
+    // its figures would all be zero: never an all-clear page for a plan that does not exist (SDD §16)
+    return (
+      <>
+        {header}
+        <EmptyState
+          icon={SearchX}
+          title={`Plan ${planId} does not exist`}
+          description="It may have been mistyped or come from an old link."
+          action={
+            <Button variant="secondary" onClick={() => setPlan('')}>
+              Show all plans
+            </Button>
+          }
+        />
+      </>
+    );
+  }
+
+  return (
+    <>
+      {header}
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
 
       {!s ? (

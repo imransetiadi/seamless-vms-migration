@@ -25,6 +25,20 @@ describe('Overview page (mock data)', () => {
     for (const value of values) expect(value).toHaveClass('text-muted-foreground');
   });
 
+  it('keeps a plan in the address that names no plan chosen, and says it does not exist instead of an all-clear (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Overview />, { route: '/?plan=plan-00000000', path: '/', token: 'viewer' });
+    expect(await screen.findByText(/^plan plan-00000000 does not exist$/i)).toBeInTheDocument();
+    const select = screen.getByLabelText(/^plan$/i);
+    expect(select).toHaveValue('plan-00000000');
+    // no zeros read as all clear
+    expect(screen.queryByText(/no vm is down/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /show all plans/i }));
+    await waitFor(() => expect(screen.getByLabelText(/^plan$/i)).toHaveValue(''));
+    expect(screen.queryByText(/does not exist/i)).not.toBeInTheDocument();
+  });
+
   it('renders KPI tiles from /stats', async () => {
     const { server } = renderWithApp(<Overview />);
 
