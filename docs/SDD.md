@@ -1859,6 +1859,10 @@ keys are that request's body: a field the file leaves out keeps its value, `upda
 events carry the API's data (`plan.created` `{name, vms}`, `plan.updated` `{fields}`, the file's keys)
 with actor `cli`. The CLI has no role: whoever can run it against the store owns the store, so the
 approver-only fields (§12) are not checked.
+`plan validate` and `plan start` wait, before they exit, for the cleanups of the migrations they
+cancelled (a VM removed from the plan, §5.1), saying so: the process's end would cut them short, and a
+running server only resumes a cut-short cleanup when it starts. One interrupted anyway (Ctrl-C) keeps its
+mark and runs when the server next starts.
 `events prune` deletes the events older than its cutoff and then records `events.pruned` (actor `cli`, data
 `{before, deleted}`), which the deletion cannot take: the trail keeps who cut it and where. It refuses a
 cutoff after now (a negative or non-finite `--older-than-days`, a later `--before`), which would delete the
