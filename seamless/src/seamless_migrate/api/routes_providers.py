@@ -124,6 +124,34 @@ def _check_secret_names(provider: Provider, fields: set[str]) -> None:
             f"{', '.join(bad)}: a secret name is 1-128 letters, digits, '.', '_' or '-', "
             "starting with a letter or digit",
         )
+    # provider-* names are the ones the store writes for each provider: naming another provider's
+    # would let a check send its credentials to this provider's endpoint (SDD §13.3)
+    own = {
+        "credentials_secret": credentials_secret_name(provider.id),
+        "conversion_host.ssh_key_secret": conversion_key_secret_name(provider.id),
+    }
+    taken = [
+        field
+        for field, name in names.items()
+        if name is not None and name.startswith("provider-") and name != own[field]
+    ]
+    if taken:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(taken)}: provider-* names belong to the secrets Seamless stores for each "
+            "provider; this one is another provider's",
+        )
+
+
+def _secret_names(provider: Provider) -> dict[str, str]:
+    """The secrets a provider reads, by name, for its audit events (never a value; SDD §13.3)."""
+    names = {}
+    if provider.credentials_secret:
+        names["credentials_secret"] = provider.credentials_secret
+    if provider.conversion_host is not None and provider.conversion_host.ssh_key_secret:
+        names["ssh_key_secret"] = provider.conversion_host.ssh_key_secret
+    return names
 
 
 @router.post("/providers", response_model=Provider, status_code=201)
@@ -145,7 +173,12 @@ async def create_provider(
         "provider.created",
         f"provider {provider.id} created",
         actor=principal.name,
-        data={"provider_id": provider.id, "kind": str(provider.kind), "role": str(provider.role)},
+        data={
+            "provider_id": provider.id,
+            "kind": str(provider.kind),
+            "role": str(provider.role),
+            **_secret_names(provider),
+        },
     )
     return provider
 
@@ -188,7 +221,7 @@ async def update_provider(
         "provider.updated",
         f"provider {provider_id} updated",
         actor=principal.name,
-        data={"provider_id": provider_id, "fields": sorted(body)},
+        data={"provider_id": provider_id, "fields": sorted(body), **_secret_names(updated)},
     )
     return updated
 

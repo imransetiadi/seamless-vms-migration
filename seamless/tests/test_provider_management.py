@@ -317,7 +317,9 @@ def test_credential_validation_per_kind(api):
     }
 
 
-@pytest.mark.parametrize("bad", ["../etc", "-starts-with-dash", "has space", "a" * 129, ".", ".."])
+@pytest.mark.parametrize(
+    "bad", ["../etc", "-starts-with-dash", "has space", "a" * 129, ".", "..", "trailing\n"]
+)
 def test_a_secret_name_the_reader_could_not_use_is_refused(api, bad):
     """SDD §13.3: credentials_secret and conversion_host.ssh_key_secret name a secret managed
     outside Seamless; a name security.secrets would refuse to read is refused when written."""
@@ -343,6 +345,43 @@ def test_a_provider_stored_with_an_odd_secret_name_stays_editable(api):
         patch(api, "/api/v1/providers/src-osp", {"credentials_secret": "old name"}).status_code
         == 422
     )
+
+
+def test_a_provider_may_not_name_another_providers_secret(api):
+    """SDD §13.3: provider-* names belong to the providers the store writes them for; a check would
+    send another provider's credentials to this provider's endpoint."""
+    other = api.post(
+        "/api/v1/providers",
+        json={**VCENTER, "id": "vc-x", "credentials_secret": "provider-src-osp"},
+    )
+    assert other.status_code == 422 and "another provider" in other.json()["error"]["message"]
+    own = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-y", "credentials_secret": "provider-vc-y"}
+    )
+    assert own.status_code == 201, own.text
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "provider-dst-rhoso-ssh"}
+    assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 422
+    host["ssh_key_secret"] = "provider-src-osp-ssh"
+    assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 200
+
+
+def test_provider_events_name_the_secrets_it_reads(api):
+    """SDD §13.3: the audit trail says which secret a provider reads, never a value."""
+    created = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-z", "credentials_secret": "vcenter-dc9"}
+    )
+    assert created.status_code == 201, created.text
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "conv-dc9-key"}
+    assert patch(api, "/api/v1/providers/vc-z", {"conversion_host": host}).status_code == 200
+    events = api.store.events(since_seq=0, limit=100000)
+    made = next(
+        e for e in events if e.kind == "provider.created" and e.data["provider_id"] == "vc-z"
+    )
+    assert made.data["credentials_secret"] == "vcenter-dc9"
+    changed = [
+        e for e in events if e.kind == "provider.updated" and e.data["provider_id"] == "vc-z"
+    ]
+    assert changed[-1].data["ssh_key_secret"] == "conv-dc9-key"
 
 
 def test_a_secret_managed_outside_seamless_can_be_named(api):
@@ -508,6 +547,57 @@ def test_kubernetes_store_against_a_fake_api_server():
     )
     with pytest.raises(SecretStoreError, match="may not GET secrets in ns"):
         forbidden.read("provider-x")
+
+
+def test_kubernetes_store_reads_only_its_own_or_labelled_secrets():
+    """SDD §13.3: never the deployment's own Secrets (seamless-db, seamless-tokens, ...)."""
+
+    def secret(labels, **data):
+        encoded = {k: base64.b64encode(v.encode()).decode() for k, v in data.items()}
+        return {"metadata": {"labels": labels}, "data": encoded}
+
+    secrets = {
+        "seamless-db": secret(
+            {"app.kubernetes.io/part-of": "seamless-migrate"}, username="pg", password="x"
+        ),
+        "seamless-ext": secret({"seamless.io/provider-secret": "true"}, username="u", password="p"),
+        "seamless-own": secret(
+            {"app.kubernetes.io/managed-by": "seamless-migrate"}, username="o", password="q"
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        name = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=secrets[name]) if name in secrets else httpx.Response(404)
+
+    store = KubernetesSecretStore(
+        "ns", base_url="https://api.test", token="t", transport=httpx.MockTransport(handler)
+    )
+    assert store.read("db") is None
+    assert store.read("ext") == {"username": "u", "password": "p"}
+    assert store.read("own") == {"username": "o", "password": "q"}
+
+
+def test_a_name_the_kubernetes_store_cannot_hold_reads_the_variables(tmp_path, monkeypatch):
+    """SDD §13.3: upper-case or '_' is a valid secret name but not a Kubernetes one: the
+    variables are read instead of the read failing."""
+    settings = Settings(secrets_dir=tmp_path, secret_store="kubernetes", k8s_namespace="ns")
+    from seamless_migrate.security import secret_store as module
+
+    asked: list[str] = []
+
+    class FakeStore:
+        def __init__(self, namespace):
+            pass
+
+        def read(self, name):
+            asked.append(name)
+            raise module.SecretStoreError(f"invalid secret name {name!r}")
+
+    monkeypatch.setattr(module, "KubernetesSecretStore", FakeStore)
+    env = {"SEAMLESS_SECRET_VCENTER_DC2_USERNAME": "u", "SEAMLESS_SECRET_VCENTER_DC2_PASSWORD": "p"}
+    assert read_secret("Vcenter_DC2", settings, env) == {"username": "u", "password": "p"}
+    assert asked == []
 
 
 def test_read_secret_order_files_then_store_then_environment(tmp_path, monkeypatch):

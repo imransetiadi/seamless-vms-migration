@@ -31,7 +31,7 @@ class SecretNotFound(LookupError):
 def valid_secret_name(name: str) -> bool:
     """A name this module reads (SDD §13.3): 1-128 letters, digits, ``.``, ``_`` or ``-``,
     starting with a letter or digit - never a path."""
-    return bool(_NAME.match(name)) and name not in (".", "..")
+    return bool(_NAME.fullmatch(name)) and name not in (".", "..")
 
 
 def _env_prefix(name: str) -> str:
@@ -54,12 +54,15 @@ def read_secret(
                 continue
             values[entry.name] = entry.read_text(encoding="utf-8").strip()
     if not values and settings.secret_store == "kubernetes":
-        from .secret_store import KubernetesSecretStore, SecretStoreError
+        from .secret_store import KubernetesSecretStore, SecretStoreError, kubernetes_name
 
-        try:
-            values = KubernetesSecretStore(settings.k8s_namespace).read(name) or {}
-        except SecretStoreError as exc:
-            raise SecretNotFound(f"secret {name!r}: {exc}") from None
+        # a name the store cannot hold (upper-case, '_') is not there: the variables come next
+        # (SDD §13.3)
+        if kubernetes_name(name):
+            try:
+                values = KubernetesSecretStore(settings.k8s_namespace).read(name) or {}
+            except SecretStoreError as exc:
+                raise SecretNotFound(f"secret {name!r}: {exc}") from None
     if not values:
         source = os.environ if env is None else env
         prefix = _env_prefix(name)
