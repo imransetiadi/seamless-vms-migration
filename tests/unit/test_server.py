@@ -467,11 +467,30 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             {"id": "sub-slaac", "network_id": "net-slaac", "cidr": "fd00:20::/64",
              "ipv6_address_mode": "slaac", "ipv6_ra_mode": "slaac"},
             {"id": "sub-p2p", "network_id": "net-p2p", "cidr": "10.255.0.0/31"},
+            {"id": "sub-provider", "network_id": "net-provider", "cidr": "10.0.0.0/24"},
+            {"id": "sub-private-b", "network_id": "net-private-b", "cidr": "10.0.0.0/24"},
+            {"id": "sub-ext", "network_id": "net-ext", "cidr": "10.0.0.0/24"},
         ):
             self.dst.subnets[subnet["id"]] = fake.Obj(
                 {"ipv6_address_mode": None, "ipv6_ra_mode": None, **subnet}
             )
-        networks = {"app": "net-app", "slaac": "net-slaac", "p2p": "net-p2p", "public": "net-public"}
+        networks = {
+            "app": "net-app", "slaac": "net-slaac", "p2p": "net-p2p", "public": "net-public",
+            "provider": "net-provider", "private-b": "net-private-b", "ext": "net-ext",
+        }
+        # the credential's own networks, and three of other projects: shared, private, external
+        for net_id, project, shared, external in (
+            ("net-app", self.dst.current_project_id, False, False),
+            ("net-slaac", self.dst.current_project_id, False, False),
+            ("net-p2p", self.dst.current_project_id, False, False),
+            ("net-public", self.dst.current_project_id, False, True),
+            ("net-provider", "project-admin", True, False),
+            ("net-private-b", "project-b", False, False),
+            ("net-ext", "project-admin", False, True),
+        ):
+            self.dst.networks[net_id] = fake.Obj(
+                id=net_id, project_id=project, is_shared=shared, is_router_external=external
+            )
 
         def network_id(conn, ref, required=True):
             if ref["name"] == "twice":
@@ -535,6 +554,41 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         [subnet] = self.errors([network_port("p3", "app", gone)])
         self.assertIn("port p3 on network 'app'", subnet)
         self.assertIn("No Subnet found for gone-subnet", subnet)
+
+    def test_refuses_a_network_the_credential_may_not_put_a_port_on(self):
+        """SDD 6.6: another project's network takes the port only when it is shared with the
+        credential's project or external, and only from a token with the admin or advsvc role:
+        Neutron's policy lets only those, or the network's project, choose the address or MAC
+        that the import asks for - after the source stops."""
+        app = [{"ip_address": "10.0.0.5"}]
+        for mode in ("nova", "neutron"):
+            # the credential's own network, whatever its roles
+            self.assertEqual(self.errors([network_port("p1", "app", app)], mode=mode), [])
+            [private] = self.errors([network_port("p1", "private-b", app)], mode=mode)
+            self.assertEqual(
+                "Destination prerequisites not met: port p1 on network 'private-b': the network "
+                "belongs to project project-b and is neither shared with the credential's project "
+                "nor external",
+                private,
+            )
+            for name in ("provider", "ext"):
+                [member] = self.errors([network_port("p1", name, app)], mode=mode)
+                self.assertEqual(
+                    f"Destination prerequisites not met: port p1 on network '{name}': the "
+                    "network belongs to project project-admin, and Neutron lets only the admin or "
+                    "advsvc role, or that project, choose a port's address or MAC there; the "
+                    "destination credential's token has neither role",
+                    member,
+                )
+        for roles in (["admin", "member", "reader"], ["advsvc"]):
+            self.dst.roles = roles
+            for mode in ("nova", "neutron"):
+                self.assertEqual(self.errors([network_port("p1", "provider", app)], mode=mode), [])
+                self.assertEqual(self.errors([network_port("p1", "ext", app)], mode=mode), [])
+                # the admin sees every project's networks, yet never puts the VM on another
+                # tenant's private one
+                [private] = self.errors([network_port("p1", "private-b", app)], mode=mode)
+                self.assertIn("is neither shared with the credential's project nor external", private)
 
     def test_refuses_an_address_neutron_would_refuse_on_the_port(self):
         def check(address, network="app", subnet=None, mode="nova"):

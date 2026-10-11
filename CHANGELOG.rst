@@ -140,3 +140,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``port_creation_mode: neutron`` another port with its MAC on the network.
   The unbound port an earlier attempt created is the one exception, since
   the import uses it again.
+- ``import_workload_dst_check`` also refuses, before the source stops, a port
+  on a network that another project owns where the credential may not put it.
+  Such a network must be shared with the credential's project or external: an
+  admin sees every project's networks, and a port on another tenant's private
+  network would put the server there. The credential's token must also carry
+  the ``admin`` or ``advsvc`` role. Neutron's policy (2023.1
+  ``create_port:fixed_ips:ip_address``, ``create_port:mac_address``,
+  ``create_port:port_security_enabled``) lets only those roles, or the
+  network's own project, choose a port's address, MAC or port security. The
+  import chooses them for every port: Nova creates the port with the user's
+  token and its fixed IP, and ``port_creation_mode: neutron`` sends the MAC,
+  every address and the port-security flag.

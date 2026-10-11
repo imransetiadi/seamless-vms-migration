@@ -24,6 +24,40 @@ SERVER_PORT_ORDER_MAX = 1000
 # what makes Neutron derive a port's address on a subnet from its MAC (SDD 6.6)
 AUTO_ADDRESS_MODES = ("slaac", "dhcpv6-stateless")
 
+# the roles Neutron's policy (2023.1 create_port:fixed_ips:ip_address, :mac_address,
+# :port_security_enabled) lets choose a port's address, MAC or port security on another
+# project's network (SDD 6.6)
+PORT_ROLES = ("admin", "advsvc")
+
+
+def credential_roles(conn):
+    """The role names of the token the connection `conn` holds (SDD 6.6)."""
+    return set(conn.session.auth.get_access(conn.session).role_names or [])
+
+
+def network_refusal(conn, network_id):
+    """Why the credential of `conn` may not put a port on the network `network_id`, or
+    None (SDD 6.6). Another project's network takes it only when shared with the
+    credential's project or external - an admin sees every project's networks - and the
+    import chooses every port's address or MAC, which Neutron lets only PORT_ROLES, or
+    the network's own project, choose."""
+    network = conn.network.get_network(network_id)
+    project = network["project_id"]
+    if project == conn.current_project_id:
+        return None
+    if not (network["is_shared"] or network["is_router_external"]):
+        return (
+            f"the network belongs to project {project} and is neither shared with the "
+            "credential's project nor external"
+        )
+    if not credential_roles(conn) & set(PORT_ROLES):
+        return (
+            f"the network belongs to project {project}, and Neutron lets only the admin or "
+            "advsvc role, or that project, choose a port's address or MAC there; the "
+            "destination credential's token has neither role"
+        )
+    return None
+
 
 def port_description(source_port_id):
     """The description of a destination port created through Neutron for the
@@ -186,7 +220,8 @@ class ServerPort(osm_resource.Resource):
     def dst_port_errors(self, conn, port_creation_mode):
         """What would make the import fail to create this port after the source stops,
         looked up now as the import will look it up (SDD 6.6): its network and subnet
-        references, and every fixed IP as Neutron's IPAM takes it on the port.
+        references, whether the credential may put a port on that network, and every fixed
+        IP as Neutron's IPAM takes it on the port.
 
         Returns: list of strings (error messages), empty when the port can be created
         """
@@ -196,17 +231,20 @@ class ServerPort(osm_resource.Resource):
         )
         try:
             refs = self._refs_from_ser(conn)
+            refused = network_refusal(conn, refs["network_id"])
         except (
             osm_resource.OPENSTACK_EXC.ResourceFailure,
             osm_resource.OPENSTACK_EXC.ResourceNotFound,
             osm_resource.OPENSTACK_EXC.DuplicateResource,
         ) as e:
             return [f"Destination prerequisites not met: {where}: {e}"]
+        errors = []
+        if refused:
+            errors.append(f"Destination prerequisites not met: {where}: {refused}")
         subnets = list(conn.network.subnets(network_id=refs["network_id"]))
         # Nova creates its ports with a compute owner and a new MAC; a port created
         # through Neutron has no owner yet and keeps the source MAC
         neutron = port_creation_mode == "neutron"
-        errors = []
         for fixed_ip in refs["fixed_ips"]:
             problem = _address_refusal(fixed_ip, subnets, neutron, params.get("mac_address"))
             if problem:

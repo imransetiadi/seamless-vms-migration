@@ -40,10 +40,15 @@ class FakeCloud:
         self.images = {}
         self.devices = {}
         self.ports = {}
+        self.networks = {}
         self.subnets = {}
         self.floating_ips = {}
         self.addresses = {}
         self.fail_on = {}
+        # the credential: its project, and the role names of its token (a member by default)
+        self.current_project_id = "project-%s" % name
+        self.roles = ["member", "reader"]
+        self.session = _FakeSession(self)
         self._ids = itertools.count(1)
         self.block_storage = _FakeBlockStorage(self)
         self.compute = _FakeCompute(self)
@@ -223,6 +228,18 @@ class FakeCloud:
         return self.images[image.id]
 
 
+class _FakeSession:
+    """keystoneauth's session as far as the token's role names go:
+    ``conn.session.auth.get_access(conn.session).role_names``."""
+
+    def __init__(self, cloud):
+        self.auth = self
+        self.cloud = cloud
+
+    def get_access(self, session):
+        return Obj(role_names=list(self.cloud.roles))
+
+
 class _FakeBlockStorage:
     def __init__(self, cloud):
         self.cloud = cloud
@@ -337,6 +354,10 @@ class _FakeNetwork:
             for port in list(self.cloud.ports.values())
             if all(matches(port, key, value) for key, value in query.items())
         ]
+
+    def get_network(self, network_id):
+        self.cloud.record("get_network", network_id=network_id)
+        return self.cloud.networks[network_id]
 
     def subnets(self, **query):
         self.cloud.record("subnets", **query)
