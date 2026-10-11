@@ -12,7 +12,7 @@ from ..domain.enums import (
     Strategy,
     strategies_for,
 )
-from ..domain.models import Estimate, Finding, Plan, VMRef
+from ..domain.models import Estimate, Finding, Nic, Plan, VMRef
 from ..storage import SUPPORTED, StorageError, resolve_destination, split_host
 
 #: Two downtimes tie when they differ by less than 10 % (of the smaller one) or less than 60 s.
@@ -62,6 +62,14 @@ def eligibility(
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the destination provider")
+        # os-migrate recreates each port through Nova with exactly one fixed IP and raises for any
+        # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses
+        odd_ports = [n for n in vm.nics if len(n.fixed_ips) != 1]
+        if odd_ports:
+            copy_reasons.append(
+                "port(s) without exactly one fixed IP, which Nova cannot recreate: "
+                + _ports(odd_ports)
+            )
         out[Strategy.cold].extend(copy_reasons)
         out[Strategy.warm].extend(copy_reasons)
         if multiattach:
@@ -87,6 +95,12 @@ def eligibility(
             )
         if multiattach:
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
+        # the destination server gets one fixed IP per port: the other addresses would be dropped
+        several = [n for n in vm.nics if len(n.fixed_ips) > 1]
+        if several:
+            handover.append(
+                f"port(s) with several fixed IPs, of which one would be kept: {_ports(several)}"
+            )
         encrypted = [d for d in vm.disks if d.encrypted]
         if encrypted:
             handover.append(f"encrypted disk(s), which Cinder cannot unmanage: {_ids(encrypted)}")
@@ -101,6 +115,11 @@ def eligibility(
             for reasons in out.values():
                 reasons.append(f"blocked by finding {finding.code}")
     return out
+
+
+def _ports(nics: Sequence[Nic]) -> str:
+    """Each NIC by its network and addresses, e.g. "app-net (10.0.0.5, fd00::5)"."""
+    return ", ".join(f"{n.network} ({', '.join(n.fixed_ips) or 'no fixed IP'})" for n in nics)
 
 
 def _storage_reasons(

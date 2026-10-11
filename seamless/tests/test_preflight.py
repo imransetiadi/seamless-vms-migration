@@ -90,6 +90,7 @@ def test_catalog_is_complete():
         "DST_PROJECT_MISSING",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
+        "NET_PORT_IPS",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         "VOL_ENCRYPTED",
@@ -351,6 +352,25 @@ def test_mapping_targets_must_exist_in_the_destination():
         )
     )
     assert all(not x.code.startswith("MAP_") for x in check(vm, plan=good))
+
+
+def test_finding_net_port_ips_names_each_nic_with_its_addresses():
+    """SDD §9.3: a NIC without exactly one fixed IP (dual-stack included) is named with its
+    addresses; VMware NICs go through the migration kit and are not checked."""
+    vm = make_vm(
+        nics=[
+            Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"], mtu=1500),
+            Nic(network="db-net", fixed_ips=[], mtu=9000),
+            Nic(network="app-net", fixed_ips=["10.0.0.6"], mtu=1500),
+        ]
+    )
+    f = only(check(vm), "NET_PORT_IPS")
+    assert f.severity == Severity.warning
+    assert "app-net (10.0.0.5, fd00::5)" in f.message and "db-net (no fixed IP)" in f.message
+    assert "10.0.0.6" not in f.message
+    assert all(x.code != "NET_PORT_IPS" for x in check(make_vm()))
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    assert all(x.code != "NET_PORT_IPS" for x in check(vm, source=vmware))
 
 
 def test_vmware_sources_are_never_prestaged():

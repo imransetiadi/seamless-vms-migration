@@ -137,6 +137,12 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "SR-IOV/macvtap ports need an equivalent physnet in RHOSO; map the network accordingly.",
     ),
+    "NET_PORT_IPS": CatalogEntry(
+        Severity.warning,
+        (),
+        "Give each such port exactly one fixed IP before the cutover, or migrate the VM by storage "
+        "handover when its ports have at most one address each.",
+    ),
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
         (),
@@ -666,6 +672,21 @@ def run_preflight(
     sriov = [nic.network for nic in vm.nics if nic.vnic_type in _SRIOV_VNIC_TYPES]
     if sriov:
         out.append(finding("NET_SRIOV_PORT", f"SR-IOV/macvtap port(s) on: {_names(sriov)}."))
+
+    # os-migrate recreates each port through Nova with exactly one fixed IP; the handover keeps one
+    # per port (SDD §9.2, §9.3). VMware NICs go through the migration kit.
+    odd_ports = [nic for nic in vm.nics if len(nic.fixed_ips) != 1]
+    if odd_ports and (source is None or source.kind != ProviderKind.vmware):
+        listed = ", ".join(
+            f"{n.network} ({', '.join(n.fixed_ips) or 'no fixed IP'})" for n in odd_ports
+        )
+        out.append(
+            finding(
+                "NET_PORT_IPS",
+                f"NIC(s) without exactly one fixed IP: {listed}. Cold and warm migration cannot "
+                "recreate them; storage handover keeps one address per port.",
+            )
+        )
 
     if "pci_passthrough:alias" in vm.flavor_extra_specs:
         out.append(

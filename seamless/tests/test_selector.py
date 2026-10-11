@@ -239,3 +239,36 @@ def test_handover_ineligible_with_encrypted_disk():
     reasons = eligibility(vm, ProviderKind.openstack, plan, caps, caps)
     assert any("encrypted" in r for r in reasons[Strategy.storage_handover])
     assert not any("encrypted" in r for r in reasons[Strategy.cold])
+
+
+def test_ports_without_exactly_one_fixed_ip_rule_out_the_strategies_that_cannot_keep_them():
+    """SDD §9.2: os-migrate recreates each port through Nova with exactly one fixed IP and raises
+    for any other count after the source is stopped; the handover keeps one address per port and
+    would drop the rest. A dual-stack port is two addresses."""
+    from seamless_migrate.domain.models import Nic
+
+    plan = make_plan(handover=HandoverConfig(enabled=True, backend_map={"ceph-ssd": "h@rbd#pool"}))
+    disks = [make_disk(id="v1", volume_type="ceph-ssd")]
+    dual = make_vm(disks=disks, nics=[Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"])])
+    reasons = eligibility(dual, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS)
+    for strategy in (Strategy.cold, Strategy.warm, Strategy.storage_handover):
+        assert any("app-net (10.0.0.5, fd00::5)" in r for r in reasons[strategy]), (
+            strategy,
+            reasons[strategy],
+        )
+
+    no_ip = make_vm(disks=disks, nics=[Nic(network="l2-net", fixed_ips=[])])
+    reasons = eligibility(no_ip, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS)
+    assert any("l2-net (no fixed IP)" in r for r in reasons[Strategy.cold])
+    assert any("l2-net (no fixed IP)" in r for r in reasons[Strategy.warm])
+    assert not any("l2-net" in r for r in reasons[Strategy.storage_handover])
+
+    one = make_vm(disks=disks, nics=[Nic(network="app-net", fixed_ips=["10.0.0.5"])])
+    reasons = eligibility(one, ProviderKind.openstack, plan, OK_CAPS, OK_CAPS)
+    assert not any("app-net" in r for rs in reasons.values() for r in rs)
+
+    # VMware NICs go through the migration kit, not os-migrate's ports
+    vmw = make_vm(
+        cbt_enabled=True, nics=[Nic(network="VM Network", fixed_ips=["10.0.0.5", "fd00::5"])]
+    )
+    assert all(r == [] for r in eligibility(vmw, ProviderKind.vmware, make_plan(), {}, {}).values())
