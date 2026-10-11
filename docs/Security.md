@@ -101,7 +101,7 @@ QASuite case that exercises the control.
 | C1-01 | Spoofing | Stolen or guessed bearer token | 256-bit random tokens (`smg_` + 32 URL-safe bytes), only SHA-256 stored, `hmac.compare_digest`; TLS; token never in URL/logs; rotation procedure (§5.1, §13) | Impl + Cfg | M (tokens do not expire) | `test_token_create_prints_token_and_yaml_hash`, `test_unauthenticated_401_and_audit_event` |
 | C1-02 | Spoofing | Authentication left disabled on a reachable bind | CLI refuses `SEAMLESS_AUTH_DISABLED=true` unless the bind is loopback; Compose and manifests pin `false` | Impl | L | `test_auth_disabled_only_on_loopback`, `test_serve_refuses_auth_disabled_on_public_bind` |
 | C1-03 | Tampering | Role bypass: a viewer or operator calls an approver/admin route | Minimum role declared per route; roles ordered; FSM rejects invalid transitions with 409 | Impl | L | `test_role_matrix` (every route × role), `test_migration_actions_transitions` |
-| C1-04 | Tampering | Irreversible action by mistake or abuse (finalize, cutover) | Finalize needs approver **and** `confirm == vm.name`; cutover needs approval, window, concurrency cap (SDD §5.4); the plan policy fields `require_approval`, `auto_cutover` and `cutover_window` can only be set by an approver, so an operator cannot switch approval off or schedule the window (SDD §12); rollback allowed to operators (safe direction) | Impl | L | `test_finalize_confirm_mismatch_400`, `test_finalize_requires_confirm_name`, `test_cutover_window_respected_and_force_window`, `test_max_concurrent_cutovers` |
+| C1-04 | Tampering | Irreversible action by mistake or abuse (finalize, cutover) | Finalize needs approver **and** `confirm == vm.name`; cutover needs approval, window, concurrency cap (SDD §5.4); the plan policy fields `require_approval`, `require_distinct_approver`, `auto_cutover` and `cutover_window` can only be set by an approver, so an operator cannot switch approval off or schedule the window (SDD §12); rollback allowed to operators (safe direction) | Impl | L | `test_finalize_confirm_mismatch_400`, `test_finalize_requires_confirm_name`, `test_cutover_window_respected_and_force_window`, `test_max_concurrent_cutovers` |
 | C1-05 | Tampering | Injection through request fields and tenant-chosen names (SQL, command, regex, Jinja templates) | Pydantic v2 validation; SQLAlchemy Core with bound parameters — string filters are pushed into SQL as bound JSON-path/value parameters with filter names fixed in code, and re-checked in Python; query integers bounded to the column width (422, never a 500); VM names `re.escape`d; NUL stripped from tenant strings (PostgreSQL JSONB); vars passed as files, not shell, with every string — the values and the keys of nested maps — tagged `!unsafe` so Ansible never templates a VM name, source network name, mapping value or password (R-16) | Impl | L | `test_workload_filter_escapes_regex`, `test_generated_ansible_input_is_never_templated`, `test_ansible_reads_generated_input_verbatim`, `test_error_envelope_shape`, QASuite §10 fuzz cases |
 | C1-06 | Repudiation | An actor denies a cutover, rollback or finalize | Every mutating call emits an audit event with `actor = principal.name`; failed authentication emits `auth.denied` (never the token); events are append-only through the API | Impl | M (a DB administrator can alter rows, §9.4) | `test_unauthenticated_401_and_audit_event`, `test_events_since` |
 | C1-07 | Info disclosure | Credentials leaked through the API or errors | `Provider.credentials_secret` is a *name*; no endpoint returns credential material; uniform error envelope without stack traces; `/metrics` not public by default | Impl | L | `test_error_envelope_shape`, `test_metrics_format`, QASuite §10 |
@@ -198,7 +198,7 @@ QASuite case that exercises the control.
 |---|---|---|---|---|---|
 | C9-01 | Tampering | Malicious or vulnerable dependency | Version floors in `pyproject.toml`, **lockfiles with hashes recommended**, `pip-audit`, `npm audit`, SBOM, digest-pinned base images, monthly update window; the `openstacksdk` git fork pin is a known weak spot (SEC-09) | Cfg + **Rec** | M |
 | C9-02 | Tampering | Tampered image or manifest | Digest pins in `kustomization.yaml`; image signing (cosign) is a 1.0.0 roadmap item (PRD §9) | **Open** | M |
-| C9-03 | Elevation | Container escape or lateral movement | Non-root, `cap_drop: ALL`, `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root FS (OpenShift), no service-account token, default-deny NetworkPolicy; Colima VM boundary for local runs | Impl + Cfg | L |
+| C9-03 | Elevation | Container escape or lateral movement | Non-root, `cap_drop: ALL`, `allowPrivilegeEscalation: false`, seccomp `RuntimeDefault`, read-only root FS (OpenShift), a service-account token only on the control plane — for the Secret store, through a namespaced Role on Secrets (R-15) — and none on PostgreSQL or the ServiceAccount default, default-deny NetworkPolicy; Colima VM boundary for local runs | Impl + Cfg | L |
 | C9-04 | Info disclosure | Secrets baked into images or build contexts | `seamless/.containerignore` — the file `docker build -f seamless/Containerfile` reads through `Containerfile.dockerignore`, and Podman's `--ignorefile` — and the root `.dockerignore` exclude `.env`, `tokens.yaml`, `clouds.yaml`/`clouds.yml`, `compose.local.yaml`, a filled-in `deploy/openshift/secret.yaml`, `tests/auth_*.yml`, `secrets` directories, keys and `.claude` (`test_build_context_excludes_every_secret_path`); no build `ARG` secrets; gitleaks scan | Cfg | L |
 | C9-05 | Info disclosure | Developer shell environment leaks long-lived keys into agent transcripts (e.g. `docker compose config` prints resolved variables) | Keep keys out of shells used by agents; give a key only to the single process that needs it, through its environment (a subshell with `read -rs`), never inline on a command line; never paste `compose config` output; `.claude/settings.json` denies *reading* secret files (a guardrail, not a sandbox: it does not stop `cat` in a shell) | Cfg + **Rec** | M |
 
@@ -238,6 +238,8 @@ QASuite case that exercises the control.
 
 ### 5.2 Role matrix (SDD §12, ordered `viewer < operator < approver < admin`)
 
+The main routes by role; SDD §12 lists every route with its minimum role (`test_every_route_is_documented_in_sdd_12`).
+
 | Route | Min. role | Viewer | Operator | Approver | Admin |
 |---|---|---|---|---|---|
 | `GET /health` | public | ✓ | ✓ | ✓ | ✓ |
@@ -255,12 +257,13 @@ QASuite case that exercises the control.
 Design intent: operators can run and *undo* (rollback, cancel) but cannot authorize the risky forward steps
 (cutover, finalize) nor change the policy that gates them (approval required, automatic cutover, change window: SDD §12); only admins can define the endpoints the control plane connects to (the SSRF surface,
 C1-10). Procedural control: approvers and operators should be different people for production waves
-("four eyes"); the API does not forbid one person holding both roles — keep separate tokens.
+("four eyes"); the API does not forbid one token holding both roles, but the maker-checker rule (on by
+default, `require_distinct_approver`, SDD §5.4) refuses a cutover's requester as its approver — keep separate tokens.
 
 ### 5.3 Audit
 
-Every mutating call emits a persisted event (`plan.*`, `migration.*`, `provider.*`, `advisor.*`,
-`memory.lesson_saved`, `auth.denied`; SDD §4.3) with `ts`, `actor`, `message` and structured `data`; ephemeral
+Every mutating call emits a persisted event (`plan.*`, `migration.*`, `provider.*`, `advisor.*`, `policy.*`,
+`decision.*`, `memory.lesson_saved`, `auth.denied`; SDD §4.3) with `ts`, `actor`, `message` and structured `data`; ephemeral
 progress/log/heartbeat events are never stored. Forward `SEAMLESS_LOG_JSON=true` logs to your platform
 logging, and export `events` to a SIEM by polling `GET /api/v1/events?since=<seq>&limit=1000` or by
 database-side export. On PostgreSQL an event appended by another process (the `seamless` CLI while
@@ -278,7 +281,7 @@ This section is the target of the SDD §6.6 cross-reference ("See Security.md §
 
 | Path | Baseline os-migrate | Required end state |
 |---|---|---|
-| **Conversion hosts** (`volume_common.py`, the normal path) | `qemu-nbd -b 127.0.0.1 --read-only …` (lines 799–815) or `nbdkit --ipaddr 127.0.0.1 … file file=<dev>` (lines 785–797); reached from the destination host through `ssh -L port:localhost:port` | Loopback-only is correct; the nbdkit export is `--readonly` (SEC-05 fixed) so a compromised or buggy peer cannot write to the source volume |
+| **Conversion hosts** (`volume_common.py`, the normal path) | `qemu-nbd -b 127.0.0.1 --read-only …` (`_export_volumes_from_converter`) or `nbdkit --ipaddr 127.0.0.1 … file file=<dev>` (the same method, when `nbdkit` is present); reached from the destination host through `ssh -L port:localhost:port` | Loopback-only is correct; the nbdkit export is `--readonly` (SEC-05 fixed) so a compromised or buggy peer cannot write to the source volume |
 | **Hypervisor "direct" mode** (`roles/import_from_hypervisor/tasks/process_disk.yml:42-48`) | `sudo qemu-nbd -f <fmt> -p <port> <disk>` — **writable, bound to all interfaces, unauthenticated, unencrypted**; `os_migrate_nbdkit_readonly` and `os_migrate_nbdkit_ip_allow` exist in `defaults/main.yml` but are never read, while the upstream guide (`docs/src/user/nbd-source-migration.rst:216-231`) tells operators the export is read-only | SDD §6.6 / **Task A4**: pass `--read-only` when `os_migrate_nbdkit_readonly` (default `true`); `--bind {{ os_migrate_nbdkit_bind_address }}` with the new default `127.0.0.1`; `--shared=1`; `quote` filters for paths and instance ids |
 
 The warm path never uses the hypervisor export: `import_workloads_warm` asserts that a workload is not
@@ -328,7 +331,7 @@ nc -vz <hypervisor> 10809                  # expected: refused / timed out
 
 ### 6.3 SSH host-key policy
 
-Baseline: `RemoteShell._default_options` (`plugins/module_utils/volume_common.py:543-552`) passes
+Baseline: `RemoteShell._default_options` (`plugins/module_utils/volume_common.py`) passes
 `BatchMode=yes`, **`StrictHostKeyChecking=no`**, `ConnectTimeout=10`; `roles/conversion_host/tasks/conv_host_inventory.yml:30`
 sets `ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'` for the Ansible connection. With `no`, a first
 connection to an impostor succeeds silently and a changed key only produces a warning. Conversion hosts are
@@ -373,7 +376,7 @@ malicious, corruption).
 |---|---|---|---|
 | Admin and operator API tokens | `compose-init.sh`, `seamless token create` | holder's password manager; hash in `tokens.yaml` / Secret `seamless-tokens` | §5.1 |
 | `POSTGRES_PASSWORD` | `compose-init.sh` (`openssl rand -hex 24`) / `oc create secret` | `.env` (0600) / Secret `seamless-db` | annually or on suspicion: `ALTER USER seamless PASSWORD '…'` **and** update `SEAMLESS_DB_URL`; Compose `--rotate-db-password` only for a *new* DB |
-| `JEV_MCP_AUTH_TOKEN` | `compose-init.sh` | `.env` | any time: `compose-init.sh --force`, recreate the stack |
+| `JEV_MCP_AUTH_TOKEN` | `compose-init.sh` | `.env` | any time: `compose-init.sh --force --keep-token` (plain `--force` also replaces the admin token), recreate the stack |
 | `TYPESAFE_API_KEY` | provider console | caller's environment → `.env` / Secret `seamless-ai` | quarterly, on staff change, on suspicion; issue separate keys per environment; revoke the old key at the provider |
 | `AGENTMEMORY_SECRET` | agentmemory server | `.env` / Secret | on suspicion |
 | Cloud credentials | Keystone | Secret `seamless-clouds` (`clouds.yaml`) | application credentials: create new → update Secret → restart → delete old (`openstack application credential delete`); passwords: per policy |
@@ -462,8 +465,8 @@ CIDRs of your clouds, vCenter, conversion hosts, Jev provider and agentmemory be
 | Single instance | one container | `replicas: 1`, `strategy: Recreate` (the orchestrator is a singleton); no PodDisruptionBudget, which would block node drains: a control plane evicted mid-run resumes its migrations from their checkpoints (QASuite R-01) |
 | Logs | `json-file` with rotation | cluster logging; `SEAMLESS_LOG_JSON=true` |
 
-Not hardened in 0.1.0: the bundled PostgreSQL pod has a writable root filesystem (the SCL image writes its
-socket and data directories) and no TLS.
+Not hardened in 0.1.0: the bundled PostgreSQL pod runs without TLS (its root filesystem is read-only, with
+emptyDirs for the socket and data directories the SCL image writes).
 
 ### 9.2 Supply chain
 
@@ -472,8 +475,8 @@ socket and data directories) and no TLS.
 | Jev MCP, agentmemory MCP | exact versions pinned (`@jkudish/jev-mcp@0.14.1`, `@agentmemory/mcp@0.9.30`) in `.mcp.json` and the Compose `jev` service | Preinstall Jev into the image (`npm ci --ignore-scripts`, lockfile) so the runtime never downloads code with `npx -y` (C7-08) |
 | Python dependencies | version **floors** in `seamless/pyproject.toml` | Build the image from a hash-pinned lockfile (`uv lock`/`pip-compile --generate-hashes`); re-lock monthly |
 | Dashboard dependencies | `package-lock.json` | `npm ci` only; `npm audit --omit=dev` in CI |
-| Collection dependencies | `requirements.txt` pins `openstacksdk` to a **git URL of a fork** without a hash (SEC-09); vendored `openstack.cloud` is tagged (`OS_CLOUD_VERSION ?= 2.5.0`) | Build a wheel from the fork once, verify the diff, pin by hash. The `os_migrate.vmware_migration_kit` version is pinned in `requirements.yml` (2.2.7) and installed from it |
-| Base images | `postgres:16-alpine`, `node:22-alpine` and the UBI 9 Python 3.11 base are pinned by digest in the Compose file and the Containerfile; `kustomization.yaml` `images:` still uses tags | Pin by digest in `kustomization.yaml` for production (comments show how) |
+| Collection dependencies | `requirements.txt` pins `openstacksdk` to a **git URL of a fork** without a hash (SEC-09); vendored `openstack.cloud` is tagged (`OS_CLOUD_VERSION ?= 2.6.0`) | Build a wheel from the fork once, verify the diff, pin by hash. The `os_migrate.vmware_migration_kit` version is pinned in `requirements.yml` (2.2.7) and installed from it |
+| Base images | `postgres:16-alpine`, `node:22-alpine` and the UBI 9 Python 3.11 base are pinned by digest in the Compose file and the Containerfile; the OpenShift `kustomization.yaml` `images:` still uses tags (the Kubernetes overlay pins PostgreSQL by digest) | Pin by digest in `kustomization.yaml` for production (comments show how) |
 | SBOM | CycloneDX generated per image by the CI `image` job (`trivy image --format cyclonedx`, uploaded as an artifact) | Publish it with each release |
 | Scanning | CI runs `pip-audit`, `npm audit`, `gitleaks` (tree and history), `trivy config` on the manifests and `trivy image` on the built image (QASuite §13.1a) | Keep them as release gates; Dependabot keeps the pins moving |
 | GitHub Actions | every `uses:` in `.github/workflows` is pinned to a full commit SHA with its release in a comment (`actions/checkout@11d5960… # v4.4.0`): a tag can be moved or force-pushed to run other code with the workflow's token, a SHA cannot (`test_every_action_is_pinned_to_a_commit_sha_with_its_version`); each pin was checked to be on its repository's default or release branch | Dependabot's `github-actions` updates move the pins weekly |
@@ -524,8 +527,9 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
   ```
 
   Confirm first that the control plane issues no DDL against an existing schema (`Store.create_schema()` uses
-  `checkfirst`) and that `events` is never updated or deleted by the application (only the test helper
-  truncates it). The owner can still alter rows, so also export `events` periodically to write-once storage.
+  `checkfirst`) and that `events` is never updated by the application; it is deleted only by
+  `seamless events prune` (older than a cut-off, SDD §15) and the test helper, so run the prune as the owner role,
+  or grant DELETE on `events` to the role that runs it. The owner can still alter rows, so also export `events` periodically to write-once storage.
 * Data at rest: storage-class encryption for PVCs; encrypted backups; restore drills ([Performance.md](Performance.md) §9).
 * Patch cadence: PostgreSQL 16 minor releases within 30 days; image rebuilds monthly.
 
@@ -634,7 +638,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 | ID | Finding | Evidence | Sev. | Impact | Remediation | Status in 0.1.0 |
 |---|---|---|---|---|---|---|
 | SEC-01 | Hypervisor NBD export is **writable, bound to all interfaces, unauthenticated, unencrypted**; the documented `os_migrate_nbdkit_readonly` / `os_migrate_nbdkit_ip_allow` variables are never read, so the guide's "always read-only" is false assurance. The `pkill -f "qemu-nbd.*<port>"` pattern is broad and `{{ disk_item }}` is interpolated unquoted | `roles/import_from_hypervisor/tasks/process_disk.yml:42-48, 63, 83`; `defaults/main.yml:8, 12`; `docs/src/user/nbd-source-migration.rst:216-231` | **High** | Any host that reaches the port can read **and modify** a VM disk | SDD §6.6 / **Task A4**: `--read-only`, `--bind` (default `127.0.0.1`), `--shared=1`, quoting | **Fixed by Task A4** — verify with QASuite S-03/S-04 |
-| SEC-02 | SSH host keys not verified: `StrictHostKeyChecking=no` in the Python SSH helper and the Ansible inventory; the `AnsibleExecutor` additionally defaults `ANSIBLE_HOST_KEY_CHECKING=False` | `plugins/module_utils/volume_common.py:548`; `roles/conversion_host/tasks/conv_host_inventory.yml:30`; `seamless/src/seamless_migrate/executors/ansible.py` (`_env`) | Medium | MITM/impostor receives or injects disk data on untrusted networks | §6.3: per-run `known_hosts`, pinned keys, `StrictHostKeyChecking=yes` — **both** the collection options and the executor default must change | **Open** (0.2.0); compensating controls in §6.3 |
+| SEC-02 | SSH host keys not verified: `StrictHostKeyChecking=no` in the Python SSH helper and the Ansible inventory; the `AnsibleExecutor` additionally defaults `ANSIBLE_HOST_KEY_CHECKING=False` | `plugins/module_utils/volume_common.py` (`RemoteShell._default_options`); `roles/conversion_host/tasks/conv_host_inventory.yml:30`; `seamless/src/seamless_migrate/executors/ansible.py` (`_env`) | Medium | MITM/impostor receives or injects disk data on untrusted networks | §6.3: per-run `known_hosts`, pinned keys, `StrictHostKeyChecking=yes` — **both** the collection options and the executor default must change | **Open** (0.2.0); compensating controls in §6.3 |
 | SEC-03 | Conversion-host security group allows **SSH and ICMP from `0.0.0.0/0`**, and a floating IP is created by default | `roles/conversion_host/tasks/main.yml:24-47`; `playbooks/deploy_conversion_hosts.yml` (`os_migrate_{src,dst}_conversion_manage_fip` defaults to `true`) | Medium | Internet-reachable SSH on a host that can read customer disks | Restrict `remote_ip_prefix` to the control plane and the peer host; `os_migrate_*_conversion_manage_fip: false` | **Mitigated by the executor when `conversion_host.ssh_allowed_cidr` is set** (SDD §7.2 pins `os_migrate_conversion_secgroup_remote_ip_prefix`); **Open** for hosts deployed without it; floating-IP guidance in §6.4; collection change recommended |
 | SEC-04 | `enable_password_access.yml` flips `PasswordAuthentication yes` and sets a password hash from a **well-known default** (`weak_password_disabled_by_default`) | `roles/conversion_host_content/tasks/enable_password_access.yml`; `defaults/main.yml:25-26`; `playbooks/deploy_conversion_hosts.yml:112-113` | Medium (**High** combined with SEC-03) | Password SSH reachable from the internet with a guessable password | Never enable; keep `…enable_password_access: false` (default); remove the default password so enabling without setting one fails | **Mitigated**: `false` by default and pinned by the executor in every generated vars file (SDD §7.2) |
 | SEC-05 | `nbdkit` export on conversion hosts had no `--readonly` | `plugins/module_utils/volume_common.py` (nbdkit branch) | Low–Medium | Loopback only, but a compromised destination host could write to the source volume | Add `-r`/`--readonly` | **Fixed** (the nbdkit command carries `--readonly`; CHANGELOG 1.1.0) |
@@ -838,7 +842,7 @@ rescan with `gitleaks` → add the pattern to the scanning rules → record the 
 
 External and manual checks (commands in [QASuite.md](QASuite.md) §10): secret scanning (`gitleaks`),
 dependency audit (`pip-audit`, `npm audit`), image scan and SBOM (`trivy`), manifest linting
-(`kubernetes-validate`, `trivy config`, `shellcheck`, `yamllint`), API baseline scan (OWASP ZAP in safe mode
+(`kubeconform`, `trivy config`, `shellcheck`, `yamllint`), API baseline scan (OWASP ZAP in safe mode
 against the demo stack), the RBAC matrix against a live stack, NBD exposure checks on a hypervisor (§6.1),
 host-key and security-group review of the conversion hosts, and the AI-safety cases S-14…S-16.
 

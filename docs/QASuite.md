@@ -505,7 +505,7 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 
 | ID | Test | Method | Expected |
 |---|---|---|---|
-| S-01 | RBAC matrix | `test_role_matrix` (unit) and `rbac-live.sh` against the demo stack with four tokens | every route × role as in Security.md §5.2, including the plan policy fields: an operator that sets `require_approval`, `auto_cutover` or `cutover_window` on `POST /plans` or `PATCH /plans/{id}` gets 403 (before any 400/404/422), an approver does not; an operator spelling out the defaults is accepted (asserted in `test_plan_create_validate_start_flow`) |
+| S-01 | RBAC matrix | `test_role_matrix` (unit) and `rbac-live.sh` against the demo stack with four tokens | every route × role as in SDD §12 (Security.md §5.2 shows the main ones), including the plan policy fields: an operator that sets `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` on `POST /plans` or `PATCH /plans/{id}` gets 403 (before any 400/404/422), an approver does not; an operator spelling out the defaults is accepted (asserted in `test_plan_create_validate_start_flow`) |
 | S-02 | Authentication failures | missing, malformed and wrong tokens; `GET /events` afterwards | 401; one `auth.denied` event per attempt; the event data never contains the token |
 | S-03 | Hypervisor NBD bind (SEC-01) | on a hypervisor with the A4 role: `sudo ss -ltnp \| grep qemu-nbd`; from another host `nc -vz <hv> 10809` | listens on `127.0.0.1` (or the migration IP); remote connect refused |
 | S-04 | NBD read-only (SEC-01, SEC-05) | `ps -o args= -C qemu-nbd` shows `--read-only`; `qemu-io -c 'write -P 0xff 0 4096' nbd://127.0.0.1:<port>` | write fails with a read-only error; for nbdkit on conversion hosts the same (`--readonly`, SEC-05 fixed) |
@@ -1042,7 +1042,7 @@ decision when it validates its plan — the smoke plan of an earlier run, or a n
 VM, one migration across plans, SDD §5.4; the demo leaves `report-01` and `batch-01` unplanned for it and for a
 plan of your own) — so it can run again on the same stack without adding a plan (exit code = failed checks);
 [`tests/e2e/rbac-live.sh`](../tests/e2e/rbac-live.sh)
-is the RBAC matrix — every route × role of SDD §12 and Security.md §5.2, the plan policy fields included (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
+is the RBAC matrix — every route × role of SDD §12 (Security.md §5.2 shows the main ones), the plan policy fields included (`VIEWER= OPERATOR= APPROVER= ADMIN=`); [`tests/e2e/demo-restart.sh`](../tests/e2e/demo-restart.sh)
 runs DEMO-04 and DEMO-06; [`tests/e2e/browser-demo.mjs`](../tests/e2e/browser-demo.mjs) (`TOKEN_FILE=…`) opens
 the dashboard in headless Chromium through the control plane — real security headers, CSP and API — signs
 in, visits every page, the first plan and its first migration, and fails on any console error, CSP
