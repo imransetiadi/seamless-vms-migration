@@ -760,6 +760,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   it ran (a `skipping:` result, e.g. `data_copy: false`, starts no clock) (`TASK [... : Stop the source server]` for the
   warm role, `TASK [... : Perform workload stop if os_migrate_workload_stop_before_migration is true]`
   for the cold role, the kit's power-off task for VMware); at the latest when the cutover step starts.
+* Progress: the executor reads the os-migrate progress file `{run dir}/osm/workload_logs/{stem}.state`, which
+  `import_workload_prelim` names, with its `.log`, after the VM: the stem is the VM name with `%` written `%25`,
+  `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
+  never names a file outside `workload_logs`, and two names never share a file.
 * Cold rollback passes `os_migrate_rollback_match_by_name: true` (the cold path does not record the
   destination server id in a warm state file) only once the source was stopped (`downtime_started_at` set), as
   the VMware rollback looks up the server by name only then: the cold role creates the server after the stop, so
