@@ -700,6 +700,11 @@ releases its lock, and every later attach on that host would wait for it in vain
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check.
 
+`import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
+exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
+keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
+`web-01` and the workload was skipped as already migrated, and a name like `app(` was an invalid expression.
+
 ---
 
 ## 7. Control plane executors
