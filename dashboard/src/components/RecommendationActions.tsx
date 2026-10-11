@@ -36,7 +36,8 @@ export function RecommendationActions({
   const alternatives = eligible.filter((s) => s !== recommended);
   const [option, setOption] = useState<Strategy | ''>(() => alternatives[0] ?? '');
   const [reason, setReason] = useState('');
-  // the policy in force says whether a reason is required, as the API checks it; unknown: ask for one (SDD §14.6)
+  // the policy in force says whether a reason is required when the decision recorded no rule, as the API checks it;
+  // unknown: ask for one (SDD §14.6)
   const inForce = policies.data ? (resolvePolicy(policies.data.items, rec.plan_id, rec.provider_id, rec.decision_type) ?? policies.data.default) : undefined;
   // the rules the decision recorded win: a policy changed since does not rewrite it (SDD §14.6)
   const reasonRequired = rec.decision.require_override_reason ?? (inForce ? inForce.require_override_reason : true);
