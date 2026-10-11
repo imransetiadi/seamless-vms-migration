@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -170,27 +171,67 @@ def ports_without_security_groups(doc: dict[str, Any]) -> list[str]:
     return missing
 
 
+def _ip_version(address: str) -> int | None:
+    try:
+        return ipaddress.ip_address(address).version
+    except ValueError:
+        return None
+
+
 def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride]) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose server ports with an entry (by MAC,
     lower case) go to the entry's network, their addresses - the entry's, else their own - as
-    address-only fixed IP references that Neutron places by subnet (SDD §7.2, §6.6)."""
+    address-only fixed IP references that Neutron places by subnet (SDD §7.2, §6.6).
+
+    A floating IP on a port's former address moves to its new address of the same IP version:
+    os-migrate attaches it by that address. ``PermanentStepError`` when there is no such address
+    or several, or when an entry's MAC is no exported port's (the VM's NICs changed since
+    validation): raised after the export, before the import stops the source.
+    """
     out = copy.deepcopy(doc)
+    applied: set[str] = set()
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
             continue
-        for port in (resource.get("params") or {}).get("ports") or []:
+        server = resource.get("params") or {}
+        moved: dict[str, tuple[str, list[str]]] = {}  # former address -> (MAC, new addresses)
+        for port in server.get("ports") or []:
             params = port.get("params") or {}
-            entry = entries.get(str(params.get("mac_address") or "").lower())
+            mac = str(params.get("mac_address") or "").lower()
+            entry = entries.get(mac)
             if entry is None:
                 continue
+            applied.add(mac)
+            former = [ref.get("ip_address") for ref in params.get("fixed_ips_refs") or []]
             if entry.network:
                 params["network_ref"] = {**(params.get("network_ref") or {}), "name": entry.network}
-            addresses = (
-                entry.fixed_ips
-                if entry.fixed_ips is not None
-                else [ref.get("ip_address") for ref in params.get("fixed_ips_refs") or []]
-            )
+            addresses = entry.fixed_ips if entry.fixed_ips is not None else former
             params["fixed_ips_refs"] = [{"ip_address": address} for address in addresses]
+            for address in former:
+                moved[str(address)] = (mac, list(addresses))
+        for fip in server.get("floating_ips") or []:
+            params = fip.get("params") or {}
+            address = str(params.get("fixed_ip_address") or "")
+            if address not in moved:
+                continue
+            mac, addresses = moved[address]
+            version = _ip_version(address)
+            same = [a for a in addresses if _ip_version(a) == version]
+            if len(same) != 1:
+                count = (
+                    f"{len(same)} IPv{version} addresses" if same else f"no IPv{version} address"
+                )
+                raise PermanentStepError(
+                    f"the floating IP on {address} cannot follow NIC {mac}: its override gives it "
+                    f"{count}; give the NIC exactly one, so the floating IP moves to it"
+                )
+            params["fixed_ip_address"] = same[0]
+    unknown = sorted(set(entries) - applied)
+    if unknown:
+        raise PermanentStepError(
+            "the export has no port with the MAC of the NIC override(s) "
+            f"{', '.join(unknown)}: the VM's NICs changed since validation; validate the plan again"
+        )
     return out
 
 
@@ -929,11 +970,13 @@ class AnsibleExecutor:
             ]
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
-        if nic_overrides:
-            doc = apply_nic_overrides(doc, nic_overrides)
         if port_mode is not None:
             doc = set_port_creation_mode(doc, port_mode)
+        # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if nic_overrides:
+            doc = apply_nic_overrides(doc, nic_overrides)
+            path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:
             # written first: a rollback reads the planned server from it

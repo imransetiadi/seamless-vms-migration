@@ -453,6 +453,90 @@ def test_apply_nic_overrides_sends_a_port_elsewhere_by_address():
     ]
 
 
+def fip_doc(addresses=("10.0.0.5",)):
+    """A planned server: port fa:16:3e:00:00:01 holds ``addresses``, a floating IP 10.0.0.5."""
+    return {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {
+                    "ports": [
+                        {
+                            "params": {
+                                "mac_address": "fa:16:3e:00:00:01",
+                                "network_ref": {"name": "app-net"},
+                                "fixed_ips_refs": [
+                                    {"ip_address": a, "subnet_ref": {"name": "app-subnet"}}
+                                    for a in addresses
+                                ],
+                            }
+                        }
+                    ],
+                    "floating_ips": [
+                        {
+                            "params": {
+                                "fixed_ip_address": "10.0.0.5",
+                                "floating_ip_address": "203.0.113.7",
+                            }
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def test_apply_nic_overrides_moves_the_floating_ip_to_the_new_address():
+    """SDD §7.2: os-migrate attaches a floating IP by its fixed address, so it follows the port to
+    its new address of the same IP version."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["fd00:10::5", "192.168.10.5"])
+    out = apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": entry})
+    [fip] = out["resources"][0]["params"]["floating_ips"]
+    assert fip["params"]["fixed_ip_address"] == "192.168.10.5"
+    # a network-only entry keeps the address, and the floating IP stays on it
+    kept = apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz")})
+    assert kept["resources"][0]["params"]["floating_ips"][0]["params"]["fixed_ip_address"] == (
+        "10.0.0.5"
+    )
+
+
+def test_apply_nic_overrides_refuses_what_it_cannot_place_before_the_stop():
+    """With no new address of the floating IP's version, with several, or with an entry whose MAC
+    no exported port has, the cutover stops after the export, before the source stops."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    for addresses, said in (
+        (["fd00:10::5"], "no IPv4 address"),
+        (["192.168.10.5", "192.168.10.6"], "2 IPv4 addresses"),
+    ):
+        entry = NicOverride(fixed_ips=addresses)
+        with pytest.raises(PermanentStepError, match=said):
+            apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": entry})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:99": NicOverride(network="rhoso-dmz")})
+
+
+async def test_an_override_the_export_cannot_take_stops_the_cutover_before_the_stop(
+    env, monkeypatch
+):
+    """The VM's NICs changed since validation: the cutover stops after the export, with only the
+    planned server written for a rollback (never a same-named twin), and the import (which stops
+    the source) never runs."""
+    monkeypatch.setenv("ANSIBLE_FAKE_TWIN_ID", "srv-twin")
+    cold, rec = nic_ctx(env, Strategy.cold, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+    doc = yaml.safe_load((run_dir(env) / "osm" / "workloads.yml").read_text())
+    servers = [r for r in doc["resources"] if r["type"] == "openstack.compute.Server"]
+    assert [r["_info"]["id"] for r in servers] == ["srv-1"]
+
+
 async def test_a_cutover_writes_the_vms_nic_overrides_into_workloads(env):
     """SDD §7.2: after the export the planned server's overridden port is rewritten."""
     entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
