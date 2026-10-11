@@ -129,12 +129,12 @@ def _install_error_handlers(app: FastAPI) -> None:
         return response
 
 
-#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts) and the
-#: Fira fonts from Google Fonts (dashboard/index.html); Swagger UI loads from jsdelivr.
+#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts); it bundles
+#: its fonts (SDD §16), so nothing loads from another host. Swagger UI loads from jsdelivr.
 _CSP_APP = (
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
-    "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' "
-    "data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+    "form-action 'self'"
 )
 #: Swagger UI boots from an inline script: it gets a per-response nonce (no 'unsafe-inline').
 _CSP_DOCS = (

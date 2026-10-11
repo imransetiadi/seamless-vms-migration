@@ -507,7 +507,11 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
             assert res.headers["x-content-type-options"] == "nosniff", path
             assert res.headers["x-frame-options"] == "DENY"
             assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
-            assert "fonts.gstatic.com" in res.headers["content-security-policy"]
+            # the dashboard bundles its fonts (SDD §16): fonts and styles come from this server only
+            csp = res.headers["content-security-policy"]
+            directives = dict(d.strip().split(" ", 1) for d in csp.split(";"))
+            assert directives["font-src"] == "'self'", path
+            assert directives["style-src"] == "'self' 'unsafe-inline'", path
         docs = client.get("/api/docs")
         assert docs.status_code == 200 and "swagger" in docs.text.lower()
         csp = docs.headers["content-security-policy"]
