@@ -168,7 +168,8 @@ VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: i
         os_type: str|null, host: str|null, tags: dict[str,str] = {},
         flavor_extra_specs: dict[str,str] = {}, cbt_enabled: bool|null = null,
         snapshot_count: int = 0, tools_ok: bool|null = null,
-        change_rate_bps: float|null = null }
+        change_rate_bps: float|null = null,
+        key_name: str|null = null }   # the Nova keypair the server boots with (OpenStack); VMware: null
    derived (properties, also serialized): disk_bytes: int, used_bytes: int, guest_os: GuestOS
    (used_bytes = Σ used_gb·2^30 when every disk has used_gb, else ⌊disk_bytes·0.6⌋;
     guest_os = identify(os_type), §9.5)
@@ -836,7 +837,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   are exported and imported (`os_migrate_flavors_filter`, each name anchored and `re.escape`d), and with none
   the flavor playbooks are skipped — os-migrate's import rewrites the extra specs of a same-named flavor it
   finds, so a destination flavor, shared by every project, is never changed. The orchestrator looks the
-  destination flavors up when it pre-stages.
+  destination flavors up when it pre-stages. `keypairs` is scoped the same way: only the `key_name`s of the plan's
+  VMs that the source credential owns and the destination credential lacks (`os_migrate_keypairs_filter`); with
+  none, its playbooks are skipped.
 
 ### 7.3 HandoverExecutor (`executors/handover.py`) — `storage_handover`
 
@@ -1218,6 +1221,8 @@ Finding catalog (code — severity — condition):
 | `MAP_FLAVOR_MISSING` | blocker | no flavor mapping and no destination flavor with ≥ vcpus, ≥ ram, ≥ root disk — flavors carrying `pci_passthrough:*`, `resources:*`, `trait:*` or `aggregate_instance_extra_specs:*` extra specs are never matched automatically (when one fits, the smallest fitting flavor is recorded in `Migration.resolved_mappings.flavors` and `MAP_FLAVOR_AUTO` names it: info, or **warning** when the source flavor carries `hw:*` extra specs the match drops; VMware VMs carry no flavor and get no `MAP_FLAVOR_AUTO`, the migration kit sizes the server); also when a mapping's *target* flavor does not exist in the destination |
 | `MAP_VOLUME_TYPE_MISSING` | warning; **blocker** when `plan.mappings.volume_types` is non-empty, and when a mapping's *target* type does not exist in the destination | a disk volume type has no mapping and no same-named destination type (with mapped volume types the executor preserves them, §6.4, so an unmapped type would fail volume creation after the source was stopped) |
 | `DST_QUOTA_INSUFFICIENT` | blocker | cumulative demand of the plan's VMs per destination project exceeds free quota (cores, ram, instances, volumes, gigabytes); an `image_root` disk counts as a volume unless `plan.default_strategy` is `cold` (the warm path's `boot_disk_copy` creates a destination volume) |
+| `DST_KEYPAIR_MISSING` | blocker | an OpenStack VM's `key_name` names no keypair of the destination credential and pre-staging does not create it: `"keypairs"` is not in `plan.prestage_resources`, or the source credential does not own it (its owner is another user: create the keypair, its public key, for the destination credential). Without this check the cutover fails after validation, in its destination check |
+| `MAP_KEYPAIR_PRESTAGED` | info | `"keypairs"` is pre-staged and the VM's `key_name`, owned by the source credential, has no keypair of the destination credential: pre-staging imports it (the same name and public key) |
 | `DST_PROJECT_MISSING` | blocker | the destination project charged for the VM is unknown: `plan.mappings.projects` maps the VM's project to a project the destination inventory does not list, or the VM's project (when the source reports one — VMware VMs have none and are charged to the destination credential's project) is unmapped, not a destination project by the same name, and the destination has more than one project (nothing to charge) |
 | `NET_MTU_SHRINK` | warning | destination network MTU < source NIC MTU |
 | `NET_SRIOV_PORT` | warning | `vnic_type` in {direct, direct-physical, macvtap} |
@@ -1317,11 +1322,13 @@ class DestinationProvider(Protocol):
     async def delete_server(self, server_id: str) -> None
 ```
 
-`SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str]}`;
+`SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
+the source credential's own keypairs — what `export_keypairs.yml` can export)}`;
 `DestinationInventory {networks: dict[str, int|None], flavors: list[{name, vcpus, ram_mb, disk_gb,
 extra_specs}], volume_types: list[str], quotas: dict[project, {cores, ram_mb, instances, volumes,
 gigabytes}] (free amounts: -1 is unlimited and null not reported — pre-flight blocks on neither), projects:
-list[str]}`.
+list[str], keypairs: list[str] (the destination credential's own keypairs: the server is created as that user, and
+a `key_name` it does not own fails `import_workload_dst_check` just before the source is stopped)}`.
 
 Implementations: `OpenStackProvider` (openstacksdk, lazily imported, blocking calls wrapped with
 `asyncio.to_thread`; used for kinds `openstack` and `rhoso`; `check()` reports `{"admin": bool,
@@ -2054,7 +2061,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   destination boot: `shutdown_s`, `snapshot_s`, `create_s`, `boot_s` (Performance.md §6.4) — §9.1; other overrides
   a plan already has are kept),
   the resources pre-staged at the destination (any of the six defaults of §4.2, in that order, then Flavors — off
-  by default: the plan's flavors that RHOSO lacks, created with the same specs, `MAP_FLAVOR_PRESTAGED`; other
+  by default: the plan's flavors that RHOSO lacks, created with the same specs, `MAP_FLAVOR_PRESTAGED` — and
+  Keypairs — off by default: the VMs' keypairs the migration user lacks at RHOSO, `MAP_KEYPAIR_PRESTAGED`; other
   entries a plan already has are kept; VMware sources pre-stage nothing, §7.2), the verification settings — TCP and Windows ports,
   probe address, console success patterns, timeout, automatic rollback, advisor review, the application probes of
   every VM (kind, port, path, expected status, §7.5) — and storage handover;
