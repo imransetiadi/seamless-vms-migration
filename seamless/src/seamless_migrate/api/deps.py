@@ -47,13 +47,17 @@ class Services:
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
-    #: full document lists reused by /stats and /metrics while their change stamp holds
-    _doc_cache: dict[str, tuple[tuple[int, int], list[Any]]] = field(default_factory=dict)
+    #: per kind: (change stamp, the documents in creation order, {id: (version, document)}),
+    #: reused by /stats, /metrics and /advisor/recommendations (SDD §11)
+    _doc_cache: dict[str, tuple[tuple[int, int], list[Any], dict[str, tuple[int, Any]]]] = field(
+        default_factory=dict
+    )
     _doc_cache_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def all_documents(self, kind: str, model_cls: type[Any]) -> list[Any]:
-        """Every document of ``kind``, reloaded only when the store's change stamp moved
-        (one aggregate query per call instead of loading and validating every row)."""
+        """Every document of ``kind`` in creation order. While the store's change stamp holds,
+        the cached list (one aggregate query); when it moved, only the documents whose version
+        changed or that are new are loaded — a run writes a migration every second (SDD §11)."""
         stamp = await self.db.change_stamp(kind)
         cached = self._doc_cache.get(kind)
         if cached is not None and cached[0] == stamp:
@@ -62,8 +66,18 @@ class Services:
             cached = self._doc_cache.get(kind)
             if cached is not None and cached[0] == stamp:
                 return cached[1]
-            rows = await self.db.list(kind, model_cls)
-            self._doc_cache[kind] = (stamp, rows)
+            known = cached[2] if cached is not None else {}
+            versions = await self.db.versions(kind)
+            stale = {id_ for id_, version in versions if known.get(id_, (None,))[0] != version}
+            fresh = await self.db.get_many(kind, stale, model_cls) if stale else {}
+            by_id: dict[str, tuple[int, Any]] = {}
+            for id_, _ in versions:
+                # a stale document deleted between the two reads is left out
+                hit = fresh.get(id_) if id_ in stale else known.get(id_)
+                if hit is not None:
+                    by_id[id_] = hit
+            rows = [by_id[id_][1] for id_, _ in versions if id_ in by_id]
+            self._doc_cache[kind] = (stamp, rows, by_id)
             return rows
 
     @property

@@ -71,6 +71,22 @@ def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
     assert any_store.plan_phases([]) == {}
 
 
+def test_versions_and_get_many_read_only_what_is_asked(any_store: Store):
+    """SDD §11: (id, version) in creation order, no document read; get_many loads what exists."""
+    a, b, c = (make_migration() for _ in range(3))
+    for m in (a, b, c):
+        any_store.put("migration", m)
+    any_store.put("migration", b.model_copy(update={"progress_pct": 40.0}), expected_version=1)
+    any_store.delete("migration", c.id)
+    assert any_store.versions("migration") == [(a.id, 1), (b.id, 2)]
+    got = any_store.get_many("migration", [b.id, c.id, "mig-missing"], Migration)
+    assert set(got) == {b.id}
+    version, model = got[b.id]
+    assert (version, model.progress_pct) == (2, 40.0)
+    assert any_store.get_many("migration", [], Migration) == {}
+    assert any_store.versions("plan") == []
+
+
 def test_list_filters(any_store: Store):
     a = make_migration(plan_id="plan-a", phase=Phase.ready, wave_id="wave-1")
     b = make_migration(plan_id="plan-a", phase=Phase.blocked, wave_id="wave-2")

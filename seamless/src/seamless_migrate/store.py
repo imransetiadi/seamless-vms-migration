@@ -48,6 +48,8 @@ documents = sa.Table(
 #: Top-level JSON fields the list filters push into SQL (SDD §11); each gets an expression
 #: index on ``(kind, field)`` so a plan's migrations or a phase are found without a full scan.
 INDEXED_FIELDS = ("plan_id", "phase", "wave_id", "status", "role")
+#: ids per IN (...) of ``get_many``: far below SQLite's and PostgreSQL's bound-parameter limits
+_GET_MANY_CHUNK = 500
 for _field in INDEXED_FIELDS:
     sa.Index(f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string())
 
@@ -306,6 +308,33 @@ class Store:
             out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
         return out
 
+    def versions(self, kind: str) -> list[tuple[str, int]]:
+        """``(id, version)`` of every document of ``kind`` in creation order (SDD §11): one index
+        read, no document loaded — a cached list reloads only what changed."""
+        query = (
+            sa.select(documents.c.id, documents.c.version)
+            .where(documents.c.kind == kind)
+            .order_by(documents.c.created_at, documents.c.id)
+        )
+        with self.engine.connect() as conn:
+            return [(row.id, int(row.version)) for row in conn.execute(query)]
+
+    def get_many(
+        self, kind: str, ids: Collection[str], model_cls: type[M]
+    ) -> dict[str, tuple[int, M]]:
+        """``{id: (version, document)}`` for the ``ids`` that exist (SDD §11)."""
+        wanted = list(dict.fromkeys(ids))
+        out: dict[str, tuple[int, M]] = {}
+        with self.engine.connect() as conn:
+            for start in range(0, len(wanted), _GET_MANY_CHUNK):
+                chunk = wanted[start : start + _GET_MANY_CHUNK]
+                query = sa.select(documents.c.id, documents.c.version, documents.c.data).where(
+                    documents.c.kind == kind, documents.c.id.in_(chunk)
+                )
+                for row in conn.execute(query):
+                    out[row.id] = (int(row.version), model_cls.model_validate(row.data))
+        return out
+
     def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
         """Each plan's distinct migration phases (SDD §8.1, §11): one ``SELECT DISTINCT`` over the
         indexed ``plan_id`` and ``phase`` expressions; no document is loaded or validated. A plan
@@ -439,6 +468,14 @@ class AsyncStore:
         return await asyncio.to_thread(
             lambda: self.sync.list(kind, model_cls, limit=limit, offset=offset, **filters)
         )
+
+    async def versions(self, kind: str) -> list[tuple[str, int]]:
+        return await asyncio.to_thread(self.sync.versions, kind)
+
+    async def get_many(
+        self, kind: str, ids: Collection[str], model_cls: type[M]
+    ) -> dict[str, tuple[int, M]]:
+        return await asyncio.to_thread(self.sync.get_many, kind, ids, model_cls)
 
     async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
         return await asyncio.to_thread(self.sync.plan_phases, plan_ids)

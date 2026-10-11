@@ -7,6 +7,7 @@ from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
 from seamless_migrate.store import Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
+from tests.factories import make_migration
 
 
 @pytest.fixture
@@ -327,6 +328,39 @@ def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     assert svc._doc_cache["plan"][1] is not plans_list
     assert [p.id for p in svc._doc_cache["plan"][1]] == [created.json()["id"]]
     assert svc._doc_cache["migration"][1] is migrations_list
+
+
+def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeypatch):
+    """SDD §11: during a run a write lands every second; /stats reloads that document, not all."""
+    svc = api.client.app.state.services
+    kept, changed, gone = (make_migration() for _ in range(3))
+    for m in (kept, changed, gone):
+        api.store.put("migration", m)
+    assert api.get("/api/v1/stats").json()["total"] == 3
+    before = {m.id: m for m in svc._doc_cache["migration"][1]}
+
+    api.store.put(
+        "migration", changed.model_copy(update={"phase": Phase.syncing}), expected_version=1
+    )
+    api.store.delete("migration", gone.id)
+    added = make_migration()
+    api.store.put("migration", added)
+    loaded: list[str] = []
+    real_get_many = api.store.get_many
+
+    def counting_get_many(kind, ids, model_cls):
+        loaded.extend(ids)
+        return real_get_many(kind, ids, model_cls)
+
+    monkeypatch.setattr(api.store, "get_many", counting_get_many)
+    stats = api.get("/api/v1/stats").json()
+
+    after = svc._doc_cache["migration"][1]
+    assert [m.id for m in after] == [kept.id, changed.id, added.id]  # creation order
+    assert after[0] is before[kept.id]  # not reloaded
+    assert after[1].phase == Phase.syncing
+    assert sorted(loaded) == sorted([changed.id, added.id])
+    assert stats["total"] == 3 and stats["by_phase"].get("syncing") == 1
 
 
 def test_stats_shape(api):
