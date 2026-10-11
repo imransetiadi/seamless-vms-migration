@@ -51,7 +51,7 @@ function Brand() {
   );
 }
 
-function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () => void }) {
+function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: (to: string) => void }) {
   return (
     <ul className="flex flex-col gap-0.5">
       {NAV.map((item) => {
@@ -60,7 +60,7 @@ function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () 
           <li key={item.to}>
             <Link
               to={item.to}
-              onClick={onNavigate}
+              onClick={onNavigate ? () => onNavigate(item.to) : undefined}
               aria-current={active ? 'page' : undefined}
               className={cn(
                 'flex min-h-11 items-center gap-3 rounded-md border-l-2 px-3 text-sm transition-colors duration-200',
@@ -219,7 +219,28 @@ export function Layout() {
   const { pathname, hash, state } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Escape closes the open menu and returns the focus to its button (disclosure pattern, SDD §16), when the focus
+  // is in the menu or on its button - never a key meant for something else on the page
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const focus = document.activeElement;
+      if (event.key !== 'Escape' || !(focus === menuButtonRef.current || menuRef.current?.contains(focus))) return;
+      setMenuOpen(false);
+      menuButtonRef.current?.focus();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [menuOpen]);
   const lastPath = useRef(pathname);
+  // the phone menu closes on a choice; the link goes with it, so the focus goes where a navigation puts it — the
+  // page — even when the choice is the page already shown, which moves nowhere (SDD §16)
+  const navigateFromMenu = (to: string) => {
+    setMenuOpen(false);
+    if (to === pathname) mainRef.current?.focus({ preventScroll: true });
+  };
 
   // Move focus to the main region after client-side navigation (screen readers announce the page).
   // Comparing paths (not a "first render" flag) keeps the initial load untouched — so the first Tab
@@ -257,6 +278,7 @@ export function Layout() {
       <div className="flex min-w-0 flex-col">
         <header className="sticky top-0 z-nav flex items-center gap-2 border-b border-border bg-background/95 px-3 py-1.5 backdrop-blur-sm lg:hidden">
           <button
+            ref={menuButtonRef}
             type="button"
             onClick={() => setMenuOpen((open) => !open)}
             aria-expanded={menuOpen}
@@ -273,9 +295,9 @@ export function Layout() {
           </div>
         </header>
         {menuOpen && (
-          <div id="mobile-navigation" className="border-b border-border bg-card px-3 py-3 lg:hidden">
+          <div id="mobile-navigation" ref={menuRef} className="border-b border-border bg-card px-3 py-3 lg:hidden">
             <nav aria-label="Primary">
-              <NavLinks pathname={pathname} onNavigate={() => setMenuOpen(false)} />
+              <NavLinks pathname={pathname} onNavigate={navigateFromMenu} />
             </nav>
             <div className="mt-3">
               <SessionFooter />

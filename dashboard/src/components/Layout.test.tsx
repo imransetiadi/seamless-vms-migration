@@ -1,4 +1,5 @@
-import { act, screen } from '@testing-library/react';
+import { act, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { LiveContext, LiveEventHub } from '../api/live';
 import { createTestServer, renderWithApp } from '../test/utils';
@@ -96,3 +97,27 @@ describe('Layout health notice', () => {
     expect(await screen.findByText(/the orchestrator loop is not running/i)).toBeInTheDocument();
   });
 });
+
+describe('Layout phone navigation (SDD §16 focus)', () => {
+  it("choosing the page you are on closes the menu and puts the focus on the page, not on nothing", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Layout />, { route: '/', path: '/' });
+    await user.click(await screen.findByRole('button', { name: 'Open navigation' }));
+    const menu = document.getElementById('mobile-navigation')!;
+    await user.click(within(menu).getByRole('link', { name: 'Overview' }));
+    expect(document.getElementById('mobile-navigation')).toBeNull();
+    expect(screen.getByRole('main')).toHaveFocus();
+  });
+
+  it('Escape closes the menu and returns the focus to its button', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Layout />, { route: '/', path: '/' });
+    await user.click(await screen.findByRole('button', { name: 'Open navigation' }));
+    const menu = document.getElementById('mobile-navigation')!;
+    within(menu).getByRole('link', { name: 'Plans' }).focus();
+    await user.keyboard('{Escape}');
+    expect(document.getElementById('mobile-navigation')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Open navigation' })).toHaveFocus();
+  });
+});
+
