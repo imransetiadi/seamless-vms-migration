@@ -842,7 +842,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabled={busy}>
+          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabledReason={busy ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button type="button" size="lg" variant="secondary" loading={busy} onClick={() => void save(false)}>

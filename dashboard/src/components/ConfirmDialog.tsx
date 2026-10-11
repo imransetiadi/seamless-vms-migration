@@ -124,7 +124,8 @@ export function ConfirmDialog({
         )}
         {error !== undefined && error !== null && <ErrorBanner error={error} title={`${confirmLabel} failed`} />}
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <Button ref={cancelRef} size="lg" onClick={onCancel} disabled={pending}>
+          {/* unavailable while the request runs, yet focusable and saying why (SDD §16) */}
+          <Button ref={cancelRef} size="lg" onClick={onCancel} disabledReason={pending ? 'Wait for the request to finish.' : null}>
             {cancelLabel}
           </Button>
           <Button

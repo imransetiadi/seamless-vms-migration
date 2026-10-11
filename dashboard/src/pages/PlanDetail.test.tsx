@@ -78,6 +78,27 @@ describe('PlanDetail', () => {
     expect(regions).toContain(report.closest('[role="status"]'));
   });
 
+  it('keeps Cancel focusable while the plan is saved, saying why (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<PlanDetail />, {
+      route: '/plans/plan-c81d44a0',
+      path: '/plans/:planId',
+      token: 'operator',
+      // the save never answers: the dialog stays busy
+      wrapFetch: (mock) => (input, init) => ((init?.method ?? 'GET') === 'GET' ? mock(input, init) : new Promise<Response>(() => {})),
+    });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    const name = within(dialog).getByLabelText(/^name/i);
+    await user.clear(name);
+    await user.type(name, 'Analytics, renamed');
+    await user.click(within(dialog).getByRole('button', { name: /^save changes$/i }));
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
+    await waitFor(() => expect(cancel).toHaveAttribute('aria-disabled', 'true'));
+    expect(cancel).not.toBeDisabled();
+    expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
+  });
+
   it('announces a saved plan edit (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPlan('plan-c81d44a0');

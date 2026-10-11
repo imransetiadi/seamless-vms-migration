@@ -1114,7 +1114,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
-          <Button size="lg" onClick={onClose} disabled={saving.isPending}>
+          <Button size="lg" onClick={onClose} disabledReason={saving.isPending ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button size="lg" type="submit" variant="primary" loading={saving.isPending}>

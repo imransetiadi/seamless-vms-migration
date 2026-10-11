@@ -109,6 +109,23 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     expect(card('Spark — stricter')).toHaveTextContent('Plan Shared Ceph handover — analytics');
   });
 
+  it('keeps Cancel focusable while the policy is saved, saying why (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorPolicies />, {
+      route: '/advisor/policies',
+      // the save never answers: the dialog stays busy
+      wrapFetch: (mock) => (input, init) => ((init?.method ?? 'GET') === 'GET' ? mock(input, init) : new Promise<Response>(() => {})),
+    });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    await user.click(within(card(FINANCE)).getByRole('button', { name: `Edit ${FINANCE}` }));
+    const dialog = await screen.findByRole('dialog', { name: 'Edit policy' });
+    await user.click(within(dialog).getByRole('button', { name: 'Save policy' }));
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
+    await waitFor(() => expect(cancel).toHaveAttribute('aria-disabled', 'true'));
+    expect(cancel).not.toBeDisabled();
+    expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
+  });
+
   it('edits a policy from its current values and replaces it', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });

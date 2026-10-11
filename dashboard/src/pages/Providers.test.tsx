@@ -38,6 +38,25 @@ describe('Providers page', () => {
     expect(within(rhosp).getByRole('button', { name: /^edit$/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Providers />, {
+      route: '/providers',
+      path: '/providers',
+      token: 'admin',
+      // the save never answers: the dialog stays busy
+      wrapFetch: (mock) => (input, init) => ((init?.method ?? 'GET') === 'GET' ? mock(input, init) : new Promise<Response>(() => {})),
+    });
+    const rhosp = await screen.findByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    await user.click(within(rhosp).getByRole('button', { name: 'Edit' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
+    await waitFor(() => expect(cancel).toHaveAttribute('aria-disabled', 'true'));
+    expect(cancel).not.toBeDisabled();
+    expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
+  });
+
   it('shows Delete to non-admins as unavailable with the reason, like Edit (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('operator');

@@ -44,6 +44,20 @@ describe('ConfirmDialog', () => {
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
+  it('keeps Cancel focusable while its request runs, saying why (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onCancel = vi.fn();
+    render(<ConfirmDialog open tone="danger" title="Finalize web-01?" confirmLabel="Finalize" pending onConfirm={vi.fn()} onCancel={onCancel} />);
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    // a danger dialog opens on Cancel: it keeps the focus while the request runs
+    expect(cancel).toHaveFocus();
+    expect(cancel).not.toBeDisabled();
+    expect(cancel).toHaveAttribute('aria-disabled', 'true');
+    expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
+    await user.click(cancel);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
   it('still says why when the caller gives no reason of its own', () => {
     render(<ConfirmDialog open title="Plan waves?" confirmLabel="Plan waves" canConfirm={false} onConfirm={vi.fn()} onCancel={vi.fn()} />);
     expect(screen.getByRole('button', { name: 'Plan waves' })).toHaveAccessibleDescription('Complete the fields above first.');
