@@ -2173,7 +2173,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `shareProcessNamespace`
   — the pod's pause process is PID 1 and reaps what Ansible leaves behind, the ssh `ControlPersist` masters,
   as `init: true` does in Compose; `seamless serve` would leave them as zombies — liveness
-  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS), NetworkPolicy (ingress from router only;
+  `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only;
   egress to cloud APIs, vCenter, conversion hosts, Jev, agentmemory, and the migrated VMs' verification ports
   that the dashboard's plan form proposes, TCP 22 for Linux and 3389 for Windows, §7.5 — a `tcp:<port>` check
   the policy blocks times out and fails the verification, which `auto_rollback` rolls back; another verification
