@@ -1448,7 +1448,10 @@ served at `/` with SPA fallback for non-`/api` paths.
 
 Static bearer tokens: `SEAMLESS_TOKENS_FILE` (YAML `tokens: [{name, role, sha256}]`); only SHA-256
 hashes are stored; comparison uses `hmac.compare_digest`. `seamless token create --name N --role R`
-prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry.
+prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry. It refuses a name
+the tokens file refuses (empty, or longer than 128 characters) and the names the control plane records
+as actors itself — `anonymous`, `unauthenticated`, `cli`, `system` — so no token's audit events pass
+for theirs.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
 refuses to start with it unless the bind host is loopback (`127.0.0.1`, `::1`, `localhost`).
 Demo mode on loopback disables auth by default. Every request refused for its role emits
@@ -1843,6 +1846,8 @@ update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, r
 the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
 only if the plan did not change since it was read (a server that started or validated it meanwhile), and
 otherwise fails and asks to run it again, so it never overwrites a change it did not see.
+`estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
+`max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
 
 A command that fails prints one line `error: …` on stderr and exits 1, never a traceback, for the
 errors the API answers with a status (§12). A provider SDK's message is redacted and cut at 500
