@@ -455,6 +455,21 @@ function keepSyncHistory(m: Migration, keepFirst: number): void {
 }
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
 const POLICY_FIELDS = ['require_approval', 'require_distinct_approver', 'auto_cutover', 'cutover_window'] as const;
+/** A secret name the control plane reads (SDD §13.3): never a path. */
+const SECRET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+/** Like the API: a named secret must be readable; only the fields the request sets are checked (SDD §13.3). */
+function checkSecretNames(input: Record<string, unknown>, fields: Set<string>): void {
+  const names: Array<[string, unknown]> = [];
+  if (fields.has('credentials_secret')) names.push(['credentials_secret', input.credentials_secret]);
+  const host = input.conversion_host as { ssh_key_secret?: unknown } | null | undefined;
+  if (fields.has('conversion_host') && host) names.push(['conversion_host.ssh_key_secret', host.ssh_key_secret]);
+  const bad = names.filter(([, name]) => name !== null && name !== undefined && !(typeof name === 'string' && SECRET_NAME.test(name))).map(([field]) => field);
+  if (bad.length) {
+    throw new HttpError(422, 'validation_error', `${bad.join(', ')}: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit`);
+  }
+}
+
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
@@ -1450,6 +1465,7 @@ export class MockServer {
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
     checkDistribution(input);
+    checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']));
     const defaults: Partial<Provider> = {
       cloud: null,
       credentials_secret: null,
@@ -1483,6 +1499,7 @@ export class MockServer {
     );
     if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
     checkDistribution({ ...provider, ...input });
+    checkSecretNames(input, new Set(Object.keys(input)));
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });
     return ok(provider);

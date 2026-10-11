@@ -947,6 +947,20 @@ describe('mock API', () => {
     expect(dropped.phase).toBe('cancelled');
   });
 
+  it('refuses a secret name the control plane could not read, like the API: on POST and on the PATCH fields set (SDD §13.3)', () => {
+    const { server } = setup('admin');
+    const call = (method: string, path: string, body: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const vcenter = { id: 'vc-x', name: 'vCenter X', kind: 'vmware', role: 'source', endpoint: 'https://vc.example/sdk', distribution: 'vmware' };
+    expect(call('POST', '/providers', { ...vcenter, credentials_secret: '../etc' })).toMatchObject({ status: 422 });
+    expect(call('POST', '/providers', { ...vcenter, credentials_secret: 'vc-x.prod_1' })).toMatchObject({ status: 201, body: { credentials_secret: 'vc-x.prod_1' } });
+    const host = { manage: false, address: '10.0.0.5', ssh_key_secret: 'has space' };
+    expect(call('PATCH', '/providers/vc-x', { conversion_host: host })).toMatchObject({ status: 422 });
+    expect(call('PATCH', '/providers/vc-x', { conversion_host: { ...host, ssh_key_secret: 'conv-key' } })).toMatchObject({ status: 200 });
+    // only the fields a PATCH sets are checked
+    server.providers.find((p) => p.id === 'vc-x')!.credentials_secret = 'old name';
+    expect(call('PATCH', '/providers/vc-x', { name: 'vCenter X2' })).toMatchObject({ status: 200 });
+  });
+
   it('keeps a provider while a plan still needs it, like the API: until it completes and its VMs are finalized (SDD §12)', () => {
     const { server } = setup('admin');
     const plan = server.plans[0]!;

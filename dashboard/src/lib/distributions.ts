@@ -1,7 +1,8 @@
 import type { Distribution, ProviderKind, ProviderRole } from '../api/types';
 
 /** Credential methods the dialog offers (SDD §13.3). */
-export type CredentialMode = 'password' | 'application_credential' | 'clouds_yaml' | 'vcenter';
+/** `external_secret`: a secret managed outside Seamless, named by `credentials_secret` (SDD §13.3). */
+export type CredentialMode = 'password' | 'application_credential' | 'clouds_yaml' | 'vcenter' | 'external_secret';
 
 export interface DistributionPreset {
   id: Distribution;
@@ -32,7 +33,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     endpointExample: 'https://overcloud.example.com:13000/v3',
     endpointHint: 'The public Keystone endpoint of the overcloud (port 13000).',
     caHint: 'The overcloud CA, e.g. the file referenced by OS_CACERT in overcloudrc.',
-    credentialModes: ['password', 'application_credential', 'clouds_yaml'],
+    credentialModes: ['password', 'application_credential', 'clouds_yaml', 'external_secret'],
     managedConversionHost: true,
   },
   {
@@ -45,7 +46,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     endpointExample: 'https://openstack.example.com:5000/v3',
     endpointHint: 'The Keystone v3 endpoint (port 5000 unless a proxy publishes it elsewhere).',
     caHint: 'The CA that signed the Keystone certificate, when it is not publicly trusted.',
-    credentialModes: ['password', 'application_credential', 'clouds_yaml'],
+    credentialModes: ['password', 'application_credential', 'clouds_yaml', 'external_secret'],
     managedConversionHost: true,
   },
   {
@@ -58,7 +59,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     endpointExample: 'https://kolla-vip.example.com:5000/v3',
     endpointHint: 'The kolla_external_vip_address endpoint (kolla_internal_fqdn for internal access).',
     caHint: 'Kolla’s root CA, usually /etc/kolla/certificates/ca/root.crt on the deploy host.',
-    credentialModes: ['password', 'application_credential', 'clouds_yaml'],
+    credentialModes: ['password', 'application_credential', 'clouds_yaml', 'external_secret'],
     managedConversionHost: true,
   },
   {
@@ -71,7 +72,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     endpointExample: 'https://vcenter.example.com/sdk',
     endpointHint: 'The vCenter SDK URL. Use a service account with read access and snapshot rights.',
     caHint: 'The vCenter machine SSL CA, when vCenter uses its own VMCA.',
-    credentialModes: ['vcenter'],
+    credentialModes: ['vcenter', 'external_secret'],
     managedConversionHost: false,
   },
   {
@@ -84,7 +85,7 @@ export const DISTRIBUTION_PRESETS: DistributionPreset[] = [
     endpointExample: 'https://keystone-public-openstack.apps.cluster.example.com/v3',
     endpointHint: 'The keystone-public route (oc get route keystone-public -n openstack).',
     caHint: 'The OpenShift ingress CA when the route certificate is not publicly trusted.',
-    credentialModes: ['password', 'application_credential', 'clouds_yaml'],
+    credentialModes: ['password', 'application_credential', 'clouds_yaml', 'external_secret'],
     managedConversionHost: true,
   },
 ];

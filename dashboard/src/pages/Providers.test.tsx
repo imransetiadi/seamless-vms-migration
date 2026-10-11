@@ -209,6 +209,60 @@ describe('Providers page', () => {
     expect(await screen.findByRole('status')).toHaveTextContent(/vcenter dc3 added/i);
   });
 
+  it('connects vCenter with secrets managed outside Seamless: it names them and writes none (SDD §13.3, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC4');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc4.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    expect(within(dialog).queryByLabelText(/vcenter user/i)).not.toBeInTheDocument();
+    await user.type(within(dialog).getByLabelText(/^secret name/i), 'vcenter-dc4');
+    expect(within(dialog).getByRole('region', { name: 'Sign-in' })).toHaveTextContent(/managed outside Seamless, at each connection\. Seamless never writes/);
+    expect(within(dialog).getByRole('region', { name: 'Sign-in' })).not.toHaveTextContent(/Stored in the platform/);
+    await user.click(within(dialog).getByRole('button', { name: /existing host/i }));
+    await user.type(within(dialog).getByLabelText(/^address/i), '198.51.100.78');
+    await user.click(within(dialog).getByRole('radio', { name: 'Key in a secret managed outside Seamless' }));
+    await user.type(within(dialog).getByLabelText(/^key secret name/i), 'conv-dc4-key');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const created = server.providers.find((p) => p.id === 'vcenter-dc4');
+    expect(created).toMatchObject({ credentials_secret: 'vcenter-dc4', credentials_updated_at: null, conversion_key_updated_at: null });
+    expect(created?.conversion_host).toMatchObject({ manage: false, address: '198.51.100.78', ssh_key_secret: 'conv-dc4-key' });
+    expect(server.events.some((e) => e.kind === 'provider.credentials_updated' || e.kind === 'provider.conversion_key_updated')).toBe(false);
+  });
+
+  it('refuses a secret name the control plane could not read, before anything is sent', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC5');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc5.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    await user.type(within(dialog).getByLabelText(/^secret name/i), '../etc');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/secret name/i);
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveAccessibleDescription(/letters, digits/i);
+    expect(server.providers.some((p) => p.id === 'vcenter-dc5')).toBe(false);
+  });
+
+  it('opens a provider that names a secret managed outside Seamless in that sign-in method', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const lab = server.providers.find((p) => p.id === 'community-lab')!;
+    lab.cloud = null;
+    lab.credentials_secret = 'lab-openstack';
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
+    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
+    expect(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' })).toBeChecked();
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveValue('lab-openstack');
+  });
+
   it('edits a provider: credentials stay empty, only changed fields are sent, the platform type is locked', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
