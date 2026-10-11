@@ -861,6 +861,14 @@ Twenty-three further iterations after the integration run, each verified with th
   unknown wave id up to the general text bound; the mock refuses what `check_plan_spec` refuses, a PATCH naming a
   field a plan cannot change, a provider route below its role before the lookup, and list pages outside the API's
   bounds, with the API's words (`mock.test.ts`).
+* Phone design pass (2026-10-11, frontend-design: screenshot critique of every route at 1440 dark/light and 390 px,
+  plan, build, re-shoot): the migration page offers the actions available now first, the next step's first and
+  primary, the unavailable ones in a quieter row under "Unavailable now", still focusable and saying why, a button
+  that changes rows keeping the focus (`MigrationActions.test.tsx`); the plans list keeps each plan's done count and
+  clouds under its name on a phone and never scrolls sideways (Playwright "the plans list keeps each plan's progress
+  and clouds on a phone…"); the lifecycle stepper reads down two columns on a phone, half its height (Playwright "on
+  a phone the lifecycle reads down two columns…"). Next from the same critique: the Overview's KPI tiles before
+  Downtime now on a phone.
 
 ### 13.2 Exit criteria — release 0.1.0
 
