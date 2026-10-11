@@ -333,7 +333,7 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
-`auth.denied`, and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
+`auth.denied`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
 never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
@@ -1850,6 +1850,10 @@ keys are that request's body: a field the file leaves out keeps its value, `upda
 events carry the API's data (`plan.created` `{name, vms}`, `plan.updated` `{fields}`, the file's keys)
 with actor `cli`. The CLI has no role: whoever can run it against the store owns the store, so the
 approver-only fields (§12) are not checked.
+`events prune` deletes the events older than its cutoff and then records `events.pruned` (actor `cli`, data
+`{before, deleted}`), which the deletion cannot take: the trail keeps who cut it and where. It refuses a
+cutoff after now (a negative or non-finite `--older-than-days`, a later `--before`), which would delete the
+whole trail; a `--before` without an offset is UTC.
 `estimate` refuses the knobs a plan refuses: `--slo` and `--max-passes` below 1 (`downtime_slo_s`,
 `max_sync_passes`, §4.2), the others as `estimator_overrides` (§9.1).
 
