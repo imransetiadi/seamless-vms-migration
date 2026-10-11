@@ -1980,6 +1980,31 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   header and the sign-in page; `public/favicon.svg` draws the same mark and `public/apple-touch-icon.png` is it
   at 180 px on a full-bleed tile. Each instance names its own tile gradient: the sidebar and the mobile header
   are both in the page, one of them hidden, and a gradient defined inside a hidden element does not paint.
+* Navigation (the app shell): every page has its navigation on the left. From 768 px it is a column at the left
+  edge — from 1280 px the full sidebar (15rem: the brand, the items with their labels beside their icons, the
+  session at the bottom: live indicator, Demo, orchestrator, version, user and role, theme, sign out), from 768 px
+  to 1279 px a rail (5rem: the brand mark, each item's icon with its label under it, never a label shown only on
+  hover, and at the bottom the live indicator, the theme and sign out as labelled icons). "Collapse navigation" /
+  "Expand navigation" at the column's foot switches between the two at any width from 768 px and is remembered
+  in the browser for that viewer (`localStorage`; without a stored choice the width decides, and a failing storage
+  only forgets it). The items stand in four labelled groups, in this order: Migrations — Overview (`/`), Plans
+  (`/plans`, also current on a migration's page); Clouds — Providers, Inventory; Activity — Events; Advisor —
+  Recommendations (`/advisor`, also current on a recommendation's page), Policies (`/advisor/policies`), Audit
+  trail (`/advisor/audit`). The current item is marked `aria-current="page"`. Plans carries the count of failed
+  migrations from `/stats` ("{n} failed", danger tone with its icon, part of the link's name; nothing while it is
+  0 or while the stats are unknown). Below 768 px a header holds the menu button, the brand, the live indicator
+  and the theme; the menu is a drawer sliding in from the left over the dimmed page (a modal dialog named
+  "Navigation": the focus stays in it, Escape or a tap on the dimmed page closes it and returns the focus to the
+  menu button; a choice closes it, and the page already shown puts the focus on the page, as a navigation does),
+  holding the full sidebar's groups and session; without motion when `prefers-reduced-motion` asks.
+* Confirmation dialogs (`ConfirmDialog`): a header with an icon in a tinted circle matching the tone — danger:
+  the action's own icon (a bin for a delete), otherwise a warning sign — beside the question as the title and,
+  when the caller names it, the object it acts on under it (its kind and id); a close button (×, "Close") in the
+  header corner does what Cancel does and is unavailable, saying why, while the request runs. The body says what
+  happens: when the caller lists the consequences, as rows — Removed, Kept, Then — each with its icon and
+  text, else the description; then the typed confirmation, which shows a check with "Matches" once the text
+  matches. The actions stand in a footer under a divider: Cancel, then the action named by its verb and object
+  (Delete provider) with its icon. Initial focus, Escape, busy and unavailable states are as for every dialog.
 * Accessibility: WCAG 2.2 AA contrast — figures shown while newer ones load too: the Overview greys them to the muted
   foreground and marks them `aria-busy`, never fades them with opacity —, visible focus rings, keyboard reachable
   actions, `aria-live`
