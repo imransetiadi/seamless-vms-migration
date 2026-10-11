@@ -737,6 +737,23 @@ A fixed IP reference without `subnet_ref` names only its address; the control pl
 override (§7.2). `ServerPort` then gives Nova the address as `fixed_ip` and Neutron `{"ip_address": …}`, and Neutron
 picks the subnet of the port's network that holds it.
 
+`Server.dst_prerequisites_errors` runs in `import_workload_dst_check`, before the cold import or the warm cutover
+stops the source and before a warm pre-copy's first pass. It looks up what each port of the workload needs, the way
+the import will after the stop:
+* The port's network reference and every fixed IP's subnet reference (`reference.network_id`,
+  `reference.subnet_id`). A `%auth%` reference searches only the credential's own project, so a shared network that
+  another project owns is not found, and a name that two of the project's networks carry is ambiguous.
+* Every fixed IP must be one that Neutron's IPAM accepts on the port. It lies in the subnet its reference names, or,
+  address-only, in a subnet of the port's network. It is a host address there as `check_subnet_ip` rules for the
+  port's owner: not an IPv4 subnet's network address (at any prefix length) or its broadcast address below a /31,
+  nor an IPv6 subnet's first address for a port that Nova creates (a port created through Neutron has no owner
+  yet). On a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the port's MAC is accepted: the kept MAC
+  with `port_creation_mode: neutron`; through Nova, which gives the port a new MAC, no explicit address at all.
+* The network of a new floating IP (`floating_ip_mode` `new`, or `auto` when no detached floating IP has the address).
+
+Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
+cutover fails while the source still runs.
+
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
 network partition ends the ssh about a minute later and the pass fails — a transient failure, retried — instead of
@@ -899,7 +916,13 @@ volumes with their server, so the order is:
      encrypted volumes is not supported"), volumes with snapshots and volumes in a group or
      consistency group (Cinder `volume.api.delete(unmanage_only=True)`, Wallaby and later);
    * no attachment is the boot volume (step 2): the destination server could not be created, nor the
-     source again on rollback.
+     source again on rollback;
+   * a port's RHOSO network (its NIC override's, else the mapped one) does not resolve with step 8's lookup. That
+     lookup takes the credential's own network of that name, else the only network of that name it sees. It fails
+     when there is no such network, when there are several in the credential's project, or when there are several
+     elsewhere and none in its project;
+   * an address step 8 would give the port is one Neutron refuses on that network (§6.6's rules for a port Nova
+     creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode).
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
@@ -928,8 +951,8 @@ volumes with their server, so the order is:
    on the managed volume with `POST /volumes/{id}/action {"os-set_image_metadata": {"metadata":
    …}}` (journaled per volume). Without it a UEFI or Windows guest would boot with defaults.
 8. Create the destination server from the managed volumes (BDM in journaled device order,
-   `delete_on_termination: false`). Its NICs: with `plan.port_creation_mode` `"nova"` each port's mapped network
-   with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
+   `delete_on_termination: false`). Each network is found with step 0's lookup. Its NICs: with
+   `plan.port_creation_mode` `"nova"` each port's mapped network with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
    MAC, every fixed IP (by address: Neutron picks the subnet), its security groups found by name in the
    destination credential's project, its port-security flag and the description `os-migrate:{source port id}`
