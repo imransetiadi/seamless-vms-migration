@@ -40,6 +40,8 @@ class FakeCloud:
         self.images = {}
         self.devices = {}
         self.ports = {}
+        self.subnets = {}
+        self.floating_ips = {}
         self.addresses = {}
         self.fail_on = {}
         self._ids = itertools.count(1)
@@ -313,7 +315,8 @@ class _FakeCompute:
 
 
 class _FakeNetwork:
-    """Neutron ports: enough for ports recreated through Neutron and their rollback (SDD 6.6)."""
+    """Neutron ports, subnets and floating IPs: enough for ports recreated through Neutron,
+    their rollback and the destination check before the stop (SDD 6.6)."""
 
     def __init__(self, cloud):
         self.cloud = cloud
@@ -324,6 +327,22 @@ class _FakeNetwork:
             port
             for port in list(self.cloud.ports.values())
             if all(port.get(key) == value for key, value in query.items())
+        ]
+
+    def subnets(self, **query):
+        self.cloud.record("subnets", **query)
+        return [
+            subnet
+            for subnet in list(self.cloud.subnets.values())
+            if all(subnet.get(key) == value for key, value in query.items())
+        ]
+
+    def ips(self, **query):
+        self.cloud.record("ips", **query)
+        return [
+            fip
+            for fip in list(self.cloud.floating_ips.values())
+            if all(fip.get(key) == value for key, value in query.items())
         ]
 
     def create_port(self, **params):

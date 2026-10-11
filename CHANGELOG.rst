@@ -118,3 +118,19 @@ This project follows a simple changelog to satisfy collection metadata validatio
   the subnet of the port's network that holds it. Seamless Migrate writes such
   references for a per-VM NIC override (a VM's port moved to another network
   or given other addresses). Exported references keep their ``subnet_ref``.
+- ``import_workload_dst_check`` checks the ports and floating IPs before the
+  source stops. It looks up what each port of the workload needs, the way the
+  import will after the stop: the port's network and every fixed IP's subnet
+  reference. A ``%auth%`` reference searches only the credential's own project,
+  so a shared network that another project owns, or a name that two of the
+  project's networks carry, is reported. Each fixed IP must also be one that
+  Neutron's IPAM takes on the port:
+
+  - a host address of its subnet, or of a subnet of the network when only the
+    address is given (not an IPv4 network address, nor a broadcast address
+    below a /31, nor an IPv6 subnet's first address for a port Nova creates);
+  - on a SLAAC or DHCPv6-stateless subnet, only the EUI-64 address of the kept
+    MAC with ``port_creation_mode: neutron``, and no explicit address through
+    Nova, which gives the port a new MAC.
+
+  The floating IP the import would attach or create is looked up too.

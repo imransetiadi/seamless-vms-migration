@@ -389,7 +389,10 @@ class Server(osm_resource.Resource):
         return refs
 
     def dst_prerequisites_errors(self, conn, filters=None):
-        """Get messages for unmet destination cloud prerequisites including keypairs.
+        """Get messages for unmet destination cloud prerequisites including keypairs,
+        every port's network, subnets and addresses, and the floating IPs (SDD 6.6): run
+        before the source is stopped, they are looked up as the import will look them up
+        after it.
 
         Returns: list of strings (error messages), empty when prerequisites
         are met
@@ -410,4 +413,18 @@ class Server(osm_resource.Resource):
             ) as e:
                 errors.append(f"Destination keypair prerequisites not met: {e}")
 
+        # an export from before a migration param existed takes its class default
+        migration_params = {**self.migration_param_defaults, **self.migration_params()}
+        for port_data in params.get("ports") or []:
+            errors.extend(
+                ServerPort.from_data(port_data).dst_port_errors(
+                    conn, migration_params["port_creation_mode"]
+                )
+            )
+        for fip_data in params.get("floating_ips") or []:
+            errors.extend(
+                ServerFloatingIP.from_data(fip_data).dst_errors(
+                    conn, migration_params["floating_ip_mode"]
+                )
+            )
         return errors
