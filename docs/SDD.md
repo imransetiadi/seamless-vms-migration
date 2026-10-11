@@ -403,7 +403,9 @@ volumes): `cancelled` is terminal, so no later action could remove them. The mig
 `migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
 in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
 orchestrator starts (the step is idempotent, §7.1), and once its outcome is recorded the checkpoint becomes
-`cleaned` or `cleanup_failed`.
+`cleaned` or `cleanup_failed`. A stop that comes after the step ran waits for that one save, so the outcome is
+recorded and stands; only a cleanup that the stop interrupts before its outcome is recorded says so in a
+`migration.error` ("runs again when the orchestrator starts") — never one whose outcome was recorded.
 
 Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `completed`, `finalized`,
 `cancelled`, `rolled_back` (`failed` blocks a wave until an operator retries, rolls back or cancels).
