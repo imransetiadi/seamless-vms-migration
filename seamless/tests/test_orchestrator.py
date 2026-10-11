@@ -1812,6 +1812,70 @@ async def test_a_cancels_cleanup_whose_outcome_was_not_recorded_runs_again(tmp_p
     assert len(rollbacks) == 2 and store.get("migration", mid, Migration).checkpoint == "cleaned"
 
 
+@pytest.mark.parametrize("outcome", ["cleanup_failed", "cleaned"])
+@pytest.mark.parametrize("slow", ["before_the_write", "after_the_write"])
+async def test_a_stop_while_the_cleanup_outcome_is_saved_waits_for_it(
+    tmp_path, store, slow, outcome
+):
+    """SDD §5.1: a stop that comes after the cancel's cleanup ran waits for its outcome to be
+    saved; the outcome stands and no migration.error says the cleanup was interrupted — also
+    when the save had already written and only the task had not resumed yet."""
+    settings = make_settings(tmp_path)
+    started = asyncio.Event()
+
+    async def long_pass(ctx):
+        started.set()
+        await asyncio.sleep(60)
+
+    async def cleanup(ctx):
+        if outcome == "cleanup_failed":
+            raise PermanentStepError("cinder: volume is busy")
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: long_pass, StepName.ROLLBACK: cleanup}
+    )
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm},
+        executor=executor,
+        settings=settings,
+    )
+    saving = asyncio.Event()
+    real = h.orch._cleanup_recorded
+
+    async def slow_save(mid: str, outcome: str) -> None:
+        if slow == "before_the_write":
+            saving.set()
+            await asyncio.sleep(0.2)
+        await real(mid, outcome)
+        if slow == "after_the_write":
+            # written, but the task has not resumed when the stop comes (a busy event loop)
+            saving.set()
+            await asyncio.sleep(0.2)
+
+    h.orch._cleanup_recorded = slow_save
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await asyncio.wait_for(started.wait(), 5)
+    await h.orch.cancel(mid, "rina", "wrong VM")
+    await asyncio.wait_for(saving.wait(), 5)
+    await h.orch.stop()
+    assert store.get("migration", mid, Migration).checkpoint == outcome
+    events = [e for e in store.events(since_seq=0, limit=100000) if e.migration_id == mid]
+    errors = [e.message for e in events if e.kind == "migration.error"]
+    if outcome == "cleanup_failed":
+        assert len(errors) == 1
+        assert "rollback_workloads.yml" in errors[0]
+    else:
+        assert errors == []
+        assert [e.data.get("action") for e in events if e.kind == "migration.action"][
+            -1
+        ] == "cleanup"
+
+
 async def test_a_cancels_cleanup_that_failed_is_not_run_again(tmp_path, store):
     """SDD §5.1: a cleanup that fails records a migration.error naming the manual
     rollback_workloads.yml run and sets checkpoint "cleanup_failed": the next start does not

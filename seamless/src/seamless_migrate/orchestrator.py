@@ -22,7 +22,7 @@ import logging
 import time
 import weakref
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -1359,6 +1359,26 @@ class Orchestrator:
     async def _cleanup_after_cancel(
         self, m: Migration, step: asyncio.Task[Any] | None, actor: str
     ) -> None:
+        recorded = False
+
+        async def record(outcome: str, report: Coroutine[Any, Any, None]) -> None:
+            """The step ran: its outcome event and checkpoint are saved even when a stop() comes
+            meanwhile — the stop waits for them, and the outcome stands (SDD §5.1)."""
+            nonlocal recorded
+
+            async def save() -> None:
+                await report
+                await self._cleanup_recorded(m.id, outcome)
+
+            saving = asyncio.ensure_future(save())
+            try:
+                await asyncio.shield(saving)
+            except asyncio.CancelledError:
+                await asyncio.wait({saving})
+                recorded = not saving.cancelled() and saving.exception() is None
+                raise
+            recorded = True
+
         try:
             if step is not None:
                 # the executor kills the playbook and removes its secret files; the step's own
@@ -1375,34 +1395,40 @@ class Orchestrator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._emit(
-                    "migration.error",
-                    f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
-                    "rollback_workloads.yml for the workload to remove its temporary resources",
-                    migration=m,
-                    data={"step": "cleanup", "error_class": type(exc).__name__},
+                await record(
+                    "cleanup_failed",
+                    self._emit(
+                        "migration.error",
+                        f"{m.vm.name}: cleanup after the cancel failed: "
+                        f"{redact(str(exc))[:300]}; run rollback_workloads.yml for the workload to "
+                        "remove its temporary resources",
+                        migration=m,
+                        data={"step": "cleanup", "error_class": type(exc).__name__},
+                    ),
                 )
-                await self._cleanup_recorded(m.id, "cleanup_failed")
                 return
-            await self._emit(
-                "migration.action",
-                f"{m.vm.name}: temporary resources of the cancelled migration removed",
-                migration=m,
-                actor=actor,
-                data={"action": "cleanup"},
-            )
-            await self._cleanup_recorded(m.id, "cleaned")
-        except asyncio.CancelledError:
-            # a shutdown interrupted the cleanup: its outcome is still recorded, and its mark
-            # stays, so the next start runs it (SDD §5.1)
-            with contextlib.suppress(Exception):
-                await self._emit(
-                    "migration.error",
-                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; it runs "
-                    "again when the orchestrator starts",
+            await record(
+                "cleaned",
+                self._emit(
+                    "migration.action",
+                    f"{m.vm.name}: temporary resources of the cancelled migration removed",
                     migration=m,
-                    data={"step": "cleanup", "error_class": "CancelledError"},
-                )
+                    actor=actor,
+                    data={"action": "cleanup"},
+                ),
+            )
+        except asyncio.CancelledError:
+            # a shutdown interrupted the cleanup before its outcome was recorded: its mark stays,
+            # so the next start runs it, and the event says so; a recorded outcome stands (SDD §5.1)
+            if not recorded:
+                with contextlib.suppress(Exception):
+                    await self._emit(
+                        "migration.error",
+                        f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; it "
+                        "runs again when the orchestrator starts",
+                        migration=m,
+                        data={"step": "cleanup", "error_class": "CancelledError"},
+                    )
             raise
         finally:
             # tracked until it has finished, its outcome event included: whoever waits for the
