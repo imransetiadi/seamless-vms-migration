@@ -25,6 +25,7 @@ from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Plan, Provider, utcnow
+from ..planning.ipam import address_refusal
 from ..storage import (
     StorageError,
     manage_reference,
@@ -127,6 +128,29 @@ def _existing_server(conn: Any, server_id: str) -> Any:
         if _not_found(exc):
             return None
         raise
+
+
+def _destination_network(conn: Any, name: str) -> Any:
+    """A port's RHOSO network as step 8 finds it (SDD §7.3 step 0): the credential's own network of
+    that name, else the only network of that name it sees - the admin credential sees every
+    project's, and a name can be in several."""
+    own = list(conn.network.networks(name=name, project_id=conn.current_project_id))
+    if len(own) == 1:
+        return own[0]
+    if own:
+        raise PermanentStepError(
+            f"RHOSO has {len(own)} networks named {name!r} in the credential's project"
+        )
+    seen = list(conn.network.networks(name=name))
+    if len(seen) == 1:
+        return seen[0]
+    if not seen:
+        raise PermanentStepError(f"RHOSO has no network named {name!r}")
+    projects = ", ".join(sorted({str(_attr(n, "project_id")) for n in seen}))
+    raise PermanentStepError(
+        f"RHOSO has {len(seen)} networks named {name!r}, none in the credential's project "
+        f"(projects {projects})"
+    )
 
 
 def port_description(source_port_id: str) -> str:
@@ -367,11 +391,20 @@ class HandoverExecutor:
         return storage
 
     def _readiness(
-        self, src: Any, dst: Any, server_id: str, backend_map: dict[str, str]
+        self,
+        src: Any,
+        dst: Any,
+        server_id: str,
+        backend_map: dict[str, str],
+        plan: Plan | None = None,
     ) -> dict[str, Any]:
-        """Step 0 as a read-only report: what each volume would become, and every problem."""
-        attachments = self._capture_definition(src, server_id)["attachments"]
+        """Step 0 as a read-only report: what each volume would become, and every problem; with the
+        plan, also what would make step 8 fail on a port."""
+        definition = self._capture_definition(src, server_id)
+        attachments = definition["attachments"]
         problems: list[str] = []
+        if plan is not None:
+            problems.extend(self._port_problems(dst, definition["networks"], plan, server_id))
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -433,7 +466,12 @@ class HandoverExecutor:
         return {"server_id": server_id, "volumes": volumes, "problems": problems}
 
     async def readiness(
-        self, source: Provider, destination: Provider, server_id: str, backend_map: dict[str, str]
+        self,
+        source: Provider,
+        destination: Provider,
+        server_id: str,
+        backend_map: dict[str, str],
+        plan: Plan | None = None,
     ) -> dict[str, Any]:
         """Read-only handover check of one server (SDD §7.3 step 0): per volume its driver
         family, source pool, destination host and manage reference, and every problem that would
@@ -442,8 +480,33 @@ class HandoverExecutor:
         dst = await self._conn(destination)
         return await self._call(
             "check the handover readiness",
-            lambda: self._readiness(src, dst, server_id, backend_map),
+            lambda: self._readiness(src, dst, server_id, backend_map, plan),
         )
+
+    @staticmethod
+    def _port_problems(
+        dst: Any, networks: list[dict[str, Any]], plan: Plan, vm_id: str
+    ) -> list[str]:
+        """What would make step 8 fail on a port, found while the VM still runs (§7.3 step 0): its
+        RHOSO network does not resolve with step 8's lookup, or an address step 8 would give it is
+        one Neutron refuses there (§6.6)."""
+        neutron = plan.port_creation_mode == "neutron"
+        problems: list[str] = []
+        for n in networks:
+            target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
+            where = f"port {n.get('port_id')} ({n.get('mac_address')})"
+            try:
+                network = _destination_network(dst, target)
+            except PermanentStepError as exc:
+                problems.append(f"{where}: {exc}")
+                continue
+            subnets = list(dst.network.subnets(network_id=_attr(network, "id")))
+            # Nova keeps one address per port (step 8)
+            for address in addresses if neutron else addresses[:1]:
+                why = address_refusal(address, subnets, neutron=neutron, mac=n.get("mac_address"))
+                if why:
+                    problems.append(f"{where} on {target!r}: {address} {why}")
+        return problems
 
     @staticmethod
     def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
@@ -667,7 +730,7 @@ class HandoverExecutor:
             if not journal.done(key):
                 description = port_description(n["port_id"])
                 target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
-                network = conn.network.find_network(target, ignore_missing=False)
+                network = _destination_network(conn, target)
                 project_id = conn.current_project_id
                 mac = str(n["mac_address"] or "").lower()
                 # only the port step 8 would create: the admin credential sees every project's
@@ -761,7 +824,9 @@ class HandoverExecutor:
 
         if not journal.data["order"]:
             # step 0: everything that can be checked while the VM still runs (§7.3, §7.3.1)
-            report = await self.readiness(ctx.source, ctx.destination, server_id, backend_map)
+            report = await self.readiness(
+                ctx.source, ctx.destination, server_id, backend_map, ctx.plan
+            )
             if report["problems"]:
                 raise PermanentStepError(
                     "storage handover refused: " + "; ".join(report["problems"])
@@ -898,7 +963,7 @@ class HandoverExecutor:
                     networks = []
                     for n in definition["networks"]:
                         target, addresses = self._destination_nic(ctx.plan, vm_id, n)
-                        network = dst.network.find_network(target, ignore_missing=False)
+                        network = _destination_network(dst, target)
                         net = {"uuid": _attr(network, "id")}
                         # Nova keeps one address per port: its override's, else its first
                         if addresses:

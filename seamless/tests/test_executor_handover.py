@@ -311,8 +311,43 @@ class FakeNetwork:
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
 
-    def find_network(self, name, ignore_missing=True):
-        return NS(id=f"{self.c.name}-net-{name}", name=name)
+    def networks(self, name=None, project_id=None):
+        """Neutron's network list filtered by name and owner; by default every name is one
+        network of the credential's own project."""
+        listed = self.c.network_list
+        if listed is None:
+            listed = [
+                NS(id=f"{self.c.name}-net-{name}", name=name, project_id=self.c.current_project_id)
+            ]
+        return [
+            n
+            for n in listed
+            if (name is None or n.name == name)
+            and (project_id is None or n.project_id == project_id)
+        ]
+
+    def subnets(self, network_id=None):
+        """By default a network's subnets hold every address; a test lists its own."""
+        if self.c.subnet_list is None:
+            return [
+                NS(
+                    id="any-v4",
+                    network_id=network_id,
+                    cidr="0.0.0.0/0",
+                    ipv6_address_mode=None,
+                    ipv6_ra_mode=None,
+                ),
+                NS(
+                    id="any-v6",
+                    network_id=network_id,
+                    cidr="::/0",
+                    ipv6_address_mode=None,
+                    ipv6_ra_mode=None,
+                ),
+            ]
+        return [
+            sn for sn in self.c.subnet_list if network_id is None or sn.network_id == network_id
+        ]
 
 
 CEPH = {"vendor_name": "Open Source", "storage_protocol": "ceph"}
@@ -337,6 +372,8 @@ class FakeCloud:
         self.security_groups = {}
         self.group_lookups = []
         self.current_project_id = f"{name}-project"
+        self.network_list = None
+        self.subnet_list = None
         self.image_metadata = {}
         self.deleted_by_nova = []
         self.refuse_metadata = False
@@ -1585,3 +1622,134 @@ def test_port_description_matches_the_collection():
     exec(compile(ast.Module(body=[func], type_ignores=[]), "server_port.py", "exec"), namespace)
     for port_id in ("port-1", "8b0c01a1-205f-490b-a4fc-ee8f44711bc7"):
         assert port_description(port_id) == namespace["port_description"](port_id)
+
+
+def subnet(network_id, cidr, mode=None):
+    return NS(
+        id=f"sub-{cidr}",
+        network_id=network_id,
+        cidr=cidr,
+        ipv6_address_mode=mode,
+        ipv6_ra_mode=mode,
+    )
+
+
+async def test_handover_step_0_refuses_a_network_step_8_could_not_resolve(tmp_path):
+    """SDD §7.3 step 0: step 8 takes the credential's own network of that name, else the only one
+    it sees; none, several in its project, or several elsewhere refuse before the stop."""
+    cases = {
+        "none": [],
+        "two-own": [
+            NS(id="a", name="rhoso-app", project_id="dst-project"),
+            NS(id="b", name="rhoso-app", project_id="dst-project"),
+        ],
+        "two-elsewhere": [
+            NS(id="a", name="rhoso-app", project_id="tenant-a"),
+            NS(id="b", name="rhoso-app", project_id="tenant-b"),
+        ],
+    }
+    for name, listed in cases.items():
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert "rhoso-app" in str(refused.value), name
+        assert "port-1" in str(refused.value), name
+        # the VM keeps running: nothing was stopped
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+
+
+async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
+    """SDD §7.3 step 8: the credential's own network of that name among same-named ones of other
+    projects, and a shared one another project owns when it is the only one of that name."""
+    own = NS(id="own-net", name="rhoso-app", project_id="dst-project")
+    other = NS(id="other-net", name="rhoso-app", project_id="tenant-b")
+    shared = NS(id="shared-net", name="rhoso-app", project_id="admin-project")
+    for name, listed, expected in (
+        ("own", [other, own], "own-net"),
+        ("shared", [shared], "shared-net"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["networks"] == [
+            {"uuid": expected, "fixed_ip": "10.0.0.5"}
+        ], name
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / f"{name}-neutron")
+        clouds["dst"].network_list = listed
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+        [attrs] = clouds["dst"].port_attrs
+        assert attrs["network_id"] == expected, name
+
+
+async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):
+    """SDD §7.3 step 0 and §6.6: each address step 8 gives a port must be one Neutron takes on
+    that network - a host address of its subnets; on a SLAAC subnet only the kept MAC's EUI-64
+    address in "neutron" mode, and no explicit address through Nova (a new MAC)."""
+    from seamless_migrate.domain.models import NicOverride
+
+    net = "dst-net-rhoso-app"
+
+    async def cutover(name, subnets, plan_of=lambda p: p):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].subnet_list = subnets
+        ctx = make_ctx(plan_of(plan), mig, SRC, DST, settings)[0]
+        try:
+            await executor.run(StepName.CUTOVER, ctx)
+        except PermanentStepError as exc:
+            assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+            return str(exc)
+        return None
+
+    v4 = subnet(net, "10.0.0.0/24")
+    # the port's own 10.0.0.5 (Nova takes its first address)
+    assert await cutover("ok", [v4]) is None
+    refused = await cutover("outside", [subnet(net, "10.9.0.0/24")])
+    assert "10.0.0.5 is no host address of any subnet" in refused
+    entry = NicOverride(fixed_ips=["10.0.0.0"])
+    refused = await cutover("network-address", [v4], lambda p: overridden(p, entry))
+    assert "10.0.0.0 is no host address" in refused
+    # SLAAC: the kept MAC fa:16:3e:00:00:01 derives fd00:20::f816:3eff:fe00:1 on fd00:20::/64
+    slaac = subnet(net, "fd00:20::/64", "slaac")
+    eui = NicOverride(fixed_ips=["10.0.0.5", "fd00:20::f816:3eff:fe00:1"])
+    other = NicOverride(fixed_ips=["10.0.0.5", "fd00:20::5"])
+    assert (
+        await cutover(
+            "eui64", [v4, slaac], lambda p: overridden(p, eui, port_creation_mode="neutron")
+        )
+        is None
+    )
+    refused = await cutover(
+        "not-eui64", [v4, slaac], lambda p: overridden(p, other, port_creation_mode="neutron")
+    )
+    assert "fd00:20::5 is not fd00:20::f816:3eff:fe00:1" in refused
+    v6_only = NicOverride(fixed_ips=["fd00:20::f816:3eff:fe00:1"])
+    refused = await cutover("nova-slaac", [v4, slaac], lambda p: overridden(p, v6_only))
+    assert "SLAAC or DHCPv6-stateless" in refused
+
+
+async def test_handover_step_0_looks_up_the_network_a_nic_override_names(tmp_path):
+    """SDD §7.3 step 0: the port's RHOSO network is its NIC override's when the entry names one;
+    the read-only report the lab runs says the same when it is given the plan."""
+    from seamless_migrate.domain.models import NicOverride
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    # the mapped rhoso-app resolves; the override's rhoso-dmz is in two other projects
+    clouds["dst"].network_list = [
+        NS(id="app", name="rhoso-app", project_id="dst-project"),
+        NS(id="dmz-a", name="rhoso-dmz", project_id="tenant-a"),
+        NS(id="dmz-b", name="rhoso-dmz", project_id="tenant-b"),
+    ]
+    moved = overridden(plan, NicOverride(network="rhoso-dmz"))
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map, moved)
+    [problem] = [p for p in report["problems"] if "port-1" in p]
+    assert "2 networks named 'rhoso-dmz', none in the credential's project" in problem
+    # without the plan the report checks the volumes only, as before
+    plain = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert not [p for p in plain["problems"] if "port-1" in p]
+    with pytest.raises(PermanentStepError, match="rhoso-dmz"):
+        await executor.run(StepName.CUTOVER, make_ctx(moved, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # the mapped network alone is fine
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["dst"].created[0]["networks"] == [{"uuid": "app", "fixed_ip": "10.0.0.5"}]
