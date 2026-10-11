@@ -1938,7 +1938,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
   plan's heading; the migration page's Use suggested probe, whose suggestion goes once the VM has probes → Edit probes
-  beside it; while Cancel returns focus to the button) or while its request runs (a busy button stays focusable,
+  beside it; a failure's Retry that succeeds, its message going with it → the page's heading; while Cancel returns
+  focus to the button) or while its request runs (a busy button stays focusable,
   `aria-busy` and `aria-disabled`, and ignores further presses), `prefers-reduced-motion` honoured,
   44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
   over it — so Tab never hides the focused control under them (WCAG 2.4.11), and Escape closing the topmost dialog
