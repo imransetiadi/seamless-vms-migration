@@ -133,8 +133,10 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
   });
 
   it('blocks an address Neutron gives no VM, as the API words it', () => {
-    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.0.0', '10.30.255.255', '10.30.1.5'] }), nets, [vm.name], {
-      subnets,
+    // an IPv6 subnet's first address is a port's (review NC-08)
+    const dual = [...subnets, { name: 'web-v6', network: 'tenant-web', cidr: 'fd00:30::/64' }];
+    const found = preflight(vm, 'openstack', plan({ network: 'tenant-web', fixed_ips: ['10.30.0.0', '10.30.255.255', '10.30.1.5', 'fd00:30::'] }), nets, [vm.name], {
+      subnets: dual,
       selected: [vm],
     });
     expect(found.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
@@ -192,6 +194,11 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     );
     const fits = [{ ...subnets[0]!, cidr: '10.20.0.0/16' }];
     expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets: fits }))).not.toContain('NET_ADDRESS_REFUSED');
+    // Nova creates the port with no owner: an IPv6 subnet's first address is taken (review NC-08)
+    const first = makeVm({ id: 'os-o1', name: 'nic-01', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:01', fixed_ips: ['fd00:30::'] }] });
+    const v6 = [{ ...subnets[0]!, cidr: 'fd00:30::/64' }];
+    const nova = { ...plan, port_creation_mode: 'nova' as const };
+    expect(codes(preflight(first, 'openstack', nova, { 'tenant-app': 1442 }, [first.name], { selected: [first], networkDetails: details, subnets: v6 }))).not.toContain('NET_ADDRESS_REFUSED');
   });
 
   it("blocks a NIC on another project's network the credential may not use, with the API's message (SDD §9.3, §6.6)", () => {

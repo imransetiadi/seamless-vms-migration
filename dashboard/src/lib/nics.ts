@@ -130,8 +130,9 @@ function fromBits(value: bigint, bits: 32 | 128): string {
 
 /**
  * What makes `address` no host address of the subnets of `cidrs` that hold it, in the API's words (SDD §9.3, as Neutron's
- * check_subnet_ip): an IPv4 subnet's network address at any prefix length, its broadcast address below a /31, an IPv6
- * subnet's first address. Null for a host address of one of them, or an address none of them holds.
+ * check_subnet_ip for a port created with no owner): an IPv4 subnet's network address at any prefix length, its broadcast
+ * address below a /31; an IPv6 subnet's first address is taken. Null for a host address of one of them, or an address none
+ * of them holds.
  */
 export function noHostAddress(address: string, cidrs: string[]): string | null {
   const ip = toBits(address);
@@ -147,7 +148,7 @@ export function noHostAddress(address: string, cidrs: string[]): string | null {
     if (ip.value >> host !== first >> host) continue;
     // the subnet as the API's ip_network(cidr, strict=False) writes it
     const subnet = `${fromBits(first, ip.bits)}/${length}`;
-    if (ip.value === first) why = why ?? `the network address of ${subnet}`;
+    if (ip.bits === 32 && ip.value === first) why = why ?? `the network address of ${subnet}`;
     else if (ip.bits === 32 && length < 31 && ip.value === (first | ((1n << host) - 1n))) why = why ?? `the broadcast address of ${subnet}`;
     else return null;
   }
@@ -158,10 +159,11 @@ export function noHostAddress(address: string, cidrs: string[]): string | null {
 const AUTO_ADDRESS_MODES = ['slaac', 'dhcpv6-stateless'];
 
 /**
- * Neutron's check_subnet_ip (2023.1), as the API's ipam.host_address: an IPv4 subnet's network address is never a port's,
- * nor its broadcast address below a /31; an IPv6 subnet's first address is refused only to a port Nova creates.
+ * Neutron's check_subnet_ip (2023.1) for a port created with no owner, as Nova and Seamless create theirs, as the API's
+ * ipam.host_address: an IPv4 subnet's network address is never a port's, nor its broadcast address below a /31; an IPv6
+ * subnet's first address is taken.
  */
-function hostAddress(ip: { value: bigint; bits: 32 | 128 }, cidr: string, createdByNova: boolean): boolean {
+function hostAddress(ip: { value: bigint; bits: 32 | 128 }, cidr: string): boolean {
   const [base, prefix] = cidr.split('/');
   const net = base ? toBits(base) : null;
   const length = Number(prefix);
@@ -170,7 +172,7 @@ function hostAddress(ip: { value: bigint; bits: 32 | 128 }, cidr: string, create
   const first = (net.value >> host) << host;
   if (ip.value >> host !== first >> host) return false;
   if (ip.bits === 32) return ip.value !== first && (length >= 31 || ip.value !== (first | ((1n << host) - 1n)));
-  return !createdByNova || ip.value !== first;
+  return true;
 }
 
 /** The address SLAAC gives `mac` on `cidr` (oslo's get_ipv6_addr_by_EUI64), written as the API writes it. */
@@ -196,7 +198,7 @@ export function addressRefusal(
   const ip = toBits(address);
   if (!ip) return 'is not an IP address';
   // an address alone: Neutron takes the first subnet of the network that holds it
-  const subnet = subnets.find((s) => hostAddress(ip, s.cidr, !neutron));
+  const subnet = subnets.find((s) => hostAddress(ip, s.cidr));
   if (!subnet) return "is no host address of any subnet of the port's network";
   if (AUTO_ADDRESS_MODES.includes(subnet.ipv6_address_mode ?? '') || AUTO_ADDRESS_MODES.includes(subnet.ipv6_ra_mode ?? '')) {
     // Neutron takes an explicit address there only if it derives the same one

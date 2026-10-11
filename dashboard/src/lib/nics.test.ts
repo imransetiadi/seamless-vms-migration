@@ -86,14 +86,14 @@ describe('noHostAddress', () => {
   it('names what Neutron gives no VM, as the API does (SDD §9.3)', () => {
     expect(noHostAddress('192.168.10.0', ['192.168.10.0/24'])).toBe('the network address of 192.168.10.0/24');
     expect(noHostAddress('192.168.10.255', ['192.168.10.0/24'])).toBe('the broadcast address of 192.168.10.0/24');
-    expect(noHostAddress('fd00:10::', ['fd00:10::/64'])).toBe('the network address of fd00:10::/64');
     expect(noHostAddress('10.255.0.0', ['10.255.0.0/31'])).toBe('the network address of 10.255.0.0/31');
     expect(noHostAddress('10.9.9.9', ['10.9.9.9/32'])).toBe('the network address of 10.9.9.9/32');
     // the subnet as the API writes it
     expect(noHostAddress('192.168.10.0', ['192.168.10.7/24'])).toBe('the network address of 192.168.10.0/24');
-    expect(noHostAddress('fd00::', ['FD00:0::/64'])).toBe('the network address of fd00::/64');
+    // a port created with no owner, as Nova and Seamless create theirs, takes an IPv6 subnet's first address (review NC-08)
+    expect(noHostAddress('fd00::', ['FD00:0::/64'])).toBeNull();
     const cidrs = ['192.168.10.0/24', '10.255.0.0/31', 'fd00:10::/64', 'fd99::/16'];
-    for (const host of ['192.168.10.1', '192.168.10.254', '10.255.0.1', 'fd00:10::ffff:ffff:ffff:ffff', 'fd99:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '10.0.0.5', 'nonsense'])
+    for (const host of ['192.168.10.1', '192.168.10.254', '10.255.0.1', 'fd00:10::', 'fd00:10::ffff:ffff:ffff:ffff', 'fd99::', 'fd99:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '10.0.0.5', 'nonsense'])
       expect(noHostAddress(host, cidrs), host).toBeNull();
   });
 });
@@ -120,13 +120,13 @@ describe('addressRefusal (SDD §6.6: what Neutron 2023.1 refuses on a port, as t
     expect(eui64('fd00:20::/64', 'FA:16:3E:00:00:01')).toBe('fd00:20::f816:3eff:fe00:1');
   });
 
-  it("follows check_subnet_ip for the port's owner", () => {
+  it('follows check_subnet_ip for a port without an owner', () => {
     const subnets = [subnet('10.0.0.0/24'), subnet('10.255.0.0/31'), subnet('fd00:10::/64')];
     for (const host of ['10.0.0.5', '10.0.0.254', '10.255.0.1', 'fd00:10::5']) expect(addressRefusal(host, subnets, { neutron: false, mac: null }), host).toBeNull();
-    for (const refused of ['10.0.0.0', '10.0.0.255', '10.255.0.0', '10.9.0.5', 'fd00:10::'])
+    for (const refused of ['10.0.0.0', '10.0.0.255', '10.255.0.0', '10.9.0.5'])
       expect(addressRefusal(refused, subnets, { neutron: false, mac: null }), refused).toBe("is no host address of any subnet of the port's network");
-    // a port created through Neutron has no owner yet: an IPv6 subnet's first address is taken
-    expect(addressRefusal('fd00:10::', subnets, { neutron: true, mac })).toBeNull();
+    // Nova and the import create ports with no owner, and check_subnet_ip takes an IPv6 subnet's first address for one (review NC-08)
+    for (const neutron of [false, true]) expect(addressRefusal('fd00:10::', subnets, { neutron, mac }), String(neutron)).toBeNull();
     expect(addressRefusal('nonsense', subnets, { neutron: false, mac: null })).toBe('is not an IP address');
   });
 
