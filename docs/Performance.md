@@ -592,7 +592,10 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   `GET /metrics` need every migration: they keep the last loaded list and reload it only when the store's
   `change_stamp` (count + sum of versions, one aggregate query) moved — measured on SQLite with 1,000
   migrations: a full load + validation 19 ms, the stamp 0.2 ms, so a 15 s Prometheus scrape or an idle
-  overview costs one aggregate query. `GET /plans` filters by `status` and pages like `/migrations`. Prefer SSE-triggered
+  overview costs one aggregate query. `GET /plans` filters by `status` and pages like `/migrations`; it and
+  `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one `SELECT DISTINCT` over the indexed
+  `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
+  226 → 39 ms and 153 → 32 ms CPU. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling.
 * **Writes:** the orchestrator persists after every state change; progress updates are throttled. Each update
   rewrites one JSONB value (new tuple version): ≤ 10–20 writes/s at 10 active migrations — easy for PostgreSQL.
