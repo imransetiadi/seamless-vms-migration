@@ -11,7 +11,7 @@ from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
-from .networks import port_refusal, resolve_network
+from .networks import kit_subnet, port_refusal, resolve_network
 
 S = Strategy
 
@@ -706,8 +706,8 @@ def run_preflight(
             )
         )
 
-    # every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); the
-    # VMware migration kit maps port groups its own way
+    # every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware
+    # NIC's too: Seamless gives the migration kit the network it resolves (§7.2)
     openstack_source = source is None or source.kind != ProviderKind.vmware
     seen = _network_list(dst_inv)
     resolved: dict[int, dict[str, Any]] = {}
@@ -716,7 +716,7 @@ def run_preflight(
         network, why = resolve_network(seen, plan.nic_target(vm.source_id, nic)[0])
         if network is not None:
             resolved[id(nic)] = network
-        elif why and openstack_source:
+        elif why:
             ambiguous.append(f"{(nic.mac or '?').lower()} ({nic.network}): {why}")
     if ambiguous:
         out.append(
@@ -727,10 +727,11 @@ def run_preflight(
         )
 
     # whether the credential may put each NIC's port on its resolved network: another project's
-    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3)
+    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3);
+    # the VMware migration kit creates every port with the NIC's MAC (§7.2)
     roles = (dst_caps or {}).get("roles")
     denied = []
-    for nic in vm.nics if openstack_source else ():
+    for nic in vm.nics:
         network = resolved.get(id(nic))
         why = None if network is None else port_refusal(network, roles)
         if network is not None and why:
@@ -965,6 +966,26 @@ def run_preflight(
                     refused.append(
                         f"{(nic.mac or '?').lower()} on {network['name']!r}: {address} {why}"
                     )
+        if refused:
+            out.append(
+                finding(
+                    "NET_ADDRESS_REFUSED",
+                    "Neutron would refuse these addresses on their RHOSO network: "
+                    + "; ".join(refused)
+                    + ".",
+                )
+            )
+    # the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its
+    # network (SDD §7.2, §9.3)
+    if not openstack_source and dst_inv.subnets:
+        refused = []
+        for nic in vm.nics:
+            network = resolved.get(id(nic))
+            if network is None:
+                continue
+            _, why = kit_subnet(nic, _subnets_of(dst_inv, network))
+            if why:
+                refused.append(f"{(nic.mac or '?').lower()} on {network['name']!r}: {why}")
         if refused:
             out.append(
                 finding(

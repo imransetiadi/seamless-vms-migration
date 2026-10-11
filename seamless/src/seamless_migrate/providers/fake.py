@@ -283,6 +283,8 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
                 network=spec.network,
                 mac="00:50:56:" + ":".join(f"{rng.randrange(256):02x}" for _ in range(3)),
                 fixed_ips=[f"10.2.{0 if spec.network == 'DC2-Prod' else 9}.{20 + index}"],
+                # a standard port group's NIC: the kit maps it by its summary, the name (SDD §7.2)
+                network_key=spec.network,
             )
         ],
         power_state="running",
@@ -423,6 +425,7 @@ class FakeDestinationProvider:
             # the demo VMs' addresses lie in these (SDD §10): NIC addresses validate against them
             subnets=[
                 {
+                    "id": f"sub-{name}-v4",
                     "name": f"{name}-v4",
                     "network": name,
                     "network_id": f"net-{name}",

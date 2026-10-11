@@ -943,10 +943,10 @@ def test_finding_map_network_ambiguous_resolves_a_name_as_the_cutover_does():
     ):
         codes = [x.code for x in check(vm, plan=plan, dst=resolved_dst(details))]
         assert "MAP_NETWORK_AMBIGUOUS" not in codes and "MAP_NETWORK_MISSING" not in codes
-    # VMware sources go through the migration kit: not this rule
+    # a VMware NIC too: Seamless resolves its port group's network for the migration kit (§7.2)
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
     codes = [x.code for x in check(vm, plan=plan, dst=elsewhere, source=vmware)]
-    assert "MAP_NETWORK_AMBIGUOUS" not in codes
+    assert "MAP_NETWORK_AMBIGUOUS" in codes
     # an override to such a name: the ambiguity alone, no empty MAP_NIC_OVERRIDE
     moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-app"}}})
     codes = [x.code for x in check(vm, plan=moved, dst=elsewhere)]
@@ -1015,8 +1015,9 @@ def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network(
     codes = [x.code for x in check(later, dst=gone)]
     assert "MAP_NETWORK_PRESTAGED" in codes and "NET_ADDRESS_REFUSED" not in codes
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, dst=resolved_dst(details))]
+    # a VMware NIC's IPv4 address is checked by the migration kit's rule (its own test)
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
-    assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, dst=gone, source=vmware)]
+    assert "NET_ADDRESS_REFUSED" in [x.code for x in check(vm, dst=gone, source=vmware)]
 
 
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
@@ -1071,9 +1072,41 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     # a NIC override's network is judged the same way
     moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-net"}}})
     assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, plan=moved)]
-    # VMware NICs go through the migration kit, which this rule does not cover
+    # a VMware NIC too: the migration kit creates every port with the NIC's MAC (§7.2)
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
-    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, member, source=vmware)]
+    assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, source=vmware)]
+
+
+def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_rule():
+    """SDD §9.3, §7.2: the kit sends a VMware NIC's IPv4 guest addresses only, all with one subnet
+    of its network: each must be a host address there, and one subnet must hold them all."""
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    details = [net("prod", "dc2-prod")]
+    first = subnet_of("prod", "dc2-prod", "10.2.0.0/24")
+    second = subnet_of("prod", "dc2-prod", "10.2.1.0/24")
+    plan = make_plan(mappings=Mappings(networks={"DC2-Prod": "dc2-prod"}))
+
+    def found(*addresses, subnets=(first, second)):
+        vm = make_vm(
+            source_id="vm-1",
+            nics=[Nic(network="DC2-Prod", mac="00:50:56:AA:BB:CC", fixed_ips=list(addresses))],
+        )
+        return check(vm, plan=plan, dst=resolved_dst(details, subnets), source=vmware)
+
+    # one subnet holds them; an IPv6 address the kit never sends is not judged
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("10.2.1.5", "10.2.1.6", "fd00::5")]
+    f = only(found("10.2.0.5", "10.2.1.5"), "NET_ADDRESS_REFUSED")
+    assert f.message == (
+        "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on "
+        "'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the "
+        "migration kit gives a NIC's IPv4 addresses one subnet."
+    )
+    f = only(found("10.2.0.255"), "NET_ADDRESS_REFUSED")
+    assert (
+        "00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.255 is no host address of any subnet" in f.message
+    )
+    # no IPv4 address at all: nothing to refuse
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("fe80::1")]
 
 
 def test_mtu_and_nic_override_subnets_follow_the_resolved_network():

@@ -14,7 +14,7 @@ import yaml
 
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
-from seamless_migrate.domain.models import ConversionHostConfig, Mappings, utcnow
+from seamless_migrate.domain.models import ConversionHostConfig, Mappings, Nic, utcnow
 from seamless_migrate.executors.ansible import (
     CONVERSION_KEY_FILE,
     KIT_PLAYBOOK,
@@ -99,7 +99,10 @@ class FakeImpl:
         self.calls.append(("inventory",))
         if self.registry.inventory_error:
             raise ProviderError("networks: HTTP 503")
-        return DestinationInventory(network_details=list(self.registry.networks))
+        return DestinationInventory(
+            network_details=list(self.registry.networks),
+            subnets=[dst_subnet(n) for n in self.registry.networks],
+        )
 
 
 def dst_net(name, own=True, project_id=None):
@@ -110,6 +113,19 @@ def dst_net(name, own=True, project_id=None):
         "project_id": project_id or ("finance-rhoso" if own else "admin"),
         "own": own,
         "shared": not own,
+    }
+
+
+def dst_subnet(network, cidr="10.0.0.0/16"):
+    """A network's one subnet, by id: what a VMware NIC's network_map value names (SDD §7.2)."""
+    return {
+        "id": f"sub-{network['id']}",
+        "name": f"{network['name']}-v4",
+        "network": network["name"],
+        "network_id": network["id"],
+        "cidr": cidr,
+        "ipv6_address_mode": None,
+        "ipv6_ra_mode": None,
     }
 
 
@@ -167,9 +183,11 @@ def env(tmp_path, monkeypatch):
     return SimpleNamespace(settings=settings, log=log, executor=executor, registry=registry)
 
 
-def ctx_for(env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, **mig_kw):
+def ctx_for(
+    env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, nics=None, **mig_kw
+):
     plan = make_plan(id="plan-00c0ffee", mappings=mappings)
-    vm = make_vm(source_id="srv-1", name=name)
+    vm = make_vm(source_id="srv-1", name=name, **({"nics": nics} if nics is not None else {}))
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
     return make_ctx(plan, mig, source, DST, env.settings)
 
@@ -675,7 +693,11 @@ async def test_generated_ansible_input_is_never_templated(env, strategy, source)
     ``network_map`` — is written ``!unsafe``, and the playbook still receives it unchanged."""
     networks = {**MAPPINGS.networks, JINJA_NAME: "rhoso-app"}
     mappings = MAPPINGS.model_copy(update={"networks": networks})
-    ctx, _ = ctx_for(env, strategy=strategy, source=source, name=JINJA_NAME, mappings=mappings)
+    # a port group named by whoever runs vCenter keys the kit's network_map (SDD §7.2)
+    nics = [Nic(network=JINJA_NAME, mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])]
+    ctx, _ = ctx_for(
+        env, strategy=strategy, source=source, name=JINJA_NAME, mappings=mappings, nics=nics
+    )
     await env.executor.run(StepName.PRECOPY, ctx)
     calls = read_log(env.log)
     assert calls
@@ -691,7 +713,9 @@ async def test_generated_ansible_input_is_never_templated(env, strategy, source)
                 assert node.tag in NEVER_TEMPLATED, (call["playbook"], name, node.value)
     if strategy is Strategy.vmware_warm:
         assert calls[-1]["vars"]["vms_list"] == [JINJA_NAME]
-        assert calls[-1]["vars"]["network_map"] == networks
+        assert calls[-1]["vars"]["network_map"] == {
+            JINJA_NAME: "net-rhoso-app-mine,sub-net-rhoso-app-mine"
+        }
     else:
         [query] = calls[-1]["vars"]["os_migrate_workloads_filter"]
         assert re.search(query["regex"], JINJA_NAME)
@@ -766,6 +790,83 @@ def test_ansible_reads_generated_input_verbatim(tmp_path):
     assert "ok=6" in run.stdout and "failed=0" in run.stdout
 
 
+async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_it(env):
+    """SDD §7.2: every kit run gets used_mapped_networks true and network_map[the kit's key] =
+    "{network id},{subnet id}" of the RHOSO network each NIC's port group resolves to - mapped or
+    same-named, a distributed port group by its key. A NIC that cannot go there stops the run
+    before the kit, which powers the VM off at the cutover."""
+    std = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:01",
+        fixed_ips=["10.0.0.5", "fe80::1"],
+        network_key="app-net",
+    )
+    dvs = Nic(
+        network="DC2-DMZ",
+        mac="00:50:56:00:00:02",
+        fixed_ips=["10.0.0.6"],
+        network_key="dvportgroup-7",
+    )
+    # DC2-DMZ is mapped; app-net is not, and a RHOSO network of that name takes it
+    maps = Mappings(networks={"DC2-DMZ": "rhoso-dmz"})
+    ctx, rec = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, mappings=maps, nics=[std, dvs]
+    )
+    await env.executor.run(StepName.CUTOVER, ctx)
+    v = read_log(env.log)[-1]["vars"]
+    assert v["used_mapped_networks"] is True
+    assert v["network_map"] == {
+        "app-net": "net-app-net-mine,sub-net-app-net-mine",
+        "dvportgroup-7": "net-rhoso-dmz-mine,sub-net-rhoso-dmz-mine",
+    }
+
+    async def refused(nics, error=PermanentStepError, roles=None):
+        ran = len(read_log(env.log))
+        destination = DST.model_copy(update={"capabilities": {"roles": roles}} if roles else {})
+        plan = make_plan(id="plan-00c0ffee", mappings=maps)
+        # another VM: the cutover above created a server named web-01
+        mig = make_migration(
+            id="mig-00000000aa",
+            plan_id=plan.id,
+            vm=make_vm(source_id="srv-2", name="db-01", nics=nics),
+            strategy=Strategy.vmware_cold,
+        )
+        c, r = make_ctx(plan, mig, VCENTER, destination, env.settings)
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, c)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and r.downtime_marks == 0
+        return str(exc.value)
+
+    gone = Nic(network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"])
+    assert await refused([std, gone]) == (
+        "the NIC 00:50:56:00:00:09 of db-01 cannot go to RHOSO network 'gone-net': there is no "
+        "network named 'gone-net'"
+    )
+    outside = std.model_copy(update={"fixed_ips": ["192.0.2.5"]})
+    assert await refused([outside]) == (
+        "the NIC 00:50:56:00:00:01 of db-01 on 'app-net': 192.0.2.5 is no host address of any "
+        "subnet of the port's network"
+    )
+    # two NICs the kit maps by one key but that need different networks
+    twin = dvs.model_copy(update={"network": "app-net", "mac": "00:50:56:00:00:03"})
+    assert "shares the migration kit's key 'dvportgroup-7' with another NIC" in await refused(
+        [dvs, twin]
+    )
+    # another project's shared network, from a member's token (SDD §6.6)
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    on_shared = Nic(network="shared-net", mac="00:50:56:00:00:04", fixed_ips=["10.0.0.7"])
+    assert "Neutron lets only the admin or advsvc role" in await refused(
+        [on_shared], roles=["member", "reader"]
+    )
+    # the destination's networks cannot be read: transient, before the kit
+    env.registry.inventory_error = True
+    assert "could not read the destination's networks" in await refused(
+        [std], error=TransientStepError
+    )
+    assert rec.downtime_marks == 1
+
+
 async def test_vmware_warm_flags(env):
     ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
     await env.executor.run(StepName.PRECOPY, ctx)
@@ -775,7 +876,9 @@ async def test_vmware_warm_flags(env):
     assert (v["cbt_sync"], v["cutover"]) == (True, False)
     assert v["vms_list"] == ["web-01"]
     assert v["vcenter_hostname"] == "vcenter.dc2.example"
-    assert v["network_map"] == {"app-net": "rhoso-app", "DC2-Prod": "dc2-prod"}
+    # SDD §7.2: every NIC by the kit's key to the RHOSO network and subnet Seamless resolved
+    assert v["used_mapped_networks"] is True
+    assert v["network_map"] == {"app-net": "net-rhoso-app-mine,sub-net-rhoso-app-mine"}
     assert v["use_fixed_ips"] is True and v["already_deploy_conversion_host"] is True
     assert v["cinder_volume_type"] == "rbd-hdd"
     assert v["os_migrate_vmw_data_dir"] == str(run_dir(env))

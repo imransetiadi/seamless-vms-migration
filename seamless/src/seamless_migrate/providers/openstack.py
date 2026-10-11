@@ -275,6 +275,7 @@ class OpenStackProvider:
         names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
         subnets = [
             {
+                "id": str(_attr(s, "id")),
                 "name": str(_attr(s, "name")),
                 "network": names[_attr(s, "network_id")],
                 "network_id": str(_attr(s, "network_id")),

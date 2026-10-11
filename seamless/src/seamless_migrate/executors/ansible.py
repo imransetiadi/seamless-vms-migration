@@ -39,7 +39,13 @@ from ..domain.models import (
     next_pass_number,
     utcnow,
 )
-from ..planning.networks import resolve_network
+from ..planning.networks import (
+    kit_network_key,
+    kit_network_value,
+    kit_subnet,
+    port_refusal,
+    resolve_network,
+)
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
@@ -399,8 +405,11 @@ def _common_openstack_vars(
     return out
 
 
-def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
-    """Non-secret extra-vars for running ``step`` (credentials go to ``secrets.yml``)."""
+def build_vars(
+    step: StepName, ctx: StepContext, network_map: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Non-secret extra-vars for running ``step`` (credentials go to ``secrets.yml``); a VMware
+    run's ``network_map`` is what ``_vmware_network_map`` resolved (SDD §7.2)."""
     step = StepName(step)
     m = ctx.migration
     rdir = run_dir(ctx.settings, ctx.plan.id, m.id)
@@ -410,8 +419,10 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
         out: dict[str, Any] = {
             "vcenter_hostname": host,
             "vms_list": [m.vm.name],
-            "network_map": dict(mappings.networks),
-            "used_mapped_networks": bool(mappings.networks),
+            # every NIC by the kit's key to the RHOSO network and subnet Seamless resolved: the kit
+            # drops a NIC its map lacks, and without the map sends every NIC to an unset variable
+            "network_map": dict(network_map or {}),
+            "used_mapped_networks": True,
             "use_fixed_ips": True,
             "os_migrate_vmw_data_dir": str(rdir),
             "already_deploy_conversion_host": True,
@@ -736,6 +747,8 @@ class AnsibleExecutor:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        # the kit powers the VM off at the cutover: its networks are settled before it runs
+        network_map = await self._vmware_network_map(ctx) if strategy in VMWARE else None
         passes_before = 0
         if strategy == Strategy.warm:
             state_before = await asyncio.to_thread(
@@ -746,7 +759,7 @@ class AnsibleExecutor:
         stop_skipped = await self._execute(
             rdir,
             osm,
-            build_vars(step, ctx),
+            build_vars(step, ctx, network_map),
             ctx.source,
             ctx.destination,
             build_inventory(ctx),
@@ -883,6 +896,56 @@ class AnsibleExecutor:
             return None
         # none listed (an older provider): nothing to resolve against
         return list(getattr(inventory, "network_details", None) or [])
+
+    async def _vmware_network_map(self, ctx: StepContext) -> dict[str, str]:
+        """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
+        "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
+        mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
+        holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
+        resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
+        take, two NICs one key would send to different values; networks that cannot be read are a
+        transient failure."""
+        try:
+            inventory = await self.providers.get(ctx.destination).inventory()
+        except ProviderError as exc:
+            raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
+        networks = list(getattr(inventory, "network_details", None) or [])
+        subnets = list(getattr(inventory, "subnets", None) or [])
+        roles = ctx.destination.capabilities.get("roles")
+        vm = ctx.migration.vm
+        out: dict[str, str] = {}
+        problems: list[str] = []
+        for nic in vm.nics:
+            name = ctx.plan.nic_target(vm.source_id, nic)[0]
+            what = f"the NIC {nic.mac or '?'} of {vm.name}"
+            network, why = resolve_network(networks, name)
+            if network is None:
+                problems.append(
+                    f"{what} cannot go to RHOSO network {name!r}: "
+                    + (why or f"there is no network named {name!r}")
+                )
+                continue
+            refused = port_refusal(network, roles)
+            if refused:
+                problems.append(
+                    f"{what} cannot go to RHOSO network {name!r} "
+                    f"(project {network.get('project_id')}): {refused}"
+                )
+                continue
+            own = [s for s in subnets if s.get("network_id") == network.get("id")]
+            subnet, why = kit_subnet(nic, own)
+            if why:
+                problems.append(f"{what} on {name!r}: {why}")
+                continue
+            key, value = kit_network_key(nic), kit_network_value(network, subnet)
+            if out.setdefault(key, value) != value:
+                problems.append(
+                    f"{what} shares the migration kit's key {key!r} with another NIC that goes to "
+                    f"{out[key]}, not {value}"
+                )
+        if problems:
+            raise PermanentStepError("; ".join(problems))
+        return out
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         try:

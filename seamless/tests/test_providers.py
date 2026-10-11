@@ -194,15 +194,16 @@ class FakeNetwork:
 
     def subnets(self, **_):
         return [
-            NS(name="app-subnet", network_id="net-1", cidr="10.0.0.0/24"),
+            NS(id="sub-1", name="app-subnet", network_id="net-1", cidr="10.0.0.0/24"),
             NS(
+                id="sub-6",
                 name="app-v6",
                 network_id="net-1",
                 cidr="fd00::/64",
                 ipv6_address_mode="slaac",
                 ipv6_ra_mode="slaac",
             ),
-            NS(name="orphan", network_id="net-gone", cidr="192.0.2.0/24"),
+            NS(id="sub-x", name="orphan", network_id="net-gone", cidr="192.0.2.0/24"),
         ]
 
     def agents(self, **_):
@@ -673,8 +674,10 @@ async def test_openstack_destination_inventory(stub_openstack):
     conn.network.get_network("net-9").is_router_external = True
     assert (await dst.inventory()).network_details[1]["external"] is True
     # the subnets it sees, by network name and id, where a NIC's addresses must lie
+    # each with its id: what a VMware NIC's network_map value names (SDD §10, §7.2)
     assert inv.subnets == [
         {
+            "id": "sub-1",
             "name": "app-subnet",
             "network": "app-net",
             "network_id": "net-1",
@@ -683,6 +686,7 @@ async def test_openstack_destination_inventory(stub_openstack):
             "ipv6_ra_mode": None,
         },
         {
+            "id": "sub-6",
             "name": "app-v6",
             "network": "app-net",
             "network_id": "net-1",
@@ -773,7 +777,8 @@ class VirtualEthernetCard:
     def __init__(self, mac, network):
         self.key = 4000
         self.macAddress = mac
-        self.deviceInfo = NS(label="Network adapter 1")
+        # vSphere's summary of a NIC on a standard port group is the network's name
+        self.deviceInfo = NS(label="Network adapter 1", summary=network)
         self.backing = NS(deviceName=network)
 
 
@@ -877,6 +882,9 @@ async def test_vmware_provider_maps_vm(tmp_path):
         "00:50:56:aa:bb:cc",
         ["10.2.0.15", "fe80::1"],
     )
+    # SDD §4, §7.2: what the migration kit maps the NIC by - a standard port group's NIC by its
+    # device summary
+    assert nic.network_key == "DC2-Prod"
     assert vm.tags == {"app": "billing"}
     caps = await provider.check()
     assert caps["api_version"] == "8.0.2.0" and caps["cbt_enabled_vms"] == 1
@@ -1292,7 +1300,8 @@ async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
 
     vm = fake_vcenter_vm()
     nic = vm.config.hardware.device[-1]
-    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7"))
+    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7", portKey="12"))
+    nic.deviceInfo = NS(label="Network adapter 1", summary="DVSwitch: 50 2c 9e")
     vim = NS(
         VirtualMachine=VirtualMachine,
         vm=FAKE_VIM.vm,
@@ -1320,6 +1329,16 @@ async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
     )
     [mapped] = await provider.list_vms()
     assert mapped.nics[0].network == "DC2-DMZ"
+    # the migration kit maps a distributed port group's NIC by the port group's key (SDD §7.2)
+    assert mapped.nics[0].network_key == "dvportgroup-7"
+    # an NSX opaque network: Seamless names it by its id, the kit maps it by the device summary
+    nic.backing = NS(opaqueNetworkId="nsx-ls-1")
+    nic.deviceInfo = NS(label="Network adapter 1", summary="nsx.LogicalSwitch: 5ab3")
+    [mapped] = await provider.list_vms()
+    assert (mapped.nics[0].network, mapped.nics[0].network_key) == (
+        "nsx-ls-1",
+        "nsx.LogicalSwitch: 5ab3",
+    )
 
     # pyVmomi exceptions become ProviderError with the vSphere message
     def failing(**_):
@@ -1399,3 +1418,37 @@ async def test_fake_destination_inventory_resolves_every_demo_nic():
                 assert "MAP_NETWORK_AMBIGUOUS" not in codes, (vm.name, codes)
                 assert "NET_ADDRESS_REFUSED" not in codes, (seed, vm.name, mode, codes)
                 assert "NET_PORT_NOT_PERMITTED" not in codes, (seed, vm.name, mode, codes)
+
+
+async def test_fake_vmware_vms_get_a_network_map_value_for_every_nic():
+    """SDD §7.2, §9.3: the demo's VMware plan (DC2-Prod and DC2-DMZ mapped) blocks none of its VMs
+    on the network findings, and the migration kit gets every NIC's network and subnet."""
+    from seamless_migrate.domain.models import Mappings
+    from seamless_migrate.planning.networks import (
+        kit_network_key,
+        kit_network_value,
+        kit_subnet,
+        resolve_network,
+    )
+    from seamless_migrate.planning.preflight import run_preflight
+    from tests.factories import make_plan, make_provider
+
+    dst_provider = FakeDestinationProvider(seed=42)
+    caps, dst = await dst_provider.check(), await dst_provider.inventory()
+    vcenter = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    source = FakeSourceProvider(ProviderKind.vmware, seed=Settings().demo_seed)
+    vms, src = await source.list_vms(), await source.inventory()
+    plan = make_plan(mappings=Mappings(networks={"DC2-Prod": "dc2-prod", "DC2-DMZ": "dc2-dmz"}))
+    for vm in vms:
+        codes = [
+            f.code for f in run_preflight(vm, plan, src, dst, vms, source=vcenter, dst_caps=caps)
+        ]
+        for code in ("MAP_NETWORK_AMBIGUOUS", "NET_ADDRESS_REFUSED", "NET_PORT_NOT_PERMITTED"):
+            assert code not in codes, (vm.name, codes)
+        for nic in vm.nics:
+            network, _ = resolve_network(dst.network_details, plan.nic_target(vm.source_id, nic)[0])
+            own = [s for s in dst.subnets if s["network_id"] == network["id"]]
+            subnet, why = kit_subnet(nic, own)
+            assert why is None, (vm.name, why)
+            assert kit_network_key(nic) == nic.network
+            assert kit_network_value(network, subnet) == f"{network['id']},{subnet['id']}"

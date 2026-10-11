@@ -161,6 +161,9 @@ class Nic(_Model):
     fixed_ips: list[str] = Field(default_factory=list)
     vnic_type: str = "normal"
     mtu: int | None = None
+    #: VMware: what the migration kit maps the NIC by - its distributed port group's key, else its
+    #: device summary (a standard port group's name); None for OpenStack (SDD §4, §7.2)
+    network_key: str | None = None
 
 
 PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]

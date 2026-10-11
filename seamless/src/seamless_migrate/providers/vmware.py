@@ -140,16 +140,24 @@ def map_vm(
     nics: list[Nic] = []
     for dev in (d for d in devices if isinstance(d, nic_cls)):
         backing = getattr(dev, "backing", None)
+        port = getattr(backing, "port", None)
+        group_key = getattr(port, "portgroupKey", None)
         network = getattr(backing, "deviceName", None)
         if not network:
-            port = getattr(backing, "port", None)
-            key = getattr(port, "portgroupKey", None)
-            network = portgroups.get(key, key) if key else None
+            network = portgroups.get(group_key, group_key) if group_key else None
         if not network:
             network = getattr(backing, "opaqueNetworkId", None) or "unknown"
         mac = str(getattr(dev, "macAddress", "") or "")
+        # what the migration kit maps the NIC by, as vmware.vmware's guest facts report it: the
+        # distributed port group's key, else the device summary (SDD §7.2)
+        summary = getattr(getattr(dev, "deviceInfo", None), "summary", None)
         nics.append(
-            Nic(network=str(network), mac=mac or None, fixed_ips=guest_ips.get(mac.lower(), []))
+            Nic(
+                network=str(network),
+                mac=mac or None,
+                fixed_ips=guest_ips.get(mac.lower(), []),
+                network_key=str(group_key or summary or network),
+            )
         )
 
     # PCI passthrough and vGPU (shared PCI) devices: expressed as the flavor extra specs the
