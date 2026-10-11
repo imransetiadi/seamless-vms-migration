@@ -159,10 +159,11 @@ test('the Overview inbox lists both kinds of pending approval; the advisor decis
   await expect(inbox.getByRole('listitem', { name: 'app-billing-01' })).toContainText('Cutover approval');
   const held = inbox.getByRole('listitem', { name: 'analytics-node-2' });
   await expect(held).toContainText('Advisor decision · Migration strategy');
-  // one kind at a time
-  await inbox.getByText('Cutover approval (2)').click();
+  // one kind at a time; the counts are not fixed: the mock's migrations move on, and another may reach an advisor hold
+  // while the test runs (it did on a busy machine)
+  await inbox.getByText(/^Cutover approval \(\d+\)$/).click();
   await expect(held).toBeHidden();
-  await inbox.getByText('Advisor decision (1)').click();
+  await inbox.getByText(/^Advisor decision \(\d+\)$/).click();
   await expect(inbox.getByRole('listitem', { name: 'app-billing-01' })).toBeHidden();
   await held.getByRole('link', { name: 'analytics-node-2' }).click();
   await expect(page).toHaveURL(/\/advisor\/recommendations\/rec-/);
