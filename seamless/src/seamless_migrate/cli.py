@@ -605,11 +605,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # orchestrator/store errors surface as messages, not tracebacks
+        from .ai.redaction import redact_cut
         from .orchestrator import OrchestratorError
         from .providers.base import ProviderError
-        from .store import NotFound
+        from .store import ConflictError, NotFound
 
-        if isinstance(exc, OrchestratorError | ProviderError | NotFound | ValueError):
+        # SDD §15: one line, as the API answers each of these with a status (§12)
+        if isinstance(exc, ProviderError):
+            # an SDK's message may carry endpoint URLs or credentials: the API's 502 (§13.4)
+            print(f"error: {redact_cut(str(exc), 500)}", file=sys.stderr)
+            return 1
+        if isinstance(exc, ConflictError):
+            again = "a running server changed it, run the command again"
+            print(f"error: {exc}; {again}", file=sys.stderr)
+            return 1
+        if isinstance(exc, OrchestratorError | NotFound | ValueError):
             print(f"error: {exc}", file=sys.stderr)
             return 1
         raise

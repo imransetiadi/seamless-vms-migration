@@ -222,6 +222,59 @@ def test_plan_apply_refuses_what_the_api_refuses(env, capsys, change, message):
     assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
 
 
+def _demo_plan(env, monkeypatch) -> Plan:
+    monkeypatch.setenv("SEAMLESS_DEMO", "true")
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    plan = Plan(
+        name="Demo", source_provider_id="src-osp", destination_provider_id="dst-rhoso", vm_ids=["x"]
+    )
+    store.put("plan", plan)
+    store.dispose()
+    return plan
+
+
+def test_cli_prints_a_provider_error_redacted_and_cut(env, capsys, monkeypatch):
+    """SDD §15: a provider SDK's message leaves as the API's 502 does (redact_cut 500, §13.4)."""
+    from seamless_migrate.providers import fake
+    from seamless_migrate.providers.base import ProviderError
+
+    plan = _demo_plan(env, monkeypatch)
+    url = "https://admin:S3cretPa55@vcenter.example/sdk"
+
+    async def boom(self):
+        raise ProviderError(f"invalid vCenter endpoint {url!r} " + "x" * 2000)
+
+    monkeypatch.setattr(fake.FakeSourceProvider, "inventory", boom)
+    assert cli.main(["plan", "validate", plan.id]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: inventory failed: invalid vCenter endpoint")
+    assert "S3cretPa55" not in err
+    assert len(err.strip()) <= len("error: ") + 500
+    assert "Traceback" not in err
+
+
+def test_cli_reports_a_lost_race_as_one_line_not_a_traceback(env, capsys, monkeypatch):
+    """SDD §15: a ConflictError (a running server changed the document) asks to run it again."""
+    from seamless_migrate.orchestrator import Orchestrator
+    from seamless_migrate.store import ConflictError
+
+    plan = _demo_plan(env, monkeypatch)
+
+    async def lost(self, plan_id, actor):
+        raise ConflictError(f"plan {plan_id!r} changed (version 3, expected 2)")
+
+    monkeypatch.setattr(Orchestrator, "validate_plan", lost)
+    assert cli.main(["plan", "validate", plan.id]) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and err.startswith("error: ")
+    assert f"plan {plan.id!r} changed" in err and "run the command again" in err
+
+
 def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):
     monkeypatch.setenv("SEAMLESS_DEMO", "true")
     store = store_for(env)
