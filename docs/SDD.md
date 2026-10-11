@@ -1008,6 +1008,10 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   so none writes over another's change (auto-waves never turns a plan started meanwhile back into a
   draft, validation never marks a started plan `validated`, and an edit waits for a running validation:
   a plan edited during a validation ends up `draft`, never `validated` with settings no validation saw).
+  The plan's lock is its process's own, and an edit can come from another process (`seamless plan apply`
+  beside the server, §15): so before it marks the plan `validated` the validation compares the plan's
+  editable fields with the ones it read, and when they changed it leaves the plan as the edit left it and
+  fails with 409 (`conflict`, "changed while it was being validated; validate it again").
 
 ### 8.1 Plan status and the finalize queue (ADV-19)
 
