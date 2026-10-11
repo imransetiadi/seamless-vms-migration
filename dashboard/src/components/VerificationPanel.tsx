@@ -143,8 +143,10 @@ function checkState(c: VerificationCheck): 'ok' | 'failed' | 'skipped' {
  * probe's target, result, latency and time, and the checks.
  */
 export function VerificationPanel({ migration: m, plan, role, onSaved }: { migration: Migration; plan: Plan | null | undefined; role: Role | undefined; onSaved: (text: string) => void }) {
-  // the plan's edit rules (SDD §12): a migration in flight keeps the plan as it is
-  const siblings = useMigrations({ plan_id: m.plan_id });
+  // the plan's edit rules (SDD §12): a migration in flight keeps the plan as it is. Only a draft or validated plan is
+  // editable at all, so only then are its migrations loaded — a running plan's page is where live events refetch them
+  const editable = plan?.status === 'draft' || plan?.status === 'validated';
+  const siblings = useMigrations({ plan_id: m.plan_id }, { enabled: editable });
   const edit = plan ? planActions(plan, role, siblings.data ?? [m]).edit : { enabled: false, reason: 'The plan is loading.' };
   const record = m.verification;
   const caption = useId();
