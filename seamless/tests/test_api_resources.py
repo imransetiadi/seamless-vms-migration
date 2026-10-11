@@ -3,6 +3,7 @@ import inspect
 import json
 import time
 
+import fastapi.routing
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -271,6 +272,40 @@ def test_plans_carry_their_derived_status_and_finalize_reminder(api):
         json={"derived_status": "finalized"},
     )
     assert patched.status_code == 422
+
+
+def test_the_migration_list_is_validated_once_and_sent_as_before(api, monkeypatch):
+    """SDD §12: GET /migrations sends what the store validated, without FastAPI dumping it,
+    validating it again and serializing it (185 ms CPU for 1,000 migrations)."""
+    vm_ids = first_clean_vms(api, n=2)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "list",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    assert api.post(f"/api/v1/plans/{plan_id}/validate", Role.operator).status_code == 200
+    expected = [m.model_dump(mode="json") for m in api.store.list("migration", Migration)]
+    expected_plan = [m for m in expected if m["plan_id"] == plan_id]
+
+    validated_again = []
+    real_serialize = fastapi.routing.serialize_response
+
+    async def counting_serialize(*args, **kwargs):
+        validated_again.append(kwargs.get("field"))
+        return await real_serialize(*args, **kwargs)
+
+    monkeypatch.setattr(fastapi.routing, "serialize_response", counting_serialize)
+    listed = api.get(f"/api/v1/migrations?plan_id={plan_id}", Role.viewer)
+    everything = api.get("/api/v1/migrations", Role.viewer)
+    assert listed.headers["content-type"] == "application/json"
+    assert (listed.json(), everything.json()) == (expected_plan, expected)
+    assert validated_again == []
 
 
 def test_plan_routes_derive_the_status_without_loading_migrations(api, monkeypatch):
