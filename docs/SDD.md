@@ -766,6 +766,9 @@ the import will after the stop:
   compute owner only afterwards), and `check_subnet_ip` takes it for a port without one. On a SLAAC or
   DHCPv6-stateless subnet only the EUI-64 address of the port's MAC is accepted: the kept MAC with
   `port_creation_mode: neutron`; through Nova, which gives the port a new MAC, no explicit address at all.
+* With `port_creation_mode: nova`, exactly one fixed IP. Nova creates each port with one address, and the import
+  refuses a port with none or several (`InconsistentState`) only after the source stopped. §9.2 rules such a VM out
+  of `cold` and `warm` at validation; this catches a port whose addresses changed at the source since then.
 * The network of a new floating IP (`floating_ip_mode` `new`, or `auto` when no detached floating IP has the address).
 * No other port of the network holds what the import will ask Neutron for. That covers an address of the port
   (`IpAddressAlreadyAllocated`), and with `port_creation_mode: neutron` also its MAC (`MacAddressInUse`, and
