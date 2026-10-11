@@ -39,6 +39,7 @@ from ..domain.models import (
     next_pass_number,
     utcnow,
 )
+from ..planning.networks import resolve_network
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
@@ -207,6 +208,10 @@ def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride])
                 params["network_ref"] = {**(params.get("network_ref") or {}), "name": entry.network}
             addresses = entry.fixed_ips if entry.fixed_ips is not None else former
             params["fixed_ips_refs"] = [{"ip_address": address} for address in addresses]
+            # what a warm cutover exports again for, should the entry be removed (SDD §7.2)
+            if not isinstance(port.get("_migration_params"), dict):
+                port["_migration_params"] = {}
+            port["_migration_params"]["nic_override"] = True
             for address in former:
                 moved[str(address)] = (mac, list(addresses))
         for fip in server.get("floating_ips") or []:
@@ -235,36 +240,94 @@ def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride])
     return out
 
 
-def _address_only_refs(doc: dict[str, Any]) -> bool:
-    """Whether a server port holds a fixed IP reference without subnet_ref: a NIC override
-    applied at the export (SDD §7.2)."""
+def _overridden_ports(doc: dict[str, Any]) -> bool:
+    """Whether a server port of the export carries a NIC override applied at the export (marked
+    ``_migration_params.nic_override``, SDD §7.2)."""
     return any(
-        "subnet_ref" not in (ref or {})
+        bool((port.get("_migration_params") or {}).get("nic_override"))
         for resource in doc.get("resources") or []
         if resource.get("type") == SERVER_TYPE
         for port in (resource.get("params") or {}).get("ports") or []
-        for ref in (port.get("params") or {}).get("fixed_ips_refs") or []
     )
 
 
-def _apply_port_mode(osm: Path, mode: str, cutover: bool, nic_overrides: bool = False) -> bool:
-    """Write the plan's port_creation_mode into an existing export before a run (SDD §7.2).
+def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str) -> dict:
+    name = ref.get("name")
+    network, why = resolve_network(networks, str(name))
+    if network is None:
+        raise PermanentStepError(
+            f"{what} cannot go to RHOSO network {name!r}: "
+            + (why or f"there is no network named {name!r}")
+        )
+    # os-migrate searches the credential's own project for %auth%, and every network it sees
+    # for a reference without a project (SDD §7.2)
+    scope = "%auth%" if network.get("own") else None
+    return {**ref, "project_name": scope, "domain_name": scope}
+
+
+def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
+    RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
+    keeps ``%auth%`` as the reference's project and domain, another project's - the only one of
+    its name - neither; every fixed IP reference becomes address-only, so Neutron finds the
+    address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port or a
+    floating IP whose network does not resolve: raised before the import stops the source."""
+    out = copy.deepcopy(doc)
+    for resource in out.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        server = resource.get("params") or {}
+        for port in server.get("ports") or []:
+            params = port.get("params") or {}
+            what = f"the port {params.get('mac_address')} of {server.get('name')}"
+            params["network_ref"] = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            params["fixed_ips_refs"] = [
+                {"ip_address": ref["ip_address"]}
+                for ref in params.get("fixed_ips_refs") or []
+                if ref.get("ip_address")
+            ]
+        for fip in server.get("floating_ips") or []:
+            params = fip.get("params") or {}
+            if params.get("floating_network_ref"):
+                what = (
+                    f"the floating IP {params.get('floating_ip_address')} of {server.get('name')}"
+                )
+                params["floating_network_ref"] = _resolved_ref(
+                    params["floating_network_ref"], networks, what
+                )
+    return out
+
+
+def _apply_port_mode(
+    osm: Path,
+    mode: str,
+    cutover: bool,
+    nic_overrides: bool = False,
+    networks: Sequence[dict[str, Any]] | None = None,
+) -> bool:
+    """Write the plan's port_creation_mode into an existing export before a run, and resolve its
+    network references again with the destination's ``networks`` when given (SDD §7.2).
 
     True when a cutover must export the workload again: in "neutron" mode its ports were exported
-    without their security groups, or the VM has NIC overrides, or had some at the export (an
-    entry removed since). The export replaces the server in place, so the file stays for a
-    rollback should the new export fail.
+    without their security groups, or the VM has NIC overrides, or had some at the export (a port
+    marked ``nic_override``: an entry removed since). The export replaces the server in place, so
+    the file stays for a rollback should the new export fail.
     """
     path = osm / "workloads.yml"
     if not path.exists():
         return False
     doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    path.write_text(yaml.safe_dump(set_port_creation_mode(doc, mode), sort_keys=False))
-    return cutover and (
+    reexport = cutover and (
         (mode == "neutron" and bool(ports_without_security_groups(doc)))
         or nic_overrides
-        or _address_only_refs(doc)
+        or _overridden_ports(doc)
     )
+    doc = set_port_creation_mode(doc, mode)
+    # a new export is resolved after it instead
+    if networks and not reexport:
+        doc = resolve_network_refs(doc, networks)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    return reexport
 
 
 def effective_mappings(plan_mappings: Mappings, resolved: Mappings | None) -> Mappings:
@@ -656,13 +719,17 @@ class AnsibleExecutor:
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
         reexport = False
+        networks: list[dict[str, Any]] | None = None
         if strategy in (Strategy.cold, Strategy.warm):
+            if step != StepName.ROLLBACK:
+                networks = await self._destination_networks(ctx)
             reexport = await asyncio.to_thread(
                 _apply_port_mode,
                 osm,
                 ctx.plan.port_creation_mode,
                 step == StepName.CUTOVER,
                 bool(ctx.plan.nic_overrides.get(ctx.migration.vm.source_id)),
+                networks,
             )
         playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
         if not playbooks:
@@ -686,6 +753,7 @@ class AnsibleExecutor:
             playbooks,
             ctx,
             effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
+            networks,
         )
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -801,6 +869,21 @@ class AnsibleExecutor:
             )
         )
 
+    async def _destination_networks(self, ctx: StepContext) -> list[dict[str, Any]] | None:
+        """The destination's networks for this run's network references (SDD §7.2); None when
+        they cannot be read - the references stay as exported, and the destination check (§6.6)
+        still looks them up before the source stops."""
+        try:
+            inventory = await self.providers.get(ctx.destination).inventory()
+        except ProviderError as exc:
+            await ctx.log(
+                f"could not read the destination's networks ({exc}): the network references "
+                "stay as exported"
+            )
+            return None
+        # none listed (an older provider): nothing to resolve against
+        return list(getattr(inventory, "network_details", None) or [])
+
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         try:
             return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
@@ -892,6 +975,7 @@ class AnsibleExecutor:
         playbooks: Sequence[_Playbook],
         ctx: StepContext | None,
         mappings: Mappings | None,
+        networks: Sequence[dict[str, Any]] | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped."""
         vars_path = workdir / "vars.yml"
@@ -928,7 +1012,7 @@ class AnsibleExecutor:
                     mode = ctx.plan.port_creation_mode if ctx is not None else None
                     nics = ctx.plan.nic_overrides.get(planned or "") if ctx is not None else None
                     await asyncio.to_thread(
-                        self._rewrite_workloads, osm, mappings, planned, mode, nics
+                        self._rewrite_workloads, osm, mappings, planned, mode, nics, networks
                     )
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
@@ -942,9 +1026,11 @@ class AnsibleExecutor:
         planned_id: str | None = None,
         port_mode: str | None = None,
         nic_overrides: Mapping[str, NicOverride] | None = None,
+        networks: Sequence[dict[str, Any]] | None = None,
     ) -> None:
         """Keep only the planned server of the export, apply the mappings, the VM's NIC
-        overrides and the plan's port_creation_mode (SDD §7.2)."""
+        overrides and the plan's port_creation_mode, and resolve the network references against
+        the destination's ``networks`` (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -976,6 +1062,9 @@ class AnsibleExecutor:
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if nic_overrides:
             doc = apply_nic_overrides(doc, nic_overrides)
+            path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if networks:
+            doc = resolve_network_refs(doc, networks)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:

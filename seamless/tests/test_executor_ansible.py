@@ -26,11 +26,13 @@ from seamless_migrate.executors.ansible import (
     build_vars,
     classify_failure,
     effective_mappings,
+    resolve_network_refs,
     workload_file_stem,
     workload_filter,
 )
 from seamless_migrate.executors.ansible import _inventory as build_inventory_doc
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
+from seamless_migrate.planning.preflight import DestinationInventory
 from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
@@ -92,11 +94,32 @@ class FakeImpl:
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
 
+    async def inventory(self):
+        """The destination's networks, for the network references (SDD §7.2)."""
+        self.calls.append(("inventory",))
+        if self.registry.inventory_error:
+            raise ProviderError("networks: HTTP 503")
+        return DestinationInventory(network_details=list(self.registry.networks))
+
+
+def dst_net(name, own=True, project_id=None):
+    return {
+        "id": f"net-{name}-{project_id or ('mine' if own else 'theirs')}",
+        "name": name,
+        "mtu": 1500,
+        "project_id": project_id or ("finance-rhoso" if own else "admin"),
+        "own": own,
+        "shared": not own,
+    }
+
 
 class FakeRegistry:
     def __init__(self, existing=()):
         self.calls = []
         self.existing = set(existing)
+        # the credential's own networks the tests send ports to (SDD §7.2)
+        self.networks = [dst_net(n) for n in ("rhoso-app", "rhoso-dmz", "app-net", "dc2-prod")]
+        self.inventory_error = False
 
     def get(self, provider):
         return FakeImpl(self)
@@ -545,6 +568,8 @@ async def test_a_cutover_writes_the_vms_nic_overrides_into_workloads(env):
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["network_ref"]["name"] == "rhoso-dmz"
     assert port["params"]["fixed_ips_refs"] == [{"ip_address": "192.168.10.5"}]
+    # the marker a warm cutover exports again for, should the entry go (SDD §7.2)
+    assert port["_migration_params"]["nic_override"] is True
 
 
 async def test_a_warm_cutover_exports_again_for_the_vms_nic_overrides(env):
@@ -576,8 +601,11 @@ async def test_a_warm_cutover_exports_again_when_an_override_was_removed(env):
         "export_workloads.yml",
         "import_workloads_cutover.yml",
     ]
-    refs = exported_server(env)["params"]["ports"][0]["params"]["fixed_ips_refs"]
-    assert refs[0]["subnet_ref"]["name"] == "app-subnet"
+    port = exported_server(env)["params"]["ports"][0]
+    # back to its mapped network with its own address, unmarked
+    assert port["params"]["network_ref"]["name"] == "rhoso-app"
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert not (port.get("_migration_params") or {}).get("nic_override")
 
 
 async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
@@ -1179,6 +1207,9 @@ class FailingImpl:
     async def power_on(self, source_id):
         raise ProviderError(f"power on {source_id}: timeout")
 
+    async def inventory(self):
+        raise ProviderError("inventory: connection refused")
+
 
 class FailingRegistry(FakeRegistry):
     def get(self, provider):
@@ -1499,3 +1530,238 @@ async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
     await env.executor.run(StepName.CUTOVER, ctx2)
     assert rec2.downtime_marks == 1 and rec2.downtime_at[0] is not None
     assert (utcnow() - rec2.downtime_at[0]).total_seconds() < 60
+
+
+def server_doc(*ports, floating=()):
+    return {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {
+                    "name": "web-01",
+                    "ports": [
+                        {
+                            "params": {
+                                "mac_address": mac,
+                                "network_ref": {
+                                    "name": network,
+                                    "project_name": "finance",
+                                    "domain_name": "Default",
+                                },
+                                "fixed_ips_refs": [
+                                    {
+                                        "ip_address": address,
+                                        "subnet_ref": {
+                                            "name": "app-subnet",
+                                            "project_name": "finance",
+                                        },
+                                    }
+                                ],
+                            },
+                            "_migration_params": {},
+                        }
+                        for mac, network, address in ports
+                    ],
+                    "floating_ips": [
+                        {
+                            "params": {
+                                "fixed_ip_address": "10.0.0.5",
+                                "floating_ip_address": address,
+                                "floating_network_ref": {
+                                    "name": network,
+                                    "project_name": "admin",
+                                    "domain_name": "Default",
+                                },
+                            }
+                        }
+                        for address, network in floating
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def test_resolve_network_refs_points_each_port_at_the_network_the_cutover_finds():
+    """SDD §7.2: the credential's own network keeps %auth% as the reference's project and domain;
+    another project's network, the only one of its name, gets neither (os-migrate looks it up by
+    name); every fixed IP reference becomes address-only."""
+    networks = [
+        dst_net("rhoso-app"),
+        dst_net("rhoso-app", own=False),
+        dst_net("provider-vlan9", own=False),
+    ]
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"),
+        ("fa:16:3e:00:00:02", "provider-vlan9", "172.16.9.5"),
+        floating=[("203.0.113.10", "provider-vlan9")],
+    )
+    out = resolve_network_refs(doc, networks)
+    own, shared = (p["params"] for p in out["resources"][0]["params"]["ports"])
+    assert own["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+    assert shared["network_ref"] == {
+        "name": "provider-vlan9",
+        "project_name": None,
+        "domain_name": None,
+    }
+    assert own["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert shared["fixed_ips_refs"] == [{"ip_address": "172.16.9.5"}]
+    [fip] = out["resources"][0]["params"]["floating_ips"]
+    assert fip["params"]["floating_network_ref"] == {
+        "name": "provider-vlan9",
+        "project_name": None,
+        "domain_name": None,
+    }
+    # a copy: the export itself is unchanged
+    assert (
+        doc["resources"][0]["params"]["ports"][0]["params"]["network_ref"]["project_name"]
+        == "finance"
+    )
+
+
+def test_resolve_network_refs_refuses_a_name_it_cannot_resolve():
+    """SDD §7.2: a port network the rule cannot resolve stops the cutover before the source stops,
+    naming the port; so does a floating IP's."""
+    two = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso-2")]
+    two[1]["own"] = True
+    doc = server_doc(("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"))
+    with pytest.raises(
+        PermanentStepError, match="fa:16:3e:00:00:01.*2 networks of the credential's project"
+    ):
+        resolve_network_refs(doc, two)
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:01.*no network named 'rhoso-app'"):
+        resolve_network_refs(doc, [dst_net("other")])
+    floating = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"), floating=[("203.0.113.10", "gone")]
+    )
+    with pytest.raises(PermanentStepError, match="203.0.113.10.*no network named 'gone'"):
+        resolve_network_refs(floating, [dst_net("rhoso-app")])
+
+
+async def test_a_cutover_resolves_the_network_references_before_the_import(env):
+    """SDD §7.2: after the export the port of a mapped network points at the RHOSO network the rule
+    resolves - a shared one of another project by name alone - with address-only fixed IPs."""
+    env.registry.networks = [dst_net("rhoso-app", own=False, project_id="admin")]
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": None,
+        "domain_name": None,
+    }
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+
+
+async def test_a_cutover_stops_before_the_import_when_a_port_network_cannot_be_resolved(env):
+    """Two networks of the credential's project carry the mapped name: the cutover stops after the
+    export, before anything is stopped."""
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso")]
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+
+
+async def test_a_warm_cutover_resolves_its_export_again_without_exporting(env):
+    """SDD §7.2: each run resolves the references of the existing export again - here the mapped
+    network is now another project's - and only an override marker exports again."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    assert (
+        exported_server(env)["params"]["ports"][0]["params"]["network_ref"]["project_name"]
+        == "%auth%"
+    )
+    env.registry.networks = [dst_net("rhoso-app", own=False, project_id="admin")]
+    later, _ = ctx_for(env)
+    await env.executor.run(StepName.CUTOVER, later)
+    assert [c["playbook"] for c in read_log(env.log)][-1:] == ["import_workloads_cutover.yml"]
+    assert "export_workloads.yml" not in [c["playbook"] for c in read_log(env.log)][1:]
+    assert (
+        exported_server(env)["params"]["ports"][0]["params"]["network_ref"]["project_name"] is None
+    )
+
+
+async def test_an_unreadable_destination_keeps_the_exported_network_references(env):
+    """SDD §7.2: the destination's networks cannot be read - the run logs it and keeps the
+    references as exported; the destination check (§6.6) still looks them up before the stop."""
+    env.registry.inventory_error = True
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    assert any("could not read the destination's networks" in line for line in rec.logs)
+
+
+async def test_a_rollback_never_resolves_network_references(env):
+    """SDD §7.2: the references are resolved for the runs that import; a rollback must not be held
+    up by a network that no longer resolves."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="other")]
+    env.registry.networks[1]["own"] = True
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    reads = env.registry.calls.count(("inventory",))
+    rollback, _ = ctx_for(env)
+    await env.executor.run(StepName.ROLLBACK, rollback)
+    assert read_log(env.log)[-1]["playbook"] == "rollback_workloads.yml"
+    assert env.registry.calls.count(("inventory",)) == reads
+
+
+async def test_a_cutover_that_exports_again_resolves_only_the_new_export(env):
+    """SDD §7.2: when the cutover exports again (here for a new NIC override), the stale export is
+    not resolved first - its network may no longer resolve, the new export's does."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    # rhoso-app no longer resolves; the override sends the port to rhoso-dmz
+    env.registry.networks = [
+        dst_net("rhoso-app"),
+        {**dst_net("rhoso-app"), "id": "net-rhoso-app-second"},
+        dst_net("rhoso-dmz"),
+    ]
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    cutover, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+def test_resolve_network_refs_keeps_a_port_without_addresses_and_a_floating_ip_without_network():
+    """A port without a fixed IP stays without one; a floating IP that names no network is left
+    to os-migrate (SDD §7.2)."""
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"), floating=[("203.0.113.10", "x")]
+    )
+    server = doc["resources"][0]["params"]
+    server["ports"][0]["params"]["fixed_ips_refs"] = []
+    server["floating_ips"][0]["params"]["floating_network_ref"] = None
+    out = resolve_network_refs(doc, [dst_net("rhoso-app")])
+    params = out["resources"][0]["params"]
+    assert params["ports"][0]["params"]["fixed_ips_refs"] == []
+    assert params["floating_ips"][0]["params"]["floating_network_ref"] is None
+
+
+async def test_a_destination_without_network_details_keeps_the_exported_references(env):
+    """An inventory that lists no networks with their owners (an older provider) resolves
+    nothing: the references stay as exported rather than refusing every port."""
+    env.registry.networks = []
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
