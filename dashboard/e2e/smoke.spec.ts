@@ -177,8 +177,9 @@ for (const width of [320, 375]) {
   });
 }
 
-// With the web fonts and with the fallback an offline install keeps (Google Fonts unreachable): a name that fits
-// in Fira Sans can be a few pixels too wide in the system font. Each run measures once its fonts are settled.
+// With the web fonts and with the system font a browser shows until they arrive (font-display: swap), or when they
+// cannot load: a name that fits in Fira Sans can be a few pixels too wide in the system font. Each run measures once
+// its fonts are settled.
 for (const [width, fonts] of [
   [320, 'web'],
   [1280, 'web'],
@@ -186,7 +187,7 @@ for (const [width, fonts] of [
   [1280, 'fallback'],
 ] as const) {
   test(`no text is cut off with an ellipsis on a ${width} px wide screen${fonts === 'fallback' ? ' without the web fonts' : ''} (WCAG 1.4.10, SDD §16)`, async ({ page }) => {
-    if (fonts === 'fallback') await page.route(/fonts\.(googleapis|gstatic)\.com/, (route) => route.abort());
+    if (fonts === 'fallback') await page.route(/\.woff2?$/, (route) => route.abort());
     await page.setViewportSize({ width, height: 800 });
     await signIn(page, 'viewer');
     for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
