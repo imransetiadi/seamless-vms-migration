@@ -208,7 +208,7 @@ All paths relative to `seamless/`. Package `src/seamless_migrate/`. Tests under 
 
 ### Task C1: Scaffold, design system, shell, API layer
 
-**Files:** Create `dashboard/{package.json,index.html,vite.config.ts,tsconfig.json,tailwind.config.ts,postcss.config.js,.eslintrc.cjs}`, `dashboard/design-system/` (persisted ui-ux-pro-max output), `dashboard/src/{main.tsx,App.tsx,index.css}`, `dashboard/src/api/{types.ts,client.ts,stream.ts,mock.ts,hooks.ts}`, `dashboard/src/components/{Layout.tsx,ThemeToggle.tsx,StatusBadge.tsx,PhaseStepper.tsx,KpiTile.tsx,ConfirmDialog.tsx,EmptyState.tsx,ErrorBanner.tsx}`, `dashboard/src/lib/format.ts`; Test `dashboard/src/**/*.test.ts(x)`.
+**Files:** Create `dashboard/{package.json,index.html,vite.config.ts,tsconfig.json,postcss.config.js,.eslintrc.cjs}`, `dashboard/design-system/` (persisted ui-ux-pro-max output), `dashboard/src/{main.tsx,App.tsx,index.css}`, `dashboard/src/api/{types.ts,client.ts,stream.ts,mock.ts,hooks.ts}`, `dashboard/src/components/{Layout.tsx,ThemeToggle.tsx,StatusBadge.tsx,PhaseStepper.tsx,KpiTile.tsx,ConfirmDialog.tsx,EmptyState.tsx,ErrorBanner.tsx}`, `dashboard/src/lib/format.ts`; Test `dashboard/src/**/*.test.ts(x)`.
 
 **Interfaces:** `types.ts` mirrors SDD §4 and §12 exactly; `ApiClient` (`get/post/put/patch/delete`, `ApiError {status, code, message}`), `streamEvents(since, onEvent, signal)` (fetch streaming SSE parser with resume); `phaseMeta(phase) -> {label, tone, icon}`; formatters `formatBytes`, `formatDuration`, `formatPct`, `formatRelative`.
 
@@ -245,7 +245,7 @@ All paths relative to `seamless/`. Package `src/seamless_migrate/`. Tests under 
 
 ### Task D1: Agent tooling and README
 
-**Files:** Create `.mcp.json` (servers `jev`: `npx -y @jkudish/jev-mcp@0.14.1`, env `TYPESAFE_API_KEY: ${TYPESAFE_API_KEY}`; `agentmemory`: `npx -y @agentmemory/mcp@0.9.30`, env `AGENTMEMORY_URL`, `AGENTMEMORY_SECRET`), `.claude/settings.json` (`extraKnownMarketplaces` for `obra/superpowers-marketplace` and `nextlevelbuilder/ui-ux-pro-max-skill`; `enabledPlugins` `superpowers@superpowers-marketplace`, `ui-ux-pro-max@ui-ux-pro-max-skill`), `CLAUDE.md` (how agents work here: SDD is binding, superpowers workflow, Jev usage rules, agentmemory conventions, never commit secrets); Modify `README.md` (new top section: what Seamless Migrate is, quick start with Colima/Compose, links to docs; keep the os-migrate content below under "Collection reference").
+**Files:** Create `.mcp.json` (servers `jev`: `npx -y @jkudish/jev-mcp@0.14.1`, env `TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}`; `agentmemory`: `npx -y @agentmemory/mcp@0.9.30`, env `AGENTMEMORY_URL`, `AGENTMEMORY_SECRET`), `.claude/settings.json` (`extraKnownMarketplaces` for `obra/superpowers-marketplace` and `nextlevelbuilder/ui-ux-pro-max-skill`; `enabledPlugins` `superpowers@superpowers-marketplace`, `ui-ux-pro-max@ui-ux-pro-max-skill`), `CLAUDE.md` (how agents work here: SDD is binding, superpowers workflow, Jev usage rules, agentmemory conventions, never commit secrets); Modify `README.md` (new top section: what Seamless Migrate is, quick start with Colima/Compose, links to docs; keep the os-migrate content below under "Collection reference").
 
 - [x] Validate JSON with `python3 -m json.tool` → commit `chore: add MCP servers, Claude plugins and agent guide`.
 

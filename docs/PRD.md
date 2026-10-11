@@ -93,7 +93,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 |---|---|---|---|
 | FR-01 | Register source providers (OpenStack/RHOSP 17.1, VMware) and a RHOSO destination; check connectivity and capabilities | M | `POST /providers/{id}/check` returns status and capabilities (admin, compute microversion, OVN, CBT support) |
 | FR-02 | Discover inventory (VMs, disks, NICs, flavors, power state, guest OS, CBT, snapshots) | M | Inventory table lists VMs with disk sizes, guest OS (SDD §9.5) and readiness flags |
-| FR-03 | Create plans with VM selection, mappings (network, flavor, volume type, project), SLO, approval, window | M | Plan persisted; editable while draft/validated |
+| FR-03 | Create plans with VM selection, mappings (network, flavor, volume type, project), SLO, approval, window | M | Plan persisted; editable while draft/validated, except while a migration is in flight, and its providers fixed while one is failed (SDD §12) |
 | FR-04 | Pre-flight validation with a documented finding catalog (blocker/warning/info) | M | All SDD §9.3 codes implemented and unit-tested |
 | FR-05 | Downtime/duration estimate per VM and strategy | M | Estimator formulas SDD §9.1; shown in plan and migration views |
 | FR-06 | Automatic strategy selection with eligibility rules; per-VM override | M | Ineligible strategies can never be selected; override rejected if ineligible |
@@ -150,7 +150,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 
 | Release | Scope |
 |---|---|
-| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift + Compose/Colima deployment, docs |
+| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Colima or Podman) deployment, docs |
 | 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks) |
 | 0.3.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP), Octavia/Heat migration helpers |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, scale test 5,000 VMs, signed releases |
