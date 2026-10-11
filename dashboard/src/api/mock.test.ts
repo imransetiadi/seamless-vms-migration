@@ -682,6 +682,29 @@ describe('mock API', () => {
     expect(server.migrations.filter((m) => m.plan_id === plan.id).map((m) => m.id).sort()).toEqual(ids);
   });
 
+  it("blocks a NIC on another project's network that the RHOSO token may not put a port on, judged with its roles like the API (SDD §9.3, §10)", async () => {
+    const { server, client } = setup('operator');
+    const [vm] = freeVms(server, 'rhosp17-dc1', 1);
+    // the VM moved to the shared provider-ext, an address of its subnet
+    vm!.nics = [{ ...vm!.nics[0]!, network: 'provider-ext', fixed_ips: ['203.0.113.77'] }];
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Shared network',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: [vm!.source_id],
+    });
+    const codes = async () => {
+      await client.post(`/plans/${plan.id}/validate`);
+      return server.migrations.find((m) => m.plan_id === plan.id)!.findings.map((f) => f.code);
+    };
+    // the mock's admin token may
+    expect(await codes()).not.toContain('NET_PORT_NOT_PERMITTED');
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    destination.capabilities = { ...destination.capabilities, roles: ['member', 'reader'] };
+    expect(await codes()).toContain('NET_PORT_NOT_PERMITTED');
+    expect(server.migrations.find((m) => m.plan_id === plan.id)!.phase).toBe('blocked');
+  });
+
   it('cancels the migration of a VM taken out of a plan at the next validation, and refuses it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const [keep, drop] = freeVms(server, 'rhosp17-dc1', 2);

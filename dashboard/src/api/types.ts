@@ -805,7 +805,9 @@ export interface DestinationNetwork {
   project_id: string | null;
   /** The destination credential's project owns it. */
   own: boolean;
+  /** Neutron's `shared` and `router:external` as the credential sees them: whether it may put a port on another project's network (SDD §6.6). */
   shared: boolean;
+  external?: boolean;
 }
 
 /** `VMRef[]` for a source provider, `DestinationInventory` for a destination provider. */

@@ -36,7 +36,7 @@ import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
-import { networkList, resolveNetwork, subnetsOf } from '../lib/networks';
+import { networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
 import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
@@ -464,7 +464,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
+      capabilities: { admin: true, roles: ['admin', 'member', 'reader'], compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
@@ -546,6 +546,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       capabilities: {
         admin: true,
+        // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
+        roles: ['admin', 'member', 'reader'],
         compute_microversion: '2.95',
         ovn: true,
         volume_backends: PROD_STORAGE.map((b) => b.pool),
@@ -814,6 +816,8 @@ const NETWORK_REMEDIATION = {
     "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
   NET_ADDRESS_REFUSED:
     'Give the NIC an address its RHOSO network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
+  NET_PORT_NOT_PERMITTED:
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared or external network takes it once the RHOSO credential has the admin role.",
 };
 
 /** Like the API (SDD §9.3): every entry of the VM checked before anything stops, with the API's messages. */
@@ -887,8 +891,8 @@ export function preflight(
   plan: Plan,
   destinationNetworks: Record<string, number | null>,
   selectedNames: string[],
-  /** The destination's subnets, its networks with their owners and the plan's VMs, for the NIC checks (SDD §9.3). */
-  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[] } = {},
+  /** The destination's subnets, its networks with their owners, its token's roles and the plan's VMs, for the NIC checks (SDD §9.3). */
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[] } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
@@ -913,6 +917,15 @@ export function preflight(
   }
   if (ambiguous.length)
     add('MAP_NETWORK_AMBIGUOUS', 'blocker', `The cutover cannot tell these RHOSO networks apart: ${ambiguous.join('; ')}.`, NETWORK_REMEDIATION.MAP_NETWORK_AMBIGUOUS);
+  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3)
+  const denied: string[] = [];
+  for (const nic of sourceKind === 'vmware' ? [] : vm.nics) {
+    const network = resolved.get(nic);
+    const why = network ? portRefusal(network, context.roles) : null;
+    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}' (project ${network.project_id}): ${why}`);
+  }
+  if (denied.length)
+    add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
   for (const nic of vm.nics) {
     const mapped = plan.mappings.networks[nic.network] ?? nic.network;
     // a NIC its override sends elsewhere is checked by MAP_NIC_OVERRIDE_INVALID (SDD §9.3)

@@ -724,6 +724,39 @@ describe('MigrationDetail', () => {
     expect(select).not.toHaveAccessibleDescription();
   });
 
+  it("marks another project's network the RHOSO credential may not use, and says why (SDD §16, §6.6)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
+    // another tenant's private network, which an admin's token would see: never, whatever the roles
+    inventory.networks = { ...inventory.networks, 'tenant-b-private': 1442 };
+    inventory.network_details = [
+      ...inventory.network_details!,
+      { id: 'net-tenant-b', name: 'tenant-b-private', mtu: 1442, project_id: 'tenant-b', own: false, shared: false, external: false },
+    ];
+    // a member's token: another project's shared provider-ext is not allowed either
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    destination.capabilities = { ...destination.capabilities, roles: ['member', 'reader'] };
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'operator', server });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: `Network of ${m.vm.name}` });
+    const select = within(dialog).getAllByRole('combobox')[0]!;
+    expect(await within(select).findByRole('option', { name: 'provider-ext (not allowed)' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'tenant-b-private (not allowed)' })).toBeInTheDocument();
+    expect(within(select).getByRole('option', { name: 'tenant-app' })).toBeInTheDocument();
+    // said under the field too, as NET_PORT_NOT_PERMITTED says it
+    await user.selectOptions(select, 'provider-ext');
+    expect(select).toHaveAccessibleDescription(
+      "The RHOSO credential may not put a port on provider-ext (project admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither. Validation refuses it.",
+    );
+    await user.selectOptions(select, 'tenant-b-private');
+    expect(select).toHaveAccessibleDescription(
+      "The RHOSO credential may not put a port on tenant-b-private (project tenant-b): it is neither shared with the credential's project nor external. Validation refuses it.",
+    );
+  });
+
   it("keeps an override's network that RHOSO no longer lists selected, marked so (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

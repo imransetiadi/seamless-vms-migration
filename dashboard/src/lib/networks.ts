@@ -16,10 +16,33 @@ export function resolveNetwork(networks: DestinationNetwork[], name: string): { 
   return { network: null, why: `${seen.length} networks of other projects are named '${name}' (${projects}), none of the credential's project` };
 }
 
-/** The networks an inventory lists with their owners; one from before `network_details` lists each name once, as the credential's own (SDD §11). */
+/** The networks an inventory lists with their owners; one from before `network_details` lists each name once, as the credential's own (SDD §10). */
 export function networkList(inventory: Pick<DestinationInventory, 'networks' | 'network_details'>): DestinationNetwork[] {
   if (inventory.network_details?.length) return inventory.network_details;
-  return Object.entries(inventory.networks).map(([name, mtu]) => ({ id: null, name, mtu, project_id: null, own: true, shared: false }));
+  return Object.entries(inventory.networks).map(([name, mtu]) => ({ id: null, name, mtu, project_id: null, own: true, shared: false, external: false }));
+}
+
+/** The roles Neutron's policy lets choose a port's address, MAC or port security on another project's network: the API's PORT_ROLES (SDD §6.6). */
+export const PORT_ROLES = ['admin', 'advsvc'];
+
+/**
+ * Why the destination credential may not put a port on `network`, or null, as the API's port_refusal (SDD §6.6): another
+ * project's network takes it only when shared with the credential's project or external (an admin sees every project's
+ * networks), and only from a token with the admin or advsvc role, since every recreated port asks for its address or MAC.
+ * `roles` undefined (not reported) leaves that half unjudged.
+ */
+export function portRefusal(network: DestinationNetwork, roles: readonly string[] | undefined): string | null {
+  if (network.own) return null;
+  if (!(network.shared || network.external)) return "it is neither shared with the credential's project nor external";
+  if (roles !== undefined && !roles.some((role) => PORT_ROLES.includes(role)))
+    return "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither";
+  return null;
+}
+
+/** The role names of the destination's token, as its check reported them (SDD §10); undefined when it reported none. */
+export function capabilityRoles(capabilities: Record<string, unknown> | undefined): string[] | undefined {
+  const roles = capabilities?.roles;
+  return Array.isArray(roles) ? roles.map(String) : undefined;
 }
 
 /** A resolved network's subnets: by its id, else (an inventory from before it) by name. */

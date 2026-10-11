@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures, buildInventories, buildProviders, eligibility, makeVm, preflight } from './mockData';
-import type { DestinationInventory, Plan, VMRef } from './types';
+import { capabilityRoles } from '../lib/networks';
+import type { DestinationInventory, DestinationNetwork, Plan, ProviderKind, VMRef } from './types';
 
 const now = Date.parse('2026-10-09T12:00:00Z');
 
@@ -193,6 +194,37 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(codes(preflight(vm, 'openstack', plan, { 'tenant-app': 1442 }, [vm.name], { selected: [vm], networkDetails: details, subnets: fits }))).not.toContain('NET_ADDRESS_REFUSED');
   });
 
+  it("blocks a NIC on another project's network the credential may not use, with the API's message (SDD §9.3, §6.6)", () => {
+    const shared = net('p', 'tenant-web', false, 'project-admin');
+    const external = { ...net('e', 'tenant-web', false, 'project-admin'), shared: false, external: true };
+    const tenant = { ...net('b', 'tenant-web', false, 'project-b'), shared: false };
+    const member = ['member', 'reader'];
+    const run = (network: DestinationNetwork, roles: string[] | undefined, kind: ProviderKind = 'openstack') =>
+      preflight(vm, kind, base, { 'tenant-web': 1442 }, [vm.name], {
+        selected: [vm],
+        networkDetails: [network],
+        subnets: [{ name: 's', network: 'tenant-web', network_id: network.id!, cidr: '10.20.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }],
+        roles,
+      });
+    const denied = run(shared, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED');
+    expect(denied?.severity).toBe('blocker');
+    expect(denied?.message).toBe(
+      "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-admin): Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither.",
+    );
+    expect(denied?.remediation).toBe(
+      "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared or external network takes it once the RHOSO credential has the admin role.",
+    );
+    expect(run(external, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(denied?.message);
+    // another tenant's private network, whatever the roles
+    for (const roles of [['admin'], undefined])
+      expect(run(tenant, roles).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
+        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project project-b): it is neither shared with the credential's project nor external.",
+      );
+    for (const roles of [['admin', 'member', 'reader'], ['advsvc'], undefined]) expect(codes(run(shared, roles))).not.toContain('NET_PORT_NOT_PERMITTED');
+    // VMware NICs go through the migration kit, which this rule does not cover
+    expect(codes(run(shared, member, 'vmware'))).not.toContain('NET_PORT_NOT_PERMITTED');
+  });
+
   it('takes the MTU and an override\'s subnets from the resolved network, not same-named ones', () => {
     const own = { ...net('own', 'tenant-web', true, 'shop'), mtu: 1500 };
     const other = { ...net('other', 'tenant-web', false, 'p9'), mtu: 1400 };
@@ -245,13 +277,20 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     const inventories = buildInventories();
     const dst = inventories['rhoso-prod'] as DestinationInventory;
     const vms = inventories['rhosp17-dc1'] as VMRef[];
+    // the mock's RHOSO credential is an admin: jump-host-01 keeps its address on the shared provider-ext
+    const roles = capabilityRoles(buildProviders(now).find((p) => p.id === 'rhoso-prod')!.capabilities);
+    expect(roles).toContain('admin');
     for (const mode of ['nova', 'neutron'] as const) {
       const plan = { ...base, mappings: { networks: {}, flavors: {}, volume_types: {}, projects: {} }, port_creation_mode: mode };
       for (const v of vms) {
-        const found = codes(preflight(v, 'openstack', plan, dst.networks, [v.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details }));
+        const found = codes(preflight(v, 'openstack', plan, dst.networks, [v.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles }));
         expect(found, v.name).not.toContain('MAP_NETWORK_AMBIGUOUS');
         expect(found, `${v.name} ${mode}`).not.toContain('NET_ADDRESS_REFUSED');
+        expect(found, `${v.name} ${mode}`).not.toContain('NET_PORT_NOT_PERMITTED');
       }
     }
+    // a member's token could not keep it there
+    const jump = vms.find((v) => v.name === 'jump-host-01')!;
+    expect(codes(preflight(jump, 'openstack', base, dst.networks, [jump.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles: ['member'] }))).toContain('NET_PORT_NOT_PERMITTED');
   });
 });

@@ -14,6 +14,7 @@ import { DEFAULT_API_BASE } from './client';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
 import { guestOsOf } from '../lib/guestOs';
+import { capabilityRoles } from '../lib/networks';
 import { canonicalIp, isIpAddress } from '../lib/nics';
 import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
 import { countedApprovals } from '../lib/migrationActions';
@@ -1041,7 +1042,9 @@ export class MockServer {
     const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
     const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
     const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails });
+    // the destination's token roles, as its check reported them (SDD §9.3, §10)
+    const roles = capabilityRoles(destination.capabilities);
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
@@ -1268,7 +1271,8 @@ export class MockServer {
             } else {
               provider.status = 'ok';
               provider.status_message = 'All services reachable.';
-              provider.capabilities = { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+              // an OpenStack check also reports its token's roles (SDD §10)
+              provider.capabilities = { admin: true, ...(provider.kind === 'vmware' ? {} : { roles: ['admin', 'member', 'reader'] }), compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
             }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
