@@ -1,7 +1,9 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { Button } from './Button';
 import { Modal } from './Modal';
+import { Term } from './Term';
 
 function Dialog() {
   return (
@@ -105,6 +107,39 @@ describe('Modal (SDD §16)', () => {
     (document.activeElement as HTMLElement).blur();
     await user.keyboard('{Escape}');
     expect(busy).not.toHaveBeenCalled();
+  });
+
+  it('dismisses a shown note or definition on Escape and keeps the dialog; the next Escape closes it (WCAG 1.4.13, SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const onClose = vi.fn();
+    render(
+      <Modal open onClose={onClose} labelledBy="title">
+        <h2 id="title">New plan</h2>
+        <p>
+          <Term definition="VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.">Encrypted volume</Term>
+        </p>
+        <Button disabledReason="Select VMs in the table first.">Create plan</Button>
+      </Modal>,
+    );
+    // a soft-disabled button's note
+    const create = screen.getByRole('button', { name: 'Create plan' });
+    await user.click(create);
+    expect(screen.getByRole('note')).toHaveTextContent('Select VMs in the table first.');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    // the note gone, the next Escape closes the dialog
+    expect(create).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // a term's definition, shown by a tap
+    await user.click(screen.getByRole('button', { name: 'Encrypted volume' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    await user.keyboard('{Escape}');
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 
   it('wraps to the summary of a closed <details> at its end, not to what the <details> hides', async () => {

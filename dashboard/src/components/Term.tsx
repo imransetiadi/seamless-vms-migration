@@ -44,7 +44,11 @@ export function Term({ children, definition }: { children: ReactNode; definition
         onFocus={show}
         onBlur={hide}
         onKeyDown={(event) => {
-          if (event.key === 'Escape') hide();
+          // Escape dismisses a shown definition only: the dialog around it stays (WCAG 1.4.13, SDD §16)
+          if (event.key === 'Escape' && at) {
+            event.stopPropagation();
+            hide();
+          }
         }}
         className="inline cursor-help rounded-sm border-0 bg-transparent p-0 font-[inherit] text-inherit underline decoration-dotted underline-offset-4"
       >
