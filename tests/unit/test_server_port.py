@@ -362,3 +362,69 @@ class TestServerPortNeutron(unittest.TestCase):
         with self.assertRaisesRegex(exc.InconsistentState, "security groups"):
             sp.create_or_update(self.dst)
         self.assertEqual(self.dst.calls_to("create_port"), [])
+
+
+class TestAddressOnlyFixedIps(unittest.TestCase):
+    """A fixed IP reference without subnet_ref names only its address (SDD 6.6): the control
+    plane writes them for a NIC override; Neutron picks the subnet that holds the address."""
+
+    def setUp(self):
+        self.subnet_lookups = []
+
+        def subnet_id(conn, ref, required=True):
+            self.subnet_lookups.append(ref)
+            return "dst-subnet-" + ref["name"]
+
+        for name, fake_fn in (
+            ("subnet_id", subnet_id),
+            ("network_id", lambda conn, ref, required=True: "dst-net-" + ref["name"]),
+        ):
+            patcher = mock.patch.object(reference, name, side_effect=fake_fn)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def port(self, fixed_ips_refs):
+        sp = server_port.ServerPort.from_data(
+            {
+                "type": "openstack.network.ServerPort",
+                "params": {
+                    "binding_profile": None,
+                    "binding_vnic_type": "normal",
+                    "mac_address": "fa:16:3e:ab:cd:ef",
+                    "network_ref": {"name": "rhoso-dmz", "project_name": "p", "domain_name": "d"},
+                    "fixed_ips_refs": fixed_ips_refs,
+                    "security_group_refs": [],
+                    "is_port_security_enabled": True,
+                },
+                "_info": {"id": "uuid-src-port", "device_id": "srv", "device_owner": "compute:nova"},
+            }
+        )
+        return sp
+
+    def test_an_address_only_reference_resolves_no_subnet(self):
+        refs = self.port([{"ip_address": "192.168.10.5"}])._refs_from_ser(None)
+        self.assertEqual(refs["fixed_ips"], [{"ip_address": "192.168.10.5"}])
+        self.assertEqual(self.subnet_lookups, [])
+        both = self.port(
+            [
+                {"ip_address": "10.0.0.5", "subnet_ref": {"name": "app-subnet"}},
+                {"ip_address": "192.168.10.5"},
+            ]
+        )._refs_from_ser(None)
+        self.assertEqual(
+            both["fixed_ips"],
+            [
+                {"ip_address": "10.0.0.5", "subnet_id": "dst-subnet-app-subnet"},
+                {"ip_address": "192.168.10.5"},
+            ],
+        )
+
+    def test_nova_and_neutron_take_the_address_alone(self):
+        sp = self.port([{"ip_address": "192.168.10.5"}])
+        self.assertEqual(
+            sp.nova_sdk_params(None), {"uuid": "dst-net-rhoso-dmz", "fixed_ip": "192.168.10.5"}
+        )
+        dst = fake.FakeCloud("dst")
+        sp.create_or_update(dst)
+        [(_, created)] = dst.calls_to("create_port")
+        self.assertEqual(created["fixed_ips"], [{"ip_address": "192.168.10.5"}])

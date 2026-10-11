@@ -207,12 +207,12 @@ class ServerPort(osm_resource.Resource):
         refs["fixed_ips_refs"] = params["fixed_ips_refs"]
         refs["fixed_ips"] = []
         for fixed_ip in params["fixed_ips_refs"]:
-            refs["fixed_ips"].append(
-                {
-                    "ip_address": fixed_ip["ip_address"],
-                    "subnet_id": reference.subnet_id(conn, fixed_ip["subnet_ref"]),
-                }
-            )
+            entry = {"ip_address": fixed_ip["ip_address"]}
+            # without subnet_ref only the address is named (a NIC override, SDD 6.6):
+            # Neutron picks the subnet of the port's network that holds it
+            if fixed_ip.get("subnet_ref"):
+                entry["subnet_id"] = reference.subnet_id(conn, fixed_ip["subnet_ref"])
+            refs["fixed_ips"].append(entry)
         refs["network_ref"] = params["network_ref"]
         refs["network_id"] = reference.network_id(conn, params["network_ref"])
 

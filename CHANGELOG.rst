@@ -113,3 +113,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_rollback`` deletes those ports
   (``deleted_port_ids``), also when the cutover failed before the server
   existed. Nova keeps such ports when their server is deleted later.
+- A fixed IP reference without ``subnet_ref`` names only its address: Nova
+  gets it as ``fixed_ip`` and Neutron as ``{ip_address}``, and Neutron picks
+  the subnet of the port's network that holds it. Seamless Migrate writes such
+  references for a per-VM NIC override (a VM's port moved to another network
+  or given other addresses). Exported references keep their ``subnet_ref``.
