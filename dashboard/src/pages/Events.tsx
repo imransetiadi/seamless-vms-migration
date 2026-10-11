@@ -21,7 +21,7 @@ import {
   TimerOff,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useMemo, useRef, useState } from 'react';
+import { memo, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
@@ -94,11 +94,54 @@ function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
 interface Item {
   key: string;
   event: Event;
+  /** `event.ts` in ms, parsed once: the list is sorted again on every live event. */
+  t: number;
+}
+
+function itemOf(key: string, event: Event): Item {
+  return { key, event, t: Date.parse(event.ts) };
 }
 
 function byNewest(a: Item, b: Item): number {
-  return Date.parse(b.event.ts) - Date.parse(a.event.ts) || b.event.seq - a.event.seq;
+  return b.t - a.t || b.event.seq - a.event.seq;
 }
+
+/**
+ * One event. Memoized on the event and its plan's name: a live event redraws the page's count and adds its own row,
+ * so the rows already shown (up to a page of 200) are not drawn again (SDD §16).
+ */
+const EventRow = memo(function EventRow({ event, planName }: { event: Event; planName: string | undefined }) {
+  const meta = kindMeta(event.kind);
+  return (
+    <li className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
+      <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
+        {formatTime(event.ts)}
+        <span className="block text-[11px]">{formatDateTime(event.ts).slice(0, 10)}</span>
+      </time>
+      <span className={cn('inline-flex min-w-0 items-start gap-1.5 text-xs', TONE_CLASSES[meta.tone].text)}>
+        <meta.icon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+        <code className="break-all text-foreground">{event.kind}</code>
+      </span>
+      <div className="min-w-0">
+        <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
+        <p className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+          <span>by {event.actor}</span>
+          {event.plan_id && (
+            <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
+              {planName ?? event.plan_id}
+            </Link>
+          )}
+          {event.migration_id && (
+            <Link to={`/migrations/${event.migration_id}`} className="font-mono underline underline-offset-4">
+              {event.migration_id}
+            </Link>
+          )}
+          {event.seq > 0 && <span className="num">#{event.seq}</span>}
+        </p>
+      </div>
+    </li>
+  );
+});
 
 /** Audit trail plus the live stream: history first, streamed events appended at the top. */
 export default function Events() {
@@ -141,7 +184,7 @@ export default function Events() {
       seenLive.current.add(event.seq);
     }
     counter.current += 1;
-    const item = { key: event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event };
+    const item = itemOf(event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event);
     setReceived((n) => n + 1);
     if (pausedRef.current) setHeld((h) => [...h, item].slice(-MAX_LIVE));
     else setLive((l) => [...l, item].slice(-MAX_LIVE));
@@ -149,12 +192,13 @@ export default function Events() {
 
   const planNames = useMemo(() => new Map((plans.data ?? []).map((p) => [p.id, p.name])), [plans.data]);
 
+  const historyItems = useMemo(() => (history.data ?? []).map((event) => itemOf(`seq-${event.seq}`, event)), [history.data]);
   const items = useMemo(() => {
     const merged = new Map<string, Item>();
-    for (const event of history.data ?? []) merged.set(`seq-${event.seq}`, { key: `seq-${event.seq}`, event });
+    for (const item of historyItems) merged.set(item.key, item);
     for (const item of live) merged.set(item.key, item);
     return [...merged.values()].sort(byNewest);
-  }, [history.data, live]);
+  }, [historyItems, live]);
 
   const filtered = useMemo(() => {
     const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
@@ -313,38 +357,9 @@ export default function Events() {
 
       {filtered.length > 0 && (
         <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
-          {filtered.slice(0, limit).map(({ key, event }) => {
-            const meta = kindMeta(event.kind);
-            return (
-              <li key={key} className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
-                <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
-                  {formatTime(event.ts)}
-                  <span className="block text-[11px]">{formatDateTime(event.ts).slice(0, 10)}</span>
-                </time>
-                <span className={cn('inline-flex min-w-0 items-start gap-1.5 text-xs', TONE_CLASSES[meta.tone].text)}>
-                  <meta.icon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-                  <code className="break-all text-foreground">{event.kind}</code>
-                </span>
-                <div className="min-w-0">
-                  <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
-                  <p className="flex flex-wrap gap-2 text-xs text-muted-foreground">
-                    <span>by {event.actor}</span>
-                    {event.plan_id && (
-                      <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
-                        {planNames.get(event.plan_id) ?? event.plan_id}
-                      </Link>
-                    )}
-                    {event.migration_id && (
-                      <Link to={`/migrations/${event.migration_id}`} className="font-mono underline underline-offset-4">
-                        {event.migration_id}
-                      </Link>
-                    )}
-                    {event.seq > 0 && <span className="num">#{event.seq}</span>}
-                  </p>
-                </div>
-              </li>
-            );
-          })}
+          {filtered.slice(0, limit).map(({ key, event }) => (
+            <EventRow key={key} event={event} planName={event.plan_id ? planNames.get(event.plan_id) : undefined} />
+          ))}
         </ol>
       )}
       {filtered.length > limit && (

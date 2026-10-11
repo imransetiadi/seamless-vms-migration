@@ -253,6 +253,21 @@ describe('Events page', () => {
     expect(download).toHaveAccessibleDescription('Only progress updates are shown; they are not part of the audit trail.');
   });
 
+  it('puts a streamed progress update at the top by its time, though it has no sequence number', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer', live: true });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText(/paused: vCenter degraded/i);
+    await streamReady(server);
+    await user.click(screen.getByRole('checkbox', { name: /show progress updates/i }));
+    act(() => {
+      // progress updates are streamed, never persisted (seq 0): only their time places them
+      server.emit({ kind: 'migration.progress', plan_id: 'plan-4f2a9c1e', migration_id: 'mig-3c1a0f9e23', actor: 'orchestrator', message: 'web-03 61%', data: {} }, false);
+    });
+    await within(list).findByText('web-03 61%');
+    expect(within(list).getAllByRole('listitem')[0]).toHaveTextContent('web-03 61%');
+  });
+
   it('downloads the shown events as JSON lines, oldest first, like `seamless events export`', async () => {
     const user = userEvent.setup({ delay: null });
     const blobs: Blob[] = [];
