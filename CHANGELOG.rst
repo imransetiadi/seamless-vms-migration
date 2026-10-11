@@ -84,3 +84,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``%25``, ``%2F``, ``%00``): a VM name such as ``../x`` or ``/etc/x`` no
   longer makes the modules write outside ``workload_logs``. Other names keep
   their file names.
+- Attach locks on the conversion hosts name their owner as
+  ``{migrator hostname}:{pid}``; before it waits, a module removes a lock whose
+  owner ran on its own host and is gone (a module killed by a cancel or a
+  timeout), instead of treating every owner as alive. A lock of another host,
+  or one written by an earlier version, is left alone.
