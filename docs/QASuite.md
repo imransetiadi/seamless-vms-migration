@@ -635,8 +635,8 @@ Show all, and a fact's Inventory link opens the VM searched for (ADV-02); UI-22 
 Connect a cloud at 1280×800 and 375×700 never leaves the focused control under their actions, and no dialog panel scrolls
 past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule finds nothing on seven pages at 320 and 375 px
 (WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
-320 and 1280 px (WCAG 1.4.10, SDD §16); each was checked to fail when the behaviour it
-guards is broken) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
+320 and 1280 px (WCAG 1.4.10, SDD §16); UI-25 the sign-in page requests no chart code and the Overview still draws its charts (40ff6b7: Rolldown had put React inside `charts`, so every page preloaded Recharts); each was checked to fail when the behaviour it
+guards is broken; known flakes under a busy machine (load average 30–60), equal on the config before 40ff6b7: UI-19's click times out, and UI-24 at 320 px sees the Overview's "Shared Ceph handover — analytics" cut off) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
 Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, are automated in `smoke.spec.ts`); UI-05 Finalize needs the typed VM name;
@@ -952,7 +952,8 @@ npm test                      # Vitest (jsdom): 4 workers and 30 s per test loca
                               # work does not time the plan-form tests out; CI (CI set) keeps the default workers
 npm run typecheck             # src, the Vite/Tailwind configs and the Playwright specs (tsconfig.e2e.json)
 npm run build                 # same as `make dashboard-build`; type-checks the app only (typecheck:app), so a broken
-                              # test spec never blocks a build; CI also runs `npm run lint` and `npm run typecheck`
+                              # test spec never blocks a build; CI also runs `npm run lint` and `npm run typecheck`;
+                              # ends with scripts/check-bundle.mjs: fails if the entry's static imports reach `charts`
 VITE_SEAMLESS_MOCK=1 npm run dev      # in-browser mock adapter that exercises every phase
 ```
 
