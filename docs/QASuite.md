@@ -869,6 +869,14 @@ Twenty-three further iterations after the integration run, each verified with th
   and clouds on a phone…"); the lifecycle stepper reads down two columns on a phone, half its height (Playwright "on
   a phone the lifecycle reads down two columns…"). Next from the same critique: the Overview's KPI tiles before
   Downtime now on a phone.
+* Dashboard browser review wave (2026-10-11, independent reviewer, mock build, 50 routes x 4 personas x 2 widths,
+  each finding reproduced twice): Cut over waits for the migration's plan (`keeps Cutover unavailable while its plan
+  loads`); a failed load keeps saying so while it is fetched again — TanStack Query 5 resets a query without data to
+  `pending` on each refetch, so every query goes through `useApiQuery`, and Retry stays busy and focused
+  (`stickyQuery.test.tsx`, `keeps a failed inventory said…`); no strategy change during an advisor hold; Check all
+  keeps naming the failed checks while Retry runs; an Overview `?plan=` naming no plan says so; Start/Resume name
+  the blocked VMs; failed provider, plan and migration lookups are named with Retry; the phone menu keeps the focus
+  and closes on Escape.
 
 ### 13.2 Exit criteria — release 0.1.0
 
