@@ -500,12 +500,49 @@ class HandoverExecutor:
             except PermanentStepError as exc:
                 problems.append(f"{where}: {exc}")
                 continue
-            subnets = list(dst.network.subnets(network_id=_attr(network, "id")))
+            net_id = _attr(network, "id")
+            subnets = list(dst.network.subnets(network_id=net_id))
             # Nova keeps one address per port (step 8)
-            for address in addresses if neutron else addresses[:1]:
+            given = addresses if neutron else addresses[:1]
+            for address in given:
                 why = address_refusal(address, subnets, neutron=neutron, mac=n.get("mac_address"))
                 if why:
                     problems.append(f"{where} on {target!r}: {address} {why}")
+            # what another port of the network holds: Neutron refuses its address, and with the MAC
+            # kept the MAC - all but the earlier attempt's own port, which step 8 uses again
+            mine = (
+                {
+                    _attr(p, "id")
+                    for p in HandoverExecutor._earlier_ports(dst, n, network, addresses)
+                }
+                if neutron and n.get("port_id")
+                else set()
+            )
+            for address in given:
+                holders = [
+                    _attr(p, "id")
+                    for p in dst.network.ports(
+                        network_id=net_id, fixed_ips=[f"ip_address={address}"]
+                    )
+                    if address in [ip.get("ip_address") for ip in _attr(p, "fixed_ips") or []]
+                    and _attr(p, "id") not in mine
+                ]
+                if holders:
+                    problems.append(
+                        f"{where} on {target!r}: {address} is held by port {holders[0]}"
+                    )
+            mac = str(n.get("mac_address") or "").lower()
+            if neutron and mac:
+                holders = [
+                    _attr(p, "id")
+                    for p in dst.network.ports(network_id=net_id, mac_address=mac)
+                    if str(_attr(p, "mac_address") or "").lower() == mac
+                    and _attr(p, "id") not in mine
+                ]
+                if holders:
+                    problems.append(
+                        f"{where} on {target!r}: MAC {mac} is held by port {holders[0]}"
+                    )
         return problems
 
     @staticmethod
@@ -698,6 +735,28 @@ class HandoverExecutor:
         return nics
 
     @staticmethod
+    def _earlier_ports(
+        conn: Any, n: dict[str, Any], network: Any, addresses: list[str]
+    ) -> list[Any]:
+        """The unbound port an earlier attempt of step 8 created for the journaled port ``n``, which
+        step 8 uses again: its description, on the target network, in the credential's project,
+        with the MAC and exactly the addresses. The admin credential sees every project's ports,
+        and a cold or warm migration of the same VM may have left one (§7.3)."""
+        description = port_description(n["port_id"])
+        mac = str(n.get("mac_address") or "").lower()
+        return [
+            p
+            for p in conn.network.ports(description=description)
+            if _attr(p, "description") == description
+            and not _attr(p, "device_id")
+            and _attr(p, "network_id") == _attr(network, "id")
+            and str(_attr(p, "mac_address") or "").lower() == mac
+            and sorted(ip.get("ip_address") for ip in _attr(p, "fixed_ips") or [])
+            == sorted(addresses)
+            and _attr(p, "project_id") == conn.current_project_id
+        ]
+
+    @staticmethod
     def _destination_nic(plan: Plan, vm_id: str, n: dict[str, Any]) -> tuple[str, list[str]]:
         """A journaled port's RHOSO network and addresses (SDD §7.3 step 8): its NIC override's
         network, else the mapped one; the override's addresses, else its own."""
@@ -732,20 +791,7 @@ class HandoverExecutor:
                 target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
                 network = _destination_network(conn, target)
                 project_id = conn.current_project_id
-                mac = str(n["mac_address"] or "").lower()
-                # only the port step 8 would create: the admin credential sees every project's
-                # ports, and a cold or warm migration of the same VM may have left one (§7.3)
-                earlier = [
-                    p
-                    for p in conn.network.ports(description=description)
-                    if _attr(p, "description") == description
-                    and not _attr(p, "device_id")
-                    and _attr(p, "network_id") == _attr(network, "id")
-                    and str(_attr(p, "mac_address") or "").lower() == mac
-                    and sorted(ip.get("ip_address") for ip in _attr(p, "fixed_ips") or [])
-                    == sorted(addresses)
-                    and _attr(p, "project_id") == project_id
-                ]
+                earlier = HandoverExecutor._earlier_ports(conn, n, network, addresses)
                 if earlier:
                     port = earlier[0]
                 else:

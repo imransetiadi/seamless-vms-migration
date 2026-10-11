@@ -264,12 +264,18 @@ class FakeNetwork:
     def __init__(self, cloud):
         self.c = cloud
 
-    def ports(self, device_id=None, description=None):
+    def ports(
+        self, device_id=None, description=None, network_id=None, fixed_ips=None, mac_address=None
+    ):
+        held = [v.split("=", 1)[1] for v in fixed_ips or [] if v.startswith("ip_address=")]
         return [
             p
             for p in self.c.ports.values()
             if (device_id is None or p.device_id == device_id)
             and (description is None or getattr(p, "description", "") == description)
+            and (network_id is None or getattr(p, "network_id", None) == network_id)
+            and (mac_address is None or getattr(p, "mac_address", None) == mac_address)
+            and all(a in [ip.get("ip_address") for ip in p.fixed_ips or []] for a in held)
         ]
 
     def get_port(self, port_id):
@@ -906,10 +912,20 @@ async def test_handover_in_neutron_mode_never_boots_on_a_port_that_is_not_its_ow
             "project_id": "dst-project",
         }
         clouds["dst"].ports[name] = NS(**{**port, **change})
-        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
-        [created] = clouds["dst"].port_attrs
-        assert created["network_id"] == "dst-net-rhoso-app", name
-        assert clouds["dst"].created[0]["networks"] != [{"port": name}], name
+        ctx = make_ctx(neutron(plan), mig, SRC, DST, settings)[0]
+        if name == "other-net":
+            # on another network it holds nothing of ours: step 8 creates the port
+            await executor.run(StepName.CUTOVER, ctx)
+            [created] = clouds["dst"].port_attrs
+            assert created["network_id"] == "dst-net-rhoso-app", name
+            assert clouds["dst"].created[0]["networks"] != [{"port": name}], name
+            continue
+        # it holds an address or the MAC on the target network: Neutron would refuse step 8's
+        # port, so step 0 refuses before anything stops - and nothing boots on it
+        with pytest.raises(PermanentStepError, match=f"is held by port {name}"):
+            await executor.run(StepName.CUTOVER, ctx)
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+        assert clouds["dst"].created == [], name
 
 
 async def test_handover_rollback_recreates_source_ports_with_their_security_groups(tmp_path):
@@ -1083,12 +1099,12 @@ async def test_handover_step_8_sends_an_overridden_nic_where_its_entry_says(tmp_
 
 async def test_handover_in_neutron_mode_resumes_on_the_port_its_nic_override_gives(tmp_path):
     """SDD §7.3 step 8: a resume compares an earlier port with what step 8 would create - the
-    override's network and addresses, in any order, the MAC in any case; a port with the NIC's
-    own addresses, or on the mapped network, is not its port."""
+    override's network and addresses, in any order, the MAC in any case; one on the mapped network
+    is not its port. A stale earlier port with the NIC's own addresses holds the MAC on the
+    override's network: step 0 refuses before anything stops (Neutron would refuse the MAC)."""
     from seamless_migrate.domain.models import NicOverride
 
     entry = NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5", "fd00:10::5"])
-    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
     leftover = {
         "mac_address": "fa:16:3e:00:00:01",
         "device_id": "",
@@ -1096,12 +1112,7 @@ async def test_handover_in_neutron_mode_resumes_on_the_port_its_nic_override_giv
         "description": "os-migrate:port-1",
         "project_id": "dst-project",
     }
-    clouds["dst"].ports["own-addresses"] = NS(
-        id="own-addresses",
-        network_id="dst-net-rhoso-dmz",
-        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
-        **leftover,
-    )
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "reuse")
     clouds["dst"].ports["mapped-network"] = NS(
         id="mapped-network",
         network_id="dst-net-rhoso-app",
@@ -1118,6 +1129,21 @@ async def test_handover_in_neutron_mode_resumes_on_the_port_its_nic_override_giv
     await executor.run(StepName.CUTOVER, ctx[0])
     assert clouds["dst"].port_attrs == []
     assert clouds["dst"].created[0]["networks"] == [{"port": "its-own"}]
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "stale")
+    clouds["dst"].ports["own-addresses"] = NS(
+        id="own-addresses",
+        network_id="dst-net-rhoso-dmz",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        **leftover,
+    )
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)
+    with pytest.raises(
+        PermanentStepError, match="MAC fa:16:3e:00:00:01 is held by port own-addresses"
+    ):
+        await executor.run(StepName.CUTOVER, ctx[0])
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    assert clouds["dst"].port_attrs == []
 
 
 def test_destination_nic_of_a_definition_journaled_with_its_first_address_only():
@@ -1753,3 +1779,58 @@ async def test_handover_step_0_looks_up_the_network_a_nic_override_names(tmp_pat
     # the mapped network alone is fine
     await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert clouds["dst"].created[0]["networks"] == [{"uuid": "app", "fixed_ip": "10.0.0.5"}]
+
+
+async def test_handover_step_0_refuses_an_address_or_mac_another_port_holds(tmp_path):
+    """SDD §7.3 step 0: Neutron refuses an address another port of the network holds, and in
+    "neutron" mode the MAC; only the unbound port an earlier attempt created is used again."""
+
+    def leftover(port_id, **change):
+        base = {
+            "id": port_id,
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:99:99:99",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}],
+            "device_id": "other-vm",
+            "created_by_nova": True,
+            "description": "",
+            "project_id": "dst-project",
+        }
+        return NS(**{**base, **change})
+
+    async def cutover(name, ports, plan_of=lambda p: p):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        for port in ports:
+            clouds["dst"].ports[port.id] = port
+        try:
+            await executor.run(
+                StepName.CUTOVER, make_ctx(plan_of(plan), mig, SRC, DST, settings)[0]
+            )
+        except PermanentStepError as exc:
+            assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+            return str(exc)
+        return None
+
+    refused = await cutover("nova-taken", [leftover("taken")])
+    assert (
+        "port port-1 (fa:16:3e:00:00:01) on 'rhoso-app': 10.0.0.5 is held by port taken" in refused
+    )
+    refused = await cutover("neutron-taken", [leftover("taken")], neutron)
+    assert "10.0.0.5 is held by port taken" in refused
+    # the earlier attempt's own unbound port: step 8 uses it again
+    mine = leftover(
+        "mine",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+    )
+    assert await cutover("neutron-mine", [mine], neutron) is None
+    # another port with the MAC: refused when the MAC is kept, not through Nova (a new MAC)
+    same = leftover(
+        "same-mac", mac_address="fa:16:3e:00:00:01", fixed_ips=[{"ip_address": "10.0.0.77"}]
+    )
+    refused = await cutover("neutron-mac", [same], neutron)
+    assert "MAC fa:16:3e:00:00:01 is held by port same-mac" in refused
+    assert await cutover("nova-mac", [same]) is None
