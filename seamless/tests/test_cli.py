@@ -405,6 +405,52 @@ def test_cli_reports_a_lost_race_as_one_line_not_a_traceback(env, capsys, monkey
     assert f"plan {plan.id!r} changed" in err and "run the command again" in err
 
 
+def test_plan_validate_waits_for_the_cleanups_it_started(env, capsys, monkeypatch):
+    """SDD §15: a VM removed from the plan has its migration cancelled; the cleanup of its
+    destination volumes finishes before the CLI exits, not at the server's next start."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    from seamless_migrate.domain.enums import SyncPassKind
+    from seamless_migrate.domain.models import Migration, SyncPass
+    from seamless_migrate.providers.fake import FakeSourceProvider
+
+    monkeypatch.setenv("SEAMLESS_DEMO", "true")
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    vms = asyncio.run(FakeSourceProvider(ProviderKind.openstack, 42).list_vms())
+    web = next(v for v in vms if v.name == "web-01")
+    dns = next(v for v in vms if v.name == "dns-01")
+    plan = Plan(
+        name="Demo",
+        source_provider_id="src-osp",
+        destination_provider_id="dst-rhoso",
+        vm_ids=[web.source_id],
+        mappings={"networks": {"finance-app": "finance-app"}},
+    )
+    store.put("plan", plan)
+    now = datetime.now(UTC)
+    # dns-01 left the plan; its failed migration ran a pass, so destination volumes exist
+    stale = make_migration(
+        plan_id=plan.id,
+        vm=dns,
+        phase=Phase.failed,
+        sync_passes=[SyncPass(number=1, kind=SyncPassKind.full, started_at=now, ended_at=now)],
+    )
+    store.put("migration", stale)
+
+    assert cli.main(["plan", "validate", plan.id]) == 0
+    m = store.get("migration", stale.id, Migration)
+    messages = [e.message for e in store.events(since_seq=0) if e.migration_id == stale.id]
+    assert not any("interrupted by a shutdown" in msg for msg in messages), messages
+    assert m.phase == Phase.cancelled and m.checkpoint != "cleanup"
+    assert "cleaning up after 1 cancelled migration(s)" in capsys.readouterr().err
+
+
 def test_plan_validate_start_and_status_in_demo(env, capsys, monkeypatch):
     monkeypatch.setenv("SEAMLESS_DEMO", "true")
     store = store_for(env)

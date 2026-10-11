@@ -1878,6 +1878,16 @@ class Orchestrator:
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
 
+    def pending_cleanups(self) -> int:
+        """How many cancels' cleanups this process runs now (SDD §5.1)."""
+        return len(self._cleanups)
+
+    async def drain_cleanups(self) -> None:
+        """Wait for the cancels' cleanups this process started - the CLI exits after them, as
+        its end would cut them short (SDD §15)."""
+        while self._cleanups:
+            await asyncio.gather(*list(self._cleanups.values()), return_exceptions=True)
+
     async def stop(self) -> None:
         self._stopping = True
         tasks = [

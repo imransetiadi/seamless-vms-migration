@@ -9,9 +9,9 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
 from pydantic import ValidationError
@@ -40,6 +40,7 @@ from .security.auth import (
 )
 
 log = logging.getLogger("seamless_migrate")
+T = TypeVar("T")
 
 
 _PLAN_ID = re.compile(r"^plan-[0-9a-f]{8}$")
@@ -366,9 +367,26 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def _then_cleanups(orchestrator: Any, work: Coroutine[Any, Any, T]) -> T:
+    """Run ``work``, then wait for the cleanups of the migrations it cancelled: the process's end
+    would cut them short (SDD §15). They run whether ``work`` succeeded or not."""
+
+    async def run() -> T:
+        try:
+            return await work
+        finally:
+            pending = orchestrator.pending_cleanups()
+            if pending:
+                print(f"cleaning up after {pending} cancelled migration(s)...", file=sys.stderr)
+                await orchestrator.drain_cleanups()
+
+    return asyncio.run(run())
+
+
 def cmd_plan_validate(args: argparse.Namespace, settings: Settings) -> int:
     services = _services(settings)
-    report = asyncio.run(services.orchestrator.validate_plan(args.plan_id, "cli"))
+    orchestrator = services.orchestrator
+    report = _then_cleanups(orchestrator, orchestrator.validate_plan(args.plan_id, "cli"))
     rows = []
     for item in report.migrations:
         chosen = next((e for e in item.estimates if e.strategy == item.strategy), None)
@@ -409,7 +427,8 @@ def cmd_plan_validate(args: argparse.Namespace, settings: Settings) -> int:
 
 def cmd_plan_start(args: argparse.Namespace, settings: Settings) -> int:
     services = _services(settings)
-    plan = asyncio.run(services.orchestrator.start_plan(args.plan_id, "cli"))
+    orchestrator = services.orchestrator
+    plan = _then_cleanups(orchestrator, orchestrator.start_plan(args.plan_id, "cli"))
     print(f"plan {plan.id} is {plan.status}")
     return 0
 
