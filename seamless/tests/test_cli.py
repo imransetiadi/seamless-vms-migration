@@ -143,6 +143,88 @@ def test_plan_apply_from_yaml(env, capsys):
     assert "invalid plan id" in capsys.readouterr().err
 
 
+def test_plan_apply_keeps_what_the_file_leaves_out_like_patch(env, capsys):
+    """SDD §15: the file is the PATCH body - unnamed fields keep their values, updated_at moves,
+    and the events carry the API's data (§12)."""
+    store = store_for(env)
+    store.put("provider", make_provider(id="src-osp"))
+    store.put(
+        "provider",
+        make_provider(id="dst-rhoso", kind=ProviderKind.rhoso, role=ProviderRole.destination),
+    )
+    path = env / "plan.yaml"
+    doc = {
+        "name": "Finance",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1", "vm-2"],
+        "cutover_window": {"start": "2026-10-11T01:00:00Z", "end": "2026-10-11T03:00:00Z"},
+        "mappings": {"networks": {"app-net": "rhoso-app"}},
+        "strategy_overrides": {"vm-1": "cold"},
+    }
+    path.write_text(yaml.safe_dump(doc))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    plan_id = capsys.readouterr().out.strip().split()[-1]
+    created = [e for e in store.events(since_seq=0) if e.kind == "plan.created"][-1]
+    assert (created.actor, created.data) == ("cli", {"name": "Finance", "vms": 2})
+    before = store.get("plan", plan_id, Plan)
+
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "id": plan_id,
+                "name": "Finance",
+                "source_provider_id": "src-osp",
+                "destination_provider_id": "dst-rhoso",
+                "vm_ids": ["vm-1", "vm-2"],
+                "downtime_slo_s": 900,
+            }
+        )
+    )
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 0
+    after = store.get("plan", plan_id, Plan)
+    assert after.downtime_slo_s == 900
+    assert after.cutover_window == before.cutover_window and after.cutover_window is not None
+    assert after.mappings.networks == {"app-net": "rhoso-app"}
+    assert after.strategy_overrides == before.strategy_overrides == {"vm-1": "cold"}
+    assert after.updated_at > before.updated_at
+    updated = [e for e in store.events(since_seq=0) if e.kind == "plan.updated"][-1]
+    assert updated.actor == "cli"
+    assert updated.data == {
+        "fields": [
+            "destination_provider_id",
+            "downtime_slo_s",
+            "name",
+            "source_provider_id",
+            "vm_ids",
+        ]
+    }
+
+
+def test_plan_apply_checks_the_merged_plan_like_patch(env, capsys):
+    """SDD §15/§12: PATCH checks the plan it would store, kept fields included."""
+    from seamless_migrate.domain.models import CutoverWindow
+
+    store, plan_id, path = _applied_plan(env, capsys)
+    stored = store.get("plan", plan_id, Plan)
+    at = stored.created_at
+    # stored before the check existed (invalid_plan_settings keeps such plans loading)
+    store.put("plan", stored.model_copy(update={"cutover_window": CutoverWindow(start=at, end=at)}))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "cutover_window: end must be after start" in capsys.readouterr().err
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
+
+
+def test_plan_apply_refuses_an_update_naming_unknown_fields_like_patch(env, capsys):
+    """SDD §15/§12: PATCH answers 422 for a field it cannot change - a typo is never dropped."""
+    store, plan_id, path = _applied_plan(env, capsys)
+    doc = yaml.safe_load(path.read_text())
+    path.write_text(yaml.safe_dump({**doc, "cutover_windw": None, "status": "running"}))
+    assert cli.main(["plan", "apply", "-f", str(path)]) == 1
+    assert "fields cannot be changed: cutover_windw, status" in capsys.readouterr().err
+    assert store.get("plan", plan_id, Plan).downtime_slo_s == 600
+
+
 def _applied_plan(env, capsys):
     store = store_for(env)
     store.put("provider", make_provider(id="src-osp"))

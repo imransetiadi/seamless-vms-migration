@@ -20,7 +20,15 @@ from . import __version__
 from .ai.redaction import redact
 from .config import Settings
 from .domain.enums import Phase, ProviderKind, Role, Strategy, strategies_for
-from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
+from .domain.models import (
+    PLAN_EDITABLE_FIELDS,
+    Migration,
+    Plan,
+    PlanCreate,
+    Provider,
+    VMRef,
+    utcnow,
+)
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
 from .security.auth import (
     MAX_TOKEN_NAME,
@@ -287,6 +295,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         plan = Plan(**spec.model_dump(), **({"id": plan_id} if plan_id else {}))
         store.put("plan", plan, expected_version=0)
         kind, verb = "plan.created", "created"
+        data: dict[str, Any] = {"name": plan.name, "vms": len(plan.vm_ids)}
     else:
         from .orchestrator import (
             PROVIDER_FIELDS,
@@ -298,6 +307,10 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
 
         # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
         existing, version = store.get_versioned("plan", existing.id, Plan)
+        # the file's keys are the PATCH body, refused first as PATCH refuses them (§12)
+        unknown = sorted(set(document) - PLAN_EDITABLE_FIELDS)
+        if unknown:
+            raise CliError(f"fields cannot be changed: {', '.join(unknown)}")
         if str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
         migrations = store.list("migration", Migration, plan_id=existing.id)
@@ -309,8 +322,25 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
             failed = [m.vm.name for m in migrations if m.phase == Phase.failed]
             if failed:
                 raise CliError(failed_provider_change_refusal(failed))
+        # the file's keys are the PATCH body: what it leaves out keeps its value, and the plan it
+        # would store is checked, kept fields included (SDD §15, §12)
+        merged = PlanCreate.model_validate(
+            {
+                **existing.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS),
+                **spec.model_dump(mode="json", include=set(document)),
+            }
+        )
+        try:
+            check_plan_spec(merged)
+        except PlanSpecError as exc:
+            raise CliError(str(exc)) from None
         plan = Plan.model_validate(
-            {**existing.model_dump(mode="json"), **spec.model_dump(mode="json"), "status": "draft"}
+            {
+                **existing.model_dump(mode="json"),
+                **merged.model_dump(mode="json"),
+                "status": "draft",
+                "updated_at": utcnow(),
+            }
         )
         try:
             store.put("plan", plan, expected_version=version)
@@ -320,6 +350,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
                 f"plan {existing.id} changed while it was being applied; run plan apply again"
             ) from None
         kind, verb = "plan.updated", "updated"
+        data = {"fields": sorted(document)}
     asyncio.run(
         emit(
             store,
@@ -328,6 +359,7 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
             f"plan {plan.name} {verb} from the CLI",
             plan_id=plan.id,
             actor="cli",
+            data=data,
         )
     )
     print(f"{verb} {plan.id}")
