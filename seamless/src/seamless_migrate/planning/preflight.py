@@ -140,8 +140,9 @@ CATALOG: dict[str, CatalogEntry] = {
     "NET_PORT_IPS": CatalogEntry(
         Severity.warning,
         (),
-        "Give each such port exactly one fixed IP before the cutover, or migrate the VM by storage "
-        "handover when its ports have at most one address each.",
+        'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode '
+        '"neutron"), give each such port exactly one fixed IP before the cutover, or migrate the '
+        "VM by storage handover when its ports have at most one address each.",
     ),
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
@@ -673,10 +674,15 @@ def run_preflight(
     if sriov:
         out.append(finding("NET_SRIOV_PORT", f"SR-IOV/macvtap port(s) on: {_names(sriov)}."))
 
-    # os-migrate recreates each port through Nova with exactly one fixed IP; the handover keeps one
-    # per port (SDD §9.2, §9.3). VMware NICs go through the migration kit.
+    # through Nova os-migrate recreates each port with exactly one fixed IP; the handover keeps one
+    # per port (SDD §9.2, §9.3). Through Neutron every address is kept, so nothing is said; VMware
+    # NICs go through the migration kit.
     odd_ports = [nic for nic in vm.nics if len(nic.fixed_ips) != 1]
-    if odd_ports and (source is None or source.kind != ProviderKind.vmware):
+    if (
+        odd_ports
+        and plan.port_creation_mode == "nova"
+        and (source is None or source.kind != ProviderKind.vmware)
+    ):
         listed = ", ".join(
             f"{n.network} ({', '.join(n.fixed_ips) or 'no fixed IP'})" for n in odd_ports
         )

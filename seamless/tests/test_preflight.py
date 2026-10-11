@@ -373,6 +373,16 @@ def test_finding_net_port_ips_names_each_nic_with_its_addresses():
     assert all(x.code != "NET_PORT_IPS" for x in check(vm, source=vmware))
 
 
+def test_finding_net_port_ips_only_in_nova_port_mode():
+    """SDD §9.3: in "neutron" mode cold and warm keep every address, so nothing is said; the
+    handover's eligibility reason remains. In "nova" mode the remediation offers "neutron"."""
+    vm = make_vm(nics=[Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"], mtu=1500)])
+    nova = only(check(vm), "NET_PORT_IPS")
+    assert "neutron" in (nova.remediation or "").lower()
+    neutron = make_plan(port_creation_mode="neutron")
+    assert all(x.code != "NET_PORT_IPS" for x in check(vm, plan=neutron))
+
+
 def test_vmware_sources_are_never_prestaged():
     """The kit has no pre-stage step: an unmapped port group blocks instead of informing."""
     vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")

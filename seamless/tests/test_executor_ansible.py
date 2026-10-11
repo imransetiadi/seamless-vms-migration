@@ -340,6 +340,70 @@ async def test_a_cold_cutover_records_its_copy_as_a_full_pass(env):
     )
 
 
+def port_mode_ctx(env, strategy, mode="neutron"):
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode=mode)
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy)
+    return make_ctx(plan, mig, SRC, DST, env.settings)
+
+
+def exported_server(env):
+    doc = yaml.safe_load((run_dir(env) / "osm" / "workloads.yml").read_text())
+    return next(r for r in doc["resources"] if r["type"] == "openstack.compute.Server")
+
+
+async def test_the_plans_port_creation_mode_reaches_workloads_before_the_import(env, monkeypatch):
+    """SDD §7.2: the executor writes plan.port_creation_mode into the server's _migration_params
+    after the export and before every playbook run, so a mode chosen after a warm export applies
+    to the next run."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    cold, _ = port_mode_ctx(env, Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    import_call = read_log(env.log)[-1]
+    assert import_call["playbook"] == "import_workloads.yml"
+    assert import_call["port_creation_mode"] == ["neutron"]
+    assert exported_server(env)["_migration_params"]["port_creation_mode"] == "neutron"
+
+    (run_dir(env) / "osm" / "workloads.yml").unlink()
+    warm, _ = port_mode_ctx(env, Strategy.warm, mode="nova")
+    await env.executor.run(StepName.PRECOPY, warm)
+    assert read_log(env.log)[-1]["port_creation_mode"] == ["nova"]
+    later, _ = port_mode_ctx(env, Strategy.warm)
+    await env.executor.run(StepName.SYNC, later)
+    sync_call = read_log(env.log)[-1]
+    assert sync_call["playbook"] == "import_workloads_precopy.yml"  # no new export
+    assert sync_call["port_creation_mode"] == ["neutron"]
+
+
+async def test_a_neutron_warm_cutover_exports_again_a_workload_without_port_security_groups(
+    env, monkeypatch
+):
+    """SDD §7.2: an export from before §6.6's rule lists ports without their security groups;
+    in "neutron" mode the warm cutover exports the workload again first."""
+    precopy, _ = port_mode_ctx(env, Strategy.warm, mode="nova")
+    await env.executor.run(StepName.PRECOPY, precopy)
+    assert "security_group_refs" not in exported_server(env)["params"]["ports"][0]["params"]
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    cutover, _ = port_mode_ctx(env, Strategy.warm)
+    await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["security_group_refs"]
+    assert read_log(env.log)[-1]["port_creation_mode"] == ["neutron"]
+
+
+async def test_neutron_mode_refuses_ports_exported_without_security_groups_before_the_stop(env):
+    """A collection that still exports ports without their security groups would create them
+    with the project's default group: the cutover stops after the export, before the import."""
+    cold, rec = port_mode_ctx(env, Strategy.cold)
+    with pytest.raises(PermanentStepError, match="security groups"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+
+
 async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
     """os-migrate exports workloads by name: a same-named server of the project that is not in
     the plan must never be imported, stopped or migrated (SDD §7.2)."""

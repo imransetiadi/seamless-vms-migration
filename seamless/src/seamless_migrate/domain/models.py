@@ -370,6 +370,9 @@ class PlanSpec(_Model):
     #: TODO(ADV-19): confirm 72 h — the owner's open question 14
     finalize_warning_h: int = Field(default=72, ge=1)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
+    #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its
+    #: security groups (SDD §6.6, §7.2, §9.2); "nova": one fixed IP per port and a new MAC
+    port_creation_mode: Literal["nova", "neutron"] = "nova"
 
 
 PlanCreate = PlanSpec

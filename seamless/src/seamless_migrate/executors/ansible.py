@@ -134,6 +134,48 @@ def apply_mappings(doc: dict[str, Any], mappings: Mappings) -> dict[str, Any]:
     return out
 
 
+def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Return a copy of an exported ``workloads.yml`` whose servers recreate their ports in
+    ``mode`` (``plan.port_creation_mode``, SDD §7.2)."""
+    out = copy.deepcopy(doc)
+    for resource in out.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        if not isinstance(resource.get("_migration_params"), dict):
+            resource["_migration_params"] = {}
+        resource["_migration_params"]["port_creation_mode"] = mode
+    return out
+
+
+def ports_without_security_groups(doc: dict[str, Any]) -> list[str]:
+    """The networks of server ports exported without their security groups, by an os-migrate
+    from before SDD §6.6's rule: Neutron would give such a port the project's default group."""
+    missing: list[str] = []
+    for resource in doc.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        for port in (resource.get("params") or {}).get("ports") or []:
+            params = port.get("params") or {}
+            if params.get("security_group_refs") is None:
+                missing.append(str((params.get("network_ref") or {}).get("name") or "?"))
+    return missing
+
+
+def _apply_port_mode(osm: Path, mode: str, cutover: bool) -> bool:
+    """Write the plan's port_creation_mode into an existing export before a run (SDD §7.2).
+
+    True when a "neutron" cutover must export the workload again: its ports were exported
+    without their security groups. The export replaces the server in place, so the file stays
+    for a rollback should the new export fail.
+    """
+    path = osm / "workloads.yml"
+    if not path.exists():
+        return False
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    path.write_text(yaml.safe_dump(set_port_creation_mode(doc, mode), sort_keys=False))
+    return mode == "neutron" and cutover and bool(ports_without_security_groups(doc))
+
+
 def effective_mappings(plan_mappings: Mappings, resolved: Mappings | None) -> Mappings:
     """Plan mappings overlaid with what preflight resolved for the migration (SDD §7.2).
 
@@ -485,8 +527,10 @@ class AnsibleExecutor:
         )
 
     # -- steps ---------------------------------------------------------------------------------
-    def _playbooks(self, step: StepName, strategy: Strategy, osm: Path) -> list[_Playbook]:
-        exported = (osm / "workloads.yml").exists()
+    def _playbooks(
+        self, step: StepName, strategy: Strategy, osm: Path, reexport: bool = False
+    ) -> list[_Playbook]:
+        exported = (osm / "workloads.yml").exists() and not reexport
         export = [] if exported else [_Playbook("export_workloads.yml")]
         if strategy == Strategy.cold:
             if step == StepName.CUTOVER:
@@ -520,7 +564,12 @@ class AnsibleExecutor:
             return await self._vmware_rollback(ctx)
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
-        playbooks = self._playbooks(step, strategy, osm)
+        reexport = False
+        if strategy in (Strategy.cold, Strategy.warm):
+            reexport = await asyncio.to_thread(
+                _apply_port_mode, osm, ctx.plan.port_creation_mode, step == StepName.CUTOVER
+            )
+        playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
         if not playbooks:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
@@ -781,7 +830,8 @@ class AnsibleExecutor:
                 )
                 if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
-                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings, planned)
+                    mode = ctx.plan.port_creation_mode if ctx is not None else None
+                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings, planned, mode)
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
@@ -789,9 +839,13 @@ class AnsibleExecutor:
 
     @staticmethod
     def _rewrite_workloads(
-        osm: Path, mappings: Mappings | None, planned_id: str | None = None
+        osm: Path,
+        mappings: Mappings | None,
+        planned_id: str | None = None,
+        port_mode: str | None = None,
     ) -> None:
-        """Keep only the planned server of the export and apply the mappings (SDD §7.2)."""
+        """Keep only the planned server of the export, apply the mappings and the plan's
+        port_creation_mode (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -817,7 +871,17 @@ class AnsibleExecutor:
             ]
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
+        if port_mode is not None:
+            doc = set_port_creation_mode(doc, port_mode)
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
+        if missing:
+            # written first: a rollback reads the planned server from it
+            raise PermanentStepError(
+                "os-migrate exported the ports on " + ", ".join(missing) + " without their "
+                "security groups: recreated through Neutron they would get the project's default "
+                "group. Update the os-migrate collection, or recreate the ports with Nova."
+            )
 
     def _playbook_arg(self, name: str) -> str:
         if name.endswith(".yml"):

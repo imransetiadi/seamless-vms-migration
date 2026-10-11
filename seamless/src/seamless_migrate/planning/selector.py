@@ -62,10 +62,11 @@ def eligibility(
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the destination provider")
-        # os-migrate recreates each port through Nova with exactly one fixed IP and raises for any
-        # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses
+        # through Nova os-migrate recreates each port with exactly one fixed IP and raises for any
+        # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses.
+        # Through Neutron every port keeps all its fixed IPs, none included (§6.6).
         odd_ports = [n for n in vm.nics if len(n.fixed_ips) != 1]
-        if odd_ports:
+        if odd_ports and plan.port_creation_mode == "nova":
             copy_reasons.append(
                 "port(s) without exactly one fixed IP, which Nova cannot recreate: "
                 + _ports(odd_ports)

@@ -116,6 +116,15 @@ def test_provider_id_regex_enforced():
             make_provider(id=bad)
 
 
+def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():
+    """SDD §4.2: "nova" keeps today's ports; "neutron" recreates each with its MAC, every fixed
+    IP and its security groups; nothing else is a mode."""
+    assert make_plan().port_creation_mode == "nova"
+    assert make_plan(port_creation_mode="neutron").port_creation_mode == "neutron"
+    with pytest.raises(ValidationError, match="port_creation_mode"):
+        make_plan(port_creation_mode="ovs")
+
+
 def test_plan_defaults_match_sdd():
     plan = make_plan()
     assert plan.default_strategy == "auto"

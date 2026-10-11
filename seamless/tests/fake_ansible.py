@@ -51,6 +51,13 @@ SCRIPT = textwrap.dedent(
         else:
             record["vars"] = data
         merged.update(data)
+    # the port_creation_mode each server of workloads.yml had when the playbook started
+    workloads = Path(merged.get("os_migrate_data_dir") or ".") / "workloads.yml"
+    if merged.get("os_migrate_data_dir") and workloads.exists():
+        resources = (yaml.safe_load(workloads.read_text()) or {{}}).get("resources") or []
+        record["port_creation_mode"] = [
+            (r.get("_migration_params") or {{}}).get("port_creation_mode")
+            for r in resources if r.get("type") == "openstack.compute.Server"]
     log = Path(os.environ["ANSIBLE_FAKE_LOG"])
     with log.open("a") as fh:
         fh.write(json.dumps(record) + "\\n")
@@ -88,6 +95,12 @@ SCRIPT = textwrap.dedent(
             "_info": {{"id": server_id}},
             "_migration_params": {{"boot_volume_params": {{"volume_type": "ceph-ssd"}}}},
         }}]}}
+        if os.environ.get("ANSIBLE_FAKE_PORT_SECURITY_GROUPS"):
+            # a collection that records each port's security groups (SDD §6.6)
+            for port in doc["resources"][0]["params"]["ports"]:
+                port["params"]["security_group_refs"] = [{{"name": "default",
+                    "project_name": "finance", "domain_name": "Default"}}]
+                port["params"]["is_port_security_enabled"] = True
         twin = os.environ.get("ANSIBLE_FAKE_TWIN_ID")
         if twin:
             # os-migrate exports by name: another server of the project with the same name

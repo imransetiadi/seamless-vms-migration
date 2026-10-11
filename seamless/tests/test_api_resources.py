@@ -144,6 +144,30 @@ def test_plan_takes_an_empty_vm_ids_and_refuses_a_missing_one(api):
     assert error == {"code": "validation_error", "message": "vm_ids: Field required"}
 
 
+def test_plan_port_creation_mode_round_trips_and_refuses_other_modes(api):
+    """SDD §4.2/§12: "nova" unless chosen; "neutron" is kept on create and on edit; any other
+    value is a 422 naming the field."""
+    body = {
+        "name": "ports",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["port_creation_mode"] == "nova"
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"port_creation_mode": "neutron"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["port_creation_mode"] == "neutron"
+    bad = api.post("/api/v1/plans", Role.operator, json={**body, "port_creation_mode": "ovs"})
+    assert bad.status_code == 422, bad.text
+    assert "port_creation_mode" in bad.json()["error"]["message"]
+
+
 def test_plan_rejects_out_of_range_tcp_port(api):
     """SDD §12: verification settings that would roll back a good cutover or never open the gate
     are a 422 on create and on edit."""
