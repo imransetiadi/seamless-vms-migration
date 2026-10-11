@@ -1107,6 +1107,22 @@ def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_r
     )
     # no IPv4 address at all: nothing to refuse
     assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("fe80::1")]
+    # the kit keeps the guest's network settings: a NIC override (itself refused) never moves
+    # a VMware NIC, which is judged on the network its port group maps to (§7.2)
+    elsewhere = make_plan(
+        mappings=Mappings(networks={"DC2-Prod": "dc2-prod"}),
+        nic_overrides={"vm-1": {"00:50:56:aa:bb:cc": {"network": "twice"}}},
+    )
+    twice = details + [net("t1", "twice"), net("t2", "twice")]
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="DC2-Prod", mac="00:50:56:AA:BB:CC", fixed_ips=["10.2.0.5"])],
+    )
+    codes = [
+        x.code
+        for x in check(vm, plan=elsewhere, dst=resolved_dst(twice, [first, second]), source=vmware)
+    ]
+    assert "MAP_NIC_OVERRIDE_INVALID" in codes and "MAP_NETWORK_AMBIGUOUS" not in codes
 
 
 def test_mtu_and_nic_override_subnets_follow_the_resolved_network():

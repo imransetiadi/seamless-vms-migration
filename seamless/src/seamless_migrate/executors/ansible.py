@@ -916,7 +916,9 @@ class AnsibleExecutor:
         out: dict[str, str] = {}
         problems: list[str] = []
         for nic in vm.nics:
-            name = ctx.plan.nic_target(vm.source_id, nic)[0]
+            # the plan's mapping of its port group, else the same name: the kit keeps the guest's
+            # network settings, so no NIC override moves it
+            name = ctx.plan.mappings.networks.get(nic.network, nic.network)
             what = f"the NIC {nic.mac or '?'} of {vm.name}"
             network, why = resolve_network(networks, name)
             if network is None:

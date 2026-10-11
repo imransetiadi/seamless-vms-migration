@@ -713,7 +713,13 @@ def run_preflight(
     resolved: dict[int, dict[str, Any]] = {}
     ambiguous: list[str] = []
     for nic in vm.nics:
-        network, why = resolve_network(seen, plan.nic_target(vm.source_id, nic)[0])
+        # the VMware kit keeps the guest's network settings: no NIC override moves its NICs (§7.2)
+        target = (
+            plan.nic_target(vm.source_id, nic)[0]
+            if openstack_source
+            else maps.networks.get(nic.network, nic.network)
+        )
+        network, why = resolve_network(seen, target)
         if network is not None:
             resolved[id(nic)] = network
         elif why:

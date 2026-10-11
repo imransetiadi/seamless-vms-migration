@@ -859,6 +859,25 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
     assert "Neutron lets only the admin or advsvc role" in await refused(
         [on_shared], roles=["member", "reader"]
     )
+    # the kit keeps the guest's network settings: a NIC override never moves a VMware NIC
+    ran = len(read_log(env.log))
+    moved = make_plan(
+        id="plan-00c0ffee",
+        mappings=maps,
+        nic_overrides={"srv-2": {"00:50:56:00:00:01": {"network": "rhoso-dmz"}}},
+    )
+    mig = make_migration(
+        id="mig-00000000aa",
+        plan_id=moved.id,
+        strategy=Strategy.vmware_warm,
+        vm=make_vm(source_id="srv-2", name="db-01", nics=[std]),
+    )
+    c, _ = make_ctx(moved, mig, VCENTER, DST, env.settings)
+    await env.executor.run(StepName.PRECOPY, c)
+    assert len(read_log(env.log)) == ran + 1
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "app-net": "net-app-net-mine,sub-net-app-net-mine"
+    }
     # the destination's networks cannot be read: transient, before the kit
     env.registry.inventory_error = True
     assert "could not read the destination's networks" in await refused(
