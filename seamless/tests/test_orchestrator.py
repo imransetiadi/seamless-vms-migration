@@ -979,6 +979,36 @@ async def test_validate_and_retry_wait_for_another_process_holding_the_claims(tm
         other.dispose()
 
 
+async def test_a_validation_never_marks_validated_a_plan_another_process_edited(tmp_path, store):
+    """SDD §8: an edit from another process (its own plan lock) during the validation leaves the
+    plan as the edit left it, and the validation fails with a conflict - never `validated` with
+    settings no validation saw."""
+    server = build_harness(tmp_path, store, [vm(1)])
+    cli = build_harness(tmp_path, store, [vm(1)])
+    plan = plan_for([vm(1)], downtime_slo_s=600)
+    store.put("plan", plan)
+    original = cli.source.inventory
+
+    async def inventory():
+        # meanwhile, PATCH /plans/{id} on the server, under the server's own plan lock
+        async with server.orch.plan_lock(plan.id):
+            p, v = store.get_versioned("plan", plan.id, Plan)
+            p.downtime_slo_s, p.status = 60, PlanStatus.draft
+            store.put("plan", p, expected_version=v)
+        return await original()
+
+    cli.source.inventory = inventory
+    with pytest.raises(ConflictError, match="changed while it was being validated"):
+        await cli.orch.validate_plan(plan.id, "cli")
+    after = store.get("plan", plan.id, Plan)
+    assert (after.status, after.downtime_slo_s) == (PlanStatus.draft, 60)
+    assert not [e for e in store.events(since_seq=0) if e.kind == "plan.validated"]
+
+    # validated again, with the settings it now has
+    report = await cli.orch.validate_plan(plan.id, "cli")
+    assert report.ok and store.get("plan", plan.id, Plan).status == PlanStatus.validated
+
+
 async def test_concurrent_validations_of_two_plans_claim_a_vm_once(tmp_path, store):
     h, first = await setup(tmp_path, store, [vm(1), vm(2)])
     second = plan_for([vm(2)], name="Second wave")

@@ -47,6 +47,7 @@ from .domain.enums import (
     SyncPassKind,
 )
 from .domain.models import (
+    PLAN_EDITABLE_FIELDS,
     AdvisorModelInfo,
     AdvisorNote,
     AdvisorPolicy,
@@ -569,6 +570,9 @@ class Orchestrator:
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
+        # SDD §8: the settings this validation assesses - an edit from another process (its own
+        # plan lock) must not end up `validated` with settings no validation saw
+        seen = plan.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
         repeated = repeated_vm_ids(plan.vm_ids)
@@ -763,10 +767,21 @@ class Orchestrator:
                 if moved.phase != P.cancelled:
                     kept.append({"vm": moved.vm.name, "phase": str(moved.phase)})
 
-        def mark_validated(fresh: Plan) -> None:
+        edited = False
+
+        def mark_validated(fresh: Plan) -> bool | None:
+            nonlocal edited
+            edited = fresh.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS) != seen
+            if edited:
+                return False  # as the edit left it
             fresh.status = PlanStatus.validated
+            return None
 
         plan = await self._update_plan(plan_id, mark_validated)
+        if edited:
+            raise ConflictError(
+                f"plan {plan_id} changed while it was being validated; validate it again"
+            )
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
         left = "".join(f"; {k['vm']} left as it is ({k['phase']})" for k in kept)
