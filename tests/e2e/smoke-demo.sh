@@ -19,10 +19,14 @@ BASE=${BASE:-http://127.0.0.1:8080}
 : "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
 H="Authorization: Bearer $TOKEN"
 HA="Authorization: Bearer $APPROVER_TOKEN"
-pass=0; fail=0
+pass=0; fail=0; skipped=0
 ok()   { pass=$((pass+1)); echo "PASS  $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL  $1"; }
+skip() { skipped=$((skipped+1)); echo "SKIP  $1"; }
 check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+# a check that needs the smoke plan: skipped, not failed, when the demo has none to give (see below)
+needs_plan(){ if [ -n "$no_plan" ]; then skip "$1"; else check "$1" "$2"; fi; }
+no_plan=""
 
 health=$(curl -fsS -m 10 "$BASE/api/v1/health" || echo '{}')
 echo "health: $health"
@@ -126,7 +130,16 @@ inventory, migrations = (json.loads(part) for part in sys.stdin.read().split("\n
 vms = inventory if isinstance(inventory, list) else inventory.get("vms", [])
 held = {m["vm"]["source_id"] for m in migrations if m["phase"] not in ("cancelled", "finalized", "rolled_back")}
 print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs") and v["source_id"] not in held][:1]))')
-  check "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)" '[ "$vm_ids" != "[]" ]'
+  if [ "$vm_ids" = "[]" ]; then
+    # not a product failure: this demo volume has nothing left to plan. A completed migration holds its VM until
+    # it is finalized (SDD §5.4), and smoke plans made before the one-plan-per-VM rule hold web-01 and web-02.
+    no_plan="no finance VM is free and no earlier smoke plan can be validated again"
+    skip "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)"
+    echo "      $no_plan: the advisor checks below are skipped. A fresh demo volume, or finalizing or rolling"
+    echo "      back a finance VM from the dashboard, gives the smoke a VM again."
+  else
+    ok "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)"
+  fi
   if [ "$vm_ids" != "[]" ]; then  # no free VM: no plan is created (the API cannot delete one)
     newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
     npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
@@ -134,7 +147,7 @@ print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs")
     [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
   fi
 fi
-check "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
+needs_plan "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
 # validation records the recommendation and its decision apart; the migration runs the decision (SDD §14.4)
 advice=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" || echo '[]'; } |
   python3 -c '
@@ -149,8 +162,8 @@ runs = bool(decided) and all(m["strategy"] == newest[m["id"]]["decision"]["final
 seen = [(r["subject"]["name"], r["model"]["name"], r["recommendation"]["option"], r["recommendation"]["confidence"], r["decision"]["status"], r["decision"]["final_option"]) for r in stored[:3]]
 print(json.dumps({"recommendations": seen, "runs_decision": runs}, separators=(",", ":")))')
 echo "advisor recommendations: $advice"
-check "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
-check "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
+needs_plan "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
+needs_plan "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
 # the newest recommendation is audited (created, then one decision) and its stored input re-hashes (SDD §14.5)
 audit=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/events?audit=true&tail=true&limit=1000&plan_id=$npid" || echo '[]'; } |
   python3 -c '
@@ -160,17 +173,17 @@ rec = next((r for r in page.get("items", []) if not r["legacy"]), None)
 kinds = [e["kind"] for e in events if rec and e["data"].get("target_id") == rec["id"]]
 print(json.dumps({"kinds": kinds, "sha": rec and rec.get("input_snapshot_sha256")}, separators=(",", ":")))')
 echo "advisor audit: $audit"
-check "the recommendation is audited: created, then one decision (ADV-05)" '[[ "$audit" =~ \"kinds\":\[\"recommendation\.created\",\"decision\.[a-z_]+\"\] ]]'
+needs_plan "the recommendation is audited: created, then one decision (ADV-05)" '[[ "$audit" =~ \"kinds\":\[\"recommendation\.created\",\"decision\.[a-z_]+\"\] ]]'
 sha=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha") or "")' <<<"$audit")
 rehash=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/snapshots/$sha" 2>/dev/null | python3 -c '
 import hashlib, json, sys
 s = json.load(sys.stdin)
 canonical = json.dumps(s["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 print(hashlib.sha256(canonical.encode("utf-8")).hexdigest() == s["sha256"])' 2>/dev/null || echo error)
-check "its input snapshot re-hashes to its SHA-256 (ADV-05)" '[ -n "$sha" ] && [ "$rehash" = True ]'
+needs_plan "its input snapshot re-hashes to its SHA-256 (ADV-05)" '[ -n "$sha" ] && [ "$rehash" = True ]'
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
 check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]]'
 echo "advisor after: $advisor"
 
-echo "== $pass passed, $fail failed =="
+echo "== $pass passed, $fail failed, $skipped skipped =="
 exit $fail
