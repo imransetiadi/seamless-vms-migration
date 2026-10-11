@@ -174,7 +174,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 | Guest change rate higher than link | Warm never converges | `max_sync_passes` cap; estimate shows non-convergence; advisor suggests cold window or handover |
 | Network semantics differ (OVS→OVN, MTU) | Post-boot connectivity issues | MTU finding, verification probes, rollback |
 | AI advisor wrong | Suboptimal choice | Bounded to eligible tie set, confidence threshold, recorded with evidence, overridable |
-| Credentials exposure | Security incident | Secrets only in mounted files/0600 temp files; redaction; Security.md controls |
+| Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
 
 ## 12. Glossary
 

@@ -217,7 +217,8 @@ start: the SDD is binding, work is test-first, and secrets are never committed.
 ## Security at a glance
 
 Static bearer tokens stored as SHA-256 hashes with four ordered roles; every mutating call audited; cloud
-credentials only from mounted files (never in the database or API); AI payloads redacted and guest console
+credentials from mounted files or the platform secret store, write-only through the API (never in the database or
+an API response); AI payloads redacted and guest console
 output screened as untrusted; non-root, read-only-root-filesystem containers with default-deny network
 policies. Report vulnerabilities privately — see [docs/Security.md](docs/Security.md) §14.
 
