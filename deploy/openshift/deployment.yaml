@@ -38,6 +38,9 @@ spec:
       # set false (and SEAMLESS_SECRET_STORE=files or remove it) to manage credentials outside the UI
       automountServiceAccountToken: true
       terminationGracePeriodSeconds: 60
+      # the pause process becomes PID 1 and reaps what Ansible leaves (its ssh ControlPersist masters), as
+      # init: true does in Compose; seamless serve as PID 1 would keep them as zombies (SDD 17)
+      shareProcessNamespace: true
       securityContext:
         runAsNonRoot: true
         seccompProfile:

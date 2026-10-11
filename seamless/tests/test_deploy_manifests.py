@@ -142,3 +142,14 @@ def test_the_secret_recipe_keeps_the_database_password_off_command_lines():
     assert not [line for line in lines if "from-literal" in line and "PGPW" in line]
     assert any("--from-env-file=/dev/stdin" in line for line in lines)
     assert any(line.startswith("printf") and "$PGPW" in line for line in lines)
+
+
+def test_the_control_plane_pod_reaps_the_processes_ansible_leaves():
+    """SDD §17: Ansible's ssh ControlPersist masters outlive their playbook and are re-parented
+    to PID 1; with a shared process namespace that is the pod's pause process, which reaps them,
+    as `init: true` does in Compose - `seamless serve` as PID 1 would leave them as zombies."""
+    docs = yaml.safe_load_all((ROOT / "deploy" / "openshift" / "deployment.yaml").read_text())
+    (deployment,) = [d for d in docs if d and d.get("kind") == "Deployment"]
+    assert deployment["spec"]["template"]["spec"].get("shareProcessNamespace") is True
+    compose = yaml.safe_load((ROOT / "deploy" / "compose" / "compose.yaml").read_text())
+    assert compose["services"]["seamless"].get("init") is True
