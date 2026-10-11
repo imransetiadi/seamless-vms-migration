@@ -303,3 +303,114 @@ def test_delete_events_before(any_store: Store):
     assert any_store.delete_events_before(datetime(2026, 10, 4, 6, 59, tzinfo=plus7)) == 1
     assert [e.message for e in any_store.events(since_seq=0, limit=100)] == ["e3", "e4"]
     assert any_store.delete_events_before(datetime(2026, 10, 4, 7, 1, tzinfo=plus7)) == 1
+
+
+# -- the cross-process VM-claim lock (SDD §5.4) ------------------------------------------------
+def test_cross_process_lock_excludes_a_second_holder(any_store: Store):
+    """Two holders of one name exclude each other as two processes would: two connections on
+    PostgreSQL (advisory lock), two open files on SQLite (flock)."""
+    other = Store(any_store.url)
+    try:
+        first, second = (
+            any_store.cross_process_lock("vm-claims"),
+            other.cross_process_lock("vm-claims"),
+        )
+        assert first.try_acquire()
+        assert not second.try_acquire()
+        first.release()
+        assert second.try_acquire()
+        assert not first.try_acquire()
+        second.release()
+        first.release()  # releasing a lock not held is a no-op
+    finally:
+        other.dispose()
+
+
+def test_cross_process_lock_dies_with_its_process(any_store: Store):
+    """A holder killed while it holds the lock never strands it: the database or the OS drops it."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    code = (
+        "import os, time\n"
+        "from seamless_migrate.store import Store\n"
+        "lock = Store(os.environ['LOCK_TEST_DB_URL']).cross_process_lock('vm-claims')\n"
+        "assert lock.try_acquire()\n"
+        "print('held', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    # the URL may carry a password: the environment, never the command line
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "LOCK_TEST_DB_URL": any_store.url},
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+        lock = any_store.cross_process_lock("vm-claims")
+        assert not lock.try_acquire()
+        os.kill(holder.pid, signal.SIGKILL)
+        holder.wait(10)
+        deadline = time.monotonic() + 10
+        while not lock.try_acquire():
+            assert time.monotonic() < deadline, "the lock outlived its process"
+            time.sleep(0.05)
+        lock.release()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(10)
+
+
+def test_an_in_memory_database_needs_no_cross_process_lock():
+    store = Store("sqlite://")
+    try:
+        lock = store.cross_process_lock("vm-claims")
+        assert lock.try_acquire() and lock.try_acquire()  # one process can reach it
+        lock.release()
+    finally:
+        store.dispose()
+
+
+async def test_a_cancelled_waiter_leaves_the_lock_free(any_store: Store):
+    """AsyncStore.cross_process_lock polls; a waiter cancelled mid-wait holds nothing after."""
+    import asyncio
+
+    from seamless_migrate.store import AsyncStore
+
+    other = Store(any_store.url)
+    try:
+        holder = other.cross_process_lock("vm-claims")
+        assert holder.try_acquire()
+
+        async def wait_for_it():
+            async with AsyncStore(any_store).cross_process_lock("vm-claims"):
+                pytest.fail("acquired a lock another holder holds")
+
+        waiter = asyncio.create_task(wait_for_it())
+        await asyncio.sleep(0.3)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        holder.release()
+        async with AsyncStore(any_store).cross_process_lock("vm-claims"):
+            assert not holder.try_acquire()
+        assert holder.try_acquire()
+        holder.release()
+    finally:
+        other.dispose()
+
+
+def test_a_closed_cross_process_lock_acquires_nothing_more(any_store: Store):
+    """close() - what a cancelled waiter does - also refuses an attempt still running in a
+    worker thread after it, so such an attempt never takes the lock for nobody."""
+    lock = any_store.cross_process_lock("vm-claims")
+    lock.close()
+    assert not lock.try_acquire()
+    other = any_store.cross_process_lock("vm-claims")
+    assert other.try_acquire()
+    other.release()

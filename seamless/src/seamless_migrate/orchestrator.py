@@ -22,7 +22,7 @@ import logging
 import time
 import weakref
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Literal
@@ -365,6 +365,13 @@ class Orchestrator:
             lock = self._locks[mid] = asyncio.Lock()
         return lock
 
+    @contextlib.asynccontextmanager
+    async def _claims(self) -> AsyncIterator[None]:
+        """The VM-claim lock (SDD §5.4): this process's, then the database-wide one, so a
+        `seamless plan validate` beside the server cannot claim a VM the server claims."""
+        async with self._lock(VM_CLAIMS), self.db.cross_process_lock(VM_CLAIMS):
+            yield
+
     def now(self) -> datetime:
         """The orchestrator's clock (UTC)."""
         return self._now()
@@ -557,7 +564,7 @@ class Orchestrator:
             # them for minutes, and the tick starts a running plan's steps under this lock
             if (await self._plan(plan_id)).status == PlanStatus.running:
                 raise NotAllowed("pause the plan before validating it again")
-            async with self._lock(VM_CLAIMS):
+            async with self._claims():
                 return await self._validate_plan(plan_id, actor)
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
@@ -1242,7 +1249,7 @@ class Orchestrator:
     async def retry(self, mid: str, actor: str) -> Migration:
         # the provider check and the save of ready share the deletions' lock (SDD §12): a ready
         # migration holds its VM, so a deletion after it refuses and one before it is seen here
-        async with self._lock(VM_CLAIMS), self._lock(mid), self._lock(PROVIDERS):
+        async with self._claims(), self._lock(mid), self._lock(PROVIDERS):
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")

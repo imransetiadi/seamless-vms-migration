@@ -58,7 +58,7 @@ from seamless_migrate.planning.estimator import (
     params_for_plan,
 )
 from seamless_migrate.providers.base import ProviderError
-from seamless_migrate.store import ConflictError, NotFound
+from seamless_migrate.store import ConflictError, NotFound, Store
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_vm
 from tests.jev_fakes import fixture_responder, load_fixture, session_factory
@@ -639,6 +639,34 @@ async def test_validate_refuses_a_vm_another_plan_holds(tmp_path, store):
     assert await h.migrations(second.id) == []
 
 
+async def test_two_processes_cannot_claim_one_vm_at_once(tmp_path, any_store):
+    """SDD §5.4: the claim lock holds across processes - a `seamless plan validate` beside the
+    server (two Orchestrators on one database, each with its own in-process locks)."""
+    server = build_harness(tmp_path, any_store, [vm(1)])
+    cli = build_harness(tmp_path, any_store, [vm(1)])
+    a, b = plan_for([vm(1)], name="A"), plan_for([vm(1)], name="B")
+    any_store.put("plan", a)
+    any_store.put("plan", b)
+    inside = asyncio.Event()
+    for src in (server.source, cli.source):
+        original = src.get_vm
+
+        async def get_vm(source_id, original=original):
+            inside.set()
+            await asyncio.sleep(0.3)  # the other validation runs meanwhile
+            return await original(source_id)
+
+        src.get_vm = get_vm
+    first = asyncio.ensure_future(server.orch.validate_plan(a.id, "alice"))
+    await asyncio.wait_for(inside.wait(), 5)
+    results = await asyncio.gather(
+        first, cli.orch.validate_plan(b.id, "cli"), return_exceptions=True
+    )
+    assert sum(isinstance(r, NotAllowed) for r in results) == 1, results
+    holders = [m for m in any_store.list("migration", Migration) if m.vm.source_id == "vm-1"]
+    assert [m.plan_id for m in holders] == [a.id]
+
+
 @pytest.mark.parametrize("phase", [P.cancelled, P.finalized, P.rolled_back])
 async def test_a_vm_is_free_for_another_plan_once_cancelled_finalized_or_rolled_back(
     tmp_path, store, phase
@@ -922,6 +950,33 @@ async def test_retry_refused_while_another_plan_holds_the_vm(tmp_path, store):
 
     await h.orch.cancel((await h.by_vm(second.id, "vm-1")).id, "bob", "back to the first plan")
     assert (await h.orch.retry(old.id, "alice")).phase == P.ready
+
+
+async def test_validate_and_retry_wait_for_another_process_holding_the_claims(tmp_path, any_store):
+    """SDD §5.4: validate_plan and retry take the database-wide claim lock - while another
+    process holds it they wait, and they go on once it lets go."""
+    h, first = await setup(tmp_path, any_store, [vm(1)])
+    other = Store(any_store.url)  # another process's connection to the database
+    try:
+        held = other.cross_process_lock("vm-claims")
+        assert held.try_acquire()
+        validation = asyncio.ensure_future(h.orch.validate_plan(first.id, "alice"))
+        await asyncio.sleep(0.4)
+        assert not validation.done()
+        held.release()
+        await asyncio.wait_for(validation, 10)
+
+        old = await h.by_vm(first.id, "vm-1")
+        old.phase = P.rolled_back
+        any_store.put("migration", old)
+        assert held.try_acquire()
+        retry = asyncio.ensure_future(h.orch.retry(old.id, "alice"))
+        await asyncio.sleep(0.4)
+        assert not retry.done()
+        held.release()
+        assert (await asyncio.wait_for(retry, 10)).phase == P.ready
+    finally:
+        other.dispose()
 
 
 async def test_concurrent_validations_of_two_plans_claim_a_vm_once(tmp_path, store):

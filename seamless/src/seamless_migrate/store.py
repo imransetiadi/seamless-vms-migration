@@ -7,8 +7,12 @@ are synchronous; async callers use :class:`AsyncStore`, which runs them in worke
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
+import hashlib
 import logging
-from collections.abc import Collection, Iterable
+import threading
+from collections.abc import AsyncIterator, Collection, Iterable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -436,10 +440,100 @@ class Store:
             result = conn.execute(events.delete().where(events.c.ts < before))
         return int(result.rowcount or 0)
 
+    def cross_process_lock(self, name: str) -> CrossProcessLock:
+        """The database-wide mutex ``name`` (SDD §5.4); see :class:`CrossProcessLock`."""
+        return CrossProcessLock(self, name)
+
     def max_seq(self) -> int:
         with self.engine.connect() as conn:
             value = conn.execute(sa.select(sa.func.max(events.c.seq))).scalar()
         return int(value or 0)
+
+
+class CrossProcessLock:
+    """One named mutex shared by every process on the database (SDD §5.4).
+
+    PostgreSQL: a session advisory lock on a connection of its own; SQLite: an exclusive
+    ``flock`` on ``{database}.{name}.lock``. Either is dropped when its process ends, so a crash
+    never strands it; an in-memory database is reachable from one process only and needs none.
+    ``try_acquire`` never blocks; the calls of one instance are serialized, so a release waits
+    for an attempt still running in another thread.
+    """
+
+    def __init__(self, store: Store, name: str) -> None:
+        self._store = store
+        self._name = name
+        self._guard = threading.Lock()
+        self._held: Any = None  # the open file or connection while held
+        self._closed = False  # a closed instance acquires nothing more
+
+    def _key(self) -> int:
+        digest = hashlib.sha256(f"seamless-migrate:{self._name}".encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
+
+    def try_acquire(self) -> bool:
+        with self._guard:
+            if self._held is not None:
+                return True
+            if self._closed:
+                # an attempt that ran on after its waiter was cancelled and closed it
+                return False
+            url = make_url(self._store.url)
+            if url.get_backend_name() == "sqlite":
+                database = url.database or ""
+                if database in ("", ":memory:") or database.startswith("file::memory:"):
+                    self._held = True
+                    return True
+                path = Path(database).expanduser()
+                handle = open(f"{path}.{self._name}.lock", "a+b")  # noqa: SIM115 - held open
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    return False
+                except BaseException:
+                    handle.close()
+                    raise
+                self._held = handle
+                return True
+            conn = self._store.engine.connect()
+            try:
+                got = conn.exec_driver_sql(
+                    "SELECT pg_try_advisory_lock(%(key)s)", {"key": self._key()}
+                ).scalar()
+                conn.commit()
+            except BaseException:
+                conn.invalidate()
+                conn.close()
+                raise
+            if not got:
+                conn.close()
+                return False
+            self._held = conn
+            return True
+
+    def close(self) -> None:
+        """Release, and refuse every later attempt - one still running in another thread too."""
+        with self._guard:
+            self._closed = True
+        self.release()
+
+    def release(self) -> None:
+        with self._guard:
+            held, self._held = self._held, None
+            if held is None or held is True:
+                return
+            if hasattr(held, "fileno"):
+                held.close()  # closing the file drops the flock
+                return
+            try:
+                held.exec_driver_sql("SELECT pg_advisory_unlock(%(key)s)", {"key": self._key()})
+                held.commit()
+            except Exception:  # noqa: BLE001 - a connection that cannot unlock is never pooled
+                log.warning("cannot release lock %s; dropping its connection", self._name)
+                held.invalidate()
+            finally:
+                held.close()
 
 
 class AsyncStore:
@@ -495,6 +589,22 @@ class AsyncStore:
 
     async def delete_events_before(self, before: datetime) -> int:
         return await asyncio.to_thread(self.sync.delete_events_before, before)
+
+    @contextlib.asynccontextmanager
+    async def cross_process_lock(self, name: str, poll_s: float = 0.1) -> AsyncIterator[None]:
+        """Hold the database-wide mutex ``name``, polling while another process holds it; a
+        waiter cancelled meanwhile holds nothing after (SDD §5.4)."""
+        lock = self.sync.cross_process_lock(name)
+        try:
+            # another process holds it: nothing in this one can signal its release, so poll
+            while True:
+                if await asyncio.to_thread(lock.try_acquire):
+                    break
+                await asyncio.sleep(poll_s)
+            yield
+        finally:
+            # also after a cancelled attempt: release waits for it and drops what it got
+            await asyncio.shield(asyncio.to_thread(lock.close))
 
     async def max_seq(self) -> int:
         return await asyncio.to_thread(self.sync.max_seq)
