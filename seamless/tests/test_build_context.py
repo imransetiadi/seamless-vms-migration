@@ -432,3 +432,13 @@ def test_gitleaks_reports_a_force_added_env_file(tmp_path):
         check=False,
     )
     assert scan.returncode == 1, scan.stdout + scan.stderr
+
+
+def test_makefile_recipes_edit_files_in_place_portably():
+    """SDD §17: the checkout runs `make vendor-links` on macOS too, whose BSD sed reads the script
+    after a bare `-i` as the backup suffix and fails. `-i.bak` (then remove the backup) works with
+    both seds, as scripts/vendor-openstack-cloud.sh does."""
+    import re
+
+    bare = [line for line in _makefile_recipe_lines() if re.search(r"\bsed -i(\s|$)", line)]
+    assert not bare, bare

@@ -185,7 +185,8 @@ vendor-links: vendor-import
 	@# Fix for the specific 'openstack' namespace import
 	@echo "--- Fixing openstack namespace imports in modules ---"
 	@for mod in $(VENDORED_MODULES); do \
-		sed -i 's/ansible_collections\.openstack\.cloud\.plugins\.module_utils\.openstack/ansible_collections.os_migrate.os_migrate.plugins.module_utils.openstack/g' plugins/modules/$$mod.py; \
+		sed -i.bak 's/ansible_collections\.openstack\.cloud\.plugins\.module_utils\.openstack/ansible_collections.os_migrate.os_migrate.plugins.module_utils.openstack/g' plugins/modules/$$mod.py \
+			&& rm -f plugins/modules/$$mod.py.bak; \
 	done
 	@# Symlink Module Utils
 	@echo "--- Linking upstream module_utils ---"
