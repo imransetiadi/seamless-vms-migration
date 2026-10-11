@@ -71,6 +71,28 @@ describe('MigrationActions', () => {
     expect(apart.cancel.className).toMatch(/sm:ml-auto/);
   });
 
+  it('never pulls the focus back to a button the user had left when a live move changes its row (SDD §16)', () => {
+    const server = createTestServer();
+    const done = server.migrations.find((m) => m.vm.name === 'web-01') as Migration;
+    const plan = server.plans.find((p) => p.id === done.plan_id) ?? null;
+    let move: (m: Migration) => void = () => {};
+    function Moving() {
+      const [m, setM] = useState(done);
+      move = setM;
+      const approver: Role = 'approver';
+      return <MigrationActions migration={m} plan={plan} role={approver} />;
+    }
+    renderWithApp(<Moving />, { server, token: 'approver' });
+    const finalize = within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^finalize$/i });
+    finalize.focus();
+    // the operator clicks the page background: the focus leaves the button for the page
+    finalize.blur();
+    expect(document.activeElement).toBe(document.body);
+    // later a live event moves the migration and Finalize changes rows: the focus stays where the user left it
+    act(() => move({ ...done, phase: 'finalized' }));
+    expect(document.activeElement).toBe(document.body);
+  });
+
   it('keeps the focus on a button that changes rows as the migration moves (SDD §16)', () => {
     const server = createTestServer();
     const done = server.migrations.find((m) => m.vm.name === 'web-01') as Migration;

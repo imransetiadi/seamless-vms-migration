@@ -11,7 +11,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useLayoutEffect, useRef, useState, type FocusEvent } from 'react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
@@ -104,18 +104,20 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const [announcement, setAnnouncement] = useState('');
   const forceId = useId();
   const deleteId = useId();
-  // a button that changes rows as the migration moves keeps the focus (SDD §16): React moves the node, which
-  // drops the focus in the browser, so the focused action is remembered and focused again after the move
+  // a button that changes rows as the migration moves keeps the focus (SDD §16): the rows are two lists, so React
+  // mounts the button anew in the other one and the focus drops to the page. The action that had the focus when this
+  // render began is noted, and only its new button gets it back - focus the user had moved elsewhere (the page,
+  // another control) is never taken back
   const buttons = useRef(new Map<MigrationActionKey, HTMLButtonElement>());
-  const focused = useRef<MigrationActionKey | null>(null);
+  const focusedAtRender = useRef<MigrationActionKey | null>(null);
+  focusedAtRender.current = null;
+  if (typeof document !== 'undefined') {
+    for (const [key, node] of buttons.current) if (node === document.activeElement) focusedAtRender.current = key;
+  }
   const rows = useRef('');
   const remember = (key: MigrationActionKey) => (node: HTMLButtonElement | null) => {
     if (node) buttons.current.set(key, node);
-    else buttons.current.delete(key);
-  };
-  // focus that went to another element is not ours to take back; focus dropped to the page by a move is
-  const forget = (event: FocusEvent<HTMLButtonElement>) => {
-    if (event.relatedTarget) focused.current = null;
+    else if (buttons.current.get(key)?.isConnected === false) buttons.current.delete(key);
   };
 
   const show = (key: MigrationActionKey) => {
@@ -160,9 +162,10 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   useLayoutEffect(() => {
     const moved = rows.current !== '' && rows.current !== layout;
     rows.current = layout;
-    const key = focused.current;
+    const key = focusedAtRender.current;
     const node = key ? buttons.current.get(key) : undefined;
-    if (moved && node && document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
+    if (!moved || !node) return;
+    if (document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
       node.focus({ preventScroll: true });
     }
   }, [layout]);
@@ -190,8 +193,6 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
               icon={ICON[key]}
               variant={primary ? (destructive && key !== 'finalize' ? 'danger' : 'primary') : 'secondary'}
               onClick={() => show(key)}
-              onFocus={() => (focused.current = key)}
-              onBlur={forget}
               className={cn(key === 'cancel' && available.length > 1 && 'sm:ml-auto')}
             >
               {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
@@ -213,8 +214,6 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             variant="secondary"
             disabledReason={availability[key].reason}
             onClick={() => show(key)}
-            onFocus={() => (focused.current = key)}
-            onBlur={forget}
           >
             {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
           </Button>
