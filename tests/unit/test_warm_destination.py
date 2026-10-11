@@ -157,6 +157,34 @@ def test_create_instance_module_reuses_a_recorded_server(tmp_path):
     create.assert_not_called()
 
 
+def test_create_instance_module_finishes_a_recorded_server(tmp_path):
+    """SDD §6.5: a re-run after the first attempt failed once Nova had created the server
+    (a timeout while it booted, an error adding floating IPs) waits for that server and adds
+    the floating IPs it lacks, instead of only reporting it."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    finished = []
+
+    def record_fips(self, conn, sdk_srv):
+        finished.append(sdk_srv.id)
+
+    with mock.patch.object(server.Server, "create") as create, mock.patch.object(
+        server.Server, "_create_floating_ips", record_fips
+    ):
+        result = fake.run_module(create_module, _create_instance_args(state_dir), dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["server_id"] == "dst-srv"
+    create.assert_not_called()
+    assert finished == ["dst-srv"]
+    assert ("wait_for_server", {"server": "dst-srv"}) in [
+        (c[0], {"server": c[1].get("server")}) for c in dst.calls_to("wait_for_server")
+    ]
+
+
 # --- rollback ------------------------------------------------------------------
 
 

@@ -144,6 +144,13 @@ class Server(osm_resource.Resource):
         self._create_floating_ips(conn, sdk_srv)
         return sdk_srv
 
+    def finish(self, conn, sdk_srv):
+        """Finish a server created by an earlier, interrupted run (SDD §6.5):
+        wait for it to be ACTIVE, then add the floating IPs it lacks."""
+        sdk_srv = conn.compute.wait_for_server(sdk_srv, failures=["ERROR"], wait=600)
+        self._create_floating_ips(conn, sdk_srv)
+        return sdk_srv
+
     def sdk_params(self, conn):
         refs = self._refs_from_ser(conn)
         sdk_params = self._to_sdk_params(refs)

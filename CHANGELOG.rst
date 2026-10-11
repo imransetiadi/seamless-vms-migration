@@ -96,3 +96,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
 - The conversion-host SSH runs with ``ServerAliveInterval=15`` and
   ``ServerAliveCountMax=4``: a silent network partition fails a pass after
   about a minute instead of keeping the source stopped for about two hours.
+- A warm cutover re-run finishes the recorded destination server instead of
+  only reporting it: ``import_workload_create_instance`` waits for it to be
+  ``ACTIVE`` and adds the floating IPs it lacks (a first attempt may have
+  failed after Nova created the server). Floating IP creation keeps one
+  already on the server's port for that fixed address, never a second.

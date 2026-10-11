@@ -83,7 +83,18 @@ class ServerFloatingIP(osm_resource.Resource):
         my_port = self._find_my_server_port(conn, sdk_srv)
         if mode == "skip":
             return None
-        elif mode == "existing":
+        # A re-run finishing a server it created before (SDD §6.5) keeps the
+        # floating IP already on the port for this fixed address: never a second.
+        on_port = list(
+            conn.network.ips(
+                port_id=my_port["id"],
+                fixed_ip_address=self.params()["fixed_ip_address"],
+            )
+        )
+        if on_port:
+            return on_port[0]
+
+        if mode == "existing":
             return self._attach_existing(conn, my_port, sdk_srv, required=True)
         elif mode == "new":
             return self._create_new(conn, my_port, sdk_srv)
