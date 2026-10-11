@@ -53,3 +53,52 @@ def test_prelim_keeps_the_log_and_state_files_in_the_log_dir(tmp_path, name):
     stem = filesystem.workload_file_stem(name)
     assert os.path.basename(result["log_file"]) == stem + ".log"
     assert os.path.basename(result["state_file"]) == stem + ".state"
+
+
+def run_prelim(tmp_path, name, existing=()):
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_prelim as prelim_module,
+    )
+
+    dst = fake.FakeCloud("dst")
+    for index, server_name in enumerate(existing):
+        dst.add_server("dst-%d" % index, server_name)
+    args = {
+        "cloud": "dst",
+        "data": fake.workload_data(name=name),
+        "src_conversion_host": {"id": "src-conv"},
+        "log_dir": str(tmp_path / "workload_logs"),
+    }
+    return fake.run_module(prelim_module, args, dst)
+
+
+@pytest.mark.parametrize(
+    ("name", "existing"),
+    [("web.01", ["web-01"]), ("db[1]", ["db1"]), ("app(", ["app(x"]), ("vm1", ["vm10", "a-vm1"])],
+)
+def test_prelim_does_not_skip_for_a_server_of_another_name(tmp_path, name, existing):
+    """SDD §6.6: the name is a literal, not a pattern (audit COL-08)."""
+    result = run_prelim(tmp_path, name, existing)
+    assert result["_exit_code"] in (None, 0), result
+    assert result["changed"] is True and "log_file" in result, result
+
+
+@pytest.mark.parametrize("name", ["web.01", "db[1]", "app(", "vm1"])
+def test_prelim_skips_for_a_server_of_exactly_its_name(tmp_path, name):
+    result = run_prelim(tmp_path, name, [name])
+    assert result["changed"] is False
+    assert "already exists on destination, skipping" in result["msg"]
+
+
+def test_prelim_does_not_skip_for_a_server_a_case_insensitive_nova_matches(tmp_path, monkeypatch):
+    """Nova's name filter runs in the database: on MySQL with a case-insensitive
+    collation ^web\\-01$ matches WEB-01 too; only a server of exactly the name counts."""
+    import re
+
+    def servers_ignoring_case(self, details=True, **query):
+        pattern = query.get("name")
+        return [s for s in self.cloud.servers.values() if re.search(pattern, s.name, re.IGNORECASE)]
+
+    monkeypatch.setattr(fake._FakeCompute, "servers", servers_ignoring_case)
+    result = run_prelim(tmp_path, "web-01", ["WEB-01"])
+    assert result["changed"] is True and "log_file" in result, result

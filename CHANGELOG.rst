@@ -89,3 +89,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   owner ran on its own host and is gone (a module killed by a cancel or a
   timeout), instead of treating every owner as alive. A lock of another host,
   or one written by an earlier version, is left alone.
+- ``import_workload_prelim`` treats the VM name as a literal when it looks for
+  a destination server of the same name (``re.escape``, then only an equal
+  name counts): ``web.01`` was skipped as already migrated because of an
+  unrelated ``web-01``, and a name such as ``app(`` failed.
