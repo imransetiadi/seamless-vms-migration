@@ -1881,7 +1881,10 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   44×44 px minimum targets for primary actions, a dialog's actions in a footer below its scrolling body — never
   over it — so Tab never hides the focused control under them (WCAG 2.4.11). An
   action that is unavailable stays focusable and says why: to assistive technology, on hover, and in a
-  short note under it when it is clicked or tapped (touch screens have no hover).
+  short note under it when it is clicked or tapped (touch screens have no hover). A status badge whose detail
+  says what to do or why — a readiness flag's guidance, why a VM in the finalize queue needs a look, a migration
+  whose numbers do not hold — gives it on hover, focus and tap (its label is a focusable term), never only in a
+  `title`.
 * Failed loads: a fetch that fails never reads as all clear — the page names what could not be loaded with
   Retry, and a panel or figure built from it says it is unavailable (or shows "—") instead of its empty
   state or a zero ("No VM is down", "Failed 0").
