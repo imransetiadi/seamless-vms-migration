@@ -750,6 +750,10 @@ the import will after the stop:
   yet). On a SLAAC or DHCPv6-stateless subnet only the EUI-64 address of the port's MAC is accepted: the kept MAC
   with `port_creation_mode: neutron`; through Nova, which gives the port a new MAC, no explicit address at all.
 * The network of a new floating IP (`floating_ip_mode` `new`, or `auto` when no detached floating IP has the address).
+* No other port of the network holds what the import will ask Neutron for. That covers an address of the port
+  (`IpAddressAlreadyAllocated`), and with `port_creation_mode: neutron` also its MAC (`MacAddressInUse`, and
+  `create_or_update` refuses any other port with the MAC). The exception is the unbound port an earlier attempt created
+  that `create_or_update` uses again: the description `os-migrate:{source port id}`, the MAC and the same addresses.
 
 Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
 cutover fails while the source still runs.
@@ -934,7 +938,10 @@ volumes with their server, so the order is:
      when there is no such network, when there are several in the credential's project, or when there are several
      elsewhere and none in its project;
    * an address step 8 would give the port is one Neutron refuses on that network (§6.6's rules for a port Nova
-     creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode).
+     creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode);
+   * another port of that network holds such an address, or in `"neutron"` mode the port's MAC. The exception is the
+     unbound port with the description `os-migrate:{source port id}`, the MAC and those addresses, which step 8 uses
+     again.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
