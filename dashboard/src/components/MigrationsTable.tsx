@@ -190,7 +190,7 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations', empt
                       {override && <span className="block text-xs text-muted-foreground">override</span>}
                     </td>
                     {waves.length > 0 && (
-                      <td className="hidden max-w-48 truncate md:table-cell" title={m.wave_id ? waveName.get(m.wave_id) : undefined}>
+                      <td className="hidden min-w-32 max-w-48 wrap-break-word md:table-cell">
                         {m.wave_id ? (waveName.get(m.wave_id) ?? m.wave_id) : '—'}
                       </td>
                     )}

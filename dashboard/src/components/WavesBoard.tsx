@@ -83,7 +83,7 @@ export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migr
             <ul className="flex flex-col gap-1">
               {members.map((m) => (
                 <li key={m.id} className="flex min-w-0 items-center justify-between gap-2 text-sm">
-                  <Link to={`/migrations/${m.id}`} className="min-w-0 truncate font-mono underline-offset-4 hover:underline">
+                  <Link to={`/migrations/${m.id}`} className="min-w-0 wrap-anywhere font-mono underline-offset-4 hover:underline">
                     {m.vm.name}
                   </Link>
                   <PhaseBadge phase={m.phase} />

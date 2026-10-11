@@ -60,9 +60,10 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
               ? value.join(', ')
               : String(value);
         return (
-          <li key={key} className="inline-flex max-w-full items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
+          <li key={key} className="inline-flex max-w-full items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
-            <span className="num truncate">{text}</span>
+            {/* wraps on a narrow screen: never cut off with an ellipsis (SDD §16) */}
+            <span className="num min-w-0 wrap-break-word">{text}</span>
           </li>
         );
       })}

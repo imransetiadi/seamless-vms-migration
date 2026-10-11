@@ -140,3 +140,21 @@ for (const width of [320, 375]) {
     }
   });
 }
+
+for (const width of [320, 1280]) {
+  test(`no text is cut off with an ellipsis on a ${width} px wide screen (WCAG 1.4.10, SDD §16)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await signIn(page, 'viewer');
+    for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
+      await page.goto(path);
+      await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+      await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+      const cut = await page.evaluate(() =>
+        Array.from(document.querySelectorAll<HTMLElement>('body *'))
+          .filter((el) => getComputedStyle(el).textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth + 1 && el.getClientRects().length > 0)
+          .map((el) => (el.textContent ?? '').trim().slice(0, 50)),
+      );
+      expect(cut, `${path}: text cut off`).toEqual([]);
+    }
+  });
+}
