@@ -1232,6 +1232,9 @@ export class MockServer {
     if (root === 'events' && method === 'GET' && !id) {
       this.require(token, 'viewer', path);
       const since = Number(query.get('since') ?? 0) || 0;
+      // before: only events below that seq, so tail + before is the page before the oldest shown (SDD §12)
+      const before = query.has('before') ? Number(query.get('before')) : Infinity;
+      if (!(before >= 1)) throw new HttpError(422, 'validation_error', 'before: Input should be greater than or equal to 1.');
       const limit = Math.min(1000, Math.max(1, Number(query.get('limit') ?? 500) || 500));
       const planId = query.get('plan_id');
       const migrationId = query.get('migration_id');
@@ -1240,6 +1243,7 @@ export class MockServer {
       const matching = this.events.filter(
         (e) =>
           e.seq > since &&
+          e.seq < before &&
           (!planId || e.plan_id === planId) &&
           (!migrationId || e.migration_id === migrationId) &&
           (!audit || (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind)),

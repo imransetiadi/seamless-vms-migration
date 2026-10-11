@@ -947,6 +947,16 @@ describe('mock API', () => {
     expect(dropped.phase).toBe('cancelled');
   });
 
+  it('pages events back with `before`, like the API: with tail, the page below a seq; 0 is refused (SDD §12)', () => {
+    const { server } = setup('viewer');
+    const get = (q: string) => server.handle('GET', '/events', new URLSearchParams(q), undefined, 'viewer');
+    const all = server.events.filter((e) => e.seq > 0);
+    const newest = get('tail=true&limit=2').body as { seq: number }[];
+    const older = get(`tail=true&limit=2&before=${newest[0]!.seq}`).body as { seq: number }[];
+    expect(older.map((e) => e.seq)).toEqual(all.slice(-4, -2).map((e) => e.seq));
+    expect(get('tail=true&before=0')).toMatchObject({ status: 422 });
+  });
+
   it('refuses a secret name the control plane could not read, like the API: on POST and on the PATCH fields set (SDD §13.3)', () => {
     const { server } = setup('admin');
     const call = (method: string, path: string, body: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');

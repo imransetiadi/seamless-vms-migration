@@ -434,6 +434,89 @@ describe('Events page', () => {
     }
   });
 
+  it('loads the events before the oldest shown once every loaded one is shown, from the same button (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 900; i += 1) {
+      server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `bulk check ${i}`, data: {} });
+    }
+    const persisted = server.events.filter((e) => e.seq > 0);
+    expect(persisted.length).toBeGreaterThan(1000); // the loaded 500, a full page before them, and the rest
+    const asked: string[] = [];
+    renderWithApp(<Events />, {
+      route: '/events',
+      token: 'viewer',
+      server,
+      wrapFetch: (mock) => (input, init) => {
+        const url = new URL(String(input), 'http://x');
+        if (url.pathname.endsWith('/events') && url.searchParams.has('before')) asked.push(url.searchParams.get('before')!);
+        return mock(input, init);
+      },
+    });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await waitFor(() => expect(within(list).getAllByRole('listitem')).toHaveLength(200));
+    const more = screen.getByRole('button', { name: 'Show 200 older events' });
+    await user.click(more);
+    await user.click(more);
+    // the 500 loaded are all shown: the same button now reads the page before them
+    expect(more).toHaveAccessibleName('Load older events');
+    await user.click(more);
+    expect(asked).toEqual([String(persisted[persisted.length - 500]!.seq)]);
+    expect(await screen.findByText('Loaded 500 older events.')).toBeInTheDocument();
+    // a full page: there may be more, so the button stays — showing the next 200 — and keeps the focus
+    expect(more).toHaveAccessibleName('Show 200 older events');
+    expect(more).toHaveFocus();
+    expect(within(list).getAllByRole('listitem')).toHaveLength(800);
+
+    await user.click(more);
+    expect(more).toHaveAccessibleName('Load older events');
+    await user.click(more);
+    const rest = persisted.length - 1000;
+    expect(await screen.findByText(`Loaded ${rest} older events.`)).toBeInTheDocument();
+    expect(asked).toEqual([String(persisted[persisted.length - 500]!.seq), String(persisted[persisted.length - 1000]!.seq)]);
+    // the start of the trail: every event is shown, the button goes and the list takes the focus (SDD §16)
+    await waitFor(() => expect(list).toHaveFocus());
+    expect(screen.queryByRole('button', { name: /older events/ })).not.toBeInTheDocument();
+    expect(within(list).getAllByRole('listitem')).toHaveLength(persisted.length);
+    expect(within(list).getByText(persisted[0]!.message)).toBeInTheDocument();
+  });
+
+  it('keeps every loaded event when the newest history is read again after older pages were loaded', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    for (let i = 0; i < 400; i += 1) {
+      server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `bulk check ${i}`, data: {} });
+    }
+    const before = server.events.filter((e) => e.seq > 0);
+    const { queryClient } = renderWithApp(<Events />, { route: '/events', token: 'viewer', server });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await waitFor(() => expect(within(list).getAllByRole('listitem')).toHaveLength(200));
+    const more = screen.getByRole('button', { name: 'Show 200 older events' });
+    await user.click(more);
+    await user.click(more);
+    await user.click(more); // Load older events: the rest of the trail
+    await screen.findByText(`Loaded ${before.length - 500} older events.`);
+    // new events, then the newest history is read again (as an audit event makes the page do)
+    for (let i = 0; i < 3; i += 1) {
+      server.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: 'bayu', message: `late check ${i}`, data: {} });
+    }
+    await act(() => queryClient.invalidateQueries({ queryKey: ['events', 'tail'] }));
+    await within(list).findByText('late check 2');
+    while (screen.queryByRole('button', { name: /older events/ })) await user.click(screen.getByRole('button', { name: /older events/ }));
+    // the oldest events of the earlier window are still there: no gap between the history and the older pages
+    expect(within(list).getAllByRole('listitem')).toHaveLength(before.length + 3);
+  });
+
+  it('offers no Load older events when the loaded history is the whole trail', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Events />, { route: '/events', token: 'viewer' });
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    expect(server.events.filter((e) => e.seq > 0).length).toBeLessThan(500);
+    while (screen.queryByRole('button', { name: /^Show \d+ older events$/ })) await user.click(screen.getByRole('button', { name: /^Show \d+ older events$/ }));
+    expect(within(list).getAllByRole('listitem').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'Load older events' })).not.toBeInTheDocument();
+  });
+
   it('lists the audit events under Advisor and memory (SDD §14.5)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Events />, { route: '/events', token: 'viewer' });

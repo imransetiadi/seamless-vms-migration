@@ -898,6 +898,8 @@ export interface StrategyRequest {
 
 export interface EventListQuery {
   since?: number;
+  /** Only events below this seq: with `tail`, the page before the oldest one shown (SDD §12). */
+  before?: number;
   plan_id?: string;
   migration_id?: string;
   /** ≤ 1000 */

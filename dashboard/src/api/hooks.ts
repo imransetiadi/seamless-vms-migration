@@ -296,7 +296,7 @@ export async function fetchEventTail(
 ): Promise<Event[]> {
   return api.get<Event[]>('/events', {
     signal,
-    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id, audit: query.audit || undefined },
+    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), before: query.before, plan_id: query.plan_id, migration_id: query.migration_id, audit: query.audit || undefined },
   });
 }
 

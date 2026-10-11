@@ -26,7 +26,7 @@ import {
 import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { exportEventTrail, jsonLineParts } from '../api/eventExport';
-import { useApi, useEventTail, usePlans } from '../api/hooks';
+import { fetchEventTail, useApi, useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
 import { Button } from '../components/Button';
@@ -44,6 +44,9 @@ import { usePageTitle } from '../lib/usePageTitle';
 
 const MAX_LIVE = 1000;
 const PAGE = 200;
+/** Events per history request: the page loads this many, and Load older events this many more (SDD §16). */
+const HISTORY = 500;
+const NO_ITEMS: Item[] = [];
 
 const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) => boolean }> = [
   { value: 'all', label: 'All', match: () => true },
@@ -168,7 +171,7 @@ export default function Events() {
   // the plan filter lives in the address like Overview's (SDD §16): its history comes from the API
   const [params, setParams] = useSearchParams();
   const planId = params.get('plan') ?? '';
-  const history = useEventTail(planId ? { plan_id: planId } : {});
+  const history = useEventTail(planId ? { plan_id: planId } : {}, HISTORY);
   const plans = usePlans();
   const [live, setLive] = useState<Item[]>([]);
   const [held, setHeld] = useState<Item[]>([]);
@@ -211,12 +214,16 @@ export default function Events() {
   const planNames = useMemo(() => new Map((plans.data ?? []).map((p) => [p.id, p.name])), [plans.data]);
 
   const historyItems = useMemo(() => (history.data ?? []).map((event) => itemOf(`seq-${event.seq}`, event)), [history.data]);
+  // pages before the loaded history (SDD §12 `before`), for the plan they were read for; a full page may have more
+  const [older, setOlder] = useState<{ planId: string | null; items: Item[]; more: boolean }>({ planId: null, items: [], more: true });
+  const olderItems = older.planId === planId ? older.items : NO_ITEMS;
   const items = useMemo(() => {
     const merged = new Map<string, Item>();
+    for (const item of olderItems) merged.set(item.key, item);
     for (const item of historyItems) merged.set(item.key, item);
     for (const item of live) merged.set(item.key, item);
     return [...merged.values()].sort(byNewest);
-  }, [historyItems, live]);
+  }, [olderItems, historyItems, live]);
 
   const filtered = useMemo(() => {
     const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
@@ -250,6 +257,36 @@ export default function Events() {
   // the whole trail (SDD §16): every persisted event, the chosen plan's when one is, paged like
   // `seamless events export`; the same button stops it, so the focus stays where it is
   const api = useApi();
+
+  // Load older events (SDD §12, §16): the page before the oldest event loaded, for the chosen plan; the same
+  // button as Show older events, so the focus stays on it
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState<unknown>(null);
+  const canLoadOlder = Boolean(history.data) && (older.planId === planId ? older.more : (history.data?.length ?? 0) >= HISTORY);
+  const loadOlder = async () => {
+    const oldest = [...olderItems, ...historyItems].reduce((min, { event }) => (event.seq > 0 ? Math.min(min, event.seq) : min), Infinity);
+    if (!Number.isFinite(oldest)) return;
+    setLoadingOlder(true);
+    setOlderError(null);
+    try {
+      const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
+      const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
+      // the history it was read below stays loaded too: when the newest history is read again, its window moves up
+      // and would otherwise leave a gap between it and these pages
+      setOlder((prev) => ({ planId, items: [...pageItems, ...(prev.planId === planId ? prev.items : []), ...historyItems], more: page.length >= HISTORY }));
+      setLimit((n) => n + PAGE);
+      setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
+      // the start of the trail removes the button: focus moves to the list, never to the page (SDD §16)
+      requestAnimationFrame(() => {
+        if (!moreRef.current) listRef.current?.focus();
+      });
+    } catch (error) {
+      setOlderError(error);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
   const [exported, setExported] = useState<number | null>(null);
   const [exportError, setExportError] = useState<unknown>(null);
   const exportRun = useRef<AbortController | null>(null);
@@ -412,19 +449,27 @@ export default function Events() {
           ))}
         </ol>
       )}
-      {filtered.length > limit && (
+      {(filtered.length > limit || canLoadOlder) && (
         <div className="mt-3">
           <Button
+            ref={moreRef}
+            disabledReason={loadingOlder ? 'Loading older events…' : null}
             onClick={() => {
-              // the last page removes this button: focus moves to the list, never to the page (SDD §16)
-              if (filtered.length <= limit + PAGE) listRef.current?.focus();
+              if (filtered.length <= limit) {
+                void loadOlder();
+                return;
+              }
+              // the last page removes this button, unless older events can still be loaded: focus moves to the
+              // list, never to the page (SDD §16)
+              if (filtered.length <= limit + PAGE && !canLoadOlder) listRef.current?.focus();
               setLimit((n) => n + PAGE);
             }}
           >
-            Show {Math.min(PAGE, filtered.length - limit)} older events
+            {filtered.length > limit ? `Show ${Math.min(PAGE, filtered.length - limit)} older events` : 'Load older events'}
           </Button>
         </div>
       )}
+      {olderError !== null && <ErrorBanner error={olderError} title="Older events could not be loaded" onRetry={() => void loadOlder()} />}
     </>
   );
 }
