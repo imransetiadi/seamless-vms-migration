@@ -2086,6 +2086,8 @@ otherwise fails and asks to run it again, so it never overwrites a change it did
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
   event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
+  Persisted events refresh the queries they affect in one batch per 400 ms; a refresh already under way is not
+  cancelled by the next batch, so a slow API still answers while events keep coming.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
   that exercises every phase.
 * Dev: `npm run dev` proxies `/api` to `http://127.0.0.1:8080`. Build output `dashboard/dist`.
