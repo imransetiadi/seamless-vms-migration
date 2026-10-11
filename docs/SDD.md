@@ -750,6 +750,9 @@ the import will after the stop:
 * The port's network reference and every fixed IP's subnet reference (`reference.network_id`,
   `reference.subnet_id`). A `%auth%` reference searches only the credential's own project, so a shared network that
   another project owns is not found, and a name that two of the project's networks carry is ambiguous.
+* With `port_creation_mode: neutron`, each of the port's security group references (`reference.security_group_id`):
+  `create_or_update` looks them up for the port it creates, and one that matches no group or several would fail it
+  after the stop. (The server's own security group references are looked up with the server's other references.)
 * Whether the credential may put the port on that network. A network of the credential's own project: always.
   Another project's network only when it is shared with the credential's project or is external (Neutron's `shared`
   and `router:external`, as the credential sees them). An admin credential sees every project's networks, and a port
@@ -998,7 +1001,12 @@ volumes with their server, so the order is:
      creates in `"nova"` mode, or for one created through Neutron with the kept MAC in `"neutron"` mode);
    * another port of that network holds such an address, or in `"neutron"` mode the port's MAC. The exception is the
      unbound port with the description `os-migrate:{source port id}`, the MAC and those addresses, which step 8 uses
-     again.
+     again;
+   * a security group that step 8 asks for by name is not exactly one group of the destination credential's project:
+     the server's groups, which step 8 passes to Nova (Nova looks each name up in the project, `default` aside, and
+     refuses one it finds none or several of), and in `"neutron"` mode each port's groups, which step 8 looks up the
+     same way for the port it creates. Step 8 runs after the source server was deleted (step 4): a missing group would
+     leave the VM on neither cloud until the rollback.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
