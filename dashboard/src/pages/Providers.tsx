@@ -226,8 +226,14 @@ function ProviderCard({
       <ConfirmDialog
         open={confirmDelete}
         tone="danger"
+        icon={Trash2}
         title={`Delete ${provider.name}?`}
-        description="This removes the provider from Seamless together with the credentials and SSH key stored for it. The cloud itself is untouched. Plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it."
+        subject={`Provider ${provider.id}`}
+        consequences={[
+          { kind: 'removed', text: 'the provider in Seamless, with the sign-in details and SSH key stored for it' },
+          { kind: 'kept', text: 'the cloud itself: nothing changes there' },
+          { kind: 'then', text: 'plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it' },
+        ]}
         confirmLabel="Delete provider"
         requireText={provider.id}
         pending={remove.isPending}

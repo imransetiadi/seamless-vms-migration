@@ -480,7 +480,8 @@ describe('Providers page', () => {
     const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
     await user.click(within(card).getByRole('button', { name: /^delete$/i }));
     const dialog = await screen.findByRole('alertdialog', { name: /delete rhosp 17\.1/i });
-    expect(dialog).toHaveTextContent('Plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it.');
+    // what happens, row by row (SDD §16)
+    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it');
     await user.type(within(dialog).getByLabelText(/type rhosp17-dc1 to confirm/i), 'rhosp17-dc1');
     await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
     const refusal = await within(dialog).findByRole('alert');

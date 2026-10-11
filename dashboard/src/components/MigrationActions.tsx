@@ -226,6 +226,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'approve'}
+        icon={ICON['approve']}
+        subject={`Migration ${m.id}`}
         title={`Approve the cutover of ${m.vm.name}?`}
         description={`Records your approval. The cutover still waits for a cutover request${plan?.auto_cutover ? ' (automatic in this plan)' : ''} and the window.`}
         confirmLabel="Approve"
@@ -237,6 +239,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'cutover'}
+        icon={ICON['cutover']}
+        subject={`Migration ${m.id}`}
         title={
           forcing ? `Let ${m.vm.name} cut over outside the window?` : early ? `Cut over ${m.vm.name} once pre-copy converges?` : `Cut over ${m.vm.name} now?`
         }
@@ -280,6 +284,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'force-cutover'}
+        icon={ICON['force-cutover']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Force the cutover of ${m.vm.name}?`}
         description={
@@ -314,6 +320,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'sync'}
+        icon={ICON['sync']}
+        subject={`Migration ${m.id}`}
         title={`Run a delta sync for ${m.vm.name}?`}
         description="Starts a keep-warm pass now so the final delta at cutover stays small. The source VM keeps running."
         confirmLabel="Sync now"
@@ -323,6 +331,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'retry'}
+        icon={ICON['retry']}
+        subject={`Migration ${m.id}`}
         title={`Retry ${m.vm.name}?`}
         description={`The migration returns to ready and starts over from its first step.${
           m.downtime_started_at && !m.downtime_ended_at
@@ -339,6 +349,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'rollback'}
+        icon={ICON['rollback']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Roll back ${m.vm.name}?`}
         description="Deletes the RHOSO instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
@@ -353,6 +365,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'cancel'}
+        icon={ICON['cancel']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Cancel ${m.vm.name}?`}
         description={
@@ -370,6 +384,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'finalize'}
+        icon={ICON['finalize']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Finalize ${m.vm.name}?`}
         description="Finalizing is irreversible: rollback is no longer possible and the source VM's temporary resources are cleaned up."

@@ -219,8 +219,17 @@ export default function AdvisorPolicies() {
       <ConfirmDialog
         open={deleting !== null}
         tone="danger"
+        icon={Trash2}
         title={`Delete ${deleting?.name ?? 'the policy'}?`}
-        description="Validations from now on use the next most specific policy, or the built-in default. Decisions already taken stay as they are, and a migration waiting for approval keeps waiting until someone approves or overrides it, or its plan is validated again."
+        subject={deleting ? `Policy ${deleting.id}` : undefined}
+        consequences={[
+          { kind: 'removed', text: 'the policy' },
+          { kind: 'kept', text: 'the decisions already taken, as they are' },
+          {
+            kind: 'then',
+            text: 'validations use the next most specific policy, or the built-in default; a migration waiting for approval keeps waiting until someone approves or overrides it, or its plan is validated again',
+          },
+        ]}
         confirmLabel="Delete policy"
         pending={remove.isPending}
         error={remove.error}
