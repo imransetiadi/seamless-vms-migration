@@ -33,6 +33,7 @@ import type {
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
+import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
 import { buildStrategyEvidence } from './mockEvidence';
 import { derivePlanStatus } from './mockPlanStatus';
@@ -741,6 +742,9 @@ export function eligibility(
     const cold: string[] = [];
     if (vm.power_state === 'error') cold.push('Source VM is in error state');
     if (!source.conversion_host || !destination.conversion_host) cold.push('No conversion host configured on both clouds');
+    // os-migrate recreates each port through Nova with exactly one fixed IP (SDD §9.2)
+    const oddPorts = portsWithoutOneFixedIp(vm);
+    if (oddPorts.length) cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
     result.cold = cold;
     result.warm = [...cold, ...(multiattach ? ['VM has a multi-attach volume'] : [])];
     const handover: string[] = [];
@@ -749,6 +753,8 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    const several = vm.nics.filter((n) => n.fixed_ips.length > 1);
+    if (several.length) handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
     if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
     handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
@@ -793,6 +799,14 @@ export function preflight(
     if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
       add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'Re-create SR-IOV ports on RHOSO manually.');
   }
+  const oddPorts = portsWithoutOneFixedIp(vm);
+  if (sourceKind !== 'vmware' && oddPorts.length)
+    add(
+      'NET_PORT_IPS',
+      'warning',
+      `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
+      'Give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
+    );
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'Provide an equivalent PCI alias on RHOSO compute nodes.');
   if ('resources:VGPU' in vm.flavor_extra_specs)
