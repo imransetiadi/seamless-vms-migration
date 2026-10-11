@@ -588,6 +588,11 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   migration, so 10 active migrations produce ≤ 10 messages/s fanned out to *N* clients (500 msg/s for 50
   dashboards) — negligible. Heartbeat every 15 s keeps proxies open; resume with `?since=<seq>` replays from
   the `events` table (`limit` ≤ 1,000).
+* **Event history:** `GET /events` serves `plan_id`, `migration_id` and the audit filter (`audit=true`, its
+  `before` pages) from indexes (SDD §11); audit events are sparse, and before `ix_events_kind_seq` (kind, seq) the
+  newest of them were found by reading the table backwards — at 1,000,000 events with 50 audit events SQLite
+  356.6 → 0.7 ms and PostgreSQL 16 79/57 → 0.5/0.2 ms per page (0ae781d); `create_schema()` builds the index once
+  on an existing table at startup (0.41 s for 1,000,000 SQLite events).
 * **Reads:** `GET /migrations` filters and pages in SQL (expression indexes, SDD §11). `GET /stats`,
   `GET /metrics` and `GET /advisor/recommendations` need every migration: they keep the last loaded list while
   the store's `change_stamp` (count + sum of versions, one aggregate query) holds, so a 15 s Prometheus scrape or
