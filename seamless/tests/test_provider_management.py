@@ -2,6 +2,7 @@
 and the conversion-host key in the platform secret store, distributions, secret resolution."""
 
 import base64
+import errno
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from seamless_migrate.api.app import create_app
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import PlanStatus, Role
 from seamless_migrate.domain.models import Plan, Provider
+from seamless_migrate.security import secret_store as secret_store_module
 from seamless_migrate.security.secret_store import (
     FileSecretStore,
     KubernetesSecretStore,
@@ -489,6 +491,31 @@ def test_an_unwritable_store_answers_503(tmp_path):
     store.dispose()
 
 
+def test_an_unwritable_store_names_the_setting_to_change(tmp_path):
+    """SDD §13.3: a host run keeps the default /var/run/secrets/seamless, which a user cannot write;
+    the 503 the dashboard shows says which setting points the store at a directory it can write."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    settings, tokens = api_settings(tmp_path, secrets_dir=blocker / "secrets")
+    store = Store(f"sqlite:///{tmp_path / 'ro.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        api = Api(client, store, settings, tokens)
+        api.post("/api/v1/providers", json=SOURCE)
+        res = put(
+            api,
+            "/api/v1/providers/src-osp/credentials",
+            {"username": "u", "password": "p", "project_name": "x"},
+        )
+        assert res.status_code == 503
+        message = res.json()["error"]["message"]
+        assert message.startswith(
+            f"secret store: cannot write the secret store at {blocker / 'secrets'}: "
+        )
+        assert message.endswith("; set SEAMLESS_SECRETS_DIR to a directory this process can write")
+    store.dispose()
+
+
 # -- stores and resolution ------------------------------------------------------------------------
 
 
@@ -508,6 +535,21 @@ def test_file_store_roundtrip(tmp_path):
             store.write(bad, {"a": "b"}, {})
     with pytest.raises(SecretStoreError):
         store.write("ok", {"bad key": "v"}, {})
+
+
+def test_file_store_that_cannot_write_says_which_setting_to_change(tmp_path, monkeypatch):
+    """SDD §13.3: a user cannot write the default directory on a host run (Permission denied)."""
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(secret_store_module.tempfile, "mkstemp", denied)
+    with pytest.raises(SecretStoreError) as caught:
+        FileSecretStore(tmp_path / "secrets").write("provider-x", {"password": "p"}, {})
+    assert str(caught.value) == (
+        f"cannot write the secret store at {tmp_path / 'secrets'}: Permission denied; "
+        "set SEAMLESS_SECRETS_DIR to a directory this process can write"
+    )
 
 
 def test_file_store_root_lists_no_secret_names_to_other_users(tmp_path, monkeypatch):

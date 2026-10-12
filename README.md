@@ -139,8 +139,12 @@ control plane reaches the host's agentmemory at `http://host.containers.internal
 ```bash
 cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                        # SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is set
-.venv/bin/seamless serve --demo            # http://127.0.0.1:8080 (demo mode on loopback needs no token)
+SEAMLESS_SECRETS_DIR=data/secrets .venv/bin/seamless serve --demo   # http://127.0.0.1:8080 (demo mode on loopback needs no token)
 ```
+
+Sign-in details entered in the dashboard (Providers → Add or Edit) go to `SEAMLESS_SECRETS_DIR`: here 0600 files under
+`seamless/data/secrets`, which git ignores. Its default, `/var/run/secrets/seamless`, is the container's path, and a
+user cannot write it on a host.
 
 ## Deploy on OpenShift
 
