@@ -1155,7 +1155,9 @@ action is the operator's, as DEMO-07 has it — New plan with vCenter DC2, `dc2-
 mapping and no approval; Validate; Start; Cut over after the first pass; Retry; Sync now; Cut over — and its 10
 checks read the page: the warning, the next step with Sync now ahead of Cut over, the refused cutover's next step
 with Retry first, and how both clear (the API is read only to wait for a pass or a phase; about 15 s). Build the dashboard first (`npm --prefix dashboard run build`): the server serves
-`dashboard/dist`. `SHOT_DIR=` keeps a screenshot of the page when a check fails.
+`dashboard/dist`. `SHOT_DIR=` keeps a screenshot of the page when a check fails. CI's `dashboard-e2e` job runs it
+after its mock-mode smoke: it builds the dashboard, installs the control plane into the runner's Python
+(`SEAMLESS=seamless`) and uploads the screenshots of a failed run with the Playwright report.
 
 The committed scripts pass `shellcheck`.
 

@@ -402,6 +402,24 @@ def _ids_carrying_a_secret(nodeids: list[str]) -> list[str]:
     return sorted({nodeid.split("[")[0] for nodeid in nodeids if redact(nodeid) != nodeid})
 
 
+def test_ci_runs_the_demo07_browser_journey_against_a_built_dashboard():
+    """The dashboard-only DEMO-07 journey (QASuite §14.7) runs in CI's dashboard-e2e job, where
+    Playwright's Chromium is installed, after the build its server serves and a control-plane
+    install. CI installs into the runner's Python, not a venv, so it names the ``seamless`` on its
+    PATH; a hang fails the step, not the job's time budget."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["dashboard-e2e"]["steps"]
+    script = "demo-cutover-refusal-browser.mjs"
+    at = next((i for i, step in enumerate(steps) if script in step.get("run", "")), None)
+    assert at is not None, [step.get("name") or step.get("uses") for step in steps]
+    journey = steps[at]
+    assert "SEAMLESS=seamless" in journey["run"]
+    assert 0 < journey.get("timeout-minutes", 0) <= 5
+    before = " ".join(f"{step.get('uses', '')} {step.get('run', '')}" for step in steps[:at])
+    assert "npm run build" in before and "actions/setup-python" in before
+    assert re.search(r"pip install -e \.", before), before
+
+
 def test_no_test_id_carries_a_secret():
     """A parametrized case's id comes from its arguments, and ids reach pytest's cache - which the
     working-tree scan of ``make seamless-check`` reads (S-17) - ``-v`` output and CI logs. So no id
