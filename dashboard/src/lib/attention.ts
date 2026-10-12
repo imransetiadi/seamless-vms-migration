@@ -7,11 +7,16 @@ import type { Tone } from './phase';
 import { isWaveActive } from './waves';
 
 const SINGLE_SHOT = new Set(['cold', 'storage_handover', 'vmware_cold']);
+/** Where what the warm passes found still stands before the cutover (SDD §7.2, §16). */
+const REFUSABLE = new Set(['precopy', 'syncing', 'awaiting_cutover']);
 
 /** What Needs attention reads of a migration, or of its summary (SDD §4, §16). */
 export type AttentionMigration = ApprovalMigration &
   Completable &
-  Pick<Migration, 'downtime_started_at' | 'downtime_ended_at' | 'source_running_at' | 'error' | 'review_required' | 'review_reason' | 'findings'>;
+  Pick<
+    Migration,
+    'downtime_started_at' | 'downtime_ended_at' | 'source_running_at' | 'error' | 'review_required' | 'review_reason' | 'findings' | 'cutover_refusals'
+  >;
 
 export interface AttentionItem {
   migration: AttentionMigration;
@@ -99,6 +104,19 @@ export function attentionItems(
         reason: `Review required${m.review_reason ? `: ${m.review_reason}` : ''}`,
         nextAction: 'Check the advisor notes and the destination VM',
         rank: 2,
+      };
+    } else if (m.cutover_refusals.length > 0 && REFUSABLE.has(m.phase)) {
+      // SDD §16: fixing what the cutover will refuse comes before what it waits for; an approval stays in
+      // Pending approvals
+      const n = m.cutover_refusals.length;
+      const fix = n === 1 ? 'Fix it' : 'Fix them';
+      item = {
+        migration: m,
+        tone: 'warning',
+        reason: `Cutover will refuse ${n} problem${n === 1 ? '' : 's'}`,
+        nextAction:
+          m.phase === 'awaiting_cutover' ? `${fix}, then Sync now (operator)` : `${fix} before it converges: the next pass looks again (operator)`,
+        rank: 3,
       };
     } else if (m.phase === 'awaiting_cutover') {
       item =
