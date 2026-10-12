@@ -2696,8 +2696,11 @@ bind mount; `.env` is 0600.
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
 `seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
 (all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
-against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
-collection, dashboard).
+against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that need only the venv and the
+dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
+scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
+name what it leaves out — the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency
+audits, the manifest and image jobs — and how to run each).
 
 Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host — on a Linux machine's own
 Docker Engine, which defines no `host.docker.internal`, the targets add `deploy/compose/compose.linux-host.yaml`,
