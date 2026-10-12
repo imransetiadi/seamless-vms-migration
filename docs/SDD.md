@@ -2357,6 +2357,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   it, then Sync now" once it waits for its cutover and "fix it before it converges" while its passes run (the next
   pass looks again); an approval it still needs stays in Pending approvals, whose row then adds to what it waits
   for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
+  A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
+  attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
+  cause, then retry or cancel (operator)".
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
