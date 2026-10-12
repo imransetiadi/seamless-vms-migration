@@ -2478,6 +2478,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cuts over once it converges); while the migration's `cutover_refusals` is not empty the page shows them above its actions as a warning,
   "The cutover will refuse this before the source stops - fix it first" with each problem, and the Cut over
   dialog repeats them (requesting stays possible: the cutover's own check refuses before the source stops); the
+  next step agrees — waiting for its cutover, requested or not, the migration's next step is to fix them and
+  sync, so a pass looks again, with Sync its action; failed before its source stopped, it says the cutover refused
+  them and that the retry's pass looks again —; the
   plan page's migration list marks such a migration with a warning naming how many problems the cutover will
   refuse; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
