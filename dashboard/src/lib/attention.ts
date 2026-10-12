@@ -158,6 +158,9 @@ export function attentionItems(
         nextAction: 'Finalize or roll it back (approver)',
         rank: 6,
       };
+    } else if (m.phase === 'rolled_back') {
+      // SDD §16: it waits for a person to fix the cause and retry it, or to cancel it - the least urgent entry
+      item = { migration: m, tone: 'info', reason: 'Rolled back — the source VM runs again', nextAction: 'Fix the cause, then retry or cancel (operator)', rank: 7 };
     }
     if (item) items.push(item);
   }

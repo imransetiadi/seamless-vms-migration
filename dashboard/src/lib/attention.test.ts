@@ -82,6 +82,24 @@ describe('attentionItems', () => {
     expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)?.reason).toMatch(/cutover request/);
   });
 
+  it('lists a rolled-back migration last: it waits for a person to retry or cancel it (SDD §16)', () => {
+    const { fx, plans, byName } = scenario();
+    const billing = byName('app-billing-01');
+    billing.phase = 'rolled_back';
+    billing.error = 'cutover: simulated cutover failure: destination volume attach timed out on the conversion host';
+    const items = attentionItems(fx.migrations, plans, NOW);
+    const item = items.find((i) => i.migration === billing);
+    expect(item).toMatchObject({ tone: 'info', reason: 'Rolled back — the source VM runs again', nextAction: 'Fix the cause, then retry or cancel (operator)', rank: 7 });
+    // last, after every more urgent entry (the overdue finalizes included): only rolled-back ones share its rank
+    expect(items.filter((i) => i.migration.phase !== 'rolled_back').every((i) => i.rank < 7)).toBe(true);
+    expect(items.indexOf(item!)).toBeGreaterThan(items.map((i) => i.rank < 7).lastIndexOf(true));
+    // listed whatever is known of its plan
+    expect(attentionItems(fx.migrations, new Map(), NOW, { plansUnknown: true }).find((i) => i.migration === billing)?.rank).toBe(7);
+    // cancelled, nothing waits for anyone
+    billing.phase = 'cancelled';
+    expect(attentionItems(fx.migrations, plans, NOW).find((i) => i.migration === billing)).toBeUndefined();
+  });
+
   it('lists a warm migration whose cutover will refuse, ahead of what it waits for (SDD §16)', () => {
     const { fx, plans, byName } = scenario();
     const billing = byName('app-billing-01');
