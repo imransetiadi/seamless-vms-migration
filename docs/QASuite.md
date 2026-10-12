@@ -1000,11 +1000,12 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                                   # unit suites; SQLite store tests; live tests skip
 .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests   # as CI and `make seamless-check` run it
 
-# PostgreSQL 16 for the store tests - an own container; the standing seamless-pg-test is left alone
-PGPW=$(openssl rand -hex 12)
+# PostgreSQL 16 for the store tests - an own container; the standing seamless-pg-test is left alone.
+# The password reaches docker through its environment (-e NAME without a value), never its command line.
+POSTGRES_PASSWORD=$(openssl rand -hex 12); export POSTGRES_PASSWORD
 docker --context colima-seamless run -d --name seamless-pg-qa -e POSTGRES_USER=seamless \
-  -e POSTGRES_PASSWORD="$PGPW" -e POSTGRES_DB=seamless_test -p 127.0.0.1:55433:5432 postgres:16-alpine
-export SEAMLESS_TEST_PG_URL="postgresql+psycopg://seamless:${PGPW}@127.0.0.1:55433/seamless_test"
+  -e POSTGRES_PASSWORD -e POSTGRES_DB=seamless_test -p 127.0.0.1:55433:5432 postgres:16-alpine
+export SEAMLESS_TEST_PG_URL="postgresql+psycopg://seamless:${POSTGRES_PASSWORD}@127.0.0.1:55433/seamless_test"
 .venv/bin/pytest -q tests/test_store.py tests/test_events.py          # both engines
 .venv/bin/pytest -q                                                   # whole suite with PostgreSQL enabled
 docker --context colima-seamless rm -f seamless-pg-qa
