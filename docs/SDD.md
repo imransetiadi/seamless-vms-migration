@@ -729,9 +729,10 @@ and which is host-specific. Nor does it send an address on a SLAAC or DHCPv6-sta
 2023.1 allocates that subnet's EUI-64 address of the MAC on every port it creates, also when the address is sent, and
 the second allocation of one address fails (`IpAddressAlreadyAllocated`). With the MAC kept, Neutron derives the same
 address, which the destination check makes sure of. Before creating a port it lists the destination network's ports
-with that MAC. It uses again an unbound one that carries that description and the same fixed IPs, not counting the
-addresses on such subnets that Neutron added (a resumed or retried cutover). It refuses
-any other port with the MAC (`InconsistentState`, naming the port) before Nova is asked for the server. It also refuses
+with that MAC. It uses again an unbound one of the credential's project that carries that description and the same
+fixed IPs, not counting the addresses on such subnets that Neutron added (a resumed or retried cutover). Another
+project's port never: an admin credential sees every project's ports, and Nova attaches no port of another project
+to the server (`PortNotUsable`). It refuses any other port with the MAC (`InconsistentState`, naming the port) before Nova is asked for the server. It also refuses
 a port exported without `security_group_refs` (an export from before this rule) rather than create it with the
 project's default group: Nova applies a server's security groups only to the ports it creates itself. The rollback
 (`WarmRollback`) deletes, after the destination server, every destination port whose description names one of the
@@ -780,8 +781,8 @@ the import will after the stop:
 * No other port of the network holds what the import will ask Neutron for. That covers an address of the port
   (`IpAddressAlreadyAllocated`), and with `port_creation_mode: neutron` also its MAC (`MacAddressInUse`, and
   `create_or_update` refuses any other port with the MAC). The exception is the unbound port an earlier attempt created
-  that `create_or_update` uses again: the description `os-migrate:{source port id}`, the MAC and the same addresses
-  (those on a SLAAC or DHCPv6-stateless subnet aside).
+  that `create_or_update` uses again: in the credential's project, with the description `os-migrate:{source port
+  id}`, the MAC and the same addresses (those on a SLAAC or DHCPv6-stateless subnet aside).
 
 Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
 cutover fails while the source still runs.
