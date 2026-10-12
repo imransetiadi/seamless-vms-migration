@@ -409,12 +409,14 @@ class HandoverExecutor:
         plan: Plan | None = None,
     ) -> dict[str, Any]:
         """Step 0 as a read-only report: what each volume would become, and every problem; with the
-        plan, also what would make step 8 fail on a port."""
-        definition = self._capture_definition(src, server_id)
+        plan, also what would make step 8 fail on a port or a security group."""
+        mode = plan.port_creation_mode if plan is not None else "nova"
+        definition = self._capture_definition(src, server_id, mode)
         attachments = definition["attachments"]
         problems: list[str] = []
         if plan is not None:
             problems.extend(self._port_problems(dst, definition["networks"], plan, server_id))
+            problems.extend(self._group_problems(dst, definition))
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -568,6 +570,30 @@ class HandoverExecutor:
                     problems.append(
                         f"{where} on {target!r}: MAC {mac} is held by port {holders[0]}"
                     )
+        return problems
+
+    @staticmethod
+    def _group_problems(dst: Any, definition: dict[str, Any]) -> list[str]:
+        """The security groups step 8 asks for by name that are not exactly one group of the
+        credential's project, found while the VM still runs (§7.3 step 0): the server's, which
+        Nova looks up by name (``default`` aside), and each port's, which ``definition`` names in
+        "neutron" mode only (step 2) and step 8 looks up for the port it creates. Step 8 runs after
+        the source server was deleted."""
+        askers: dict[str, list[str]] = {}
+        for name in definition.get("security_groups") or []:
+            if name != "default":
+                askers.setdefault(name, []).append("the server")
+        for n in definition["networks"]:
+            for name in n.get("security_groups") or []:
+                askers.setdefault(name, []).append(f"port {n.get('port_id')}")
+        problems: list[str] = []
+        for name, who in askers.items():
+            found = list(dst.network.security_groups(name=name, project_id=dst.current_project_id))
+            if len(found) != 1:
+                many = f"{len(found)} security groups" if found else "no security group"
+                problems.append(
+                    f"{', '.join(who)}: RHOSO has {many} named {name!r} in the credential's project"
+                )
         return problems
 
     @staticmethod

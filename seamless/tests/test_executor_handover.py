@@ -314,6 +314,21 @@ class FakeNetwork:
         self.c.group_lookups.append((name, project_id))
         return NS(id=f"{self.c.name}-sg-{name}", name=name)
 
+    def security_groups(self, name=None, project_id=None):
+        """Neutron's security group list filtered by name and owner; by default every name is one
+        group of the credential's own project."""
+        listed = self.c.group_list
+        if listed is None:
+            listed = [
+                NS(id=f"{self.c.name}-sg-{name}", name=name, project_id=self.c.current_project_id)
+            ]
+        return [
+            g
+            for g in listed
+            if (name is None or g.name == name)
+            and (project_id is None or g.project_id == project_id)
+        ]
+
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
 
@@ -377,6 +392,7 @@ class FakeCloud:
         self.port_attrs = []
         self.security_groups = {}
         self.group_lookups = []
+        self.group_list = None
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
         self.roles = ["admin", "member", "reader"]
@@ -1756,6 +1772,40 @@ async def test_handover_step_0_refuses_a_network_step_8_could_not_resolve(tmp_pa
         assert "port-1" in str(refused.value), name
         # the VM keeps running: nothing was stopped
         assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+
+
+async def test_handover_step_0_refuses_a_security_group_step_8_could_not_find(tmp_path):
+    """SDD §7.3 step 0: step 8 asks for the server's groups by name (Nova looks each up in the
+    project, `default` aside) and in "neutron" mode for each port's groups; one the destination
+    credential's project has none or several of refuses before the stop, not after step 4 deleted
+    the source server."""
+    web = NS(id="sg-a", name="web", project_id="dst-project")
+    twice = [web, NS(id="sg-b", name="web", project_id="dst-project")]
+    # the server's groups, in either mode: here only another project has 'web'
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "server")
+    clouds["src"].servers["srv-1"].security_groups = [{"name": "default"}, {"name": "web"}]
+    clouds["dst"].group_list = [NS(id="sg-c", name="web", project_id="tenant-b")]
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "the server: RHOSO has no security group named 'web' in the credential's project" in (
+        str(refused.value)
+    )
+    assert "'default'" not in str(refused.value)
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # in "neutron" mode each port's groups too: two of the project carry the port's 'web'
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "port")
+    clouds["dst"].group_list = twice
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert "port port-1: RHOSO has 2 security groups named 'web' in the credential's project" in (
+        str(refused.value)
+    )
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # through Nova the port's own groups are never asked for: the same destination passes
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "nova")
+    clouds["dst"].group_list = twice
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["dst"].created
 
 
 async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
