@@ -616,7 +616,7 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       { id: 'sub-provider-ext-v4', name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
     ],
   };
-  // what a NIC's network name resolves to (SDD §11): the credential's own networks, and a provider network another project shares
+  // what a NIC's network name resolves to (SDD §10): the credential's own networks, and a provider network another project shares
   destination.network_details = Object.entries(destination.networks).map(([name, mtu]) => ({
     id: `net-${name}`,
     name,

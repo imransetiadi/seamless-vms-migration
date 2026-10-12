@@ -784,9 +784,9 @@ export interface DestinationInventory {
   /** project -> free amounts */
   quotas: Record<string, ProjectQuota>;
   projects: string[];
-  /** The subnets the destination credential sees: where a NIC's addresses must lie (SDD §11). */
+  /** The subnets the destination credential sees: where a NIC's addresses must lie (SDD §10). */
   subnets?: DestinationSubnet[];
-  /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §11). */
+  /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §10). */
   network_details?: DestinationNetwork[];
 }
 
