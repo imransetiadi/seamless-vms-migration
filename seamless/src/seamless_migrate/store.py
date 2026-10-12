@@ -7,8 +7,12 @@ are synchronous; async callers use :class:`AsyncStore`, which runs them in worke
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
+import hashlib
 import logging
-from collections.abc import Collection, Iterable
+import threading
+from collections.abc import AsyncIterator, Collection, Iterable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -21,13 +25,14 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
+from .domain.enums import Phase
 from .domain.models import Event
 
 log = logging.getLogger(__name__)
 
 M = TypeVar("M", bound=BaseModel)
 
-KINDS = ("provider", "plan", "migration")
+KINDS = ("provider", "plan", "migration", "recommendation", "advisor_snapshot", "advisor_policy")
 
 JSONType = sa.JSON().with_variant(JSONB(), "postgresql")
 
@@ -47,6 +52,8 @@ documents = sa.Table(
 #: Top-level JSON fields the list filters push into SQL (SDD §11); each gets an expression
 #: index on ``(kind, field)`` so a plan's migrations or a phase are found without a full scan.
 INDEXED_FIELDS = ("plan_id", "phase", "wave_id", "status", "role")
+#: ids per IN (...) of ``get_many``: far below SQLite's and PostgreSQL's bound-parameter limits
+_GET_MANY_CHUNK = 500
 for _field in INDEXED_FIELDS:
     sa.Index(f"ix_documents_{_field}", documents.c.kind, documents.c.data[_field].as_string())
 
@@ -61,6 +68,9 @@ events = sa.Table(
     sa.Column("actor", sa.String(128), nullable=False),
     sa.Column("message", sa.Text, nullable=False),
     sa.Column("data", JSONType, nullable=False),
+    # the kinds filter (GET /events?audit=true, SDD §11): audit events are sparse, and a scan
+    # of the primary key backwards reads the whole table to find the newest of them
+    sa.Index("ix_events_kind_seq", "kind", "seq"),
     sqlite_autoincrement=True,
 )
 
@@ -157,7 +167,7 @@ class Store:
         # create_all skips the indexes of tables that already exist, and expression indexes
         # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
         with self.engine.begin() as conn:
-            for index in documents.indexes:
+            for index in (*documents.indexes, *events.indexes):
                 conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
@@ -305,6 +315,53 @@ class Store:
             out = out[start:] if limit is None else out[start : start + max(0, int(limit))]
         return out
 
+    def versions(self, kind: str) -> list[tuple[str, int]]:
+        """``(id, version)`` of every document of ``kind`` in creation order (SDD §11): one index
+        read, no document loaded — a cached list reloads only what changed."""
+        query = (
+            sa.select(documents.c.id, documents.c.version)
+            .where(documents.c.kind == kind)
+            .order_by(documents.c.created_at, documents.c.id)
+        )
+        with self.engine.connect() as conn:
+            return [(row.id, int(row.version)) for row in conn.execute(query)]
+
+    def get_many(
+        self, kind: str, ids: Collection[str], model_cls: type[M]
+    ) -> dict[str, tuple[int, M]]:
+        """``{id: (version, document)}`` for the ``ids`` that exist (SDD §11)."""
+        wanted = list(dict.fromkeys(ids))
+        out: dict[str, tuple[int, M]] = {}
+        with self.engine.connect() as conn:
+            for start in range(0, len(wanted), _GET_MANY_CHUNK):
+                chunk = wanted[start : start + _GET_MANY_CHUNK]
+                query = sa.select(documents.c.id, documents.c.version, documents.c.data).where(
+                    documents.c.kind == kind, documents.c.id.in_(chunk)
+                )
+                for row in conn.execute(query):
+                    out[row.id] = (int(row.version), model_cls.model_validate(row.data))
+        return out
+
+    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+        """Each plan's distinct migration phases (SDD §8.1, §11): one ``SELECT DISTINCT`` over the
+        indexed ``plan_id`` and ``phase`` expressions; no document is loaded or validated. A plan
+        without migrations is absent from the result."""
+        wanted = list(plan_ids)
+        if not wanted:
+            return {}
+        plan_col = documents.c.data["plan_id"].as_string()
+        phase_col = documents.c.data["phase"].as_string()
+        query = (
+            sa.select(plan_col, phase_col)
+            .distinct()
+            .where(documents.c.kind == "migration", plan_col.in_(wanted))
+        )
+        out: dict[str, set[Phase]] = {}
+        with self.engine.connect() as conn:
+            for plan_id, phase in conn.execute(query):
+                out.setdefault(plan_id, set()).add(Phase(phase))
+        return out
+
     def delete(self, kind: str, id_: str) -> None:
         with self.engine.begin() as conn:
             result = conn.execute(
@@ -339,10 +396,14 @@ class Store:
         limit: int = 500,
         kinds: Iterable[str] | None = None,
         tail: bool = False,
+        before_seq: int | None = None,
     ) -> list[Event]:
-        """Matching events after ``since_seq`` in ascending ``seq``: the first ``limit`` of them,
-        or with ``tail`` the newest ``limit`` (SDD §12)."""
+        """Matching events after ``since_seq`` (and below ``before_seq``) in ascending ``seq``: the
+        first ``limit`` of them, or with ``tail`` the newest ``limit`` — with ``before_seq``, the
+        page before an event (SDD §12)."""
         query = sa.select(events).where(events.c.seq > since_seq)
+        if before_seq is not None:
+            query = query.where(events.c.seq < before_seq)
         if plan_id is not None:
             query = query.where(events.c.plan_id == plan_id)
         if migration_id is not None:
@@ -382,10 +443,100 @@ class Store:
             result = conn.execute(events.delete().where(events.c.ts < before))
         return int(result.rowcount or 0)
 
+    def cross_process_lock(self, name: str) -> CrossProcessLock:
+        """The database-wide mutex ``name`` (SDD §5.4); see :class:`CrossProcessLock`."""
+        return CrossProcessLock(self, name)
+
     def max_seq(self) -> int:
         with self.engine.connect() as conn:
             value = conn.execute(sa.select(sa.func.max(events.c.seq))).scalar()
         return int(value or 0)
+
+
+class CrossProcessLock:
+    """One named mutex shared by every process on the database (SDD §5.4).
+
+    PostgreSQL: a session advisory lock on a connection of its own; SQLite: an exclusive
+    ``flock`` on ``{database}.{name}.lock``. Either is dropped when its process ends, so a crash
+    never strands it; an in-memory database is reachable from one process only and needs none.
+    ``try_acquire`` never blocks; the calls of one instance are serialized, so a release waits
+    for an attempt still running in another thread.
+    """
+
+    def __init__(self, store: Store, name: str) -> None:
+        self._store = store
+        self._name = name
+        self._guard = threading.Lock()
+        self._held: Any = None  # the open file or connection while held
+        self._closed = False  # a closed instance acquires nothing more
+
+    def _key(self) -> int:
+        digest = hashlib.sha256(f"seamless-migrate:{self._name}".encode()).digest()
+        return int.from_bytes(digest[:8], "big", signed=True)
+
+    def try_acquire(self) -> bool:
+        with self._guard:
+            if self._held is not None:
+                return True
+            if self._closed:
+                # an attempt that ran on after its waiter was cancelled and closed it
+                return False
+            url = make_url(self._store.url)
+            if url.get_backend_name() == "sqlite":
+                database = url.database or ""
+                if database in ("", ":memory:") or database.startswith("file::memory:"):
+                    self._held = True
+                    return True
+                path = Path(database).expanduser()
+                handle = open(f"{path}.{self._name}.lock", "a+b")  # noqa: SIM115 - held open
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    return False
+                except BaseException:
+                    handle.close()
+                    raise
+                self._held = handle
+                return True
+            conn = self._store.engine.connect()
+            try:
+                got = conn.exec_driver_sql(
+                    "SELECT pg_try_advisory_lock(%(key)s)", {"key": self._key()}
+                ).scalar()
+                conn.commit()
+            except BaseException:
+                conn.invalidate()
+                conn.close()
+                raise
+            if not got:
+                conn.close()
+                return False
+            self._held = conn
+            return True
+
+    def close(self) -> None:
+        """Release, and refuse every later attempt - one still running in another thread too."""
+        with self._guard:
+            self._closed = True
+        self.release()
+
+    def release(self) -> None:
+        with self._guard:
+            held, self._held = self._held, None
+            if held is None or held is True:
+                return
+            if hasattr(held, "fileno"):
+                held.close()  # closing the file drops the flock
+                return
+            try:
+                held.exec_driver_sql("SELECT pg_advisory_unlock(%(key)s)", {"key": self._key()})
+                held.commit()
+            except Exception:  # noqa: BLE001 - a connection that cannot unlock is never pooled
+                log.warning("cannot release lock %s; dropping its connection", self._name)
+                held.invalidate()
+            finally:
+                held.close()
 
 
 class AsyncStore:
@@ -419,6 +570,17 @@ class AsyncStore:
             lambda: self.sync.list(kind, model_cls, limit=limit, offset=offset, **filters)
         )
 
+    async def versions(self, kind: str) -> list[tuple[str, int]]:
+        return await asyncio.to_thread(self.sync.versions, kind)
+
+    async def get_many(
+        self, kind: str, ids: Collection[str], model_cls: type[M]
+    ) -> dict[str, tuple[int, M]]:
+        return await asyncio.to_thread(self.sync.get_many, kind, ids, model_cls)
+
+    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+        return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
+
     async def delete(self, kind: str, id_: str) -> None:
         await asyncio.to_thread(self.sync.delete, kind, id_)
 
@@ -430,6 +592,22 @@ class AsyncStore:
 
     async def delete_events_before(self, before: datetime) -> int:
         return await asyncio.to_thread(self.sync.delete_events_before, before)
+
+    @contextlib.asynccontextmanager
+    async def cross_process_lock(self, name: str, poll_s: float = 0.1) -> AsyncIterator[None]:
+        """Hold the database-wide mutex ``name``, polling while another process holds it; a
+        waiter cancelled meanwhile holds nothing after (SDD §5.4)."""
+        lock = self.sync.cross_process_lock(name)
+        try:
+            # another process holds it: nothing in this one can signal its release, so poll
+            while True:
+                if await asyncio.to_thread(lock.try_acquire):
+                    break
+                await asyncio.sleep(poll_s)
+            yield
+        finally:
+            # also after a cancelled attempt: release waits for it and drops what it got
+            await asyncio.shield(asyncio.to_thread(lock.close))
 
     async def max_seq(self) -> int:
         return await asyncio.to_thread(self.sync.max_seq)
@@ -447,3 +625,39 @@ __all__ = [
     "StoreError",
     "build_engine",
 ]
+
+
+class VersionedDocuments:
+    """Every document of one kind in creation order, kept between reads (SDD §11): while the
+    store's change stamp holds, the kept list (one aggregate query); when it moved, only the
+    documents whose version changed or that are new are loaded, and deleted ones dropped. The
+    documents are shared between callers: read them, never change them."""
+
+    def __init__(self, db: AsyncStore, kind: str, model_cls: type[Any]) -> None:
+        self.db, self.kind, self.model_cls = db, kind, model_cls
+        self.stamp: tuple[int, int] | None = None
+        self.rows: list[Any] = []
+        self.by_id: dict[str, tuple[int, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self) -> list[Any]:
+        stamp = await self.db.change_stamp(self.kind)
+        if stamp == self.stamp:
+            return self.rows
+        async with self._lock:
+            if stamp == self.stamp:
+                return self.rows
+            versions = await self.db.versions(self.kind)
+            known = self.by_id
+            stale = {id_ for id_, version in versions if known.get(id_, (None,))[0] != version}
+            fresh = await self.db.get_many(self.kind, stale, self.model_cls) if stale else {}
+            by_id: dict[str, tuple[int, Any]] = {}
+            for id_, _ in versions:
+                # a stale document deleted between the two reads is left out
+                hit = fresh.get(id_) if id_ in stale else known.get(id_)
+                if hit is not None:
+                    by_id[id_] = hit
+            self.rows = [by_id[id_][1] for id_, _ in versions if id_ in by_id]
+            self.by_id = by_id
+            self.stamp = stamp
+            return self.rows

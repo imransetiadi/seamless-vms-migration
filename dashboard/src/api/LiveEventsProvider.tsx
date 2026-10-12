@@ -3,6 +3,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { useApi } from './hooks';
 import { applyEventToCache, createBatchedInvalidator, LiveContext, LiveEventHub, refetchAfterReconnect } from './live';
 import { streamEvents } from './stream';
+import type { Migration } from './types';
 
 /**
  * Owns the app's single SSE connection while `enabled` (i.e. signed in). The first connection
@@ -20,8 +21,9 @@ export function LiveEventsProvider({ enabled, children }: { enabled: boolean; ch
       return;
     }
     const controller = new AbortController();
-    const batch = createBatchedInvalidator(queryClient);
-    const unsubscribe = hub.subscribe((event) => applyEventToCache(queryClient, event, batch.invalidate));
+    // an event about one migration reads it alone, not every list (SDD §16)
+    const batch = createBatchedInvalidator(queryClient, 400, (id) => api.get<Migration>(`/migrations/${encodeURIComponent(id)}`));
+    const unsubscribe = hub.subscribe((event) => applyEventToCache(queryClient, event, batch.invalidate, batch.refreshMigration));
     const refetch = refetchAfterReconnect(queryClient);
     void streamEvents(null, hub.publish, controller.signal, {
       client: api,

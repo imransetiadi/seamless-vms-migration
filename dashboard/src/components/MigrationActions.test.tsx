@@ -1,7 +1,10 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
 import type { Migration, Role } from '../api/types';
+import { forcedDowntime } from '../lib/forcedEstimate';
+import { formatDuration } from '../lib/format';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { MigrationActions } from './MigrationActions';
 
@@ -16,6 +19,103 @@ function setup(vmName: string, token: string) {
 }
 
 describe('MigrationActions', () => {
+  it('lists the actions available now first, the next step first, and the others under "Unavailable now" (SDD §16)', () => {
+    const { button } = setup('web-01', 'approver');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const names = within(group)
+      .getAllByRole('button')
+      .map((b) => b.textContent?.trim());
+    expect(names.slice(0, 2)).toEqual(['Finalize', 'Roll back']);
+    const label = within(group).getByText('Unavailable now');
+    for (const name of [/approve/i, /^cut over/i, /sync/i, /retry/i, /cancel/i]) {
+      const unavailable = button(name);
+      // after the label, quieter and smaller, still focusable and saying why
+      expect(label.compareDocumentPosition(unavailable) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(unavailable).toHaveAttribute('aria-disabled', 'true');
+      expect(unavailable).toHaveAccessibleDescription(/.+/);
+      expect(unavailable.className).toMatch(/min-h-8/);
+    }
+    // the next step's action is the primary one, at the 44 px size of primary actions
+    expect(button(/finalize/i).className).toMatch(/bg-accent/);
+    expect(button(/finalize/i).className).toMatch(/min-h-11/);
+    expect(button(/roll back/i).className).toMatch(/min-h-11/);
+  });
+
+  it('puts every action of a viewer under "Unavailable now", each still saying why (SDD §16)', () => {
+    setup('app-billing-01', 'viewer');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    // a viewer has no action: all of them are in the quiet row, under its label
+    expect(within(group).getByText('Unavailable now')).toBeInTheDocument();
+    expect(within(group).getAllByRole('button').every((b) => b.getAttribute('aria-disabled') === 'true')).toBe(true);
+  });
+
+  it('sets Cancel apart from other available actions, never from nothing', () => {
+    const server = createTestServer();
+    const render = (id: string) => {
+      const m = server.migrations.find((x) => x.id === id) as Migration;
+      const operator: Role = 'operator';
+      const utils = renderWithApp(<MigrationActions migration={m} plan={server.plans.find((p) => p.id === m.plan_id) ?? null} role={operator} />, {
+        server,
+        token: 'operator',
+      });
+      const cancel = within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^cancel$/i });
+      return { utils, cancel };
+    };
+    // in pre-copy an operator can only cancel: alone, Cancel is not pushed to the far side of the row
+    const alone = render('mig-5d7e2b4a10');
+    expect(alone.cancel).not.toHaveAttribute('aria-disabled');
+    expect(alone.cancel.className).not.toMatch(/ml-auto/);
+    alone.utils.unmount();
+    // awaiting the cutover, Sync now comes first and Cancel keeps its distance from it
+    const apart = render('mig-5d7e2b4a12');
+    expect(apart.cancel.className).toMatch(/sm:ml-auto/);
+  });
+
+  it('never pulls the focus back to a button the user had left when a live move changes its row (SDD §16)', () => {
+    const server = createTestServer();
+    const done = server.migrations.find((m) => m.vm.name === 'web-01') as Migration;
+    const plan = server.plans.find((p) => p.id === done.plan_id) ?? null;
+    let move: (m: Migration) => void = () => {};
+    function Moving() {
+      const [m, setM] = useState(done);
+      move = setM;
+      const approver: Role = 'approver';
+      return <MigrationActions migration={m} plan={plan} role={approver} />;
+    }
+    renderWithApp(<Moving />, { server, token: 'approver' });
+    const finalize = within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^finalize$/i });
+    finalize.focus();
+    // the operator clicks the page background: the focus leaves the button for the page
+    finalize.blur();
+    expect(document.activeElement).toBe(document.body);
+    // later a live event moves the migration and Finalize changes rows: the focus stays where the user left it
+    act(() => move({ ...done, phase: 'finalized' }));
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it('keeps the focus on a button that changes rows as the migration moves (SDD §16)', () => {
+    const server = createTestServer();
+    const done = server.migrations.find((m) => m.vm.name === 'web-01') as Migration;
+    const plan = server.plans.find((p) => p.id === done.plan_id) ?? null;
+    let move: (m: Migration) => void = () => {};
+    function Moving() {
+      const [m, setM] = useState(done);
+      move = setM;
+      const approver: Role = 'approver';
+      return <MigrationActions migration={m} plan={plan} role={approver} />;
+    }
+    renderWithApp(<Moving />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const finalize = within(group).getByRole('button', { name: /^finalize$/i });
+    finalize.focus();
+    expect(finalize).not.toHaveAttribute('aria-disabled');
+    // finalized elsewhere: Finalize is no longer available and moves to the quiet row
+    act(() => move({ ...done, phase: 'finalized' }));
+    const moved = within(group).getByRole('button', { name: /^finalize$/i });
+    expect(moved).toHaveAttribute('aria-disabled', 'true');
+    expect(moved).toHaveFocus();
+  });
+
   it('enables Finalize and Rollback for an approver on a completed migration', () => {
     const { button } = setup('web-01', 'approver');
     expect(button(/finalize/i)).not.toHaveAttribute('aria-disabled');
@@ -48,6 +148,80 @@ describe('MigrationActions', () => {
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
   });
 
+  it('forces the cutover of a warm migration before it converged, with a reason (SDD §5.4, ADV-16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, server, migration } = setup('db-mysql-02', 'approver');
+    expect(migration).toMatchObject({ phase: 'syncing', strategy: 'warm' });
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    expect(dialog).toHaveTextContent('The last pass (pass 2) changed 12.6 GiB.');
+    // the figure a Force cutover records (SDD §5.4, §16): after the running pass - not the converged estimate;
+    // forcing a VM whose downtime misses the SLO says so (db-mysql-02: about 21 min against 15)
+    const forced = forcedDowntime(migration, plan);
+    expect(Math.abs(forced - migration.estimate!.downtime_s)).toBeGreaterThan(60);
+    expect(forced).toBeGreaterThan(plan.downtime_slo_s);
+    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(forced)}, over the SLO of ${formatDuration(plan.downtime_slo_s)}.`);
+    // maker-checker still applies (SDD §5.4, ADV-17)
+    expect(dialog).toHaveTextContent('Another approver still approves the cutover');
+    const confirm = within(dialog).getByRole('button', { name: /^force cutover$/i });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveAccessibleDescription('Enter a reason of at least 10 characters.');
+    const reason = within(dialog).getByRole('textbox', { name: /reason/i });
+    await user.type(reason, 'Too short');
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await user.clear(reason);
+    await user.type(reason, 'The change window closes in 20 minutes');
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+
+    await user.click(confirm);
+    await waitFor(() =>
+      expect(server.migrations.find((m) => m.id === migration.id)?.force_cutover).toMatchObject({
+        actor: 'sari',
+        reason: 'The change window closes in 20 minutes',
+        delta_bytes: Math.round(12.6 * 2 ** 30),
+        estimated_downtime_s: forced, // the figure the dialog showed
+      }),
+    );
+    expect(server.events.at(-1)).toMatchObject({ kind: 'migration.force_cutover', actor: 'sari' });
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+  });
+
+  it('says the full copy is still running when a pre-copy is forced', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.id === 'mig-5d7e2b4a10')!;
+    expect(migration).toMatchObject({ phase: 'precopy', sync_passes: [] });
+    // the converged estimate is not what a Force cutover records: the dialog shows the downtime after the running full pass
+    migration.estimate = { ...migration.estimate!, downtime_s: 600 };
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^force cutover$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Force the cutover of ${migration.vm.name}?` });
+    expect(dialog).toHaveTextContent('The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile.');
+    expect(plan?.downtime_slo_s).toBe(900);
+    const forced = forcedDowntime(migration, plan!);
+    expect(forced).toBeGreaterThan(900);
+    expect(dialog).toHaveTextContent(`The estimated downtime is ${formatDuration(forced)}, over the SLO of 15m 00s.`);
+    expect(dialog).not.toHaveTextContent(/last pass/i);
+  });
+
+  it('offers Force cutover only for warm migrations, and says why it is unavailable once they converged (SDD §5.4)', () => {
+    const server = createTestServer();
+    const cold = server.migrations.find((m) => m.id === 'mig-5d7e2b4a13')!;
+    expect(cold.strategy).toBe('cold');
+    const role: Role = 'approver';
+    const { unmount } = renderWithApp(<MigrationActions migration={cold} plan={null} role={role} />, { server, token: role });
+    expect(within(screen.getByRole('group', { name: /migration actions/i })).queryByRole('button', { name: /force cutover/i })).not.toBeInTheDocument();
+    unmount();
+
+    const { button } = setup('web-01', 'approver');
+    expect(button(/^force cutover$/i)).toHaveAttribute('aria-disabled', 'true');
+    expect(button(/^force cutover$/i)).toHaveAccessibleDescription('A Force cutover skips convergence: it applies while pre-copy or delta passes run.');
+  });
+
   it('requires typing the VM name before finalizing', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('web-01', 'approver');
@@ -70,6 +244,19 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
   });
 
+  it('warns in Finalize while the source VM runs again (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'web-cache-01') as Migration;
+    migration.source_running_at = '2026-10-08T11:00:00Z';
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /finalize/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /finalize web-cache-01/i });
+    expect(dialog).toHaveTextContent('The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.');
+  });
+
   it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button } = setup('legacy-rhel6-app', 'operator');
@@ -80,6 +267,23 @@ describe('MigrationActions', () => {
     expect(dialog).toHaveTextContent(/starts over/i);
     // this migration failed with its source stopped: the clock keeps running (SDD §5.2)
     expect(dialog).toHaveTextContent(/still stopped.*downtime clock keeps running/i);
+    expect(dialog).not.toHaveTextContent(/reopens/i);
+  });
+
+  it('says a retry reopens a completed plan, which then runs again (SDD §5.1)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.phase === 'rolled_back') as Migration;
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    plan.status = 'completed';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={'operator' as Role} />, { server, token: 'operator' });
+
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /retry/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`retry ${migration.vm.name}`, 'i') });
+    expect(dialog).toHaveTextContent(/the plan has completed: the retry reopens it, so the new attempt runs/i);
+    await user.click(within(dialog).getByRole('button', { name: /^retry$/i }));
+    await waitFor(() => expect(plan.status).toBe('running'));
   });
 
   it('caps a rollback reason at the API limit of 2000 characters (SDD §12)', async () => {

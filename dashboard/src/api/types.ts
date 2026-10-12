@@ -51,6 +51,10 @@ export type Role = (typeof ROLES)[number];
 export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed'] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
+/** The plan status every view shows (SDD §8.1, ADV-19): the lifecycle, told by the plan's migrations. */
+export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed'] as const;
+export type DerivedPlanStatus = (typeof DERIVED_PLAN_STATUSES)[number];
+
 export const SYNC_PASS_KINDS = ['full', 'delta', 'final'] as const;
 export type SyncPassKind = (typeof SYNC_PASS_KINDS)[number];
 
@@ -71,6 +75,24 @@ export type AdvisorNoteKind = (typeof ADVISOR_NOTE_KINDS)[number];
 
 export const ADVISOR_NOTE_SOURCES = ['jev', 'rules', 'memory'] as const;
 export type AdvisorNoteSource = (typeof ADVISOR_NOTE_SOURCES)[number];
+
+/** What an advisor recommendation decides (SDD §4.1, §14.4). */
+export const DECISION_TYPES = ['migration_strategy', 'workload_tier', 'verification_review', 'console_screening'] as const;
+export type DecisionType = (typeof DECISION_TYPES)[number];
+
+export const DECISION_STATUSES = ['auto_applied', 'pending_approval', 'approved', 'overridden', 'below_threshold', 'fallback_rules'] as const;
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+
+export const REASON_CODES = [
+  'ABOVE_THRESHOLD_AUTO_APPLY',
+  'POLICY_REQUIRES_APPROVAL',
+  'INSUFFICIENT_EVIDENCE',
+  'APPROVED_BY_USER',
+  'OVERRIDDEN_BY_USER',
+  'BELOW_THRESHOLD_DEFAULT_KEPT',
+  'ADVISOR_UNAVAILABLE_FALLBACK',
+] as const;
+export type ReasonCode = (typeof REASON_CODES)[number];
 
 /** Workload tiers used by the wave planner and advisor classification (SDD §9.4). */
 export const WORKLOAD_TIERS = [
@@ -180,6 +202,8 @@ export interface Nic {
   fixed_ips: string[];
   vnic_type: string;
   mtu: number | null;
+  /** VMware: what the migration kit maps the NIC by, its distributed port group's key or device summary (SDD §4, §7.2). */
+  network_key?: string | null;
 }
 
 export interface VMRef {
@@ -200,6 +224,8 @@ export interface VMRef {
   snapshot_count: number;
   tools_ok: boolean | null;
   change_rate_bps: number | null;
+  /** The Nova keypair the server boots with (OpenStack); absent or null for VMware (SDD §4.1). */
+  key_name?: string | null;
   /** Derived and serialized: Σ size_gb · 2^30. */
   disk_bytes: number;
   /** Derived and serialized: Σ used_gb · 2^30 when every disk has used_gb, else ⌊disk_bytes · 0.6⌋. */
@@ -226,6 +252,50 @@ export interface CutoverWindow {
   end: Timestamp;
 }
 
+export const PROBE_KINDS = ['tcp', 'http', 'https'] as const;
+export type ProbeKind = (typeof PROBE_KINDS)[number];
+
+/** An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of `path`. */
+export interface AppProbe {
+  kind: ProbeKind;
+  port: number;
+  /** http(s) only. */
+  path: string;
+  /** http(s) only: the status that passes; null = any 2xx or 3xx. */
+  expect_status: number | null;
+}
+
+/** What one application probe found (SDD §7.5): unreachable does not fail the verification. */
+export interface ProbeResult {
+  target: string;
+  kind: ProbeKind;
+  result: 'passed' | 'failed' | 'unreachable';
+  /** The time to the service's answer; null when it did not answer. */
+  latency_ms: number | null;
+  at: Timestamp;
+  detail: string;
+}
+
+export interface VerificationCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  skipped?: boolean;
+}
+
+/** A migration's last verification: its checks and probe results (SDD §7.5). */
+export interface VerificationRecord {
+  at: Timestamp;
+  passed: boolean;
+  checks: VerificationCheck[];
+  probes: ProbeResult[];
+  warnings: string[];
+}
+
+/** What one probe list may hold, and the longest http(s) path (SDD §12). */
+export const MAX_PROBES_PER_VM = 10;
+export const MAX_PROBE_PATH = 200;
+
 export interface VerificationConfig {
   tcp_ports: number[];
   /** Probed instead of `tcp_ports` for Windows guests, whose console check is skipped (SDD §7.5). */
@@ -235,6 +305,8 @@ export interface VerificationConfig {
   timeout_s: number;
   auto_rollback: boolean;
   use_advisor: boolean;
+  /** The application probes of every VM; `Plan.probe_overrides` replaces them per VM (SDD §7.5, ADV-18). */
+  app_probes: AppProbe[];
 }
 
 export interface Wave {
@@ -245,6 +317,15 @@ export interface Wave {
   vm_ids: string[];
   depends_on: string[];
   max_parallel: number;
+}
+
+export type PortCreationMode = 'nova' | 'neutron';
+
+/** A VM NIC's network and addresses at RHOSO (SDD §4.2): null keeps the plan's mapping, or the NIC's own addresses. */
+export interface NicOverride {
+  network: string | null;
+  /** Never empty. */
+  fixed_ips: string[] | null;
 }
 
 export interface Plan {
@@ -261,6 +342,8 @@ export interface Plan {
   selection_policy: SelectionPolicy;
   downtime_slo_s: number;
   require_approval: boolean;
+  /** Maker-checker (SDD §5.4, ADV-17): the cutover's requester never counts as its approver. */
+  require_distinct_approver: boolean;
   auto_cutover: boolean;
   cutover_window: CutoverWindow | null;
   keep_warm_interval_s: number;
@@ -271,9 +354,22 @@ export interface Plan {
   estimator_overrides: Record<string, number>;
   handover: HandoverConfig;
   verification: VerificationConfig;
+  /** Per VM (source id): its application probes instead of `verification.app_probes`; [] = none (SDD §7.5). */
+  probe_overrides: Record<string, AppProbe[]>;
+  /** Hours a migration may wait in Completed before it is flagged for finalize (SDD §8.1, ADV-19). */
+  finalize_warning_h: number;
   prestage_resources: string[];
+  /**
+   * `neutron`: OpenStack cold and warm migrations recreate every port with its MAC, all its fixed IPs and its security
+   * groups (SDD §6.6); `nova`: one fixed IP per port and a new MAC.
+   */
+  port_creation_mode: PortCreationMode;
+  /** Per VM (source id), per NIC MAC (lower case): its RHOSO network and addresses; OpenStack sources (SDD §4.2). */
+  nic_overrides: Record<string, Record<string, NicOverride>>;
   waves: Wave[];
   status: PlanStatus;
+  /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
+  derived_status: DerivedPlanStatus;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -309,7 +405,13 @@ export interface Estimate {
   total_s: number;
   final_delta_bytes: number;
   meets_slo: boolean;
+  /** The downtime's parts (SDD §4, ADV-16); empty in an estimate written before them. */
+  downtime_parts: Partial<Record<DowntimePart, number>>;
 }
+
+/** The parts of a downtime estimate, in display order (SDD §4, §9.1, ADV-16): they add up to `downtime_s`. */
+export const DOWNTIME_PARTS = ['shutdown_s', 'copy_s', 'conversion_s', 'create_s', 'boot_s'] as const;
+export type DowntimePart = (typeof DOWNTIME_PARTS)[number];
 
 export interface AdvisorNote {
   kind: AdvisorNoteKind;
@@ -320,11 +422,184 @@ export interface AdvisorNote {
   created_at: Timestamp;
 }
 
+/** Who took a decision: `policy:<id>`, `user:<name>` or `system:fallback` (SDD §14.4). */
+export interface AdvisorActor {
+  kind: 'policy' | 'user' | 'system';
+  id: string;
+}
+
+export interface AdvisorModelInfo {
+  name: 'jev' | 'rules';
+  version: string;
+  deployment: 'on_prem' | 'remote' | 'unknown';
+  endpoint_host: string | null;
+}
+
+export interface RecommendedOption {
+  option: string | null;
+  /** 0..1 — the only number the control plane compares with a threshold; the dashboard never does (SDD §14.4). */
+  confidence: number | null;
+  /** Raw probabilities per option, shown only in Details. */
+  distribution: Record<string, number>;
+}
+
+export interface Decision {
+  final_option: string | null;
+  status: DecisionStatus;
+  reason_code: ReasonCode;
+  reason_text: string | null;
+  actor: AdvisorActor;
+  policy_id: string | null;
+  threshold_used: number | null;
+  decided_at: Timestamp;
+  /** The deciding policy's rules for a person's approve or override, as they were then (SDD §14.6); null: the policy in force applies. */
+  require_distinct_approver?: boolean | null;
+  require_override_reason?: boolean | null;
+}
+
+export interface AdvisorSubject {
+  kind: 'vm' | 'plan' | 'wave';
+  id: string;
+  name: string;
+}
+
+export const EVIDENCE_EFFECTS = ['supports', 'opposes', 'context'] as const;
+export type EvidenceEffect = (typeof EVIDENCE_EFFECTS)[number];
+export const EVIDENCE_SOURCE_KINDS = ['inventory', 'preflight', 'estimate', 'plan', 'provider', 'run'] as const;
+export type EvidenceSourceKind = (typeof EVIDENCE_SOURCE_KINDS)[number];
+
+/** One fact a recommendation rests on, built by the control plane's code, never by the model (SDD §14.4, ADV-02). */
+export interface EvidenceItem {
+  key: string;
+  label: string;
+  value: string | number | boolean | null;
+  display: string;
+  /** Measured against the recommendation's `evidence_option`. */
+  effect: EvidenceEffect;
+  /** Relevance, 0..100: the card shows the heaviest. */
+  weight: number;
+  /** The VM (inventory), the migration (preflight, estimate, run), the plan or the provider. */
+  source: { kind: EvidenceSourceKind; ref_id: string };
+}
+
+/** A past incident agentmemory knew when the recommendation was recorded (SDD §14.3). */
+export interface SimilarIncident {
+  title: string;
+  content: string;
+  score: number | null;
+}
+
+/** A reason Jev gave that names one of the recommendation's evidence items (SDD §14.4). */
+export interface AdvisorReason {
+  key: string;
+  text: string;
+}
+
+/** A recommendation and the decision taken on it, stored apart (SDD §4.2, §14.4). The engine runs only the decision. */
+export interface AdvisorRecommendation {
+  id: string;
+  created_at: Timestamp;
+  decision_type: DecisionType;
+  subject: AdvisorSubject;
+  plan_id: string | null;
+  migration_id: string | null;
+  /** The plan's source provider. */
+  provider_id: string | null;
+  model: AdvisorModelInfo;
+  recommendation: RecommendedOption;
+  decision: Decision;
+  /** The redacted input the recommendation rests on, an `AdvisorSnapshot` (SDD §14.5). */
+  input_snapshot_sha256: string | null;
+  /** The user whose plan validation recorded it: never the one who decides it (SDD §14.6). */
+  requested_by: string | null;
+  /** A strategy note written before recommendations existed, read as one (SDD §14.4). */
+  legacy: boolean;
+  legacy_text: string | null;
+  /** The option every evidence effect is measured against (SDD §14.4, ADV-02). */
+  evidence_option: string | null;
+  /** What validation knew when it was recorded, heaviest first. */
+  evidence: EvidenceItem[];
+  /** At most 3, searched once when it was recorded. */
+  similar_incidents: SimilarIncident[];
+  /** Jev's reasons that name an evidence key. */
+  reasons: AdvisorReason[];
+}
+
+/** Where a policy applies: plans or source providers; neither = everywhere (SDD §14.6). */
+export interface PolicyScope {
+  provider_ids: string[];
+  plan_ids: string[];
+}
+
+export const POLICY_MODES = ['auto_apply_above_threshold', 'always_require_approval'] as const;
+export type PolicyMode = (typeof POLICY_MODES)[number];
+/** A policy name is 1–200 characters and its minimum evidence 0..100 (SDD §4). */
+export const POLICY_NAME_MAX = 200;
+export const POLICY_MIN_EVIDENCE_MAX = 100;
+
+/** A policy as it is written: POST and PUT /advisor/policies (SDD §12, §14.6). */
+export interface AdvisorPolicySpec {
+  name: string;
+  scope: PolicyScope;
+  /** None = every decision type. */
+  decision_types: DecisionType[];
+  mode: PolicyMode;
+  /** 0..1 */
+  threshold: number;
+  min_evidence_for_auto_apply: number;
+  require_override_reason: boolean;
+  /** Maker-checker (ADV-17): the decision's requester neither approves nor overrides it. */
+  require_distinct_approver: boolean;
+}
+
+export interface AdvisorPolicy extends AdvisorPolicySpec {
+  id: string;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  updated_by: string;
+}
+
+/** GET /advisor/policies: the stored policies and the built-in default, read-only (SDD §12). */
+export interface PolicyList {
+  items: AdvisorPolicy[];
+  default: AdvisorPolicy;
+}
+
+/** POST /advisor/recommendations/{id}/override (SDD §12, §14.6). */
+export interface OverrideRequest {
+  option: Strategy;
+  reason?: string | null;
+}
+
+/** The shortest override reason a policy that requires one accepts (SDD §14.6). */
+export const OVERRIDE_REASON_MIN = 10;
+
+/** A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5). */
+export interface AdvisorSnapshot {
+  sha256: string;
+  created_at: Timestamp;
+  payload: Record<string, unknown>;
+}
+
 export interface Approval {
   actor: string;
   at: Timestamp;
   comment: string | null;
 }
+
+/** A cutover forced before convergence (SDD §5.4, ADV-16). */
+export interface ForceCutover {
+  actor: string;
+  at: Timestamp;
+  reason: string;
+  /** The last pass's `bytes_changed` when the cutover was forced. */
+  delta_bytes: number;
+  estimated_downtime_s: number;
+}
+
+/** The rule that ended the passes (SDD §5.3); `force` for a Force cutover (§5.4). */
+export const CONVERGENCE_RULES = ['threshold', 'slo', 'max_passes', 'force'] as const;
+export type ConvergedBy = (typeof CONVERGENCE_RULES)[number];
 
 export interface PhaseChange {
   from_phase: Phase | null;
@@ -362,13 +637,33 @@ export interface Migration {
   actual_downtime_s: number | null;
   approvals: Approval[];
   cutover_requested: boolean;
+  /** Who asked for the cutover first, and when (SDD §5.4). */
+  cutover_requested_by: string | null;
+  cutover_requested_at: Timestamp | null;
   force_window: boolean;
   advisor_notes: AdvisorNote[];
+  /** The recommendation whose decision waits for approval: the migration does not start meanwhile (SDD §5.4, §14.6). */
+  advisor_hold: string | null;
+  /** The rule that ended the passes (SDD §5.3); null before convergence and in data written before ADV-16. */
+  converged_by: ConvergedBy | null;
+  force_cutover: ForceCutover | null;
+  /** What the invariants found when it completed, one "CODE: text" each (SDD §5.5). */
+  data_issues: string[];
+  /** Demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (SDD §5.2). */
+  downtime_model_s: number | null;
+  /** The last verification: its checks and application probe results (SDD §7.5, ADV-18). */
+  verification: VerificationRecord | null;
+  /** The rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan. */
+  suggested_probes: AppProbe[];
+  /** Completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19). */
+  source_running_at: Timestamp | null;
   review_required: boolean;
   review_reason: string | null;
   destination_server_id: string | null;
   error: string | null;
   attempts: number;
+  /** Each retried attempt's strategy, oldest first: the evidence names them (SDD §4.2, §14.4). */
+  attempt_strategies: Strategy[];
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -392,6 +687,11 @@ export const PERSISTED_EVENT_KINDS = [
   'migration.downtime_started',
   'migration.downtime_ended',
   'migration.error',
+  'migration.force_cutover',
+  'migration.data_inconsistent',
+  'migration.source_running',
+  'migration.source_stopped',
+  'plan.finalized',
   'migration.approved',
   'migration.action',
   'advisor.strategy',
@@ -405,8 +705,37 @@ export const PERSISTED_EVENT_KINDS = [
   'provider.deleted',
   'provider.checked',
   'auth.denied',
+  'events.pruned',
+  // audit events (SDD §14.5)
+  'recommendation.created',
+  'decision.auto_applied',
+  'decision.pending_approval',
+  'decision.approved',
+  'decision.overridden',
+  'decision.below_threshold',
+  'decision.fallback',
+  'policy.created',
+  'policy.updated',
+  'policy.deleted',
 ] as const;
 export type PersistedEventKind = (typeof PERSISTED_EVENT_KINDS)[number];
+
+/** The audit events: who decided what, when, with which model version (SDD §14.5). */
+export const AUDIT_EVENT_KINDS = [
+  'recommendation.created',
+  'decision.auto_applied',
+  'decision.pending_approval',
+  'decision.approved',
+  'decision.overridden',
+  'decision.below_threshold',
+  'decision.fallback',
+  'policy.created',
+  'policy.updated',
+  'policy.deleted',
+  // a cutover before convergence, with its approver and reason (SDD §5.4, §14.5, ADV-16)
+  'migration.force_cutover',
+] as const;
+export type AuditEventKind = (typeof AUDIT_EVENT_KINDS)[number];
 
 /** Bus/SSE only, never stored; delivered with SSE `id: 0`. */
 export const EPHEMERAL_EVENT_KINDS = ['migration.progress', 'migration.log', 'heartbeat'] as const;
@@ -438,12 +767,13 @@ export interface DestinationFlavor {
   extra_specs: Record<string, string>;
 }
 
+/** Free amounts per destination project (SDD §10): -1 is unlimited, null not reported. */
 export interface ProjectQuota {
-  cores: number;
-  ram_mb: number;
-  instances: number;
-  volumes: number;
-  gigabytes: number;
+  cores: number | null;
+  ram_mb: number | null;
+  instances: number | null;
+  volumes: number | null;
+  gigabytes: number | null;
 }
 
 export interface DestinationInventory {
@@ -454,6 +784,34 @@ export interface DestinationInventory {
   /** project -> free amounts */
   quotas: Record<string, ProjectQuota>;
   projects: string[];
+  /** The subnets the destination credential sees: where a NIC's addresses must lie (SDD §10). */
+  subnets?: DestinationSubnet[];
+  /** Every network the destination credential sees, with its owner: what a NIC's network name resolves to (SDD §10). */
+  network_details?: DestinationNetwork[];
+}
+
+export interface DestinationSubnet {
+  /** What a VMware NIC's network_map value names (SDD §10, §7.2); an inventory from before it lacks it. */
+  id?: string;
+  name: string;
+  network: string;
+  /** The network the subnet belongs to (an inventory from before it lacks it). */
+  network_id?: string;
+  cidr: string;
+  ipv6_address_mode?: string | null;
+  ipv6_ra_mode?: string | null;
+}
+
+export interface DestinationNetwork {
+  id: string | null;
+  name: string;
+  mtu: number | null;
+  project_id: string | null;
+  /** The destination credential's project owns it. */
+  own: boolean;
+  /** Neutron's `shared` and `router:external` as the credential sees them: whether it may put a port on another project's network (SDD §6.6). */
+  shared: boolean;
+  external?: boolean;
 }
 
 /** `VMRef[]` for a source provider, `DestinationInventory` for a destination provider. */
@@ -479,6 +837,8 @@ export interface Health {
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
+  /** Demo mode's time compression (SDD §7.4): a wall second is this many model seconds; null outside demo mode. */
+  demo_speed: number | null;
   db: 'ok' | 'error';
   orchestrator: OrchestratorHealth;
 }
@@ -489,7 +849,7 @@ export interface Me {
 }
 
 
-type PlanServerFields = 'id' | 'waves' | 'status' | 'created_at' | 'updated_at';
+type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';
 
 /** Plan fields minus id/waves/status/created_at/updated_at; name, providers and vm_ids required. */
@@ -533,6 +893,9 @@ export const ACTION_TEXT_MAX = 2000;
 /** Longest plan name and description POST/PATCH /plans accept (SDD §12). */
 export const PLAN_NAME_MAX = 200;
 export const PLAN_DESCRIPTION_MAX = 2000;
+/** Bounds POST /advisor/similar-incidents accepts: query length and result count (SDD §12). */
+export const ADVISOR_QUERY_MAX = 2000;
+export const ADVISOR_LIMIT_MAX = 20;
 
 export interface ApproveRequest {
   comment?: string;
@@ -542,6 +905,14 @@ export interface CutoverRequest {
   force_window?: boolean;
   comment?: string;
 }
+
+/** POST /migrations/{id}/force-cutover (SDD §5.4, §12). */
+export interface ForceCutoverRequest {
+  reason: string;
+}
+
+/** The shortest reason a Force cutover accepts (SDD §12). */
+export const FORCE_REASON_MIN = 10;
 
 export interface RollbackRequest {
   reason: string;
@@ -557,18 +928,35 @@ export interface FinalizeRequest {
   confirm: string;
 }
 
+/** POST /plans/{id}/finalize (SDD §8.1): a wave, or the plan, with one approval. */
+export interface PlanFinalizeRequest {
+  wave_id: string | null;
+  /** The wave's name, or the plan's without `wave_id`. */
+  confirm: string;
+  delete_source: boolean;
+}
+
+export interface PlanFinalizeResult {
+  finalized: string[];
+  skipped: Array<{ migration_id: string; reason: string }>;
+}
+
 export interface StrategyRequest {
   strategy: Strategy;
 }
 
 export interface EventListQuery {
   since?: number;
+  /** Only events below this seq: with `tail`, the page before the oldest one shown (SDD §12). */
+  before?: number;
   plan_id?: string;
   migration_id?: string;
   /** ≤ 1000 */
   limit?: number;
   /** The newest `limit` matching events instead of the first, still ascending (SDD §12). */
   tail?: boolean;
+  /** Only the audit events (SDD §14.5). */
+  audit?: boolean;
 }
 
 export interface ThroughputPoint {
@@ -588,14 +976,48 @@ export interface Stats {
   p95_downtime_s: number | null;
   max_downtime_s: number | null;
   slo_compliance_pct: number | null;
+  /** Completed migrations whose numbers do not hold, left out of the downtime figures (SDD §5.5). */
+  data_inconsistent: number;
+  /** `completed` = these two: verified and waiting, and finalized (SDD §8.1, ADV-19). */
+  awaiting_finalize: number;
+  finalized: number;
   downtime_by_strategy: Partial<Record<Strategy, number>>;
   /** Last 60 one-minute buckets. */
   throughput_series: ThroughputPoint[];
 }
 
+/** Where the Jev model runs (SDD §13.4, ADV-06). */
+export type JevDeployment = 'on_prem' | 'remote';
+
 export interface AdvisorStatus {
-  jev: { mode: string; available: boolean; last_error?: string | null };
+  jev: {
+    mode: string;
+    available: boolean;
+    last_error?: string | null;
+    deployment: JevDeployment;
+    endpoint_host: string | null;
+    /** Whether the console excerpt may leave the installation for screening. */
+    console_sent: boolean;
+  };
   memory: { enabled: boolean; available: boolean; last_error?: string | null };
+}
+
+/** GET /advisor/data-sent: what each decision type sends to Jev, from the serializers' field specs (SDD §13.4). */
+export interface DataSentField {
+  key: string;
+  label: string;
+}
+
+export interface DataSentItem {
+  decision_type: DecisionType;
+  tool: string;
+  fields: DataSentField[];
+  sent: boolean;
+  note: string | null;
+}
+
+export interface DataSentList {
+  items: DataSentItem[];
 }
 
 export interface SimilarIncidentsRequest {
@@ -613,8 +1035,29 @@ export interface SimilarIncidentsResponse {
   hits: SimilarIncidentHit[];
 }
 
+/** Query of `GET /advisor/recommendations` (SDD §12). */
+export interface RecommendationListQuery {
+  migration_id?: string;
+  plan_id?: string;
+  decision_type?: DecisionType;
+  limit?: number;
+  offset?: number;
+}
+
+/** Bounds and default of the `limit` `GET /advisor/recommendations` accepts (SDD §12). */
+export const RECOMMENDATION_LIMIT_MAX = 200;
+export const RECOMMENDATION_LIMIT_DEFAULT = 50;
+
+/** `GET /advisor/recommendations`: newest first, stored and legacy entries together (SDD §12, §14.4). */
+export interface RecommendationPage {
+  items: AdvisorRecommendation[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 /** Migration actions exposed as `POST /migrations/{id}/<action>` (SDD §12). */
-export const MIGRATION_ACTIONS = ['approve', 'cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize'] as const;
+export const MIGRATION_ACTIONS = ['approve', 'cutover', 'force-cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize'] as const;
 export type MigrationAction = (typeof MIGRATION_ACTIONS)[number];
 
 export function isDestinationInventory(inventory: ProviderInventory): inventory is DestinationInventory {

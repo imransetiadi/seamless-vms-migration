@@ -74,3 +74,121 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_rollback``); a cutover re-run fails instead of skipping a
   recorded destination server that is in ``ERROR`` or gone; recorded
   destination volumes without a source device are reported.
+- ``import_workload_warm_sync`` reuses a recorded destination volume safely: a
+  bootable one is marked bootable again (a pass interrupted between the create
+  and the flag left it non-bootable, and every cutover then failed after the
+  source was stopped), one still ``creating`` is waited for, and one in
+  ``error`` is deleted and created again.
+- ``import_workload_prelim`` names the progress and log files after the VM
+  through ``filesystem.workload_file_stem`` (``%``, ``/`` and NUL written
+  ``%25``, ``%2F``, ``%00``): a VM name such as ``../x`` or ``/etc/x`` no
+  longer makes the modules write outside ``workload_logs``. Other names keep
+  their file names.
+- Attach locks on the conversion hosts name their owner as
+  ``{migrator hostname}:{pid}``; before it waits, a module removes a lock whose
+  owner ran on its own host and is gone (a module killed by a cancel or a
+  timeout), instead of treating every owner as alive. A lock of another host,
+  or one written by an earlier version, is left alone.
+- ``import_workload_prelim`` treats the VM name as a literal when it looks for
+  a destination server of the same name (``re.escape``, then only an equal
+  name counts): ``web.01`` was skipped as already migrated because of an
+  unrelated ``web-01``, and a name such as ``app(`` failed.
+- The conversion-host SSH runs with ``ServerAliveInterval=15`` and
+  ``ServerAliveCountMax=4``: a silent network partition fails a pass after
+  about a minute instead of keeping the source stopped for about two hours.
+- A warm cutover re-run finishes the recorded destination server instead of
+  only reporting it: ``import_workload_create_instance`` waits for it to be
+  ``ACTIVE`` and adds the floating IPs it lacks (a first attempt may have
+  failed after Nova created the server). Floating IP creation keeps one
+  already on the server's port for that fixed address, never a second.
+- ``port_creation_mode: neutron`` recreates each port with its MAC, every fixed
+  IP and its security groups. The export records each port's
+  ``security_group_refs`` and ``is_port_security_enabled``, and the port is
+  created with them and with the description ``os-migrate:{source port id}``,
+  never with ``binding_profile`` (admin-only, host-specific). A re-run uses
+  again the unbound port an earlier attempt created, and refuses any other port
+  with the MAC or a port exported without its security groups (Nova applies a
+  server's security groups only to the ports it creates). The default ``nova``
+  mode is unchanged, and data exported before stays valid.
+  ``import_workload_rollback`` deletes those ports
+  (``deleted_port_ids``), also when the cutover failed before the server
+  existed. Nova keeps such ports when their server is deleted later.
+- A fixed IP reference without ``subnet_ref`` names only its address: Nova
+  gets it as ``fixed_ip`` and Neutron as ``{ip_address}``, and Neutron picks
+  the subnet of the port's network that holds it. Seamless Migrate writes such
+  references for a per-VM NIC override (a VM's port moved to another network
+  or given other addresses). Exported references keep their ``subnet_ref``.
+- ``import_workload_dst_check`` checks the ports and floating IPs before the
+  source stops. It looks up what each port of the workload needs, the way the
+  import will after the stop: the port's network and every fixed IP's subnet
+  reference. A ``%auth%`` reference searches only the credential's own project,
+  so a shared network that another project owns, or a name that two of the
+  project's networks carry, is reported. Each fixed IP must also be one that
+  Neutron's IPAM takes on the port:
+
+  - a host address of its subnet, or of a subnet of the network when only the
+    address is given (not an IPv4 network address, nor a broadcast address
+    below a /31, nor an IPv6 subnet's first address for a port Nova creates);
+  - on a SLAAC or DHCPv6-stateless subnet, only the EUI-64 address of the kept
+    MAC with ``port_creation_mode: neutron``, and no explicit address through
+    Nova, which gives the port a new MAC.
+
+  The floating IP the import would attach or create is looked up too.
+- ``import_workload_dst_check`` also refuses, before the source stops, an
+  address of a port that another port of the destination network holds
+  (Neutron's ``IpAddressAlreadyAllocated``), and with
+  ``port_creation_mode: neutron`` another port with its MAC on the network.
+  The unbound port an earlier attempt created is the one exception, since
+  the import uses it again.
+- ``import_workload_dst_check`` also refuses, before the source stops, a port
+  on a network that another project owns where the credential may not put it.
+  Such a network must be shared with the credential's project or external: an
+  admin sees every project's networks, and a port on another tenant's private
+  network would put the server there. The credential's token must also carry
+  the ``admin`` or ``advsvc`` role. Neutron's policy (2023.1
+  ``create_port:fixed_ips:ip_address``, ``create_port:mac_address``,
+  ``create_port:port_security_enabled``) lets only those roles, or the
+  network's own project, choose a port's address, MAC or port security. The
+  import chooses them for every port: Nova creates the port with the user's
+  token and its fixed IP, and ``port_creation_mode: neutron`` sends the MAC,
+  every address and the port-security flag.
+- A port recreated through Neutron is created without its addresses on SLAAC
+  or DHCPv6-stateless subnets. Neutron 2023.1 allocates such a subnet's EUI-64
+  address of the MAC on every port it creates, also when the address is sent,
+  and a second allocation of one address fails (``IpAddressAlreadyAllocated``)
+  after the source has stopped. With the MAC kept Neutron derives the same
+  address, which ``import_workload_dst_check`` makes sure of. An explicit,
+  possibly empty, list keeps Neutron from adding an address of any other
+  subnet. Using again the port an earlier attempt created no longer counts the
+  addresses Neutron added on those subnets.
+- An IPv6 subnet's first address is no longer refused for a port Nova creates:
+  Nova creates its ports with no owner, and Neutron's ``check_subnet_ip`` takes
+  that address for a port without one.
+- ``import_workload_dst_check`` refuses a port without exactly one fixed IP
+  when the ports are recreated through Nova (``port_creation_mode: nova``).
+  Nova creates each port with one address, and the import refused any other
+  count only after the source had stopped. A port whose addresses changed
+  after validation is now refused while the source still runs.
+- ``import_workload_dst_check`` looks up a port's own security groups when the
+  ports are recreated through Neutron (``port_creation_mode: neutron``), as
+  ``create_or_update`` will. A group the destination lacks, or has several
+  of, used to fail the import only after the source had stopped.
+- ``import_workload_dst_check`` refuses an external network that is not shared,
+  the credential's own included, unless its token has the ``admin`` role. Nova
+  attaches such a network to a server, as a requested network or through a
+  port, only for admins (2023.1 ``network:attach_external_network``), and
+  ``advsvc`` does not count; the import failed after the source had stopped.
+- With ``port_creation_mode: neutron``, a re-run uses again an earlier
+  attempt's unbound port only when it is in the credential's project. An admin
+  credential sees every project's ports, and Nova attaches no port of another
+  project to a server (``PortNotUsable``). Such a port with the MAC is now
+  refused, by ``import_workload_dst_check`` before the source stops and by
+  ``create_or_update`` before Nova is asked for the server. Before, the import
+  failed only after the source had stopped.
+- ``import_workload_dst_check`` refuses, before the source stops, a port
+  exported without ``security_group_refs`` when the ports are recreated
+  through Neutron (``port_creation_mode: neutron``). Such an export predates
+  that field. ``create_or_update`` refuses the port rather than give it the
+  project's default group, and that refusal came only after the source had
+  stopped. Export the workload again. A port with an empty list, such as one
+  with port security off, is not affected.

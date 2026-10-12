@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -17,7 +16,7 @@ from ..domain.enums import Role
 from ..events import EventBus, emit
 from ..orchestrator import Orchestrator
 from ..security.auth import ANONYMOUS_ADMIN, Principal, TokenStore
-from ..store import AsyncStore, Store
+from ..store import AsyncStore, Store, VersionedDocuments
 
 log = logging.getLogger(__name__)
 
@@ -47,24 +46,16 @@ class Services:
     sse_heartbeat_s: float = 15.0
     _denied: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
     _auth_failures: dict[str, deque[float]] = field(default_factory=lambda: defaultdict(deque))
-    #: full document lists reused by /stats and /metrics while their change stamp holds
-    _doc_cache: dict[str, tuple[tuple[int, int], list[Any]]] = field(default_factory=dict)
-    _doc_cache_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: per kind, the documents /stats, /metrics and /advisor/recommendations read (SDD §11)
+    _doc_cache: dict[str, VersionedDocuments] = field(default_factory=dict)
 
     async def all_documents(self, kind: str, model_cls: type[Any]) -> list[Any]:
-        """Every document of ``kind``, reloaded only when the store's change stamp moved
-        (one aggregate query per call instead of loading and validating every row)."""
-        stamp = await self.db.change_stamp(kind)
-        cached = self._doc_cache.get(kind)
-        if cached is not None and cached[0] == stamp:
-            return cached[1]
-        async with self._doc_cache_lock:
-            cached = self._doc_cache.get(kind)
-            if cached is not None and cached[0] == stamp:
-                return cached[1]
-            rows = await self.db.list(kind, model_cls)
-            self._doc_cache[kind] = (stamp, rows)
-            return rows
+        """Every document of ``kind`` in creation order; only what changed is loaded again
+        (``VersionedDocuments``) - a run writes a migration every second (SDD §11)."""
+        cache = self._doc_cache.get(kind)
+        if cache is None:
+            cache = self._doc_cache[kind] = VersionedDocuments(self.db, kind, model_cls)
+        return await cache.get()
 
     @property
     def db(self) -> AsyncStore:
@@ -154,6 +145,18 @@ def authenticate(request: Request) -> Principal | None:
     if scheme.lower() != "bearer" or not token.strip():
         return None
     return svc.tokens.authenticate(token.strip())
+
+
+#: Named permissions and the minimum role that holds each (SDD §13.2; TODO(ADV-04): confirm admin).
+PERMISSIONS: dict[str, Role] = {
+    "advisor.policy.manage": Role.admin,
+    "advisor.approve": Role.admin,
+}
+
+
+def require_permission(name: str) -> Callable[[Request], Awaitable[Principal]]:
+    """FastAPI dependency: the caller's principal, whose role must hold permission ``name``."""
+    return require_role(PERMISSIONS[name])
 
 
 def require_role(role: Role) -> Callable[[Request], Awaitable[Principal]]:

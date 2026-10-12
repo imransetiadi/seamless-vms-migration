@@ -164,3 +164,106 @@ def test_qemu_nbd_export_is_read_only():
     assert len(qemu_nbd) == 1
     assert "--read-only" in qemu_nbd[0]
     assert "127.0.0.1" in qemu_nbd[0]
+
+
+class LockShell:
+    """A conversion host whose lock files hold ``owners`` (lock path -> content)."""
+
+    def __init__(self, owners):
+        self.owners = dict(owners)
+        self.commands = []
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["sudo", "cat"]:
+            if command[2] not in self.owners:
+                raise FileNotFoundError(command[2])
+            return self.owners[command[2]]
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:3] == ["sudo", "rm", "-f"]:
+            self.owners.pop(command[3], None)
+        return 1 if command[:2] == ["sudo", "kill"] else 0
+
+    def removed(self):
+        return [c[3] for c in self.commands if c[:3] == ["sudo", "rm", "-f"]]
+
+
+def lock_transfer(owners):
+    dst = cloud()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1"
+        )
+    transfer.shell = LockShell(owners)
+    return transfer
+
+
+def dead_pid():
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+DST_LOCK = volume_common.ATTACH_LOCK_FILE_DESTINATION + ".lock"
+
+
+def test_a_lock_names_its_owner_as_host_and_pid():
+    """SDD §6.6: the lock file holds {migrator hostname}:{pid}."""
+    import socket
+
+    transfer = lock_transfer({})
+    guarded = volume_common.use_lock(volume_common.ATTACH_LOCK_FILE_DESTINATION)(
+        lambda self: "attached"
+    )
+    assert guarded(transfer) == "attached"
+    flock = next(c for c in transfer.shell.commands if "flock" in c)
+    assert "echo %s:%d " % (socket.gethostname(), os.getpid()) in flock[-1]
+
+
+def test_a_dead_owner_of_this_host_loses_its_lock():
+    """A module killed by a cancel or a step timeout never released its lock (audit COL-06)."""
+    import socket
+
+    transfer = lock_transfer({DST_LOCK: "%s:%d\n" % (socket.gethostname(), dead_pid())})
+    assert transfer.check_and_cleanup_lockfiles() is True
+    assert transfer.shell.removed() == [DST_LOCK]
+
+
+def test_a_live_owner_another_hosts_lock_and_a_bare_pid_keep_their_locks():
+    """Liveness is checked only where the pid lives: never on the conversion host."""
+    import socket
+
+    for owner in (
+        "%s:%d" % (socket.gethostname(), os.getpid()),
+        "another-migrator:%d" % dead_pid(),
+        str(dead_pid()),
+    ):
+        transfer = lock_transfer({DST_LOCK: owner})
+        assert not transfer.check_and_cleanup_lockfiles()
+        assert transfer.shell.removed() == [], owner
+        assert not any(c[:2] == ["sudo", "kill"] for c in transfer.shell.commands)
+
+
+def test_conversion_host_ssh_keeps_the_link_alive():
+    """SDD §6.6: a silent partition ends the ssh in about a minute (audit COL-09), for module
+    commands and for the data link a warm pass opens from the destination to the source."""
+    from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
+
+    preamble = volume_common.RemoteShell("10.0.0.10", "cloud-user", "/keys/k").ssh_preamble()
+    pairs = list(zip(preamble, preamble[1:]))
+    assert ("-o", "ServerAliveInterval=15") in pairs
+    assert ("-o", "ServerAliveCountMax=4") in pairs
+    assert ("-o", "ConnectTimeout=10") in pairs
+    assert preamble[-1] == "cloud-user@10.0.0.10"
+
+    words = warm_migration.blocksync_receive_command(
+        "uuid-1", "/dev/vdb", "/dev/vdc", preamble, "cloud-user"
+    )
+    sender = words[words.index("--") + 1:]
+    assert "ServerAliveInterval=15" in sender and "ServerAliveCountMax=4" in sender

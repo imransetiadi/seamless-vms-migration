@@ -1,0 +1,9 @@
+# Added by the Make targets on a Linux machine's own Docker Engine only (SEAMLESS_DOCKER_CONTEXT=default, SDD 17.1):
+# that engine defines no host.docker.internal, the host of the default agentmemory URL (compose-init.sh). Colima
+# and Docker Desktop resolve the name to the developer's machine themselves; there host-gateway would be their VM.
+# The host's agentmemory must listen where the containers reach it - the bridge address (172.17.0.1 by default) or
+# all addresses behind a firewall - not on 127.0.0.1 only.
+services:
+  seamless:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

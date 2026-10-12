@@ -38,6 +38,25 @@ describe('Providers page', () => {
     expect(within(rhosp).getByRole('button', { name: /^edit$/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Providers />, {
+      route: '/providers',
+      path: '/providers',
+      token: 'admin',
+      // the save never answers: the dialog stays busy
+      wrapFetch: (mock) => (input, init) => ((init?.method ?? 'GET') === 'GET' ? mock(input, init) : new Promise<Response>(() => {})),
+    });
+    const rhosp = await screen.findByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    await user.click(within(rhosp).getByRole('button', { name: 'Edit' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
+    await waitFor(() => expect(cancel).toHaveAttribute('aria-disabled', 'true'));
+    expect(cancel).not.toBeDisabled();
+    expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
+  });
+
   it('shows Delete to non-admins as unavailable with the reason, like Edit (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('operator');
@@ -120,6 +139,40 @@ describe('Providers page', () => {
     expect(screen.getByText(`Checked ${total - count} of ${total} providers: ${healthy} healthy; ${count} could not be checked.`)).toBeInTheDocument();
   });
 
+  it('keeps the failed checks named while Retry runs, and Retry keeps the focus (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const failing = server.providers[0]!;
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'POST' && path === `/providers/${failing.id}/check`
+        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+        : handle(method, path, query, body, token);
+    // the retried check waits until the test lets it through
+    let hold: Promise<void> | null = null;
+    let release: () => void = () => {};
+    const wrapFetch = (fetchImpl: typeof fetch): typeof fetch => async (input, init) => {
+      if (hold && String(input).endsWith(`/providers/${failing.id}/check`)) await hold;
+      return fetchImpl(input, init);
+    };
+    renderWithApp(<Providers />, { route: '/providers', path: '/providers', token: 'operator', server, wrapFetch });
+    await user.click(await screen.findByRole('button', { name: /check all/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(`Could not check ${failing.name}`);
+    const retry = within(alert).getByRole('button', { name: /retry/i });
+    hold = new Promise<void>((resolve) => (release = resolve));
+    await user.click(retry);
+    // while it runs, the failure stays named and Retry is busy with the focus
+    await waitFor(() => expect(retry).toHaveAttribute('aria-busy', 'true'));
+    expect(screen.getByRole('alert')).toHaveTextContent(`Could not check ${failing.name}`);
+    expect(retry).toHaveFocus();
+    release();
+    // it failed again: the same banner, Retry ready again and still focused
+    await waitFor(() => expect(retry).not.toHaveAttribute('aria-busy'));
+    expect(screen.getByRole('alert')).toBe(alert);
+    expect(retry).toHaveFocus();
+  });
+
   it('summarises what is missing and focuses the summary', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage();
@@ -131,6 +184,9 @@ describe('Providers page', () => {
       expect(summary).toHaveTextContent(text);
     }
     await waitFor(() => expect(summary).toHaveFocus());
+    // each line takes the operator to its field, as in the plan and policy dialogs
+    await user.click(within(summary).getByRole('link', { name: /full url/i }));
+    expect(within(dialog).getByLabelText(/keystone url/i)).toHaveFocus();
   });
 
   it('connects a Kolla-Ansible source: the preset fills the form, credentials stay write-only', async () => {
@@ -188,6 +244,91 @@ describe('Providers page', () => {
     expect(created?.conversion_host).toMatchObject({ manage: false, address: '198.51.100.77', ssh_key_secret: 'provider-vcenter-dc3-ssh' });
     expect(created?.conversion_key_updated_at).not.toBeNull();
     expect(await screen.findByRole('status')).toHaveTextContent(/vcenter dc3 added/i);
+  });
+
+  it('opens the closed conversion-host section when a summary line leads to one of its fields', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    const summary = await within(dialog).findByRole('alert');
+    // the save opened the section for its errors; close it again
+    await user.click(within(dialog).getByRole('button', { name: /existing host/i }));
+    expect(within(dialog).queryByLabelText(/^address/i)).not.toBeInTheDocument();
+    await user.click(within(summary).getByRole('link', { name: /ssh private key/i }));
+    await waitFor(() => expect(dialog.querySelector('#provider-dialog-privateKey')).toHaveFocus());
+    expect(within(dialog).getByLabelText(/^address/i)).toBeInTheDocument();
+  });
+
+  it('connects vCenter with secrets managed outside Seamless: it names them and writes none (SDD §13.3, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC4');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc4.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    expect(within(dialog).queryByLabelText(/vcenter user/i)).not.toBeInTheDocument();
+    await user.type(within(dialog).getByLabelText(/^secret name/i), 'vcenter-dc4');
+    expect(within(dialog).getByRole('region', { name: 'Sign-in' })).toHaveTextContent(/managed outside Seamless, at each connection\. Seamless never writes/);
+    expect(within(dialog).getByRole('region', { name: 'Sign-in' })).not.toHaveTextContent(/Stored in the platform/);
+    await user.click(within(dialog).getByRole('button', { name: /existing host/i }));
+    await user.type(within(dialog).getByLabelText(/^address/i), '198.51.100.78');
+    await user.click(within(dialog).getByRole('radio', { name: 'Key in a secret managed outside Seamless' }));
+    await user.type(within(dialog).getByLabelText(/^key secret name/i), 'conv-dc4-key');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    const created = server.providers.find((p) => p.id === 'vcenter-dc4');
+    expect(created).toMatchObject({ credentials_secret: 'vcenter-dc4', credentials_updated_at: null, conversion_key_updated_at: null });
+    expect(created?.conversion_host).toMatchObject({ manage: false, address: '198.51.100.78', ssh_key_secret: 'conv-dc4-key' });
+    expect(server.events.some((e) => e.kind === 'provider.credentials_updated' || e.kind === 'provider.conversion_key_updated')).toBe(false);
+  });
+
+  it('refuses a secret name the control plane could not read, before anything is sent', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC5');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc5.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    await user.type(within(dialog).getByLabelText(/^secret name/i), '../etc');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/secret name/i);
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveAccessibleDescription(/letters, digits/i);
+    expect(server.providers.some((p) => p.id === 'vcenter-dc5')).toBe(false);
+  });
+
+  it('refuses another provider’s secret, which a check would send to this provider’s endpoint (SDD §13.3)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPage();
+    const dialog = await openAdd(user);
+    await user.click(within(dialog).getByRole('radio', { name: /vmware vcenter/i }));
+    await user.type(within(dialog).getByLabelText(/^name/i), 'vCenter DC6');
+    await user.type(within(dialog).getByLabelText(/vcenter url/i), 'https://vcenter.dc6.example.com/sdk');
+    await user.click(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' }));
+    // the hint says what an OpenShift Secret read through the API needs
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveAccessibleDescription(/seamless\.io\/provider-secret: "true"/);
+    await user.type(within(dialog).getByLabelText(/^secret name/i), 'provider-community-lab');
+    await user.click(within(dialog).getByRole('button', { name: /^add provider$/i }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/another provider/i);
+    expect(server.providers.some((p) => p.id === 'vcenter-dc6')).toBe(false);
+  });
+
+  it('opens a provider that names a secret managed outside Seamless in that sign-in method', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const lab = server.providers.find((p) => p.id === 'community-lab')!;
+    lab.cloud = null;
+    lab.credentials_secret = 'lab-openstack';
+    renderPage('admin', server);
+    const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
+    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
+    expect(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' })).toBeChecked();
+    expect(within(dialog).getByLabelText(/^secret name/i)).toHaveValue('lab-openstack');
   });
 
   it('edits a provider: credentials stay empty, only changed fields are sent, the platform type is locked', async () => {
@@ -330,6 +471,22 @@ describe('Providers page', () => {
     await user.click(within(failed).getByRole('button', { name: /^edit again$/i }));
     const form = await screen.findByRole('dialog', { name: /edit kolla lab f/i });
     await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
+  });
+
+  it('names the plans that still need a provider when its deletion is refused (SDD §12)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('admin');
+    const from = await screen.findByRole('region', { name: 'Migrate from' });
+    const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
+    await user.click(within(card).getByRole('button', { name: /^delete$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /delete rhosp 17\.1/i });
+    // what happens, row by row (SDD §16)
+    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it');
+    await user.type(within(dialog).getByLabelText(/type rhosp17-dc1 to confirm/i), 'rhosp17-dc1');
+    await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
+    const refusal = await within(dialog).findByRole('alert');
+    expect(refusal).toHaveTextContent('plan-4f2a9c1e ("DC1 → RHOSO production rollout", running)');
+    expect(within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' })).toBeInTheDocument();
   });
 
   it('moves the focus to the column heading once a deleted provider is gone (SDD §16)', async () => {

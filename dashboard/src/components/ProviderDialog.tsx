@@ -11,6 +11,7 @@ import { Button } from './Button';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextField } from './Field';
 import { Modal } from './Modal';
+import { Segmented } from './Segmented';
 import { ProviderStatusBadge } from './StatusBadge';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,62}$/;
@@ -47,16 +48,48 @@ interface FormState {
   hostCidr: string;
   privateKey: string;
   privateKeyLabel: string;
+  /** A secret managed outside Seamless (SDD §13.3): its name, for the credentials and for the key. */
+  secretName: string;
+  keySource: 'upload' | 'external';
+  keySecretName: string;
 }
 
-type FieldKey = 'name' | 'id' | 'endpoint' | 'cloud' | 'username' | 'password' | 'projectName' | 'appId' | 'appSecret' | 'hostName' | 'hostAddress' | 'privateKey';
+type FieldKey = 'name' | 'id' | 'endpoint' | 'cloud' | 'username' | 'password' | 'projectName' | 'appId' | 'appSecret' | 'hostName' | 'hostAddress' | 'privateKey' | 'secretName' | 'keySecretName';
+
+/** A secret name the control plane reads (SDD §13.3); never a path. */
+const SECRET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const SECRET_NAME_RULE = '1–128 letters, digits, ., _ or -, starting with a letter or digit.';
+/** On OpenShift a Secret read through the API (not mounted) must say it is meant for providers (SDD §13.3). */
+const OPENSHIFT_LABEL = 'On OpenShift, a Secret Seamless reads through the API needs the label seamless.io/provider-secret: "true".';
+
+/** Why a named secret is refused, or null (SDD §13.3): the name rule, and no other provider's provider-* secret. */
+function secretNameError(name: string, own: string, what: string): string | null {
+  const trimmed = name.trim();
+  if (!SECRET_NAME.test(trimmed)) return `Enter ${what}: ${SECRET_NAME_RULE}`;
+  if (trimmed.startsWith('provider-') && trimmed !== own) {
+    return 'This names another provider’s secret: provider-* names are the ones Seamless stores for each provider.';
+  }
+  return null;
+}
+
+/** A secret the dashboard wrote (`provider-{id}`, `provider-{id}-ssh`) is Seamless's own; any other name is managed outside it. */
+function outside(name: string | null | undefined, managed: string): string | null {
+  return name && name !== managed ? name : null;
+}
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialState(provider: Provider | undefined): FormState {
   const preset = presetFor(provider?.distribution, provider?.kind ?? 'openstack');
   const host = provider?.conversion_host;
-  const mode: CredentialMode =
-    preset.kind === 'vmware' ? 'vcenter' : provider?.cloud && !provider.credentials_secret ? 'clouds_yaml' : 'password';
+  const secretName = outside(provider?.credentials_secret, `provider-${provider?.id}`);
+  const keySecretName = outside(host?.ssh_key_secret, `provider-${provider?.id}-ssh`);
+  const mode: CredentialMode = secretName
+    ? 'external_secret'
+    : preset.kind === 'vmware'
+      ? 'vcenter'
+      : provider?.cloud && !provider.credentials_secret
+        ? 'clouds_yaml'
+        : 'password';
   return {
     distribution: provider?.distribution ?? preset.id,
     name: provider?.name ?? '',
@@ -88,6 +121,9 @@ function initialState(provider: Provider | undefined): FormState {
     hostCidr: host?.ssh_allowed_cidr ?? '',
     privateKey: '',
     privateKeyLabel: '',
+    secretName: secretName ?? '',
+    keySource: keySecretName ? 'external' : 'upload',
+    keySecretName: keySecretName ?? '',
   };
 }
 
@@ -96,6 +132,7 @@ const MODE_LABELS: Record<CredentialMode, string> = {
   application_credential: 'Application credential',
   clouds_yaml: 'clouds.yaml entry',
   vcenter: 'vCenter account',
+  external_secret: 'Secret managed outside Seamless',
 };
 
 function Section({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
@@ -185,44 +222,6 @@ function PlatformPicker({
           {PLATFORM_LOCKED}
         </p>
       )}
-    </div>
-  );
-}
-
-function Segmented<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: T;
-  options: Array<{ value: T; label: string }>;
-  onChange: (value: T) => void;
-}) {
-  const name = useId();
-  return (
-    <div role="radiogroup" aria-label={label} className="inline-flex flex-wrap gap-1 rounded-md border border-border p-1">
-      {options.map((option) => (
-        <label
-          key={option.value}
-          className={cn(
-            'inline-flex min-h-9 cursor-pointer items-center rounded px-3 text-sm transition-colors duration-150',
-            option.value === value ? 'bg-accent text-accent-foreground' : 'text-foreground hover:bg-muted',
-            'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-ring',
-          )}
-        >
-          <input
-            type="radio"
-            name={name}
-            value={option.value}
-            checked={option.value === value}
-            onChange={() => onChange(option.value)}
-            className="sr-only"
-          />
-          {option.label}
-        </label>
-      ))}
     </div>
   );
 }
@@ -320,7 +319,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setForm((f) => ({ ...f, name: value, id: f.idTouched || editing ? f.id : slugify(value) }));
 
   const wantsCredentials = () => {
-    if (form.mode === 'clouds_yaml') return false;
+    if (form.mode === 'clouds_yaml' || form.mode === 'external_secret') return false;
     if (form.mode === 'vcenter') return Boolean(form.username || form.password || form.datacenter);
     if (form.mode === 'application_credential') return Boolean(form.appId || form.appSecret);
     return Boolean(form.username || form.password || form.projectName);
@@ -335,6 +334,9 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     const required = !editing || !stored || wantsCredentials();
     if (form.mode === 'clouds_yaml') {
       if (!form.cloud.trim()) e.cloud = 'Enter the cloud name of the entry in the mounted clouds.yaml.';
+    } else if (form.mode === 'external_secret') {
+      const why = secretNameError(form.secretName, `provider-${form.id}`, 'the secret name');
+      if (why) e.secretName = why;
     } else if (required && form.mode === 'application_credential') {
       if (!form.appId.trim()) e.appId = 'Enter the application credential ID.';
       if (!form.appSecret) e.appSecret = 'Enter the application credential secret.';
@@ -346,9 +348,12 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     if (!form.hostManaged) {
       if (!form.hostName.trim() && !form.hostAddress.trim()) e.hostAddress = 'Enter the address (or name) of the existing conversion host.';
       const keyStored = editing && Boolean(current?.conversion_key_updated_at);
-      if (!keyStored && !form.privateKey) e.privateKey = 'Add the SSH private key Seamless uses to reach the conversion host.';
+      if (form.keySource === 'external') {
+        const why = secretNameError(form.keySecretName, `provider-${form.id}-ssh`, 'the name of the secret holding the key');
+        if (why) e.keySecretName = why;
+      } else if (!keyStored && !form.privateKey) e.privateKey = 'Add the SSH private key Seamless uses to reach the conversion host.';
     }
-    if (form.privateKey && !/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(form.privateKey.trim())) {
+    if (form.keySource === 'upload' && form.privateKey && !/^-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(form.privateKey.trim())) {
       e.privateKey = 'This is not an OpenSSH or PEM private key (it must start with -----BEGIN … PRIVATE KEY-----).';
     }
     return e;
@@ -366,7 +371,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       external_network: form.hostManaged ? blank(form.hostNetwork) : null,
       ssh_user: form.hostUser.trim() || 'cloud-user',
       ssh_allowed_cidr: blank(form.hostCidr),
-      ssh_key_secret: existing?.ssh_key_secret ?? null,
+      ssh_key_secret: !form.hostManaged && form.keySource === 'external' ? form.keySecretName.trim() : (existing?.ssh_key_secret ?? null),
     };
     const empty = host.manage && !host.name && !host.flavor && !host.image && !host.external_network && !host.ssh_allowed_cidr && !existing;
     return empty ? null : host;
@@ -394,7 +399,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
     setErrors(found);
     setFailure(null);
     if (Object.keys(found).length) {
-      if (['hostName', 'hostAddress', 'privateKey'].some((k) => k in found)) setHostOpen(true);
+      if (['hostName', 'hostAddress', 'privateKey', 'keySecretName'].some((k) => k in found)) setHostOpen(true);
       requestAnimationFrame(() => summaryRef.current?.focus());
       return;
     }
@@ -407,6 +412,8 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         verify_tls: form.verifyTls,
         ca_cert_path: form.caPath.trim() || null,
         cloud: form.mode === 'clouds_yaml' ? form.cloud.trim() : null,
+        // a secret managed outside Seamless is named, never written (SDD §13.3); the other methods write their own
+        ...(form.mode === 'external_secret' ? { credentials_secret: form.secretName.trim() } : {}),
         distribution: form.distribution,
         conversion_host: conversionHost(),
       };
@@ -424,11 +431,11 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         if (form.mode === 'clouds_yaml' && current.credentials_secret) patch.credentials_secret = null;
         saved = Object.keys(patch).length ? keep(await update.mutateAsync({ id: current.id, patch })) : current;
       } else {
-        saved = keep(await create.mutateAsync({ ...fields, id: form.id, kind: preset.kind, role: form.role, credentials_secret: null }));
+        saved = keep(await create.mutateAsync({ credentials_secret: null, ...fields, id: form.id, kind: preset.kind, role: form.role }));
       }
       const creds = credentials();
       if (creds) saved = keep(await setCredentials.mutateAsync({ id: saved.id, credentials: creds }));
-      if (form.privateKey) saved = keep(await setKey.mutateAsync({ id: saved.id, privateKey: form.privateKey }));
+      if (form.keySource === 'upload' && form.privateKey) saved = keep(await setKey.mutateAsync({ id: saved.id, privateKey: form.privateKey }));
       if (test) {
         saved = keep(await check.mutateAsync(saved.id));
         setOutcome({ provider: saved, checked: true });
@@ -530,7 +537,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
           </p>
         </div>
 
-        <div className="flex min-h-0 flex-col gap-5 overflow-y-auto px-5 py-4">
+        <div className="relative flex min-h-0 flex-col gap-5 overflow-y-auto px-5 py-4">
           {errorEntries.length > 0 && (
             <div ref={summaryRef} tabIndex={-1} role="alert" className="rounded-md border border-status-danger/60 bg-status-danger/10 px-3 py-2 text-sm outline-none">
               <p className="flex items-center gap-1.5 font-medium text-foreground">
@@ -540,7 +547,21 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
               <ul className="mt-1 list-disc pl-6 text-foreground">
                 {errorEntries.map(([key, message]) => (
                   <li key={key}>
-                    <a href={`#${id(key)}`} className="underline underline-offset-2">
+                    <a
+                      href={`#${id(key)}`}
+                      className="inline-block py-1 underline underline-offset-2"
+                      onClick={(e) => {
+                        // to the field itself, as in the plan and policy dialogs; a field of the closed host section opens it first
+                        e.preventDefault();
+                        const field = document.getElementById(id(key));
+                        if (field) {
+                          field.focus();
+                          return;
+                        }
+                        setHostOpen(true);
+                        requestAnimationFrame(() => document.getElementById(id(key))?.focus());
+                      }}
+                    >
                       {message}
                     </a>
                   </li>
@@ -646,7 +667,11 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
 
           <Section
             title="Sign-in"
-            description="Stored in the platform's secret store (an OpenShift Secret, or a 0600 file on Compose). Never kept in the database and never shown again."
+            description={
+              form.mode === 'external_secret'
+                ? 'Read from a secret managed outside Seamless, at each connection. Seamless never writes or shows it.'
+                : "Stored in the platform's secret store (an OpenShift Secret, or a 0600 file on Compose). Never kept in the database and never shown again."
+            }
           >
             {preset.credentialModes.length > 1 && (
               <Segmented
@@ -656,7 +681,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 options={preset.credentialModes.map((m) => ({ value: m, label: MODE_LABELS[m] }))}
               />
             )}
-            {form.mode !== 'clouds_yaml' && <StoredNote at={credsStored ? current?.credentials_updated_at : null} what="Credentials" />}
+            {form.mode !== 'clouds_yaml' && form.mode !== 'external_secret' && <StoredNote at={credsStored ? current?.credentials_updated_at : null} what="Credentials" />}
             {form.mode === 'clouds_yaml' && (
               <TextField
                 id={id('cloud')}
@@ -669,6 +694,21 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                 error={errors.cloud}
                 inputClassName="font-mono"
                 spellCheck={false}
+              />
+            )}
+            {form.mode === 'external_secret' && (
+              <TextField
+                id={id('secretName')}
+                label="Secret name"
+                required
+                value={form.secretName}
+                onChange={(e) => set('secretName', e.target.value)}
+                placeholder={preset.kind === 'vmware' ? 'e.g. vcenter-dc2' : 'e.g. rhosp17-dc1'}
+                hint={`A secret already there for Seamless — files under SEAMLESS_SECRETS_DIR/<name>/, the Secret seamless-<name> on OpenShift, or SEAMLESS_SECRET_<NAME>_* variables; ${preset.kind === 'vmware' ? 'keys username, password and optional datacenter' : 'keys username, password and project_name, or an application credential'}. Seamless reads it and never writes it. ${SECRET_NAME_RULE} ${OPENSHIFT_LABEL}`}
+                error={errors.secretName}
+                inputClassName="font-mono"
+                spellCheck={false}
+                autoComplete="off"
               />
             )}
             {(form.mode === 'password' || form.mode === 'vcenter') && (
@@ -833,6 +873,32 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
                   />
                 </div>
                 {!form.hostManaged && (
+                  <Segmented
+                    label="SSH key from"
+                    value={form.keySource}
+                    onChange={(v) => set('keySource', v)}
+                    options={[
+                      { value: 'upload', label: 'Key stored by Seamless' },
+                      { value: 'external', label: 'Key in a secret managed outside Seamless' },
+                    ]}
+                  />
+                )}
+                {!form.hostManaged && form.keySource === 'external' && (
+                  <TextField
+                    id={id('keySecretName')}
+                    label="Key secret name"
+                    required
+                    value={form.keySecretName}
+                    onChange={(e) => set('keySecretName', e.target.value)}
+                    placeholder="e.g. conversion-dc2-key"
+                    hint={`A secret holding the key under private_key (SEAMLESS_SECRETS_DIR/<name>/private_key, the Secret seamless-<name>, or SEAMLESS_SECRET_<NAME>_PRIVATE_KEY). Seamless reads it and never writes it. ${SECRET_NAME_RULE} ${OPENSHIFT_LABEL}`}
+                    error={errors.keySecretName}
+                    inputClassName="font-mono"
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                )}
+                {!form.hostManaged && form.keySource === 'upload' && (
                   <div className="flex flex-col gap-2" id={id('privateKey')} tabIndex={-1}>
                     <span className="field-label">SSH private key</span>
                     <StoredNote at={current?.conversion_key_updated_at} what="A key" />
@@ -879,7 +945,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabled={busy}>
+          <Button type="button" size="lg" variant="ghost" onClick={onClose} disabledReason={busy ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button type="button" size="lg" variant="secondary" loading={busy} onClick={() => void save(false)}>

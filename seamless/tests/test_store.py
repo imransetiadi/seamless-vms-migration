@@ -1,9 +1,11 @@
 import threading
 
 import pytest
+import sqlalchemy as sa
 
 from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
+from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.store import ConflictError, NotFound, Store
 from tests.factories import make_migration, make_plan, make_provider
 
@@ -53,6 +55,38 @@ def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     any_store.delete("migration", m.id)
     assert any_store.change_stamp("migration") == (0, 0)
     assert any_store.change_stamp("plan") == (0, 0)  # per kind
+
+
+def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
+    """SDD §8.1, §11: the set of each plan's phases, in one query, without loading a document."""
+    for plan_id, phase in (
+        ("plan-a", Phase.ready),
+        ("plan-a", Phase.blocked),
+        ("plan-a", Phase.ready),
+        ("plan-b", Phase.completed),
+        ("plan-c", Phase.syncing),
+    ):
+        any_store.put("migration", make_migration(plan_id=plan_id, phase=phase))
+    got = any_store.plan_phases(["plan-a", "plan-b", "plan-x"])
+    assert got == {"plan-a": {Phase.ready, Phase.blocked}, "plan-b": {Phase.completed}}
+    assert all(isinstance(p, Phase) for phases in got.values() for p in phases)
+    assert any_store.plan_phases([]) == {}
+
+
+def test_versions_and_get_many_read_only_what_is_asked(any_store: Store):
+    """SDD §11: (id, version) in creation order, no document read; get_many loads what exists."""
+    a, b, c = (make_migration() for _ in range(3))
+    for m in (a, b, c):
+        any_store.put("migration", m)
+    any_store.put("migration", b.model_copy(update={"progress_pct": 40.0}), expected_version=1)
+    any_store.delete("migration", c.id)
+    assert any_store.versions("migration") == [(a.id, 1), (b.id, 2)]
+    got = any_store.get_many("migration", [b.id, c.id, "mig-missing"], Migration)
+    assert set(got) == {b.id}
+    version, model = got[b.id]
+    assert (version, model.progress_pct) == (2, 40.0)
+    assert any_store.get_many("migration", [], Migration) == {}
+    assert any_store.versions("plan") == []
 
 
 def test_list_filters(any_store: Store):
@@ -140,6 +174,68 @@ def test_events_tail_returns_the_newest_matching_events_in_seq_order(any_store: 
     assert any_store.events(since_seq=seqs[-1], limit=10, tail=True) == []
     # without tail the same query still pages forward
     assert [e.seq for e in any_store.events(since_seq=base, limit=2)] == seqs[:2]
+
+
+def test_events_before_pages_back_from_the_oldest_shown(any_store: Store):
+    """SDD §12: ``before`` keeps events below a seq; with ``tail`` the newest ``limit`` of them."""
+    stored = [
+        any_store.append_event(Event(kind="migration.phase", plan_id=plan, message=str(i)))
+        for i, plan in enumerate(["plan-a", "plan-b", "plan-a", "plan-b", "plan-a", "plan-a"])
+    ]
+    seqs = [e.seq for e in stored]
+    newest = any_store.events(limit=2, tail=True)
+    assert [e.seq for e in newest] == seqs[4:]
+    older = any_store.events(limit=2, tail=True, before_seq=newest[0].seq)
+    assert [e.seq for e in older] == seqs[2:4]
+    oldest = any_store.events(limit=2, tail=True, before_seq=older[0].seq)
+    assert [e.seq for e in oldest] == seqs[:2]
+    assert any_store.events(limit=2, tail=True, before_seq=oldest[0].seq) == []
+    # with a plan: that plan's events below the seq
+    plan_a = any_store.events(plan_id="plan-a", limit=2, tail=True, before_seq=seqs[5])
+    assert [e.message for e in plan_a] == ["2", "4"]
+    # without tail: the first events after since, below before
+    assert [e.seq for e in any_store.events(since_seq=seqs[0], before_seq=seqs[3])] == seqs[1:3]
+
+
+def test_create_schema_adds_the_events_indexes_to_an_existing_table(any_store: Store):
+    """SDD §11: an events table from before ix_events_kind_seq gets it at the next startup;
+    create_all alone skips the indexes of a table that exists."""
+    with any_store.engine.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS ix_events_kind_seq")
+    any_store.append_event(Event(kind="plan.created", plan_id="plan-a", message="kept"))
+    any_store.create_schema()
+    any_store.create_schema()
+    indexes = {
+        i["name"]: i["column_names"] for i in sa.inspect(any_store.engine).get_indexes("events")
+    }
+    assert indexes["ix_events_kind_seq"] == ["kind", "seq"]
+    assert indexes["ix_events_plan_id"] == ["plan_id"]
+    assert indexes["ix_events_migration_id"] == ["migration_id"]
+    assert [e.message for e in any_store.events()] == ["kept"]
+
+
+def test_the_audit_filter_reads_the_kind_index_not_the_whole_table(store: Store):
+    """SDD §11, §12: GET /events?audit=true (and its ``before`` pages) finds the sparse audit
+    events through ix_events_kind_seq instead of reading the events table backwards."""
+    statements: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append((statement, params))
+
+    sa.event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        store.events(kinds=AUDIT_KINDS, tail=True, limit=500)
+        store.events(kinds=AUDIT_KINDS, tail=True, limit=500, before_seq=1000)
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", capture)
+    assert len(statements) == 2
+    with store.engine.connect() as conn:
+        for statement, params in statements:
+            plan = [
+                row[-1] for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, params)
+            ]
+            assert any("ix_events_kind_seq" in step for step in plan), plan
 
 
 def test_ping(any_store: Store, tmp_path):
@@ -250,3 +346,114 @@ def test_delete_events_before(any_store: Store):
     assert any_store.delete_events_before(datetime(2026, 10, 4, 6, 59, tzinfo=plus7)) == 1
     assert [e.message for e in any_store.events(since_seq=0, limit=100)] == ["e3", "e4"]
     assert any_store.delete_events_before(datetime(2026, 10, 4, 7, 1, tzinfo=plus7)) == 1
+
+
+# -- the cross-process VM-claim lock (SDD §5.4) ------------------------------------------------
+def test_cross_process_lock_excludes_a_second_holder(any_store: Store):
+    """Two holders of one name exclude each other as two processes would: two connections on
+    PostgreSQL (advisory lock), two open files on SQLite (flock)."""
+    other = Store(any_store.url)
+    try:
+        first, second = (
+            any_store.cross_process_lock("vm-claims"),
+            other.cross_process_lock("vm-claims"),
+        )
+        assert first.try_acquire()
+        assert not second.try_acquire()
+        first.release()
+        assert second.try_acquire()
+        assert not first.try_acquire()
+        second.release()
+        first.release()  # releasing a lock not held is a no-op
+    finally:
+        other.dispose()
+
+
+def test_cross_process_lock_dies_with_its_process(any_store: Store):
+    """A holder killed while it holds the lock never strands it: the database or the OS drops it."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    code = (
+        "import os, time\n"
+        "from seamless_migrate.store import Store\n"
+        "lock = Store(os.environ['LOCK_TEST_DB_URL']).cross_process_lock('vm-claims')\n"
+        "assert lock.try_acquire()\n"
+        "print('held', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    # the URL may carry a password: the environment, never the command line
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "LOCK_TEST_DB_URL": any_store.url},
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+        lock = any_store.cross_process_lock("vm-claims")
+        assert not lock.try_acquire()
+        os.kill(holder.pid, signal.SIGKILL)
+        holder.wait(10)
+        deadline = time.monotonic() + 10
+        while not lock.try_acquire():
+            assert time.monotonic() < deadline, "the lock outlived its process"
+            time.sleep(0.05)
+        lock.release()
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(10)
+
+
+def test_an_in_memory_database_needs_no_cross_process_lock():
+    store = Store("sqlite://")
+    try:
+        lock = store.cross_process_lock("vm-claims")
+        assert lock.try_acquire() and lock.try_acquire()  # one process can reach it
+        lock.release()
+    finally:
+        store.dispose()
+
+
+async def test_a_cancelled_waiter_leaves_the_lock_free(any_store: Store):
+    """AsyncStore.cross_process_lock polls; a waiter cancelled mid-wait holds nothing after."""
+    import asyncio
+
+    from seamless_migrate.store import AsyncStore
+
+    other = Store(any_store.url)
+    try:
+        holder = other.cross_process_lock("vm-claims")
+        assert holder.try_acquire()
+
+        async def wait_for_it():
+            async with AsyncStore(any_store).cross_process_lock("vm-claims"):
+                pytest.fail("acquired a lock another holder holds")
+
+        waiter = asyncio.create_task(wait_for_it())
+        await asyncio.sleep(0.3)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        holder.release()
+        async with AsyncStore(any_store).cross_process_lock("vm-claims"):
+            assert not holder.try_acquire()
+        assert holder.try_acquire()
+        holder.release()
+    finally:
+        other.dispose()
+
+
+def test_a_closed_cross_process_lock_acquires_nothing_more(any_store: Store):
+    """close() - what a cancelled waiter does - also refuses an attempt still running in a
+    worker thread after it, so such an attempt never takes the lock for nobody."""
+    lock = any_store.cross_process_lock("vm-claims")
+    lock.close()
+    assert not lock.try_acquire()
+    other = any_store.cross_process_lock("vm-claims")
+    assert other.try_acquire()
+    other.release()

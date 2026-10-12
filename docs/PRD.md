@@ -93,7 +93,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 |---|---|---|---|
 | FR-01 | Register source providers (OpenStack/RHOSP 17.1, VMware) and a RHOSO destination; check connectivity and capabilities | M | `POST /providers/{id}/check` returns status and capabilities (admin, compute microversion, OVN, CBT support) |
 | FR-02 | Discover inventory (VMs, disks, NICs, flavors, power state, guest OS, CBT, snapshots) | M | Inventory table lists VMs with disk sizes, guest OS (SDD §9.5) and readiness flags |
-| FR-03 | Create plans with VM selection, mappings (network, flavor, volume type, project), SLO, approval, window | M | Plan persisted; editable while draft/validated |
+| FR-03 | Create plans with VM selection, mappings (network, flavor, volume type, project), SLO, approval, window | M | Plan persisted; editable while draft/validated, except while a migration is in flight, and its providers fixed while one is failed (SDD §12) |
 | FR-04 | Pre-flight validation with a documented finding catalog (blocker/warning/info) | M | All SDD §9.3 codes implemented and unit-tested |
 | FR-05 | Downtime/duration estimate per VM and strategy | M | Estimator formulas SDD §9.1; shown in plan and migration views |
 | FR-06 | Automatic strategy selection with eligibility rules; per-VM override | M | Ineligible strategies can never be selected; override rejected if ineligible |
@@ -150,7 +150,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 
 | Release | Scope |
 |---|---|
-| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift + Compose/Colima deployment, docs |
+| **0.1.0 (this delivery)** | FR-01…FR-25: collection warm path + hardening, control plane, dashboard, Jev + agentmemory integration, demo mode, OpenShift, Kubernetes and Compose (Colima or Podman) deployment, docs |
 | 0.2.0 | Ceph-direct incremental diff, HA (PostgreSQL leader election), per-tenant credentials, notifications (email/Slack webhooks) |
 | 0.3.0 | Network cut-over hooks (DNS, FIP re-mapping, OVN BGP), Octavia/Heat migration helpers |
 | 1.0.0 | Certified on RHOSO 18.0.x FRs, scale test 5,000 VMs, signed releases |
@@ -160,7 +160,8 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 * Source/destination OpenStack APIs reachable from the control plane; conversion hosts reachable
   over SSH from the control plane and from each other (dst → src).
 * Tenant credentials (or admin with role assignment) on both clouds; admin required for storage
-  handover and some pre-staging resources.
+  handover and some pre-staging resources, and at RHOSO for a VM whose NIC goes to another project's
+  shared or external network (Neutron's port policy, SDD §6.6).
 * VMware: VDDK available on the RHOSO conversion host; CBT enabled for warm.
 * Jev requires a provider API key (TypeSafe direct by default); everything works with Jev off.
 * agentmemory is optional; when configured, it runs as the team's memory server.
@@ -174,7 +175,7 @@ Priority: **M** = must (0.1.0), **S** = should (0.1.0 if feasible), **C** = coul
 | Guest change rate higher than link | Warm never converges | `max_sync_passes` cap; estimate shows non-convergence; advisor suggests cold window or handover |
 | Network semantics differ (OVS→OVN, MTU) | Post-boot connectivity issues | MTU finding, verification probes, rollback |
 | AI advisor wrong | Suboptimal choice | Bounded to eligible tie set, confidence threshold, recorded with evidence, overridable |
-| Credentials exposure | Security incident | Secrets only in mounted files/0600 temp files; redaction; Security.md controls |
+| Credentials exposure | Security incident | Secrets in mounted files or the platform secret store (written once through the API, never read back), 0600 temp files for playbooks; redaction; Security.md controls |
 
 ## 12. Glossary
 

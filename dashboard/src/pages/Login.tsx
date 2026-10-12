@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { ApiError, errorMessage } from '../api/client';
 import { useHealth } from '../api/hooks';
 import { useSignIn } from '../api/session';
+import { BrandMark } from '../components/BrandMark';
 import { Button } from '../components/Button';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -60,10 +61,7 @@ export default function Login() {
       <main id="main" className="flex flex-1 items-start justify-center px-4 pb-16 pt-6 sm:items-center">
         <div className="card w-full max-w-md p-6">
           <div className="mb-5 flex items-center gap-3">
-            <svg viewBox="0 0 32 32" aria-hidden className="size-9 shrink-0">
-              <rect width="32" height="32" rx="6" className="fill-primary" />
-              <path d="M7 11h12l-3.5-3.5M25 21H13l3.5 3.5" fill="none" className="stroke-accent" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
+            <BrandMark className="size-9" />
             <div>
               <p className="font-mono text-sm font-semibold text-foreground">Seamless Migrate</p>
               <p className="text-xs text-muted-foreground">VM migrations to RHOSO 18.0</p>

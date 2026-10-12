@@ -95,6 +95,20 @@ describe('VmTable', () => {
     expect(row('vm-erp-app-01')).toHaveTextContent('Ready');
   });
 
+  it('gives a readiness flag its guidance on hover, focus and tap, never only in a title (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    render(<VmTable vms={openstackVms} providerKind="openstack" />);
+    const row = bodyRows().find((r) => r.textContent?.includes('db-pg-01'))!;
+    const flag = within(row).getByRole('button', { name: 'Encrypted volume' });
+    expect(flag).toHaveAccessibleDescription('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+    expect(within(row).queryByTitle(/VOL_ENCRYPTED/)).not.toBeInTheDocument();
+    // no truncating ancestor: its overflow would clip the focus ring (WCAG 2.4.7)
+    expect(flag.closest('.truncate')).toBeNull();
+    // a tap shows it too: touch screens have no hover
+    await user.click(flag);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('VOL_ENCRYPTED: The Barbican key must be re-created at RHOSO.');
+  });
+
   it('sorts by disk size with aria-sort', async () => {
     const user = userEvent.setup({ delay: null });
     render(<VmTable vms={openstackVms} providerKind="openstack" />);
@@ -168,8 +182,8 @@ describe('VmTable', () => {
     expect(row('web-02')).toHaveTextContent('Ubuntu 22.04');
     expect(row('report-gen-01')).toHaveTextContent('Windows Server 2022');
     // legacy releases carry the readiness hint from the catalog (SDD §9.5)
-    expect(within(row('jump-host-01')).getByTitle(/GUEST_OS_LEGACY: Ubuntu 18\.04/)).toBeInTheDocument();
-    expect(within(row('legacy-rhel6-app')).getByTitle(/GUEST_OS_LEGACY: RHEL 6/)).toBeInTheDocument();
+    expect(within(row('jump-host-01')).getByRole('button', { name: 'Legacy OS' })).toHaveAccessibleDescription(/^GUEST_OS_LEGACY: Ubuntu 18\.04/);
+    expect(within(row('legacy-rhel6-app')).getByRole('button', { name: 'Legacy OS' })).toHaveAccessibleDescription(/^GUEST_OS_LEGACY: RHEL 6/);
 
     await user.selectOptions(screen.getByLabelText('Guest OS'), 'windows');
     expect(rowNames().sort()).toEqual(['ad-dc-01', 'report-gen-01']);
@@ -199,9 +213,9 @@ describe('VmTable', () => {
   it('warns about guests virt-v2v does not support on VMware sources', () => {
     render(<VmTable vms={vmwareVms} providerKind="vmware" />);
     const legacy = bodyRows().find((r) => r.textContent?.includes('vm-legacy-win2008'))!;
-    expect(within(legacy).getByTitle(/GUEST_CONVERSION_UNSUPPORTED/)).toBeInTheDocument();
+    expect(within(legacy).getByRole('button', { name: 'Driver prep needed' })).toHaveAccessibleDescription(/^GUEST_CONVERSION_UNSUPPORTED: /);
     const ubuntu = bodyRows().find((r) => r.textContent?.includes('vm-hr-portal'))!;
     expect(ubuntu).toHaveTextContent('Ubuntu 24.04');
-    expect(within(ubuntu).getByTitle(/GUEST_CONVERSION_UNVERIFIED/)).toBeInTheDocument();
+    expect(within(ubuntu).getByRole('button', { name: 'Test conversion' })).toHaveAccessibleDescription(/^GUEST_CONVERSION_UNVERIFIED: /);
   });
 });

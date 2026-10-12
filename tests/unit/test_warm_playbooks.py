@@ -358,13 +358,13 @@ def test_warm_playbooks_story(env):
     assert "server_action:stop" not in modules_for(calls, "vm2", "srv-2")
     assert "refusing to stop the source" in out
 
-    # 4. Retrying the cutover skips vm1 (already created) and cuts vm2 over.
+    # 4. Retrying the cutover only finishes vm1 (already created, SDD §6.5) and cuts vm2 over.
     env.world["existing"] = []
     rc, out, calls = env.run("import_workloads_cutover")
     assert rc == 0, out
     # the control plane's downtime clock keys on this task header (SDD §7.2, executors STOP_TASK)
     assert "TASK [os_migrate.os_migrate.import_workloads_warm : Stop the source server]" in out
-    assert modules_for(calls, "vm1", "srv-1") == []
+    assert modules_for(calls, "vm1", "srv-1") == ["import_workload_create_instance"]
     assert "server_action:stop" in modules_for(calls, "vm2", "srv-2")
     assert env.state("srv-2")["destination_server_id"] == "dst-vm2"
 
@@ -431,7 +431,9 @@ def test_cutover_rerun_refuses_a_failed_destination_server(env):
     assert looked_up == ["dst-vm1"]
 
 
-def test_cutover_rerun_is_a_noop_for_a_healthy_destination_server(env):
+def test_cutover_rerun_finishes_a_healthy_destination_server(env):
+    """SDD §6.5: the re-run neither stops, syncs nor creates again; it finishes the recorded
+    server (ACTIVE, missing floating IPs), which an earlier attempt may have left half done."""
     rc, out, _ = env.run("import_workloads_cutover")
     assert rc == 0, out
 
@@ -439,7 +441,10 @@ def test_cutover_rerun_is_a_noop_for_a_healthy_destination_server(env):
 
     assert rc == 0, out
     assert "destination server dst-vm1 was already created" in out
-    assert modules_for(calls, "vm1", "srv-1") == []
+    assert modules_for(calls, "vm1", "srv-1") == ["import_workload_create_instance"]
+    finish = next(c for c in calls if c["module"] == "import_workload_create_instance"
+                  and c["args"]["data"]["params"]["name"] == "vm1")
+    assert finish["args"]["warm_state_dir"] and finish["args"]["block_device_mapping"] == []
     assert [c["args"]["server"] for c in calls if c["module"] == "server_info"] == ["dst-vm1", "dst-vm2"]
 
 

@@ -43,12 +43,9 @@
 - **Heading Font:** Fira Code
 - **Body Font:** Fira Sans
 - **Mood:** dashboard, data, analytics, code, technical, precise
-- **Google Fonts:** [Fira Code + Fira Sans](https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap)
-
-**CSS Import:**
-```css
-@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
-```
+- **Loading:** bundled, never from Google Fonts (SDD §16: an air-gapped install loads nothing from another host).
+  `src/main.tsx` imports `@fontsource/fira-code` (Latin 400/500/600) and `@fontsource/fira-sans` (Latin 400/500/600/700);
+  the CSP allows fonts from the control plane only.
 
 ### Spacing Variables
 

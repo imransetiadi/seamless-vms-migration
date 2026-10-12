@@ -82,7 +82,11 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
           onBlur?.(event);
         }}
         onKeyDown={(event: KeyboardEvent<HTMLButtonElement>) => {
-          if (event.key === 'Escape') setNote(null);
+          // Escape dismisses a shown note only: the dialog around it stays (WCAG 1.4.13, SDD §16)
+          if (event.key === 'Escape' && note) {
+            event.stopPropagation();
+            setNote(null);
+          }
           onKeyDown?.(event);
         }}
         {...rest}

@@ -1,4 +1,5 @@
 import { Check } from 'lucide-react';
+import type { CSSProperties } from 'react';
 import type { Migration, Phase } from '../api/types';
 import { cn } from '../lib/cn';
 import { happyPath, phaseMeta } from '../lib/phase';
@@ -39,7 +40,13 @@ export function PhaseStepper({ migration, className }: PhaseStepperProps) {
 
   return (
     <div className={cn('flex flex-col gap-3 md:flex-row md:items-start', className)}>
-      <ol aria-label="Migration lifecycle" className="grid flex-1 gap-1 md:auto-cols-fr md:grid-flow-col md:gap-0">
+      {/* on a phone two columns read top-down, steps 1..n/2 then the rest (half the height of one); from md one row.
+          --rows only sets the phone's row count: the desktop classes never read it */}
+      <ol
+        aria-label="Migration lifecycle"
+        style={{ '--rows': `repeat(${Math.ceil(path.length / 2)}, auto)` } as CSSProperties}
+        className="grid flex-1 gap-1 max-md:grid-flow-col max-md:grid-cols-2 max-md:grid-rows-(--rows) max-md:gap-x-4 md:auto-cols-fr md:grid-flow-col md:gap-0"
+      >
         {path.map((phase, index) => {
           const meta = phaseMeta(phase);
           const state = stateOf(index);

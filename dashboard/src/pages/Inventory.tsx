@@ -1,6 +1,6 @@
 import { ClipboardPlus, HardDrive, Server } from 'lucide-react';
 import { useState } from 'react';
-import { Navigate, useNavigate, useParams } from 'react-router-dom';
+import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useInventory, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, type DestinationInventory, type Provider } from '../api/types';
@@ -15,13 +15,20 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
-
-/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
-const GIB = 1024 ** 3;
+import { KEEP_FOCUS } from '../lib/navigation';
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import type { NewPlanState } from './Plans';
+
+/** OpenStack's "GB" (a flavor's disk, a Cinder quota's gigabytes) is GiB (SDD §16). */
+const GIB = 1024 ** 3;
+
+/** A free quota (SDD §10): -1 is unlimited and null not reported, never shown as a number. */
+function quotaText(value: number | null, format: (value: number) => string): string {
+  if (value === null) return 'Not reported';
+  return value < 0 ? 'Unlimited' : format(value);
+}
 
 function DestinationInventoryView({ inventory }: { inventory: DestinationInventory }) {
   const networks = Object.entries(inventory.networks);
@@ -158,11 +165,11 @@ function DestinationInventoryView({ inventory }: { inventory: DestinationInvento
                 {quotas.map(([project, q]) => (
                   <tr key={project}>
                     <th scope="row">{project}</th>
-                    <td className="num text-right">{formatNumber(q.cores)}</td>
-                    <td className="num text-right">{formatBytes(q.ram_mb * 1024 * 1024)}</td>
-                    <td className="num text-right">{formatNumber(q.instances)}</td>
-                    <td className="num text-right">{formatNumber(q.volumes)}</td>
-                    <td className="num text-right">{formatBytes(q.gigabytes * GIB)}</td>
+                    <td className="num text-right">{quotaText(q.cores, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.ram_mb, (mb) => formatBytes(mb * 1024 * 1024))}</td>
+                    <td className="num text-right">{quotaText(q.instances, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.volumes, formatNumber)}</td>
+                    <td className="num text-right">{quotaText(q.gigabytes, (gb) => formatBytes(gb * GIB))}</td>
                   </tr>
                 ))}
               </tbody>
@@ -181,6 +188,7 @@ function providerLabel(p: Provider): string {
 export default function Inventory() {
   usePageTitle('Inventory');
   const { providerId } = useParams();
+  const wanted = useSearchParams()[0].get('vm');
   const navigate = useNavigate();
   const providers = useProviders();
   const inventory = useInventory(providerId);
@@ -224,7 +232,8 @@ export default function Inventory() {
             label="Provider"
             className="w-full sm:w-80"
             value={providerId}
-            onChange={(e) => navigate(`/inventory/${e.target.value}`)}
+            // switches the inventory in place: focus stays here and the address is replaced (WCAG 3.2.2, SDD §16)
+            onChange={(e) => navigate(`/inventory/${e.target.value}`, { replace: true, state: KEEP_FOCUS })}
             options={(providers.data ?? []).map((p) => ({ value: p.id, label: providerLabel(p) }))}
           />
         }
@@ -261,6 +270,9 @@ export default function Inventory() {
               </div>
             )}
             <VmTable
+              // a link to one VM by its source id (`?vm=`, SDD §16) opens the table searching for its name
+              key={wanted ?? ''}
+              initialQuery={wanted ? (data.find((vm) => vm.source_id === wanted)?.name ?? wanted) : ''}
               vms={data}
               providerKind={provider.kind}
               caption={`VMs on ${provider.name}`}

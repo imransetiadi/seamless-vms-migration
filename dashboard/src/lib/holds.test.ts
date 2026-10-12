@@ -18,11 +18,11 @@ function migration(planId: string, vmId: string, vmName: string, phase: Phase): 
 describe('heldElsewhere (SDD §5.4)', () => {
   const plans = [plan('p1', 'Mine'), plan('p2', 'Finance'), plan('p3', 'Finance'), plan('p4', 'Other cloud', 'src-b')];
 
-  it('names the selected VMs that migrations of other plans with the same source hold, each holder once', () => {
+  it('names the selected VMs that migrations of other plans with the same source hold, each holding plan once, by name and id', () => {
     const migrations = [
       migration('p1', 'vm-1', 'web-01', 'ready'), // this plan
       migration('p2', 'vm-1', 'web-01', 'precopy'),
-      migration('p3', 'vm-1', 'web-01', 'precopy'), // the same holder text: once
+      migration('p3', 'vm-1', 'web-01', 'precopy'), // another plan of the same name: told apart by its id
       migration('p2', 'vm-2', 'web-02', 'cancelled'), // released
       migration('p2', 'vm-3', 'web-03', 'rolled_back'), // released
       migration('p2', 'vm-4', 'web-04', 'finalized'), // released
@@ -30,11 +30,11 @@ describe('heldElsewhere (SDD §5.4)', () => {
       migration('p2', 'vm-6', 'web-06', 'completed'), // not selected
     ];
     const held = heldElsewhere(['vm-1', 'vm-2', 'vm-3', 'vm-4', 'vm-5'], 'src-a', 'p1', plans, migrations);
-    expect([...held.entries()]).toEqual([['vm-1', ['web-01 (plan "Finance", precopy)']]]);
+    expect([...held.entries()]).toEqual([['vm-1', ['web-01 (plan "Finance", p2, precopy)', 'web-01 (plan "Finance", p3, precopy)']]]);
   });
 
   it('counts a completed migration as holding until it is finalized', () => {
     const held = heldElsewhere(['vm-6'], 'src-a', undefined, plans, [migration('p2', 'vm-6', 'web-06', 'completed')]);
-    expect([...held.values()]).toEqual([['web-06 (plan "Finance", completed)']]);
+    expect([...held.values()]).toEqual([['web-06 (plan "Finance", p2, completed)']]);
   });
 });

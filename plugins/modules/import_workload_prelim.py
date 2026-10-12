@@ -159,10 +159,12 @@ state_file:
 
 from ansible.module_utils.basic import AnsibleModule
 
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import filesystem
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
 
 import os
+import re
 
 
 def run_module():
@@ -196,26 +198,27 @@ def run_module():
         )
 
     # Assume an existing VM with the same name means it was already migrated.
-    # With Nova, the 'name' parameter for list request is a regular expression.
-    server_name_regex = f"^{server_name}$"
-    if (
-        len(
-            list(
-                conn.compute.servers(
-                    details=False,
-                    name=server_name_regex,
-                    **module.params["dst_filters"],
-                )
-            )
+    # With Nova, the 'name' parameter for list request is a regular expression:
+    # the name is a literal, and only a server of exactly that name counts (SDD §6.6).
+    server_name_regex = "^%s$" % re.escape(server_name)
+    same_named = [
+        candidate
+        for candidate in conn.compute.servers(
+            details=False,
+            name=server_name_regex,
+            **module.params["dst_filters"],
         )
-        > 0
-    ):
+        if candidate.name == server_name
+    ]
+    if same_named:
         module.exit_json(
             msg=f"VM '{server_name}' already exists on destination, skipping.", **result
         )
 
-    result["log_file"] = os.path.join(log_dir, server_name) + ".log"
-    result["state_file"] = os.path.join(log_dir, server_name) + ".state"
+    # the VM name is the tenant's: never a path (SDD §7.2)
+    stem = filesystem.workload_file_stem(server_name)
+    result["log_file"] = os.path.join(log_dir, stem) + ".log"
+    result["state_file"] = os.path.join(log_dir, stem) + ".state"
     result["changed"] = True
 
     module.exit_json(**result)

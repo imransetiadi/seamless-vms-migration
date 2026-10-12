@@ -32,6 +32,8 @@ _NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,200}$")
 _KEY = re.compile(r"^[A-Za-z0-9_]+$")
 SA_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 MANAGED_BY = "seamless-migrate"
+#: an operator's Secret made for providers (SDD §13.3); the store reads no other it did not write
+PROVIDER_SECRET_LABEL = "seamless.io/provider-secret"
 K8S_PREFIX = "seamless-"
 
 
@@ -45,8 +47,13 @@ class SecretStore(Protocol):
     def delete(self, name: str) -> None: ...
 
 
+def kubernetes_name(name: str) -> bool:
+    """Whether ``name`` can be a Secret of this store (lower-case, no ``_``; SDD §13.3)."""
+    return bool(_NAME.fullmatch(name))
+
+
 def _check(name: str, values: Mapping[str, str] | None = None) -> None:
-    if not _NAME.match(name):
+    if not kubernetes_name(name):
         raise SecretStoreError(f"invalid secret name {name!r}")
     for key in values or {}:
         if not _KEY.match(key):
@@ -74,6 +81,10 @@ class FileSecretStore:
         _check(name, values)
         try:
             self.root.mkdir(parents=True, exist_ok=True)
+            if self.root.stat().st_uid == os.geteuid():
+                # created or owned: the secret names are not for other local users; a mount
+                # the store does not own keeps its mode (SDD §13.3)
+                os.chmod(self.root, 0o700)
             directory = self.root / name
             directory.mkdir(mode=0o700, exist_ok=True)
             os.chmod(directory, 0o700)
@@ -167,7 +178,16 @@ class KubernetesSecretStore:
             return None
         if response.status_code != 200:
             raise SecretStoreError(f"reading secret failed: HTTP {response.status_code}")
-        data = response.json().get("data") or {}
+        secret = response.json()
+        labels = (secret.get("metadata") or {}).get("labels") or {}
+        # never the deployment's own Secrets (seamless-db, seamless-tokens, ...): only the store's
+        # own writes and the ones an operator labelled for providers (SDD §13.3)
+        if (
+            labels.get("app.kubernetes.io/managed-by") != MANAGED_BY
+            and labels.get(PROVIDER_SECRET_LABEL) != "true"
+        ):
+            return None
+        data = secret.get("data") or {}
         return {k: base64.b64decode(v).decode("utf-8") for k, v in data.items()}
 
     def write(self, name: str, values: Mapping[str, str], labels: Mapping[str, str]) -> None:

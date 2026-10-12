@@ -1,9 +1,11 @@
 import {
   Activity,
+  BadgeCheck,
   CircleCheck,
   CircleX,
   ClipboardX,
   Gauge,
+  Hourglass,
   Layers,
   ListChecks,
   Pause,
@@ -16,32 +18,39 @@ import {
 import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useMigrations, usePlan, usePlanAction, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
+import { useMigrations, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
-import type { Plan, Provider, ValidationReport } from '../api/types';
+import type { AdvisorPolicy, Plan, Provider, ValidationReport } from '../api/types';
+import { AdvisorApprovals } from '../components/AdvisorApprovals';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PlanCreateDialog } from '../components/PlanCreateDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { TextField } from '../components/Field';
-import { FindingGroupsList, type FindingRow } from '../components/FindingsList';
+import { FinalizePlanDialog, FinalizeQueue, FinalizeSkippedNotice, type FinalizeScope } from '../components/FinalizeQueue';
+import { FindingGroupsList } from '../components/FindingsList';
 import { KpiTile } from '../components/KpiTile';
 import { MigrationsTable } from '../components/MigrationsTable';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
+import { ProbeWarnings } from '../components/ProbeWarnings';
 import { PlanStatusBadge } from '../components/StatusBadge';
 import { Unavailable } from '../components/Unavailable';
 import { WavesBoard } from '../components/WavesBoard';
+import { DECISION_TYPE_LABELS, thresholdDecimals } from '../lib/advisor';
 import { cn } from '../lib/cn';
-import { groupFindings } from '../lib/findings';
+import { finalizedText, finalizeQueue, isOverdue, skippedVms, type SkippedVm } from '../lib/finalize';
 import { formatBytes, formatDateTime, formatDuration, formatNumber, formatPct, formatRate, formatRelative } from '../lib/format';
 import { clearedByValidation } from '../lib/migrationActions';
+import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
+import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
+import { usePlanFindings } from '../lib/usePlanFindings';
 
 type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
 
@@ -97,7 +106,27 @@ function windowText(plan: Plan): string {
   return `${formatDateTime(w.start)} → ${formatDateTime(w.end)} (${when})`;
 }
 
-function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[] }) {
+/** What the policy in force does with a migration strategy decision (SDD §14.6, §16, ADV-20). */
+function policyModeText(policy: AdvisorPolicy): string {
+  const what = DECISION_TYPE_LABELS.migration_strategy.toLowerCase();
+  return policy.mode === 'always_require_approval'
+    ? `Asks a person for every ${what} decision`
+    : `Applies a ${what} decision at ${formatPct(policy.threshold * 100, thresholdDecimals(policy.threshold))} confidence or more`;
+}
+
+function SettingsSummary({
+  plan,
+  providers,
+  policy,
+  builtIn = false,
+}: {
+  plan: Plan;
+  providers: Provider[];
+  /** The advisor policy in force; undefined while unknown (loading or not loaded). */
+  policy: AdvisorPolicy | undefined;
+  /** No stored policy applies: the built-in default decides, named as on /advisor/policies. */
+  builtIn?: boolean;
+}) {
   const source = providers.find((p) => p.id === plan.source_provider_id);
   const destination = providers.find((p) => p.id === plan.destination_provider_id);
   const overrides = Object.keys(plan.strategy_overrides).length;
@@ -117,7 +146,29 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         {strategyLabel(plan.default_strategy)} · {plan.selection_policy === 'min_downtime' ? 'minimum downtime' : 'simplest meeting the SLO'}
         {overrides > 0 && <span className="block text-xs text-muted-foreground">{overrides} per-VM override(s)</span>}
       </Setting>
-      <Setting label="Require approval">{plan.require_approval ? 'Yes — an approver must approve each cutover' : 'No'}</Setting>
+      {/* the two kinds of approval, each named (SDD §16, ADV-20) */}
+      <Setting label="Cutover approval">
+        {plan.require_approval
+          ? plan.require_distinct_approver
+            ? 'Yes — an approver other than the requester must approve each cutover'
+            : 'Yes — an approver must approve each cutover'
+          : 'No'}
+      </Setting>
+      <Setting label="Advisor policy">
+        {policy ? (
+          <>
+            <Link to={`/advisor/policies#policy-${encodeURIComponent(policy.id)}`} className="underline underline-offset-4">
+              {builtIn ? 'Built-in default' : policy.name}
+            </Link>
+            <span className="block text-xs text-muted-foreground">
+              {policyModeText(policy)}
+              {plan.default_strategy !== 'auto' && '; not asked while the plan sets the strategy'}
+            </span>
+          </>
+        ) : (
+          <span className="text-muted-foreground">Unknown</span>
+        )}
+      </Setting>
       <Setting label="Cutover trigger">{plan.auto_cutover ? 'Automatic once the gate opens' : 'On request (Cutover action)'}</Setting>
       <Setting label="Cutover window">{windowText(plan)}</Setting>
       <Setting label="Warm sync">
@@ -150,6 +201,12 @@ function SettingsSummary({ plan, providers }: { plan: Plan; providers: Provider[
         auto-rollback {v.auto_rollback ? 'on' : 'off'} · advisor {v.use_advisor ? 'on' : 'off'}
       </Setting>
       <Setting label="Pre-staged resources">{plan.prestage_resources.join(', ') || '—'}</Setting>
+      {plan.port_creation_mode === 'neutron' && <Setting label="Ports">MAC and fixed IPs kept</Setting>}
+      {Object.keys(plan.nic_overrides ?? {}).length > 0 && (
+        <Setting label="Network overrides">
+          {Object.keys(plan.nic_overrides).length === 1 ? '1 VM' : `${Object.keys(plan.nic_overrides).length} VMs`}
+        </Setting>
+      )}
       {mappingCount > 0 && (
         <div className="min-w-0 sm:col-span-2 xl:col-span-4">
           <dt className="text-xs uppercase tracking-wide text-muted-foreground">Mappings</dt>
@@ -207,6 +264,7 @@ export default function PlanDetail() {
   const migrations = useMigrations({ plan_id: planId });
   const providers = useProviders();
   const stats = useStats(planId);
+  const policies = usePolicies();
   const role = useRole();
   const action = usePlanAction(planId);
   const waveSizeId = useId();
@@ -216,20 +274,24 @@ export default function PlanDetail() {
   const [editing, setEditing] = useState(false);
   const [clearing, setClearing] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [finalizing, setFinalizing] = useState<FinalizeScope | null>(null);
   // the outcome of Start, Resume, Pause and Auto-plan waves, for screen readers (SDD §16)
   const [announcement, setAnnouncement] = useState('');
+  // what the last bulk finalize skipped, shown until dismissed (SDD §16)
+  const [notFinalized, setNotFinalized] = useState<SkippedVm[]>([]);
   // the header's Validate and Auto-plan waves stay on the page: they take the focus when the empty
   // state an action was started from goes away with it (SDD §16)
   const validateRef = useRef<HTMLButtonElement>(null);
   const wavesRef = useRef<HTMLButtonElement>(null);
   const emptyValidateRef = useRef<HTMLButtonElement>(null);
+  // the plan's heading takes the focus when an action takes its button with it — Start, Resume, Finalize — read
+  // by the dialog as it closes: empty on Cancel, so focus goes back to the button (SDD §16)
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const afterActionRef = useRef<HTMLElement | null>(null);
   usePageTitle(plan.data?.name ?? 'Plan');
 
   const list = useMemo(() => migrations.data ?? [], [migrations.data]);
-  const findings = useMemo<FindingRow[]>(
-    () => list.flatMap((m) => m.findings.map((f) => ({ ...f, vmName: m.vm.name, migrationId: m.id }))),
-    [list],
-  );
+  const { rows: findings, groups: findingGroups } = usePlanFindings(list);
 
   if (plan.isPending) return <LoadingBlock label="Loading plan…" rows={6} />;
   if (plan.error || !plan.data) {
@@ -287,16 +349,33 @@ export default function PlanDetail() {
   // what is built from the migrations reads as unknown when they could not be loaded, never as empty (SDD §16)
   const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
   const migrationCount = migrations.data?.length ?? s?.total;
+  // the primary action follows the derived status (SDD §8.1, ADV-19): Start is hidden once it has nothing to
+  // start — while the plan runs (Pause is its action) and once its migrations ended; a Completed plan finalizes
+  const ended = p.derived_status === 'completed' || p.derived_status === 'finalized';
+  // the advisor policy in force for the plan's strategy decisions (SDD §14.6, §16, ADV-20)
+  const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
+  const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
+  const startShown = p.status !== 'running' && !ended;
+  const askStart = () => {
+    afterActionRef.current = null;
+    setConfirm('start');
+  };
+  const askFinalize = (scope: FinalizeScope) => {
+    afterActionRef.current = null;
+    setFinalizing(scope);
+  };
+  const overdue = finalizeQueue(list).filter((m) => isOverdue(m, p.finalize_warning_h)).length;
 
   return (
     <>
       <PageHeader
         title={p.name}
+        titleRef={headingRef}
         breadcrumbs={[{ label: 'Plans', to: '/plans' }, { label: p.name }]}
         description={p.description ?? undefined}
         meta={
           <>
-            <PlanStatusBadge status={p.status} size="md" />
+            <PlanStatusBadge status={p.derived_status} size="md" />
             <code className="text-xs text-muted-foreground">{p.id}</code>
             <span className="text-xs text-muted-foreground">updated {formatRelative(p.updated_at)}</span>
           </>
@@ -319,12 +398,22 @@ export default function PlanDetail() {
             <Button ref={wavesRef} size="lg" icon={Rows3} disabledReason={actions.waves.reason} onClick={() => setConfirm('waves')}>
               Auto-plan waves
             </Button>
-            <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={() => setConfirm('start')}>
-              {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
-            </Button>
-            <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
-              Pause
-            </Button>
+            {p.derived_status === 'completed' ? (
+              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
+                Finalize all
+              </Button>
+            ) : (
+              startShown && (
+                <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={askStart}>
+                  {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
+                </Button>
+              )
+            )}
+            {!ended && (
+              <Button size="lg" icon={Pause} disabledReason={actions.pause.reason} onClick={() => setConfirm('pause')}>
+                Pause
+              </Button>
+            )}
           </div>
         }
       />
@@ -342,24 +431,47 @@ export default function PlanDetail() {
           open
           onClose={() => setEditing(false)}
           plan={p}
+          failedVms={list.filter((m) => m.phase === 'failed').map((m) => m.vm.name)}
           onSaved={() => setAnnouncement('Plan saved. It is a draft again: validate it before starting.')}
         />
       )}
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
-      <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3 2xl:grid-cols-6">
+      <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
         <KpiTile label="In progress" value={formatNumber(s?.in_progress)} icon={Activity} tone="progress" />
-        <KpiTile label="Completed" value={formatNumber(s?.completed)} icon={CircleCheck} tone="success" />
+        {/* Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19) */}
+        <KpiTile
+          label="Awaiting finalize"
+          value={formatNumber(s?.awaiting_finalize)}
+          icon={Hourglass}
+          tone={overdue > 0 ? 'warning' : 'neutral'}
+          hint={overdue > 0 ? `${overdue} overdue` : undefined}
+        />
+        <KpiTile label="Finalized" value={formatNumber(s?.finalized)} icon={BadgeCheck} tone="success" />
         <KpiTile label="Failed" value={formatNumber(s?.failed)} icon={CircleX} tone={(s?.failed ?? 0) > 0 ? 'danger' : 'neutral'} />
-        <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={`SLO ${formatDuration(p.downtime_slo_s)}`} />
-        <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} />
+        {/* a migration whose numbers do not hold is counted, not measured (SDD §5.5) */}
+        <KpiTile label="Avg downtime" value={formatDuration(s?.avg_downtime_s)} icon={Timer} hint={[`SLO ${formatDuration(p.downtime_slo_s)}`, leftOutText(s)].filter(Boolean).join('; ')} />
+        <KpiTile label="SLO compliance" value={formatPct(s?.slo_compliance_pct)} icon={Gauge} hint={leftOutText(s) ?? undefined} />
       </section>
 
       <div className="flex flex-col gap-4">
+        <AdvisorApprovals planId={p.id} migrations={migrations.data ?? []} onDecided={setAnnouncement} />
+        {notFinalized.length > 0 && (
+          <FinalizeSkippedNotice
+            skipped={notFinalized}
+            onDismiss={() => {
+              setNotFinalized([]);
+              headingRef.current?.focus();
+            }}
+          />
+        )}
+        <FinalizeQueue plan={p} migrations={list} gate={actions.finalize} allInHeader={p.derived_status === 'completed'} onFinalize={askFinalize} />
+        <ProbeWarnings plan={p} migrations={migrations.data ?? []} edit={actions.edit} onSaved={setAnnouncement} focusAfterRef={headingRef} />
+
         <Panel title="Settings" description="What the orchestrator will do for every VM in this plan">
-          <SettingsSummary plan={p} providers={providers.data ?? []} />
+          <SettingsSummary plan={p} providers={providers.data ?? []} policy={policy?.policy} builtIn={policy?.builtIn} />
         </Panel>
 
         <Panel title="Waves" description="Waves run in order; a wave starts when the waves it depends on are complete">
@@ -411,7 +523,7 @@ export default function PlanDetail() {
               <Unavailable what="findings" />
             ) : (
               <FindingGroupsList
-                groups={groupFindings(findings)}
+                groups={findingGroups}
                 emptyText={preflightDone ? undefined : 'No findings yet — pre-flight runs when the plan is validated.'}
               />
             )}
@@ -433,14 +545,30 @@ export default function PlanDetail() {
         confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
+        returnFocusRef={afterActionRef}
         onConfirm={() =>
-          run({ action: 'start' }, () =>
-            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.'),
-          )
+          run({ action: 'start' }, () => {
+            // a started plan runs: Start goes, Pause is its action
+            afterActionRef.current = headingRef.current;
+            setAnnouncement(p.status === 'paused' ? 'Plan resumed.' : p.status === 'failed' ? 'Plan started again.' : 'Plan started.');
+          })
         }
         onCancel={() => {
           setConfirm(null);
           action.reset();
+        }}
+      />
+      <FinalizePlanDialog
+        plan={p}
+        migrations={list}
+        scope={finalizing}
+        returnFocusRef={afterActionRef}
+        onClose={() => setFinalizing(null)}
+        onDone={(result) => {
+          // Finalize all and Finalize wave go once their VMs are finalized
+          afterActionRef.current = headingRef.current;
+          setAnnouncement(finalizedText(result));
+          setNotFinalized(skippedVms(result, list));
         }}
       />
       <ConfirmDialog
@@ -501,6 +629,7 @@ export default function PlanDetail() {
           value={waveSize}
           onChange={(e) => setWaveSize(e.target.value)}
           error={waveSizeValid ? null : 'Enter a whole number from 1 to 1000.'}
+          liveError
           hint="A wave may exceed this to keep an application together."
         />
       </ConfirmDialog>

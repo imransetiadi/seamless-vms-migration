@@ -1,4 +1,6 @@
 import type { Migration, Plan } from '../api/types';
+import { isOverdue } from './finalize';
+import { countedApprovals } from './migrationActions';
 import { formatRelative } from './format';
 import type { Tone } from './phase';
 import { isWaveActive } from './waves';
@@ -22,17 +24,13 @@ function windowState(plan: Plan | undefined, now: number): 'none' | 'open' | 'cl
   return now >= start && now <= end ? 'open' : 'closed';
 }
 
-/** What a human has to do next for a migration that is waiting at the cutover gate (SDD §5.4). */
+/**
+ * What a human has to do next for a migration that is waiting at the cutover gate (SDD §5.4). An approval still
+ * to give is listed once on the Overview, in Pending approvals (lib/approvals.ts, SDD §16, ADV-20): the gate's
+ * own count, so the requester's approval does not count under maker-checker.
+ */
 function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: number): AttentionItem | null {
-  if (plan && plan.require_approval && m.approvals.length === 0) {
-    return {
-      migration: m,
-      tone: 'warning',
-      reason: m.phase === 'awaiting_cutover' ? 'Converged — waiting for approval' : 'Ready for cutover — waiting for approval',
-      nextAction: 'Approve or request cutover (approver)',
-      rank,
-    };
-  }
+  if (plan && plan.require_approval && countedApprovals(m, plan).length === 0) return null;
   if (plan && !plan.auto_cutover && !m.cutover_requested) {
     return {
       migration: m,
@@ -54,8 +52,17 @@ function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: numbe
   return null;
 }
 
-/** Migrations that need a human, most urgent first — one entry per migration. */
-export function attentionItems(migrations: Migration[], plans: ReadonlyMap<string, Plan>, now = Date.now()): AttentionItem[] {
+/**
+ * Migrations that need a human, most urgent first — one entry per migration. When the plans could not be
+ * loaded (`plansUnknown`), a converged migration still waits at the cutover gate: listed with what it waits
+ * for unknown, never left out (SDD §16).
+ */
+export function attentionItems(
+  migrations: Migration[],
+  plans: ReadonlyMap<string, Plan>,
+  now = Date.now(),
+  { plansUnknown = false }: { plansUnknown?: boolean } = {},
+): AttentionItem[] {
   const items: AttentionItem[] = [];
   for (const m of migrations) {
     const plan = plans.get(m.plan_id);
@@ -68,6 +75,15 @@ export function attentionItems(migrations: Migration[], plans: ReadonlyMap<strin
         nextAction: 'Roll back to restart the source, or retry (operator)',
         rank: 0,
       };
+    } else if (m.phase === 'completed' && m.source_running_at) {
+      // the source watch saw it running again (SDD §8.1): what it writes no longer reaches RHOSO
+      item = {
+        migration: m,
+        tone: 'danger',
+        reason: 'The source VM runs again: its data diverges from RHOSO',
+        nextAction: 'Stop the source VM, or roll it back (operator)',
+        rank: 1,
+      };
     } else if (m.phase === 'failed') {
       item = { migration: m, tone: 'danger', reason: m.error ? `Failed: ${m.error}` : 'Failed', nextAction: 'Retry, roll back or cancel (operator)', rank: 1 };
     } else if (m.review_required) {
@@ -79,7 +95,16 @@ export function attentionItems(migrations: Migration[], plans: ReadonlyMap<strin
         rank: 2,
       };
     } else if (m.phase === 'awaiting_cutover') {
-      item = gateItem(m, plan, now, 3);
+      item =
+        plan || !plansUnknown
+          ? gateItem(m, plan, now, 3)
+          : {
+              migration: m,
+              tone: 'warning',
+              reason: 'Converged — waiting at the cutover gate',
+              nextAction: 'Load the plans again to see whether it waits for an approval, a cutover request or its window',
+              rank: 3,
+            };
     } else if (
       m.phase === 'ready' &&
       SINGLE_SHOT.has(m.strategy) &&
@@ -100,6 +125,15 @@ export function attentionItems(migrations: Migration[], plans: ReadonlyMap<strin
       };
     } else if (m.phase === 'rolling_back') {
       item = { migration: m, tone: 'info', reason: 'Rolling back — restarting the source VM', nextAction: 'Watch the rollback; retry when fixed', rank: 5 };
+    } else if (m.phase === 'completed' && plan && isOverdue(m, plan.finalize_warning_h, now)) {
+      // past the plan's finalize reminder (SDD §8.1, ADV-19); without its plan the reminder is unknown
+      item = {
+        migration: m,
+        tone: 'warning',
+        reason: `Waiting for finalize longer than the plan allows (${plan.finalize_warning_h} h)`,
+        nextAction: 'Finalize or roll it back (approver)',
+        rank: 6,
+      };
     }
     if (item) items.push(item);
   }

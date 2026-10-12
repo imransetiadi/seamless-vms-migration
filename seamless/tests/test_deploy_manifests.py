@@ -5,6 +5,8 @@ result (``.github/workflows/ci.yml``, job manifests); this test reads the overla
 control-plane suite catches a regression without kustomize.
 """
 
+from pathlib import Path
+
 import yaml
 
 from seamless_migrate.config import find_repo_root
@@ -103,3 +105,92 @@ def test_security_md_describes_the_api_token_the_deployment_mounts():
     assert f"`automountServiceAccountToken: {str(mounted).lower()}`" in row, row
     if mounted:
         assert "service account has no Kubernetes API token" not in " ".join(text.split())
+
+
+def test_external_egress_reaches_the_verification_ports_the_plan_form_proposes():
+    """SDD §17, §7.5: a `tcp:<port>` check the policy blocks times out and fails the verification,
+    so auto_rollback would roll back a migration that worked: the dashboard's defaults pass."""
+    import re
+
+    policies = yaml.safe_load_all(
+        (ROOT / "deploy" / "openshift" / "networkpolicy.yaml").read_text(encoding="utf-8")
+    )
+    external = next(
+        p for p in policies if p and p["metadata"]["name"] == "seamless-allow-egress-external"
+    )
+    allowed = {
+        port["port"]
+        for rule in external["spec"]["egress"]
+        for port in rule.get("ports", [])
+        if port.get("protocol", "TCP") == "TCP"
+    }
+    form = (ROOT / "dashboard" / "src" / "components" / "PlanCreateDialog.tsx").read_text(
+        encoding="utf-8"
+    )
+    proposed = {
+        int(port)
+        for field in ("tcpPorts", "windowsTcpPorts")
+        for port in re.findall(r"\d+", re.search(rf"{field}: '([^']*)'", form).group(1))
+    }
+    assert proposed == {22, 3389}
+    assert proposed <= allowed, sorted(proposed - allowed)
+
+
+def test_the_secret_recipe_keeps_the_database_password_off_command_lines():
+    """Security.md §7.2: never a secret on a command line (`ps`, /proc and shell history keep
+    them). The recipe feeds the database Secret through stdin from the printf builtin."""
+    recipe = (ROOT / "deploy" / "openshift" / "secret-example.yaml").read_text(encoding="utf-8")
+    lines = [line.lstrip("#").strip() for line in recipe.splitlines() if line.startswith("#")]
+    assert not [line for line in lines if "from-literal" in line and "PGPW" in line]
+    assert any("--from-env-file=/dev/stdin" in line for line in lines)
+    assert any(line.startswith("printf") and "$PGPW" in line for line in lines)
+
+
+def test_the_control_plane_pod_reaps_the_processes_ansible_leaves():
+    """SDD §17: Ansible's ssh ControlPersist masters outlive their playbook and are re-parented
+    to PID 1; with a shared process namespace that is the pod's pause process, which reaps them,
+    as `init: true` does in Compose - `seamless serve` as PID 1 would leave them as zombies."""
+    docs = yaml.safe_load_all((ROOT / "deploy" / "openshift" / "deployment.yaml").read_text())
+    (deployment,) = [d for d in docs if d and d.get("kind") == "Deployment"]
+    assert deployment["spec"]["template"]["spec"].get("shareProcessNamespace") is True
+    compose = yaml.safe_load((ROOT / "deploy" / "compose" / "compose.yaml").read_text())
+    assert compose["services"]["seamless"].get("init") is True
+
+
+def test_the_route_tells_browsers_to_keep_to_https():
+    """SDD §17, Security.md R-05: the OpenShift router adds no HSTS by default and the pod serves
+    plain HTTP behind the edge Route, so the Route asks for it (at least a year)."""
+    import re
+
+    route = yaml.safe_load((ROOT / "deploy" / "openshift" / "route.yaml").read_text())
+    hsts = route["metadata"]["annotations"].get("haproxy.router.openshift.io/hsts_header", "")
+    age = re.search(r"max-age=(\d+)", hsts)
+    assert age and int(age.group(1)) >= 31536000, hsts
+    assert route["spec"]["tls"]["insecureEdgeTerminationPolicy"] == "Redirect"
+
+
+def _compose_files(**make_vars: str) -> list[str]:
+    """The Compose files `make seamless-up` passes for these Make variables (a dry run)."""
+    import re
+    import subprocess
+
+    args = ["make", "-n", "--no-print-directory", "seamless-up"]
+    args += [f"{name}={value}" for name, value in make_vars.items()]
+    out = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    line = next(ln for ln in out.splitlines() if " up -d " in ln)
+    return [Path(f).name for f in re.findall(r" -f (\S+)", line)]
+
+
+def test_a_linux_docker_engine_maps_host_docker_internal_to_the_host():
+    """SDD §17.1: only a Linux machine's own Docker Engine gets compose.linux-host.yaml; on Colima
+    and Docker Desktop the name already reaches the developer's machine (host-gateway would be
+    their VM)."""
+    override = "compose.linux-host.yaml"
+    linux = dict(SEAMLESS_HOST_OS="Linux", SEAMLESS_DOCKER_CONTEXT="default")
+    assert override in _compose_files(**linux)
+    assert override not in _compose_files(**{**linux, "SEAMLESS_DOCKER_CONTEXT": "colima-x"})
+    assert override not in _compose_files(**{**linux, "SEAMLESS_HOST_OS": "Darwin"})
+    assert override not in _compose_files(**{**linux, "SEAMLESS_ENGINE": "podman"})
+    mapped = yaml.safe_load((ROOT / "deploy" / "compose" / override).read_text())
+    hosts = mapped["services"]["seamless"]["extra_hosts"]
+    assert hosts == ["host.docker.internal:host-gateway"]

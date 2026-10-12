@@ -35,6 +35,10 @@ description:
     C(kept_volume_ids). The file is kept while a source snapshot is still
     pending, so its temporary resources can be cleaned up with
     M(os_migrate.os_migrate.import_workload_warm_snapshot)."
+  - "Then deletes the destination ports created through Neutron for the
+    workload's ports (C(port_creation_mode=neutron)): Nova keeps them when it
+    deletes their server, and a cutover can fail between creating them and
+    creating the server. A port another server uses is kept."
   - "Starting the source server again is left to the caller."
 
 options:
@@ -110,6 +114,12 @@ kept_volume_ids:
   type: list
   elements: str
   sample: []
+deleted_port_ids:
+  description: IDs of the deleted destination ports that were created through Neutron.
+  returned: success
+  type: list
+  elements: str
+  sample: [6f2b0c1e-2d0a-4f4e-9a55-0d1f8c3b7a21]
 state_deleted:
   description: Whether the warm state file was removed.
   returned: success
@@ -146,6 +156,9 @@ def run_module():
 
     ser_server = server.Server.from_data(params["data"])
     server_id = ser_server.info()["id"]
+    source_port_ids = [
+        (port.get("_info") or {}).get("id") for port in ser_server.params().get("ports") or []
+    ]
     try:
         state = WarmState.load(params["state_dir"], server_id)
     except ValueError as err:
@@ -161,6 +174,7 @@ def run_module():
             dst_filters=params["dst_filters"],
             timeout=params["timeout"],
             conversion_host=params["conversion_host"],
+            source_port_ids=[port_id for port_id in source_port_ids if port_id],
         ).run(delete_volumes=params["delete_dest_volumes"])
     except Exception as err:  # pylint: disable=broad-except
         module.fail_json(msg="Rollback of server %s failed: %s" % (server_id, err))

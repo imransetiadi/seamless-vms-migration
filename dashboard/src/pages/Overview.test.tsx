@@ -1,11 +1,44 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import type { Migration } from '../api/types';
 import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
 describe('Overview page (mock data)', () => {
+  it("keeps the figures readable while another plan's statistics load: greyed and busy, never faded (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    let hold = false;
+    renderWithApp(<Overview />, {
+      // once a plan is chosen, its statistics never answer: the previous figures stay on show
+      wrapFetch: (mock) => (input, init) => (hold && String(input).split('?')[0]!.endsWith('/api/v1/stats') ? new Promise<Response>(() => {}) : mock(input, init)),
+    });
+    const strip = await screen.findByRole('region', { name: 'Key metrics' });
+    expect(strip).not.toHaveAttribute('aria-busy');
+    hold = true;
+    await user.selectOptions(screen.getByLabelText('Plan'), 'plan-4f2a9c1e');
+    await waitFor(() => expect(strip).toHaveAttribute('aria-busy', 'true'));
+    expect(strip.className).not.toMatch(/opacity-/);
+    const values = Array.from(strip.querySelectorAll('.num'));
+    expect(values.length).toBeGreaterThan(0);
+    for (const value of values) expect(value).toHaveClass('text-muted-foreground');
+  });
+
+  it('keeps a plan in the address that names no plan chosen, and says it does not exist instead of an all-clear (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Overview />, { route: '/?plan=plan-00000000', path: '/', token: 'viewer' });
+    expect(await screen.findByText(/^plan plan-00000000 does not exist$/i)).toBeInTheDocument();
+    const select = screen.getByLabelText(/^plan$/i);
+    expect(select).toHaveValue('plan-00000000');
+    // no zeros read as all clear
+    expect(screen.queryByText(/no vm is down/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /show all plans/i }));
+    await waitFor(() => expect(screen.getByLabelText(/^plan$/i)).toHaveValue(''));
+    expect(screen.queryByText(/does not exist/i)).not.toBeInTheDocument();
+  });
+
   it('renders KPI tiles from /stats', async () => {
     const { server } = renderWithApp(<Overview />);
 
@@ -15,6 +48,29 @@ describe('Overview page (mock data)', () => {
     const failed = server.migrations.filter((m) => m.phase === 'failed').length;
     expect(screen.getByRole('group', { name: 'Failed' })).toHaveTextContent(String(failed));
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
+  });
+
+  it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
+    const { server } = renderWithApp(<Overview />);
+    const awaiting = await screen.findByRole('group', { name: 'Awaiting finalize' });
+    expect(awaiting).toHaveTextContent(String(server.migrations.filter((m) => m.phase === 'completed').length));
+    expect(screen.getByRole('group', { name: 'Finalized' })).toHaveTextContent(String(server.migrations.filter((m) => m.phase === 'finalized').length));
+    expect(screen.queryByRole('group', { name: 'Completed' })).not.toBeInTheDocument();
+  });
+
+  it('says how many completed migrations the downtime figures leave out, and why (SDD §5.5, ADV-16)', async () => {
+    const server = createTestServer();
+    server.migrations.find((m) => m.id === 'mig-3c1a0f9e21')!.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];
+    renderWithApp(<Overview />, { server });
+    const average = await screen.findByRole('group', { name: 'Average downtime' });
+    expect(average).toHaveTextContent('1 left out: data inconsistent');
+    expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('1 left out: data inconsistent');
+  });
+
+  it('says nothing is left out while every completed migration holds together', async () => {
+    renderWithApp(<Overview />);
+    const average = await screen.findByRole('group', { name: 'Average downtime' });
+    expect(average).not.toHaveTextContent(/left out/);
   });
 
   it('puts the VMs that are down right now first, with their clock and SLO budget', async () => {
@@ -54,6 +110,19 @@ describe('Overview page (mock data)', () => {
       expect(line).not.toHaveClass(TONE_CLASSES.warning.text);
       expect(line.querySelector('svg')).toBeNull();
     }
+  });
+
+  it('runs the Downtime now clocks in model time in demo mode, as the migration page does (SDD §16, ADV-16)', async () => {
+    const server = createTestServer();
+    server.health = { ...server.health, demo_speed: 60 };
+    const web03 = server.migrations.find((m) => m.vm.name === 'web-03')!;
+    web03.downtime_started_at = new Date(Date.now() - 5_000).toISOString();
+    renderWithApp(<Overview />, { server });
+    const down = await screen.findByRole('region', { name: /downtime now/i });
+    const item = (await within(down).findByRole('link', { name: 'web-03' })).closest('li')!;
+    // about 5 s of wall time: about 5 minutes of model time
+    await waitFor(() => expect(item).toHaveTextContent(/\b[5-6]:\d{2}of /));
+    expect(down).toHaveTextContent('Demo time: 60× faster than real time.');
   });
 
   it('turns the clock red and says by how much once a cutover runs over its SLO', async () => {
@@ -118,9 +187,32 @@ describe('Overview page (mock data)', () => {
     const attention = await screen.findByRole('region', { name: /needs attention/i });
     await within(attention).findByRole('link', { name: 'legacy-rhel6-app' });
     expect(attention).toHaveTextContent(/source VM is stopped/i);
-    expect(within(attention).getByRole('link', { name: 'app-billing-01' })).toBeInTheDocument();
-    expect(attention).toHaveTextContent(/waiting for approval/i);
     expect(within(attention).getByRole('link', { name: 'gpu-render-01' })).toBeInTheDocument();
+  });
+
+  it('lists the pending approvals of both kinds once, each with its kind, filtered by kind (SDD §16, ADV-20)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Overview />);
+    const inbox = await screen.findByRole('region', { name: 'Pending approvals' });
+    const billing = await within(inbox).findByRole('listitem', { name: 'app-billing-01' });
+    expect(billing).toHaveTextContent('Cutover approval');
+    expect(billing).toHaveTextContent('Converged: waiting for an approval; keep-warm syncs run meanwhile.');
+    expect(within(billing).getByRole('link', { name: 'app-billing-01' })).toHaveAttribute('href', expect.stringMatching(/^\/migrations\/mig-/));
+    const held = within(inbox).getByRole('listitem', { name: 'analytics-node-2' });
+    expect(held).toHaveTextContent('Advisor decision · Migration strategy');
+    expect(held).toHaveTextContent('Shared Ceph handover — analytics');
+    expect(within(held).getByRole('link', { name: 'analytics-node-2' })).toHaveAttribute('href', '/advisor/recommendations/rec-b2c4d6e87101');
+    expect(within(inbox).getAllByRole('listitem')).toHaveLength(3);
+    // listed once on the page: Needs attention leaves it to the inbox
+    const attention = screen.getByRole('region', { name: 'Needs attention' });
+    expect(within(attention).queryByRole('link', { name: 'app-billing-01' })).not.toBeInTheDocument();
+
+    await user.click(within(inbox).getByRole('radio', { name: 'Advisor decision (1)' }));
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['analytics-node-2']);
+    await user.click(within(inbox).getByRole('radio', { name: 'Cutover approval (2)' }));
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['ad-dc-01', 'app-billing-01']);
+    await user.click(within(inbox).getByRole('radio', { name: 'All (3)' }));
+    expect(within(inbox).getAllByRole('listitem')).toHaveLength(3);
   });
 
   it('shows the phase distribution with labels and counts', async () => {
@@ -176,11 +268,74 @@ describe('Overview page (mock data)', () => {
     expect(screen.queryByText(/no plans yet/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
     // they say they are unknown instead, and the key figures are dashes, not zeros
-    expect(screen.getAllByText(/unknown: the migrations could not be loaded/i)).toHaveLength(2);
+    expect(screen.getAllByText(/unknown: the migrations could not be loaded/i)).toHaveLength(3);
     expect(screen.getAllByText(/unknown: the statistics could not be loaded/i)).toHaveLength(3);
     expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /key metrics/i });
     expect(within(metrics).getByRole('group', { name: 'Failed' })).toHaveTextContent('Failed—');
+  });
+
+  it('never reads a failed plans load as all clear while the migrations load (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/plans'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Overview />, { server });
+    expect(await screen.findByText(/plans are unavailable/i)).toBeInTheDocument();
+    // a converged migration still waits at the cutover gate: for what is unknown, never "nothing"
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    expect(await within(attention).findByRole('link', { name: 'app-billing-01' })).toBeInTheDocument();
+    expect(within(attention).getByText(/waiting at the cutover gate/i)).toBeInTheDocument();
+    expect(within(attention).getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    expect(within(attention).queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+    // the inbox cannot tell the cutover approvals, and still lists the advisor decisions (ADV-20)
+    const inbox = screen.getByRole('region', { name: 'Pending approvals' });
+    expect(within(inbox).getByText('Cutover approvals unknown: the plans could not be loaded.')).toBeInTheDocument();
+    expect(within(inbox).getAllByRole('listitem').map((li) => li.getAttribute('aria-label'))).toEqual(['analytics-node-2']);
+    // a down VM's SLO is unknown, not met
+    const downtime = screen.getByRole('region', { name: 'Downtime now' });
+    expect(within(downtime).getAllByText(/slo unknown: the plans could not be loaded/i).length).toBeGreaterThan(0);
+    // no figure counts the plans or judges against an SLO it does not know
+    const metrics = screen.getByRole('region', { name: /key metrics/i });
+    const total = within(metrics).getByRole('group', { name: 'Migrations' });
+    expect(total).not.toHaveTextContent(/in 0 plans/);
+    expect(total).toHaveTextContent(/plans unknown/);
+    const slo = screen.getByRole('region', { name: 'Downtime vs SLO' });
+    expect(within(slo).getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    // neither the legend nor the data table (rows rendered, closed) gives a verdict
+    expect(within(slo).getAllByRole('row', { hidden: true }).length).toBeGreaterThan(1);
+    expect(within(slo).queryByText(/within slo|over slo/i)).not.toBeInTheDocument();
+  });
+
+  it('says what needs attention is unknown, not nothing, when the plans fail and nothing else is waiting (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET' && path === '/plans') return { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } };
+      const result = handle(method, path, query, body, token);
+      // only finished migrations: nothing a human must do that the migrations alone could show
+      return method === 'GET' && path === '/migrations' && Array.isArray(result.body)
+        ? { ...result, body: (result.body as Migration[]).filter((m) => m.phase === 'completed') }
+        : result;
+    };
+    renderWithApp(<Overview />, { server });
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    expect(await within(attention).findByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
+    expect(within(attention).queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
+  });
+
+  it('waits for the plans before saying what needs attention (SDD §16)', async () => {
+    const pending = new Promise<Response>(() => {});
+    renderWithApp(<Overview />, {
+      wrapFetch: (mock) => (input, init) => (String(input).split('?')[0]!.endsWith('/api/v1/plans') ? pending : mock(input, init)),
+    });
+    // the migrations have loaded (a down VM has its clock), the plans have not
+    const downtime = await screen.findByRole('region', { name: 'Downtime now' });
+    await within(downtime).findByRole('link', { name: 'web-02' });
+    expect(screen.getByText('Loading items that need attention…')).toBeInTheDocument();
+    expect(screen.queryByText(/nothing needs attention/i)).not.toBeInTheDocument();
   });
 
   it('shows plan progress only once the migrations have loaded, never "0 of 0 done" before (SDD §16)', async () => {

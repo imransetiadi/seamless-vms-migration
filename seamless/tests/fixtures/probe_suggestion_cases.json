@@ -1,0 +1,284 @@
+{
+ "_comment": "Application probe suggestions (SDD \u00a79.6, ADV-18), shared by seamless/tests/test_probes.py and dashboard/src/api/mockProbes.test.ts. Each case: a VM's name, tags and os_type -> the probes the rules suggest. A database that names no engine, an old OS or an unknown role gets none; the service must be of the VM's tier (ldap-db-01 is no LDAP server).",
+ "cases": [
+  {
+   "name": "ledger-db-01",
+   "tags": {
+    "role": "postgresql"
+   },
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 5432,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "pg-orders",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 5432,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "payroll-db-01",
+   "tags": {
+    "role": "mysql"
+   },
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 3306,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "galera-02",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 3306,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "billing-db-01",
+   "tags": {
+    "role": "oracle"
+   },
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 1521,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "erp-sqlserver",
+   "tags": {},
+   "os_type": "windows2019srvNext_64Guest",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 1433,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "events-mongo-1",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 27017,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "metrics-cassandra",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 9042,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "ledger-db2",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 50000,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "search-elastic-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 9200,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "docs-couchdb",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 5984,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "orders-rabbit-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 5672,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "stream-kafka-1",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 9092,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "sessions-redis",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 6379,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "shop-tomcat-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 8080,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "hr-weblogic",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 7001,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "idm-ldap-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 389,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "ns1",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "tcp",
+     "port": 53,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "ledger-web-01",
+   "tags": {
+    "role": "frontend"
+   },
+   "os_type": "rhel9",
+   "probes": [
+    {
+     "kind": "http",
+     "port": 80,
+     "path": "/",
+     "expect_status": null
+    }
+   ]
+  },
+  {
+   "name": "dc2-db-01",
+   "tags": {},
+   "os_type": "rhel8_64Guest",
+   "probes": []
+  },
+  {
+   "name": "ldap-db-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": []
+  },
+  {
+   "name": "legacy-rhel6-app",
+   "tags": {},
+   "os_type": "rhel6",
+   "probes": []
+  },
+  {
+   "name": "report-01",
+   "tags": {},
+   "os_type": "rhel9",
+   "probes": []
+  }
+ ]
+}

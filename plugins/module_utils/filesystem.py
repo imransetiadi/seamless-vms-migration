@@ -15,6 +15,17 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import exc
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import serialization
 
 
+def workload_file_stem(name):
+    """The file name stem of a workload's progress and log files (SDD §7.2).
+
+    A VM name is chosen by the tenant: ``%`` is written ``%25``, ``/`` ``%2F``
+    and NUL ``%00``, so a name never names a file outside the log directory
+    and no two names share a file. Other names are unchanged. The control
+    plane reads the progress file by the same rule.
+    """
+    return name.replace("%", "%25").replace("/", "%2F").replace("\0", "%00")
+
+
 def write_or_replace_resource(file_path, resource):
     """Add (or replace if already present) a `resource` into a resource
     file at `file_path`. If the resource is already present *and* its

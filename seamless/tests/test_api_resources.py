@@ -1,15 +1,17 @@
 import asyncio
+import inspect
 import json
 import time
 
+import fastapi.routing
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
-from seamless_migrate.domain.enums import Phase, Role, Strategy, SyncPassKind
-from seamless_migrate.domain.models import Estimate, Migration, Plan, SyncPass, utcnow
-from seamless_migrate.store import Store
+from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
+from seamless_migrate.domain.models import Estimate, Migration, Plan, Provider, SyncPass, utcnow
+from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
 from tests.orch_support import build_harness, make_settings
@@ -63,7 +65,16 @@ def test_provider_crud(api):
     inventory = api.get("/api/v1/providers/src-osp/inventory").json()
     assert len(inventory) == 24 and {"source_id", "disk_bytes", "used_bytes"} <= set(inventory[0])
     dst_inventory = api.get("/api/v1/providers/dst-rhoso/inventory").json()
-    assert set(dst_inventory) == {"networks", "flavors", "volume_types", "quotas", "projects"}
+    assert set(dst_inventory) == {
+        "networks",
+        "flavors",
+        "volume_types",
+        "quotas",
+        "projects",
+        "keypairs",  # SDD §11
+        "subnets",  # SDD §11: where a NIC's addresses must lie
+        "network_details",  # SDD §11: what a NIC's network name resolves to
+    }
 
     # a provider used by a non-terminal plan cannot be deleted
     plan = api.post(
@@ -135,6 +146,59 @@ def test_plan_takes_an_empty_vm_ids_and_refuses_a_missing_one(api):
     assert error == {"code": "validation_error", "message": "vm_ids: Field required"}
 
 
+def test_plan_port_creation_mode_round_trips_and_refuses_other_modes(api):
+    """SDD §4.2/§12: "nova" unless chosen; "neutron" is kept on create and on edit; any other
+    value is a 422 naming the field."""
+    body = {
+        "name": "ports",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["port_creation_mode"] == "nova"
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"port_creation_mode": "neutron"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["port_creation_mode"] == "neutron"
+    bad = api.post("/api/v1/plans", Role.operator, json={**body, "port_creation_mode": "ovs"})
+    assert bad.status_code == 422, bad.text
+    assert "port_creation_mode" in bad.json()["error"]["message"]
+
+
+def test_plan_nic_overrides_round_trip_and_refuse_bad_entries(api):
+    """SDD §12: nic_overrides are stored with lower-case MACs; a bad entry is a 422 naming it."""
+    body = {
+        "name": "nics",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    created = api.post("/api/v1/plans", Role.operator, json=body)
+    assert created.status_code == 201, created.text
+    assert created.json()["nic_overrides"] == {}
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"nic_overrides": {"vm-1": {"FA:16:3E:00:00:01": {"network": "rhoso-dmz"}}}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["nic_overrides"] == {
+        "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": None}}
+    }
+    bad = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={**body, "nic_overrides": {"vm-1": {"fa:16:3e:00:00:01": {"fixed_ips": []}}}},
+    )
+    assert bad.status_code == 422, bad.text
+    assert "nic_overrides[vm-1][fa:16:3e:00:00:01]" in bad.json()["error"]["message"]
+
+
 def test_plan_rejects_out_of_range_tcp_port(api):
     """SDD §12: verification settings that would roll back a good cutover or never open the gate
     are a 422 on create and on edit."""
@@ -165,6 +229,246 @@ def test_plan_rejects_out_of_range_tcp_port(api):
         json={"verification": {"tcp_ports": [65536]}},
     )
     assert patched.status_code == 422 and "65536" in patched.json()["error"]["message"]
+
+
+def test_plan_takes_application_probes_and_refuses_bad_ones(api):
+    """SDD §7.5, §12 (ADV-18): application probes for every VM and per VM, checked like ports."""
+    vm_ids = first_clean_vms(api, n=1)
+    base = {
+        "name": "probes",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    bad = [
+        ({"verification": {"app_probes": [{"kind": "tcp", "port": 70000}]}}, "70000"),
+        ({"verification": {"app_probes": [{"kind": "http", "port": 80, "path": "x"}]}}, "path"),
+        (
+            {
+                "probe_overrides": {
+                    vm_ids[0]: [{"kind": "https", "port": 443, "expect_status": 700}]
+                }
+            },
+            "expect_status",
+        ),
+        ({"verification": {"app_probes": [{"kind": "ftp", "port": 21}]}}, "kind"),
+    ]
+    for extra, needle in bad:
+        refused = api.post("/api/v1/plans", Role.operator, json={**base, **extra})
+        assert refused.status_code == 422, (extra, refused.text)
+        assert needle in refused.json()["error"]["message"]
+    probes = {
+        "verification": {"app_probes": [{"kind": "http", "port": 80}]},
+        "probe_overrides": {vm_ids[0]: [{"kind": "tcp", "port": 5432}]},
+    }
+    created = api.post("/api/v1/plans", Role.operator, json={**base, **probes})
+    assert created.status_code == 201, created.text
+    plan = created.json()
+    assert plan["verification"]["app_probes"] == [
+        {"kind": "http", "port": 80, "path": "/", "expect_status": None}
+    ]
+    assert plan["probe_overrides"] == {
+        vm_ids[0]: [{"kind": "tcp", "port": 5432, "path": "/", "expect_status": None}]
+    }
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"probe_overrides": {vm_ids[0]: []}},
+    )
+    assert patched.status_code == 200 and patched.json()["probe_overrides"] == {vm_ids[0]: []}
+
+
+def test_a_migration_reports_its_verification_and_suggested_probes(api):
+    """SDD §4.2 (ADV-18): Migration.verification (null before one) and suggested_probes."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "suggest",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert (
+        api.post(f"/api/v1/plans/{created.json()['id']}/validate", Role.operator).status_code == 200
+    )
+    [m] = api.get(f"/api/v1/migrations?plan_id={created.json()['id']}", Role.viewer).json()
+    assert m["verification"] is None
+    assert isinstance(m["suggested_probes"], list)
+
+
+def test_plans_carry_their_derived_status_and_finalize_reminder(api):
+    """SDD §4.2, §8.1 (ADV-19): every plan route returns derived_status; the reminder is ≥ 1 h."""
+    vm_ids = first_clean_vms(api, n=1)
+    base = {
+        "name": "status",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json={**base, "finalize_warning_h": 0})
+    assert refused.status_code == 422 and "finalize_warning_h" in refused.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.operator, json=base)
+    assert created.status_code == 201, created.text
+    plan = created.json()
+    assert (plan["derived_status"], plan["finalize_warning_h"]) == ("draft", 72)
+    assert api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()["derived_status"] == "draft"
+    listed = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert listed[plan["id"]]["derived_status"] == "draft"
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    assert (
+        api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()["derived_status"] == "validated"
+    )
+    # the stored lifecycle says validated; its migration completed: the plan reads completed
+    [m] = [x for x in api.store.list("migration", Migration) if x.plan_id == plan["id"]]
+    api.store.put("migration", m.model_copy(update={"phase": Phase.completed}))
+    got = api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()
+    assert (got["status"], got["derived_status"]) == ("validated", "completed")
+    # derived_status is the API's: a client cannot set it
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"derived_status": "finalized"},
+    )
+    assert patched.status_code == 422
+
+
+def test_the_migration_list_is_validated_once_and_sent_as_before(api, monkeypatch):
+    """SDD §12: GET /migrations sends what the store validated, without FastAPI dumping it,
+    validating it again and serializing it (185 ms CPU for 1,000 migrations)."""
+    vm_ids = first_clean_vms(api, n=2)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "list",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    assert api.post(f"/api/v1/plans/{plan_id}/validate", Role.operator).status_code == 200
+    expected = [m.model_dump(mode="json") for m in api.store.list("migration", Migration)]
+    expected_plan = [m for m in expected if m["plan_id"] == plan_id]
+
+    validated_again = []
+    real_serialize = fastapi.routing.serialize_response
+
+    async def counting_serialize(*args, **kwargs):
+        validated_again.append(kwargs.get("field"))
+        return await real_serialize(*args, **kwargs)
+
+    monkeypatch.setattr(fastapi.routing, "serialize_response", counting_serialize)
+    listed = api.get(f"/api/v1/migrations?plan_id={plan_id}", Role.viewer)
+    everything = api.get("/api/v1/migrations", Role.viewer)
+    assert listed.headers["content-type"] == "application/json"
+    assert (listed.json(), everything.json()) == (expected_plan, expected)
+    assert validated_again == []
+
+
+def test_plan_routes_derive_the_status_without_loading_migrations(api, monkeypatch):
+    """SDD §8.1, §11: GET /plans and /plans/{id} take the phases from Store.plan_phases."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "phases",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    assert api.post(f"/api/v1/plans/{plan_id}/validate", Role.operator).status_code == 200
+    [m] = [x for x in api.store.list("migration", Migration) if x.plan_id == plan_id]
+    api.store.put("migration", m.model_copy(update={"phase": Phase.completed}))
+
+    # what the plan routes list (the orchestrator's tick, in the same app, lists migrations too)
+    listed_kinds: list[str] = []
+    real_list = AsyncStore.list
+
+    async def counting_list(self, kind, *args, **kwargs):
+        if any(f.filename.endswith("routes_plans.py") for f in inspect.stack(0)):
+            listed_kinds.append(kind)
+        return await real_list(self, kind, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncStore, "list", counting_list)
+    one = api.get(f"/api/v1/plans/{plan_id}", Role.viewer).json()
+    many = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert one["derived_status"] == many[plan_id]["derived_status"] == "completed"
+    assert "migration" not in listed_kinds
+
+
+def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):
+    """SDD §8.1, §12: POST /plans/{id}/finalize — 403 below approver, 400 for a wrong name,
+    404 for an unknown wave, 409 when nothing in scope is completed."""
+    vm_ids = first_clean_vms(api, n=1)
+    created = api.post(
+        "/api/v1/plans",
+        Role.operator,
+        json={
+            "name": "to finalize",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": vm_ids,
+        },
+    )
+    plan_id = created.json()["id"]
+    url = f"/api/v1/plans/{plan_id}/finalize"
+    assert api.post(url, Role.operator, json={"confirm": "to finalize"}).status_code == 403
+    assert api.post(url, Role.approver, json={"confirm": "wrong"}).status_code == 400
+    assert (
+        api.post(url, Role.approver, json={"confirm": "Pilot", "wave_id": "wave-9"}).status_code
+        == 404
+    )
+    # any id that is no wave of the plan is an unknown wave, however long; only the API's
+    # general free-text bound (2000) is a validation error (SDD §12)
+    long_id = {"confirm": "Pilot", "wave_id": "w" * 200}
+    assert api.post(url, Role.approver, json=long_id).status_code == 404
+    huge_id = {"confirm": "Pilot", "wave_id": "w" * 2001}
+    assert api.post(url, Role.approver, json=huge_id).status_code == 422
+    nothing = api.post(url, Role.approver, json={"confirm": "to finalize"})
+    assert (
+        nothing.status_code == 409
+        and "no completed migration" in nothing.json()["error"]["message"]
+    )
+
+
+def test_the_demo_power_route_sets_a_fake_source_vms_power_and_exists_only_in_demo_mode(
+    api, tmp_path
+):
+    """SDD §8.1, §12: POST /demo/vms/{source_id}/power — operator, demo mode only."""
+    [vm] = api.get("/api/v1/providers/src-osp/inventory", Role.viewer).json()[:1]
+    url = f"/api/v1/demo/vms/{vm['source_id']}/power"
+    assert api.post(url, Role.viewer, json={"state": "on"}).status_code == 403
+    off = api.post(url, Role.operator, json={"state": "off"})
+    assert off.status_code == 200 and off.json()["power_state"] == "stopped"
+    inventory = {
+        v["source_id"]: v
+        for v in api.get("/api/v1/providers/src-osp/inventory", Role.viewer).json()
+    }
+    assert inventory[vm["source_id"]]["power_state"] == "stopped"
+    assert api.post(url, Role.operator, json={"state": "on"}).json()["power_state"] == "running"
+    assert api.post(url, Role.operator, json={"state": "sideways"}).status_code == 422
+    assert (
+        api.post("/api/v1/demo/vms/os-nope/power", Role.operator, json={"state": "on"}).status_code
+        == 404
+    )
+
+    settings, tokens = api_settings(tmp_path / "real", demo=False)
+    store = Store(f"sqlite:///{tmp_path / 'real.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        real = Api(client, store, settings, tokens)
+        refused = real.post(url, Role.operator, json={"state": "on"})
+        assert refused.status_code == 404
+        assert refused.json()["error"]["message"] == "no such route outside demo mode"
+    store.dispose()
 
 
 def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
@@ -201,6 +505,82 @@ def test_patch_plan_conflicts_while_a_migration_is_in_flight(api):
         f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json=patch
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_a_plans_providers_cannot_change_while_one_of_its_migrations_is_failed(api):
+    """SDD §12: a failed migration whose source runs keeps its plan editable — to fix the cause
+    before a retry — but not its providers: its rollback acts on the clouds its attempt used (the
+    cold one matches the destination server by name), so a changed provider is refused until it
+    is rolled back or cancelled."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "switch clouds",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    for kept, copy in (("dst-rhoso", "dst-rhoso-2"), ("src-osp", "src-osp-2")):
+        other = api.store.get("provider", kept, Provider).model_copy(update={"id": copy})
+        api.store.put("provider", other, expected_version=0)
+    failed = api.store.list("migration", Migration, plan_id=plan["id"])[0]
+    failed.phase = Phase.failed  # its pre-copy failed; the source VM kept running
+    api.store.put("migration", failed)
+    url = f"/api/v1/plans/{plan['id']}"
+
+    def edit(change: dict):
+        return api.client.patch(url, headers=api.h(Role.operator), json=change)
+
+    refused = edit({"destination_provider_id": "dst-rhoso-2"})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == (
+        f"roll back or cancel the failed migration ({failed.vm.name}) before changing the plan's "
+        "providers: its rollback acts on the clouds its attempt used"
+    )
+    assert edit({"source_provider_id": "src-osp-2"}).status_code == 409  # either side
+    assert edit({"description": "fix the network mapping"}).status_code == 200  # for the retry
+    assert edit({"destination_provider_id": "dst-rhoso"}).status_code == 200  # not a change
+    failed = api.store.get("migration", failed.id, Migration)
+    failed.phase = Phase.rolled_back
+    api.store.put("migration", failed)
+    moved = edit({"destination_provider_id": "dst-rhoso-2"})
+    assert moved.status_code == 200, moved.text
+
+
+def test_the_in_flight_refusal_says_what_releases_each_vm(api):
+    """SDD §12: a completed migration is finished and cannot be cancelled, nor can a failed one
+    whose cutover stopped the source — the 409 of an edit or re-wave names each VM with what
+    releases it."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "finished",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    done, stopped = api.store.list("migration", Migration, plan_id=plan["id"])
+    done.phase = Phase.completed
+    stopped.phase = Phase.failed
+    stopped.downtime_started_at = utcnow()
+    for m in (done, stopped):
+        api.store.put("migration", m)
+    clauses = (
+        f"roll back or retry the failed migration whose source VM is stopped ({stopped.vm.name}); "
+        f"finalize or roll back the completed migration ({done.vm.name})"
+    )
+    refused = api.client.patch(
+        f"/api/v1/plans/{plan['id']}", headers=api.h(Role.operator), json={"description": "x"}
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == f"{clauses} before editing the plan"
+    waves = api.post(
+        f"/api/v1/plans/{plan['id']}/waves/auto", Role.operator, json={"max_wave_size": 5}
+    )
+    assert waves.status_code == 409
+    assert waves.json()["error"]["message"] == f"{clauses} before re-planning the waves"
 
 
 def test_plan_create_validate_start_flow(api):
@@ -499,6 +879,39 @@ def test_plan_refuses_non_finite_estimator_inputs(api):
     assert patched.status_code == 422 and "link_bps" in patched.json()["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    ("change", "status", "message"),
+    [
+        ({"name": "x" * 201}, 422, "name: at most 200 characters (got 201)"),
+        ({"vm_ids": ["vm-1", "vm-1"]}, 422, "vm_ids lists a VM more than once: vm-1"),
+        (
+            {"cutover_window": {"start": "2026-10-11T02:00:00Z", "end": "2026-10-11T01:00:00Z"}},
+            422,
+            "cutover_window: end must be after start",
+        ),
+        (
+            {"estimator_overrides": {"nope": 1.0}},
+            400,
+            "invalid estimator_overrides: nope: unknown field",
+        ),
+    ],
+    ids=["name", "vm_ids", "settings", "estimator_overrides"],
+)
+def test_plan_checks_answer_like_plan_apply(api, change, status, message):
+    """SDD §12/§15: POST /plans and `seamless plan apply` run one set of checks with one wording
+    (test_plan_apply_refuses_what_the_api_refuses holds the CLI to the same messages)."""
+    body = {
+        "name": "checked",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": ["vm-1"],
+        "require_approval": True,
+    }
+    refused = api.post("/api/v1/plans", Role.approver, json={**body, **change})
+    assert refused.status_code == status, refused.text
+    assert refused.json()["error"]["message"] == message
+
+
 def test_plan_texts_are_bounded_at_the_api_boundary(api):
     """SDD §12: a plan name holds 200 characters, a description 2000; stored plans still load."""
     vm_ids = first_clean_vms(api)
@@ -597,6 +1010,18 @@ def test_events_tail_returns_the_newest_limit_events_ascending(api):
     assert api.get("/api/v1/events?limit=2").json() == every[:2]
 
 
+def test_events_before_reads_the_page_before_the_oldest_shown(api):
+    """SDD §12, §16: Load older events asks for the newest page below the oldest event shown."""
+    seed_migrations(api.store)
+    api.post("/api/v1/migrations/mig-0000000000/approve", Role.approver, json={})
+    every = api.get("/api/v1/events?limit=1000").json()
+    assert len(every) >= 3
+    newest = api.get("/api/v1/events?tail=true&limit=1").json()
+    older = api.get(f"/api/v1/events?tail=true&limit=1&before={newest[0]['seq']}").json()
+    assert [e["seq"] for e in newest + older] == [every[-1]["seq"], every[-2]["seq"]]
+    assert api.get("/api/v1/events?tail=true&before=0").status_code == 422
+
+
 def test_auto_waves_takes_a_wave_size_from_1_to_1000(api):
     """SDD §12: max_wave_size is 1-1000; outside it the API answers 422 validation_error, the
     shape the dashboard mock copies."""
@@ -683,6 +1108,246 @@ def test_a_failed_plan_keeps_its_providers_from_deletion(api):
     assert delete().status_code == 204
 
 
+async def test_a_retry_in_a_completed_plan_whose_provider_was_deleted_answers_409(tmp_path):
+    """SDD §5.1/§12: DELETE /providers/{id} is allowed once a plan has completed; a retry would
+    reopen the plan without that provider, so it answers 409 and changes nothing."""
+    store = Store(f"sqlite:///{tmp_path / 'retry.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    vms = [make_vm(source_id="vm-1", name="web-01")]
+    h = build_harness(tmp_path, store, vms, settings=settings)
+    plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = (await h.migrations(plan.id))[0]
+    m.phase = Phase.rolled_back  # its cutover failed and was rolled back, so the plan completed
+    store.put("migration", m)
+    done = store.get("plan", plan.id, Plan)
+    done.status = PlanStatus.completed
+    store.put("plan", done)
+    app = create_app(settings, orchestrator=h.orch)
+    admin = {"Authorization": f"Bearer {tokens[Role.admin]}"}
+    operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        deleted = await c.delete("/api/v1/providers/dst-rhoso", headers=admin)
+        assert deleted.status_code == 204, deleted.text
+        refused = await c.post(f"/api/v1/migrations/{m.id}/retry", headers=operator)
+        assert refused.status_code == 409, refused.text
+        assert "provider 'dst-rhoso' no longer exists" in refused.json()["error"]["message"]
+        migration = (await c.get(f"/api/v1/migrations/{m.id}", headers=operator)).json()
+        assert migration["phase"] == "rolled_back"
+        stored = (await c.get(f"/api/v1/plans/{plan.id}", headers=operator)).json()
+        assert stored["status"] == "completed"
+    await h.orch.stop()
+    store.dispose()
+
+
+def test_a_completed_plan_keeps_its_providers_while_a_migration_holds_its_vm(api):
+    """SDD §12/§8.1: a completed migration can be rolled back until it is finalized, and its
+    rollback needs both providers - so can a rollback in progress or one that failed; a rolled-back
+    migration lets its VM go (a retry refuses when a provider is gone)."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "awaiting finalize",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = api.store.list("migration", Migration, plan_id=plan["id"])
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    delete = lambda: api.client.delete(  # noqa: E731
+        "/api/v1/providers/dst-rhoso", headers=api.h(Role.admin)
+    )
+    second.phase = Phase.finalized
+    api.store.put("migration", second)
+    for phase in (Phase.completed, Phase.rolling_back, Phase.failed):
+        first.phase = phase
+        api.store.put("migration", first)
+        refused = delete()
+        assert refused.status_code == 409, (phase, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("awaiting finalize", '
+            "1 VM not finalized); a plan needs its providers until it completes and its VMs are "
+            "finalized"
+        )
+    second.phase = Phase.completed
+    api.store.put("migration", second)
+    assert '("awaiting finalize", 2 VMs not finalized)' in delete().json()["error"]["message"]
+    first.phase, second.phase = Phase.rolled_back, Phase.cancelled
+    for m in (first, second):
+        api.store.put("migration", m)
+    assert delete().status_code == 204
+
+
+def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):
+    body = {
+        "name": "still a draft",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": [],
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    refused = api.client.delete("/api/v1/providers/src-osp", headers=api.h(Role.admin))
+    assert refused.status_code == 409
+    assert refused.json()["error"]["message"] == (
+        f'provider is used by plan(s) that still need it: {plan["id"]} ("still a draft", draft); '
+        "a plan needs its providers until it completes and its VMs are finalized"
+    )
+    ids = [plan["id"]] + [
+        api.post("/api/v1/plans", Role.operator, json={**body, "name": f"draft {i}"}).json()["id"]
+        for i in range(10)
+    ]
+    message = api.client.delete("/api/v1/providers/src-osp", headers=api.h(Role.admin)).json()[
+        "error"
+    ]["message"]
+    # at most ten plans, then how many more
+    assert ids[9] in message and ids[10] not in message and '("draft 9"' not in message
+    assert message.endswith(
+        "draft) and 1 more; a plan needs its providers until it completes and its VMs are finalized"
+    )
+
+
+async def test_a_rollback_whose_provider_no_longer_exists_answers_409(tmp_path):
+    """SDD §5.1: without its providers a rollback would fail, and a migration whose cutover stopped
+    its source could then be neither rolled back, retried nor cancelled - so it is refused and the
+    migration stays as it is (a provider deleted before the rule of SDD §12)."""
+    store = Store(f"sqlite:///{tmp_path / 'rollback.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    h = build_harness(
+        tmp_path, store, [make_vm(source_id="vm-1", name="web-01")], settings=settings
+    )
+    plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+    store.put("plan", plan, expected_version=0)
+    await h.orch.validate_plan(plan.id, "alice")
+    m = (await h.migrations(plan.id))[0]
+    m.phase = Phase.completed
+    m.downtime_started_at = utcnow()
+    m.downtime_ended_at = utcnow()
+    store.put("migration", m)
+    store.delete("provider", "dst-rhoso")
+    app = create_app(settings, orchestrator=h.orch)
+    operator = {"Authorization": f"Bearer {tokens[Role.operator]}"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        refused = await c.post(
+            f"/api/v1/migrations/{m.id}/rollback", headers=operator, json={"reason": "app broken"}
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["message"] == (
+            "web-01 cannot be rolled back: the plan's destination provider 'dst-rhoso' no longer "
+            "exists"
+        )
+        migration = (await c.get(f"/api/v1/migrations/{m.id}", headers=operator)).json()
+        assert migration["phase"] == "completed"
+    await h.orch.stop()
+    store.dispose()
+
+
+async def _race_with_a_provider_deletion(tmp_path, act):
+    """Run ``act`` (a request that checks the plan's providers) and DELETE /providers/src-osp while
+    ``act`` holds between its source and its destination check (SDD §12: one lock)."""
+    store = Store(f"sqlite:///{tmp_path / 'race.db'}")
+    store.create_schema()
+    tokens = write_tokens(tmp_path / "tokens.yaml")
+    settings = make_settings(tmp_path, tokens_file=tmp_path / "tokens.yaml", dashboard_dir=None)
+    h = build_harness(
+        tmp_path, store, [make_vm(source_id="vm-1", name="web-01")], settings=settings
+    )
+    app = create_app(settings, orchestrator=h.orch)
+    headers = {r: {"Authorization": f"Bearer {tokens[r]}"} for r in (Role.operator, Role.admin)}
+    entered, release = asyncio.Event(), asyncio.Event()
+    get = h.orch.db.get
+
+    async def slow_get(kind, key, model):
+        if kind == "provider" and key == "dst-rhoso" and not entered.is_set():
+            entered.set()  # the source was checked; the destination check waits here
+            await release.wait()
+        return await get(kind, key, model)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        setup = await act(c, headers, store, h, arm=lambda: setattr(h.orch.db, "get", slow_get))
+        acting = asyncio.create_task(setup())
+        await asyncio.wait_for(entered.wait(), 5)
+        deleting = asyncio.create_task(
+            c.delete("/api/v1/providers/src-osp", headers=headers[Role.admin])
+        )
+        await asyncio.sleep(0.05)  # as far as the deletion gets meanwhile
+        release.set()
+        acted, deleted = await acting, await deleting
+        providers = {
+            p["id"] for p in (await c.get("/api/v1/providers", headers=headers[Role.admin])).json()
+        }
+    await h.orch.stop()
+    store.dispose()
+    return acted, deleted, providers
+
+
+async def test_a_plan_created_while_its_provider_is_deleted_keeps_the_provider(tmp_path):
+    async def act(c, headers, store, h, arm):
+        body = {
+            "name": "racing",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": ["vm-1"],
+        }
+        arm()
+        return lambda: c.post("/api/v1/plans", headers=headers[Role.operator], json=body)
+
+    created, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert created.status_code == 201, created.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
+
+
+async def test_a_plan_edited_onto_a_provider_being_deleted_keeps_the_provider(tmp_path):
+    async def act(c, headers, store, h, arm):
+        plan = make_plan(
+            vm_ids=["vm-1"], source_provider_id="src-other", destination_provider_id="dst-rhoso"
+        )
+        other = store.get("provider", "src-osp", Provider).model_copy(update={"id": "src-other"})
+        store.put("provider", other, expected_version=0)
+        store.put("plan", plan, expected_version=0)
+        arm()
+        return lambda: c.patch(
+            f"/api/v1/plans/{plan.id}",
+            headers=headers[Role.operator],
+            json={"source_provider_id": "src-osp"},
+        )
+
+    edited, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert edited.status_code == 200, edited.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
+
+
+async def test_a_retry_that_reopens_a_plan_while_its_provider_is_deleted_keeps_the_provider(
+    tmp_path,
+):
+    async def act(c, headers, store, h, arm):
+        plan = make_plan(vm_ids=["vm-1"], default_strategy="cold")
+        store.put("plan", plan, expected_version=0)
+        await h.orch.validate_plan(plan.id, "alice")
+        m = (await h.migrations(plan.id))[0]
+        m.phase = Phase.rolled_back  # a rolled-back migration lets its VM go: deletable
+        store.put("migration", m)
+        done = store.get("plan", plan.id, Plan)
+        done.status = PlanStatus.completed
+        store.put("plan", done)
+        arm()
+        return lambda: c.post(f"/api/v1/migrations/{m.id}/retry", headers=headers[Role.operator])
+
+    retried, deleted, providers = await _race_with_a_provider_deletion(tmp_path, act)
+    assert retried.status_code == 200, retried.text
+    assert deleted.status_code == 409, deleted.text
+    assert "src-osp" in providers
+
+
 async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):
     """SDD §8: PATCH /plans/{id} runs under the plan's lock like the other status writers, so an
     edit that arrives while a validation runs waits for it and the plan ends draft - never
@@ -724,3 +1389,81 @@ async def test_an_edit_during_a_validation_leaves_the_plan_draft(tmp_path):
         assert (await c.post(f"/api/v1/plans/{plan.id}/start", headers=headers)).status_code == 409
     await h.orch.stop()
     store.dispose()
+
+
+def test_the_cutover_requester_cannot_approve_it_over_the_api(api):
+    """ADV-17 (SDD §5.4): the request is not an approval; the requester's approval is refused."""
+    migs = seed_migrations(api.store)
+    base = f"/api/v1/migrations/{migs['ready'].id}"
+    requested = api.post(f"{base}/cutover", Role.approver, json={"comment": "Window agreed"})
+    assert requested.status_code == 200, requested.text
+    body = requested.json()
+    assert (body["cutover_requested_by"], body["approvals"]) == ("approver-user", [])
+    assert body["cutover_requested_at"] is not None
+    refused = api.post(f"{base}/approve", Role.approver, json={"comment": "my own"})
+    assert refused.status_code == 409
+    assert refused.json()["error"]["message"] == (
+        "You requested this cutover. Another approver must approve it."
+    )
+    approved = api.post(f"{base}/approve", Role.admin, json={"comment": "Checked the findings"})
+    assert approved.status_code == 200 and approved.json()["approvals"][-1]["actor"] == "admin-user"
+
+
+def test_only_an_approver_changes_the_distinct_approver_setting(api):
+    """ADV-17: Distinct approver belongs to the approval policy, approver-only like it (SDD §12)."""
+    body = {
+        "name": "Four eyes off",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": first_clean_vms(api),
+        "require_distinct_approver": False,
+    }
+    refused = api.post("/api/v1/plans", Role.operator, json=body)
+    assert refused.status_code == 403, refused.text
+    assert "require_distinct_approver" in refused.json()["error"]["message"]
+    created = api.post("/api/v1/plans", Role.approver, json=body)
+    assert created.status_code == 201 and created.json()["require_distinct_approver"] is False
+    plain = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "require_distinct_approver": True}
+    )
+    assert plain.status_code == 201, "the default value needs no approver"
+
+
+def test_a_force_cutover_needs_an_approver_a_reason_and_a_warm_pass_in_progress(api):
+    """ADV-16 (SDD §5.4, §12): only precopy/syncing of a warm migration; 10-2000 characters."""
+    migs = seed_migrations(api.store)
+    ready = f"/api/v1/migrations/{migs['ready'].id}/force-cutover"
+    body = {"reason": "The change window closes at 22:00"}
+    assert api.post(ready, Role.operator, json=body).status_code == 403
+    assert api.post(ready, Role.approver, json={"reason": "short"}).status_code == 422
+    assert api.post(ready, Role.approver, json=body).status_code == 409  # not in a pass
+
+
+def test_an_operator_may_resend_the_current_cutover_window_in_any_spelling(api):
+    """SDD §12: a policy field at the plan's current value is no change - a window written
+    as JavaScript's toISOString writes it (milliseconds, `Z`) is the same window; another one
+    still needs the approver."""
+    window = {"start": "2026-10-08T12:00:00+00:00", "end": "2026-10-08T14:00:00+00:00"}
+    created = api.post(
+        "/api/v1/plans",
+        Role.approver,
+        json={
+            "name": "Windowed",
+            "source_provider_id": "src-osp",
+            "destination_provider_id": "dst-rhoso",
+            "vm_ids": [],
+            "cutover_window": window,
+        },
+    )
+    assert created.status_code == 201, created.text
+    url = f"/api/v1/plans/{created.json()['id']}"
+    same = {"start": "2026-10-08T12:00:00.000Z", "end": "2026-10-08T14:00:00.000Z"}
+    resent = api.client.patch(
+        url, headers=api.h(Role.operator), json={"description": "d", "cutover_window": same}
+    )
+    assert resent.status_code == 200, resent.text
+    moved = {"start": "2026-10-08T12:30:00.000Z", "end": "2026-10-08T14:00:00.000Z"}
+    changed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": moved})
+    assert changed.status_code == 403
+    malformed = api.client.patch(url, headers=api.h(Role.operator), json={"cutover_window": 5})
+    assert malformed.status_code in (403, 422)

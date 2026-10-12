@@ -5,7 +5,7 @@ import axe from 'axe-core';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import App from './App';
 import { ApiClient } from './api/client';
-import { createMockFetch } from './api/mock';
+import { createMockFetch, type MockServer } from './api/mock';
 import { createTestServer } from './test/utils';
 
 /*
@@ -24,6 +24,12 @@ const ROUTES: Array<[string, string]> = [
   ['/inventory/rhoso-prod', 'Inventory'],
   ['/events', 'Events'],
   ['/advisor', 'Advisor'],
+  ['/advisor/audit', 'Advisor audit'],
+  ['/advisor/policies', 'Advisor policies'],
+  ['/plans/plan-c81d44a0', 'Shared Ceph handover — analytics'],
+  // a completed plan: Finalize all and the finalize queue (ADV-19)
+  ['/plans/plan-2d5c8b93', 'Pilot — static content'],
+  ['/advisor/recommendations/rec-d4e6f8a09001', 'Migration strategy: static-cdn-01'],
   ['/login', 'Sign in'],
 ];
 
@@ -40,12 +46,13 @@ async function violations(): Promise<Array<{ id: string; impact: string | null |
   }));
 }
 
-function renderAt(path: string, token = 'admin') {
+function renderAt(path: string, token = 'admin', prepare?: (server: MockServer) => void, container?: HTMLElement) {
   window.history.pushState({}, '', path);
   const server = createTestServer();
+  prepare?.(server);
   const client = new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
-  render(<App client={client} queryClient={queryClient} />);
+  render(<App client={client} queryClient={queryClient} />, container ? { container } : undefined);
 }
 
 async function settled() {
@@ -54,7 +61,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
@@ -72,6 +79,85 @@ describe('axe-core: no WCAG violations', () => {
     expect(await violations()).toEqual([]);
   }, 30_000);
 
+  it('the full sidebar navigation (SDD §16)', async () => {
+    window.localStorage.setItem('seamless.nav', 'full');
+    try {
+      renderAt('/');
+      expect(await screen.findByRole('heading', { level: 1, name: 'Overview' }, { timeout: 8_000 })).toBeInTheDocument();
+      await settled();
+      expect(screen.getByTestId('app-navigation')).toHaveAttribute('data-nav', 'full');
+      expect(await violations()).toEqual([]);
+    } finally {
+      window.localStorage.removeItem('seamless.nav');
+    }
+  }, 30_000);
+
+  it('the phone navigation drawer (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    // mounted in #root as main.tsx mounts the app: an open dialog makes #root inert, the column's navigation with it
+    const root = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'root' }));
+    renderAt('/', 'admin', undefined, root);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Overview' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    await user.click(screen.getByRole('button', { name: 'Open navigation' }));
+    expect(root).toHaveAttribute('inert');
+    expect(await screen.findByRole('dialog', { name: 'Navigation' })).toBeInTheDocument();
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a migration's network editor (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    // mounted in #root as main.tsx mounts the app: the open dialog makes #root inert
+    const root = document.body.appendChild(Object.assign(document.createElement('div'), { id: 'root' }));
+    renderAt('/migrations/mig-b2c4d6e873', 'operator', undefined, root);
+    expect(await screen.findByRole('heading', { level: 1, name: 'analytics-db' }, { timeout: 8_000 })).toBeInTheDocument();
+    await settled();
+    const panel = screen.getByRole('region', { name: 'Network' });
+    await user.click(await within(panel).findByRole('button', { name: 'Edit network' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Network of analytics-db' });
+    expect(await violations()).toEqual([]);
+    // a refused address field: marked invalid and described by its problem
+    const [addresses] = within(dialog).getAllByRole('textbox');
+    await user.type(addresses!, 'nonsense');
+    await user.click(within(dialog).getByRole('button', { name: 'Save network' }));
+    await waitFor(() => expect(addresses).toHaveAttribute('aria-invalid', 'true'));
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it("a recommendation's input tab", async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/advisor/recommendations/rec-d4e6f8a09001');
+    await screen.findByRole('heading', { level: 1, name: 'Migration strategy: static-cdn-01' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('tab', { name: 'Input' }));
+    await screen.findByText(/matches its SHA-256/i);
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the policy dialog with validation errors (ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/advisor/policies');
+    await screen.findByRole('heading', { level: 1, name: 'Advisor policies' }, { timeout: 8_000 });
+    await settled();
+    await user.click(screen.getByRole('button', { name: 'New policy' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New policy' });
+    await user.selectOptions(within(dialog).getByLabelText('Applies to'), 'providers');
+    await user.click(within(dialog).getByRole('button', { name: 'Create policy' }));
+    await within(dialog).findByRole('alert');
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the override dialog of a decision that waits (ADV-04)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/migrations/mig-b2c4d6e871');
+    await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
+    await settled();
+    const group = await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    await user.click(within(group).getByRole('button', { name: 'Override' }));
+    await screen.findByRole('alertdialog', { name: 'Override the recommendation for analytics-node-2?' });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
   it('the finalize confirmation dialog', async () => {
     const user = userEvent.setup({ delay: null });
     renderAt('/migrations/mig-3c1a0f9e21', 'approver');
@@ -80,6 +166,36 @@ describe('axe-core: no WCAG violations', () => {
     const group = screen.getByRole('group', { name: /migration actions/i });
     await user.click(within(group).getByRole('button', { name: /finalize/i }));
     await screen.findByRole('alertdialog', { name: /finalize web-01/i });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('the bulk finalize dialog of a completed plan (ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderAt('/plans/plan-2d5c8b93', 'approver');
+    await screen.findByRole('heading', { level: 1, name: 'Pilot — static content' }, { timeout: 8_000 });
+    await settled();
+    await user.click(within(screen.getByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
+    await screen.findByRole('alertdialog', { name: 'Finalize 1 VM of Pilot — static content?' });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('a completed migration whose source VM runs again, with the demo power control (ADV-19)', async () => {
+    renderAt('/migrations/mig-d4e6f8a091', 'operator', (server) => {
+      server.migrations.find((m) => m.vm.name === 'web-cache-01')!.source_running_at = '2026-10-08T11:00:00Z';
+    });
+    await screen.findByRole('heading', { level: 1, name: 'web-cache-01' }, { timeout: 8_000 });
+    await settled();
+    await screen.findByRole('alert', { name: 'Source VM running' });
+    await screen.findByRole('button', { name: 'Power off the source VM (demo)' });
+    expect(await violations()).toEqual([]);
+  }, 30_000);
+
+  it('a migration whose advisor decision waits for approval, its approvals named by kind (ADV-20)', async () => {
+    const held = createTestServer().migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    renderAt(`/migrations/${held.id}`, 'viewer');
+    await screen.findByRole('heading', { level: 1, name: 'analytics-node-2' }, { timeout: 8_000 });
+    await settled();
+    await within(screen.getByRole('region', { name: 'Approvals' })).findByText('Advisor decision · Migration strategy');
     expect(await violations()).toEqual([]);
   }, 30_000);
 

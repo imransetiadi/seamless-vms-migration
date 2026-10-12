@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+import ipaddress
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..domain.enums import ProviderKind, Severity, Strategy
-from ..domain.models import Finding, Mappings, Plan, Provider, VMRef
+from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
+from .ipam import address_refusal
+from .networks import kit_subnet, port_refusal, resolve_network
 
 S = Strategy
 
@@ -18,6 +21,8 @@ class SourceInventory:
     #: network name -> MTU (None when unknown)
     networks: dict[str, int | None] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
+    #: the source credential's own keypairs: what export_keypairs.yml can export (SDD §10)
+    keypairs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -32,6 +37,14 @@ class DestinationInventory:
     #: project -> free {cores, ram_mb, instances, volumes, gigabytes}; None/-1 = unlimited
     quotas: dict[str, dict[str, int | None]] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
+    #: the destination credential's own keypairs: the server is created as that user (SDD §10)
+    keypairs: list[str] = field(default_factory=list)
+    #: [{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}]: where a NIC's
+    #: addresses must lie (SDD §10, §9.3)
+    subnets: list[dict[str, Any]] = field(default_factory=list)
+    #: [{id, name, mtu, project_id, own, shared, external}]: every network the credential sees, what
+    #: a NIC's network name resolves to (SDD §10, §7.3 step 0)
+    network_details: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +94,24 @@ CATALOG: dict[str, CatalogEntry] = {
         "Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a "
         "network mapping to use an existing RHOSO network instead.",
     ),
+    "MAP_FLAVOR_PRESTAGED": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: pre-staging creates the flavor in RHOSO with the same name, size and "
+        "extra specs. Add a flavor mapping to use an existing RHOSO flavor instead.",
+    ),
+    "DST_KEYPAIR_MISSING": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Create the keypair (its public key) for the RHOSO migration user, or pre-stage keypairs "
+        "when the source migration user owns it.",
+    ),
+    "MAP_KEYPAIR_PRESTAGED": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: pre-staging imports the keypair (name and public key) for the RHOSO "
+        "migration user.",
+    ),
     "MAP_FLAVOR_MISSING": CatalogEntry(
         Severity.blocker,
         (),
@@ -114,6 +145,44 @@ CATALOG: dict[str, CatalogEntry] = {
         Severity.warning,
         (),
         "SR-IOV/macvtap ports need an equivalent physnet in RHOSO; map the network accordingly.",
+    ),
+    "NET_PORT_IPS": CatalogEntry(
+        Severity.warning,
+        (),
+        'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode '
+        '"neutron"), give each such port exactly one fixed IP before the cutover, or migrate the '
+        "VM by storage handover when its ports have at most one address each.",
+    ),
+    "MAP_NETWORK_AMBIGUOUS": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the "
+        "only one of that name - map its network to such a name, or rename one of the networks.",
+    ),
+    "NET_ADDRESS_REFUSED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Give the NIC an address its RHOSO network takes: map its network to one whose subnets "
+        "hold it, or set the address in a NIC override; for a SLAAC address keep the MAC "
+        '(port_creation_mode "neutron").',
+    ),
+    "NET_PORT_NOT_PERMITTED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Send the NIC to a network of the credential's project: map its network to one, or set "
+        "a NIC override on the VM's migration page. Another project's shared or external "
+        "network takes it once the RHOSO credential has the admin role.",
+    ),
+    "MAP_NIC_OVERRIDE_INVALID": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Fix the VM's network overrides on its migration page: an existing RHOSO network, "
+        "addresses inside its subnets, each given once in the plan. VMware VMs take none.",
+    ),
+    "MAP_NIC_OVERRIDE": CatalogEntry(
+        Severity.info,
+        (),
+        "Nothing to do: each NIC goes where its override says.",
     ),
     "VM_PCI_PASSTHROUGH": CatalogEntry(
         Severity.blocker,
@@ -180,6 +249,12 @@ CATALOG: dict[str, CatalogEntry] = {
         Severity.info,
         (S.storage_handover,),
         "Map the volume type to a RHOSO Cinder backend in handover.backend_map.",
+    ),
+    "APP_PROBE_MISSING": CatalogEntry(
+        Severity.warning,
+        (),
+        "Add an application probe for its service to the plan, for every VM or for this one "
+        "(probe_overrides), or use the suggested probe on the plan page.",
     ),
 }
 
@@ -321,6 +396,35 @@ def fitting_flavor(vm: VMRef, dst_inv: DestinationInventory) -> dict[str, Any] |
     return same or min(fits, key=_flavor_size)
 
 
+def flavor_prestaged(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> bool:
+    """Whether pre-staging creates ``vm``'s flavor (SDD §7.2, §9.3 ``MAP_FLAVOR_PRESTAGED``):
+    "flavors" is pre-staged and the flavor has no mapping and no same-named destination flavor
+    (an existing destination flavor is never pre-staged over)."""
+    return bool(
+        vm.flavor
+        and "flavors" in plan.prestage_resources
+        and vm.flavor not in plan.mappings.flavors
+        and vm.flavor not in {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
+    )
+
+
+def keypair_missing(vm: VMRef, dst_inv: DestinationInventory) -> bool:
+    """Whether ``vm`` boots with a keypair the destination credential lacks (SDD §9.3)."""
+    return bool(vm.key_name and vm.key_name not in dst_inv.keypairs)
+
+
+def keypair_prestaged(
+    vm: VMRef, plan: Plan, src_inv: SourceInventory, dst_inv: DestinationInventory
+) -> bool:
+    """Whether pre-staging imports ``vm``'s keypair (SDD §7.2, ``MAP_KEYPAIR_PRESTAGED``):
+    "keypairs" is pre-staged, the destination lacks it and the source credential owns it."""
+    return bool(
+        keypair_missing(vm, dst_inv)
+        and "keypairs" in plan.prestage_resources
+        and vm.key_name in src_inv.keypairs
+    )
+
+
 def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Mappings:
     """Mappings preflight matched automatically for ``vm`` (``Migration.resolved_mappings``).
 
@@ -328,7 +432,11 @@ def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Ma
     same-named destination flavor fits, the smallest fitting flavor is recorded.
     """
     out = Mappings()
-    if vm.flavor and vm.flavor not in plan.mappings.flavors:
+    if (
+        vm.flavor
+        and vm.flavor not in plan.mappings.flavors
+        and not flavor_prestaged(vm, plan, dst_inv)
+    ):
         chosen = fitting_flavor(vm, dst_inv)
         if chosen is not None and chosen["name"] != vm.flavor:
             out.flavors[vm.flavor] = str(chosen["name"])
@@ -337,6 +445,162 @@ def resolve_mappings(vm: VMRef, plan: Plan, dst_inv: DestinationInventory) -> Ma
 
 def _names(items: Iterable[str]) -> str:
     return ", ".join(sorted(set(items)))
+
+
+def _canonical_ip(address: str) -> str:
+    try:
+        return str(ipaddress.ip_address(address))
+    except ValueError:
+        return address
+
+
+def _in_subnets(address: str, cidrs: Sequence[str]) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    for cidr in cidrs:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _network_list(dst_inv: DestinationInventory) -> list[dict[str, Any]]:
+    """The networks the destination credential sees (SDD §10); an inventory from before
+    network_details lists each name once, as the credential's own network."""
+    if dst_inv.network_details:
+        return dst_inv.network_details
+    return [
+        {"id": None, "name": name, "mtu": mtu, "project_id": None, "own": True, "shared": False}
+        for name, mtu in dst_inv.networks.items()
+    ]
+
+
+def _subnets_of(dst_inv: DestinationInventory, network: dict[str, Any]) -> list[dict[str, Any]]:
+    """A resolved network's subnets: by its id, else (an inventory from before it) by name."""
+    if network.get("id") is not None:
+        return [s for s in dst_inv.subnets if s.get("network_id") == network["id"]]
+    return [s for s in dst_inv.subnets if s.get("network") == network["name"]]
+
+
+def _no_host_address(address: str, cidrs: Sequence[str]) -> str | None:
+    """What makes ``address`` no host address of the subnets that hold it, as Neutron's
+    check_subnet_ip rules for a port created with no owner (SDD §9.3): an IPv4 subnet's network
+    address at any prefix length, its broadcast address below a /31 (netaddr gives a /31 or /32
+    none); an IPv6 subnet's first address is taken. None for a host address of one of them, or an
+    address none of them holds."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    why = None
+    for cidr in cidrs:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if ip not in net:
+            continue
+        if net.version == 4 and ip == net.network_address:
+            why = why or f"the network address of {net}"
+        elif net.version == 4 and net.prefixlen < 31 and ip == net.broadcast_address:
+            why = why or f"the broadcast address of {net}"
+        else:
+            return None
+    return why
+
+
+def _nic_override_findings(
+    vm: VMRef,
+    plan: Plan,
+    dst_inv: DestinationInventory,
+    selected: Sequence[VMRef],
+    source: Provider | None,
+) -> list[Finding]:
+    """MAP_NIC_OVERRIDE_INVALID / MAP_NIC_OVERRIDE (SDD §9.3): every entry checked before
+    anything stops - its MAC, its network, its addresses host addresses of the target network's
+    subnets and given to no other NIC of the plan."""
+    entries = plan.nic_overrides.get(vm.source_id) or {}
+    if not entries:
+        return []
+    if source is not None and source.kind == ProviderKind.vmware:
+        return [
+            finding(
+                "MAP_NIC_OVERRIDE_INVALID",
+                f"{vm.name} is a VMware VM: the migration kit keeps the guest's network "
+                f"settings, so its NIC overrides cannot be applied ({_names(sorted(entries))}).",
+            )
+        ]
+    # every address the plan's NICs get, on the network each goes to
+    holders: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for other in selected:
+        for n in other.nics:
+            network, addresses = plan.nic_target(other.source_id, n)
+            for a in addresses:
+                key = (network, _canonical_ip(a))
+                holders.setdefault(key, []).append(
+                    (other.source_id, (n.mac or "").lower(), other.name)
+                )
+    nics = {n.mac.lower(): n for n in vm.nics if n.mac}
+    problems: list[str] = []
+    applied: list[str] = []
+    for mac in sorted(entries):
+        nic = nics.get(mac)
+        if nic is None:
+            problems.append(f"{mac}: the VM has no NIC with this MAC")
+            continue
+        network, addresses = plan.nic_target(vm.source_id, nic)
+        if network not in dst_inv.networks:
+            # the entry's network, or the mapped one pre-staging would create later: its subnets
+            # cannot be checked before anything stops
+            problems.append(
+                f"{mac}: RHOSO has no network {network!r}"
+                + (
+                    ""
+                    if entries[mac].network
+                    else " yet: pre-staging would create it, but its subnets cannot be checked "
+                    "before; name an existing RHOSO network"
+                )
+            )
+            continue
+        resolved, _ = resolve_network(_network_list(dst_inv), network)
+        if resolved is None:
+            # MAP_NETWORK_AMBIGUOUS names it
+            continue
+        subnets = _subnets_of(dst_inv, resolved)
+        cidrs = [str(s.get("cidr")) for s in subnets]
+        outside = [a for a in addresses if not _in_subnets(a, cidrs)]
+        if outside:
+            verb = "lies" if len(outside) == 1 else "lie"
+            problems.append(f"{mac}: {', '.join(outside)} {verb} in no subnet of {network!r}")
+        neutron = plan.port_creation_mode == "neutron"
+        for a in addresses:
+            reserved = _no_host_address(a, cidrs)
+            if reserved:
+                problems.append(f"{mac}: {a} is {reserved}, not a host address")
+            elif a not in outside:
+                # on a SLAAC or DHCPv6-stateless subnet only what Neutron derives (§6.6)
+                why = address_refusal(a, subnets, neutron=neutron, mac=mac)
+                if why:
+                    problems.append(f"{mac}: {a} {why}")
+        for a in addresses:
+            for vm_id, other_mac, name in holders.get((network, _canonical_ip(a)), []):
+                if (vm_id, other_mac) != (vm.source_id, mac):
+                    problems.append(f"{mac}: {a} also goes to {name} ({other_mac})")
+        applied.append(f"{mac} ({nic.network}) -> {network}: {', '.join(addresses)}")
+    if problems:
+        return [
+            finding(
+                "MAP_NIC_OVERRIDE_INVALID",
+                f"NIC override(s) of {vm.name} cannot be applied: {'; '.join(problems)}.",
+            )
+        ]
+    if not applied:
+        return []
+    return [finding("MAP_NIC_OVERRIDE", f"NIC override(s): {'; '.join(applied)}.")]
 
 
 def run_preflight(
@@ -348,11 +612,13 @@ def run_preflight(
     *,
     source: Provider | None = None,
     destination: Provider | None = None,
+    dst_caps: Mapping[str, Any] | None = None,
 ) -> list[Finding]:
     """Evaluate the SDD §9.3 catalog for ``vm`` within ``plan``.
 
     ``all_vms`` are the plan's selected VMs (for duplicate names and cumulative quotas);
-    ``source``/``destination`` enable the conversion-host check.
+    ``source``/``destination`` enable the conversion-host check; ``dst_caps`` are the
+    destination's capabilities as validation's check just reported them (its token's roles).
     """
     selected = list(all_vms) if all_vms is not None else [vm]
     out: list[Finding] = []
@@ -390,15 +656,21 @@ def run_preflight(
             finding("SRC_VM_EPHEMERAL_ROOT", f"The root disk is {root.kind.replace('_', ' ')}.")
         )
 
+    # a NIC its override sends to another network is checked by MAP_NIC_OVERRIDE_INVALID
+    mapped_nics = [
+        nic
+        for nic in vm.nics
+        if not (plan.nic_override(vm.source_id, nic.mac) or NicOverride()).network
+    ]
     missing_nets = [
         nic.network
-        for nic in vm.nics
+        for nic in mapped_nics
         if nic.network not in maps.networks and nic.network not in dst_inv.networks
     ]
     # a mapped target must exist: nothing creates a network under the *mapped* name
     bad_net_targets = [
         f"{nic.network} -> {maps.networks[nic.network]}"
-        for nic in vm.nics
+        for nic in mapped_nics
         if nic.network in maps.networks and maps.networks[nic.network] not in dst_inv.networks
     ]
     # pre-staging creates same-named networks for OpenStack sources only: the VMware kit has
@@ -435,8 +707,90 @@ def run_preflight(
             )
         )
 
+    # every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware
+    # NIC's too: Seamless gives the migration kit the network it resolves (§7.2)
+    openstack_source = source is None or source.kind != ProviderKind.vmware
+    seen = _network_list(dst_inv)
+    resolved: dict[int, dict[str, Any]] = {}
+    ambiguous: list[str] = []
+    for nic in vm.nics:
+        # the VMware kit keeps the guest's network settings: no NIC override moves its NICs (§7.2)
+        target = (
+            plan.nic_target(vm.source_id, nic)[0]
+            if openstack_source
+            else maps.networks.get(nic.network, nic.network)
+        )
+        network, why = resolve_network(seen, target)
+        if network is not None:
+            resolved[id(nic)] = network
+        elif why:
+            ambiguous.append(f"{(nic.mac or '?').lower()} ({nic.network}): {why}")
+    if ambiguous:
+        out.append(
+            finding(
+                "MAP_NETWORK_AMBIGUOUS",
+                "The cutover cannot tell these RHOSO networks apart: " + "; ".join(ambiguous) + ".",
+            )
+        )
+
+    # whether the credential may put each NIC's port on its resolved network: another project's
+    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3);
+    # the VMware migration kit creates every port with the NIC's MAC (§7.2)
+    roles = (dst_caps or {}).get("roles")
+    denied = []
+    for nic in vm.nics:
+        network = resolved.get(id(nic))
+        why = None if network is None else port_refusal(network, roles)
+        if network is not None and why:
+            denied.append(
+                f"{(nic.mac or '?').lower()} on {network['name']!r} "
+                f"(project {network.get('project_id')}): {why}"
+            )
+    if denied:
+        out.append(
+            finding(
+                "NET_PORT_NOT_PERMITTED",
+                "The RHOSO credential may not put these NICs on their network: "
+                + "; ".join(denied)
+                + ".",
+            )
+        )
+
+    if keypair_prestaged(vm, plan, src_inv, dst_inv):
+        out.append(
+            finding(
+                "MAP_KEYPAIR_PRESTAGED",
+                f"Pre-staging imports keypair {vm.key_name!r} for the RHOSO migration user.",
+            )
+        )
+    elif keypair_missing(vm, dst_inv):
+        owned = vm.key_name in src_inv.keypairs
+        out.append(
+            finding(
+                "DST_KEYPAIR_MISSING",
+                f"The VM boots with keypair {vm.key_name!r}, which the RHOSO migration user does "
+                "not have: the cutover would stop at its destination check."
+                + (
+                    " Pre-stage keypairs to import it."
+                    if owned
+                    else " Another user owns it at the source, so pre-staging cannot export it: "
+                    "create it, its public key, for the RHOSO migration user."
+                ),
+            )
+        )
+
     dst_flavor_names = {str(f.get("name")) for f in dst_inv.flavors if f.get("name")}
-    if vm.flavor and vm.flavor in maps.flavors:
+    if flavor_prestaged(vm, plan, dst_inv) and (
+        source is None or source.kind != ProviderKind.vmware
+    ):
+        out.append(
+            finding(
+                "MAP_FLAVOR_PRESTAGED",
+                f"Pre-staging creates RHOSO flavor {vm.flavor!r} with the source's size and "
+                "extra specs.",
+            )
+        )
+    elif vm.flavor and vm.flavor in maps.flavors:
         target = maps.flavors[vm.flavor]
         if target not in dst_flavor_names:
             out.append(
@@ -563,15 +917,93 @@ def run_preflight(
     shrinks = []
     for nic in vm.nics:
         src_mtu = nic.mtu if nic.mtu is not None else src_inv.networks.get(nic.network)
-        dst_mtu = dst_inv.networks.get(maps.networks.get(nic.network, nic.network))
+        target = plan.nic_target(vm.source_id, nic)[0]
+        dst_mtu = (
+            resolved[id(nic)].get("mtu") if id(nic) in resolved else dst_inv.networks.get(target)
+        )
         if src_mtu is not None and dst_mtu is not None and dst_mtu < src_mtu:
-            shrinks.append(f"{nic.network} {src_mtu} -> {dst_mtu}")
+            shrinks.append(
+                f"{nic.network} {src_mtu} -> {dst_mtu}"
+                if target == maps.networks.get(nic.network, nic.network)
+                else f"{nic.network} {src_mtu} -> {target} {dst_mtu}"
+            )
     if shrinks:
         out.append(finding("NET_MTU_SHRINK", f"Destination MTU is smaller: {_names(shrinks)}."))
 
     sriov = [nic.network for nic in vm.nics if nic.vnic_type in _SRIOV_VNIC_TYPES]
     if sriov:
         out.append(finding("NET_SRIOV_PORT", f"SR-IOV/macvtap port(s) on: {_names(sriov)}."))
+
+    # through Nova os-migrate recreates each port with exactly one fixed IP; the handover keeps one
+    # per port (SDD §9.2, §9.3). Through Neutron every address is kept, so nothing is said; VMware
+    # NICs go through the migration kit.
+    # the addresses a NIC gets: its override's, else its own (SDD §9.2)
+    addresses = {id(nic): plan.nic_target(vm.source_id, nic)[1] for nic in vm.nics}
+    odd_ports = [nic for nic in vm.nics if len(addresses[id(nic)]) != 1]
+    if (
+        odd_ports
+        and plan.port_creation_mode == "nova"
+        and (source is None or source.kind != ProviderKind.vmware)
+    ):
+        listed = ", ".join(
+            f"{n.network} ({', '.join(addresses[id(n)]) or 'no fixed IP'})" for n in odd_ports
+        )
+        out.append(
+            finding(
+                "NET_PORT_IPS",
+                f"NIC(s) without exactly one fixed IP: {listed}. Cold and warm migration cannot "
+                "recreate them; storage handover keeps one address per port.",
+            )
+        )
+
+    # a NIC without an override keeps its own addresses: Neutron must take them on its resolved
+    # network (an override's are MAP_NIC_OVERRIDE_*'s); a network pre-staging creates, or an
+    # inventory without subnets, cannot be checked (SDD §9.3, §6.6)
+    if openstack_source and dst_inv.subnets:
+        neutron = plan.port_creation_mode == "neutron"
+        refused: list[str] = []
+        for nic in vm.nics:
+            network = resolved.get(id(nic))
+            if network is None or plan.nic_override(vm.source_id, nic.mac) is not None:
+                continue
+            subnets = _subnets_of(dst_inv, network)
+            for address in nic.fixed_ips if neutron else nic.fixed_ips[:1]:
+                why = address_refusal(address, subnets, neutron=neutron, mac=nic.mac)
+                if why:
+                    refused.append(
+                        f"{(nic.mac or '?').lower()} on {network['name']!r}: {address} {why}"
+                    )
+        if refused:
+            out.append(
+                finding(
+                    "NET_ADDRESS_REFUSED",
+                    "Neutron would refuse these addresses on their RHOSO network: "
+                    + "; ".join(refused)
+                    + ".",
+                )
+            )
+    # the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its
+    # network (SDD §7.2, §9.3)
+    if not openstack_source and dst_inv.subnets:
+        refused = []
+        for nic in vm.nics:
+            network = resolved.get(id(nic))
+            if network is None:
+                continue
+            _, why = kit_subnet(nic, _subnets_of(dst_inv, network))
+            if why:
+                refused.append(f"{(nic.mac or '?').lower()} on {network['name']!r}: {why}")
+        if refused:
+            out.append(
+                finding(
+                    "NET_ADDRESS_REFUSED",
+                    "Neutron would refuse these addresses on their RHOSO network: "
+                    + "; ".join(refused)
+                    + ".",
+                )
+            )
+
+    out.extend(_nic_override_findings(vm, plan, dst_inv, selected, source))
 
     if "pci_passthrough:alias" in vm.flavor_extra_specs:
         out.append(
@@ -658,7 +1090,26 @@ def run_preflight(
                     f"Volume type(s) without a handover backend: {_names(unmapped)}.",
                 )
             )
+    missing = _app_probe_missing(vm, plan)
+    if missing is not None:
+        out.append(missing)
     return out
+
+
+def _app_probe_missing(vm: VMRef, plan: Plan) -> Finding | None:
+    """A database VM verified only by its boot (SDD §9.3, ADV-18)."""
+    # imported here: the wave planner (planning.waves, behind planning.probes) imports this module
+    from .probes import describe_probe, is_database, probes_for, suggest_probes
+
+    if not is_database(vm) or probes_for(vm, plan):
+        return None
+    suggested = suggest_probes(vm)
+    hint = f" Suggested: {', '.join(describe_probe(p) for p in suggested)}." if suggested else ""
+    return finding(
+        "APP_PROBE_MISSING",
+        f"{vm.name} is a database VM without an application probe: verification would check only "
+        f"that it booted.{hint}",
+    )
 
 
 def has_blocker(findings: Iterable[Finding]) -> bool:

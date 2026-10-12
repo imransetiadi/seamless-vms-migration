@@ -17,22 +17,31 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.routing import Match
 
 from .. import __version__
 from ..ai.advisor import Advisor
 from ..ai.jev import JevClient
 from ..ai.knowledge import KnowledgeService
-from ..ai.memory import MemoryClient, redact
+from ..ai.memory import MemoryClient
+from ..ai.redaction import redact
 from ..config import Settings
 from ..domain.fsm import InvalidTransition
 from ..events import EventBus
 from ..executors.router import ExecutorRouter
-from ..orchestrator import BadRequest, NotAllowed, Orchestrator
+from ..orchestrator import BadRequest, NotAllowed, Orchestrator, Unprocessable
 from ..providers.base import ProviderError
 from ..providers.registry import ProviderRegistry
 from ..security.auth import TokenStore
 from ..store import ConflictError, NotFound, Store
-from . import routes_events, routes_migrations, routes_misc, routes_plans, routes_providers
+from . import (
+    routes_advisor,
+    routes_events,
+    routes_migrations,
+    routes_misc,
+    routes_plans,
+    routes_providers,
+)
 from .deps import ApiError, Services
 
 log = logging.getLogger(__name__)
@@ -102,6 +111,10 @@ def _install_error_handlers(app: FastAPI) -> None:
     async def bad_request(_: Request, exc: BadRequest) -> JSONResponse:
         return _error(400, "bad_request", str(exc))
 
+    @app.exception_handler(Unprocessable)
+    async def unprocessable(_: Request, exc: Unprocessable) -> JSONResponse:
+        return _error(422, "validation_error", str(exc))
+
     @app.exception_handler(ProviderError)
     async def provider_error(_: Request, exc: ProviderError) -> JSONResponse:
         # SDK messages may carry endpoint URLs or credentials: same redaction as the orchestrator
@@ -117,12 +130,12 @@ def _install_error_handlers(app: FastAPI) -> None:
         return response
 
 
-#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts) and the
-#: Fira fonts from Google Fonts (dashboard/index.html); Swagger UI loads from jsdelivr.
+#: Security headers (Security.md R-05). The dashboard needs inline styles (Recharts); it bundles
+#: its fonts (SDD §16), so nothing loads from another host. Swagger UI loads from jsdelivr.
 _CSP_APP = (
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
-    "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' "
-    "data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+    "form-action 'self'"
 )
 #: Swagger UI boots from an inline script: it gets a per-response nonce (no 'unsafe-inline').
 _CSP_DOCS = (
@@ -245,6 +258,16 @@ def _install_api_docs(app: FastAPI, settings: Settings) -> None:
 _DISABLED_DOCS = ("docs", "redoc", "openapi.json")
 
 
+def _api_path_takes_another_method(request: Request) -> bool:
+    """Whether a route other than this fallback matches the request's path for another method
+    (``Match.PARTIAL``); the API's routes sit in included routers, which answer it too."""
+    fallback = request.scope.get("route")
+    return any(
+        route is not fallback and route.matches(request.scope)[0] == Match.PARTIAL
+        for route in request.app.router.routes
+    )
+
+
 def _install_spa(app: FastAPI, dist: Path) -> None:
     root = dist.resolve()
     index = root / "index.html"
@@ -252,8 +275,11 @@ def _install_spa(app: FastAPI, dist: Path) -> None:
         app.mount("/assets", StaticFiles(directory=root / "assets"), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def spa(full_path: str) -> Any:
+    async def spa(full_path: str, request: Request) -> Any:
         first = full_path.split("/", 1)[0]
+        if first == "api" and _api_path_takes_another_method(request):
+            # the GET fallback must not turn a wrong method on an API route into a 404 (SDD §12)
+            return _error(405, "method_not_allowed", "Method Not Allowed")
         if first == "api" or first in _DISABLED_DOCS:
             return _error(404, "not_found", "Not Found")
         candidate = (root / full_path).resolve()
@@ -356,7 +382,14 @@ def create_app(
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type"],
         )
-    for module in (routes_misc, routes_providers, routes_plans, routes_migrations, routes_events):
+    for module in (
+        routes_misc,
+        routes_advisor,
+        routes_providers,
+        routes_plans,
+        routes_migrations,
+        routes_events,
+    ):
         app.include_router(module.router, prefix=API_PREFIX)
     dist = settings.dashboard_dir
     if dist is not None and (Path(dist) / "index.html").is_file():

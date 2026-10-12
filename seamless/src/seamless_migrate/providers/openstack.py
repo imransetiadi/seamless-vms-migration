@@ -7,9 +7,11 @@ import contextlib
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import ProviderRole
 from ..domain.models import Disk, Nic, Provider, VMRef
@@ -140,7 +142,7 @@ class OpenStackProvider:
             ) from None
         except Exception as exc:
             message = str(exc).strip() or type(exc).__name__
-            raise ProviderError(f"{self.provider.id}: {message[:500]}") from exc
+            raise ProviderError(f"{self.provider.id}: {redact_cut(message, 500)}") from exc
 
     def close(self) -> None:
         """Close the cached connection (a replaced provider must not keep its session)."""
@@ -201,8 +203,14 @@ class OpenStackProvider:
                     }
                 )
             storage.sort(key=lambda b: b["pool"])
+        # the role names of its token: what Neutron's port policy names (SDD §10, §6.6); left out
+        # when the token cannot tell, so that half of NET_PORT_NOT_PERMITTED is not judged
+        roles = _try(
+            lambda: sorted(set(conn.session.auth.get_access(conn.session).role_names or [])), None
+        )
         return {
             "admin": admin,
+            **({"roles": roles} if roles is not None else {}),
             "compute_microversion": microversion,
             "ovn": ovn,
             "volume_backends": [b["pool"] for b in storage],
@@ -227,10 +235,15 @@ class OpenStackProvider:
 
     def _inventory(self) -> SourceInventory | DestinationInventory:
         conn = self._connection()
-        networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in conn.network.networks()}
+        visible = list(conn.network.networks())
+        networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in visible}
         project = self._project_name(conn)
+        # the credential's own keypairs: what it can export, or owns as the creator (SDD §10)
+        keypairs = sorted(str(_attr(k, "name")) for k in conn.compute.keypairs())
         if self.provider.role == ProviderRole.source:
-            return SourceInventory(networks=networks, projects=[project] if project else [])
+            return SourceInventory(
+                networks=networks, projects=[project] if project else [], keypairs=keypairs
+            )
         flavors = [
             {
                 "name": str(_attr(f, "name")),
@@ -243,12 +256,45 @@ class OpenStackProvider:
         ]
         volume_types = [str(_attr(t, "name")) for t in conn.block_storage.types()]
         quotas = _try(lambda: {project: self._free_quota(conn)}, {})
+        # every network it sees with its owner: what a NIC's network name resolves to; shared and
+        # external: whether the credential may put a port on another project's (SDD §10, §6.6)
+        own_project = _attr(conn, "current_project_id", default=None)
+        network_details = [
+            {
+                "id": str(_attr(n, "id")),
+                "name": str(_attr(n, "name")),
+                "mtu": _attr(n, "mtu"),
+                "project_id": _attr(n, "project_id", default=None),
+                "own": _attr(n, "project_id", default=None) == own_project,
+                "shared": bool(_attr(n, "is_shared", default=False)),
+                "external": bool(_attr(n, "is_router_external", default=False)),
+            }
+            for n in visible
+        ]
+        # where a NIC's addresses must lie, by network name and id (SDD §10, §9.3)
+        names = {_attr(n, "id"): str(_attr(n, "name")) for n in visible}
+        subnets = [
+            {
+                "id": str(_attr(s, "id")),
+                "name": str(_attr(s, "name")),
+                "network": names[_attr(s, "network_id")],
+                "network_id": str(_attr(s, "network_id")),
+                "cidr": str(_attr(s, "cidr")),
+                "ipv6_address_mode": _attr(s, "ipv6_address_mode", default=None),
+                "ipv6_ra_mode": _attr(s, "ipv6_ra_mode", default=None),
+            }
+            for s in conn.network.subnets()
+            if _attr(s, "network_id") in names
+        ]
         return DestinationInventory(
             networks=networks,
             flavors=flavors,
             volume_types=volume_types,
             quotas=quotas,
             projects=[project] if project else [],
+            keypairs=keypairs,
+            subnets=subnets,
+            network_details=network_details,
         )
 
     @staticmethod
@@ -313,6 +359,9 @@ class OpenStackProvider:
         return str(output) if output is not None else None
 
     def _delete_server(self, server_id: str) -> None:
+        # the wait ends within the call's bound: past it the call reports a timeout while the
+        # deletion goes on (SDD §8.1)
+        deadline = time.monotonic() + PROVIDER_CALL_TIMEOUT_S - 5
         conn = self._connection()
         server = conn.compute.find_server(server_id, ignore_missing=True)
         if server is None:
@@ -320,7 +369,7 @@ class OpenStackProvider:
         conn.compute.delete_server(server, ignore_missing=True)
         wait = getattr(conn.compute, "wait_for_delete", None)
         if wait is not None:
-            wait(server, wait=600)
+            wait(server, wait=max(1, int(deadline - time.monotonic())))
 
     def _find_server(self, name: str) -> str | None:
         conn = self._connection()
@@ -541,4 +590,5 @@ class _MapContext:
             host=_attr(server, "compute_host", "hypervisor_hostname", "host"),
             tags=metadata,
             flavor_extra_specs={str(k): str(v) for k, v in extra_specs.items()},
+            key_name=_attr(server, "key_name", default=None) or None,
         )

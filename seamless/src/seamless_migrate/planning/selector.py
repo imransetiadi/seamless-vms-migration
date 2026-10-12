@@ -62,6 +62,17 @@ def eligibility(
             copy_reasons.append("no conversion host configured on the source provider")
         if not dst_caps.get("conversion_host"):
             copy_reasons.append("no conversion host configured on the destination provider")
+        # through Nova os-migrate recreates each port with exactly one fixed IP and raises for any
+        # other count, after the source is stopped (SDD §9.2); a dual-stack port is two addresses.
+        # Through Neutron every port keeps all its fixed IPs, none included (§6.6).
+        # the addresses a NIC gets: its override's, else its own (SDD §9.2)
+        nics = [(n.network, plan.nic_target(vm.source_id, n)[1]) for n in vm.nics]
+        odd_ports = [(net, ips) for net, ips in nics if len(ips) != 1]
+        if odd_ports and plan.port_creation_mode == "nova":
+            copy_reasons.append(
+                "port(s) without exactly one fixed IP, which Nova cannot recreate: "
+                + _ports(odd_ports)
+            )
         out[Strategy.cold].extend(copy_reasons)
         out[Strategy.warm].extend(copy_reasons)
         if multiattach:
@@ -87,6 +98,13 @@ def eligibility(
             )
         if multiattach:
             handover.append(f"multi-attach disk(s): {_ids(multiattach)}")
+        # through Nova the destination server gets one fixed IP per port and the others would be
+        # dropped; through Neutron every one is kept (SDD §7.3 step 8)
+        several = [(net, ips) for net, ips in nics if len(ips) > 1]
+        if several and plan.port_creation_mode == "nova":
+            handover.append(
+                f"port(s) with several fixed IPs, of which one would be kept: {_ports(several)}"
+            )
         encrypted = [d for d in vm.disks if d.encrypted]
         if encrypted:
             handover.append(f"encrypted disk(s), which Cinder cannot unmanage: {_ids(encrypted)}")
@@ -101,6 +119,11 @@ def eligibility(
             for reasons in out.values():
                 reasons.append(f"blocked by finding {finding.code}")
     return out
+
+
+def _ports(nics: Sequence[tuple[str, list[str]]]) -> str:
+    """Each NIC by its network and addresses, e.g. "app-net (10.0.0.5, fd00::5)"."""
+    return ", ".join(f"{network} ({', '.join(ips) or 'no fixed IP'})" for network, ips in nics)
 
 
 def _storage_reasons(
@@ -146,16 +169,20 @@ def tie_set(estimates: Sequence[Estimate]) -> list[Strategy]:
     return sorted(ties, key=simplicity)
 
 
-def advisor_scope(estimates: Sequence[Estimate]) -> list[Strategy]:
+def advisor_scope(estimates: Sequence[Estimate], policy: str) -> list[Strategy]:
     """Strategies the advisor may choose between (SDD §9.2/§14.2); empty = no advice needed.
 
-    All eligible strategies when none meets the SLO, else the tie set when it has 2+ members.
+    All eligible strategies when none meets the SLO, else the ``min_downtime`` tie set when it has
+    2+ members. Under ``simplest_meeting_slo`` the simplest strategy meeting the SLO - the rule the
+    operator chose - has no tie, so the advisor keeps out.
     """
     eligible = [e for e in estimates if e.eligible]
     if not eligible:
         return []
     if not any(e.meets_slo for e in eligible):
         return sorted((e.strategy for e in eligible), key=simplicity)
+    if policy == "simplest_meeting_slo":
+        return []
     ties = tie_set(eligible)
     return ties if len(ties) >= 2 else []
 

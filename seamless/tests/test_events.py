@@ -36,6 +36,11 @@ def test_kind_catalog_matches_sdd():
         "migration.downtime_started",
         "migration.downtime_ended",
         "migration.error",
+        "migration.force_cutover",
+        "migration.data_inconsistent",
+        "migration.source_running",
+        "migration.source_stopped",
+        "plan.finalized",
         "migration.approved",
         "migration.action",
         "advisor.strategy",
@@ -49,6 +54,18 @@ def test_kind_catalog_matches_sdd():
         "provider.deleted",
         "provider.checked",
         "auth.denied",
+        "events.pruned",
+        # audit events (SDD §14.5)
+        "recommendation.created",
+        "decision.auto_applied",
+        "decision.pending_approval",
+        "decision.approved",
+        "decision.overridden",
+        "decision.below_threshold",
+        "decision.fallback",
+        "policy.created",
+        "policy.updated",
+        "policy.deleted",
     }
     assert EPHEMERAL_KINDS == {"migration.progress", "migration.log", "heartbeat"}
 

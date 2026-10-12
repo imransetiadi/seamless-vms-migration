@@ -17,6 +17,9 @@ const Providers = lazy(() => import('./pages/Providers'));
 const Inventory = lazy(() => import('./pages/Inventory'));
 const Events = lazy(() => import('./pages/Events'));
 const Advisor = lazy(() => import('./pages/Advisor'));
+const AdvisorAudit = lazy(() => import('./pages/AdvisorAudit'));
+const AdvisorPolicies = lazy(() => import('./pages/AdvisorPolicies'));
+const RecommendationDetail = lazy(() => import('./pages/RecommendationDetail'));
 const Login = lazy(() => import('./pages/Login'));
 const NotFound = lazy(() => import('./pages/NotFound'));
 
@@ -34,6 +37,9 @@ const ROUTES: Array<{ path?: string; index?: true; element: ReactNode }> = [
   { path: 'inventory/:providerId', element: <Inventory /> },
   { path: 'events', element: <Events /> },
   { path: 'advisor', element: <Advisor /> },
+  { path: 'advisor/audit', element: <AdvisorAudit /> },
+  { path: 'advisor/policies', element: <AdvisorPolicies /> },
+  { path: 'advisor/recommendations/:recId', element: <RecommendationDetail /> },
   { path: '*', element: <NotFound /> },
 ];
 

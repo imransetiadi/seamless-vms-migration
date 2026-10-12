@@ -190,3 +190,38 @@ class TestServerFloatingIP(unittest.TestCase):
         with self.assertRaises(exc.CannotConverge):
             fip._find_specified_detached_floating_ip(conn)
         conn.network.ips.assert_called_with(floating_ip_address="172.20.9.135")
+
+    def _conn_with_port_fips(self, on_port):
+        """A server whose port holds fixed IP 192.168.20.7 and ``on_port`` floating IPs."""
+        port = {"id": "uuid-test-server-port", "fixed_ips": [{"ip_address": "192.168.20.7"}]}
+        conn = mock.Mock()
+        conn.network.ports.return_value = [port]
+
+        def ips(**query):
+            if query.get("port_id") == "uuid-test-server-port":
+                return list(on_port)
+            return [{"port_id": None, "id": "uuid-detached-fip"}]
+
+        conn.network.ips.side_effect = ips
+        return conn
+
+    def test_create_keeps_a_floating_ip_already_on_the_port(self):
+        """SDD §6.5: a re-run never adds a second floating IP for the same fixed address."""
+        attached = {"id": "uuid-test-server-fip", "port_id": "uuid-test-server-port",
+                    "fixed_ip_address": "192.168.20.7"}
+        fip = ServerFloatingIP.from_sdk(None, sdk_server_floating_ip())
+        for mode in ("auto", "new", "existing"):
+            conn = self._conn_with_port_fips([attached])
+            self.assertEqual(attached, fip.create(conn, {"id": "uuid-test-server"}, mode))
+            conn.network.create_ip.assert_not_called()
+            conn.network.update_ip.assert_not_called()
+            conn.network.ips.assert_any_call(
+                port_id="uuid-test-server-port", fixed_ip_address="192.168.20.7"
+            )
+
+    def test_create_adds_a_floating_ip_the_port_lacks(self):
+        fip = ServerFloatingIP.from_sdk(None, sdk_server_floating_ip())
+        conn = self._conn_with_port_fips([])
+        fip.create(conn, {"id": "uuid-test-server"}, "auto")
+        conn.network.update_ip.assert_called_once()
+        conn.network.create_ip.assert_not_called()

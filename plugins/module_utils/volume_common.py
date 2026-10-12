@@ -9,6 +9,8 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import exc
 import json
 import logging
 import os
+import re
+import socket
 import subprocess
 import tempfile
 import time
@@ -37,6 +39,12 @@ except ImportError:
     DEVNULL = open(os.devnull, "r+", encoding="utf8")
 
 
+def _lock_host():
+    """This host's name as a lock records it (SDD §6.6)."""
+    host = socket.gethostname()
+    return host if re.match(r"^[A-Za-z0-9._-]+$", host or "") else "unknown"
+
+
 def use_lock(lock_file):
     """Boilerplate for functions that need to take a lock."""
 
@@ -48,7 +56,8 @@ def use_lock(lock_file):
                 try:
                     self.log.info("Waiting for lock %s...", lock_file)
                     lock = lock_file + ".lock"
-                    pid = str(os.getpid())
+                    # the owner, so a later module can tell a dead one (SDD §6.6)
+                    owner = "%s:%d" % (_lock_host(), os.getpid())
                     cmd = [
                         "sudo",
                         "flock",
@@ -62,7 +71,7 @@ def use_lock(lock_file):
                         + lock
                         + " || exit 17 ) "
                         + "&& echo "
-                        + pid
+                        + owner
                         + " | sudo "
                         + " tee "
                         + lock
@@ -331,16 +340,23 @@ class OpenStackVolumeBase:
             self.log.info("Deleting volume %s.", volume["id"])
             self.conn.delete_volume(volume["id"], timeout=self.timeout, wait=True)
 
-    def check_process(self, pid):
-        """Check whether pid exists in the current process table."""
-        if not pid:
-            return False
-        try:
-            self.shell.cmd_val(["sudo", "kill", "-0", str(pid)])
-        except subprocess.CalledProcessError:
-            return False
-        else:
+    def check_process(self, owner):
+        """Whether the owner of a lock (``host:pid``) may still hold it (SDD §6.6).
+
+        A pid is checked only on the host it belongs to: the conversion host's
+        process table knows nothing of the migrator's pids, so the owner of
+        another host, or a lock in the earlier bare-pid form, counts as alive.
+        """
+        host, sep, pid = (owner or "").strip().rpartition(":")
+        if not sep or host != _lock_host() or not pid.isdigit():
             return True
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
 
     def check_and_cleanup_lockfiles(self):
         """
@@ -645,6 +661,12 @@ class RemoteShell:  # pylint: disable=ansible-bad-function
             "StrictHostKeyChecking=no",
             "-o",
             "ConnectTimeout=10",
+            # a silent partition ends the ssh in about a minute, not the
+            # kernel's ~2 h TCP keepalive, while the source may be stopped (SDD §6.6)
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
         ]
         if self.key_path:
             options.extend(["-i", self.key_path])

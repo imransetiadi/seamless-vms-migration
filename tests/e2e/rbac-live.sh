@@ -35,7 +35,8 @@ check PUT  /migrations/nope/strategy operator; check GET  /events viewer
 check GET  /stats viewer;                      check GET  /advisor/status viewer
 check POST /advisor/similar-incidents operator
 
-# plan policy fields (require_approval, auto_cutover, cutover_window) need approver, also on POST /plans (SDD 12);
+# plan policy fields (require_approval, require_distinct_approver, auto_cutover, cutover_window) need approver,
+# also on POST /plans (SDD 12);
 # the 403 for an operator must win over any 400/404/422 of the same request
 policy() { # METHOD PATH JSON-BODY
   local code
@@ -48,5 +49,6 @@ policy() { # METHOD PATH JSON-BODY
 }
 policy POST  /plans      '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
 policy PATCH /plans/nope '{"require_approval":false}'
+policy PATCH /plans/nope '{"require_distinct_approver":false}'
 policy PATCH /plans/nope '{"cutover_window":{"start":"2030-01-01T01:00:00Z","end":"2030-01-01T05:00:00Z"}}'
 if [ "$fail" = 0 ]; then echo "RBAC matrix OK"; else echo "RBAC matrix FAILED"; exit 1; fi

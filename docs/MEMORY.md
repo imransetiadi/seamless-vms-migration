@@ -15,7 +15,8 @@ may and may not enter it, how it is configured, how agents are expected to use i
 
 The one rule that governs everything below: **memory never decides and never blocks.** A migration's
 state is derived only from PostgreSQL and deterministic rules; memory can add an advisory note to a failed
-migration and nothing else. With agentmemory switched off, down, wrong or poisoned, migrations behave
+migration and similar past incidents to the evidence of an advisor recommendation (read at validation), and
+nothing else. With agentmemory switched off, down, wrong or poisoned, migrations behave
 identically (§7).
 
 ---
@@ -27,7 +28,7 @@ identically (§7).
 | Purpose | Reuse operational experience: lessons on completion, failure and rollback; *similar-incident recall* when a migration fails | Authoritative state and a complete, ordered audit trail | Keep the team's and their agents' engineering knowledge across sessions |
 | Store | **agentmemory** server (REST), project `seamless-migrate` | **PostgreSQL 16**: `documents` (providers, plans, migrations) and `events` (SDD §11) | agentmemory (same server, MCP) + `CLAUDE.md` (versioned in git) |
 | Written by | `KnowledgeService` (`ai/knowledge.py`) on `on_completed`, `on_failure`, `on_rolled_back` (SDD §14.3) | Orchestrator and API on **every** state change and mutating call (`emit`, `Store.put`) | Contributors and their coding agents via the `agentmemory` MCP server (`.mcp.json`); reviewers via pull requests to `CLAUDE.md` |
-| Read by | `KnowledgeService.search` on failure; operators via `POST /api/v1/advisor/similar-incidents` and the dashboard *Advisor* page | API, dashboard, CLI, reports; the orchestrator resumes from it after a restart (FR-16) | Agents at session start (`memory_smart_search`, `memory_lesson_recall`); humans via the agentmemory viewer |
+| Read by | `KnowledgeService.on_failure` (a failed migration's note) and `similar_for` (a validation's advisor evidence, `similar_incidents`, SDD §14.4); operators via `POST /api/v1/advisor/similar-incidents` and the dashboard *Advisor* page | API, dashboard, CLI, reports; the orchestrator resumes from it after a restart (FR-16) | Agents at session start (`memory_smart_search`, `memory_lesson_recall`); humans via the agentmemory viewer |
 | Content | Short lessons built from *profile buckets*, strategy, step, error class and outcome — redacted (§3) | Full typed documents, `phase_history`, `sync_passes`, `AdvisorNote`s with `source`/`confidence`, approvals, events with `actor` | Decisions with reasons, root-caused bugs, procedures, measurements, gotchas (§5) |
 | Trust | **Advisory.** Shown as `AdvisorNote(kind="similar_incidents", source="memory")`; never drives a transition | **Authoritative.** The only input to state transitions | **Unverified.** Verify against the code before acting on it |
 | Retention | Server-side decay and auto-forget; Seamless sets no TTL in 0.1.0 (§3.4) | No automatic purge in 0.1.0; recommended: keep ≥ 13 months of events, archive beyond (§3.4) | Same server policy as L1 |
@@ -128,7 +129,7 @@ never a dump of logs, console output or API payloads.**
 
 | Never stored in agentmemory | Why | Enforced by |
 |---|---|---|
-| Passwords, tokens, API keys, `Authorization` headers, PEM/private-key blocks, credentials inside URLs | Secret exposure (NFR-06, NFR-07) | `ai.memory.redact()` client-side (`test_redact_removes_secrets`); agentmemory's own privacy filter server-side; `<private>` tags are stripped by the server |
+| Passwords, tokens, API keys, `Authorization` headers, PEM/private-key blocks, credentials inside URLs and connection strings, the `auth` section of a `clouds.yaml` | Secret exposure (NFR-06, NFR-07) | The one redaction layer `ai/redaction.py`, applied by `MemoryClient` to every request body (`test_redact_removes_secrets`, `test_every_agentmemory_request_leaves_redacted`); agentmemory's own privacy filter server-side; `<private>` tags are stripped by the server |
 | Guest console output (including excerpts) | Untrusted text (prompt-injection carrier) and may contain secrets | By construction: only `review_verification` reads it, after `jev_screen`, and sends it to Jev — never to `KnowledgeService` (SDD §13.4; `test_verification_blocked_console_sets_review_required`) |
 | API tokens, token hashes, `clouds.yaml` or VMware credential material | Credentials never leave the credential path (SDD §13.3) | Never part of any `Migration`/`Plan` field that lessons are built from |
 | Raw Ansible/`blocksync` output and run-directory contents | Hostnames, paths, addresses; unbounded size | Lessons carry the error *class* and a truncated message only |
@@ -136,13 +137,16 @@ never a dump of logs, console output or API payloads.**
 | VM names, **when** `SEAMLESS_MEMORY_REDACT_NAMES=true` | Customer-identifying names | Name list passed to `redact()` (§3.6) |
 | Operator identities | Personal data | Only L2 events carry `actor`; lessons do not |
 
-Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/memory.py` (SDD §13.4; the plan
-test `test_redact_removes_secrets` covers them): PEM blocks (`-----BEGIN … -----END …` → `[REDACTED PEM]`);
-credentials in URLs (`scheme://user:password@host`); `Authorization` headers and bare `Bearer` tokens;
-`key=value`, `key: value` and `"key": "value"` assignments for password, passwd, pwd, secret, client secret,
-token, auth token, `x-auth-token`, API/access/secret/private key and credential(s); and well-known token shapes —
-Seamless API tokens (`smg_…`), Keystone Fernet tokens (`gAAAAA…`) and JWTs (`eyJ….….…`). Matches become
-`[REDACTED]`. Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
+Redaction rule classes implemented by `redact(text, redact_names=None)` in `ai/redaction.py`, the one layer every
+agentmemory body and every Jev call passes (SDD §13.4; `test_redact_removes_secrets` and the reviewed snapshot
+`test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot` cover them): PEM blocks (`-----BEGIN … -----END …`
+→ `[REDACTED PEM]`); the `auth` section of a `clouds.yaml` (YAML or JSON → `auth: [REDACTED]`); credentials in URLs
+and connection strings (`scheme://user:password@host`, a password with `@` too, `Password=…;`); `Authorization`
+headers and bare `Bearer` tokens; `key=value`, `key: value` and `"key": "value"` assignments for password, passwd,
+pwd, secret, client secret, token, auth token, `x-auth-token`, API/access/secret/private key and credential(s),
+the key possibly prefixed (`OS_PASSWORD`); and well-known token shapes — Seamless API tokens (`smg_…`), Keystone
+Fernet tokens (`gAAAAA…`), JWTs (`eyJ….….…`), AWS access key ids, GitHub tokens, `sk-` keys and Slack tokens.
+Matches become `[REDACTED]`; `redact_payload` also replaces the whole value of a credential key. Redaction is pattern-based: it does **not** remove hostnames, IP addresses or business-sensitive
 words that appear in an error message — treat the memory server as an internal system and prefer
 `SEAMLESS_MEMORY_REDACT_NAMES=true` whenever the server is shared (§3.6).
 
@@ -198,7 +202,7 @@ words that appear in an error message — treat the memory server as an internal
 * **Sensitive data found in memory** (checklist): ① delete the memories with a reason; ② verify with a
   search for the offending string; ③ **rotate** the leaked secret (Security.md §7, §13); ④ find the leak's
   origin — if a Seamless payload carried it, add a failing case to `test_redact_removes_secrets` first, then
-  fix `redact()`; ⑤ record the incident (Security.md §13).
+  fix `redact()` in `ai/redaction.py`; ⑤ record the incident (Security.md §13).
 * **Erasure requests:** operator identities exist only in L2 `events` (`actor`) and git history; agentmemory
   holds none by design. Handle requests against L2 under change control.
 * **Access control:** bind the memory server to loopback; when it must be reachable (team server, cluster),
@@ -242,8 +246,11 @@ inside the VM network:
 docker --context colima-seamless run --rm busybox wget -qO- http://host.docker.internal:3111/agentmemory/livez
 ```
 
-On a Linux Docker host add `extra_hosts: ["host.docker.internal:host-gateway"]` to the `seamless` service (via
-`SEAMLESS_EXTRA_COMPOSE_FILE`).
+On a Linux machine's own Docker Engine (`SEAMLESS_DOCKER_CONTEXT=default`) the Make targets add
+`deploy/compose/compose.linux-host.yaml`, which maps `host.docker.internal` to the host gateway (SDD §17.1); pass it
+with `-f` when you run `docker compose` yourself. agentmemory on that host must then listen on an address the
+containers reach — the bridge's (`172.17.0.1` by default), or all addresses behind a firewall — not on `127.0.0.1`
+only. Colima and Docker Desktop resolve the name themselves.
 
 ### 4.3 OpenShift
 
@@ -365,7 +372,7 @@ server; never impersonate another agent id.
 | M-04 | **Jev is advisory-only**, bounded to the eligible tie set / no-SLO case, applied only at `confidence ≥ 0.6` | Live `jev_decide` on a clear case scored 0.65–0.68, so 0.8 would almost never apply; the deterministic selector must stay authoritative | Slightly more overrides than a stricter threshold, always inside bounds; every call recorded as an `AdvisorNote` with source and confidence | After collecting real outcomes: calibrate confidence against operator overrides per tool | SDD §14.2 |
 | M-05 | **Dedicated Colima profile `seamless`** (4 CPU / 6 GiB / 40 GiB), Docker context `colima-seamless`, every Make target pinned to it | The developer's `default` profile and other containers (e.g. `seamless-pg-test`) must never be disturbed; reproducible resources; no port or volume collisions | Slightly more setup; two VMs when both profiles run (memory) | If CI replaces local Compose runs | SDD §17.1 |
 | M-06 | **Memory is optional, external and non-fatal** (agentmemory over REST, 5 s timeout, errors swallowed) | A support tool must not become a point of failure of a migration platform | Recall quality depends on a server the team operates; tests must prove the swallow behavior | If memory becomes part of an approval workflow (not planned) | SDD §14.3 |
-| M-07 | **Credentials never enter the database or the API**; mounted files and 0600 temp files only | One credential path to audit and rotate | Per-tenant credentials are a 0.2.0 item; every provider references a `clouds.yaml` entry | 0.2.0 per-tenant credentials | SDD §13.3 |
+| M-07 | **Credentials never enter the database or an API response**; they come from mounted files, or — entered in the dashboard — are written once through `PUT /providers/{id}/credentials` to the platform secret store (`SEAMLESS_SECRET_STORE`), and reach playbooks as 0600 temp files | Few credential paths to audit and rotate, none of them readable back | A provider references a mounted `clouds.yaml` entry, its `provider-{id}` secret, or a secret managed outside Seamless that it names (never written by the dashboard; SDD §13.3) | Per-tenant credential stores | SDD §13.3 |
 | M-08 | **Static hashed bearer tokens** in 0.1.0 (OIDC/OpenShift OAuth later) | Works offline and in demo; no IdP dependency; hash-only storage | Manual rotation; tokens do not expire | Enterprise SSO requirement | SDD §13.1 |
 | M-09 | **Two Compose networks**: `backend` (`internal: true`, PostgreSQL) and `frontend` (outbound) | PostgreSQL gets no route out and no published port | The control plane is on both | — | SDD §17.1 |
 | M-10 | **Edge-TLS Route** on OpenShift; no in-pod TLS in 0.1.0 | Re-encrypt requires TLS in the application | Router → pod hop is plain HTTP, confined by NetworkPolicy | In-pod TLS or a service-mesh/sidecar | SDD §17 |
@@ -376,7 +383,7 @@ server; never impersonate another agent id.
 
 | Failure | What happens | Impact on migrations | Detection | Recovery |
 |---|---|---|---|---|
-| agentmemory down, unreachable or slow | `MemoryClient` times out after 5 s; `remember` → `False`, `search` → `[]`; errors logged and swallowed | **None.** No similar-incident note on failures; no lesson saved | `GET /api/v1/advisor/status` → `"memory":{"enabled":true,"available":false,"last_error":…}`; warnings in the log | Restart/repair the server. No backfill is required; lessons can be re-created from L2 events if wanted |
+| agentmemory down, unreachable or slow | `MemoryClient` times out after 5 s; `remember` → `False`, `search` → `[]`; errors logged and swallowed | **None.** No similar-incident note on failures; no lesson saved | `GET /api/v1/advisor/status` → `"memory":{"enabled":true,"available":false,"last_error":…}` — the call and what happened, e.g. `"search timed out after 5 s"` (the Advisor page shows it on the agentmemory card); warnings in the log | Restart/repair the server. No backfill is required; lessons can be re-created from L2 events if wanted |
 | Auth failure (401/403) | Same as above | None | `last_error` mentions the status | Fix `SEAMLESS_MEMORY_SECRET` |
 | Black-holed network (packets dropped) | Each call costs up to the 5 s timeout | Failure handling must not block the FSM on memory. `test_memory_failures_swallowed` covers errors, not latency, so the timing is verified by the resilience test QASuite §11 R-04 | Step-duration metrics | Remove the filter |
 | Wrong URL or project id | Lessons are written to, or searched in, the wrong place | None; recall quality drops | Probe memory with `test_live_memory_roundtrip`; compare projects | Correct the setting; delete stray memories (§3.5) |
@@ -397,7 +404,7 @@ server; never impersonate another agent id.
 | Tolerant parsing of `results\|memories\|items`, `content\|narrative\|title` | `test_memory_search_tolerant_parsing` |
 | Failures swallowed | `test_memory_failures_swallowed` |
 | Similar incidents attached on failure | `test_knowledge_on_failure_attaches_hits`, `test_similar_incidents_attached_on_failure` (orchestrator) |
-| Redaction | `test_redact_removes_secrets` |
+| Redaction | `test_redact_removes_secrets`, `test_a_fixture_of_fake_secrets_redacts_to_the_reviewed_snapshot`, `test_every_agentmemory_request_leaves_redacted` |
 | Console output blocked from AI use | `test_verification_blocked_console_sets_review_required` |
 | Live server | `test_live_memory_roundtrip` (`SEAMLESS_LIVE_MEMORY=1`) |
 | Outage behavior | QASuite §11 R-04 (agentmemory outage and black-holed network); R-03 covers the Jev counterpart |

@@ -83,7 +83,18 @@ class ServerFloatingIP(osm_resource.Resource):
         my_port = self._find_my_server_port(conn, sdk_srv)
         if mode == "skip":
             return None
-        elif mode == "existing":
+        # A re-run finishing a server it created before (SDD §6.5) keeps the
+        # floating IP already on the port for this fixed address: never a second.
+        on_port = list(
+            conn.network.ips(
+                port_id=my_port["id"],
+                fixed_ip_address=self.params()["fixed_ip_address"],
+            )
+        )
+        if on_port:
+            return on_port[0]
+
+        if mode == "existing":
             return self._attach_existing(conn, my_port, sdk_srv, required=True)
         elif mode == "new":
             return self._create_new(conn, my_port, sdk_srv)
@@ -108,6 +119,35 @@ class ServerFloatingIP(osm_resource.Resource):
             conn.network.update_ip(existing, port_id=my_port["id"])
             return existing
         return None
+
+    def dst_errors(self, conn, mode):
+        """What would make the import fail on this floating IP after the source stops,
+        looked up now as `create` will look it up (SDD 6.6): the detached floating IP it
+        attaches, or the network (and QoS policy) of the one it creates.
+
+        Returns: list of strings (error messages), empty when the import can proceed
+        """
+        params = self.params()
+        where = "floating IP {0} on network '{1}'".format(
+            params.get("floating_ip_address"),
+            (params.get("floating_network_ref") or {}).get("name"),
+        )
+        try:
+            if mode in ("auto", "existing") and self._find_specified_detached_floating_ip(
+                conn, required=mode == "existing"
+            ):
+                return []
+            if mode in ("auto", "new"):
+                self._refs_from_ser(conn)
+        except (
+            exc.InconsistentState,
+            exc.CannotConverge,
+            osm_resource.OPENSTACK_EXC.ResourceFailure,
+            osm_resource.OPENSTACK_EXC.ResourceNotFound,
+            osm_resource.OPENSTACK_EXC.DuplicateResource,
+        ) as e:
+            return [f"Destination prerequisites not met: {where}: {e}"]
+        return []
 
     def _find_my_server_port(self, conn, sdk_srv, delay=5, retries=5):
         params = self.params()

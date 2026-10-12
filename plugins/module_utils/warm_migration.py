@@ -30,6 +30,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import blocksync
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils.server_port import (
+    port_description,
+)
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     serialized_volume_type,
     ATTACH_LOCK_FILE_DESTINATION,
@@ -770,15 +773,32 @@ class OpenstackWarmSync(_WarmVolumeBase):
             recorded = self.state.dest_volumes.get(dev)
             if recorded is not None:
                 volume = self._get_volume_maybe(recorded.get("dest_id"))
-                if volume is not None:
+                if volume is not None and volume.status == "error":
+                    # Cinder failed to create it: it never becomes usable
+                    self.log.warning(
+                        "Destination volume %s of %s is in error, deleting it and "
+                        "creating a new one",
+                        volume.id,
+                        dev,
+                    )
+                    self.conn.delete_volume(volume.id, wait=True, timeout=self.timeout)
+                elif volume is not None:
+                    if volume.status == "creating":
+                        # a pass interrupted while Cinder created it
+                        volume = self._wait_volume_available(volume)
                     if source["size"] and source["size"] > recorded["size"]:
                         self._extend_dest_volume(dev, volume, source["size"])
+                    if recorded.get("bootable"):
+                        # set again: a pass interrupted between the create and the flag
+                        # left it unset, and Nova refuses to boot from such a volume
+                        self.conn.block_storage.set_volume_bootable_status(volume, True)
                     continue
-                self.log.warning(
-                    "Destination volume %s of %s is gone, creating a new one",
-                    recorded.get("dest_id"),
-                    dev,
-                )
+                else:
+                    self.log.warning(
+                        "Destination volume %s of %s is gone, creating a new one",
+                        recorded.get("dest_id"),
+                        dev,
+                    )
             self._create_dest_volume(dev, source)
             created.add(dev)
         return created
@@ -999,7 +1019,10 @@ class WarmRollback:
 
     Deletes the destination server recorded in the warm state (or, with
     ``match_by_name``, the only destination server with exactly the
-    workload's name, for workloads migrated without a warm state). With
+    workload's name, for workloads migrated without a warm state), then the
+    destination ports created through Neutron for ``source_port_ids`` - Nova
+    keeps them when it deletes their server, and a cutover can fail between
+    creating them and creating the server (SDD 6.6). With
     ``delete_volumes`` it also deletes the destination volumes - the
     recorded ones and every volume attached to that server - and the warm
     state itself; the state is kept while a source snapshot is pending so
@@ -1015,9 +1038,11 @@ class WarmRollback:
         dst_filters=None,
         timeout=DEFAULT_TIMEOUT,
         conversion_host=None,
+        source_port_ids=None,
     ):
         self.conn = conn
         self.state = state
+        self.source_port_ids = list(source_port_ids or [])
         self.server_name = server_name or state.server_name
         self.match_by_name = match_by_name
         self.dst_filters = dst_filters or {}
@@ -1033,6 +1058,7 @@ class WarmRollback:
             "deleted_server_id": None,
             "deleted_volume_ids": [],
             "kept_volume_ids": [],
+            "deleted_port_ids": [],
             "state_deleted": False,
         }
         recorded = self.state.exists()
@@ -1058,6 +1084,9 @@ class WarmRollback:
         if recorded and self.state.destination_server_id is not None:
             self.state.destination_server_id = None
             self.state.save()
+        result["deleted_port_ids"] = self._delete_ports(result["deleted_server_id"])
+        if result["deleted_port_ids"]:
+            result["changed"] = True
         if not delete_volumes:
             return result
 
@@ -1091,6 +1120,26 @@ class WarmRollback:
                 self.state.save()
             result["changed"] = True
         return result
+
+    def _delete_ports(self, deleted_server_id):
+        """Delete the destination ports created through Neutron for the
+        workload's source ports, unbound or bound to the server just deleted;
+        a port another server uses is kept (SDD 6.6)."""
+        deleted = []
+        for source_port_id in self.source_port_ids:
+            marker = port_description(source_port_id)
+            for port in self.conn.network.ports(description=marker):
+                if port.description != marker:
+                    continue  # never trust the filter alone before a delete
+                if port.device_id and port.device_id != deleted_server_id:
+                    self.log.warning(
+                        "Keeping destination port %s: server %s uses it", port.id, port.device_id
+                    )
+                    continue
+                self.log.info("Deleting destination port %s", port.id)
+                self.conn.network.delete_port(port, ignore_missing=True)
+                deleted.append(port.id)
+        return deleted
 
     def _find_destination_server(self):
         if self.state.destination_server_id:

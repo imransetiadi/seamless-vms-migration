@@ -31,7 +31,7 @@ class ExecutorRouter:
     @property
     def simulated(self) -> Any:
         if self._simulated is None:
-            self._simulated = SimulatedExecutor(self.settings)
+            self._simulated = SimulatedExecutor(self.settings, providers=self._providers)
         return self._simulated
 
     @property

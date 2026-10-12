@@ -20,7 +20,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
 from ..config import Settings
-from .memory import redact
+from .redaction import redact, redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +173,8 @@ class JevClient:
         if self.breaker_open:
             self.calls[(tool, "circuit_open")] += 1
             raise JevUnavailable("circuit breaker open after repeated Jev failures")
+        # SDD §13.4: nothing leaves for Jev unredacted, whoever built the arguments
+        arguments = redact_payload(arguments)
         try:
             payload = await asyncio.wait_for(
                 self._call_once(tool, arguments), timeout=self.settings.jev_timeout_s

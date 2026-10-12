@@ -18,7 +18,16 @@ const META: Record<LiveStatus, { label: string; tone: Tone; icon: LucideIcon }> 
  * Event-stream health, labelled "Live" only while the SSE connection is open; the tooltip shows
  * when the last event/heartbeat arrived so stale data is recognisable.
  */
-export function LiveIndicator({ compact = false, className }: { compact?: boolean; className?: string }) {
+export function LiveIndicator({
+  compact = false,
+  stacked = false,
+  className,
+}: {
+  compact?: boolean;
+  /** The navigation rail's form: the icon above its label, which wraps (SDD §16). */
+  stacked?: boolean;
+  className?: string;
+}) {
   const { status, lastEventAt, lastHeartbeatAt } = useLiveSnapshot();
   const meta = META[status];
   const last = Math.max(lastEventAt ?? 0, lastHeartbeatAt ?? 0);
@@ -26,10 +35,15 @@ export function LiveIndicator({ compact = false, className }: { compact?: boolea
   return (
     <span
       title={`Event stream: ${meta.label}. ${detail}`}
-      className={cn('inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium', TONE_CLASSES[meta.tone].text, className)}
+      className={cn(
+        'inline-flex items-center font-medium',
+        stacked ? 'flex-col gap-1 text-center text-[11px] leading-tight' : 'gap-1.5 whitespace-nowrap text-xs',
+        TONE_CLASSES[meta.tone].text,
+        className,
+      )}
     >
       <meta.icon aria-hidden className={cn('size-3.5 shrink-0', meta.icon === LoaderCircle && 'animate-spin')} />
-      <span className={compact ? 'sr-only' : undefined}>
+      <span className={compact ? 'sr-only' : stacked ? 'max-w-full hyphens-auto [overflow-wrap:anywhere]' : undefined}>
         {compact ? `Event stream: ${meta.label}` : meta.label}
       </span>
     </span>

@@ -46,6 +46,8 @@ export interface VmTableProps {
   onSelectedChange?: (next: Set<string>) => void;
   caption?: string;
   pageSize?: number;
+  /** The search the table opens with: a link to one VM (SDD §16, ADV-02). */
+  initialQuery?: string;
 }
 
 function PowerCell({ state }: { state: PowerState }) {
@@ -65,16 +67,16 @@ function ReadinessCell({ flags, level }: { flags: ReadinessFlag[]; level: Readin
       {level === 'ready' && <StatusBadge tone="success" icon={CircleCheck} label="Ready" />}
       {shown.map((flag) => {
         const meta = severityMeta(flag.severity);
-        return <StatusBadge key={flag.code} tone={meta.tone} icon={meta.icon} label={flag.label} title={`${flag.code}: ${flag.detail}`} />;
+        return <StatusBadge key={flag.code} tone={meta.tone} icon={meta.icon} label={flag.label} detail={`${flag.code}: ${flag.detail}`} />;
       })}
     </div>
   );
 }
 
 /** Inventory table with search, power/readiness/project filters, sorting and optional selection. */
-export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200 }: VmTableProps) {
+export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '' }: VmTableProps) {
   const searchId = useId();
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState(initialQuery);
   const [power, setPower] = useState<PowerState | 'all'>('all');
   const [readiness, setReadiness] = useState<ReadinessFilter>('all');
   const [project, setProject] = useState('all');

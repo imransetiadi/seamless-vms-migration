@@ -4,15 +4,20 @@
 import {
   keepPreviousData,
   useMutation,
-  useQuery,
   useQueryClient,
   type QueryClient,
   type QueryKey,
 } from '@tanstack/react-query';
 import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
+import { useApiQuery } from './stickyQuery';
 import type {
+  AdvisorPolicy,
+  AdvisorPolicySpec,
+  AdvisorRecommendation,
+  AdvisorSnapshot,
   AdvisorStatus,
+  DataSentList,
   ApproveRequest,
   AutoWavesRequest,
   CancelRequest,
@@ -20,6 +25,7 @@ import type {
   Event,
   EventListQuery,
   FinalizeRequest,
+  ForceCutoverRequest,
   Health,
   Me,
   Migration,
@@ -27,18 +33,25 @@ import type {
   MigrationListQuery,
   Plan,
   PlanCreate,
+  PlanFinalizeRequest,
+  PlanFinalizeResult,
   PlanPatch,
+  PolicyList,
+  OverrideRequest,
   Provider,
   ProviderCreate,
   ProviderCredentials,
   ProviderPatch,
   ProviderInventory,
+  RecommendationListQuery,
+  RecommendationPage,
   RollbackRequest,
   SimilarIncidentsRequest,
   SimilarIncidentsResponse,
   Stats,
   Strategy,
   ValidationReport,
+  VMRef,
 } from './types';
 
 export const ApiContext = createContext<ApiClient | null>(null);
@@ -64,6 +77,12 @@ export const queryKeys = {
   eventTail: (query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}) => ['events', 'tail', query] as const,
   stats: (planId?: string | null) => ['stats', planId ?? null] as const,
   advisorStatus: ['advisor', 'status'] as const,
+  dataSent: ['advisor', 'data-sent'] as const,
+  recommendations: (query: RecommendationListQuery = {}) => ['advisor', 'recommendations', query] as const,
+  /** Under `recommendations`, so a refresh of the list refreshes it too. */
+  recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
+  snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
+  policies: ['advisor', 'policies'] as const,
 };
 
 function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
@@ -77,7 +96,7 @@ function noRetryOnClientErrors(failureCount: number, error: Error): boolean {
 
 export function useMe() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.me,
     queryFn: ({ signal }) => api.get<Me>('/me', { signal }),
     retry: noRetryOnClientErrors,
@@ -87,7 +106,7 @@ export function useMe() {
 
 export function useHealth() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.health,
     queryFn: ({ signal }) => api.get<Health>('/health', { signal }),
     refetchInterval: 60_000,
@@ -95,9 +114,15 @@ export function useHealth() {
   });
 }
 
+/** Demo mode's time compression from `GET /health` (SDD §7.4): running downtime clocks show model time (§16, ADV-16). */
+export function useDemoSpeed(): number | null {
+  const health = useHealth();
+  return health.data?.demo ? health.data.demo_speed : null;
+}
+
 export function useProviders() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.providers,
     queryFn: ({ signal }) => api.get<Provider[]>('/providers', { signal }),
     retry: noRetryOnClientErrors,
@@ -106,7 +131,7 @@ export function useProviders() {
 
 export function useInventory(providerId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.inventory(providerId ?? ''),
     queryFn: ({ signal }) => api.get<ProviderInventory>(`/providers/${enc(providerId ?? '')}/inventory`, { signal }),
     enabled: Boolean(providerId),
@@ -117,7 +142,7 @@ export function useInventory(providerId: string | undefined) {
 
 export function usePlans() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.plans,
     queryFn: ({ signal }) => api.get<Plan[]>('/plans', { signal }),
     retry: noRetryOnClientErrors,
@@ -126,7 +151,7 @@ export function usePlans() {
 
 export function usePlan(planId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.plan(planId ?? ''),
     queryFn: ({ signal }) => api.get<Plan>(`/plans/${enc(planId ?? '')}`, { signal }),
     enabled: Boolean(planId),
@@ -142,7 +167,7 @@ export interface ListOptions {
 
 export function useMigrations(query: MigrationListQuery = {}, options: ListOptions = {}) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.migrations(query),
     queryFn: ({ signal }) =>
       api.get<Migration[]>('/migrations', {
@@ -163,7 +188,7 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
 
 export function useMigration(migrationId: string | undefined) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.migration(migrationId ?? ''),
     queryFn: ({ signal }) => api.get<Migration>(`/migrations/${enc(migrationId ?? '')}`, { signal }),
     enabled: Boolean(migrationId),
@@ -173,7 +198,7 @@ export function useMigration(migrationId: string | undefined) {
 
 export function useStats(planId?: string | null) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.stats(planId),
     queryFn: ({ signal }) => api.get<Stats>('/stats', { signal, query: { plan_id: planId ?? undefined } }),
     refetchInterval: 15_000,
@@ -184,10 +209,74 @@ export function useStats(planId?: string | null) {
 
 export function useAdvisorStatus() {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.advisorStatus,
     queryFn: ({ signal }) => api.get<AdvisorStatus>('/advisor/status', { signal }),
     refetchInterval: 30_000,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/data-sent`: what each decision type sends to Jev (SDD §13.4, ADV-06). */
+export function useDataSent() {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.dataSent,
+    queryFn: ({ signal }) => api.get<DataSentList>('/advisor/data-sent', { signal }),
+  });
+}
+
+/** `GET /advisor/recommendations`: stored and legacy recommendations, newest first (SDD §12, §14.4). */
+export function useRecommendations(query: RecommendationListQuery = {}, options: ListOptions = {}) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.recommendations(query),
+    queryFn: ({ signal }) =>
+      api.get<RecommendationPage>('/advisor/recommendations', {
+        signal,
+        query: {
+          migration_id: query.migration_id,
+          plan_id: query.plan_id,
+          decision_type: query.decision_type,
+          limit: query.limit,
+          offset: query.offset,
+        },
+      }),
+    enabled: options.enabled ?? true,
+    placeholderData: options.keepPrevious ? keepPreviousData : undefined,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/recommendations/{id}`: one recommendation, a legacy one too (SDD §12). */
+export function useRecommendation(recId: string | undefined) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.recommendation(recId ?? ''),
+    queryFn: ({ signal }) => api.get<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId ?? '')}`, { signal }),
+    enabled: Boolean(recId),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/policies`: the stored policies and the built-in default (SDD §12, §14.6). */
+export function usePolicies() {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.policies,
+    queryFn: ({ signal }) => api.get<PolicyList>('/advisor/policies', { signal }),
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/snapshots/{sha256}`: a redacted advisor input; it never changes (SDD §14.5). */
+export function useSnapshot(sha256: string | null | undefined) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.snapshot(sha256 ?? ''),
+    queryFn: ({ signal }) => api.get<AdvisorSnapshot>(`/advisor/snapshots/${enc(sha256 ?? '')}`, { signal }),
+    enabled: Boolean(sha256),
+    staleTime: Infinity,
     retry: noRetryOnClientErrors,
   });
 }
@@ -207,13 +296,13 @@ export async function fetchEventTail(
 ): Promise<Event[]> {
   return api.get<Event[]>('/events', {
     signal,
-    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), plan_id: query.plan_id, migration_id: query.migration_id },
+    query: { tail: true, limit: Math.min(keep, EVENT_LIMIT), before: query.before, plan_id: query.plan_id, migration_id: query.migration_id, audit: query.audit || undefined },
   });
 }
 
 export function useEventTail(query: Omit<EventListQuery, 'since' | 'limit' | 'tail'> = {}, keep = 500) {
   const api = useApi();
-  return useQuery({
+  return useApiQuery({
     queryKey: queryKeys.eventTail(query),
     queryFn: ({ signal }) => fetchEventTail(api, query, keep, signal),
     retry: noRetryOnClientErrors,
@@ -362,9 +451,11 @@ export function usePlanAction(planId: string) {
           return api.post<Plan>(`${base}/waves/auto`, request.body ?? {});
       }
     },
-    onSuccess: (result) => {
+    onSuccess: (result, request) => {
       if ('waves' in result) queryClient.setQueryData(queryKeys.plan(planId), result);
       invalidateAll(queryClient, [queryKeys.plans, ['migrations'], ['stats'], ['events']]);
+      // a validation records a recommendation for every automatic choice it hands the advisor (SDD §14.4)
+      if (request.action === 'validate') invalidateAll(queryClient, [['advisor', 'recommendations']]);
     },
   });
 }
@@ -372,6 +463,7 @@ export function usePlanAction(planId: string) {
 export type MigrationActionRequest =
   | { action: 'approve'; body?: ApproveRequest }
   | { action: 'cutover'; body?: CutoverRequest }
+  | { action: 'force-cutover'; body: ForceCutoverRequest }
   | { action: 'sync' }
   | { action: 'rollback'; body: RollbackRequest }
   | { action: 'retry' }
@@ -394,6 +486,29 @@ export function useMigrationAction(migrationId: string) {
   });
 }
 
+/** POST /plans/{id}/finalize (SDD §8.1, ADV-19): a wave or the plan, with one approval. */
+export function useFinalizePlan(planId: string) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: PlanFinalizeRequest) => api.post<PlanFinalizeResult>(`/plans/${enc(planId)}/finalize`, body),
+    onSuccess: () => invalidateAll(queryClient, [['migrations'], ['migration'], ['stats'], queryKeys.plan(planId), queryKeys.plans, ['events']]),
+  });
+}
+
+/**
+ * POST /demo/vms/{source_id}/power (demo mode, SDD §8.1): show the source watch's alert. Only the inventory
+ * changes now; the migration changes at the watch's next check, whose event refreshes it.
+ */
+export function useDemoPower() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sourceId, on }: { sourceId: string; on: boolean }) => api.post<VMRef>(`/demo/vms/${enc(sourceId)}/power`, { state: on ? 'on' : 'off' }),
+    onSuccess: () => invalidateAll(queryClient, [['inventory']]),
+  });
+}
+
 export function useSetStrategy(migrationId: string) {
   const api = useApi();
   const queryClient = useQueryClient();
@@ -403,6 +518,41 @@ export function useSetStrategy(migrationId: string) {
       queryClient.setQueryData(queryKeys.migration(migration.id), migration);
       invalidateAll(queryClient, [['migrations']]);
     },
+  });
+}
+
+/** POST or PUT `/advisor/policies` (`advisor.policy.manage`, SDD §12, §14.6). */
+export function useSavePolicy() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, spec }: { id?: string; spec: AdvisorPolicySpec }) =>
+      id ? api.put<AdvisorPolicy>(`/advisor/policies/${enc(id)}`, spec) : api.post<AdvisorPolicy>('/advisor/policies', spec),
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.policies, ['events', 'tail']]),
+  });
+}
+
+/** DELETE `/advisor/policies/{id}` (`advisor.policy.manage`). */
+export function useDeletePolicy() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete(`/advisor/policies/${enc(id)}`),
+    onSuccess: () => invalidateAll(queryClient, [queryKeys.policies, ['events', 'tail']]),
+  });
+}
+
+export type RecommendationDecisionRequest = { action: 'approve' } | { action: 'override'; body: OverrideRequest };
+
+/** Approve or override an advisor decision (`advisor.approve`, SDD §14.6). */
+export function useDecideRecommendation(recId: string) {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: RecommendationDecisionRequest) =>
+      api.post<AdvisorRecommendation>(`/advisor/recommendations/${enc(recId)}/${request.action}`, request.action === 'override' ? request.body : {}),
+    // the decision changes the migration's strategy and hold, an override the plan's overrides too
+    onSuccess: () => invalidateAll(queryClient, [['advisor', 'recommendations'], ['migrations'], ['migration'], ['plans'], ['events', 'tail']]),
   });
 }
 

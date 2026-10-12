@@ -11,16 +11,19 @@ from __future__ import annotations
 import logging
 
 from .config import Settings
-from .domain.enums import Phase, ProviderKind, ProviderRole
+from .domain.enums import DecisionType, Phase, ProviderKind, ProviderRole
 from .domain.models import (
+    AdvisorPolicy,
     ConversionHostConfig,
     Mappings,
     Migration,
     Plan,
+    PolicyScope,
     Provider,
     VerificationConfig,
 )
 from .orchestrator import Orchestrator
+from .planning.probes import is_database, suggest_probes
 from .providers.fake import FakeSourceProvider
 from .store import Store
 
@@ -33,6 +36,14 @@ UNPLANNED_FINANCE_VMS = frozenset({"report-01", "batch-01"})
 VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
+FINANCE_POLICY = "Finance — approval required"
+#: ADV-17 (SDD §5.4): the VMware plan's first cutovers, asked for by one person, approved by another
+DEMO_REQUESTER = "sari"
+DEMO_APPROVER = "rina"
+DEMO_APPROVAL_COMMENTS = (
+    "Change CHG-2041 approved by the DC2 service owner; backups checked this morning.",
+    "Agreed with the application team for tonight's window; rollback steps reviewed.",
+)
 
 DEMO_PROVIDERS = (
     Provider(
@@ -77,13 +88,17 @@ DEMO_PROVIDERS = (
 async def _plans(settings: Settings) -> list[Plan]:
     finance_vms = await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed).list_vms()
     vmware_vms = await FakeSourceProvider(ProviderKind.vmware, settings.demo_seed).list_vms()
+    planned = [vm for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS]
+    # the finance plan probes its databases' services (ADV-18, SDD §7.4); the VMware plan probes
+    # nothing, so its validation warns about its database VMs (APP_PROBE_MISSING)
+    probed = {vm.source_id: suggest_probes(vm) for vm in planned if is_database(vm)}
     return [
         Plan(
             name=FINANCE_PLAN,
             description="Side-by-side migration of the finance estate; cuts over automatically.",
             source_provider_id="rhosp17-finance",
             destination_provider_id="rhoso18",
-            vm_ids=[vm.source_id for vm in finance_vms if vm.name not in UNPLANNED_FINANCE_VMS],
+            vm_ids=[vm.source_id for vm in planned],
             mappings=Mappings(
                 networks={"finance-app": "finance-app", "finance-db": "finance-db"},
                 volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
@@ -93,6 +108,7 @@ async def _plans(settings: Settings) -> list[Plan]:
             auto_cutover=True,
             keep_warm_interval_s=120,
             verification=VerificationConfig(timeout_s=120),
+            probe_overrides={vm_id: probes for vm_id, probes in probed.items() if probes},
         ),
         Plan(
             name=VMWARE_PLAN,
@@ -132,6 +148,22 @@ async def seed_demo(
                 stored.model_copy(update={"distribution": provider.distribution}),
                 expected_version=version,
             )
+    # SDD §14.6 (ADV-04): the spec's demo policy, in force before the demo plans are validated
+    if FINANCE_POLICY not in {p.name for p in await db.list("advisor_policy", AdvisorPolicy)}:
+        await db.put(
+            "advisor_policy",
+            AdvisorPolicy(
+                id="pol-finance",
+                name=FINANCE_POLICY,
+                scope=PolicyScope(provider_ids=["rhosp17-finance"]),
+                decision_types=[DecisionType.migration_strategy],
+                mode="always_require_approval",
+                threshold=settings.jev_min_confidence,
+                require_override_reason=True,
+                updated_by=DEMO_ACTOR,
+            ),
+            expected_version=0,
+        )
     existing_plans = {p.name for p in await db.list("plan", Plan)}
     for plan in await _plans(settings):
         if plan.name in existing_plans:
@@ -146,4 +178,41 @@ async def seed_demo(
                 migration.id, DEMO_ACTOR, f"excluded from the demo: blocked by {codes}"
             )
         await orchestrator.start_plan(plan.id, DEMO_ACTOR)
+        if plan.name == VMWARE_PLAN:
+            await _seed_cutover_approvals(orchestrator, plan.id)
         log.info("demo plan %r seeded and started", plan.name)
+    await _restore_source_power(orchestrator)
+
+
+#: a migration in these stopped its source: the simulated cutover did, before a restart
+_SOURCE_STOPPED = frozenset({Phase.cutover, Phase.verifying, Phase.completed, Phase.finalized})
+
+
+async def _restore_source_power(orchestrator: Orchestrator) -> None:
+    """A restart builds new fakes, whose sources run (SDD §8.1): stop again those a simulated
+    cutover stopped, so the source watch flags only a source the demo powered on."""
+    plans = {p.id: p for p in await orchestrator.db.list("plan", Plan)}
+    for m in await orchestrator.db.list("migration", Migration):
+        stopped = m.phase in _SOURCE_STOPPED or (m.downtime_started_at and not m.downtime_ended_at)
+        plan = plans.get(m.plan_id)
+        if not stopped or plan is None:
+            continue
+        source = await orchestrator.source_client(plan)
+        power_off = getattr(source, "power_off", None)
+        if power_off is not None:
+            await power_off(m.vm.source_id)
+
+
+async def _seed_cutover_approvals(orchestrator: Orchestrator, plan_id: str) -> None:
+    """Two cutovers of the first wave, requested and approved by two people (ADV-17); the rest
+    of the plan waits for an approver."""
+    plan = await orchestrator.db.get("plan", plan_id, Plan)
+    order = {wave.id: index for index, wave in enumerate(plan.waves)}
+    migrations = await orchestrator.db.list("migration", Migration, plan_id=plan_id)
+    waiting = sorted(
+        (m for m in migrations if m.phase == Phase.ready),
+        key=lambda m: (order.get(m.wave_id or "", len(order)), m.vm.name),
+    )
+    for migration, comment in zip(waiting, DEMO_APPROVAL_COMMENTS, strict=False):
+        await orchestrator.request_cutover(migration.id, DEMO_REQUESTER)
+        await orchestrator.approve(migration.id, DEMO_APPROVER, comment)

@@ -17,8 +17,10 @@ from ..domain.enums import Strategy
 from ..domain.models import AdvisorNote, Estimate, Finding, Plan, VMRef
 from ..planning.selector import advisor_scope, select_strategy
 from ..planning.waves import TIERS, heuristic_tier
+from . import payloads
+from .decision import Advice
 from .jev import JevClient, JevUnavailable
-from .memory import redact
+from .redaction import redact
 
 log = logging.getLogger(__name__)
 GIB = 2**30
@@ -81,7 +83,7 @@ SCREEN_PURPOSE = (
     "Interpret a guest console log to decide whether the VM booted successfully after migration"
 )
 INJECTION_REASON = "console output contained instructions aimed at an AI agent"
-CONSOLE_EXCERPT_CHARS = 6000
+CONSOLE_EXCERPT_CHARS = payloads.CONSOLE_EXCERPT_CHARS
 
 
 def _gib(n: int) -> str:
@@ -111,33 +113,8 @@ class Advisor:
     def _strategy_evidence(
         self, vm: VMRef, estimates: Sequence[Estimate], plan: Plan, findings: Sequence[Finding]
     ) -> str:
-        disks = "; ".join(
-            f"{d.kind} {d.size_gb} GiB"
-            + (f" type {d.volume_type}" if d.volume_type else "")
-            + (" multi-attach" if d.multiattach else "")
-            + (" encrypted" if d.encrypted else "")
-            + (" independent" if d.independent else "")
-            for d in vm.disks
-        )
-        rate = (
-            f"{vm.change_rate_bps / MIB:.1f} MiB/s measured"
-            if vm.change_rate_bps is not None
-            else "unknown (default 2 MiB/s assumed)"
-        )
-        est_text = "; ".join(
-            f"{e.strategy}: downtime {e.downtime_s:.0f} s, pre-copy {e.precopy_s:.0f} s over "
-            f"{e.passes} pass(es), "
-            + ("eligible" if e.eligible else f"INELIGIBLE ({'; '.join(e.reasons)})")
-            for e in estimates
-        )
-        finding_text = ", ".join(f"{f.code} ({f.severity})" for f in findings) or "none"
-        text = (
-            f"VM {vm.name}: {vm.vcpus} vCPU, {vm.ram_mb} MB RAM, {len(vm.disks)} disk(s) "
-            f"[{disks}], provisioned {_gib(vm.disk_bytes)}, used {_gib(vm.used_bytes)}. "
-            f"Guest write rate {rate}. Downtime SLO {plan.downtime_slo_s} s. "
-            f"Link {plan.link_bps / MIB:.0f} MiB/s. Findings: {finding_text}. "
-            f"Estimates: {est_text}."
-        )
+        # rendered from the declared field specs (SDD §13.4, ADV-06): nothing else is sent
+        text = payloads.render_strategy(payloads.StrategyInput(vm, estimates, plan, findings))
         return self._redact(text, [vm.name])
 
     async def recommend_strategy(
@@ -146,13 +123,12 @@ class Advisor:
         estimates: Sequence[Estimate],
         plan: Plan,
         findings: Sequence[Finding] = (),
-    ) -> AdvisorNote | None:
-        """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when not needed.
-
-        ``note.data["applied"]`` tells the caller whether to switch to ``note.data["selected"]``.
-        """
-        scope = advisor_scope(estimates)
-        if not scope or not self.jev_enabled:
+    ) -> Advice | None:
+        """Ask Jev to break a tie (or pick when nothing meets the SLO); ``None`` when no advice is
+        needed. Returns the advice - or why Jev gave none; ``decide()`` takes the decision
+        (SDD §14.2, §14.4)."""
+        scope = advisor_scope(estimates, plan.selection_policy)
+        if not scope:
             return None
         deterministic, reason = select_strategy(vm, estimates, plan)
         eligible = [e for e in estimates if e.eligible]
@@ -162,90 +138,67 @@ class Advisor:
         ]
         if len(candidates) < 2:
             return None  # nothing to decide: jev_decide needs at least two candidates
-        base_data: dict[str, Any] = {
+        # the jev_decide arguments, built even when Jev is off: they are the input snapshot (§14.5)
+        arguments: dict[str, Any] = {
+            "decision": self._redact(
+                f"Which migration strategy should be used for VM {vm.name} moving to RHOSO 18.0?",
+                [vm.name],
+            ),
+            "evidence": self._strategy_evidence(vm, estimates, plan, findings),
+            "priorities": (
+                f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
+                "simpler strategy when downtimes differ by less than 10 %; never pick an "
+                "ineligible strategy"
+            ),
+            "candidates": candidates,
+            "requirements": list(STRATEGY_REQUIREMENTS),
+        }
+        # exactly the declared arguments (SDD §13.4): GET /advisor/data-sent lists them
+        request = {key: arguments[key] for key in payloads.STRATEGY_REQUEST_FIELDS}
+        request["escalate_on_contradiction"] = True
+        base: dict[str, Any] = {
+            "scope": tuple(s.value for s in scope),
+            "options": tuple(c["id"] for c in candidates),
             "deterministic": deterministic.value,
             "deterministic_reason": reason,
-            "scope": [s.value for s in scope],
-            "candidates": [c["id"] for c in candidates],
+            "request": request,
         }
+        if not self.jev_enabled:
+            return Advice(
+                option=None,
+                confidence=None,
+                unavailable="Jev is disabled (SEAMLESS_JEV_MODE=off)",
+                **base,
+            )
         assert self.jev is not None
         try:
-            response = await self.jev.decide(
-                decision=self._redact(
-                    f"Which migration strategy should be used for VM {vm.name} moving to "
-                    "RHOSO 18.0?",
-                    [vm.name],
-                ),
-                evidence=self._strategy_evidence(vm, estimates, plan, findings),
-                priorities=(
-                    f"Minimize downtime within the SLO of {plan.downtime_slo_s} s; prefer the "
-                    "simpler strategy when downtimes differ by less than 10 %; never pick an "
-                    "ineligible strategy"
-                ),
-                candidates=candidates,
-                requirements=list(STRATEGY_REQUIREMENTS),
-                escalate_on_contradiction=True,
-            )
+            response = await self.jev.decide(**request)
         except JevUnavailable as exc:
-            return AdvisorNote(
-                kind="strategy",
-                source="rules",
-                summary=f"Jev unavailable ({exc}); kept the deterministic choice {deterministic}",
-                data={**base_data, "selected": None, "applied": False},
-            )
-
+            return Advice(option=None, confidence=None, unavailable=str(exc), **base)
         rec = response.get("recommendation") or {}
         selected = rec.get("selected")
         confidence = rec.get("confidence")
-        status = rec.get("status") or response.get("status")
-        confident = isinstance(confidence, int | float) and float(confidence) >= (
-            self.settings.jev_min_confidence
-        )
-        in_scope = isinstance(selected, str) and selected in base_data["scope"]
-        applied = bool(
-            in_scope
-            and confident
-            and not rec.get("escaped")
-            and status not in ("escalate", "invalid_response")
-        )
-        if applied:
-            summary = f"Jev recommends {selected} (confidence {confidence:.2f}); applied"
-        elif selected is None or not in_scope:
-            summary = (
-                f"Jev answered {selected or status or 'no selection'}; kept the deterministic "
-                f"choice {deterministic}"
-            )
-        else:
-            summary = (
-                f"Jev suggested {selected} (confidence {confidence}, status {status or 'ok'}); "
-                f"below the bar, kept {deterministic}"
-            )
-        return AdvisorNote(
-            kind="strategy",
-            source="jev",
-            summary=summary,
+        probabilities = rec.get("probabilities") or {}
+        model = response.get("model")
+        # jev_decide gives no reasons today; any it gives are checked against the evidence (ADV-02)
+        reasons = rec.get("reasons", response.get("reasons"))
+        return Advice(
+            option=selected if isinstance(selected, str) else None,
             confidence=float(confidence) if isinstance(confidence, int | float) else None,
-            data={
-                **base_data,
-                "selected": selected,
-                "applied": applied,
-                "status": status,
-                "escaped": bool(rec.get("escaped")),
-                "probabilities": rec.get("probabilities") or {},
-                "contradicted_requirements": rec.get("contradicted_requirements") or [],
-                "warnings": response.get("warnings") or [],
+            distribution={
+                k: float(v) for k, v in probabilities.items() if isinstance(v, int | float)
             },
+            status=rec.get("status") or response.get("status"),
+            escaped=bool(rec.get("escaped")),
+            model_version=model if isinstance(model, str) else None,
+            reasons=tuple(reasons) if isinstance(reasons, list) else (),
+            **base,
         )
 
     # -- classification ----------------------------------------------------------------------
     def _describe_vm(self, vm: VMRef) -> str:
-        tags = ",".join(f"{k}:{v}" for k, v in sorted(vm.tags.items()))
-        disks = "+".join(f"{d.size_gb}GiB" for d in vm.disks) or "none"
-        text = (
-            f"name={vm.name} os={vm.os_type or 'unknown'} tags={tags or 'none'} disks={disks} "
-            f"flavor={vm.flavor or f'{vm.vcpus}vcpu/{vm.ram_mb}MB'}"
-        )
-        return self._redact(text, [vm.name])
+        # rendered from the declared field specs (SDD §13.4, ADV-06)
+        return self._redact(payloads.render_workload(vm), [vm.name])
 
     async def classify_workloads(self, vms: Sequence[VMRef]) -> tuple[dict[str, str], AdvisorNote]:
         tiers = {vm.source_id: heuristic_tier(vm) for vm in vms}
@@ -261,7 +214,13 @@ class Advisor:
         errors: list[str] = []
         for start in range(0, len(vms), CLASSIFY_BATCH):
             batch = vms[start : start + CLASSIFY_BATCH]
-            items = [{"id": vm.source_id, "text": self._describe_vm(vm)} for vm in batch]
+            # SDD §14.2/§13.4: an opaque key per item, its place in the batch - the VM's own id
+            # never leaves; the answer maps back through it
+            keys = {f"item-{n}": vm.source_id for n, vm in enumerate(batch, 1)}
+            items = [
+                {"id": key, "text": self._describe_vm(vm)}
+                for key, vm in zip(keys, batch, strict=True)
+            ]
             try:
                 response = await self.jev.classify(
                     items=items, classes=TIER_CLASSES, purpose=CLASSIFY_PURPOSE
@@ -270,7 +229,7 @@ class Advisor:
                 errors.append(str(exc))
                 continue
             for result in response.get("results") or []:
-                rid = result.get("id")
+                rid = keys.get(str(result.get("id")))
                 tier = result.get("classification")
                 if (
                     rid in tiers
@@ -298,11 +257,15 @@ class Advisor:
         )
 
     # -- verification review -------------------------------------------------------------------
-    async def review_verification(self, vm: VMRef, result: Any) -> AdvisorNote | None:
+    async def review_verification(
+        self, vm: VMRef, result: Any, review_reason: str | None = None
+    ) -> AdvisorNote | None:
         """Screen the console excerpt and cross-check the boot claims; may flag for review.
 
-        Returns a note whose ``data["review_required"]``/``data["review_reason"]`` the caller
-        applies to the migration. ``result.passed`` is never modified.
+        ``review_reason`` is what the verification rules ask review for (SDD §7.5: a database VM
+        without an application probe, an unreachable probe); it comes first. Returns a note whose
+        ``data["review_required"]``/``data["review_reason"]`` the caller applies to the migration.
+        ``result.passed`` is never modified.
         """
         if not self.jev_enabled:
             return None
@@ -313,11 +276,12 @@ class Advisor:
             for c in result.checks
         )
         evidence = [{"id": "checks", "text": self._redact(checks, [vm.name])}]
-        review_required = False
-        review_reason: str | None = None
+        reasons: list[str] = [review_reason] if review_reason else []
         screen: dict[str, Any] = {}
         console = (result.evidence or {}).get("console")
-        if console:
+        # with a remote model the excerpt stays in this installation unless allowed (SDD §13.4)
+        console_sent = bool(console) and payloads.console_allowed(self.settings)
+        if console_sent:
             # SDD §13.4/§14.2: the excerpt is redacted before it is screened — it is the one
             # place raw guest text leaves the control plane
             excerpt = self._redact(str(console)[-CONSOLE_EXCERPT_CHARS:], [vm.name])
@@ -332,8 +296,7 @@ class Advisor:
             except JevUnavailable as exc:
                 screen = {"action": "unavailable", "reason": str(exc)}
             if screen.get("action") == "block":
-                review_required = True
-                review_reason = INJECTION_REASON
+                reasons.append(INJECTION_REASON)
             elif screen.get("action") == "pass":
                 evidence.append({"id": "console", "text": excerpt})
             # review / skip / unavailable: untrusted text stays out of the evidence
@@ -348,26 +311,40 @@ class Advisor:
                 source="jev",
                 summary=f"Verification review unavailable: {exc}",
                 data={
-                    "review_required": review_required,
-                    "review_reason": review_reason,
+                    "review_required": bool(reasons),
+                    "review_reason": "; ".join(reasons) or None,
                     "screen": screen,
                     "results": [],
                     "passed": bool(result.passed),
+                    "console_sent": console_sent,
                 },
             )
-        for item in results:
-            if item.get("verdict") == "contradicted" and item.get("action") == "auto":
-                review_required = True
-                review_reason = review_reason or f"advisor contradicted: {item.get('claim')}"
+        contradicted = [
+            item
+            for item in results
+            if item.get("verdict") == "contradicted" and item.get("action") == "auto"
+        ]
+        if contradicted and INJECTION_REASON not in reasons:
+            reasons.append(f"advisor contradicted: {contradicted[0].get('claim')}")
+        review_required = bool(reasons)
+        review_reason = "; ".join(reasons) or None
         confidences = [
             float(i["confidence"]) for i in results if isinstance(i.get("confidence"), int | float)
         ]
-        verdicts = ", ".join(f"{i.get('verdict')}" for i in results) or "none"
-        summary = (
-            f"Review required: {review_reason}"
-            if review_required
-            else f"Boot claims {verdicts}; no review needed"
-        )
+        # each verdict once, in the order seen: never "verified, verified" (ADV-18)
+        verdicts = list(dict.fromkeys(str(i.get("verdict")) for i in results))
+        if review_required:
+            summary = f"Review required: {review_reason}"
+        elif verdicts == ["verified"]:
+            summary = "Boot verified; no review needed"
+        else:
+            named = " and ".join(verdicts) or "none"
+            summary = f"Boot claims {named}, none contradicted; no review needed"
+        if console and not console_sent:
+            summary += (
+                ". The console excerpt stayed in this installation (remote advisor): "
+                "screened by the verification's own console patterns only"
+            )
         return AdvisorNote(
             kind="verification",
             source="jev",
@@ -382,5 +359,6 @@ class Advisor:
                     for i in results
                 ],
                 "passed": bool(result.passed),
+                "console_sent": console_sent,
             },
         )

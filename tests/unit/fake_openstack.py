@@ -39,11 +39,20 @@ class FakeCloud:
         self.snapshots = {}
         self.images = {}
         self.devices = {}
+        self.ports = {}
+        self.networks = {}
+        self.subnets = {}
+        self.floating_ips = {}
         self.addresses = {}
         self.fail_on = {}
+        # the credential: its project, and the role names of its token (a member by default)
+        self.current_project_id = "project-%s" % name
+        self.roles = ["member", "reader"]
+        self.session = _FakeSession(self)
         self._ids = itertools.count(1)
         self.block_storage = _FakeBlockStorage(self)
         self.compute = _FakeCompute(self)
+        self.network = _FakeNetwork(self)
 
     # --- model helpers -------------------------------------------------
     def new_id(self, kind):
@@ -70,6 +79,20 @@ class FakeCloud:
         self.devices[server_id] = ["/dev/vda"]
         self.addresses[address] = server_id
         return self.servers[server_id]
+
+    def add_port(self, port_id, mac, network_id="net-1", description="", device_id="",
+                 fixed_ips=None, project_id=None):
+        self.ports[port_id] = Obj(
+            id=port_id,
+            mac_address=mac,
+            network_id=network_id,
+            description=description,
+            device_id=device_id,
+            fixed_ips=list(fixed_ips or []),
+            # Neutron's: the token's project unless an admin names another
+            project_id=project_id or self.current_project_id,
+        )
+        return self.ports[port_id]
 
     def add_server(self, server_id, name, image=""):
         self.servers[server_id] = Obj(
@@ -207,6 +230,18 @@ class FakeCloud:
         return self.images[image.id]
 
 
+class _FakeSession:
+    """keystoneauth's session as far as the token's role names go:
+    ``conn.session.auth.get_access(conn.session).role_names``."""
+
+    def __init__(self, cloud):
+        self.auth = self
+        self.cloud = cloud
+
+    def get_access(self, session):
+        return Obj(role_names=list(self.cloud.roles))
+
+
 class _FakeBlockStorage:
     def __init__(self, cloud):
         self.cloud = cloud
@@ -264,6 +299,11 @@ class _FakeCompute:
         server_id = getattr(server, "id", server)
         self.cloud.record("delete_server", server=server_id)
         self.cloud.servers.pop(server_id, None)
+        # Like Nova: the ports it did not create itself outlive the server, unbound (the
+        # fake's ports are all such ports).
+        for port in self.cloud.ports.values():
+            if port.device_id == server_id:
+                port.device_id = ""
         # Like Nova: volumes of a deleted server are detached.
         for volume in self.cloud.volumes.values():
             volume.attachments = [
@@ -291,6 +331,65 @@ class _FakeCompute:
         )
         self.cloud.images[image.id] = image
         return image
+
+
+class _FakeNetwork:
+    """Neutron ports, subnets and floating IPs: enough for ports recreated through Neutron,
+    their rollback and the destination check before the stop (SDD 6.6)."""
+
+    def __init__(self, cloud):
+        self.cloud = cloud
+
+    def ports(self, **query):
+        self.cloud.record("ports", **query)
+
+        def matches(port, key, value):
+            # Neutron's fixed_ips filter: "ip_address=X" entries a port must hold
+            if key == "fixed_ips":
+                held = {ip.get("ip_address") for ip in port.get("fixed_ips") or []}
+                wanted = [v.split("=", 1)[1] for v in value if v.startswith("ip_address=")]
+                return all(address in held for address in wanted)
+            return port.get(key) == value
+
+        return [
+            port
+            for port in list(self.cloud.ports.values())
+            if all(matches(port, key, value) for key, value in query.items())
+        ]
+
+    def get_network(self, network_id):
+        self.cloud.record("get_network", network_id=network_id)
+        return self.cloud.networks[network_id]
+
+    def subnets(self, **query):
+        self.cloud.record("subnets", **query)
+        return [
+            subnet
+            for subnet in list(self.cloud.subnets.values())
+            if all(subnet.get(key) == value for key, value in query.items())
+        ]
+
+    def ips(self, **query):
+        self.cloud.record("ips", **query)
+        return [
+            fip
+            for fip in list(self.cloud.floating_ips.values())
+            if all(fip.get(key) == value for key, value in query.items())
+        ]
+
+    def create_port(self, **params):
+        self.cloud.record("create_port", **params)
+        port = Obj(params, id=self.cloud.new_id("port"), device_id="")
+        port.setdefault("description", "")
+        port.setdefault("project_id", self.cloud.current_project_id)
+        port.setdefault("fixed_ips", [])
+        self.cloud.ports[port.id] = port
+        return port
+
+    def delete_port(self, port, ignore_missing=True):
+        port_id = getattr(port, "id", port)
+        self.cloud.record("delete_port", port=port_id)
+        self.cloud.ports.pop(port_id, None)
 
 
 class FakeProcess:
@@ -445,7 +544,7 @@ def server_volume_data(
 
 def workload_data(
     server_id="srv-1", name="vm1", volumes=(), image_ref=None, boot_disk_copy=True,
-    boot_volume_params=None,
+    boot_volume_params=None, ports=(),
 ):
     params = {"availability_zone": None, "name": None, "description": None,
               "volume_type": None}
@@ -456,7 +555,7 @@ def workload_data(
             "name": name,
             "image_ref": image_ref,
             "volumes": list(volumes),
-            "ports": [],
+            "ports": list(ports),
             "floating_ips": [],
             "security_group_refs": [],
             "flavor_ref": {"name": "m1.small", "project_name": None, "domain_name": None},

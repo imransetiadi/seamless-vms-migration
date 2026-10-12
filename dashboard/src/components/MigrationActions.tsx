@@ -2,18 +2,21 @@ import {
   ArrowRight,
   BadgeCheck,
   CircleSlash,
+  FastForward,
   RefreshCw,
   RotateCcw,
   ThumbsUp,
+  TriangleAlert,
   Undo2,
   Zap,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useState } from 'react';
-import { useMigrationAction, type MigrationActionRequest } from '../api/hooks';
-import { ACTION_TEXT_MAX, type Migration, type Plan, type Role } from '../api/types';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
+import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatDuration } from '../lib/format';
+import { forcedDowntime } from '../lib/forcedEstimate';
+import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
 import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
@@ -24,6 +27,7 @@ import { TextAreaField } from './Field';
 const LABEL: Record<MigrationActionKey, string> = {
   approve: 'Approve',
   cutover: 'Cut over',
+  'force-cutover': 'Force cutover',
   sync: 'Sync now',
   rollback: 'Roll back',
   retry: 'Retry',
@@ -34,6 +38,7 @@ const LABEL: Record<MigrationActionKey, string> = {
 const ICON: Record<MigrationActionKey, LucideIcon> = {
   approve: ThumbsUp,
   cutover: Zap,
+  'force-cutover': FastForward,
   sync: RefreshCw,
   rollback: Undo2,
   retry: RotateCcw,
@@ -44,6 +49,7 @@ const ICON: Record<MigrationActionKey, LucideIcon> = {
 const DONE: Record<MigrationActionKey, string> = {
   approve: 'approved',
   cutover: 'cutover requested',
+  'force-cutover': 'cutover forced',
   sync: 'delta sync requested',
   rollback: 'rollback started',
   retry: 'retry requested',
@@ -64,17 +70,25 @@ export interface MigrationActionsProps {
   role: Role | undefined;
   /** The plan failed to load: its cutover window and approval policy are unknown (SDD §16). */
   planUnavailable?: boolean;
+  /** The plan is still loading: its cutover window and approval policy are not known yet (SDD §16). */
+  planLoading?: boolean;
 }
 
 /**
- * Approve / Cut over / Sync / Retry / Roll back / Cancel / Finalize, enabled only for a valid phase
- * and sufficient role (unavailable ones stay focusable and say why). Every action confirms first;
- * destructive ones use the danger tone and Finalize requires typing the VM name.
+ * Approve / Cut over / Force cutover / Sync / Retry / Roll back / Cancel / Finalize, enabled only for a
+ * valid phase and sufficient role (unavailable ones stay focusable and say why). Every action confirms
+ * first; destructive ones use the danger tone and Finalize requires typing the VM name. Force cutover
+ * belongs to warm strategies alone: a single-shot one has no passes to skip (SDD §5.4).
  */
-export function MigrationActions({ migration: m, plan, role, planUnavailable = false }: MigrationActionsProps) {
-  const availability = migrationActions(m, role, plan);
+export function MigrationActions({ migration: m, plan, role, planUnavailable = false, planLoading = false }: MigrationActionsProps) {
+  // the cutover's requester does not approve it (maker-checker, SDD §5.4)
+  const me = useMe().data?.name;
+  const availability = migrationActions(m, role, plan, undefined, me);
+  const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
   if (planUnavailable && availability.cutover.enabled) {
     availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
+  } else if (planLoading && availability.cutover.enabled) {
+    availability.cutover = { enabled: false, reason: 'The plan is loading: its cutover window and approval policy are not known yet.' };
   }
   // a requested cutover waiting for a closed window: the Cutover action lets it start outside the window (SDD §5.4)
   const forcing = waitsOnClosedWindow(m, plan, Date.now());
@@ -90,6 +104,21 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const [announcement, setAnnouncement] = useState('');
   const forceId = useId();
   const deleteId = useId();
+  // a button that changes rows as the migration moves keeps the focus (SDD §16): the rows are two lists, so React
+  // mounts the button anew in the other one and the focus drops to the page. The action that had the focus when this
+  // render began is noted, and only its new button gets it back - focus the user had moved elsewhere (the page,
+  // another control) is never taken back
+  const buttons = useRef(new Map<MigrationActionKey, HTMLButtonElement>());
+  const focusedAtRender = useRef<MigrationActionKey | null>(null);
+  focusedAtRender.current = null;
+  if (typeof document !== 'undefined') {
+    for (const [key, node] of buttons.current) if (node === document.activeElement) focusedAtRender.current = key;
+  }
+  const rows = useRef('');
+  const remember = (key: MigrationActionKey) => (node: HTMLButtonElement | null) => {
+    if (node) buttons.current.set(key, node);
+    else if (buttons.current.get(key)?.isConnected === false) buttons.current.delete(key);
+  };
 
   const show = (key: MigrationActionKey) => {
     action.reset();
@@ -115,9 +144,31 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
     <TextAreaField label="Comment (optional)" rows={2} maxLength={ACTION_TEXT_MAX} value={comment} onChange={(e) => setComment(e.target.value)} hint="Recorded in the audit trail." />
   );
   const estimate = m.estimate ? formatDuration(m.estimate.downtime_s) : 'unknown';
+  // what a Force cutover records (SDD §5.4, §16): the downtime after the running pass, not the converged estimate
+  const forced = plan && isWarmStrategy(m.strategy) ? forcedDowntime(m, plan) : null;
+  // the API lists only passes that ended (SDD §4.2): the last one is what a Force cutover records
+  const lastPass = m.sync_passes.filter((p) => p.ended_at !== null).sort((a, b) => a.number - b.number).at(-1);
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
   const closedWindow = !windowOpen(plan);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
+
+  // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
+  const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));
+  const available = offered
+    .filter((key) => availability[key].enabled)
+    .sort((a, b) => Number(b === step.action) - Number(a === step.action));
+  const unavailable = offered.filter((key) => !availability[key].enabled);
+  const layout = available.join(',');
+  useLayoutEffect(() => {
+    const moved = rows.current !== '' && rows.current !== layout;
+    rows.current = layout;
+    const key = focusedAtRender.current;
+    const node = key ? buttons.current.get(key) : undefined;
+    if (!moved || !node) return;
+    if (document.activeElement !== node && (document.activeElement === document.body || document.activeElement === null)) {
+      node.focus({ preventScroll: true });
+    }
+  }, [layout]);
 
   return (
     <div className="flex flex-col gap-3">
@@ -130,24 +181,43 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         <ArrowRight aria-hidden className={cn('mt-0.5 size-4 shrink-0', step.action ? 'text-status-success' : 'text-muted-foreground')} />
         {step.text}
       </p>
-      <div role="group" aria-label="Migration actions" className="flex flex-wrap gap-2">
-        {MIGRATION_ACTION_ORDER.map((key) => {
-          const primary = key === step.action && availability[key].enabled;
+      <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
+        {available.map((key) => {
+          const primary = key === step.action;
           const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
           return (
             <Button
               key={key}
+              ref={remember(key)}
               size="lg"
               icon={ICON[key]}
               variant={primary ? (destructive && key !== 'finalize' ? 'danger' : 'primary') : 'secondary'}
-              disabledReason={availability[key].reason}
               onClick={() => show(key)}
-              className={cn(destructive && key === 'cancel' && 'sm:ml-auto')}
+              className={cn(key === 'cancel' && available.length > 1 && 'sm:ml-auto')}
             >
               {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
             </Button>
           );
         })}
+        {unavailable.length > 0 && (
+          <p key="unavailable" className="mt-1 basis-full text-xs text-muted-foreground">
+            Unavailable now
+          </p>
+        )}
+        {unavailable.map((key) => (
+          // quieter and smaller, still focusable and saying why (SDD §16)
+          <Button
+            key={key}
+            ref={remember(key)}
+            size="sm"
+            icon={ICON[key]}
+            variant="secondary"
+            disabledReason={availability[key].reason}
+            onClick={() => show(key)}
+          >
+            {key === 'cutover' && forcing ? 'Cut over outside the window' : LABEL[key]}
+          </Button>
+        ))}
       </div>
       <p role="status" className="sr-only">
         {announcement}
@@ -156,6 +226,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'approve'}
+        icon={ICON['approve']}
+        subject={`Migration ${m.id}`}
         title={`Approve the cutover of ${m.vm.name}?`}
         description={`Records your approval. The cutover still waits for a cutover request${plan?.auto_cutover ? ' (automatic in this plan)' : ''} and the window.`}
         confirmLabel="Approve"
@@ -167,6 +239,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'cutover'}
+        icon={ICON['cutover']}
+        subject={`Migration ${m.id}`}
         title={
           forcing ? `Let ${m.vm.name} cut over outside the window?` : early ? `Cut over ${m.vm.name} once pre-copy converges?` : `Cut over ${m.vm.name} now?`
         }
@@ -179,7 +253,10 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
               ? 'The cutover is requested now and starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. '
               : ''}
             {early && !forcing ? 'Then the' : 'The'} source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
-            {slo ? ` against an SLO of ${slo}` : ''}. This also records your approval; the migration can be rolled back until it is finalized.
+            {slo ? ` against an SLO of ${slo}` : ''}.{' '}
+            {fourEyes
+              ? 'Your request is not an approval: another approver approves the cutover. The migration can be rolled back until it is finalized.'
+              : 'This also records your approval; the migration can be rolled back until it is finalized.'}
           </>
         }
         confirmLabel={forcing ? 'Cut over outside the window' : early ? 'Request cutover' : 'Start cutover'}
@@ -206,7 +283,45 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
 
       <ConfirmDialog
         {...common}
+        open={open === 'force-cutover'}
+        icon={ICON['force-cutover']}
+        subject={`Migration ${m.id}`}
+        tone="danger"
+        title={`Force the cutover of ${m.vm.name}?`}
+        description={
+          <>
+            {lastPass
+              ? `The cutover skips the convergence rule: the running pass finishes, then the source VM stops and the final sync copies what changed. The last pass (pass ${lastPass.number}) changed ${formatBytes(lastPass.bytes_changed)}. `
+              : 'The cutover skips the convergence rule. The full copy is still running: the cutover follows it, and the final sync copies what changed meanwhile. '}
+            The estimated downtime is {forced !== null ? formatDuration(forced) : 'unknown'}
+            {/* forcing skips the passes that would shorten it: say when it misses the SLO already */}
+            {slo ? (forced !== null && plan && forced > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
+            {fourEyes
+              ? 'Another approver still approves the cutover; the window and a free cutover slot still apply.'
+              : 'This also records your approval; the window and a free cutover slot still apply.'}
+          </>
+        }
+        confirmLabel="Force cutover"
+        canConfirm={reason.trim().length >= FORCE_REASON_MIN}
+        confirmReason={`Enter a reason of at least ${FORCE_REASON_MIN} characters.`}
+        onConfirm={() => submit({ action: 'force-cutover', body: { reason: reason.trim() } })}
+      >
+        <TextAreaField
+          label="Reason"
+          required
+          rows={2}
+          maxLength={ACTION_TEXT_MAX}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          hint={`At least ${FORCE_REASON_MIN} characters; recorded in the audit trail.`}
+        />
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        {...common}
         open={open === 'sync'}
+        icon={ICON['sync']}
+        subject={`Migration ${m.id}`}
         title={`Run a delta sync for ${m.vm.name}?`}
         description="Starts a keep-warm pass now so the final delta at cutover stays small. The source VM keeps running."
         confirmLabel="Sync now"
@@ -216,11 +331,16 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'retry'}
+        icon={ICON['retry']}
+        subject={`Migration ${m.id}`}
         title={`Retry ${m.vm.name}?`}
         description={`The migration returns to ready and starts over from its first step.${
           m.downtime_started_at && !m.downtime_ended_at
             ? ' The source VM is still stopped: its downtime clock keeps running until the next cutover is verified.'
             : ''
+        }${
+          // SDD §5.1: a completed plan is driven no more; the retry returns it to running
+          plan?.status === 'completed' ? ' The plan has completed: the retry reopens it, so the new attempt runs.' : ''
         } Make sure the cause of the failure is fixed.`}
         confirmLabel="Retry"
         onConfirm={() => submit({ action: 'retry' })}
@@ -229,6 +349,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'rollback'}
+        icon={ICON['rollback']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Roll back ${m.vm.name}?`}
         description="Deletes the RHOSO instance (volumes are kept) and starts the source VM again. Downtime ends when the source is running."
@@ -243,6 +365,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'cancel'}
+        icon={ICON['cancel']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Cancel ${m.vm.name}?`}
         description={
@@ -260,6 +384,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
       <ConfirmDialog
         {...common}
         open={open === 'finalize'}
+        icon={ICON['finalize']}
+        subject={`Migration ${m.id}`}
         tone="danger"
         title={`Finalize ${m.vm.name}?`}
         description="Finalizing is irreversible: rollback is no longer possible and the source VM's temporary resources are cleaned up."
@@ -267,6 +393,13 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         requireText={m.vm.name}
         onConfirm={() => submit({ action: 'finalize', body: { confirm: m.vm.name, delete_source: deleteSource } })}
       >
+        {m.source_running_at && (
+          // the source watch saw it running (SDD §8.1, ADV-19)
+          <p className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-2.5 text-sm text-foreground">
+            <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+            The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.
+          </p>
+        )}
         <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">
           <input id={deleteId} type="checkbox" className="mt-1 size-4 accent-accent" checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)} />
           <span>

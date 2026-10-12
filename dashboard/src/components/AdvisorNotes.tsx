@@ -2,7 +2,7 @@ import { Bot, BrainCircuit, Info, ListChecks, type LucideIcon } from 'lucide-rea
 import { Link } from 'react-router-dom';
 import type { AdvisorNote, AdvisorNoteSource } from '../api/types';
 import { formatDateTime, formatPct, formatRelative } from '../lib/format';
-import { ADVISOR_KIND_LABELS, ADVISOR_SOURCE_LABELS, STRATEGY_LABELS } from '../lib/status';
+import { ADVISOR_KIND_LABELS, ADVISOR_SOURCE_LABELS } from '../lib/status';
 import { EmptyState } from './EmptyState';
 
 const SOURCE_ICON: Record<AdvisorNoteSource, LucideIcon> = { jev: Bot, rules: ListChecks, memory: BrainCircuit };
@@ -13,11 +13,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function text(value: unknown): string {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
-}
-
-function strategyName(value: unknown): string {
-  const key = text(value);
-  return STRATEGY_LABELS[key as keyof typeof STRATEGY_LABELS] ?? key;
 }
 
 /** Kind-specific evidence. Everything here is untrusted data and is rendered as plain text only. */
@@ -41,15 +36,9 @@ function NoteDetails({ note }: { note: AdvisorNote }) {
         </ul>
       );
     }
-    case 'strategy': {
-      const probabilities = Object.entries(asRecord(data.probabilities)).filter(([, v]) => typeof v === 'number') as Array<[string, number]>;
-      return (
-        <p className="mt-1 text-xs text-muted-foreground">
-          {data.selected !== undefined && <>Selected: {strategyName(data.selected)}. </>}
-          {probabilities.length > 0 && <>Probabilities: {probabilities.map(([k, v]) => `${strategyName(k)} ${formatPct(v * 100, 0)}`).join(' · ')}</>}
-        </p>
-      );
-    }
+    case 'strategy':
+      // listed as a (legacy) recommendation with its decision instead (SDD §14.4)
+      return null;
     case 'classification':
       return data.tier ? <p className="mt-1 text-xs text-muted-foreground">Tier: <code>{text(data.tier)}</code>{data.decision ? ` (${text(data.decision)})` : ''}</p> : null;
     case 'verification':

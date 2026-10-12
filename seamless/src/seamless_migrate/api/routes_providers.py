@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request, Response
 from pydantic import ValidationError
 
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
-from ..domain.models import ConversionHostConfig, Plan, Provider, utcnow
+from ..domain.models import ConversionHostConfig, Migration, Plan, Provider, utcnow
 from ..events import emit
+from ..orchestrator import RELEASES_VM
 from ..security.auth import Principal
 from ..security.secret_store import (
     SecretStoreError,
@@ -19,14 +23,15 @@ from ..security.secret_store import (
     credentials_secret_name,
     secret_store,
 )
-from ..store import ConflictError
+from ..security.secrets import valid_secret_name
+from ..store import ConflictError, NotFound
 from .deps import ApiError, require_role, services
 from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["providers"])
-#: plans that release their providers: only a completed one — a failed plan can be started
-#: again (SDD §8, §12)
+#: plans that can release their providers: only a completed one, once none of its migrations
+#: holds its VM — a failed plan can be started again (SDD §8, §12)
 TERMINAL_PLAN_STATUSES = frozenset({PlanStatus.completed})
 #: plans whose provider must not change under them (PATCH answers 409)
 ACTIVE_PLAN_STATUSES = frozenset({PlanStatus.running, PlanStatus.paused})
@@ -102,25 +107,97 @@ async def list_providers(
     return await services(request).db.list("provider", Provider)
 
 
+def _check_secret_names(provider: Provider, fields: set[str]) -> None:
+    """SDD §13.3: a secret named for a provider must be one ``security.secrets`` can read; only
+    the fields the request sets are checked, so a provider stored before stays editable."""
+    names = {}
+    if "credentials_secret" in fields:
+        names["credentials_secret"] = provider.credentials_secret
+    if "conversion_host" in fields and provider.conversion_host is not None:
+        names["conversion_host.ssh_key_secret"] = provider.conversion_host.ssh_key_secret
+    bad = [
+        field for field, name in names.items() if name is not None and not valid_secret_name(name)
+    ]
+    if bad:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(bad)}: a secret name is 1-128 letters, digits, '.', '_' or '-', "
+            "starting with a letter or digit",
+        )
+    # provider-* names are the ones the store writes for each provider: naming another provider's
+    # would let a check send its credentials to this provider's endpoint (SDD §13.3)
+    own = {
+        "credentials_secret": credentials_secret_name(provider.id),
+        "conversion_host.ssh_key_secret": conversion_key_secret_name(provider.id),
+    }
+    taken = [
+        field
+        for field, name in names.items()
+        if name is not None and name.startswith("provider-") and name != own[field]
+    ]
+    if taken:
+        raise ApiError(
+            422,
+            "validation_error",
+            f"{', '.join(taken)}: provider-* names belong to the secrets Seamless stores for each "
+            "provider; this one is another provider's",
+        )
+
+
+def _secret_names(provider: Provider) -> dict[str, str]:
+    """The secrets a provider reads, by name, for its audit events (never a value; SDD §13.3)."""
+    names = {}
+    if provider.credentials_secret:
+        names["credentials_secret"] = provider.credentials_secret
+    if provider.conversion_host is not None and provider.conversion_host.ssh_key_secret:
+        names["ssh_key_secret"] = provider.conversion_host.ssh_key_secret
+    return names
+
+
 @router.post("/providers", response_model=Provider, status_code=201)
 async def create_provider(
     body: Provider, request: Request, principal: Principal = Depends(require_role(Role.admin))
 ) -> Provider:
     svc = services(request)
+    _check_secret_names(body, {"credentials_secret", "conversion_host"})
     provider = body.model_copy(
         update={**_SERVER_OWNED, "credentials_updated_at": None, "conversion_key_updated_at": None}
     )
-    try:
-        await svc.db.put("provider", provider, expected_version=0)
-    except ConflictError:
-        raise ApiError(409, "conflict", f"provider {provider.id!r} already exists") from None
+    # the store names a provider's secrets provider-{id} and provider-{id}-ssh: an id that makes
+    # them another provider's would overwrite (and on deletion remove) its key (SDD §13.3)
+    async with svc.orchestrator.provider_lock():
+        clash = next(
+            (
+                other.id
+                for other in await svc.db.list("provider", Provider)
+                if provider.id == f"{other.id}-ssh" or other.id == f"{provider.id}-ssh"
+            ),
+            None,
+        )
+        if clash is not None:
+            raise ApiError(
+                409,
+                "conflict",
+                f"provider id {provider.id!r} would share a secret with provider {clash!r}: "
+                "Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh",
+            )
+        try:
+            await svc.db.put("provider", provider, expected_version=0)
+        except ConflictError:
+            raise ApiError(409, "conflict", f"provider {provider.id!r} already exists") from None
     await emit(
         svc.store,
         svc.bus,
         "provider.created",
         f"provider {provider.id} created",
         actor=principal.name,
-        data={"provider_id": provider.id, "kind": str(provider.kind), "role": str(provider.role)},
+        data={
+            "provider_id": provider.id,
+            "kind": str(provider.kind),
+            "role": str(provider.role),
+            **_secret_names(provider),
+        },
     )
     return provider
 
@@ -155,6 +232,7 @@ async def update_provider(
         )
     except ValidationError as exc:
         raise ApiError(422, "validation_error", _summarize(exc)) from None
+    _check_secret_names(updated, set(body))
     await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
@@ -162,7 +240,7 @@ async def update_provider(
         "provider.updated",
         f"provider {provider_id} updated",
         actor=principal.name,
-        data={"provider_id": provider_id, "fields": sorted(body)},
+        data={"provider_id": provider_id, "fields": sorted(body), **_secret_names(updated)},
     )
     return updated
 
@@ -177,6 +255,39 @@ async def _store_secret(
         raise ApiError(503, "unavailable", f"secret store: {exc}") from None
 
 
+async def _record_secret(
+    request: Request, provider_id: str, name: str, update: Callable[[Provider], dict[str, Any]]
+) -> Provider:
+    """The provider records a secret already in the store (SDD §13.3): a versioned write, retried
+    when a check or another write changed the provider meanwhile (they touch other fields) — the
+    update is derived from the fresh copy each time, so no concurrent change is lost — and so a
+    written secret is always recorded; a provider deleted meanwhile answers 404 and the secret
+    goes again."""
+    svc = services(request)
+    attempt = 0
+    # until it lands: a conflict means another write landed, so each retry makes progress; giving up
+    # would leave a secret the store already holds unrecorded and unaudited (SDD §13.3)
+    while True:
+        if attempt:
+            await asyncio.sleep(min(0.5, 0.01 * 2**attempt) * random.uniform(0.5, 1.0))
+        attempt += 1
+        try:
+            provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+        except NotFound:
+            store = secret_store(svc.settings)
+            try:
+                await asyncio.to_thread(store.delete, name)
+            except SecretStoreError:
+                log.warning("secret %s of a deleted provider could not be removed", name)
+            raise
+        updated = provider.model_copy(update={**update(provider), **_SERVER_OWNED})
+        try:
+            await svc.db.put("provider", updated, expected_version=version)
+        except ConflictError:
+            continue
+        return updated
+
+
 @router.put("/providers/{provider_id}/credentials", response_model=Provider)
 async def set_provider_credentials(
     provider_id: str,
@@ -186,14 +297,16 @@ async def set_provider_credentials(
 ) -> Provider:
     """Write-only (SDD §12/§13.3): the values go to the secret store, never to the database."""
     svc = services(request)
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+    provider = await svc.db.get("provider", provider_id, Provider)
     values = _credential_values(provider, body)
     name = credentials_secret_name(provider_id)
     await _store_secret(request, name, values, provider_id)
-    updated = provider.model_copy(
-        update={"credentials_secret": name, "credentials_updated_at": utcnow(), **_SERVER_OWNED}
+    updated = await _record_secret(
+        request,
+        provider_id,
+        name,
+        lambda _: {"credentials_secret": name, "credentials_updated_at": utcnow()},
     )
-    await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,
@@ -214,23 +327,23 @@ async def set_conversion_key(
 ) -> Provider:
     """Write-only SSH private key of an existing conversion host (SDD §12/§13.3)."""
     svc = services(request)
-    provider, version = await svc.db.get_versioned("provider", provider_id, Provider)
+    await svc.db.get("provider", provider_id, Provider)  # 404 before anything is written
     key = body.private_key.strip()
     if "PRIVATE KEY-----" not in key or not key.startswith("-----BEGIN"):
         raise ApiError(422, "validation_error", "private_key must be an OpenSSH or PEM private key")
     name = conversion_key_secret_name(provider_id)
     await _store_secret(request, name, {"private_key": key + "\n"}, provider_id)
-    host = (provider.conversion_host or ConversionHostConfig()).model_copy(
-        update={"ssh_key_secret": name}
-    )
-    updated = provider.model_copy(
-        update={
-            "conversion_host": host,
+    updated = await _record_secret(
+        request,
+        provider_id,
+        name,
+        lambda fresh: {
+            "conversion_host": (fresh.conversion_host or ConversionHostConfig()).model_copy(
+                update={"ssh_key_secret": name}
+            ),
             "conversion_key_updated_at": utcnow(),
-            **_SERVER_OWNED,
-        }
+        },
     )
-    await svc.db.put("provider", updated, expected_version=version)
     await emit(
         svc.store,
         svc.bus,
@@ -242,21 +355,50 @@ async def set_conversion_key(
     return updated
 
 
+async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
+    """The plans that still need the provider (SDD §12), each with why: one that has not completed
+    (a failed one can start again), or a completed one with a migration that holds its VM - it can
+    be rolled back until it is finalized, and its rollback needs both providers (§8.1)."""
+    plans = [
+        p
+        for p in await svc.db.list("plan", Plan)
+        if provider_id in (p.source_provider_id, p.destination_provider_id)
+    ]
+    completed = [p.id for p in plans if p.status in TERMINAL_PLAN_STATUSES]
+    holding: Counter[str] = Counter()
+    if completed:
+        for m in await svc.db.list("migration", Migration, plan_id=completed):
+            if m.phase not in RELEASES_VM:
+                holding[m.plan_id] += 1
+    users = []
+    for p in plans:
+        n = holding[p.id]
+        if p.status not in TERMINAL_PLAN_STATUSES:
+            users.append(f'{p.id} ("{p.name}", {p.status})')
+        elif n:
+            users.append(f'{p.id} ("{p.name}", {n} VM{"" if n == 1 else "s"} not finalized)')
+    return users
+
+
 @router.delete("/providers/{provider_id}", status_code=204)
 async def delete_provider(
     provider_id: str, request: Request, principal: Principal = Depends(require_role(Role.admin))
 ) -> Response:
     svc = services(request)
-    await svc.db.get("provider", provider_id, Provider)  # 404 when missing
-    users = [
-        p.id
-        for p in await svc.db.list("plan", Plan)
-        if p.status not in TERMINAL_PLAN_STATUSES
-        and provider_id in (p.source_provider_id, p.destination_provider_id)
-    ]
-    if users:
-        raise ApiError(409, "conflict", f"provider is used by plan(s): {', '.join(users)}")
-    await svc.db.delete("provider", provider_id)
+    # SDD §12: plan creations, edits and retries check their providers under the same lock
+    async with svc.orchestrator.provider_lock():
+        await svc.db.get("provider", provider_id, Provider)  # 404 when missing
+        users = await _plans_that_need(svc, provider_id)
+        if users:
+            rest = len(users) - 10
+            raise ApiError(
+                409,
+                "conflict",
+                f"provider is used by plan(s) that still need it: {', '.join(users[:10])}"
+                f"{f' and {rest} more' if rest > 0 else ''}; a plan needs its providers until it "
+                "completes and its VMs are finalized",
+            )
+        await svc.db.delete("provider", provider_id)
     forget = getattr(svc.providers, "forget", None)
     if forget is not None:
         forget(provider_id)

@@ -3,7 +3,8 @@ import type { Migration, Phase } from '../api/types';
 /** Allowed migration phase transitions — SDD §5.1 (`seamless_migrate.domain.fsm.TRANSITIONS`). */
 export const TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = {
   pending: ['validating', 'cancelled'],
-  validating: ['ready', 'blocked', 'failed'],
+  // cancelled: only by a validation, for a leftover whose VM left vm_ids (SDD §5.1, §5.4)
+  validating: ['ready', 'blocked', 'failed', 'cancelled'],
   blocked: ['validating', 'cancelled'],
   ready: ['precopy', 'cutover', 'validating', 'cancelled'],
   precopy: ['syncing', 'awaiting_cutover', 'failed', 'cancelled'],

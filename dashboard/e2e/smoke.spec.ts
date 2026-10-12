@@ -1,4 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
+
+const AXE = readFileSync(new URL('../node_modules/axe-core/axe.min.js', import.meta.url), 'utf8');
 
 // Mock mode accepts the role names as tokens (src/api/mock.ts).
 async function signIn(page: Page, token = 'admin') {
@@ -44,6 +47,42 @@ test('the main journey renders: overview, plans, plan detail, migration detail',
   await expect(page).toHaveURL(/\/migrations\/mig-/);
   await expect(page.getByRole('heading', { name: /estimate inputs/i })).toBeVisible();
   await expect(page.getByRole('heading', { name: /^estimates$/i })).toBeVisible();
+});
+
+test('chart code loads with the overview that draws charts, not with the sign-in page (SDD §16)', async ({ page }) => {
+  const scripts: string[] = [];
+  page.on('request', (request) => {
+    if (request.resourceType() === 'script') scripts.push(new URL(request.url()).pathname);
+  });
+  await page.goto('/login');
+  await expect(page.getByRole('button', { name: /sign in/i })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  expect(scripts.filter((path) => path.includes('/charts-'))).toEqual([]);
+
+  await page.getByLabel(/token/i).fill('admin');
+  await page.getByRole('button', { name: /sign in/i }).click();
+  await expect(page.locator('.recharts-surface').first()).toBeVisible();
+  expect(scripts.filter((path) => path.includes('/charts-'))).toHaveLength(1);
+});
+
+test('the fonts come with the dashboard: nothing loads from another host (SDD §16)', async ({ page, baseURL }) => {
+  const foreign: string[] = [];
+  page.on('request', (request) => {
+    if (new URL(request.url()).origin !== new URL(baseURL ?? '').origin) foreign.push(request.url());
+  });
+  await signIn(page);
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await page.waitForLoadState('networkidle');
+  const loaded = await page.evaluate(async () => {
+    await document.fonts.ready;
+    const faces: string[] = [];
+    document.fonts.forEach((font) => {
+      if (font.status === 'loaded') faces.push(`${font.family.replaceAll('"', '')} ${font.weight}`);
+    });
+    return faces;
+  });
+  expect(foreign).toEqual([]);
+  expect(loaded).toEqual(expect.arrayContaining(['Fira Sans 400', 'Fira Code 600']));
 });
 
 test('a viewer sees operator and approver actions soft-disabled', async ({ page }) => {
@@ -96,6 +135,39 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await expect(page.locator('body')).not.toContainText('browser-secret');
 });
 
+test("on a phone the Overview's first downtime clock is on the first screen, under compact key figures (SDD §16)", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'viewer');
+  await page.goto('/');
+  const strip = page.getByRole('region', { name: 'Key metrics' });
+  await expect(strip.getByRole('group', { name: 'Migrations' })).toBeVisible();
+  // every figure and its hint still shown, in less height
+  for (const name of ['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance']) {
+    await expect(strip.getByRole('group', { name })).toBeVisible();
+  }
+  // the first VM that is down shows its running clock and its SLO within the first screen
+  const first = page.getByRole('region', { name: 'Downtime now' }).getByRole('listitem').first();
+  const slo = first.getByText(/^of \d+:\d\d$/);
+  await expect(slo).toBeVisible();
+  const box = await slo.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+});
+
+test("the plans list keeps each plan's progress and clouds on a phone, without scrolling sideways (SDD §16)", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page, 'viewer');
+  await page.goto('/plans');
+  const table = page.getByRole('table', { name: /migration plans/i });
+  await expect(table).toBeVisible();
+  const sideways = await page.locator('.table-wrap').first().evaluate((el) => el.scrollWidth - el.clientWidth);
+  expect(sideways).toBeLessThanOrEqual(1);
+  const row = table.getByRole('row').nth(1);
+  await expect(row.getByText(/^\d+\/\d+ done$/)).toBeVisible();
+  // the clouds column is hidden on a phone: the same text stands under the name, visible
+  await expect(row.getByText(/^RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production$/).filter({ visible: true })).toHaveCount(1);
+});
+
 test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
   // a viewer sees the most soft-disabled controls, each with a visually hidden reason
@@ -118,3 +190,87 @@ test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)
     expect(overflow, `${path} is ${overflow} px wider than the screen`).toBe(0);
   }
 });
+
+for (const width of [320, 375]) {
+  test(`every target is 24 px or spaced from the next on a ${width} px wide screen (WCAG 2.5.8)`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await signIn(page, 'viewer');
+    for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
+      await page.goto(path);
+      await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+      await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+      await page.addScriptTag({ content: AXE });
+      const failures = await page.evaluate(async () => {
+        const axe = (window as unknown as { axe: { run: (context: Document, options: object) => Promise<{ violations: Array<{ nodes: Array<{ target: string[] }> }> }> } }).axe;
+        const result = await axe.run(document, { runOnly: { type: 'rule', values: ['target-size'] } });
+        return result.violations.flatMap((v) => v.nodes.map((n) => n.target.join(' ')));
+      });
+      expect(failures, `${path}: ${failures.length} targets too small and too close`).toEqual([]);
+    }
+  });
+}
+
+test('the error summaries of the plan, policy and provider dialogs keep their links 24 px or spaced (WCAG 2.5.8)', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await signIn(page, 'admin');
+  const targets = async () => {
+    await page.addScriptTag({ content: AXE });
+    return page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (context: Element, options: object) => Promise<{ violations: Array<{ nodes: Array<{ target: string[] }> }> }> } }).axe;
+      const dialog = document.querySelector('[role="dialog"]') as Element;
+      const result = await axe.run(dialog, { runOnly: { type: 'rule', values: ['target-size'] } });
+      return result.violations.flatMap((v) => v.nodes.map((n) => n.target.join(' ')));
+    });
+  };
+
+  await page.goto('/plans');
+  await page.getByRole('button', { name: 'New plan' }).click();
+  const plan = page.getByRole('dialog', { name: 'New migration plan' });
+  await plan.getByRole('button', { name: /^create plan/i }).click();
+  await expect(plan.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'plan dialog').toEqual([]);
+  await page.keyboard.press('Escape');
+
+  await page.goto('/advisor/policies');
+  await page.getByRole('button', { name: 'New policy' }).click();
+  const policy = page.getByRole('dialog', { name: 'New policy' });
+  await policy.getByRole('button', { name: 'Create policy' }).click();
+  await expect(policy.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'policy dialog').toEqual([]);
+  await page.keyboard.press('Escape');
+
+  await page.goto('/providers');
+  await page.getByRole('button', { name: /^add provider$/i }).first().click();
+  const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+  await provider.getByRole('button', { name: /^add provider$/i }).click();
+  await expect(provider.getByRole('alert').first()).toBeVisible();
+  expect(await targets(), 'provider dialog').toEqual([]);
+});
+
+// With the web fonts and with the system font a browser shows until they arrive (font-display: swap), or when they
+// cannot load: a name that fits in Fira Sans can be a few pixels too wide in the system font. Each run measures once
+// its fonts are settled.
+for (const [width, fonts] of [
+  [320, 'web'],
+  [1280, 'web'],
+  [320, 'fallback'],
+  [1280, 'fallback'],
+] as const) {
+  test(`no text is cut off with an ellipsis on a ${width} px wide screen${fonts === 'fallback' ? ' without the web fonts' : ''} (WCAG 1.4.10, SDD §16)`, async ({ page }) => {
+    if (fonts === 'fallback') await page.route(/\.woff2?$/, (route) => route.abort());
+    await page.setViewportSize({ width, height: 800 });
+    await signIn(page, 'viewer');
+    for (const path of ['/', '/plans', '/plans/plan-4f2a9c1e', '/providers', '/inventory/rhosp17-dc1', '/events', '/advisor']) {
+      await page.goto(path);
+      await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+      await expect(page.getByRole('status').filter({ hasText: /loading/i })).toHaveCount(0);
+      await page.evaluate(() => document.fonts.ready);
+      const cut = await page.evaluate(() =>
+        Array.from(document.querySelectorAll<HTMLElement>('body *'))
+          .filter((el) => getComputedStyle(el).textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth + 1 && el.getClientRects().length > 0)
+          .map((el) => (el.textContent ?? '').trim().slice(0, 50)),
+      );
+      expect(cut, `${path}: text cut off`).toEqual([]);
+    }
+  });
+}

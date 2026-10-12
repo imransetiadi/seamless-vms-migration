@@ -1,5 +1,5 @@
 import { SearchX } from 'lucide-react';
-import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { formatDuration, formatNumber, formatPct } from '../lib/format';
@@ -31,6 +31,61 @@ function findingScore(m: Migration): number {
   // blockers dominate, then warnings, then info.
   return SEVERITIES.reduce((score, severity, i) => score + m.findings.filter((f) => f.severity === severity).length * 1000 ** (2 - i), 0);
 }
+
+interface MigrationRowProps {
+  migration: Migration;
+  /** The plan overrides this VM's strategy. */
+  override: boolean;
+  /** The wave cell's text, or null when the plan has no waves (the column is not shown). */
+  wave: string | null;
+}
+
+/**
+ * One table row. Memoized on plain props: a live event patches one migration (SDD §16), so on a plan of
+ * hundreds of VMs only that row is drawn again.
+ */
+const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }: MigrationRowProps) {
+  return (
+    <tr>
+      <th scope="row" className="whitespace-nowrap font-mono">
+        <Link to={`/migrations/${m.id}`} className="underline-offset-4 hover:underline">
+          {m.vm.name}
+        </Link>
+      </th>
+      <td>
+        <PhaseBadge phase={m.phase} />
+      </td>
+      <td className="whitespace-nowrap">
+        {strategyLabel(m.strategy)}
+        {override && <span className="block text-xs text-muted-foreground">override</span>}
+      </td>
+      {wave !== null && <td className="hidden min-w-32 max-w-48 wrap-break-word md:table-cell">{wave}</td>}
+      <td className="hidden w-36 lg:table-cell">
+        {isActivePhase(m.phase) || m.phase === 'awaiting_cutover' ? (
+          <div className="flex items-center gap-2">
+            <ProgressBar value={m.progress_pct} label={`${m.vm.name} progress`} size="sm" />
+            <span className="num w-12 text-right text-xs">{formatPct(m.progress_pct, 0)}</span>
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        )}
+      </td>
+      <td>
+        <EstimateCell estimate={m.estimate} compact />
+      </td>
+      <td>
+        <FindingsSummary findings={m.findings} />
+      </td>
+      <td className="num hidden whitespace-nowrap text-right md:table-cell">
+        {m.actual_downtime_s !== null
+          ? formatDuration(m.actual_downtime_s)
+          : m.downtime_started_at && !m.downtime_ended_at
+            ? <span className="text-status-warning">running</span>
+            : '—'}
+      </td>
+    </tr>
+  );
+});
 
 /** Plan migrations with strategy, estimate and findings; text/phase/strategy/wave filters; sortable. */
 export function MigrationsTable({ migrations, plan, caption = 'Migrations', emptyDescription, emptyAction }: MigrationsTableProps) {
@@ -173,53 +228,14 @@ export function MigrationsTable({ migrations, plan, caption = 'Migrations', empt
               </tr>
             </thead>
             <tbody>
-              {sorted.map((m) => {
-                const override = plan?.strategy_overrides[m.vm.source_id];
-                return (
-                  <tr key={m.id}>
-                    <th scope="row" className="whitespace-nowrap font-mono">
-                      <Link to={`/migrations/${m.id}`} className="underline-offset-4 hover:underline">
-                        {m.vm.name}
-                      </Link>
-                    </th>
-                    <td>
-                      <PhaseBadge phase={m.phase} />
-                    </td>
-                    <td className="whitespace-nowrap">
-                      {strategyLabel(m.strategy)}
-                      {override && <span className="block text-xs text-muted-foreground">override</span>}
-                    </td>
-                    {waves.length > 0 && (
-                      <td className="hidden max-w-48 truncate md:table-cell" title={m.wave_id ? waveName.get(m.wave_id) : undefined}>
-                        {m.wave_id ? (waveName.get(m.wave_id) ?? m.wave_id) : '—'}
-                      </td>
-                    )}
-                    <td className="hidden w-36 lg:table-cell">
-                      {isActivePhase(m.phase) || m.phase === 'awaiting_cutover' ? (
-                        <div className="flex items-center gap-2">
-                          <ProgressBar value={m.progress_pct} label={`${m.vm.name} progress`} size="sm" />
-                          <span className="num w-12 text-right text-xs">{formatPct(m.progress_pct, 0)}</span>
-                        </div>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
-                    </td>
-                    <td>
-                      <EstimateCell estimate={m.estimate} compact />
-                    </td>
-                    <td>
-                      <FindingsSummary findings={m.findings} />
-                    </td>
-                    <td className="num hidden whitespace-nowrap text-right md:table-cell">
-                      {m.actual_downtime_s !== null
-                        ? formatDuration(m.actual_downtime_s)
-                        : m.downtime_started_at && !m.downtime_ended_at
-                          ? <span className="text-status-warning">running</span>
-                          : '—'}
-                    </td>
-                  </tr>
-                );
-              })}
+              {sorted.map((m) => (
+                <MigrationRow
+                  key={m.id}
+                  migration={m}
+                  override={Boolean(plan?.strategy_overrides[m.vm.source_id])}
+                  wave={waves.length > 0 ? (m.wave_id ? (waveName.get(m.wave_id) ?? m.wave_id) : '—') : null}
+                />
+              ))}
             </tbody>
           </table>
         </div>

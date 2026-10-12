@@ -1,4 +1,4 @@
-import type { ProviderKind, Severity, VMRef } from '../api/types';
+import type { Nic, ProviderKind, Severity, VMRef } from '../api/types';
 import { guestOsOf } from './guestOs';
 
 /**
@@ -16,6 +16,16 @@ export type ReadinessLevel = 'ready' | 'attention' | 'blocker';
 
 const SRIOV = new Set(['direct', 'direct-physical', 'macvtap']);
 
+/** NICs os-migrate cannot recreate through Nova, which takes exactly one fixed IP per port (SDD §9.2). */
+export function portsWithoutOneFixedIp(vm: VMRef): Nic[] {
+  return vm.nics.filter((n) => n.fixed_ips.length !== 1);
+}
+
+/** Each NIC by its network and addresses, as the API words it: "app-net (10.0.0.5, fd00::5)". */
+export function describePorts(nics: Nic[]): string {
+  return nics.map((n) => `${n.network} (${n.fixed_ips.join(', ') || 'no fixed IP'})`).join(', ');
+}
+
 export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
   const flags: ReadinessFlag[] = [];
   const add = (code: string, label: string, severity: Severity, detail: string) => flags.push({ code, label, severity, detail });
@@ -30,6 +40,17 @@ export function readinessFlags(vm: VMRef, kind: ProviderKind): ReadinessFlag[] {
   if (guest.lifecycle === 'legacy') add('GUEST_OS_LEGACY', 'Legacy OS', 'warning', `${guest.label} is out of vendor support; it still migrates — test the application on RHOSO.`);
   if (guest.family === 'unknown') add('GUEST_OS_UNKNOWN', 'Unknown OS', 'info', 'The guest OS is not identified; set os_distro/os_version or run VMware Tools.');
   if (vm.nics.some((n) => SRIOV.has(n.vnic_type))) add('NET_SRIOV_PORT', 'SR-IOV port', 'warning', 'SR-IOV ports must be re-created manually.');
+  const oddPorts = portsWithoutOneFixedIp(vm);
+  if (kind !== 'vmware' && oddPorts.length > 0) {
+    add(
+      'NET_PORT_IPS',
+      'Port IPs',
+      'warning',
+      oddPorts.length === 1
+        ? `Port ${describePorts(oddPorts)} keeps every address only with the plan option "Keep MAC addresses and every fixed IP": without it, cold and warm cannot recreate it and storage handover keeps one of its addresses.`
+        : `Ports ${describePorts(oddPorts)} keep every address only with the plan option "Keep MAC addresses and every fixed IP": without it, cold and warm cannot recreate them and storage handover keeps one address per port.`,
+    );
+  }
   if (kind === 'vmware') {
     if (vm.cbt_enabled === false) add('VMW_CBT_DISABLED', 'CBT off', 'warning', 'Changed Block Tracking is off: only cold migration.');
     if (vm.disks.some((d) => d.independent)) add('VMW_INDEPENDENT_DISK', 'Independent disk', 'warning', 'Independent disks cannot be tracked by CBT.');

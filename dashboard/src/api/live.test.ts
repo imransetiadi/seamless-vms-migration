@@ -1,5 +1,6 @@
-import { QueryClient } from '@tanstack/react-query';
+import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
+import { ApiError } from './client';
 import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
 import type { Event, Migration } from './types';
@@ -142,6 +143,48 @@ describe('applyEventToCache', () => {
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 43, kind: 'provider.checked', migration_id: null, plan_id: null }, invalidate);
     expect(invalidate).toHaveBeenCalledWith(['providers']);
   });
+
+  it('refreshes the recommendations and the audit lists on an audit event (SDD §14.5)', () => {
+    for (const kind of ['recommendation.created', 'decision.overridden']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 46, kind }, invalidate);
+      expect(invalidate, kind).toHaveBeenCalledWith(['advisor', 'recommendations']);
+      expect(invalidate, kind).toHaveBeenCalledWith(['events', 'tail']);
+      expect(invalidate, kind).toHaveBeenCalledWith(['migration', migration.id]);
+    }
+  });
+
+  it("refreshes the migrations lists on a decision: approving clears a hold another viewer's plan page shows (SDD §14.6)", () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 47, kind: 'decision.approved' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+    invalidate.mockClear();
+    // a recommendation alone holds nothing: its decision event follows it
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: 'rec-000000000001' }), seq: 48, kind: 'recommendation.created' }, invalidate);
+    expect(invalidate).not.toHaveBeenCalledWith(['migrations']);
+  });
+
+  it('refreshes the policies and the audit lists on a policy change (SDD §14.6)', () => {
+    for (const kind of ['policy.created', 'policy.updated', 'policy.deleted']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({ target_id: 'pol-000000000001' }), seq: 49, kind, migration_id: null, plan_id: null }, invalidate);
+      expect(invalidate.mock.calls.map(([key]) => key), kind).toEqual([
+        ['advisor', 'policies'],
+        ['events', 'tail'],
+      ]);
+    }
+  });
+
+  it('refreshes the recommendations when an advisor event says one was recorded, and only then (SDD §14.4)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ recommendation_id: 'rec-000000000001' }), seq: 44, kind: 'advisor.strategy' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['advisor', 'recommendations']);
+    expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
+
+    invalidate.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 45, kind: 'migration.phase' }, invalidate);
+    expect(invalidate).not.toHaveBeenCalledWith(['advisor', 'recommendations']);
+  });
 });
 
 describe('applyEventToCache for providers', () => {
@@ -209,6 +252,48 @@ describe('createBatchedInvalidator', () => {
     }
   });
 
+  it('lets a slow refetch finish while events keep arriving, instead of cancelling it at every flush', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      let finished = 0;
+      const starts: number[] = [];
+      // an API that answers in 800 ms, slower than the 400 ms flush
+      const observer = new QueryObserver(queryClient, {
+        queryKey: ['migrations'],
+        queryFn: ({ signal }) =>
+          new Promise<number>((resolve, reject) => {
+            starts.push(Date.now());
+            const timer = setTimeout(() => resolve(++finished), 800);
+            signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              reject(new DOMException('aborted', 'AbortError'));
+            });
+          }),
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.advanceTimersByTimeAsync(800);
+      expect(finished).toBe(1);
+      const batch = createBatchedInvalidator(queryClient, 400);
+      // an event every 300 ms for 6 s
+      for (let i = 0; i < 20; i++) {
+        batch.invalidate(['migrations']);
+        await vi.advanceTimersByTimeAsync(300);
+      }
+      // the list still refreshed while the events went on
+      expect(finished).toBeGreaterThanOrEqual(4);
+      // and once they stop, a fetch that began after the last event shows its change
+      const lastEvent = Date.now() - 300;
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(Math.max(...starts)).toBeGreaterThanOrEqual(lastEvent);
+      expect(queryClient.isFetching({ queryKey: ['migrations'] })).toBe(0);
+      unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drops pending work on dispose (sign-out, unmount)', () => {
     vi.useFakeTimers();
     try {
@@ -239,5 +324,288 @@ describe('refetchAfterReconnect', () => {
     onStatus('reconnecting');
     onStatus('open');
     expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('one migration spliced into the cached lists (SDD §16)', () => {
+  const other = fx.migrations.find((m) => m.id !== migration.id && m.plan_id === migration.plan_id) as Migration;
+
+  it('asks for the one migration instead of every list, for an event about an existing migration', () => {
+    const { queryClient, invalidate } = setup();
+    const refresh = vi.fn();
+    for (const kind of ['migration.phase', 'migration.error', 'migration.sync_pass', 'advisor.classification', 'decision.approved']) {
+      invalidate.mockClear();
+      refresh.mockClear();
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 60, kind }, invalidate, refresh);
+      expect(refresh, kind).toHaveBeenCalledWith(migration.id);
+      expect(invalidate, kind).not.toHaveBeenCalledWith(['migrations']);
+    }
+    // a new migration is in no cached list yet: the lists are read again
+    invalidate.mockClear();
+    refresh.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 61, kind: 'migration.created' }, invalidate, refresh);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+    // a decision that names no migration
+    invalidate.mockClear();
+    applyEventToCache(queryClient, { ...progressEvent({}), seq: 62, kind: 'decision.approved', migration_id: null }, invalidate, refresh);
+    expect(invalidate).toHaveBeenCalledWith(['migrations']);
+  });
+
+  async function flushed(fetchMigration: (id: string) => Promise<Migration>, lists: Array<[object, Migration[]]>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    for (const [query, list] of lists) queryClient.setQueryData(['migrations', query], list);
+    const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+    const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+    batch.refreshMigration(migration.id);
+    batch.refreshMigration(migration.id);
+    await vi.advanceTimersByTimeAsync(400);
+    // what the read queued for the next batch
+    await vi.advanceTimersByTimeAsync(400);
+    const invalidated = spy.mock.calls.map(([filters]) => filters?.queryKey);
+    batch.dispose();
+    return { queryClient, invalidated };
+  }
+
+  it('reads the migration once per batch and puts it into the lists that hold it, reading the others again', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing', progress_pct: 3 };
+      const fetchMigration = vi.fn(async () => fresh);
+      const { queryClient, invalidated } = await flushed(fetchMigration, [
+        [{}, [other, migration]],
+        [{ plan_id: migration.plan_id }, [migration]],
+        [{ phase: 'precopy' }, [migration]],
+        [{ plan_id: 'plan-00000000' }, []],
+        [{ plan_id: migration.plan_id, limit: 1 }, [other]],
+      ]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      expect(fetchMigration).toHaveBeenCalledWith(migration.id);
+      expect(queryClient.getQueryData<Migration[]>(['migrations', {}])).toEqual([other, fresh]);
+      expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])).toEqual([fresh]);
+      expect(queryClient.getQueryData<Migration>(['migration', migration.id])).toEqual(fresh);
+      // a list filtered by phase may lose or gain it, a paged one may shift: read again
+      expect(invalidated).toContainEqual(['migrations', { phase: 'precopy' }]);
+      expect(invalidated).toContainEqual(['migrations', { plan_id: migration.plan_id, limit: 1 }]);
+      // another plan's list neither holds it nor could
+      expect(invalidated).not.toContainEqual(['migrations', { plan_id: 'plan-00000000' }]);
+      expect(invalidated).not.toContainEqual(['migrations', {}]);
+      expect(invalidated).not.toContainEqual(['migrations']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a list again that should hold the migration but does not, and every list when the read fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const missing = await flushed(async () => migration, [[{ plan_id: migration.plan_id }, [other]]]);
+      expect(missing.invalidated).toContainEqual(['migrations', { plan_id: migration.plan_id }]);
+
+      const failed = await flushed(async () => {
+        throw new Error('502');
+      }, [[{}, [migration]]]);
+      expect(failed.invalidated).toContainEqual(['migrations']);
+      expect(failed.queryClient.getQueryData<Migration[]>(['migrations', {}])).toEqual([migration]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refreshes nothing on a saved lesson: it changes no migration, list or figure (SDD §16)', () => {
+    const { queryClient, invalidate } = setup();
+    const refresh = vi.fn();
+    applyEventToCache(queryClient, { ...progressEvent({ type: 'fact' }), seq: 63, kind: 'memory.lesson_saved' }, invalidate, refresh);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  /** An observed migration list whose every read takes `ms`, counting its reads. */
+  function slowList(client: QueryClient, key: unknown[], ms: number) {
+    let reads = 0;
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => {
+        reads += 1;
+        return new Promise<Migration[]>((resolve) => setTimeout(() => resolve([migration]), ms));
+      },
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    return { reads: () => reads, observer, unsubscribe };
+  }
+
+  it('reads a list once when the same batch refreshes it and splices a migration into it (SDD §16)', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const list = slowList(client, ['migrations', { plan_id: migration.plan_id }], 300);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(list.reads()).toBe(1);
+      const fresh: Migration = { ...migration, phase: 'completed' };
+      const batch = createBatchedInvalidator(client, 400, (id) => new Promise((resolve) => setTimeout(() => resolve({ ...fresh, id }), 100)));
+      // a plan event refreshes every list; the migration's own event splices it in, in the same batch
+      applyEventToCache(client, { ...progressEvent({}), seq: 80, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 81, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 6; i += 1) await vi.advanceTimersByTimeAsync(500);
+      // the batch's own read started after both events: no second read of a megabyte list
+      expect(list.reads()).toBe(2);
+      list.unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /** An observed migration list whose reads answer in turn from `answers`: a list, or an error after `ms`. */
+  function scriptedList(client: QueryClient, key: unknown[], answers: Array<{ ms: number; fail?: boolean }>) {
+    let reads = 0;
+    const observer = new QueryObserver(client, {
+      queryKey: key,
+      queryFn: () => {
+        const answer = answers[Math.min(reads, answers.length - 1)]!;
+        reads += 1;
+        return new Promise<Migration[]>((resolve, reject) =>
+          setTimeout(() => (answer.fail ? reject(new Error('503')) : resolve([migration])), answer.ms),
+        );
+      },
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    return { reads: () => reads, unsubscribe };
+  }
+
+  it("reads a list once more when the batch's own read of it fails while a splice waits on it (SDD §16)", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const key = ['migrations', { plan_id: migration.plan_id }];
+      const list = scriptedList(client, key, [{ ms: 0 }, { ms: 300, fail: true }, { ms: 0 }]);
+      await vi.advanceTimersByTimeAsync(10);
+      const batch = createBatchedInvalidator(client, 400, async (id) => ({ ...migration, id, phase: 'completed' }));
+      applyEventToCache(client, { ...progressEvent({}), seq: 83, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 84, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 6; i += 1) await vi.advanceTimersByTimeAsync(500);
+      // the failed read left the splice's migration out: the list is read again, and only once
+      expect(list.reads()).toBe(3);
+      list.unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("puts the migration into a list whose read by the same batch failed before the splice, as before (SDD §16)", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const key = ['migrations', { plan_id: migration.plan_id }];
+      const list = scriptedList(client, key, [{ ms: 0 }, { ms: 50, fail: true }]);
+      await vi.advanceTimersByTimeAsync(10);
+      const fresh: Migration = { ...migration, phase: 'completed' };
+      const other: Migration = { ...migration, id: 'mig-other', phase: 'completed' };
+      client.setQueryData(key, [migration, { ...other, phase: 'cutover' }]);
+      const read = (id: string) => new Promise<Migration>((resolve) => setTimeout(() => resolve(id === other.id ? other : fresh), 100));
+      const batch = createBatchedInvalidator(client, 400, read);
+      applyEventToCache(client, { ...progressEvent({}), seq: 85, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 86, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 87, kind: 'migration.phase', migration_id: other.id }, batch.invalidate, batch.refreshMigration);
+      await vi.advanceTimersByTimeAsync(600);
+      // both splices land, the second after the first wrote into the list
+      expect(client.getQueryData<Migration[]>(key)?.map((m) => m.phase)).toEqual(['completed', 'completed']);
+      expect(list.reads()).toBe(2);
+      list.unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('puts every migration of the batch into a cached list no page shows, which the batch only marks stale (SDD §16)', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const key = ['migrations', { plan_id: migration.plan_id }];
+      const other: Migration = { ...migration, id: 'mig-other', phase: 'cutover' };
+      client.setQueryData(key, [migration, other]);
+      const batch = createBatchedInvalidator(client, 400, async (id) => ({ ...(id === other.id ? other : migration), phase: 'completed' }));
+      applyEventToCache(client, { ...progressEvent({}), seq: 88, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 89, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 90, kind: 'migration.phase', migration_id: other.id }, batch.invalidate, batch.refreshMigration);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(client.getQueryData<Migration[]>(key)?.map((m) => m.phase)).toEqual(['completed', 'completed']);
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a list again whose read was under way before the batch, so the event still shows (SDD §16)', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const list = slowList(client, ['migrations', { plan_id: migration.plan_id }], 1000);
+      await vi.advanceTimersByTimeAsync(1000);
+      void list.observer.refetch();
+      expect(list.reads()).toBe(2);
+      const batch = createBatchedInvalidator(client, 400, async () => ({ ...migration, phase: 'completed' }));
+      applyEventToCache(client, { ...progressEvent({}), seq: 82, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 8; i += 1) await vi.advanceTimersByTimeAsync(500);
+      expect(list.reads()).toBe(3);
+      list.unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a list again that has no data yet - its load failed or is under way - as before the splice', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const key = ['migrations', { plan_id: migration.plan_id }];
+      let calls = 0;
+      const observer = new QueryObserver(client, {
+        queryKey: key,
+        queryFn: () => {
+          calls += 1;
+          return calls === 1 ? Promise.reject(new Error('503')) : Promise.resolve([migration]);
+        },
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('error'));
+      const batch = createBatchedInvalidator(client, 400, async () => migration);
+      applyEventToCache(client, { ...progressEvent({}), seq: 70, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 5; i += 1) await vi.advanceTimersByTimeAsync(500);
+      expect(calls).toBe(2);
+      unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never turns a loaded migration's page into a failure on one failed single read; its own query retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient({ defaultOptions: { queries: { staleTime: 5_000 } } });
+      const key = ['migration', migration.id];
+      let calls = 0;
+      const get = async (): Promise<Migration> => {
+        calls += 1;
+        if (calls === 2) throw new ApiError(502, 'provider_error', 'a router blip');
+        return { ...migration };
+      };
+      // useMigration's retry: a 5xx twice
+      const observer = new QueryObserver(client, { queryKey: key, queryFn: get, retry: (count: number, error: Error) => !(error instanceof ApiError && error.status < 500) && count < 2 });
+      const unsubscribe = observer.subscribe(() => {});
+      await vi.waitFor(() => expect(client.getQueryState(key)?.status).toBe('success'));
+      const batch = createBatchedInvalidator(client, 400, get);
+      applyEventToCache(client, { ...progressEvent({}), seq: 71, kind: 'migration.sync_pass' }, batch.invalidate, batch.refreshMigration);
+      for (let i = 0; i < 20; i += 1) await vi.advanceTimersByTimeAsync(500);
+      expect(client.getQueryState(key)?.status).toBe('success');
+      unsubscribe();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,4 +1,7 @@
+import ast
 import copy
+import json
+import logging
 import os
 import re
 import subprocess
@@ -11,7 +14,7 @@ import yaml
 
 from seamless_migrate.config import Settings, find_repo_root
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
-from seamless_migrate.domain.models import ConversionHostConfig, Mappings, utcnow
+from seamless_migrate.domain.models import ConversionHostConfig, Mappings, Nic, utcnow
 from seamless_migrate.executors.ansible import (
     CONVERSION_KEY_FILE,
     KIT_PLAYBOOK,
@@ -23,10 +26,13 @@ from seamless_migrate.executors.ansible import (
     build_vars,
     classify_failure,
     effective_mappings,
+    resolve_network_refs,
+    workload_file_stem,
     workload_filter,
 )
 from seamless_migrate.executors.ansible import _inventory as build_inventory_doc
 from seamless_migrate.executors.base import PermanentStepError, StepName, TransientStepError
+from seamless_migrate.planning.preflight import DestinationInventory
 from seamless_migrate.providers.base import ProviderError
 from tests.executor_support import make_ctx
 from tests.factories import make_migration, make_plan, make_provider, make_vm
@@ -49,6 +55,10 @@ VCENTER = make_provider(
     credentials_secret="vcenter-dc2",
     conversion_host=None,
 )
+# a NIC as the VMware provider records it: a standard port group's key is its name (SDD §4)
+VMW_NICS = [
+    Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net")
+]
 MAPPINGS = Mappings(
     networks={"app-net": "rhoso-app", "DC2-Prod": "dc2-prod"},
     flavors={"m1.small": "rhoso.small"},
@@ -88,11 +98,50 @@ class FakeImpl:
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
 
+    async def inventory(self):
+        """The destination's networks, for the network references (SDD §7.2)."""
+        self.calls.append(("inventory",))
+        if self.registry.inventory_error:
+            raise ProviderError("networks: HTTP 503")
+        return DestinationInventory(
+            network_details=list(self.registry.networks),
+            subnets=[dst_subnet(n) for n in self.registry.networks] + self.registry.subnets,
+        )
+
+
+def dst_net(name, own=True, project_id=None):
+    return {
+        "id": f"net-{name}-{project_id or ('mine' if own else 'theirs')}",
+        "name": name,
+        "mtu": 1500,
+        "project_id": project_id or ("finance-rhoso" if own else "admin"),
+        "own": own,
+        "shared": not own,
+    }
+
+
+def dst_subnet(network, cidr="10.0.0.0/16"):
+    """A network's one subnet, by id: what a VMware NIC's network_map value names (SDD §7.2)."""
+    return {
+        "id": f"sub-{network['id']}",
+        "name": f"{network['name']}-v4",
+        "network": network["name"],
+        "network_id": network["id"],
+        "cidr": cidr,
+        "ipv6_address_mode": None,
+        "ipv6_ra_mode": None,
+    }
+
 
 class FakeRegistry:
     def __init__(self, existing=()):
         self.calls = []
         self.existing = set(existing)
+        # the credential's own networks the tests send ports to (SDD §7.2)
+        self.networks = [dst_net(n) for n in ("rhoso-app", "rhoso-dmz", "app-net", "dc2-prod")]
+        # more subnets, after each network's one
+        self.subnets: list[dict] = []
+        self.inventory_error = False
 
     def get(self, provider):
         return FakeImpl(self)
@@ -140,9 +189,11 @@ def env(tmp_path, monkeypatch):
     return SimpleNamespace(settings=settings, log=log, executor=executor, registry=registry)
 
 
-def ctx_for(env, strategy=Strategy.warm, source=SRC, name="web-01", **mig_kw):
-    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
-    vm = make_vm(source_id="srv-1", name=name)
+def ctx_for(
+    env, strategy=Strategy.warm, source=SRC, name="web-01", mappings=MAPPINGS, nics=None, **mig_kw
+):
+    plan = make_plan(id="plan-00c0ffee", mappings=mappings)
+    vm = make_vm(source_id="srv-1", name=name, **({"nics": nics} if nics is not None else {}))
     mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
     return make_ctx(plan, mig, source, DST, env.settings)
 
@@ -314,6 +365,293 @@ async def test_cutover_cold_sets_stop_before_migration(env):
     assert not env.executor.supports(Strategy.storage_handover)
 
 
+async def test_a_cold_cutover_records_its_copy_as_a_full_pass(env):
+    """SDD §7.2/§5.5: the copy a cold cutover reported as progress is its full pass, so
+    bytes_transferred stays its listed passes (invariant 2) - before, every real cold migration
+    completed BYTES_MISMATCH."""
+    started = utcnow()
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, bytes_total=7 * 2**30)
+    result = await env.executor.run(StepName.CUTOVER, ctx)
+    full = result.sync_pass
+    assert full is not None and full.kind == SyncPassKind.full
+    # what the state file's 100 % stands for: the VM's used bytes
+    assert (full.bytes_changed, full.bytes_transferred) == (7 * 2**30, 7 * 2**30)
+    assert full.bytes_scanned == ctx.migration.vm.disk_bytes
+    assert started <= full.started_at <= full.ended_at
+    assert full.duration_s == (full.ended_at - full.started_at).total_seconds()
+    assert result.destination_server_id == "dst-web-01"
+    # without a byte count from validation, the VM's used bytes
+    plain, _ = ctx_for(env, strategy=Strategy.cold, name="db-01")
+    assert (await env.executor.run(StepName.CUTOVER, plain)).sync_pass.bytes_transferred == (
+        plain.migration.vm.used_bytes
+    )
+
+
+def port_mode_ctx(env, strategy, mode="neutron"):
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode=mode)
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy)
+    return make_ctx(plan, mig, SRC, DST, env.settings)
+
+
+def exported_server(env):
+    doc = yaml.safe_load((run_dir(env) / "osm" / "workloads.yml").read_text())
+    return next(r for r in doc["resources"] if r["type"] == "openstack.compute.Server")
+
+
+async def test_the_plans_port_creation_mode_reaches_workloads_before_the_import(env, monkeypatch):
+    """SDD §7.2: the executor writes plan.port_creation_mode into the server's _migration_params
+    after the export and before every playbook run, so a mode chosen after a warm export applies
+    to the next run."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    cold, _ = port_mode_ctx(env, Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    import_call = read_log(env.log)[-1]
+    assert import_call["playbook"] == "import_workloads.yml"
+    assert import_call["port_creation_mode"] == ["neutron"]
+    assert exported_server(env)["_migration_params"]["port_creation_mode"] == "neutron"
+
+    (run_dir(env) / "osm" / "workloads.yml").unlink()
+    warm, _ = port_mode_ctx(env, Strategy.warm, mode="nova")
+    await env.executor.run(StepName.PRECOPY, warm)
+    assert read_log(env.log)[-1]["port_creation_mode"] == ["nova"]
+    later, _ = port_mode_ctx(env, Strategy.warm)
+    await env.executor.run(StepName.SYNC, later)
+    sync_call = read_log(env.log)[-1]
+    assert sync_call["playbook"] == "import_workloads_precopy.yml"  # no new export
+    assert sync_call["port_creation_mode"] == ["neutron"]
+
+
+async def test_a_neutron_warm_cutover_exports_again_a_workload_without_port_security_groups(
+    env, monkeypatch
+):
+    """SDD §7.2: an export from before §6.6's rule lists ports without their security groups;
+    in "neutron" mode the warm cutover exports the workload again first."""
+    precopy, _ = port_mode_ctx(env, Strategy.warm, mode="nova")
+    await env.executor.run(StepName.PRECOPY, precopy)
+    assert "security_group_refs" not in exported_server(env)["params"]["ports"][0]["params"]
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    cutover, _ = port_mode_ctx(env, Strategy.warm)
+    await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["security_group_refs"]
+    assert read_log(env.log)[-1]["port_creation_mode"] == ["neutron"]
+
+
+async def test_neutron_mode_refuses_ports_exported_without_security_groups_before_the_stop(env):
+    """A collection that still exports ports without their security groups would create them
+    with the project's default group: the cutover stops after the export, before the import."""
+    cold, rec = port_mode_ctx(env, Strategy.cold)
+    with pytest.raises(PermanentStepError, match="security groups"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+    # the rewrite did not finish: no export record, so the next run exports again (SDD §7.2)
+    assert not (run_dir(env) / "osm" / "rewrite.json").exists()
+
+
+def nic_ctx(env, strategy, overrides, mappings=MAPPINGS, **mig_kw):
+    plan = make_plan(
+        id="plan-00c0ffee",
+        mappings=mappings,
+        nic_overrides={"srv-1": overrides} if overrides else {},
+    )
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=strategy, **mig_kw)
+    return make_ctx(plan, mig, SRC, DST, env.settings)
+
+
+def test_apply_nic_overrides_sends_a_port_elsewhere_by_address():
+    """SDD §7.2: the port with an entry (by MAC) goes to the entry's network; its addresses -
+    the entry's, else its own - become address-only references Neutron places by subnet."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    port = {
+        "mac_address": "FA:16:3E:00:00:01",
+        "network_ref": {"name": "app-net", "project_name": "finance", "domain_name": "Default"},
+        "fixed_ips_refs": [{"ip_address": "10.0.0.5", "subnet_ref": {"name": "app-subnet"}}],
+    }
+    other = {**port, "mac_address": "fa:16:3e:00:00:02"}
+    doc = {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {"ports": [{"params": port}, {"params": other}]},
+            }
+        ]
+    }
+    both = apply_nic_overrides(
+        doc, {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5"])}
+    )
+    first, second = (p["params"] for p in both["resources"][0]["params"]["ports"])
+    assert first["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "finance",
+        "domain_name": "Default",
+    }
+    assert first["fixed_ips_refs"] == [{"ip_address": "192.168.10.5"}]
+    assert second == other  # no entry: untouched
+    assert doc["resources"][0]["params"]["ports"][0]["params"] == port  # a copy
+    kept = apply_nic_overrides(doc, {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz")})
+    assert kept["resources"][0]["params"]["ports"][0]["params"]["fixed_ips_refs"] == [
+        {"ip_address": "10.0.0.5"}
+    ]
+
+
+def fip_doc(addresses=("10.0.0.5",)):
+    """A planned server: port fa:16:3e:00:00:01 holds ``addresses``, a floating IP 10.0.0.5."""
+    return {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {
+                    "ports": [
+                        {
+                            "params": {
+                                "mac_address": "fa:16:3e:00:00:01",
+                                "network_ref": {"name": "app-net"},
+                                "fixed_ips_refs": [
+                                    {"ip_address": a, "subnet_ref": {"name": "app-subnet"}}
+                                    for a in addresses
+                                ],
+                            }
+                        }
+                    ],
+                    "floating_ips": [
+                        {
+                            "params": {
+                                "fixed_ip_address": "10.0.0.5",
+                                "floating_ip_address": "203.0.113.7",
+                            }
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def test_apply_nic_overrides_moves_the_floating_ip_to_the_new_address():
+    """SDD §7.2: os-migrate attaches a floating IP by its fixed address, so it follows the port to
+    its new address of the same IP version."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["fd00:10::5", "192.168.10.5"])
+    out = apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": entry})
+    [fip] = out["resources"][0]["params"]["floating_ips"]
+    assert fip["params"]["fixed_ip_address"] == "192.168.10.5"
+    # a network-only entry keeps the address, and the floating IP stays on it
+    kept = apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": NicOverride(network="rhoso-dmz")})
+    assert kept["resources"][0]["params"]["floating_ips"][0]["params"]["fixed_ip_address"] == (
+        "10.0.0.5"
+    )
+
+
+def test_apply_nic_overrides_leaves_a_floating_ip_on_an_address_the_port_keeps():
+    """SDD §7.2, review NC-06: a floating IP stays on its address when the override keeps it, also
+    beside other addresses of its version - os-migrate attaches it by that address; only one that
+    must move needs exactly one new address of its version."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    for doc, entry in (
+        # a network-only entry on a port with two IPv4 addresses
+        (fip_doc(("10.0.0.5", "10.0.1.5")), NicOverride(network="rhoso-dmz")),
+        # an entry whose addresses list the floating IP's among another
+        (fip_doc(), NicOverride(fixed_ips=["10.0.1.5", "10.0.0.5"])),
+    ):
+        out = apply_nic_overrides(doc, {"fa:16:3e:00:00:01": entry})
+        [fip] = out["resources"][0]["params"]["floating_ips"]
+        assert fip["params"]["fixed_ip_address"] == "10.0.0.5"
+
+
+def test_apply_nic_overrides_refuses_what_it_cannot_place_before_the_stop():
+    """With no new address of the floating IP's version, with several, or with an entry whose MAC
+    no exported port has, the cutover stops after the export, before the source stops."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    for addresses, said in (
+        (["fd00:10::5"], "no IPv4 address"),
+        (["192.168.10.5", "192.168.10.6"], "2 IPv4 addresses"),
+    ):
+        entry = NicOverride(fixed_ips=addresses)
+        with pytest.raises(PermanentStepError, match=said):
+            apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:01": entry})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        apply_nic_overrides(fip_doc(), {"fa:16:3e:00:00:99": NicOverride(network="rhoso-dmz")})
+
+
+async def test_an_override_the_export_cannot_take_stops_the_cutover_before_the_stop(
+    env, monkeypatch
+):
+    """The VM's NICs changed since validation: the cutover stops after the export, with only the
+    planned server written for a rollback (never a same-named twin), and the import (which stops
+    the source) never runs."""
+    monkeypatch.setenv("ANSIBLE_FAKE_TWIN_ID", "srv-twin")
+    cold, rec = nic_ctx(env, Strategy.cold, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+    doc = yaml.safe_load((run_dir(env) / "osm" / "workloads.yml").read_text())
+    servers = [r for r in doc["resources"] if r["type"] == "openstack.compute.Server"]
+    assert [r["_info"]["id"] for r in servers] == ["srv-1"]
+
+
+async def test_a_cutover_writes_the_vms_nic_overrides_into_workloads(env):
+    """SDD §7.2: after the export the planned server's overridden port is rewritten."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    cold, _ = nic_ctx(env, Strategy.cold, entry)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"]["name"] == "rhoso-dmz"
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "192.168.10.5"}]
+    # the marker a warm cutover exports again for, should the entry go (SDD §7.2)
+    assert port["_migration_params"]["nic_override"] is True
+
+
+async def test_a_warm_cutover_exports_again_for_the_vms_nic_overrides(env):
+    """The export of the first pre-copy predates the entry: the cutover exports again and the
+    overridden port goes where the entry says."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    plain, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.PRECOPY, plain)
+    warm, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.CUTOVER, warm)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["fixed_ips_refs"] == [
+        {"ip_address": "192.168.10.5"}
+    ]
+
+
+async def test_a_warm_cutover_exports_again_when_an_override_was_removed(env):
+    """An entry removed after the export left address-only references: the cutover exports the
+    workload again, so the port goes back to its mapped network and subnet."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    with_entry, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.PRECOPY, with_entry)
+    removed, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.CUTOVER, removed)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]
+    # back to its mapped network with its own address, unmarked
+    assert port["params"]["network_ref"]["name"] == "rhoso-app"
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert not (port.get("_migration_params") or {}).get("nic_override")
+
+
 async def test_rewrite_workloads_keeps_only_the_planned_server(env, monkeypatch):
     """os-migrate exports workloads by name: a same-named server of the project that is not in
     the plan must never be imported, stopped or migrated (SDD §7.2)."""
@@ -355,14 +693,17 @@ NEVER_TEMPLATED = {
 JINJA_NAME = "{{ lookup('pipe', 'id') }}{% if true %}-x{% endif %}"
 
 
-def value_scalars(node):
-    """The scalar nodes in value position (mapping values, sequence items) of a YAML node."""
+def data_scalars(node, nested=False):
+    """The scalar nodes of a YAML document that hold data: every value, and every key of a nested
+    mapping (``dict2items`` turns a key into a value); the top-level keys are the variable names."""
     if isinstance(node, yaml.MappingNode):
-        for _key, value in node.value:
-            yield from value_scalars(value)
+        for key, value in node.value:
+            if nested:
+                yield from data_scalars(key, True)
+            yield from data_scalars(value, True)
     elif isinstance(node, yaml.SequenceNode):
         for item in node.value:
-            yield from value_scalars(item)
+            yield from data_scalars(item, True)
     elif isinstance(node, yaml.ScalarNode):
         yield node
 
@@ -374,44 +715,75 @@ async def test_generated_ansible_input_is_never_templated(env, strategy, source)
     """Security.md C1-05, SDD §7.2: Ansible templates every string it reads, so a VM name (chosen
     by whoever runs the source VM), a mapping value or a password holding Jinja would run on the
     control plane (``lookup('pipe', …)``). Every string in vars.yml, secrets.yml and the
-    inventory is written ``!unsafe``, and the playbook still receives it unchanged."""
-    ctx, _ = ctx_for(env, strategy=strategy, source=source, name=JINJA_NAME)
+    inventory — the values and the keys of nested mappings, such as a source network's name in
+    ``network_map`` — is written ``!unsafe``, and the playbook still receives it unchanged."""
+    networks = {**MAPPINGS.networks, JINJA_NAME: "rhoso-app"}
+    mappings = MAPPINGS.model_copy(update={"networks": networks})
+    # a port group named by whoever runs vCenter keys the kit's network_map (SDD §7.2)
+    nics = [
+        Nic(
+            network=JINJA_NAME,
+            mac="00:50:56:00:00:01",
+            fixed_ips=["10.0.0.5"],
+            network_key=JINJA_NAME,
+        )
+    ]
+    ctx, _ = ctx_for(
+        env, strategy=strategy, source=source, name=JINJA_NAME, mappings=mappings, nics=nics
+    )
     await env.executor.run(StepName.PRECOPY, ctx)
     calls = read_log(env.log)
     assert calls
     for call in calls:
         assert {"vars.yml", "secrets.yml", "inventory.yml"} <= set(call["raw"])
         for name, text in call["raw"].items():
-            for node in value_scalars(yaml.compose(text)):
+            root = yaml.compose(text)
+            # only the top-level keys stay plain: variable names (group names), never data
+            for key, _ in root.value:
+                assert key.tag == "tag:yaml.org,2002:str", (call["playbook"], name, key.value)
+                assert key.value.isidentifier(), (call["playbook"], name, key.value)
+            for node in data_scalars(root):
                 assert node.tag in NEVER_TEMPLATED, (call["playbook"], name, node.value)
     if strategy is Strategy.vmware_warm:
         assert calls[-1]["vars"]["vms_list"] == [JINJA_NAME]
+        assert calls[-1]["vars"]["network_map"] == {
+            JINJA_NAME: "net-rhoso-app-mine,sub-net-rhoso-app-mine"
+        }
     else:
         [query] = calls[-1]["vars"]["os_migrate_workloads_filter"]
         assert re.search(query["regex"], JINJA_NAME)
 
 
 def test_ansible_reads_generated_input_verbatim(tmp_path):
-    """The real ``ansible-playbook`` keeps a Jinja VM name and password literal instead of running
-    them, and the run still works: modules execute through the ``!unsafe`` connection variables of
-    the executor's inventory and receive the nested secrets unchanged."""
+    """The real ``ansible-playbook`` keeps a Jinja VM name, network name and password literal
+    instead of running them — a network name keys ``network_map``, and ``dict2items`` makes that
+    key a value — and the run still works: modules execute through the ``!unsafe`` connection
+    variables of the executor's inventory, its host variables resolve, and the nested secrets
+    arrive unchanged."""
     playbook_bin = Path(sys.executable).with_name("ansible-playbook")
     if not playbook_bin.exists():
         pytest.skip("ansible-core is not installed (the collection extra)")
     marker = "INJECTED-BY-VM-NAME"
     name = "{{ lookup('pipe', 'echo " + marker + "') }}"
     (tmp_path / "vars.yml").write_text(
-        ansible_yaml({"vms_list": [name], "network_map": {"a": name}})
+        ansible_yaml({"vms_list": [name], "network_map": {"a": name, name: "rhoso-app"}})
     )
     (tmp_path / "secrets.yml").write_text(
         ansible_yaml({"os_migrate_src_auth": {"username": "svc", "password": name + "%{x}"}})
     )
-    # the executor's own inventory: local connection and interpreter are !unsafe strings
-    (tmp_path / "inventory.yml").write_text(build_inventory_doc())
+    # the executor's own inventory: local connection and interpreter are !unsafe strings, and so
+    # are the keys below the group names (a conversion host, its variables)
+    conversion = {"conv.example.invalid": {"ansible_ssh_user": "cloud-user"}}
+    (tmp_path / "inventory.yml").write_text(build_inventory_doc(conversion))
     (tmp_path / "play.yml").write_text(
         "- hosts: migrator\n  gather_facts: false\n  tasks:\n"
         "    - ansible.builtin.debug:\n"
         '        msg: "name={{ vms_list[0] }} net={{ network_map.a }}"\n'
+        "    - ansible.builtin.debug:\n"
+        '        msg: "src={{ item.key }} dst={{ item.value }}"\n'
+        '      loop: "{{ network_map | dict2items }}"\n'
+        "    - ansible.builtin.debug:\n"
+        "        msg: \"user={{ hostvars[groups['conversion_host'][0]].ansible_ssh_user }}\"\n"
         "    - ansible.builtin.debug:\n"
         '        msg: "pw={{ os_migrate_src_auth.password }}"\n'
         "    - ansible.builtin.ping:\n"
@@ -444,13 +816,189 @@ def test_ansible_reads_generated_input_verbatim(tmp_path):
     )
     assert run.returncode == 0, run.stdout + run.stderr
     assert f"name={name} net={name}" in run.stdout
+    assert f"src={name} dst=rhoso-app" in run.stdout
+    assert "user=cloud-user" in run.stdout
     assert marker not in run.stdout.replace(name, "")
     assert f"pw={name}%{{x}}" in run.stdout
-    assert "ok=4" in run.stdout and "failed=0" in run.stdout
+    assert "ok=6" in run.stdout and "failed=0" in run.stdout
+
+
+async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_it(env):
+    """SDD §7.2: every kit run gets used_mapped_networks true and network_map[the kit's key] =
+    "{network id},{subnet id}" of the RHOSO network each NIC's port group resolves to - mapped or
+    same-named, a distributed port group by its key. A NIC that cannot go there stops the run
+    before the kit, which powers the VM off at the cutover."""
+    std = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:01",
+        fixed_ips=["10.0.0.5", "fe80::1"],
+        network_key="app-net",
+    )
+    dvs = Nic(
+        network="DC2-DMZ",
+        mac="00:50:56:00:00:02",
+        fixed_ips=["10.0.0.6"],
+        network_key="dvportgroup-7",
+    )
+    # DC2-DMZ is mapped; app-net is not, and a RHOSO network of that name takes it
+    maps = Mappings(networks={"DC2-DMZ": "rhoso-dmz"})
+    ctx, rec = ctx_for(
+        env, strategy=Strategy.vmware_cold, source=VCENTER, mappings=maps, nics=[std, dvs]
+    )
+    await env.executor.run(StepName.CUTOVER, ctx)
+    v = read_log(env.log)[-1]["vars"]
+    assert v["used_mapped_networks"] is True
+    assert v["network_map"] == {
+        "app-net": "net-app-net-mine,sub-net-app-net-mine",
+        "dvportgroup-7": "net-rhoso-dmz-mine,sub-net-rhoso-dmz-mine",
+    }
+
+    async def refused(nics, error=PermanentStepError, roles=None):
+        ran = len(read_log(env.log))
+        destination = DST.model_copy(update={"capabilities": {"roles": roles}} if roles else {})
+        plan = make_plan(id="plan-00c0ffee", mappings=maps)
+        # another VM: the cutover above created a server named web-01
+        mig = make_migration(
+            id="mig-00000000aa",
+            plan_id=plan.id,
+            vm=make_vm(source_id="srv-2", name="db-01", nics=nics),
+            strategy=Strategy.vmware_cold,
+        )
+        c, r = make_ctx(plan, mig, VCENTER, destination, env.settings)
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, c)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and r.downtime_marks == 0
+        return str(exc.value)
+
+    gone = Nic(network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"])
+    assert await refused([std, gone]) == (
+        "the NIC 00:50:56:00:00:09 of db-01 cannot go to RHOSO network 'gone-net': there is no "
+        "network named 'gone-net'"
+    )
+    outside = std.model_copy(update={"fixed_ips": ["192.0.2.5"]})
+    assert await refused([outside]) == (
+        "the NIC 00:50:56:00:00:01 of db-01 on 'app-net': 192.0.2.5 is no host address of any "
+        "subnet of the port's network"
+    )
+    # two NICs the kit maps by one key but that need different networks
+    twin = dvs.model_copy(update={"network": "app-net", "mac": "00:50:56:00:00:03"})
+    assert "shares the migration kit's key 'dvportgroup-7' with another NIC" in await refused(
+        [dvs, twin]
+    )
+    # another project's shared network, from a member's token (SDD §6.6)
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    on_shared = Nic(network="shared-net", mac="00:50:56:00:00:04", fixed_ips=["10.0.0.7"])
+    assert "Neutron lets only the admin or advsvc role" in await refused(
+        [on_shared], roles=["member", "reader"]
+    )
+    # the kit keeps the guest's network settings: a NIC override never moves a VMware NIC
+    ran = len(read_log(env.log))
+    moved = make_plan(
+        id="plan-00c0ffee",
+        mappings=maps,
+        nic_overrides={"srv-2": {"00:50:56:00:00:01": {"network": "rhoso-dmz"}}},
+    )
+    mig = make_migration(
+        id="mig-00000000aa",
+        plan_id=moved.id,
+        strategy=Strategy.vmware_warm,
+        vm=make_vm(source_id="srv-2", name="db-01", nics=[std]),
+    )
+    c, _ = make_ctx(moved, mig, VCENTER, DST, env.settings)
+    await env.executor.run(StepName.PRECOPY, c)
+    assert len(read_log(env.log)) == ran + 1
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "app-net": "net-app-net-mine,sub-net-app-net-mine"
+    }
+    # the destination's networks cannot be read: transient, before the kit
+    env.registry.inventory_error = True
+    assert "could not read the destination's networks" in await refused(
+        [std], error=TransientStepError
+    )
+    assert rec.downtime_marks == 1
+
+
+async def test_vmware_refuses_a_nic_validated_before_its_kit_key_was_recorded(env):
+    """SDD §7.2: the kit looks a NIC on a distributed port group up by the group's key and drops
+    one the map lacks. A NIC record without the key (a VM validated before it was recorded) is
+    refused before the kit, never keyed by its port group's name (review RT-12)."""
+    old = Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+    ctx, rec = ctx_for(env, nics=[old], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == (
+        "the NIC 00:50:56:00:00:01 of web-01 was validated before the migration kit's key of its "
+        "port group was recorded: validate the plan again"
+    )
+    # nothing ran: the VM keeps running
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+    # validated again, the record carries the key
+    ctx, _ = ctx_for(env, nics=[old.model_copy(update={"network_key": "dvportgroup-7"})], **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-7": "net-app-net-mine,sub-net-app-net-mine"
+    }
+
+
+@pytest.mark.parametrize("bare_first", [True, False])
+async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_needs(
+    env, bare_first
+):
+    """SDD §7.2: the kit gives every NIC of one key one value. A NIC with no IPv4 address needs no
+    particular subnet, so it takes the one another NIC of its key needs, in either order; the run
+    stops before the kit only when NICs of the key need different values (review RT-06)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    env.registry.subnets.append({**dst_subnet(net, "10.1.0.0/24"), "id": "sub-b", "name": "b"})
+    bare = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:01",
+        fixed_ips=["fe80::1"],
+        network_key="dvportgroup-7",
+    )
+    in_b = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:02",
+        fixed_ips=["10.1.0.5"],
+        network_key="dvportgroup-7",
+    )
+    nics = [bare, in_b] if bare_first else [in_b, bare]
+    # app-net unmapped: the RHOSO network of that name takes it
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+    ctx, _ = ctx_for(env, nics=nics, **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {"dvportgroup-7": f"{net['id']},sub-b"}
+
+    async def refused(nics):
+        ran = len(read_log(env.log))
+        c, r = ctx_for(env, name="db-01", nics=nics, **kit)
+        with pytest.raises(PermanentStepError) as exc:
+            await env.executor.run(StepName.CUTOVER, c)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and r.downtime_marks == 0
+        return str(exc.value)
+
+    # two addresses of one key in different subnets: the kit's one value cannot take both
+    in_a = in_b.model_copy(update={"mac": "00:50:56:00:00:03", "fixed_ips": ["10.0.0.5"]})
+    assert await refused([in_a, in_b] if bare_first else [in_b, in_a]) == (
+        "the NIC 00:50:56:00:00:02 of db-01 shares the migration kit's key 'dvportgroup-7' with "
+        f"another NIC that goes to {net['id']},sub-{net['id']}, not {net['id']},sub-b"
+        if bare_first
+        else "the NIC 00:50:56:00:00:03 of db-01 shares the migration kit's key 'dvportgroup-7' "
+        f"with another NIC that goes to {net['id']},sub-b, not {net['id']},sub-{net['id']}"
+    )
+    # a NIC with no IPv4 address on another network of the key: no subnet of app-net suits it
+    elsewhere = bare.model_copy(update={"network": "rhoso-dmz"})
+    dmz = next(n for n in env.registry.networks if n["name"] == "rhoso-dmz")
+    assert await refused([elsewhere, in_b] if bare_first else [in_b, elsewhere]) == (
+        "the NIC 00:50:56:00:00:01 of db-01 shares the migration kit's key 'dvportgroup-7' with "
+        f"another NIC that goes to {net['id']},sub-b, not {dmz['id']},sub-{dmz['id']}"
+    )
 
 
 async def test_vmware_warm_flags(env):
-    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
     await env.executor.run(StepName.PRECOPY, ctx)
     first = read_log(env.log)[-1]
     assert first["playbook"] == KIT_PLAYBOOK == "os_migrate.vmware_migration_kit.migration"
@@ -458,7 +1006,9 @@ async def test_vmware_warm_flags(env):
     assert (v["cbt_sync"], v["cutover"]) == (True, False)
     assert v["vms_list"] == ["web-01"]
     assert v["vcenter_hostname"] == "vcenter.dc2.example"
-    assert v["network_map"] == {"app-net": "rhoso-app", "DC2-Prod": "dc2-prod"}
+    # SDD §7.2: every NIC by the kit's key to the RHOSO network and subnet Seamless resolved
+    assert v["used_mapped_networks"] is True
+    assert v["network_map"] == {"app-net": "net-rhoso-app-mine,sub-net-rhoso-app-mine"}
     assert v["use_fixed_ips"] is True and v["already_deploy_conversion_host"] is True
     assert v["cinder_volume_type"] == "rbd-hdd"
     assert v["os_migrate_vmw_data_dir"] == str(run_dir(env))
@@ -476,7 +1026,11 @@ async def test_vmware_warm_flags(env):
 
     # the warm cutover above created the server: a cold cutover of the same VM is a resume
     cold_ctx, _ = ctx_for(
-        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
     )
     await env.executor.run(StepName.CUTOVER, cold_ctx)
     cold = read_log(env.log)[-1]["vars"]
@@ -501,6 +1055,37 @@ async def test_progress_tail_reports_pct(env, monkeypatch):
     assert any(line.startswith("TASK [") for line in rec.logs)
 
 
+async def test_progress_tail_reads_the_state_file_named_by_the_escaped_stem(env, monkeypatch):
+    """SDD §7.2: the progress file of a VM whose name holds a / is workload_logs/{stem}.state,
+    as import_workload_prelim names it — never a path the tenant's name chose."""
+    name = "../x/web%01"
+    monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.5")
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", name)
+    ctx, rec = ctx_for(env, strategy=Strategy.cold, name=name)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert 75.0 in [p[0] for p in rec.progress]
+    osm = run_dir(env) / "osm"
+    assert (osm / "workload_logs" / "..%2Fx%2Fweb%2501.state").exists()
+    assert not (osm / "x").exists()
+
+
+def test_workload_file_stem_matches_the_collection():
+    """SDD §7.2: the executor reads the file import_workload_prelim writes, so both apply the
+    collection's rule (plugins/module_utils/filesystem.py, loaded without its imports)."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/filesystem.py"
+    ).read_text()
+    tree = ast.parse(source)
+    func = next(n for n in tree.body if getattr(n, "name", None) == "workload_file_stem")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), "filesystem.py", "exec"), namespace)
+    names = ["web-01", "web 01", "../../x", "/etc/shadow", "50%/x", "a\0b", "a%2Fb", "%%//"]
+    assert [workload_file_stem(n) for n in names] == [
+        namespace["workload_file_stem"](n) for n in names
+    ]
+    assert all("/" not in workload_file_stem(n) for n in names)
+
+
 def test_transient_vs_permanent_failure_classifier():
     assert classify_failure("fatal: Timeout when waiting for 192.0.2.10:22") is TransientStepError
     assert classify_failure("keystoneauth: HTTP 503 Service Unavailable") is TransientStepError
@@ -519,6 +1104,21 @@ async def test_transient_vs_permanent_failure(env, monkeypatch):
     with pytest.raises(PermanentStepError, match="flavor"):
         await env.executor.run(StepName.CUTOVER, ctx)
     assert not (run_dir(env) / "secrets.yml").exists()
+
+
+async def test_a_failed_prestage_logs_a_redacted_tail(env, monkeypatch, caplog):
+    """SDD §13.4: a failed pre-stage has no migration to log to, so the service log keeps its
+    output's last 4000 characters — redacted over the last 4000 + 16384 first, so a PEM block
+    whose BEGIN line lies before the kept part is still found."""
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 5000 + "-----END RSA PRIVATE KEY-----"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "key rejected: ' + pem + '"}')
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["networks"])
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.executors.ansible"):
+        with pytest.raises(PermanentStepError):
+            await env.executor.prestage(plan, SRC, DST)
+    [record] = [r for r in caplog.records if "last lines" in r.getMessage()]
+    tail = record.getMessage().split("last lines:\n", 1)[1]
+    assert "[REDACTED PEM]" in tail and "KKKK" not in tail and len(tail) <= 4000
 
 
 async def test_prestage_runs_resources_in_order(env):
@@ -544,6 +1144,52 @@ async def test_prestage_runs_resources_in_order(env):
     assert len(read_log(env.log)) == before, "VMware sources need no prestage"
 
 
+async def test_prestage_scopes_flavors_to_the_plan(env):
+    """SDD §7.2: only the flavors the orchestrator names (the plan's, which RHOSO lacks) are
+    exported and imported, each anchored and escaped; without any, the flavor playbooks are
+    skipped - os-migrate's default filter is every flavor, and its import rewrites the extra
+    specs of a same-named destination flavor."""
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["networks", "flavors"])
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=False, prestage_flavors=["m1.custom", "c4.x(1)"]
+    )
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_networks.yml",
+        "import_networks.yml",
+        "export_flavors.yml",
+        "import_flavors.yml",
+    ]
+    assert all(
+        c["vars"]["os_migrate_flavors_filter"]
+        == [{"regex": "^m1\\.custom$"}, {"regex": "^c4\\.x\\(1\\)$"}]
+        for c in calls
+    )
+    for flavors in ([], None):
+        before = len(read_log(env.log))
+        kwargs = {} if flavors is None else {"prestage_flavors": flavors}
+        await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False, **kwargs)
+        assert [c["playbook"] for c in read_log(env.log)[before:]] == [
+            "export_networks.yml",
+            "import_networks.yml",
+        ]
+
+
+async def test_prestage_scopes_keypairs_to_the_plan(env):
+    """SDD §7.2: keypairs are scoped like flavors - only the key_names the orchestrator names;
+    without any, the keypair playbooks are skipped."""
+    plan = make_plan(id="plan-00c0ffee", prestage_resources=["keypairs"])
+    await env.executor.prestage(
+        plan, SRC, DST, deploy_conversion_hosts=False, prestage_keypairs=["ops.key"]
+    )
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == ["export_keypairs.yml", "import_keypairs.yml"]
+    assert all(c["vars"]["os_migrate_keypairs_filter"] == [{"regex": "^ops\\.key$"}] for c in calls)
+    before = len(calls)
+    await env.executor.prestage(plan, SRC, DST, deploy_conversion_hosts=False)
+    assert read_log(env.log)[before:] == []
+
+
 def test_build_vars_and_inventory_are_pure(env):
     ctx, _ = ctx_for(env, strategy=Strategy.cold)
     v1 = build_vars(StepName.CUTOVER, ctx)
@@ -564,7 +1210,8 @@ def test_build_vars_safety_pins_and_volume_types(env):
     assert "os_migrate_conversion_secgroup_remote_ip_prefix" not in v
     assert v["os_migrate_workloads_preserve_volume_type"] is True  # MAPPINGS maps ceph-hdd
     assert "os_migrate_rollback_match_by_name" not in v
-    rollback = build_vars(StepName.ROLLBACK, ctx)
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    rollback = build_vars(StepName.ROLLBACK, stopped)
     assert rollback["os_migrate_rollback_match_by_name"] is True
     assert rollback["os_migrate_workload_stop_before_migration"] is False
 
@@ -708,7 +1355,7 @@ async def test_vmware_conversion_host_key_secret(env, monkeypatch):
     mig = make_migration(
         id="mig-00000000aa",
         plan_id=plan.id,
-        vm=make_vm(source_id="srv-1", name="web-01"),
+        vm=make_vm(source_id="srv-1", name="web-01", nics=VMW_NICS),
         strategy=Strategy.vmware_warm,
     )
     ctx, _ = make_ctx(plan, mig, VCENTER, keyed, env.settings)
@@ -797,6 +1444,9 @@ class FailingImpl:
     async def power_on(self, source_id):
         raise ProviderError(f"power on {source_id}: timeout")
 
+    async def inventory(self):
+        raise ProviderError("inventory: connection refused")
+
 
 class FailingRegistry(FakeRegistry):
     def get(self, provider):
@@ -844,6 +1494,71 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
     assert result.destination_server_id == "dst-web-01"
 
 
+def test_cold_rollback_before_any_stop_never_matches_by_name(env):
+    """SDD §7.2: the cold role creates the destination server after it stops the source, so
+    before a stop a same-named server is not this migration's — a cutover refused or skipped
+    for a name collision is rolled back without deleting it (or, after a cancel, its volumes)."""
+    for options in ({}, {"delete_dest_volumes": True}):
+        ctx, _ = ctx_for(env, strategy=Strategy.cold)
+        ctx.options.update(options)
+        assert ctx.migration.downtime_started_at is None
+        rollback = build_vars(StepName.ROLLBACK, ctx)
+        assert "os_migrate_rollback_match_by_name" not in rollback
+        stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+        stopped.options.update(options)
+        assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+
+
+def _finished_cutover_state(env, record_server=True):
+    """The warm state an attempt leaves when it ran the final pass and created the server, then
+    failed (a timeout while the server booted, an error adding its floating IPs)."""
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    state = json.loads(path.read_text())
+    state["passes"].append(dict(state["passes"][-1], number=2, kind="final"))
+    if record_server:
+        state["destination_server_id"] = "dst-srv-1"
+    path.write_text(json.dumps(state))
+
+
+async def test_warm_cutover_rerun_on_a_recorded_server_is_a_finished_cutover(env, monkeypatch):
+    """SDD §7.2 (audit COL-05): the role finished the recorded server (§6.5); the re-run returns
+    it and the final pass the failed attempt ran, instead of a permanent failure whose rollback
+    would delete the good server."""
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    _finished_cutover_state(env)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")  # the role finishes the server, no pass
+    retry, _ = ctx_for(
+        env, strategy=Strategy.warm, sync_passes=[first.sync_pass], downtime_started_at=utcnow()
+    )
+    result = await env.executor.run(StepName.CUTOVER, retry)
+    assert result.destination_server_id == "dst-srv-1"
+    assert result.sync_pass is not None
+    assert (result.sync_pass.number, result.sync_pass.kind) == (2, SyncPassKind.final)
+
+    # the migration already lists the final pass: it is not reported twice
+    listed, _ = ctx_for(
+        env,
+        strategy=Strategy.warm,
+        sync_passes=[first.sync_pass, result.sync_pass],
+        downtime_started_at=utcnow(),
+    )
+    again = await env.executor.run(StepName.CUTOVER, listed)
+    assert again.destination_server_id == "dst-srv-1" and again.sync_pass is None
+
+
+async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_failure(
+    env, monkeypatch
+):
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    first = await env.executor.run(StepName.PRECOPY, ctx)
+    _finished_cutover_state(env, record_server=False)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")
+    retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
+    with pytest.raises(PermanentStepError, match="recorded no new pass"):
+        await env.executor.run(StepName.CUTOVER, retry)
+
+
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
     """Without a recorded destination server, only a cutover that powered the VM off can have
     created a same-named server; an earlier failure leaves any such server alone."""
@@ -885,6 +1600,30 @@ async def test_a_huge_output_line_does_not_fail_the_step(env, monkeypatch):
     result = await env.executor.run(StepName.PRECOPY, ctx)
     assert result.sync_pass is not None
     assert any(line.startswith("ok: [localhost] => xxx") for line in rec.logs)
+
+
+async def test_a_failing_steps_error_is_redacted_before_it_is_cut(env, monkeypatch):
+    """SDD §13.4: the failing output line in a step's error is redacted over its cut plus 16384
+    characters before it is cut to 500 — a PEM block that the cut splits would otherwise reach
+    Migration.error, as the orchestrator's later redaction no longer recognizes it."""
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 900 + "-----END RSA PRIVATE KEY-----"
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", '{"msg": "key rejected: ' + pem + '"}')
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    with pytest.raises(PermanentStepError) as failed:
+        await env.executor.run(StepName.PRECOPY, ctx)
+    message = str(failed.value)
+    assert message.startswith("export_workloads.yml failed (exit 2): fatal: [localhost]: FAILED!")
+    assert "[REDACTED PEM]" in message and "KKKK" not in message
+
+
+async def test_output_lines_reach_the_log_whole(env, monkeypatch):
+    """SDD §4, §7.1: the executor hands every output line to ``StepContext.log`` whole — the
+    orchestrator redacts it before the cut to 2000 characters, so a cut here first could split a
+    secret (a PEM block) before redaction sees its end."""
+    monkeypatch.setenv("ANSIBLE_FAKE_LONG_LINE", "5000")
+    ctx, rec = ctx_for(env, strategy=Strategy.warm)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert "ok: [localhost] => " + "x" * 5000 in rec.logs
 
 
 async def test_ansible_output_and_config_variables_are_not_forwarded(env, monkeypatch):
@@ -1028,3 +1767,464 @@ async def test_skipped_stop_task_starts_no_downtime_clock(env, monkeypatch):
     await env.executor.run(StepName.CUTOVER, ctx2)
     assert rec2.downtime_marks == 1 and rec2.downtime_at[0] is not None
     assert (utcnow() - rec2.downtime_at[0]).total_seconds() < 60
+
+
+def server_doc(*ports, floating=()):
+    return {
+        "resources": [
+            {
+                "type": "openstack.compute.Server",
+                "params": {
+                    "name": "web-01",
+                    "ports": [
+                        {
+                            "params": {
+                                "mac_address": mac,
+                                "network_ref": {
+                                    "name": network,
+                                    "project_name": "finance",
+                                    "domain_name": "Default",
+                                },
+                                "fixed_ips_refs": [
+                                    {
+                                        "ip_address": address,
+                                        "subnet_ref": {
+                                            "name": "app-subnet",
+                                            "project_name": "finance",
+                                        },
+                                    }
+                                ],
+                            },
+                            "_migration_params": {},
+                        }
+                        for mac, network, address in ports
+                    ],
+                    "floating_ips": [
+                        {
+                            "params": {
+                                "fixed_ip_address": "10.0.0.5",
+                                "floating_ip_address": address,
+                                "floating_network_ref": {
+                                    "name": network,
+                                    "project_name": "admin",
+                                    "domain_name": "Default",
+                                },
+                            }
+                        }
+                        for address, network in floating
+                    ],
+                },
+            }
+        ]
+    }
+
+
+def test_resolve_network_refs_points_each_port_at_the_network_the_cutover_finds():
+    """SDD §7.2: the credential's own network keeps %auth% as the reference's project and domain;
+    another project's network, the only one of its name, gets neither (os-migrate looks it up by
+    name); every fixed IP reference becomes address-only."""
+    networks = [
+        dst_net("rhoso-app"),
+        dst_net("rhoso-app", own=False),
+        dst_net("provider-vlan9", own=False),
+    ]
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"),
+        ("fa:16:3e:00:00:02", "provider-vlan9", "172.16.9.5"),
+        floating=[("203.0.113.10", "provider-vlan9")],
+    )
+    out = resolve_network_refs(doc, networks)
+    own, shared = (p["params"] for p in out["resources"][0]["params"]["ports"])
+    assert own["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+    assert shared["network_ref"] == {
+        "name": "provider-vlan9",
+        "project_name": None,
+        "domain_name": None,
+    }
+    assert own["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert shared["fixed_ips_refs"] == [{"ip_address": "172.16.9.5"}]
+    [fip] = out["resources"][0]["params"]["floating_ips"]
+    assert fip["params"]["floating_network_ref"] == {
+        "name": "provider-vlan9",
+        "project_name": None,
+        "domain_name": None,
+    }
+    # a copy: the export itself is unchanged
+    assert (
+        doc["resources"][0]["params"]["ports"][0]["params"]["network_ref"]["project_name"]
+        == "finance"
+    )
+
+
+def test_resolve_network_refs_refuses_a_name_it_cannot_resolve():
+    """SDD §7.2: a port network the rule cannot resolve stops the cutover before the source stops,
+    naming the port."""
+    two = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso-2")]
+    two[1]["own"] = True
+    doc = server_doc(("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"))
+    with pytest.raises(
+        PermanentStepError, match="fa:16:3e:00:00:01.*2 networks of the credential's project"
+    ):
+        resolve_network_refs(doc, two)
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:01.*no network named 'rhoso-app'"):
+        resolve_network_refs(doc, [dst_net("other")])
+
+
+def test_resolve_network_refs_keeps_a_floating_network_it_cannot_resolve():
+    """SDD §7.2, review NC-10: a floating IP's network that does not resolve keeps its reference
+    as exported - in auto mode a detached floating IP with the address needs no network, and the
+    destination check refuses a network the import needs before the stop - while the port's is
+    resolved as always."""
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"),
+        floating=[("203.0.113.10", "gone"), ("203.0.113.11", "twice")],
+    )
+    networks = [dst_net("rhoso-app"), dst_net("twice"), {**dst_net("twice"), "id": "net-twice-2"}]
+    out = resolve_network_refs(doc, networks)
+    fips = out["resources"][0]["params"]["floating_ips"]
+    assert [f["params"]["floating_network_ref"] for f in fips] == [
+        {"name": "gone", "project_name": "admin", "domain_name": "Default"},
+        {"name": "twice", "project_name": "admin", "domain_name": "Default"},
+    ]
+    port = out["resources"][0]["params"]["ports"][0]["params"]
+    assert port["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+async def test_a_cutover_keeps_a_floating_network_it_cannot_resolve(env, monkeypatch):
+    """SDD §7.2, review NC-10: RHOSO has no network named like the floating IP's - the cutover
+    runs with the reference as exported, for the destination check to judge by the mode."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLOATING", "203.0.113.7@public")
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    [fip] = exported_server(env)["params"]["floating_ips"]
+    assert fip["params"]["floating_network_ref"] == {
+        "name": "public",
+        "project_name": "admin",
+        "domain_name": "Default",
+    }
+
+
+async def test_a_cutover_resolves_the_network_references_before_the_import(env):
+    """SDD §7.2: after the export the port of a mapped network points at the RHOSO network the rule
+    resolves - a shared one of another project by name alone - with address-only fixed IPs."""
+    env.registry.networks = [dst_net("rhoso-app", own=False, project_id="admin")]
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": None,
+        "domain_name": None,
+    }
+    assert port["params"]["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+
+
+async def test_a_cutover_stops_before_the_import_when_a_port_network_cannot_be_resolved(env):
+    """Two networks of the credential's project carry the mapped name: the cutover stops after the
+    export, before anything is stopped."""
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso")]
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == ["export_workloads.yml"]
+    assert rec.downtime_marks == 0
+
+
+async def test_a_warm_cutover_resolves_its_export_again_without_exporting(env):
+    """SDD §7.2: each run resolves the references of the existing export again - here the mapped
+    network is now another project's - and only an override marker exports again."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    assert (
+        exported_server(env)["params"]["ports"][0]["params"]["network_ref"]["project_name"]
+        == "%auth%"
+    )
+    env.registry.networks = [dst_net("rhoso-app", own=False, project_id="admin")]
+    later, _ = ctx_for(env)
+    await env.executor.run(StepName.CUTOVER, later)
+    assert [c["playbook"] for c in read_log(env.log)][-1:] == ["import_workloads_cutover.yml"]
+    assert "export_workloads.yml" not in [c["playbook"] for c in read_log(env.log)][1:]
+    assert (
+        exported_server(env)["params"]["ports"][0]["params"]["network_ref"]["project_name"] is None
+    )
+
+
+async def test_an_unreadable_destination_keeps_the_exported_network_references(env):
+    """SDD §7.2: the destination's networks cannot be read - the run logs it and keeps the
+    references as exported; the destination check (§6.6) still looks them up before the stop."""
+    env.registry.inventory_error = True
+    cold, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    assert any("could not read the destination's networks" in line for line in rec.logs)
+
+
+async def test_a_rollback_never_resolves_network_references(env):
+    """SDD §7.2: the references are resolved for the runs that import; a rollback must not be held
+    up by a network that no longer resolves."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="other")]
+    env.registry.networks[1]["own"] = True
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    reads = env.registry.calls.count(("inventory",))
+    rollback, _ = ctx_for(env)
+    await env.executor.run(StepName.ROLLBACK, rollback)
+    assert read_log(env.log)[-1]["playbook"] == "rollback_workloads.yml"
+    assert env.registry.calls.count(("inventory",)) == reads
+
+
+async def test_a_cutover_that_exports_again_resolves_only_the_new_export(env):
+    """SDD §7.2: when the cutover exports again (here for a new NIC override), the stale export is
+    not resolved first - its network may no longer resolve, the new export's does."""
+    warm, _ = ctx_for(env)
+    await env.executor.run(StepName.PRECOPY, warm)
+    # rhoso-app no longer resolves; the override sends the port to rhoso-dmz
+    env.registry.networks = [
+        dst_net("rhoso-app"),
+        {**dst_net("rhoso-app"), "id": "net-rhoso-app-second"},
+        dst_net("rhoso-dmz"),
+    ]
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    cutover, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][-2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+def _edited(**changes):
+    """MAPPINGS as the operator edited them after a failed attempt (SDD §12 PATCH /plans/{id})."""
+    return Mappings(**{**MAPPINGS.model_dump(), **changes})
+
+
+def _ambiguous(env, name):
+    """``name`` no longer resolves: two networks of the credential's project carry it."""
+    env.registry.networks = [n for n in env.registry.networks if n["name"] != name] + [
+        dst_net(name),
+        {**dst_net(name), "id": f"net-{name}-second"},
+    ]
+
+
+async def test_a_cold_retry_with_a_fixed_mapping_never_resolves_the_export_it_replaces(env):
+    """SDD §7.2, review NC-02: the mapped name did not resolve; the operator maps the network
+    elsewhere and retries. The cutover exports again, so the name in the previous export must not
+    hold it up."""
+    _ambiguous(env, "rhoso-app")
+    first, _ = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, first)
+    fixed = _edited(networks={"app-net": "rhoso-dmz", "DC2-Prod": "dc2-prod"})
+    retry, _ = ctx_for(env, strategy=Strategy.cold, mappings=fixed)
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][1:] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-dmz"
+
+
+async def test_a_cold_cutover_never_resolves_the_export_it_replaces(env, monkeypatch):
+    """SDD §7.2: the cold cutover always exports again, so the export it replaces is never
+    resolved - even when its record matches the plan, a name in it that no longer resolves must
+    not hold up the new export."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "import_workloads.yml")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", "Could not find a flavor named rhoso.small")
+    first, _ = ctx_for(env, strategy=Strategy.cold)
+    with pytest.raises(PermanentStepError, match="flavor"):
+        await env.executor.run(StepName.CUTOVER, first)
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    osm = run_dir(env) / "osm"
+    assert (osm / "rewrite.json").exists()
+    doc = yaml.safe_load((osm / "workloads.yml").read_text())
+    doc["resources"][0]["params"]["ports"][0]["params"]["network_ref"]["name"] = "gone-net"
+    (osm / "workloads.yml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    retry, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-app"
+
+
+async def test_a_warm_run_exports_again_once_the_plans_mappings_changed(env):
+    """SDD §7.2, review NC-02: a warm pass on an unchanged plan works on the export as it is; once
+    the mappings differ from the export record (a plan edited after a failed attempt), the next
+    pass exports again and the new mapping reaches the export."""
+    warm, _ = ctx_for(env)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    same, _ = ctx_for(env, sync_passes=[first.sync_pass])
+    await env.executor.run(StepName.SYNC, same)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+        "import_workloads_precopy.yml",
+    ]
+    fixed = _edited(networks={"app-net": "rhoso-dmz", "DC2-Prod": "dc2-prod"})
+    edited, _ = ctx_for(env, mappings=fixed, sync_passes=[first.sync_pass])
+    await env.executor.run(StepName.SYNC, edited)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-dmz"
+
+
+async def test_a_warm_cutover_exports_again_for_a_flavor_matched_anew(env):
+    """SDD §7.2: the record holds the mappings the rewrite applied - the plan's overlaid with the
+    migration's resolved ones - so a flavor that a re-validation matched anew reaches the
+    cutover."""
+    unmapped = _edited(flavors={})
+    matched = Mappings(flavors={"m1.small": "rhoso.small"})
+    warm, _ = ctx_for(env, mappings=unmapped, resolved_mappings=matched)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "rhoso.small"
+    # the same match: the export as it is
+    same, _ = ctx_for(
+        env, mappings=unmapped, resolved_mappings=matched, sync_passes=[first.sync_pass]
+    )
+    await env.executor.run(StepName.SYNC, same)
+    later, _ = ctx_for(
+        env, mappings=unmapped, resolved_mappings=Mappings(flavors={"m1.small": "rhoso.medium"})
+    )
+    await env.executor.run(StepName.CUTOVER, later)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "import_workloads_precopy.yml",
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["flavor_ref"]["name"] == "rhoso.medium"
+
+
+async def test_the_export_record_holds_what_the_rewrite_applied(env):
+    """SDD §7.2: beside the export, the mappings the rewrite applied and the VM's NIC override
+    entries; removed before each export, so an export whose rewrite fails has none."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    warm, _ = nic_ctx(
+        env, Strategy.warm, entry, resolved_mappings=Mappings(flavors={"m1.large": "rhoso.large"})
+    )
+    await env.executor.run(StepName.PRECOPY, warm)
+    record = run_dir(env) / "osm" / "rewrite.json"
+    assert json.loads(record.read_text()) == {
+        "mappings": {
+            "networks": MAPPINGS.networks,
+            "flavors": {"m1.large": "rhoso.large", "m1.small": "rhoso.small"},
+            "volume_types": MAPPINGS.volume_types,
+            "projects": MAPPINGS.projects,
+        },
+        "nic_overrides": {
+            "fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}
+        },
+    }
+    # an entry whose MAC no exported port has: the rewrite fails after the export, before the stop
+    gone, _ = nic_ctx(env, Strategy.warm, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
+    with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
+        await env.executor.run(StepName.CUTOVER, gone)
+    assert not record.exists()
+
+
+async def test_an_export_without_a_record_is_exported_again(env):
+    """SDD §7.2, review NC-03: an export written before the record - here also before the
+    nic_override marker - whose override was removed since. The next warm run exports again, so
+    the port goes back to its mapped network."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    with_entry, _ = nic_ctx(env, Strategy.warm, entry)
+    await env.executor.run(StepName.PRECOPY, with_entry)
+    osm = run_dir(env) / "osm"
+    doc = yaml.safe_load((osm / "workloads.yml").read_text())
+    for port in doc["resources"][0]["params"]["ports"]:
+        port.get("_migration_params", {}).pop("nic_override", None)
+    (osm / "workloads.yml").write_text(yaml.safe_dump(doc, sort_keys=False))
+    (osm / "rewrite.json").unlink(missing_ok=True)
+    removed, _ = nic_ctx(env, Strategy.warm, None)
+    await env.executor.run(StepName.CUTOVER, removed)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"]["name"] == "rhoso-app"
+    assert port["fixed_ips_refs"] == [{"ip_address": "10.0.0.5"}]
+
+
+async def test_a_cutover_rerun_on_a_recorded_server_neither_exports_nor_resolves(env, monkeypatch):
+    """SDD §7.2, review NC-07: the re-run only finishes the server the failed attempt created -
+    its ports exist, and the plan cannot change while the source is stopped. It runs on the export
+    as it is: the VM's NIC override does not export it again, and a network name that stopped
+    resolving does not fail it (§8's automatic rollback would undo a finished cutover)."""
+    entry = {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+    warm, _ = nic_ctx(env, Strategy.warm, entry)
+    first = await env.executor.run(StepName.PRECOPY, warm)
+    _finished_cutover_state(env)
+    monkeypatch.setenv("ANSIBLE_FAKE_SKIP_PASS", "1")  # the role finishes the server, no pass
+    _ambiguous(env, "rhoso-dmz")
+    reads = env.registry.calls.count(("inventory",))
+    retry, _ = nic_ctx(
+        env,
+        Strategy.warm,
+        entry,
+        sync_passes=[first.sync_pass],
+        downtime_started_at=utcnow(),
+    )
+    result = await env.executor.run(StepName.CUTOVER, retry)
+    assert result.destination_server_id == "dst-srv-1"
+    assert [c["playbook"] for c in read_log(env.log)][2:] == ["import_workloads_cutover.yml"]
+    assert env.registry.calls.count(("inventory",)) == reads
+    port = exported_server(env)["params"]["ports"][0]["params"]
+    assert port["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+def test_resolve_network_refs_keeps_a_port_without_addresses_and_a_floating_ip_without_network():
+    """A port without a fixed IP stays without one; a floating IP that names no network is left
+    to os-migrate (SDD §7.2)."""
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"), floating=[("203.0.113.10", "x")]
+    )
+    server = doc["resources"][0]["params"]
+    server["ports"][0]["params"]["fixed_ips_refs"] = []
+    server["floating_ips"][0]["params"]["floating_network_ref"] = None
+    out = resolve_network_refs(doc, [dst_net("rhoso-app")])
+    params = out["resources"][0]["params"]
+    assert params["ports"][0]["params"]["fixed_ips_refs"] == []
+    assert params["floating_ips"][0]["params"]["floating_network_ref"] is None
+
+
+async def test_a_destination_without_network_details_keeps_the_exported_references(env):
+    """An inventory that lists no networks with their owners (an older provider) resolves
+    nothing: the references stay as exported rather than refusing every port."""
+    env.registry.networks = []
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"

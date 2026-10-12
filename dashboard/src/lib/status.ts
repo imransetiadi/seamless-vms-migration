@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import {
+  BadgeCheck,
   CircleAlert,
   CircleCheck,
   CircleHelp,
@@ -12,7 +13,7 @@ import {
   Play,
   TriangleAlert,
 } from 'lucide-react';
-import type { AdvisorNoteKind, AdvisorNoteSource, PlanStatus, ProviderKind, ProviderStatus, Severity, Strategy } from '../api/types';
+import type { AdvisorNoteKind, AdvisorNoteSource, DerivedPlanStatus, ProviderKind, ProviderStatus, Severity, Strategy } from '../api/types';
 import type { Tone } from './phase';
 
 export interface StatusMeta {
@@ -64,12 +65,14 @@ export const TONE_CLASSES: Record<Tone, { text: string; badge: string; bar: stri
   },
 };
 
-const PLAN_STATUS: Record<PlanStatus, StatusMeta> = {
+/** The derived plan status (SDD §8.1): Completed awaits finalize, Finalized is done. */
+const PLAN_STATUS: Record<DerivedPlanStatus, StatusMeta> = {
   draft: { label: 'Draft', tone: 'neutral', icon: PencilLine },
   validated: { label: 'Validated', tone: 'info', icon: ListChecks },
   running: { label: 'Running', tone: 'progress', icon: Play },
   paused: { label: 'Paused', tone: 'warning', icon: Pause },
   completed: { label: 'Completed', tone: 'success', icon: CircleCheck },
+  finalized: { label: 'Finalized', tone: 'success', icon: BadgeCheck },
   failed: { label: 'Failed', tone: 'danger', icon: CircleX },
 };
 
@@ -88,7 +91,7 @@ const SEVERITY: Record<Severity, StatusMeta> = {
 
 const FALLBACK: StatusMeta = { label: 'Unknown', tone: 'neutral', icon: CircleAlert };
 
-export function planStatusMeta(status: PlanStatus): StatusMeta {
+export function planStatusMeta(status: DerivedPlanStatus): StatusMeta {
   return PLAN_STATUS[status] ?? { ...FALLBACK, label: String(status) };
 }
 

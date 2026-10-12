@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 
-from ..domain.models import AdvisorNote, Migration
+from ..domain.models import AdvisorNote, Migration, SimilarIncident, VMRef
 from ..events import EventBus, emit
 from ..store import Store
-from .memory import MemoryClient, redact
+from .memory import MemoryClient
+from .redaction import redact
 
 log = logging.getLogger(__name__)
 GIB = 2**30
@@ -56,6 +57,22 @@ class KnowledgeService:
                 )
         except Exception:
             log.warning("saving a lesson failed", exc_info=True)
+
+    async def similar_for(self, option: str, vm: VMRef) -> list[SimilarIncident] | None:
+        """Past incidents like this VM and option, at most 3, for a recommendation (SDD §14.4,
+        ADV-02): [] without memory or hits, None when memory failed — the caller asks no more."""
+        if self.memory is None:
+            return []
+        query = f"{option} {vm.os_type or 'unknown OS'} {size_bucket(vm.disk_bytes)}"
+        hits = await self.memory.search(query, limit=MAX_HITS, names=[vm.name])
+        if not hits and self.memory.available is False:
+            return None
+        return [
+            SimilarIncident(
+                title=h.title[:200], content=h.content[:HIT_CONTENT_CHARS], score=h.score
+            )
+            for h in hits[:MAX_HITS]
+        ]
 
     async def on_failure(
         self, migration: Migration, step: str, error: BaseException

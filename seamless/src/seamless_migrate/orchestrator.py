@@ -20,18 +20,26 @@ import contextlib
 import inspect
 import logging
 import time
+import weakref
 from collections import Counter, defaultdict
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import replace
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Literal
 
-from .ai.memory import redact
+from .ai.decision import Advice, Approve, Override, decide
+from .ai.evidence import build_strategy_evidence, evidence_count, keep_reasons
+from .ai.policies import resolve_policy
+from .ai.recommendations import LEGACY_PREFIX
+from .ai.redaction import redact, redact_cut
+from .ai.snapshots import created_event, decision_event, store_snapshot
 from .config import Settings
 from .domain import fsm
 from .domain.enums import (
     SINGLE_SHOT_STRATEGIES,
     WARM_STRATEGIES,
+    DecisionStatus,
+    DecisionType,
     Phase,
     PlanStatus,
     ProviderRole,
@@ -39,21 +47,33 @@ from .domain.enums import (
     SyncPassKind,
 )
 from .domain.models import (
+    PLAN_EDITABLE_FIELDS,
+    AdvisorModelInfo,
     AdvisorNote,
+    AdvisorPolicy,
+    AdvisorRecommendation,
+    AdvisorSubject,
     Approval,
+    Decision,
     Estimate,
+    EvidenceItem,
     Finding,
+    ForceCutover,
     Mappings,
     Migration,
     PhaseChange,
     Plan,
     Provider,
+    RecommendedOption,
+    SimilarIncident,
     SyncPass,
     ValidationItem,
     ValidationReport,
     VMRef,
     invalid_plan_settings,
     keep_sync_history,
+    new_migration_id,
+    new_recommendation_id,
     next_pass_number,
     repeated_vm_ids,
     utcnow,
@@ -66,25 +86,37 @@ from .executors.base import (
     StepResult,
     TransientStepError,
 )
+from .invariants import check_invariants
 from .planning.estimator import (
     EstimatorParams,
     calibrated_change_rate,
     estimate,
     estimate_final_downtime,
+    estimate_forced_downtime,
+    final_downtime_parts,
     observed_scan_rate,
     params_for_plan,
 )
-from .planning.preflight import has_blocker, resolve_mappings, run_preflight
+from .planning.preflight import (
+    flavor_prestaged,
+    has_blocker,
+    keypair_prestaged,
+    resolve_mappings,
+    run_preflight,
+)
+from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
 from .providers.base import ProviderError
-from .store import AsyncStore, ConflictError, NotFound, Store
-from .verification import VerificationResult, Verifier
+from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
+from .verification import VerificationResult, Verifier, review_reason
 
 log = logging.getLogger(__name__)
 P = Phase
 
 PROGRESS_MIN_INTERVAL_S = 1.0
+#: a migration.log line is cut to this many characters, after redaction (SDD §4)
+LOG_LINE_CHARS = 2000
 APPROVABLE = frozenset(
     {
         P.pending,
@@ -100,18 +132,75 @@ APPROVABLE = frozenset(
 )
 CUTOVER_REQUESTABLE = frozenset({P.ready, P.precopy, P.syncing, P.awaiting_cutover})
 REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
-#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4)
-REMOVABLE = REVALIDATABLE | {P.failed}
+#: phases whose migration validation cancels when its VM leaves ``vm_ids`` (SDD §5.4); a
+#: migration it finds in validating is a leftover of an interrupted validation (plan lock)
+REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
 #: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
 RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
 #: it is taken after a plan lock and before a migration lock
 VM_CLAIMS = "vm-claims"
+#: a provider's deletion checks and deletes under this lock, and a plan's creation, edit and retry
+#: check their providers under it, so none saves a plan with a provider deleted meanwhile (SDD
+#: §12); it is taken last and never held while another lock is awaited
+PROVIDERS = "providers"
 #: a migration in one of these depends on the plan's providers, mappings and strategy as they were
 #: when it started: the plan is not edited or re-waved meanwhile (SDD §12)
 IN_FLIGHT_PHASES = frozenset(
     {P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.rolling_back, P.completed}
 )
+#: what releases a migration that keeps its plan from changing, most urgent first (SDD §12): a
+#: failed one holds the plan only while its cutover keeps the source stopped (the VM is down), a
+#: completed one is finished and awaits finalize (§8.1); singular and plural of what it is
+_RELEASES: tuple[tuple[str, str, str], ...] = (
+    (
+        "roll back or retry",
+        "the failed migration whose source VM is stopped",
+        "the failed migrations whose source VM is stopped",
+    ),
+    ("finish, roll back or cancel", "the migration in flight", "the migrations in flight"),
+    ("finalize or roll back", "the completed migration", "the completed migrations"),
+)
+
+
+def blocks_plan_change(m: Migration) -> bool:
+    """A migration in flight or whose source VM is stopped keeps its plan as it is (SDD §12)."""
+    return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+
+
+#: what a validation compares before it marks the plan `validated` (SDD §8): another process may
+#: have edited, re-waved, started or paused the plan meanwhile under its own plan lock
+_VALIDATION_WATCHES = PLAN_EDITABLE_FIELDS | {"waves", "status"}
+
+#: a plan's clouds: a failed migration's rollback acts on the ones its attempt used (SDD §12)
+PROVIDER_FIELDS = ("source_provider_id", "destination_provider_id")
+
+
+def failed_provider_change_refusal(failed: list[str]) -> str:
+    """The 409 of a change of a plan's providers while migrations named ``failed`` are failed
+    (SDD §12), the same from PATCH /plans/{id} and from `seamless plan apply` (§15)."""
+    noun = "migration" if len(failed) == 1 else "migrations"
+    return (
+        f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before changing the "
+        "plan's providers: its rollback acts on the clouds its attempt used"
+    )
+
+
+def in_flight_refusal(busy: Iterable[Migration], before: str, limit: int = 10) -> str:
+    """The 409 of an edit or re-wave while ``busy`` are in flight (SDD §12): each VM, at most
+    ``limit`` per kind and how many are left out, with what releases it."""
+    names: list[list[str]] = [[], [], []]
+    for m in busy:
+        names[0 if m.phase == P.failed else 2 if m.phase == P.completed else 1].append(m.vm.name)
+    clauses = []
+    for (action, one, many), group in zip(_RELEASES, names, strict=True):
+        if not group:
+            continue
+        group.sort()
+        rest = len(group) - limit
+        listed = ", ".join(group[:limit]) + (f" and {rest} more" if rest > 0 else "")
+        clauses.append(f"{action} {one if len(group) == 1 else many} ({listed})")
+    return f"{'; '.join(clauses)} before {before}"
 
 
 class OrchestratorError(Exception):
@@ -126,8 +215,19 @@ class BadRequest(OrchestratorError, ValueError):
     """The request is invalid (HTTP 400)."""
 
 
+class Unprocessable(OrchestratorError, ValueError):
+    """The request is well formed but cannot be applied as given (HTTP 422)."""
+
+
 class VerificationFailed(PermanentStepError):
     pass
+
+
+def _add_model_s(m: Migration, details: dict[str, Any]) -> None:
+    """Add the model seconds a simulated step kept the source stopped (demo, SDD §5.2)."""
+    model_s = details.get("downtime_model_s")
+    if isinstance(model_s, int | float):
+        m.downtime_model_s = (m.downtime_model_s or 0.0) + float(model_s)
 
 
 def _phase_started(m: Migration, phase: Phase) -> datetime | None:
@@ -136,6 +236,43 @@ def _phase_started(m: Migration, phase: Phase) -> datetime | None:
         if change.to_phase == phase:
             return change.at
     return None
+
+
+#: a Force cutover: where it applies and its shortest reason (SDD §5.4, ADV-16)
+FORCEABLE = frozenset({Phase.precopy, Phase.syncing})
+FORCE_REASON_MIN = 10
+#: the convergence rules (SDD §5.3)
+ConvergedBy = Literal["threshold", "slo", "max_passes", "force"]
+
+#: maker-checker refusals (SDD §5.4, §14.6, ADV-17)
+OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
+#: the approver who forces a cutover is held to the requester's rule (SDD §5.4)
+OWN_FORCE = "You forced this cutover. Another approver must approve it."
+OWN_DECISION = "You requested this decision. Another approver must decide it."
+
+
+def _refuse_unchangeable(m: Migration) -> None:
+    """A strategy decision applies to pending, ready and blocked migrations only (SDD §8)."""
+    if m.phase not in REVALIDATABLE:
+        raise NotAllowed(f"the strategy cannot change in {m.phase}")
+
+
+def _clear_request(m: Migration) -> None:
+    """Drop the cutover request with its requester and the window bypass granted with it (§5.4)."""
+    m.cutover_requested = False
+    m.cutover_requested_by = None
+    m.cutover_requested_at = None
+    m.force_window = False
+    m.force_cutover = None  # a Force cutover belongs to its assessment too (ADV-16)
+
+
+def counted_approvals(m: Migration, plan: Plan) -> list[Approval]:
+    """The approvals the gate counts: all, but under a distinct approver neither the requester's
+    nor the forcer's (§5.4)."""
+    if not plan.require_distinct_approver:
+        return list(m.approvals)
+    own = {m.cutover_requested_by, m.force_cutover.actor if m.force_cutover else None}
+    return [a for a in m.approvals if a.actor not in own]
 
 
 def _fmt_bytes(n: float) -> str:
@@ -164,6 +301,9 @@ class Orchestrator:
     ) -> None:
         self.store = store
         self.db = AsyncStore(store)
+        # what the tick reads every second: only the migrations that changed are loaded again
+        # (SDD §11, Performance.md); read-only - every change goes through _load/_save
+        self._migrations = VersionedDocuments(self.db, "migration", Migration)
         self.bus = bus
         self.providers = providers
         self.executors = executors
@@ -175,7 +315,12 @@ class Orchestrator:
         self._verifier_factory = verifier_factory or (
             lambda dst: Verifier(dst, settings, poll_s=verify_poll_s)
         )
-        self._locks: dict[str, asyncio.Lock] = {}
+        # SDD §8: a lock lives while a coroutine holds it or waits for it
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        #: when the next source watch is due (SDD §8.1); set by the first tick
+        self._source_watch_due: datetime | None = None
+        #: the source watch in progress: the tick starts it and never waits for it (SDD §8.1)
+        self._watch_task: asyncio.Task[None] | None = None
         self._drivers: dict[str, asyncio.Task[None]] = {}
         #: migration id -> (crashes in a row, monotonic time of the last one): relaunch backoff
         self._driver_crashes: dict[str, tuple[int, float]] = {}
@@ -209,11 +354,34 @@ class Orchestrator:
         """The plan's lock (SDD §8): an edit through the API takes it, like the status writers."""
         return self._lock(f"plan:{plan_id}")
 
+    def provider_lock(self) -> asyncio.Lock:
+        """The lock of provider deletions and the provider checks of plans (SDD §12)."""
+        return self._lock(PROVIDERS)
+
+    async def _missing_provider(self, plan: Plan) -> tuple[str, ProviderRole] | None:
+        """The first provider of ``plan`` that no longer exists, with its role (SDD §5.1)."""
+        for provider_id, role in (
+            (plan.source_provider_id, ProviderRole.source),
+            (plan.destination_provider_id, ProviderRole.destination),
+        ):
+            try:
+                await self.db.get("provider", provider_id, Provider)
+            except NotFound:
+                return provider_id, role
+        return None
+
     def _lock(self, mid: str) -> asyncio.Lock:
         lock = self._locks.get(mid)
         if lock is None:
             lock = self._locks[mid] = asyncio.Lock()
         return lock
+
+    @contextlib.asynccontextmanager
+    async def _claims(self) -> AsyncIterator[None]:
+        """The VM-claim lock (SDD §5.4): this process's, then the database-wide one, so a
+        `seamless plan validate` beside the server cannot claim a VM the server claims."""
+        async with self._lock(VM_CLAIMS), self.db.cross_process_lock(VM_CLAIMS):
+            yield
 
     def now(self) -> datetime:
         """The orchestrator's clock (UTC)."""
@@ -298,15 +466,31 @@ class Orchestrator:
         actor: str = "system",
         data: dict[str, Any] | None = None,
     ) -> tuple[Migration, int]:
-        new = fsm.transition(m, to, reason, actor, now=self._now())
+        return await self._transitions(m, version, [(to, reason, data)], actor)
+
+    async def _transitions(
+        self,
+        m: Migration,
+        version: int,
+        steps: list[tuple[Phase, str, dict[str, Any] | None]],
+        actor: str = "system",
+    ) -> tuple[Migration, int]:
+        """Several transitions in one write — a crash or a failed event write never splits them
+        (SDD §8) — then one ``migration.phase`` event each."""
+        new = m
+        for to, reason, _ in steps:
+            new = fsm.transition(new, to, reason, actor, now=self._now())
         version = await self._save(new, version)
-        await self._emit(
-            "migration.phase",
-            f"{new.vm.name}: {m.phase} -> {to} ({reason})",
-            migration=new,
-            actor=actor,
-            data={"from": str(m.phase), "to": str(to), "reason": reason, **(data or {})},
-        )
+        before = m.phase
+        for to, reason, data in steps:
+            await self._emit(
+                "migration.phase",
+                f"{new.vm.name}: {before} -> {to} ({reason})",
+                migration=new,
+                actor=actor,
+                data={"from": str(before), "to": str(to), "reason": reason, **(data or {})},
+            )
+            before = to
         return new, version
 
     # ------------------------------------------------------------------------------------------
@@ -359,8 +543,9 @@ class Orchestrator:
     # planning actions
     async def _held_elsewhere(self, plan: Plan, vm_ids: set[str]) -> dict[str, list[str]]:
         """The VMs of ``vm_ids`` that migrations of other plans with the same source provider hold
-        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", phase)``
-        once per holder — plans validated before the rule may hold a VM several times."""
+        (SDD §5.4: one VM, one migration across plans), by source id: ``name (plan "…", plan-id,
+        phase)`` once per holding plan — plans validated before the rule may hold a VM several
+        times, and plan names need not be unique, so the id tells two plans apart."""
         others = {
             other.id: other
             for other in await self.db.list("plan", Plan)
@@ -371,7 +556,7 @@ class Orchestrator:
         held: dict[str, set[str]] = {}
         for m in await self.db.list("migration", Migration, plan_id=list(others)):
             if m.vm.source_id in vm_ids and m.phase not in RELEASES_VM:
-                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.phase})'
+                holder = f'{m.vm.name} (plan "{others[m.plan_id].name}", {m.plan_id}, {m.phase})'
                 held.setdefault(m.vm.source_id, set()).add(holder)
         return {vm_id: sorted(holders) for vm_id, holders in held.items()}
 
@@ -385,11 +570,20 @@ class Orchestrator:
     async def validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         # one validation per plan at a time: concurrent runs would create duplicate migrations;
         # and one claim of VMs at a time across plans (SDD §5.4)
-        async with self._lock(f"plan:{plan_id}"), self._lock(VM_CLAIMS):
-            return await self._validate_plan(plan_id, actor)
+        async with self._lock(f"plan:{plan_id}"):
+            # SDD §8: refused before waiting for the claims — another plan's validation may hold
+            # them for minutes, and the tick starts a running plan's steps under this lock
+            if (await self._plan(plan_id)).status == PlanStatus.running:
+                raise NotAllowed("pause the plan before validating it again")
+            async with self._claims():
+                return await self._validate_plan(plan_id, actor)
 
     async def _validate_plan(self, plan_id: str, actor: str) -> ValidationReport:
         plan = await self._plan(plan_id)
+        # SDD §8: the settings, waves and status this validation assesses - a change by another
+        # process (its own plan lock: an edit, auto-waves, a start, a pause) must never end up
+        # `validated` with settings no validation saw, nor lose its status to this one
+        seen = plan.model_dump(mode="json", include=_VALIDATION_WATCHES)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
         repeated = repeated_vm_ids(plan.vm_ids)
@@ -456,10 +650,29 @@ class Orchestrator:
                 "from vm_ids"
             )
         params = params_for_plan(plan)
+        # SDD §14.6: the policy in force for the plan's strategy decisions
+        policy = resolve_policy(
+            await self.db.list("advisor_policy", AdvisorPolicy),
+            plan.id,
+            plan.source_provider_id,
+            DecisionType.migration_strategy,
+            self.settings,
+        )
         items: list[ValidationItem] = []
+        # a memory outage is met once per validation: the search is not repeated for every VM
+        memory_up = True
         for vm in vms:
+            # dst_caps: what the check above just read (its token's roles, SDD §9.3), not the
+            # capabilities `destination` held before it
             findings = run_preflight(
-                vm, plan, src_inv, dst_inv, vms, source=source, destination=destination
+                vm,
+                plan,
+                src_inv,
+                dst_inv,
+                vms,
+                source=source,
+                destination=destination,
+                dst_caps=dst_caps,
             )
             resolved = resolve_mappings(vm, plan, dst_inv)
             reasons = eligibility(vm, source.kind, plan, src_caps, dst_caps, findings)
@@ -470,24 +683,89 @@ class Orchestrator:
                 for strategy, why in reasons.items()
             ]
             strategy, why = select_strategy(vm, estimates, plan)
-            notes: list[AdvisorNote] = []
             automatic = (
                 plan.default_strategy == "auto" and vm.source_id not in plan.strategy_overrides
             )
-            if self.advisor is not None and automatic:
-                note = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
-                if note is not None:
-                    notes.append(note)
-                    chosen = note.data.get("selected")
-                    match = next((e for e in estimates if e.strategy == chosen), None)
-                    if note.data.get("applied") and match is not None and match.eligible:
-                        strategy, why = match.strategy, f"advisor ({note.source}): {note.summary}"
+            # SDD §14.4: validation makes no choice for a migration in flight or finished (it
+            # leaves it alone), so the advisor is not asked about it
+            current = existing.get(vm.source_id)
+            chooses = current is None or current.phase in (*REVALIDATABLE, P.validating)
+            advice = None
+            if self.advisor is not None and automatic and chooses:
+                advice = await self.advisor.recommend_strategy(vm, estimates, plan, findings)
+            decision = None
+            rec_id = new_recommendation_id()
+            # the evidence names the migration this validation writes, created below if new
+            migration_id = current.id if current is not None else new_migration_id()
+            evidence_option = None
+            evidence: list[EvidenceItem] = []
+            if advice is not None:
+                # SDD §14.4 (ADV-02): the facts measured against the recommended option, or the
+                # deterministic one when the advisor gave none; decide() counts those that bear
+                evidence_option = (
+                    advice.option if advice.option in advice.options else strategy.value
+                )
+                evidence = build_strategy_evidence(
+                    vm,
+                    plan,
+                    source.kind,
+                    estimates,
+                    findings,
+                    evidence_option,
+                    current,
+                    migration_id=migration_id,
+                )
+                # SDD §14.4: decide() takes the decision; the engine reads only its final option
+                decision = decide(
+                    advice, policy, evidence_count(evidence), strategy.value, now=self._now()
+                )
+                final = decision.final_option
+                match = next((e for e in estimates if e.strategy == final), None)
+                if match is not None and match.eligible and match.strategy != strategy:
+                    strategy = match.strategy
+                    why = (
+                        f"advisor decision {decision.status}: {final} "
+                        f"(confidence {advice.confidence:.2f})"
+                    )
             migration = existing.get(vm.source_id) or await self._create_migration(
-                plan, vm, strategy, actor
+                plan, vm, strategy, actor, migration_id=migration_id
             )
+            # a decision that waits for approval holds the migration from the same write on
+            # (SDD §5.4, §14.6); any other validation clears an earlier hold
+            waiting = decision is not None and decision.status == DecisionStatus.pending_approval
             migration = await self._apply_validation(
-                migration.id, plan, vm, strategy, why, estimates, findings, notes, actor, resolved
+                migration.id,
+                plan,
+                vm,
+                strategy,
+                why,
+                estimates,
+                findings,
+                actor,
+                resolved,
+                hold=rec_id if waiting else None,
             )
+            # recorded only when this validation took the choice (ready or blocked now): one that
+            # went in flight meanwhile was left alone and runs what it ran
+            validated = migration.phase in (P.ready, P.blocked)
+            if advice is not None and decision is not None and validated:
+                incidents: list[SimilarIncident] = []
+                if memory_up and self.knowledge is not None and evidence_option is not None:
+                    found = await self.knowledge.similar_for(evidence_option, vm)
+                    memory_up = found is not None
+                    incidents = found or []
+                await self._record_strategy_recommendation(
+                    plan,
+                    vm,
+                    migration,
+                    advice,
+                    decision,
+                    rec_id,
+                    actor,
+                    evidence_option=evidence_option,
+                    evidence=evidence,
+                    incidents=incidents,
+                )
             items.append(
                 ValidationItem(
                     migration_id=migration.id,
@@ -498,30 +776,63 @@ class Orchestrator:
                     estimates=migration.estimates,
                 )
             )
+        kept: list[dict[str, str]] = []
         for stale in removed:
-            await self.cancel(stale.id, actor, "removed from the plan")
+            try:
+                await self.cancel(stale.id, actor, "removed from the plan", by_validation=True)
+            except NotAllowed:
+                # SDD §5.4: an operator moved it meanwhile (a rollback): it stays as it is, and the
+                # validation finishes
+                moved, _ = await self._load(stale.id)
+                if moved.phase != P.cancelled:
+                    kept.append({"vm": moved.vm.name, "phase": str(moved.phase)})
 
-        def mark_validated(fresh: Plan) -> None:
+        edited = False
+
+        def mark_validated(fresh: Plan) -> bool | None:
+            nonlocal edited
+            edited = fresh.model_dump(mode="json", include=_VALIDATION_WATCHES) != seen
+            if edited:
+                return False  # as that change left it
             fresh.status = PlanStatus.validated
+            return None
 
         plan = await self._update_plan(plan_id, mark_validated)
+        if edited:
+            raise ConflictError(
+                f"plan {plan_id} changed while it was being validated (now {plan.status}); "
+                "it was left as that change left it"
+            )
         ok = all(item.phase != P.blocked for item in items)
         blocked = sum(1 for item in items if item.phase == P.blocked)
+        left = "".join(f"; {k['vm']} left as it is ({k['phase']})" for k in kept)
         await self._emit(
             "plan.validated",
-            f"{plan.name}: {len(items)} VM(s) validated, {blocked} blocked",
+            f"{plan.name}: {len(items)} VM(s) validated, {blocked} blocked{left}",
             plan_id=plan.id,
             actor=actor,
-            data={"ok": ok, "migrations": len(items), "blocked": blocked},
+            data={
+                "ok": ok,
+                "migrations": len(items),
+                "blocked": blocked,
+                **({"kept": kept} if kept else {}),
+            },
         )
         return ValidationReport(plan_id=plan.id, ok=ok, migrations=items)
 
     async def _create_migration(
-        self, plan: Plan, vm: VMRef, strategy: Strategy, actor: str
+        self,
+        plan: Plan,
+        vm: VMRef,
+        strategy: Strategy,
+        actor: str,
+        *,
+        migration_id: str | None = None,
     ) -> Migration:
         now = self._now()
         wave = plan.wave_of(vm.source_id)
         migration = Migration(
+            id=migration_id or new_migration_id(),
             plan_id=plan.id,
             wave_id=wave.id if wave else None,
             vm=vm,
@@ -559,9 +870,10 @@ class Orchestrator:
         why: str,
         estimates: list[Estimate],
         findings: list[Finding],
-        notes: list[AdvisorNote],
         actor: str,
         resolved: Mappings | None = None,
+        *,
+        hold: str | None = None,
     ) -> Migration:
         no_eligible = not any(e.eligible for e in estimates)
         blocked = has_blocker(findings) or no_eligible
@@ -579,17 +891,19 @@ class Orchestrator:
             m.estimates = estimates
             m.estimate = next((e for e in estimates if e.strategy == strategy), None)
             m.findings = findings
+            # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+            m.suggested_probes = suggest_probes(vm)
             m.resolved_mappings = resolved or Mappings()
             m.wave_id = wave.id if wave else None
             m.bytes_total = vm.used_bytes
-            # keep one strategy note per validation (the latest)
-            m.advisor_notes = [n for n in m.advisor_notes if n.kind != "strategy"] + notes
+            m.advisor_hold = hold
+            # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
+            # stay - strategy notes of earlier versions are listed as legacy recommendations
             m.error = None
             # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
             # this validation carries over to the new strategy, findings and estimate
             m.approvals = []
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
             if no_eligible:
                 details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
                 m.error = f"no eligible strategy ({details})"[:1000]
@@ -603,22 +917,77 @@ class Orchestrator:
                 m, v = await self._transition(
                     m, v, P.ready, why, actor, data={"strategy": str(strategy)}
                 )
-        for note in notes:
-            await self._emit(
-                "advisor.strategy",
-                note.summary,
-                migration=m,
-                data={"source": note.source, **note.data},
-            )
         return m
 
-    async def in_flight(self, plan_id: str) -> list[str]:
-        """VM names of the plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
-        return sorted(
-            m.vm.name
-            for m in await self.db.list("migration", Migration, plan_id=plan_id)
-            if m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
+    async def _record_strategy_recommendation(
+        self,
+        plan: Plan,
+        vm: VMRef,
+        migration: Migration,
+        advice: Advice,
+        decision: Decision,
+        rec_id: str,
+        requested_by: str,
+        *,
+        evidence_option: str | None = None,
+        evidence: Sequence[EvidenceItem] = (),
+        incidents: Sequence[SimilarIncident] = (),
+    ) -> AdvisorRecommendation:
+        """Store the strategy recommendation, its decision, its evidence and its input; audit both
+        (SDD §14.4, §14.5)."""
+        answered = advice.unavailable is None
+        snapshot = await store_snapshot(
+            self.db,
+            {
+                "tool": "jev_decide",
+                "arguments": dict(advice.request or {}),
+                "scope": list(advice.scope),
+                "options": list(advice.options),
+                "deterministic": advice.deterministic,
+                "deterministic_reason": advice.deterministic_reason,
+            },
+            now=decision.decided_at,
         )
+        rec = AdvisorRecommendation(
+            id=rec_id,
+            created_at=decision.decided_at,
+            decision_type=DecisionType.migration_strategy,
+            subject=AdvisorSubject(kind="vm", id=vm.source_id, name=vm.name),
+            plan_id=plan.id,
+            migration_id=migration.id,
+            provider_id=plan.source_provider_id,
+            model=AdvisorModelInfo(
+                name="jev" if answered else "rules",
+                version=(advice.model_version or "unknown") if answered else "rules",
+                # where the model that answered runs (SDD §4, §13.4); the rules ran here
+                deployment=self.settings.jev_deployment if answered else "unknown",
+                endpoint_host=self.settings.jev_endpoint_host if answered else None,
+            ),
+            recommendation=RecommendedOption(
+                option=advice.option,
+                confidence=advice.confidence,
+                distribution=dict(advice.distribution),
+            ),
+            decision=decision,
+            input_snapshot_sha256=snapshot,
+            requested_by=requested_by,
+            evidence_option=evidence_option,
+            evidence=list(evidence),
+            similar_incidents=list(incidents),
+            reasons=keep_reasons(advice.reasons, evidence, recommendation_id=rec_id),
+        )
+        await self.db.put("recommendation", rec)
+        for kind, message, actor, data in (created_event(rec), decision_event(rec)):
+            await self._emit(kind, message, migration=migration, actor=actor, data=data)
+        return rec
+
+    async def in_flight(self, plan_id: str) -> list[Migration]:
+        """The plan's migrations in flight (SDD §12: no edit, no re-wave meanwhile)."""
+        return [
+            m
+            for m in await self.db.list("migration", Migration, plan_id=plan_id)
+            if blocks_plan_change(m)
+        ]
 
     async def auto_waves(self, plan_id: str, max_wave_size: int, actor: str) -> Plan:
         # status changes serialize on the plan's lock (SDD §8): a start waits instead of being
@@ -632,10 +1001,7 @@ class Orchestrator:
             raise NotAllowed(f"waves cannot change while the plan is {plan.status}")
         busy = await self.in_flight(plan.id)
         if busy:
-            raise NotAllowed(
-                f"migrations in flight: {', '.join(busy[:10])}; finish, roll back or cancel them "
-                "before re-planning the waves"
-            )
+            raise NotAllowed(in_flight_refusal(busy, "re-planning the waves"))
         if max_wave_size < 1:
             raise BadRequest("max_wave_size must be >= 1")
         source = await self._provider(plan.source_provider_id, ProviderRole.source)
@@ -745,6 +1111,12 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in APPROVABLE:
                 raise NotAllowed(f"a migration in {m.phase} cannot be approved")
+            plan = await self._plan(m.plan_id)
+            if plan.require_distinct_approver and m.cutover_requested_by == actor:
+                raise NotAllowed(OWN_CUTOVER)
+            forcer = m.force_cutover.actor if m.force_cutover is not None else None
+            if plan.require_distinct_approver and forcer == actor:
+                raise NotAllowed(OWN_FORCE)
             m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
             await self._save(m, v)
         await self._emit(
@@ -764,23 +1136,94 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in CUTOVER_REQUESTABLE:
                 raise NotAllowed(f"cutover cannot be requested in {m.phase}")
-            m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
+            # maker-checker (SDD §5.4): the request is an approval only without a distinct approver
+            approves = not (await self._plan(m.plan_id)).require_distinct_approver
+            if approves:
+                m.approvals.append(Approval(actor=actor, at=self._now(), comment=comment))
+            if m.cutover_requested_by is None:  # a repeated request keeps the first requester
+                m.cutover_requested_by = actor
+                m.cutover_requested_at = self._now()
             m.cutover_requested = True
             m.force_window = m.force_window or force_window
             await self._save(m, v)
-        await self._emit(
-            "migration.approved",
-            f"{m.vm.name} approved by {actor}",
-            migration=m,
-            actor=actor,
-            data={"comment": comment},
-        )
+        if approves:
+            await self._emit(
+                "migration.approved",
+                f"{m.vm.name} approved by {actor}",
+                migration=m,
+                actor=actor,
+                data={"comment": comment},
+            )
         await self._emit(
             "migration.action",
             f"cutover of {m.vm.name} requested by {actor}",
             migration=m,
             actor=actor,
-            data={"action": "cutover", "force_window": force_window},
+            data={"action": "cutover", "force_window": force_window, "comment": comment},
+        )
+        self.wake()
+        return m
+
+    async def force_cutover(self, mid: str, actor: str, reason: str) -> Migration:
+        """Cut over before convergence: recorded, audited; the gate still applies (SDD §5.4)."""
+        reason = reason.strip()
+        if len(reason) < FORCE_REASON_MIN:
+            raise Unprocessable(
+                f"a Force cutover needs a reason of at least {FORCE_REASON_MIN} characters"
+            )
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if m.phase not in FORCEABLE or m.strategy not in WARM_STRATEGIES:
+                raise NotAllowed(
+                    "a Force cutover applies to a warm migration in pre-copy or syncing, "
+                    f"not to {m.strategy} in {m.phase}"
+                )
+            if m.force_cutover is not None:
+                # forced once (SDD §5.4): a second forcer would take the first one's place, whose
+                # own approval would then count again, and the first record would be lost
+                raise NotAllowed(
+                    f"Already forced by {m.force_cutover.actor}: "
+                    "the cutover follows the running pass."
+                )
+            plan = await self._plan(m.plan_id)
+            last = m.sync_passes[-1] if m.sync_passes else None
+            # after the running pass: as long as the last one that ended, or the first pass
+            # while none has (SDD §5.4)
+            estimated = estimate_forced_downtime(
+                m.vm,
+                m.strategy,
+                float(last.duration_s or 0.0) if last is not None else None,
+                self._params(m, plan),
+            )
+            now = self._now()
+            m.force_cutover = ForceCutover(
+                actor=actor,
+                at=now,
+                reason=reason,
+                delta_bytes=last.bytes_changed if last is not None else 0,
+                estimated_downtime_s=estimated,
+            )
+            # a request too, under maker-checker like POST ...cutover (SDD §5.4, ADV-17)
+            if not plan.require_distinct_approver:
+                m.approvals.append(Approval(actor=actor, at=now, comment=reason))
+            if m.cutover_requested_by is None:
+                m.cutover_requested_by = actor
+                m.cutover_requested_at = now
+            m.cutover_requested = True
+            await self._save(m, v)
+        await self._emit(
+            "migration.force_cutover",
+            f"cutover of {m.vm.name} forced by {actor}: {reason}",
+            migration=m,
+            actor=actor,
+            data={
+                # in the audit trail (SDD §14.5): its target is the migration
+                "target_id": m.id,
+                "vm": m.vm.name,
+                "reason": reason,
+                "delta_bytes": m.force_cutover.delta_bytes,
+                "estimated_downtime_s": estimated,
+            },
         )
         self.wake()
         return m
@@ -808,6 +1251,21 @@ class Orchestrator:
             m, v = await self._load(mid)
             if not fsm.can_transition(m, P.rolling_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be rolled back")
+            if m.phase == P.completed and m.checkpoint == "finalizing":
+                # SDD §8.1: the rollback would delete the destination server and find no source
+                raise NotAllowed("the finalize began deleting the source VM: finalize it again")
+            # SDD §5.1: without its providers the rollback fails, and a migration whose cutover
+            # stopped its source could then be neither rolled back, retried nor cancelled
+            missing = await self._missing_provider(await self._plan(m.plan_id))
+            if missing is not None:
+                provider_id, role = missing
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be rolled back: the plan's {role} provider "
+                    f"{provider_id!r} no longer exists"
+                )
+            # SDD §8.1: the rollback starts the source on purpose; a migration that completes
+            # again is watched afresh
+            m.source_running_at = None
             m, v = await self._transition(
                 m, v, P.rolling_back, f"rollback requested: {reason}", actor
             )
@@ -825,27 +1283,46 @@ class Orchestrator:
         return m
 
     async def retry(self, mid: str, actor: str) -> Migration:
-        async with self._lock(VM_CLAIMS), self._lock(mid):
+        # the provider check and the save of ready share the deletions' lock (SDD §12): a ready
+        # migration holds its VM, so a deletion after it refuses and one before it is seen here
+        async with self._claims(), self._lock(mid), self._lock(PROVIDERS):
             m, v = await self._load(mid)
             if m.phase not in (P.failed, P.rolled_back):
                 raise NotAllowed(f"a migration in {m.phase} cannot be retried")
-            held = await self._held_elsewhere(await self._plan(m.plan_id), {m.vm.source_id})
+            plan = await self._plan(m.plan_id)
+            held = await self._held_elsewhere(plan, {m.vm.source_id})
             if held:
                 # SDD §5.4: a rolled-back migration let its VM go; another plan may have taken it
                 raise NotAllowed(
                     f"{m.vm.name} cannot be retried: a migration in another plan holds the VM: "
                     f"{self._holders(held)}; finish, roll back or cancel it there first"
                 )
+            # only a completed plan's providers can be deleted (SDD §12), and the plan may still
+            # complete before the reopen below: the new attempt needs both
+            missing = await self._missing_provider(plan)
+            if missing is not None:
+                provider_id, role = missing
+                raise NotAllowed(
+                    f"{m.vm.name} cannot be retried: the plan's {role} provider "
+                    f"{provider_id!r} no longer exists; create a new plan for the VM"
+                )
             if m.phase == P.rolled_back:
                 # the FSM counts failed -> ready only; a retry after an automatic rollback
                 # is still a new attempt of the cutover (executors key their behaviour on it)
                 m.attempts += 1
-            m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
+            # everything below is saved in the same write as the move to ready (SDD §5.1): a crash
+            # never leaves a ready migration with the earlier attempt's request and bypass
+            # the strategy of the attempt being retried: the evidence names it (SDD §14.4), even
+            # after a later validation chose another
+            m.attempt_strategies = [*m.attempt_strategies, m.strategy]
             m.error = None
             # a new attempt is requested anew: the window bypass granted with the old request goes
             # with it, approvals stay (SDD §5.1, §5.4)
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
+            # what the earlier attempt found about itself goes with it: the new attempt records
+            # its own (SDD §5.1, §5.3, §5.5)
+            m.data_issues = []
+            m.converged_by = None
             m.checkpoint = None
             m.progress_pct = 0
             m.review_required = False
@@ -853,11 +1330,36 @@ class Orchestrator:
             # the downtime clock belongs to the outage (SDD §5.2): a closed clock — verified boot,
             # or the source running again after a rollback — starts afresh; an open one means the
             # source has not run since it stopped, so the next cutover counts from that first stop
+            # (in demo mode its model seconds add to those the clock kept)
             if not fsm.source_stopped(m):
                 m.downtime_started_at = None
                 m.downtime_ended_at = None
                 m.actual_downtime_s = None
-            await self._save(m, v)
+                m.downtime_model_s = None
+            m, v = await self._transition(m, v, P.ready, f"retry requested by {actor}", actor)
+        reopened = False
+
+        def reopen(fresh: Plan) -> bool:
+            nonlocal reopened
+            reopened = fresh.status == PlanStatus.completed  # re-evaluated on every retry
+            if not reopened:
+                return False
+            fresh.status = PlanStatus.running
+            return True
+
+        # SDD §5.1/§8: a completed plan is driven no more, so the new attempt reopens it - under
+        # the plan's lock, taken only now: held across the claim wait above, it would hold up the
+        # tick; a completion that wrote before the transition is seen here, a later one sees ready
+        async with self._lock(f"plan:{m.plan_id}"):
+            plan = await self._update_plan(m.plan_id, reopen)
+            if reopened:
+                await self._emit(
+                    "plan.updated",
+                    f"{plan.name} reopened: retry of {m.vm.name}",
+                    plan_id=plan.id,
+                    actor=actor,
+                    data={"status": "running"},
+                )
         await self._emit(
             "migration.action",
             f"retry of {m.vm.name}",
@@ -868,26 +1370,37 @@ class Orchestrator:
         self.wake()
         return m
 
-    async def cancel(self, mid: str, actor: str, reason: str | None = None) -> Migration:
+    async def cancel(
+        self, mid: str, actor: str, reason: str | None = None, *, by_validation: bool = False
+    ) -> Migration:
         async with self._lock(mid):
             m, v = await self._load(mid)
+            if m.phase == P.validating and not by_validation:
+                # SDD §5.1: a validation of the plan may be moving it; only a validation cancels
+                # one - under the plan's lock it knows it is a leftover whose VM left vm_ids
+                raise NotAllowed(
+                    f"{m.vm.name} is being validated and cannot be cancelled; validate the plan "
+                    "again - it finishes the migration, or cancels it once its VM left vm_ids"
+                )
             why = fsm.refusal(m, P.cancelled)
             if why is not None:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
                     raise NotAllowed(f"a migration in {m.phase} cannot be cancelled")
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
-            previous = m.phase
+            m.advisor_hold = None  # a cancelled migration takes no decision (SDD §14.6)
+            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
+            # the retries, §8) or has just finished unrecorded; with the passes a migration
+            # recorded, that data path left snapshots, temporary and destination volumes behind,
+            # and `cancelled` is terminal: no later action could remove them
+            data_path = m.phase in (P.precopy, P.syncing) or bool(m.sync_passes)
+            if data_path:
+                m.checkpoint = "cleanup"  # saved with cancelled: a crash cannot lose the cleanup
             m, v = await self._transition(
                 m, v, P.cancelled, f"cancelled: {reason or 'no reason given'}", actor
             )
             step = self._steps.get(mid)
             if step is not None:
                 step.cancel()
-            # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
-            # the retries, §8) or has just finished unrecorded; with the passes a migration
-            # recorded, that data path left snapshots, temporary and destination volumes behind,
-            # and `cancelled` is terminal: no later action could remove them
-            data_path = previous in (P.precopy, P.syncing) or bool(m.sync_passes)
         await self._emit(
             "migration.action",
             f"{m.vm.name} cancelled",
@@ -906,6 +1419,26 @@ class Orchestrator:
     async def _cleanup_after_cancel(
         self, m: Migration, step: asyncio.Task[Any] | None, actor: str
     ) -> None:
+        recorded = False
+
+        async def record(outcome: str, report: Coroutine[Any, Any, None]) -> None:
+            """The step ran: its outcome event and checkpoint are saved even when a stop() comes
+            meanwhile — the stop waits for them, and the outcome stands (SDD §5.1)."""
+            nonlocal recorded
+
+            async def save() -> None:
+                await report
+                await self._cleanup_recorded(m.id, outcome)
+
+            saving = asyncio.ensure_future(save())
+            try:
+                await asyncio.shield(saving)
+            except asyncio.CancelledError:
+                await asyncio.wait({saving})
+                recorded = not saving.cancelled() and saving.exception() is None
+                raise
+            recorded = True
+
         try:
             if step is not None:
                 # the executor kills the playbook and removes its secret files; the step's own
@@ -922,36 +1455,54 @@ class Orchestrator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._emit(
-                    "migration.error",
-                    f"{m.vm.name}: cleanup after the cancel failed: {redact(str(exc))[:300]}; run "
-                    "rollback_workloads.yml for the workload to remove its temporary resources",
-                    migration=m,
-                    data={"step": "cleanup", "error_class": type(exc).__name__},
+                await record(
+                    "cleanup_failed",
+                    self._emit(
+                        "migration.error",
+                        f"{m.vm.name}: cleanup after the cancel failed: "
+                        f"{redact(str(exc))[:300]}; run rollback_workloads.yml for the workload to "
+                        "remove its temporary resources",
+                        migration=m,
+                        data={"step": "cleanup", "error_class": type(exc).__name__},
+                    ),
                 )
                 return
-            await self._emit(
-                "migration.action",
-                f"{m.vm.name}: temporary resources of the cancelled migration removed",
-                migration=m,
-                actor=actor,
-                data={"action": "cleanup"},
+            await record(
+                "cleaned",
+                self._emit(
+                    "migration.action",
+                    f"{m.vm.name}: temporary resources of the cancelled migration removed",
+                    migration=m,
+                    actor=actor,
+                    data={"action": "cleanup"},
+                ),
             )
         except asyncio.CancelledError:
-            # a shutdown interrupted the cleanup: its outcome is still recorded (SDD §5.1)
-            with contextlib.suppress(Exception):
-                await self._emit(
-                    "migration.error",
-                    f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; run "
-                    "rollback_workloads.yml for the workload to remove its temporary resources",
-                    migration=m,
-                    data={"step": "cleanup", "error_class": "CancelledError"},
-                )
+            # a shutdown interrupted the cleanup before its outcome was recorded: its mark stays,
+            # so the next start runs it, and the event says so; a recorded outcome stands (SDD §5.1)
+            if not recorded:
+                with contextlib.suppress(Exception):
+                    await self._emit(
+                        "migration.error",
+                        f"{m.vm.name}: cleanup after the cancel was interrupted by a shutdown; it "
+                        "runs again when the orchestrator starts",
+                        migration=m,
+                        data={"step": "cleanup", "error_class": "CancelledError"},
+                    )
             raise
         finally:
             # tracked until it has finished, its outcome event included: whoever waits for the
             # cleanup (or cancels it, as stop() does) never finds it gone before its outcome
             self._cleanups.pop(m.id, None)
+
+    async def _cleanup_recorded(self, mid: str, outcome: str) -> None:
+        """The cancel's cleanup recorded its outcome: its mark goes, so no start runs it again
+        (SDD §5.1)."""
+        async with self._lock(mid):
+            m, v = await self._load(mid)
+            if m.phase == P.cancelled and m.checkpoint == "cleanup":
+                m.checkpoint = outcome
+                await self._save(m, v)
 
     async def finalize(
         self, mid: str, actor: str, delete_source: bool = False, confirm: str = ""
@@ -966,13 +1517,19 @@ class Orchestrator:
             source = await self.db.get("provider", plan.source_provider_id, Provider)
             destination = await self.db.get("provider", plan.destination_provider_id, Provider)
             executor = self.executors.for_strategy(m.strategy)
+            if delete_source:
+                # SDD §8.1: from here the source may be gone, even if the step fails — a failed
+                # finalize is finalized again, never rolled back
+                m.checkpoint = "finalizing"
+                v = await self._save(m, v)
             ctx = self._context(
                 m, plan, source, destination, options={"delete_source": delete_source}, locked=True
             )
             try:
                 result = await executor.run(StepName.FINALIZE, ctx)
             except (TransientStepError, PermanentStepError) as exc:
-                raise NotAllowed(f"finalize failed: {redact(str(exc))}") from exc
+                # redacted and cut like any reason a skipped VM reports (SDD §8.1)
+                raise NotAllowed(f"finalize failed: {redact_cut(str(exc), 500)}") from exc
             m.checkpoint = "finalized"
             m, v = await self._transition(
                 m,
@@ -991,12 +1548,178 @@ class Orchestrator:
         )
         return m
 
+    async def finalize_plan(
+        self,
+        plan_id: str,
+        actor: str,
+        *,
+        wave_id: str | None,
+        confirm: str,
+        delete_source: bool = False,
+    ) -> dict[str, Any]:
+        """Finalize a wave or the plan with one approval, each VM as ``finalize`` (SDD §8.1)."""
+        plan = await self._plan(plan_id)
+        if wave_id is not None:
+            wave = next((w for w in plan.waves if w.id == wave_id), None)
+            if wave is None:
+                raise NotFound("wave", wave_id)
+            scope, name = set(wave.vm_ids), wave.name
+        else:
+            scope, name = None, plan.name
+        if confirm != name:
+            raise BadRequest(f"confirm must equal the name {name!r}")
+        migrations = await self.db.list("migration", Migration, plan_id=plan_id)
+        waiting = [
+            m
+            for m in migrations
+            if m.phase == P.completed and (scope is None or m.vm.source_id in scope)
+        ]
+        if not waiting:
+            raise NotAllowed(f"no completed migration to finalize in {name}")
+        finalized: list[Migration] = []
+        skipped: list[dict[str, str]] = []
+        for m in sorted(waiting, key=lambda x: x.vm.name):
+            try:
+                finalized.append(
+                    await self.finalize(m.id, actor, delete_source=delete_source, confirm=m.vm.name)
+                )
+            except NotAllowed as exc:  # left completed meanwhile, or the cleanup failed
+                skipped.append({"migration_id": m.id, "reason": str(exc)})
+            except Exception as exc:  # any other error skips this VM, not the others (SDD §8.1)
+                log.warning("finalize of %s failed", m.id, exc_info=True)
+                reason = redact_cut(str(exc), 500).strip() or type(exc).__name__
+                skipped.append({"migration_id": m.id, "reason": f"finalize failed: {reason}"})
+        names = {m.id: m.vm.name for m in waiting}
+        await self._emit(
+            "plan.finalized",
+            f"{name}: {len(finalized)} finalized by {actor}"
+            + (f", {len(skipped)} skipped" if skipped else ""),
+            plan_id=plan_id,
+            actor=actor,
+            data={
+                "wave_id": wave_id,
+                "finalized": [m.vm.name for m in finalized],
+                "skipped": [{"vm": names[s["migration_id"]], **s} for s in skipped],
+            },
+        )
+        return {"finalized": [m.id for m in finalized], "skipped": skipped}
+
+    async def source_client(self, plan: Plan) -> Any:
+        """The client of the plan's source provider (the source watch, the demo controls)."""
+        provider = await self.db.get("provider", plan.source_provider_id, Provider)
+        return self.providers.get(provider)
+
+    async def demo_power(self, source_id: str, *, on: bool) -> VMRef:
+        """Power a fake source VM on or off (demo mode, SDD §8.1); NotFound for an unknown VM."""
+        for provider in await self.db.list("provider", Provider):
+            if provider.role != ProviderRole.source:
+                continue
+            client = self.providers.get(provider)
+            try:
+                await client.get_vm(source_id)
+            except ProviderError:
+                continue
+            await (client.power_on if on else client.power_off)(source_id)
+            vm: VMRef = await client.get_vm(source_id)
+            return vm
+        raise NotFound("source VM", source_id)
+
+    def _start_source_watch(self) -> None:
+        """Start the source watch when it is due, as a task of its own, one at a time; the tick
+        never waits for it - a slow source provider must not hold the gates and passes (SDD
+        §8.1)."""
+        if self._watch_task is not None and not self._watch_task.done():
+            return  # a slow watch delays the next one, nothing else
+        now = self._now()
+        scale = max(self.settings.demo_speed, 1.0) if self.settings.demo else 1.0
+        interval = timedelta(seconds=self.settings.source_watch_s / scale)
+        if self._source_watch_due is None:
+            self._source_watch_due = now + interval
+        if now < self._source_watch_due:
+            return
+        self._source_watch_due = now + interval
+        self._watch_task = asyncio.create_task(self._watch_sources(), name="seamless-source-watch")
+
+    async def _watch_sources(self) -> None:
+        """A completed migration's source VM seen running again is flagged once, and cleared once
+        seen stopped again; each change is an event (SDD §8.1)."""
+        try:
+            await self._watch_sources_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("the source watch failed", exc_info=True)
+
+    async def _watch_sources_once(self) -> None:
+        clients: dict[str, Any] = {}
+        # each plan read once per pass, a plan that is gone too: a plan of 1,000 VMs is ~22 KB,
+        # and in demo the watch runs every few seconds
+        plans: dict[str, Plan | None] = {}
+        for m in await self.db.list("migration", Migration, phase=P.completed):
+            try:
+                if m.plan_id not in plans:
+                    try:
+                        plans[m.plan_id] = await self._plan(m.plan_id)
+                    except NotFound:
+                        plans[m.plan_id] = None
+                plan = plans[m.plan_id]
+                if plan is None:
+                    continue
+                if plan.source_provider_id not in clients:
+                    clients[plan.source_provider_id] = await self.source_client(plan)
+                vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)
+            except (ProviderError, NotFound):
+                continue  # gone (a finalize deleted it, a handover rebuilt it) or unreachable
+            except Exception:
+                log.warning("source watch failed for %s", m.id, exc_info=True)
+                continue
+            seen = self._now()  # when the provider answered: one call may take minutes (§8.1)
+            state = str(vm.power_state)
+            if state not in ("running", "stopped"):
+                # a reboot or a resize, a paused VM, an error, an unknown state: not seen
+                # stopped - the alert stays as it is (SDD §8.1)
+                continue
+            running = state == "running"
+            if running == (m.source_running_at is not None):
+                continue
+            async with self._lock(m.id):
+                cur, v = await self._load(m.id)
+                if cur.phase != P.completed or running == (cur.source_running_at is not None):
+                    continue
+                cur.source_running_at = seen if running else None
+                await self._save(cur, v)
+            if running:
+                await self._emit(
+                    "migration.source_running",
+                    f"{cur.vm.name}: the source VM runs again - its data diverges from RHOSO; "
+                    "stop it, or roll back",
+                    migration=cur,
+                    data={"power_state": str(vm.power_state)},
+                )
+            else:
+                await self._emit(
+                    "migration.source_stopped",
+                    f"{cur.vm.name}: the source VM is stopped again",
+                    migration=cur,
+                    data={"power_state": str(vm.power_state)},
+                )
+
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
-        async with self._lock(mid):
+        current, _ = await self._load(mid)
+        _refuse_unchangeable(current)  # before the plan's lock (SDD §8); repeated under it
+        plan_id = current.plan_id
+        # SDD §8: the plan's lock first, as the advisor's override (§14.6): a running validation
+        # finishes before the change, and no validation undoes it afterwards
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
             m, v = await self._load(mid)
             if m.phase not in REVALIDATABLE:
                 raise NotAllowed(f"the strategy cannot change in {m.phase}")
+            if m.advisor_hold is not None:
+                raise NotAllowed(
+                    f"the advisor's decision ({m.advisor_hold}) waits for approval: approve or "
+                    "override it (advisor.approve)"
+                )
             est = m.estimate_for(strategy)
             if est is None:
                 raise BadRequest(f"strategy {strategy} does not apply to this VM (validate first)")
@@ -1005,15 +1728,14 @@ class Orchestrator:
             m.strategy = strategy
             m.estimate = est
             m.approvals = []  # the approval was given for the previous strategy (SDD §5.4)
-            m.cutover_requested = False
-            m.force_window = False
+            _clear_request(m)
             await self._save(m, v)
-        source_id = m.vm.source_id
+            source_id = m.vm.source_id
 
-        def override(plan: Plan) -> None:
-            plan.strategy_overrides[source_id] = strategy
+            def override(plan: Plan) -> None:
+                plan.strategy_overrides[source_id] = strategy
 
-        plan = await self._update_plan(m.plan_id, override)
+            plan = await self._update_plan(m.plan_id, override)
         await self._emit(
             "migration.action",
             f"{m.vm.name}: strategy set to {strategy}",
@@ -1030,6 +1752,131 @@ class Orchestrator:
         )
         return m
 
+    async def approve_recommendation(self, rec_id: str, actor: str) -> AdvisorRecommendation:
+        """Apply the advisor's recommended option (SDD §14.6)."""
+        return await self._decide_recommendation(rec_id, Approve(user=actor), actor)
+
+    async def override_recommendation(
+        self, rec_id: str, option: str, reason: str | None, actor: str
+    ) -> AdvisorRecommendation:
+        """Choose another eligible option than the advisor did (SDD §14.6)."""
+        reason = (reason or "").strip() or None
+        return await self._decide_recommendation(
+            rec_id, Override(user=actor, option=option, reason=reason), actor
+        )
+
+    async def _decide_recommendation(
+        self, rec_id: str, action: Approve | Override, actor: str
+    ) -> AdvisorRecommendation:
+        if rec_id.startswith(LEGACY_PREFIX):
+            raise NotAllowed("a legacy entry is history: it cannot be approved or overridden")
+        rec = await self.db.get("recommendation", rec_id, AdvisorRecommendation)
+        if rec.migration_id is None or rec.plan_id is None:
+            raise NotAllowed(f"recommendation {rec_id} decides nothing a person can change yet")
+        mid, plan_id = rec.migration_id, rec.plan_id
+        _refuse_unchangeable((await self._load(mid))[0])  # before the plan's lock (SDD §8)
+        async with self._lock(f"plan:{plan_id}"), self._lock(mid):
+            stored = await self.db.list("recommendation", AdvisorRecommendation, migration_id=mid)
+            newest = max(stored, key=lambda r: (r.created_at, r.id))
+            if newest.id != rec_id:
+                raise NotAllowed(f"a newer recommendation ({newest.id}) replaced {rec_id}")
+            rec = newest
+            plan = await self._plan(plan_id)
+            policies = await self.db.list("advisor_policy", AdvisorPolicy)
+            policy = resolve_policy(
+                policies, plan.id, plan.source_provider_id, rec.decision_type, self.settings
+            )
+            # SDD §14.6: the rules of the policy that took the decision, as they were then; the
+            # policy in force only for a decision that recorded none (the fallback, older data)
+            distinct = rec.decision.require_distinct_approver
+            if distinct is None:
+                distinct = policy.require_distinct_approver
+            reason_required = rec.decision.require_override_reason
+            if reason_required is None:
+                reason_required = policy.require_override_reason
+            if distinct and rec.requested_by == actor:
+                raise NotAllowed(OWN_DECISION)  # maker-checker (SDD §14.6, ADV-17)
+            if isinstance(action, Override) and reason_required:
+                if len(action.reason or "") < 10:
+                    raise Unprocessable(
+                        f"policy {rec.decision.policy_id or policy.id} requires an override "
+                        "reason of at least 10 characters"
+                    )
+            m, v = await self._load(mid)
+            if m.phase not in REVALIDATABLE:
+                raise NotAllowed(f"the strategy cannot change in {m.phase}")
+            pinned = plan.strategy_overrides.get(m.vm.source_id)
+            if pinned is not None:
+                # SDD §14.6: a person set the strategy in the plan, which a validation honours
+                # without a recommendation - the newest one no longer stands
+                raise NotAllowed(
+                    f"The plan sets the strategy of {m.vm.name} ({pinned}): change it in the plan."
+                )
+            if isinstance(action, Approve) and rec.decision.status == DecisionStatus.approved:
+                raise NotAllowed("The decision is already approved.")  # one event per change
+            eligible = tuple(e.strategy.value for e in m.estimates if e.eligible)
+            advice = Advice(
+                option=rec.recommendation.option,
+                confidence=rec.recommendation.confidence,
+                scope=eligible,
+                options=eligible,
+            )
+            try:
+                decision = decide(
+                    advice, policy, 0, m.strategy.value, action=action, now=self._now()
+                )
+            except ValueError as exc:
+                if isinstance(action, Override):
+                    raise Unprocessable(str(exc)) from None
+                raise NotAllowed(str(exc)) from None
+            before = rec.decision
+            # the rules go on with a person's decision: a later one follows them too
+            decision = decision.model_copy(
+                update={
+                    "require_distinct_approver": distinct,
+                    "require_override_reason": reason_required,
+                }
+            )
+            rec = rec.model_copy(update={"decision": decision})
+            await self.db.put("recommendation", rec)
+            final = Strategy(str(decision.final_option))
+            changed = final != m.strategy
+            m.strategy = final
+            m.estimate = m.estimate_for(final)
+            m.advisor_hold = None
+            if changed:  # the approval was given for the previous strategy (SDD §5.4)
+                m.approvals = []
+                _clear_request(m)
+            await self._save(m, v)
+            if isinstance(action, Override):
+                source_id = m.vm.source_id
+
+                def keep(fresh: Plan) -> None:
+                    fresh.strategy_overrides[source_id] = final
+
+                # SDD §14.6: under the plan's lock, with the decision - a validation waiting for
+                # the lock honours the override instead of asking the advisor again
+                plan = await self._update_plan(plan_id, keep)
+        if isinstance(action, Override):
+            await self._emit(
+                "plan.updated",
+                f"{plan.name}: strategy override for {m.vm.name}",
+                plan_id=plan.id,
+                actor=actor,
+                data={"strategy_overrides": {source_id: str(final)}},
+            )
+        kind, message, by, data = decision_event(rec, before)
+        await self._emit(kind, message, migration=m, actor=by, data=data)
+        if changed:
+            await self._emit(
+                "migration.action",
+                f"{m.vm.name}: strategy set to {final} by the advisor decision",
+                migration=m,
+                actor=actor,
+                data={"action": "strategy", "strategy": str(final)},
+            )
+        return rec
+
     # ------------------------------------------------------------------------------------------
     # lifecycle and tick loop
     async def start(self) -> None:
@@ -1040,10 +1887,27 @@ class Orchestrator:
         for m in await self.db.list("migration", Migration):
             if m.phase in fsm.RESUMABLE_PHASES:
                 self._launch(m.id)
+            elif (
+                m.phase == P.cancelled and m.checkpoint == "cleanup" and m.id not in self._cleanups
+            ):
+                # a cleanup a stop or a crash cut short runs again (SDD §5.1)
+                self._cleanups[m.id] = asyncio.create_task(
+                    self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
+                )
             if any(c.to_phase in (P.precopy, P.cutover) for c in m.phase_history):
                 self._prestage_done.add(m.plan_id)  # work started: resources were pre-staged
         self._tick_task = asyncio.create_task(self._loop(), name="seamless-orchestrator")
         self._started = True
+
+    def pending_cleanups(self) -> int:
+        """How many cancels' cleanups this process runs now (SDD §5.1)."""
+        return len(self._cleanups)
+
+    async def drain_cleanups(self) -> None:
+        """Wait for the cancels' cleanups this process started - the CLI exits after them, as
+        its end would cut them short (SDD §15)."""
+        while self._cleanups:
+            await asyncio.gather(*list(self._cleanups.values()), return_exceptions=True)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -1051,6 +1915,7 @@ class Orchestrator:
             t
             for t in (
                 self._tick_task,
+                self._watch_task,
                 *self._drivers.values(),
                 *self._prestage_tasks.values(),
                 *self._steps.values(),
@@ -1062,6 +1927,7 @@ class Orchestrator:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._tick_task = None
+        self._watch_task = None
         self._started = False
         self._drivers.clear()
         self._steps.clear()
@@ -1122,6 +1988,7 @@ class Orchestrator:
 
     async def tick(self) -> None:
         await self._resume_orphans()
+        self._start_source_watch()
         all_plans = await self.db.list("plan", Plan)
         plans = [p for p in all_plans if p.status == PlanStatus.running]
         if not plans:
@@ -1129,8 +1996,8 @@ class Orchestrator:
         # only the migrations of plans that can still have work: running ones, plus paused and
         # re-validated ones whose in-flight steps still count against the concurrency limits
         live = (PlanStatus.running, PlanStatus.paused, PlanStatus.validated)
-        active = [p.id for p in all_plans if p.status in live]
-        migrations = await self.db.list("migration", Migration, plan_id=active)
+        active = {p.id for p in all_plans if p.status in live}
+        migrations = [m for m in await self._migrations.get() if m.plan_id in active]
         by_plan: dict[str, list[Migration]] = defaultdict(list)
         for m in migrations:
             by_plan[m.plan_id].append(m)
@@ -1143,7 +2010,7 @@ class Orchestrator:
             await self._tick_plan(plan, by_plan.get(plan.id, []), counts, now)
 
     def _gate(self, m: Migration, plan: Plan, now: datetime) -> bool:
-        if plan.require_approval and not m.approvals:
+        if plan.require_approval and not counted_approvals(m, plan):
             return False
         window = plan.cutover_window
         if window is not None and not m.force_window and not window.contains(now):
@@ -1229,6 +2096,15 @@ class Orchestrator:
 
         # 4. plan completion
         if all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+            await self._complete(plan)
+
+    async def _complete(self, plan: Plan) -> None:
+        # SDD §8: under the plan's lock, on the migrations re-read there — a retry that returned
+        # after the tick's snapshot keeps the plan running (SDD §5.1)
+        async with self._lock(f"plan:{plan.id}"):
+            migs = await self.db.list("migration", Migration, plan_id=plan.id)
+            if not all(m.phase in fsm.WAVE_COMPLETE_PHASES for m in migs):
+                return
             completed = False
 
             def finish(fresh: Plan) -> bool:
@@ -1259,6 +2135,8 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase not in allowed:
                 return False
+            if m.advisor_hold is not None:
+                return False  # its advisor decision waits for approval (SDD §5.4, §14.6)
             # the tick chose it for its strategy on its snapshot; set_strategy under this lock may
             # have changed it since: a pre-copy is a warm migration's, a cutover from ready a
             # single-shot one's (SDD §8)
@@ -1312,6 +2190,30 @@ class Orchestrator:
                     kwargs["deploy_conversion_hosts"] = any(
                         m.strategy in (Strategy.cold, Strategy.warm) for m in migs
                     )
+                params = inspect.signature(executor.prestage).parameters
+                scoped = {"flavors": "prestage_flavors", "keypairs": "prestage_keypairs"}
+                if any(r in plan.prestage_resources and scoped[r] in params for r in scoped):
+                    # only the plan's flavors RHOSO lacks (a destination flavor is shared by every
+                    # project and never pre-staged over) and the keypairs the destination user
+                    # lacks and the source user owns (SDD §7.2)
+                    src_inv = await self.providers.get(source).inventory()
+                    dst_inv = await self.providers.get(destination).inventory()
+                    if "flavors" in plan.prestage_resources and "prestage_flavors" in params:
+                        kwargs["prestage_flavors"] = sorted(
+                            {
+                                m.vm.flavor
+                                for m in migs
+                                if m.vm.flavor and flavor_prestaged(m.vm, plan, dst_inv)
+                            }
+                        )
+                    if "keypairs" in plan.prestage_resources and "prestage_keypairs" in params:
+                        kwargs["prestage_keypairs"] = sorted(
+                            {
+                                m.vm.key_name
+                                for m in migs
+                                if m.vm.key_name and keypair_prestaged(m.vm, plan, src_inv, dst_inv)
+                            }
+                        )
                 await executor.prestage(plan, source, destination, **kwargs)
             self._prestage_done.add(plan.id)
             await self._emit(
@@ -1325,17 +2227,29 @@ class Orchestrator:
             raise
         except Exception as exc:
             log.exception("prestage of %s failed", plan.id)
+            failed = False
 
-            def fail(fresh: Plan) -> None:
+            def fail(fresh: Plan) -> bool:
+                nonlocal failed
+                failed = fresh.status == PlanStatus.running  # re-evaluated on every retry
+                if not failed:
+                    return False
                 fresh.status = PlanStatus.failed
+                return True
 
-            await self._update_plan(plan.id, fail)
-            await self._emit(
-                "plan.updated",
-                f"{plan.name}: pre-staging failed",
-                plan_id=plan.id,
-                data={"status": "failed", "error": redact(str(exc))[:500]},
-            )
+            # SDD §8: a status writer like the others, under the plan's lock; only a plan that
+            # still runs fails. One paused, validated again or edited meanwhile keeps its status
+            # (an edited draft must not become a failed plan that start_plan accepts unvalidated)
+            # and pre-stages again at its next start
+            async with self._lock(f"plan:{plan.id}"):
+                await self._update_plan(plan.id, fail)
+                error = redact(str(exc))[:500]
+                await self._emit(
+                    "plan.updated",
+                    f"{plan.name}: pre-staging failed",
+                    plan_id=plan.id,
+                    data={"status": "failed", "error": error} if failed else {"error": error},
+                )
         finally:
             self._prestage_tasks.pop(plan.id, None)
 
@@ -1345,8 +2259,8 @@ class Orchestrator:
         """SDD §8: drive again a migration in a resumable phase whose driver task died — after a
         backoff while it keeps crashing, and never while its step task still runs."""
         now = time.monotonic()
-        resumable = await self.db.list("migration", Migration, phase=list(fsm.RESUMABLE_PHASES))
-        for m in resumable:
+        migrations = await self._migrations.get()
+        for m in (m for m in migrations if m.phase in fsm.RESUMABLE_PHASES):
             driver, step = self._drivers.get(m.id), self._steps.get(m.id)
             if (driver is not None and not driver.done()) or (step is not None and not step.done()):
                 continue
@@ -1432,9 +2346,8 @@ class Orchestrator:
                 await self._mark_downtime(mid, at)
 
         async def log_line(line: str) -> None:
-            await self._emit(
-                "migration.log", line[:2000], plan_id=m.plan_id, persist=False, migration=m
-            )
+            text = redact_cut(line, LOG_LINE_CHARS)
+            await self._emit("migration.log", text, plan_id=m.plan_id, persist=False, migration=m)
 
         return StepContext(
             plan=plan,
@@ -1596,6 +2509,8 @@ class Orchestrator:
             observed = observed_scan_rate(sync_pass, m.vm, params_for_plan(plan))
             if observed is not None:
                 m.observed_scan_bps = observed
+        if sync_pass.kind == SyncPassKind.final:
+            return  # the estimate stays the one the convergence rule used (SDD §5.3, ADV-16)
         fresh = estimate(m.vm, m.strategy, self._params(m, plan), plan.downtime_slo_s)
         if m.estimate is not None:
             fresh = fresh.model_copy(
@@ -1626,24 +2541,65 @@ class Orchestrator:
         )
         return cur, v
 
-    def _converged(self, m: Migration, plan: Plan) -> tuple[bool, str]:
+    def _converged(self, m: Migration, plan: Plan) -> tuple[ConvergedBy | None, str]:
+        """The rule that ends the passes, or ``None`` and why another pass runs (SDD §5.3)."""
         last = m.sync_passes[-1]
+        if m.force_cutover is not None:  # the only way past the rules below (SDD §5.4)
+            force = m.force_cutover
+            return "force", f"Force cutover by {force.actor}: {force.reason}"
         counted = Strategy(m.strategy) != Strategy.vmware_warm  # CBT passes report no bytes
         if counted and last.bytes_changed <= plan.convergence_threshold_bytes:
-            return True, f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
+            return "threshold", f"converged: last pass changed {_fmt_bytes(last.bytes_changed)}"
         final = estimate_final_downtime(
             m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
         )
         if final <= plan.downtime_slo_s:
-            return True, f"estimated final downtime {final:.0f} s is within the SLO"
+            return "slo", f"estimated final downtime {final:.0f} s is within the SLO"
         if len(m.sync_passes) >= plan.max_sync_passes:
-            return True, f"max_sync_passes ({plan.max_sync_passes}) reached"
-        return False, (
+            return "max_passes", f"max_sync_passes ({plan.max_sync_passes}) reached"
+        return None, (
             f"another delta pass: changed {_fmt_bytes(last.bytes_changed)}, "
             f"estimated downtime {final:.0f} s"
             if counted
             else f"another CBT pass: estimated downtime {final:.0f} s"
         )
+
+    def _converge(self, m: Migration, plan: Plan, rule: ConvergedBy) -> None:
+        """Record the rule, and make the estimate the one it used: the final-downtime estimate
+        with its parts (SDD §5.3, ADV-16)."""
+        m.converged_by = rule
+        last = m.sync_passes[-1]
+        parts = final_downtime_parts(
+            m.vm, m.strategy, float(last.duration_s or 0.0), self._params(m, plan)
+        )
+        if m.estimate is not None:
+            downtime = sum(parts.values())
+            m.estimate = m.estimate.model_copy(
+                update={
+                    "downtime_s": downtime,
+                    "downtime_parts": parts,
+                    "total_s": m.estimate.precopy_s + downtime,
+                    "meets_slo": downtime <= plan.downtime_slo_s,
+                }
+            )
+
+    def _downtime_s(self, m: Migration, ended: datetime, plan: Plan) -> float:
+        """The downtime of a verified migration (SDD §5.2): wall time, or - after a simulated
+        cutover - its model seconds plus the plan's boot time, like the passes' durations."""
+        if m.downtime_model_s is not None:
+            return m.downtime_model_s + self._params(m, plan).boot_s
+        assert m.downtime_started_at is not None
+        return (ended - m.downtime_started_at).total_seconds()
+
+    def _rollback_downtime_s(self, m: Migration, ended: datetime, plan: Plan) -> float:
+        """The downtime a rollback ends (SDD §5.2): wall time, or - in demo mode - the model
+        seconds the simulated steps reported, plus the plan's boot time when the cutover had
+        finished (the destination booted for its verification)."""
+        if m.downtime_model_s is not None:
+            booted = m.checkpoint == "cutover"
+            return m.downtime_model_s + (self._params(m, plan).boot_s if booted else 0.0)
+        assert m.downtime_started_at is not None
+        return (ended - m.downtime_started_at).total_seconds()
 
     async def _do_pass(self, m: Migration) -> None:
         step = StepName.PRECOPY if m.phase == P.precopy else StepName.SYNC
@@ -1672,12 +2628,13 @@ class Orchestrator:
             cur.progress_pct = 100.0
             cur.checkpoint = f"{step}:{next_pass_number(cur)}"
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
-            converged, why = self._converged(cur, plan)
-            if converged:
+            rule, why = self._converged(cur, plan)
+            if rule is not None:
+                self._converge(cur, plan, rule)
                 await self._transition(cur, v, P.awaiting_cutover, why)
             elif cur.phase == P.precopy:
                 await self._transition(cur, v, P.syncing, why)
-        if converged:
+        if rule is not None:
             self.wake()
 
     async def _do_cutover(self, m: Migration) -> None:
@@ -1701,6 +2658,9 @@ class Orchestrator:
             if result.sync_pass is not None:
                 cur, v = await self._record_pass(cur, v, result.sync_pass, plan)
             cur.destination_server_id = result.destination_server_id or cur.destination_server_id
+            # a simulated cutover counts its downtime in model seconds, added to those an open
+            # clock kept from an earlier attempt (SDD §5.2, ADV-16)
+            _add_model_s(cur, result.details)
             cur.checkpoint = "cutover"
             cur.progress_pct = 100.0
             if cur.downtime_started_at is None:
@@ -1735,11 +2695,16 @@ class Orchestrator:
         if result is None:
             return
         note: AdvisorNote | None = None
+        # what the rules ask review for (SDD §7.5, ADV-18): an unreachable probe, a database VM
+        # that only booted - with or without the advisor
+        rules_reason = review_reason(m.vm, plan, result) if result.passed else None
         # SDD §14.2: the advisor may flag a *passed* verification; a failed one carries
         # provider error text (endpoints) the review cannot change and must not ship
         if plan.verification.use_advisor and self.advisor is not None and result.passed:
             try:
-                note = await self.advisor.review_verification(m.vm, result)
+                note = await self.advisor.review_verification(
+                    m.vm, result, review_reason=rules_reason
+                )
             except Exception:
                 log.warning("verification review failed", exc_info=True)
         summary = result.summary()
@@ -1747,6 +2712,11 @@ class Orchestrator:
             cur, v = await self._load(m.id)
             if cur.phase != P.verifying:
                 return
+            # the checks and probe results, passed or failed (SDD §7.5)
+            cur.verification = result.record(self._now())
+            if rules_reason:
+                cur.review_required = True
+                cur.review_reason = rules_reason
             if note is not None:
                 cur.advisor_notes.append(note)
                 if note.data.get("review_required"):
@@ -1754,10 +2724,16 @@ class Orchestrator:
                     cur.review_reason = note.data.get("review_reason")
             if result.passed:
                 now = self._now()
-                if cur.downtime_started_at is not None:
+                # SDD §5.2: a verification run again (a stop or a failed event write came before
+                # completed) keeps the end the first one recorded: the outage ended then
+                if cur.downtime_started_at is not None and cur.downtime_ended_at is None:
                     cur.downtime_ended_at = now
-                    cur.actual_downtime_s = (now - cur.downtime_started_at).total_seconds()
+                    cur.actual_downtime_s = self._downtime_s(cur, now, plan)
                 cur.checkpoint = "verified"
+                # the numbers of a completed migration must hold together (SDD §5.5, ADV-16)
+                cur.data_issues = check_invariants(
+                    cur, await self._plan(cur.plan_id), self.settings
+                )
             v = await self._save(cur, v)
             # events first, then the terminal transition (nothing is lost on a stop)
             if note is not None:
@@ -1774,6 +2750,14 @@ class Orchestrator:
                         f"{cur.vm.name}: verified after {cur.actual_downtime_s:.0f} s of downtime",
                         migration=cur,
                         data={"actual_downtime_s": cur.actual_downtime_s},
+                    )
+                if cur.data_issues:
+                    await self._emit(
+                        "migration.data_inconsistent",
+                        f"{cur.vm.name}: its numbers do not hold together - "
+                        + "; ".join(cur.data_issues),
+                        migration=cur,
+                        data={"issues": list(cur.data_issues)},
                     )
                 cur, v = await self._transition(
                     cur, v, P.completed, "verification passed", data={"verification": summary}
@@ -1806,7 +2790,14 @@ class Orchestrator:
             return
         if result is None:
             return
-        old_source_id = m.vm.source_id
+        plan = await self._plan(m.plan_id)
+        vm = result.details.get("vm")
+        recreated = VMRef.model_validate(vm) if isinstance(vm, dict) else None
+        if recreated is not None and recreated.source_id != m.vm.source_id:
+            # SDD §7.3: the plan follows a recreated source VM before the migration is rolled
+            # back - rolled_back is never resumed, so a stop after it would lose the rewrite; a
+            # stop before it resumes rolling_back, and the rewrite changes nothing the second time
+            await self._replace_vm_id(m.plan_id, m.vm.source_id, recreated.source_id)
         async with self._lock(m.id):
             cur, v = await self._load(m.id)
             if cur.phase != P.rolling_back:
@@ -1815,13 +2806,14 @@ class Orchestrator:
                 (c.reason for c in reversed(cur.phase_history) if c.to_phase == P.rolling_back),
                 "rollback",
             )
-            if isinstance(result.details.get("vm"), dict):
-                cur.vm = VMRef.model_validate(result.details["vm"])
-            ended = cur.downtime_started_at is not None and cur.downtime_ended_at is None
+            if recreated is not None:
+                cur.vm = recreated
+            ended = fsm.source_stopped(cur)
             if ended:
                 now = self._now()
                 cur.downtime_ended_at = now
-                cur.actual_downtime_s = (now - cur.downtime_started_at).total_seconds()
+                _add_model_s(cur, result.details)
+                cur.actual_downtime_s = self._rollback_downtime_s(cur, now, plan)
             cur.destination_server_id = None
             cur.checkpoint = "rolled_back"
             v = await self._save(cur, v)
@@ -1835,21 +2827,34 @@ class Orchestrator:
             cur, v = await self._transition(
                 cur, v, P.rolled_back, "rollback finished; the source VM runs again"
             )
-        if cur.vm.source_id != old_source_id:
-            await self._replace_vm_id(cur.plan_id, old_source_id, cur.vm.source_id)
         if self.knowledge is not None:
             await self.knowledge.on_rolled_back(cur, reason)
         self.wake()
 
     async def _replace_vm_id(self, plan_id: str, old: str, new: str) -> None:
-        def rewrite(plan: Plan) -> None:
+        """The plan follows a recreated source VM (SDD §7.3): every field keyed by its id; once
+        done nothing names ``old``, and a repeat writes nothing."""
+        changed = False
+
+        def rewrite(plan: Plan) -> bool:
+            nonlocal changed
+            before = plan.model_dump()
             plan.vm_ids = [new if v == old else v for v in plan.vm_ids]
             for wave in plan.waves:
                 wave.vm_ids = [new if v == old else v for v in wave.vm_ids]
             if old in plan.strategy_overrides:
                 plan.strategy_overrides[new] = plan.strategy_overrides.pop(old)
+            if old in plan.probe_overrides:
+                plan.probe_overrides[new] = plan.probe_overrides.pop(old)
+            # its ports keep their MACs (the rollback recreates them with theirs, §7.3)
+            if old in plan.nic_overrides:
+                plan.nic_overrides[new] = plan.nic_overrides.pop(old)
+            changed = plan.model_dump() != before
+            return changed
 
         plan = await self._update_plan(plan_id, rewrite)
+        if not changed:
+            return
         await self._emit(
             "plan.updated",
             f"{plan.name}: source VM {old} is now {new}",
@@ -1871,15 +2876,31 @@ class Orchestrator:
             if cur.phase != expected:
                 return  # an operator action moved the migration meanwhile
             cur.error = f"{step}: {message}"[:1000]
-            cur, v = await self._transition(
-                cur, v, P.failed, f"{step} failed: {message[:200]}", data=data
+            if isinstance(exc, PermanentStepError) and fsm.source_stopped(cur):
+                # the model seconds a failed simulated step kept the source stopped (SDD §5.2)
+                _add_model_s(cur, exc.details)
+            plan = await self._plan(cur.plan_id)
+            steps: list[tuple[Phase, str, dict[str, Any] | None]] = [
+                (P.failed, f"{step} failed: {message[:200]}", data)
+            ]
+            rollback = (
+                expected != P.rolling_back
+                and cur.downtime_started_at is not None
+                and plan.verification.auto_rollback
             )
+            if rollback:
+                # SDD §8: saved with the failure — a restart or a failed event write right after
+                # it resumes the rollback, never leaving the stopped VM in failed
+                steps.append((P.rolling_back, f"automatic rollback after {step} failure", None))
+            cur, v = await self._transitions(cur, v, steps)
         await self._emit(
             "migration.error",
             f"{cur.vm.name}: {step} failed: {message[:300]}",
             migration=cur,
             data={"step": str(step), "error_class": type(exc).__name__, "message": message[:1000]},
         )
+        if rollback:
+            self._launch(mid)
         if self.knowledge is not None:
             note = await self.knowledge.on_failure(cur, str(step), exc)
             if note is not None:
@@ -1887,19 +2908,6 @@ class Orchestrator:
                     cur, v = await self._load(mid)
                     cur.advisor_notes.append(note)
                     await self._save(cur, v)
-        plan = await self._plan(cur.plan_id)
-        if (
-            expected != P.rolling_back
-            and cur.downtime_started_at is not None
-            and plan.verification.auto_rollback
-        ):
-            async with self._lock(mid):
-                cur, v = await self._load(mid)
-                if cur.phase == P.failed:
-                    await self._transition(
-                        cur, v, P.rolling_back, f"automatic rollback after {step} failure"
-                    )
-            self._launch(mid)
 
 
 def phases(migrations: Iterable[Migration]) -> Counter[str]:

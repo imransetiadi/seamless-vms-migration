@@ -9,21 +9,38 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
 from pydantic import ValidationError
 
 from . import __version__
+from .ai.redaction import redact
 from .config import Settings
-from .domain.enums import ProviderKind, Role, Strategy, strategies_for
-from .domain.models import Migration, Plan, PlanCreate, Provider, VMRef
+from .domain.enums import Phase, ProviderKind, Role, Strategy, strategies_for
+from .domain.models import (
+    PLAN_EDITABLE_FIELDS,
+    Migration,
+    Plan,
+    PlanCreate,
+    Provider,
+    VMRef,
+    utcnow,
+)
 from .planning.estimator import EstimatorParams, estimate, invalid_estimator_overrides
-from .security.auth import TokenStore, auth_disabled_allowed, generate_token, is_loopback
+from .security.auth import (
+    MAX_TOKEN_NAME,
+    RESERVED_TOKEN_NAMES,
+    TokenStore,
+    auth_disabled_allowed,
+    generate_token,
+    is_loopback,
+)
 
 log = logging.getLogger("seamless_migrate")
+T = TypeVar("T")
 
 
 _PLAN_ID = re.compile(r"^plan-[0-9a-f]{8}$")
@@ -52,16 +69,25 @@ def _gib(n: int) -> str:
     return f"{n / 2**30:.1f}"
 
 
+class _RedactingFormatter(logging.Formatter):
+    """A plain service-log line leaves through redact, its traceback included: the chained
+    exceptions carry what an SDK printed (SDD §13.4)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            # redacted before serialization: redacting the JSON line could break its quoting
+            "message": redact(record.getMessage()),
         }
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
+            payload["exc"] = redact(self.formatException(record.exc_info))
         return json.dumps(payload)
 
 
@@ -70,10 +96,15 @@ def configure_logging(settings: Settings) -> None:
     if settings.log_json:
         handler.setFormatter(_JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(_RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(settings.log_level.upper())
+
+
+#: on SIGTERM the server waits this long for open requests — an event stream never ends by
+#: itself — then cancels them, so the lifespan stops the orchestrator (SDD §8)
+SHUTDOWN_GRACE_S = 5
 
 
 #: uvicorn installs its own plain-text handlers; ``uvicorn_log_config`` routes them through the
@@ -146,6 +177,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
             reload=True,
             log_level=settings.log_level.lower(),
             log_config=uvicorn_log_config(settings.log_level),
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
         )
         return
     uvicorn.run(
@@ -155,6 +187,7 @@ def run_server(app: Any, settings: Settings, reload: bool) -> None:  # pragma: n
         log_level=settings.log_level.lower(),
         log_config=uvicorn_log_config(settings.log_level),
         proxy_headers=True,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
     )
 
 
@@ -203,6 +236,14 @@ def cmd_serve(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_token_create(args: argparse.Namespace, settings: Settings) -> int:
+    # SDD §13.1: never an entry the tokens file refuses, nor a token acting as the control plane
+    if not args.name or len(args.name) > MAX_TOKEN_NAME:
+        raise CliError(f"a token name has 1 to {MAX_TOKEN_NAME} characters")
+    if args.name.strip().casefold() in RESERVED_TOKEN_NAMES:
+        raise CliError(f"{args.name!r} is an actor the control plane records itself; pick another")
+    if ":" in args.name:
+        # the form of the advisor's actors and deciders: policy:<id>, user:<name>, system:… (§14.4)
+        raise CliError(f"{args.name!r} has a colon, the form of the advisor's actors; pick another")
     token = generate_token()
     print(token)
     print(TokenStore.yaml_entry(args.name, Role(args.role), token), end="")
@@ -237,6 +278,12 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         spec = PlanCreate.model_validate(document)
     except ValidationError as exc:
         raise CliError(f"invalid plan: {exc}") from None
+    from .plan_checks import PlanSpecError, check_plan_spec
+
+    try:
+        check_plan_spec(spec)  # SDD §15: what POST /plans refuses, the CLI refuses too
+    except PlanSpecError as exc:
+        raise CliError(str(exc)) from None
     store = _store(settings)
     _resolve_providers(store, spec)
     plans = store.list("plan", Plan)
@@ -252,14 +299,63 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
         plan = Plan(**spec.model_dump(), **({"id": plan_id} if plan_id else {}))
         store.put("plan", plan, expected_version=0)
         kind, verb = "plan.created", "created"
+        data: dict[str, Any] = {"name": plan.name, "vms": len(plan.vm_ids)}
     else:
+        from .orchestrator import (
+            PROVIDER_FIELDS,
+            blocks_plan_change,
+            failed_provider_change_refusal,
+            in_flight_refusal,
+        )
+        from .store import ConflictError
+
+        # SDD §15: an update follows PATCH /plans/{id} (§12), against the version it read
+        existing, version = store.get_versioned("plan", existing.id, Plan)
+        # the file's keys are the PATCH body, refused first as PATCH refuses them (§12)
+        # a YAML key that is no string (`1:`, `yes:`) is a field the plan cannot change too
+        unknown = sorted(str(key) for key in document if key not in PLAN_EDITABLE_FIELDS)
+        if unknown:
+            raise CliError(f"fields cannot be changed: {', '.join(unknown)}")
         if str(existing.status) not in ("draft", "validated"):
             raise CliError(f"plan {existing.id} is {existing.status}; it cannot be changed")
-        plan = Plan.model_validate(
-            {**existing.model_dump(mode="json"), **spec.model_dump(mode="json"), "status": "draft"}
+        migrations = store.list("migration", Migration, plan_id=existing.id)
+        busy = [m for m in migrations if blocks_plan_change(m)]
+        if busy:
+            raise CliError(in_flight_refusal(busy, "editing the plan"))
+        if any(getattr(spec, f) != getattr(existing, f) for f in PROVIDER_FIELDS):
+            # SDD §12: a failed migration's rollback acts on the clouds its attempt used
+            failed = [m.vm.name for m in migrations if m.phase == Phase.failed]
+            if failed:
+                raise CliError(failed_provider_change_refusal(failed))
+        # the file's keys are the PATCH body: what it leaves out keeps its value, and the plan it
+        # would store is checked, kept fields included (SDD §15, §12)
+        merged = PlanCreate.model_validate(
+            {
+                **existing.model_dump(mode="json", include=PLAN_EDITABLE_FIELDS),
+                **spec.model_dump(mode="json", include=set(document)),
+            }
         )
-        store.put("plan", plan)
+        try:
+            check_plan_spec(merged)
+        except PlanSpecError as exc:
+            raise CliError(str(exc)) from None
+        plan = Plan.model_validate(
+            {
+                **existing.model_dump(mode="json"),
+                **merged.model_dump(mode="json"),
+                "status": "draft",
+                "updated_at": utcnow(),
+            }
+        )
+        try:
+            store.put("plan", plan, expected_version=version)
+        except ConflictError:
+            # a running server changed it meanwhile (a start, a validation): never overwrite that
+            raise CliError(
+                f"plan {existing.id} changed while it was being applied; run plan apply again"
+            ) from None
         kind, verb = "plan.updated", "updated"
+        data = {"fields": sorted(document)}
     asyncio.run(
         emit(
             store,
@@ -268,15 +364,33 @@ def cmd_plan_apply(args: argparse.Namespace, settings: Settings) -> int:
             f"plan {plan.name} {verb} from the CLI",
             plan_id=plan.id,
             actor="cli",
+            data=data,
         )
     )
     print(f"{verb} {plan.id}")
     return 0
 
 
+def _then_cleanups(orchestrator: Any, work: Coroutine[Any, Any, T]) -> T:
+    """Run ``work``, then wait for the cleanups of the migrations it cancelled: the process's end
+    would cut them short (SDD §15). They run whether ``work`` succeeded or not."""
+
+    async def run() -> T:
+        try:
+            return await work
+        finally:
+            pending = orchestrator.pending_cleanups()
+            if pending:
+                print(f"cleaning up after {pending} cancelled migration(s)...", file=sys.stderr)
+                await orchestrator.drain_cleanups()
+
+    return asyncio.run(run())
+
+
 def cmd_plan_validate(args: argparse.Namespace, settings: Settings) -> int:
     services = _services(settings)
-    report = asyncio.run(services.orchestrator.validate_plan(args.plan_id, "cli"))
+    orchestrator = services.orchestrator
+    report = _then_cleanups(orchestrator, orchestrator.validate_plan(args.plan_id, "cli"))
     rows = []
     for item in report.migrations:
         chosen = next((e for e in item.estimates if e.strategy == item.strategy), None)
@@ -317,7 +431,8 @@ def cmd_plan_validate(args: argparse.Namespace, settings: Settings) -> int:
 
 def cmd_plan_start(args: argparse.Namespace, settings: Settings) -> int:
     services = _services(settings)
-    plan = asyncio.run(services.orchestrator.start_plan(args.plan_id, "cli"))
+    orchestrator = services.orchestrator
+    plan = _then_cleanups(orchestrator, orchestrator.start_plan(args.plan_id, "cli"))
     print(f"plan {plan.id} is {plan.status}")
     return 0
 
@@ -348,6 +463,11 @@ def cmd_estimate(args: argparse.Namespace, settings: Settings) -> int:
     problems = invalid_estimator_overrides(
         {k: v for k, v in overrides.items() if k != "max_passes"}
     )
+    # SDD §15: what a plan refuses (downtime_slo_s, max_sync_passes >= 1, §4.2)
+    if not args.slo >= 1:
+        problems.append("--slo: must be at least 1")
+    if args.max_passes is not None and args.max_passes < 1:
+        problems.append("--max-passes: must be at least 1")
     if problems:
         print("error: " + "; ".join(problems), file=sys.stderr)
         return 2
@@ -447,17 +567,38 @@ def cmd_events_export(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
-    """Delete events older than a date or an age; refuses without ``--confirm``."""
-    from datetime import datetime, timedelta
+    """Delete events older than a date or an age; refuses without ``--confirm`` (SDD §15)."""
+    import math
+    from datetime import UTC, datetime, timedelta
 
-    from .domain.models import utcnow
+    from .events import EventBus, emit
 
+    now = utcnow()
     if args.before:
-        before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+        try:
+            before = datetime.fromisoformat(args.before.replace("Z", "+00:00"))
+        except ValueError:
+            print(f"error: --before {args.before!r} is no ISO date and time", file=sys.stderr)
+            return 2
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=UTC)  # a --before without an offset is UTC
     elif args.older_than_days is not None:
-        before = utcnow() - timedelta(days=float(args.older_than_days))
+        days = float(args.older_than_days)
+        if not math.isfinite(days) or days < 0:
+            print("error: --older-than-days must be a number of days, 0 or more", file=sys.stderr)
+            return 2
+        try:
+            before = now - timedelta(days=days)
+        except OverflowError:
+            # an age reaching back before year 1: a refused argument, never a traceback (SDD §15)
+            print(f"error: --older-than-days {days:g} reaches back before year 1", file=sys.stderr)
+            return 2
     else:
         print("error: give --before <ISO datetime> or --older-than-days N", file=sys.stderr)
+        return 2
+    if before > now:
+        # a cutoff after now deletes the whole trail, the events still to come included
+        print(f"error: --before {before.isoformat()} is after now", file=sys.stderr)
         return 2
     if not args.confirm:
         print(
@@ -466,7 +607,19 @@ def cmd_events_prune(args: argparse.Namespace, settings: Settings) -> int:
             file=sys.stderr,
         )
         return 2
-    deleted = _store(settings).delete_events_before(before)
+    store = _store(settings)
+    deleted = store.delete_events_before(before)
+    # written after the delete, so the trail keeps who cut it and where (SDD §15)
+    asyncio.run(
+        emit(
+            store,
+            EventBus(store),
+            "events.pruned",
+            f"{deleted} event(s) before {before.isoformat()} deleted from the CLI",
+            actor="cli",
+            data={"before": before.isoformat(), "deleted": deleted},
+        )
+    )
     print(f"deleted {deleted} event(s) before {before.isoformat()}")
     return 0
 
@@ -557,11 +710,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # orchestrator/store errors surface as messages, not tracebacks
+        from .ai.redaction import redact_cut
         from .orchestrator import OrchestratorError
         from .providers.base import ProviderError
-        from .store import NotFound
+        from .store import ConflictError, NotFound
 
-        if isinstance(exc, OrchestratorError | ProviderError | NotFound | ValueError):
+        # SDD §15: one line, as the API answers each of these with a status (§12)
+        if isinstance(exc, ProviderError):
+            # an SDK's message may carry endpoint URLs or credentials: the API's 502 (§13.4)
+            print(f"error: {redact_cut(str(exc), 500)}", file=sys.stderr)
+            return 1
+        if isinstance(exc, ConflictError):
+            again = "a running server changed it, run the command again"
+            print(f"error: {exc}; {again}", file=sys.stderr)
+            return 1
+        if isinstance(exc, OrchestratorError | NotFound | ValueError):
             print(f"error: {exc}", file=sys.stderr)
             return 1
         raise

@@ -1,9 +1,13 @@
 import {
   Activity,
+  Archive,
   ArrowRightLeft,
   Bot,
   Download,
+  Eraser,
   BrainCircuit,
+  Gavel,
+  CircleStop,
   CircleX,
   ClipboardList,
   Hand,
@@ -20,9 +24,10 @@ import {
   TimerOff,
   type LucideIcon,
 } from 'lucide-react';
-import { useId, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useEventTail, usePlans } from '../api/hooks';
+import { exportEventTrail, jsonLineParts } from '../api/eventExport';
+import { fetchEventTail, useApi, useEventTail, usePlans } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import type { Event } from '../api/types';
 import { Button } from '../components/Button';
@@ -33,21 +38,30 @@ import { LiveIndicator } from '../components/LiveIndicator';
 import { PageHeader } from '../components/PageHeader';
 import { LoadingBlock } from '../components/Skeleton';
 import { cn } from '../lib/cn';
-import { formatDateTime, formatTime } from '../lib/format';
+import { formatDateTime, formatNumber, formatTime } from '../lib/format';
 import type { Tone } from '../lib/phase';
 import { TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
 const MAX_LIVE = 1000;
 const PAGE = 200;
+/** Events per history request: the page loads this many, and Load older events this many more (SDD §16). */
+const HISTORY = 500;
+const NO_ITEMS: Item[] = [];
 
 const CATEGORIES: Array<{ value: string; label: string; match: (kind: string) => boolean }> = [
   { value: 'all', label: 'All', match: () => true },
   { value: 'migrations', label: 'Migrations', match: (k) => k.startsWith('migration.') },
   { value: 'plans', label: 'Plans and waves', match: (k) => k.startsWith('plan.') || k.startsWith('wave.') },
-  { value: 'advisor', label: 'Advisor and memory', match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') },
+  {
+    value: 'advisor',
+    label: 'Advisor and memory',
+    // the advisor's audit events (SDD §14.5) are advisor activity too
+    match: (k) => k.startsWith('advisor.') || k.startsWith('memory.') || k.startsWith('recommendation.') || k.startsWith('decision.'),
+  },
   { value: 'providers', label: 'Providers', match: (k) => k.startsWith('provider.') },
-  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') },
+  // a prune cuts the audit trail itself (SDD §15)
+  { value: 'security', label: 'Security', match: (k) => k.startsWith('auth.') || k === 'events.pruned' },
 ];
 
 function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
@@ -74,10 +88,13 @@ function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
       return { icon: ScrollText, tone: 'neutral' };
     case 'auth.denied':
       return { icon: ShieldAlert, tone: 'danger' };
+    case 'events.pruned':
+      return { icon: Eraser, tone: 'warning' };
     default:
       if (kind.startsWith('plan.')) return { icon: ClipboardList, tone: 'info' };
       if (kind.startsWith('wave.')) return { icon: Rows3, tone: 'info' };
-      if (kind.startsWith('advisor.')) return { icon: Bot, tone: 'info' };
+      if (kind.startsWith('advisor.') || kind.startsWith('recommendation.')) return { icon: Bot, tone: 'info' };
+      if (kind.startsWith('decision.')) return { icon: Gavel, tone: 'info' };
       if (kind.startsWith('memory.')) return { icon: BrainCircuit, tone: 'info' };
       if (kind.startsWith('provider.')) return { icon: Server, tone: 'neutral' };
       return { icon: Activity, tone: 'neutral' };
@@ -87,10 +104,68 @@ function kindMeta(kind: string): { icon: LucideIcon; tone: Tone } {
 interface Item {
   key: string;
   event: Event;
+  /** `event.ts` in ms, parsed once: the list is sorted again on every live event. */
+  t: number;
+}
+
+function itemOf(key: string, event: Event): Item {
+  return { key, event, t: Date.parse(event.ts) };
 }
 
 function byNewest(a: Item, b: Item): number {
-  return Date.parse(b.event.ts) - Date.parse(a.event.ts) || b.event.seq - a.event.seq;
+  return b.t - a.t || b.event.seq - a.event.seq;
+}
+
+/**
+ * One event. Memoized on the event and its plan's name: a live event redraws the page's count and adds its own row,
+ * so the rows already shown (up to a page of 200) are not drawn again (SDD §16).
+ */
+const EventRow = memo(function EventRow({ event, planName }: { event: Event; planName: string | undefined }) {
+  const meta = kindMeta(event.kind);
+  return (
+    <li className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
+      <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
+        {formatTime(event.ts)}
+        <span className="block text-[11px]">{formatDateTime(event.ts).slice(0, 10)}</span>
+      </time>
+      <span className={cn('inline-flex min-w-0 items-start gap-1.5 text-xs', TONE_CLASSES[meta.tone].text)}>
+        <meta.icon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+        <code className="break-all text-foreground">{event.kind}</code>
+      </span>
+      <div className="min-w-0">
+        <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
+        <p className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+          <span>by {event.actor}</span>
+          {event.plan_id && (
+            <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
+              {planName ?? event.plan_id}
+            </Link>
+          )}
+          {event.migration_id && (
+            <Link to={`/migrations/${event.migration_id}`} className="font-mono underline underline-offset-4">
+              {event.migration_id}
+            </Link>
+          )}
+          {event.seq > 0 && <span className="num">#{event.seq}</span>}
+        </p>
+      </div>
+    </li>
+  );
+});
+
+/** Saves JSON lines as a file, the format of `seamless events export`. */
+function saveJsonLines(lines: string[], name: string): void {
+  const blob = new Blob(lines, { type: 'application/x-ndjson' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function stamp(): string {
+  return new Date().toISOString().slice(0, 19).replace(/:/g, '');
 }
 
 /** Audit trail plus the live stream: history first, streamed events appended at the top. */
@@ -100,12 +175,14 @@ export default function Events() {
   // the plan filter lives in the address like Overview's (SDD §16): its history comes from the API
   const [params, setParams] = useSearchParams();
   const planId = params.get('plan') ?? '';
-  const history = useEventTail(planId ? { plan_id: planId } : {});
+  const history = useEventTail(planId ? { plan_id: planId } : {}, HISTORY);
   const plans = usePlans();
   const [live, setLive] = useState<Item[]>([]);
   const [held, setHeld] = useState<Item[]>([]);
   const [paused, setPaused] = useState(false);
   const [received, setReceived] = useState(0);
+  // only pausing and resuming are announced: a region that read every event out would flood a screen reader (SDD §16)
+  const [announcement, setAnnouncement] = useState('');
   const [showProgress, setShowProgress] = useState(false);
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
@@ -132,7 +209,7 @@ export default function Events() {
       seenLive.current.add(event.seq);
     }
     counter.current += 1;
-    const item = { key: event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event };
+    const item = itemOf(event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event);
     setReceived((n) => n + 1);
     if (pausedRef.current) setHeld((h) => [...h, item].slice(-MAX_LIVE));
     else setLive((l) => [...l, item].slice(-MAX_LIVE));
@@ -140,12 +217,17 @@ export default function Events() {
 
   const planNames = useMemo(() => new Map((plans.data ?? []).map((p) => [p.id, p.name])), [plans.data]);
 
+  const historyItems = useMemo(() => (history.data ?? []).map((event) => itemOf(`seq-${event.seq}`, event)), [history.data]);
+  // pages before the loaded history (SDD §12 `before`), for the plan they were read for; a full page may have more
+  const [older, setOlder] = useState<{ planId: string | null; items: Item[]; more: boolean }>({ planId: null, items: [], more: true });
+  const olderItems = older.planId === planId ? older.items : NO_ITEMS;
   const items = useMemo(() => {
     const merged = new Map<string, Item>();
-    for (const event of history.data ?? []) merged.set(`seq-${event.seq}`, { key: `seq-${event.seq}`, event });
+    for (const item of olderItems) merged.set(item.key, item);
+    for (const item of historyItems) merged.set(item.key, item);
     for (const item of live) merged.set(item.key, item);
     return [...merged.values()].sort(byNewest);
-  }, [history.data, live]);
+  }, [olderItems, historyItems, live]);
 
   const filtered = useMemo(() => {
     const match = CATEGORIES.find((c) => c.value === category)?.match ?? (() => true);
@@ -173,23 +255,88 @@ export default function Events() {
   /** The shown audit events as JSON lines, oldest first — the format of `seamless events export`. */
   const download = () => {
     const events = shownAudit.map(({ event }) => event).sort((a, b) => a.seq - b.seq);
-    const blob = new Blob(events.map((event) => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `seamless-events-${new Date().toISOString().slice(0, 19).replace(/:/g, '')}.jsonl`;
-    link.click();
-    URL.revokeObjectURL(url);
+    saveJsonLines(jsonLineParts(events), `seamless-events-${stamp()}.jsonl`);
+  };
+
+  // the whole trail (SDD §16): every persisted event, the chosen plan's when one is, paged like
+  // `seamless events export`; the same button stops it, so the focus stays where it is
+  const api = useApi();
+
+  // Load older events (SDD §12, §16): the page before the oldest event loaded, for the chosen plan; the same
+  // button as Show older events, so the focus stays on it
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState<unknown>(null);
+  const canLoadOlder = Boolean(history.data) && (older.planId === planId ? older.more : (history.data?.length ?? 0) >= HISTORY);
+  const loadOlder = async () => {
+    const oldest = [...olderItems, ...historyItems].reduce((min, { event }) => (event.seq > 0 ? Math.min(min, event.seq) : min), Infinity);
+    if (!Number.isFinite(oldest)) return;
+    setLoadingOlder(true);
+    setOlderError(null);
+    try {
+      const page = await fetchEventTail(api, { plan_id: planId || undefined, before: oldest }, HISTORY);
+      const pageItems = page.map((event) => itemOf(`seq-${event.seq}`, event));
+      // the history it was read below stays loaded too: when the newest history is read again, its window moves up
+      // and would otherwise leave a gap between it and these pages
+      setOlder((prev) => ({ planId, items: [...pageItems, ...(prev.planId === planId ? prev.items : []), ...historyItems], more: page.length >= HISTORY }));
+      setLimit((n) => n + PAGE);
+      setAnnouncement(page.length ? `Loaded ${page.length} older events.` : 'This is the start of the trail.');
+      // the start of the trail removes the button: focus moves to the list, never to the page (SDD §16)
+      requestAnimationFrame(() => {
+        if (!moreRef.current) listRef.current?.focus();
+      });
+    } catch (error) {
+      setOlderError(error);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+  const [exported, setExported] = useState<number | null>(null);
+  const [exportError, setExportError] = useState<unknown>(null);
+  const exportRun = useRef<AbortController | null>(null);
+  // leaving the page stops an export: nothing is saved behind the operator's back
+  useEffect(() => () => exportRun.current?.abort(), []);
+  const exportTrail = async () => {
+    if (exportRun.current) {
+      exportRun.current.abort();
+      return;
+    }
+    const run = new AbortController();
+    exportRun.current = run;
+    setExported(0);
+    setExportError(null);
+    try {
+      const events = await exportEventTrail(api, { planId: planId || undefined, signal: run.signal, onProgress: setExported });
+      saveJsonLines(jsonLineParts(events), `seamless-events-${planId ? `${planId}-` : ''}all-${stamp()}.jsonl`);
+      setAnnouncement(`Exported ${events.length} events.`);
+    } catch (error) {
+      if (run.signal.aborted) setAnnouncement('Export stopped: nothing was saved.');
+      else setExportError(error);
+    } finally {
+      exportRun.current = null;
+      setExported(null);
+    }
+  };
+
+  const pause = () => {
+    setPaused(true);
+    setAnnouncement('Live updates paused: new events wait until you resume.');
   };
 
   const resume = () => {
     setLive((l) => [...l, ...held].slice(-MAX_LIVE));
     setHeld([]);
     setPaused(false);
+    setAnnouncement(
+      held.length === 0
+        ? 'Live updates resumed: no new event arrived while paused.'
+        : `Live updates resumed: ${held.length} held event${held.length === 1 ? '' : 's'} added.`,
+    );
   };
 
+  // Pause stops everything that updates on its own — the list and this count — until Resume (WCAG 2.2.2, SDD §16)
   const statusText = paused
-    ? `Paused · ${held.length} new event${held.length === 1 ? '' : 's'} held`
+    ? 'Paused · new events wait until you resume'
     : received === 0
       ? 'Live · waiting for new events'
       : `Live · ${received} new event${received === 1 ? '' : 's'} since you opened this page`;
@@ -209,12 +356,15 @@ export default function Events() {
             >
               Download shown events
             </Button>
+            <Button size="lg" icon={exported === null ? Archive : CircleStop} onClick={() => void exportTrail()}>
+              {exported === null ? 'Export the whole trail' : 'Stop export'}
+            </Button>
             {paused ? (
               <Button size="lg" variant="primary" icon={Play} onClick={resume}>
-                Resume ({held.length} new)
+                Resume live updates
               </Button>
             ) : (
-              <Button size="lg" icon={Pause} onClick={() => setPaused(true)}>
+              <Button size="lg" icon={Pause} onClick={pause}>
                 Pause live updates
               </Button>
             )}
@@ -275,67 +425,57 @@ export default function Events() {
 
       <div className="mb-3 flex flex-wrap items-center gap-3 text-xs">
         <LiveIndicator />
-        <p role="status" aria-label="Event stream" className="text-muted-foreground">
-          {statusText}
+        <p className="text-muted-foreground">{statusText}</p>
+        {exported !== null && (
+          // plain text: read on demand, never announced page by page; the result is (SDD §16)
+          <p className="text-muted-foreground">Exporting the whole trail: {formatNumber(exported)} events read</p>
+        )}
+        <p role="status" className="sr-only">
+          {announcement}
         </p>
       </div>
 
       {history.isPending && <LoadingBlock label="Loading the audit trail…" rows={8} />}
       {history.error && <ErrorBanner error={history.error} title="The audit trail is unavailable" onRetry={() => void history.refetch()} />}
-      {/* "No events match" only once the trail is known: a failed load is not an empty trail (SDD §16) */}
-      {history.data && filtered.length === 0 && (
-        <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
-      )}
+      {/* the plan filter is built from the plans: without them it lists only the chosen one (SDD §16) */}
+      {plans.error && <ErrorBanner error={plans.error} title="Plans are unavailable: the plan filter lists only the chosen plan" onRetry={() => void plans.refetch()} />}
+      {exportError !== null && <ErrorBanner error={exportError} title="The export failed: nothing was saved" onRetry={() => void exportTrail()} />}
+      {/* "No events match" only once the trail is known: a failed load is not an empty trail; read out from a live
+          region already on the page — the count is not, as it moves with every live event (SDD §16) */}
+      <div role="status">
+        {history.data && filtered.length === 0 && (
+          <EmptyState icon={ScrollText} title="No events match" description="Change the category or search, or wait for new activity." />
+        )}
+      </div>
 
       {filtered.length > 0 && (
         <ol ref={listRef} tabIndex={-1} aria-label="Events, newest first" className="card divide-y divide-border outline-hidden">
-          {filtered.slice(0, limit).map(({ key, event }) => {
-            const meta = kindMeta(event.kind);
-            return (
-              <li key={key} className="grid grid-cols-[minmax(0,1fr)] gap-1 px-3 py-2.5 sm:grid-cols-[6.5rem_12.5rem_minmax(0,1fr)] sm:gap-3">
-                <time dateTime={event.ts} title={formatDateTime(event.ts)} className="num text-xs text-muted-foreground">
-                  {formatTime(event.ts)}
-                  <span className="block text-[11px]">{formatDateTime(event.ts).slice(0, 10)}</span>
-                </time>
-                <span className={cn('inline-flex min-w-0 items-start gap-1.5 text-xs', TONE_CLASSES[meta.tone].text)}>
-                  <meta.icon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
-                  <code className="break-all text-foreground">{event.kind}</code>
-                </span>
-                <div className="min-w-0">
-                  <p className="wrap-break-word text-sm text-foreground">{event.message || '—'}</p>
-                  <p className="flex flex-wrap gap-x-2 text-xs text-muted-foreground">
-                    <span>by {event.actor}</span>
-                    {event.plan_id && (
-                      <Link to={`/plans/${event.plan_id}`} className="underline underline-offset-4">
-                        {planNames.get(event.plan_id) ?? event.plan_id}
-                      </Link>
-                    )}
-                    {event.migration_id && (
-                      <Link to={`/migrations/${event.migration_id}`} className="font-mono underline underline-offset-4">
-                        {event.migration_id}
-                      </Link>
-                    )}
-                    {event.seq > 0 && <span className="num">#{event.seq}</span>}
-                  </p>
-                </div>
-              </li>
-            );
-          })}
+          {filtered.slice(0, limit).map(({ key, event }) => (
+            <EventRow key={key} event={event} planName={event.plan_id ? planNames.get(event.plan_id) : undefined} />
+          ))}
         </ol>
       )}
-      {filtered.length > limit && (
+      {(filtered.length > limit || canLoadOlder) && (
         <div className="mt-3">
           <Button
+            ref={moreRef}
+            disabledReason={loadingOlder ? 'Loading older events…' : null}
             onClick={() => {
-              // the last page removes this button: focus moves to the list, never to the page (SDD §16)
-              if (filtered.length <= limit + PAGE) listRef.current?.focus();
+              if (filtered.length <= limit) {
+                void loadOlder();
+                return;
+              }
+              // the last page removes this button, unless older events can still be loaded: focus moves to the
+              // list, never to the page (SDD §16)
+              if (filtered.length <= limit + PAGE && !canLoadOlder) listRef.current?.focus();
               setLimit((n) => n + PAGE);
             }}
           >
-            Show {Math.min(PAGE, filtered.length - limit)} older events
+            {filtered.length > limit ? `Show ${Math.min(PAGE, filtered.length - limit)} older events` : 'Load older events'}
           </Button>
         </div>
       )}
+      {olderError !== null && <ErrorBanner error={olderError} title="Older events could not be loaded" onRetry={() => void loadOlder()} />}
     </>
   );
 }

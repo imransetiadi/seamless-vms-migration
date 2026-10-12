@@ -51,6 +51,12 @@ class TransientStepError(Exception):
 class PermanentStepError(Exception):
     """The migration moves to ``failed``."""
 
+    def __init__(self, *args: object, details: dict[str, Any] | None = None) -> None:
+        super().__init__(*args)
+        #: what the step reported before it failed, e.g. the simulator's ``downtime_model_s``
+        #: (SDD §5.2, §7.1)
+        self.details: dict[str, Any] = dict(details or {})
+
 
 @runtime_checkable
 class Executor(Protocol):

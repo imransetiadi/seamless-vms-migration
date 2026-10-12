@@ -6,10 +6,17 @@
  */
 import type {
   AdvisorNote,
+  AdvisorPolicy,
+  AdvisorRecommendation,
+  AdvisorSnapshot,
+  ConvergedBy,
   DestinationInventory,
+  DestinationNetwork,
+  DestinationSubnet,
   Disk,
   Estimate,
   Event,
+  EvidenceItem,
   Finding,
   Migration,
   Nic,
@@ -18,15 +25,253 @@ import type {
   Plan,
   Provider,
   ProviderKind,
+  ReasonCode,
+  SimilarIncident,
   Strategy,
   SyncPass,
+  VerificationRecord,
   VMRef,
 } from './types';
+import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { pyRepr } from '../lib/format';
+import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
+import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
+import { kitSubnet, networkList, portRefusal, resolveNetwork, subnetsOf } from '../lib/networks';
+import { describePorts, portsWithoutOneFixedIp } from '../lib/readiness';
 import { resolveDestination, splitHost, storageBackends } from '../lib/storage';
+import { buildStrategyEvidence } from './mockEvidence';
+import { derivePlanStatus } from './mockPlanStatus';
+import { isDatabase, suggestProbes } from './mockProbes';
 
 export const GiB = 1024 ** 3;
 export const MiB = 1024 ** 2;
+
+/** `SEAMLESS_JEV_MIN_CONFIDENCE`'s default: the global default policy's threshold (SDD §14.4). */
+export const JEV_MIN_CONFIDENCE = 0.6;
+export const GLOBAL_DEFAULT_POLICY = 'global-default';
+/** What Jev reports as its model in a jev_decide answer. */
+export const JEV_MODEL = 'jev-1.13.0';
+
+/** The decisions validation takes on a strategy recommendation (SDD §14.4, §14.6). */
+export type StrategyDecision = 'auto_applied' | 'below_threshold' | 'fallback_rules' | 'pending_approval';
+
+const REASON_OF: Record<StrategyDecision, ReasonCode> = {
+  auto_applied: 'ABOVE_THRESHOLD_AUTO_APPLY',
+  below_threshold: 'BELOW_THRESHOLD_DEFAULT_KEPT',
+  fallback_rules: 'ADVISOR_UNAVAILABLE_FALLBACK',
+  pending_approval: 'POLICY_REQUIRES_APPROVAL',
+};
+
+/** What the mock's memory knew when the fixtures' recommendations were recorded (SDD §14.3, ADV-02). */
+const FIXTURE_INCIDENTS: Partial<Record<string, SimilarIncident[]>> = {
+  warm: [
+    { title: 'Warm pass never converged on a busy PostgreSQL VM', content: 'Change rate (~60 MiB/s) exceeded the link share. Scheduled cutover off-peak and raised max_sync_passes to 8.', score: 0.82 },
+    { title: 'sshd bound to the old fixed IP after migration', content: 'Remove ListenAddress from sshd_config or use 0.0.0.0; verification tcp:22 then passed.', score: 0.61 },
+  ],
+  vmware_warm: [
+    { title: 'VMware CBT reset after snapshot consolidation', content: 'Consolidation reset CBT; vmware_warm restarted with a full pass. Consolidate snapshots before pre-copy.', score: 0.88 },
+  ],
+};
+
+/** The demo policy of the spec (ADV-04) for the mock's DC1 source provider (SDD §14.6). */
+export const FINANCE_POLICY_ID = 'pol-finance';
+/** The fixtures' plans were validated by the operator persona, and their cutovers requested by the admin one (ADV-17). */
+const VALIDATED_BY = 'bayu';
+const REQUESTED_BY = 'rina';
+
+export interface StrategyRecommendationInput {
+  id: string;
+  at: string;
+  migration: Pick<Migration, 'id' | 'plan_id' | 'vm'>;
+  providerId: string;
+  /** What Jev recommended; null with `fallback` when it gave no answer. */
+  option: string | null;
+  confidence: number | null;
+  /** The options Jev was offered: the confidence it did not give the option is spread over the others. */
+  options: readonly string[];
+  status: StrategyDecision;
+  /** The deterministic choice, which the decision keeps unless the advice is applied. */
+  deterministic: Strategy;
+  /** Why there was no usable advice (fallback). */
+  fallback?: string;
+  /** The input snapshot the recommendation rests on (SDD §14.5). */
+  snapshotSha256: string | null;
+  /** The policy that decided (default the built-in global default, SDD §14.6). */
+  policyId?: string;
+  /** Its threshold (default SEAMLESS_JEV_MIN_CONFIDENCE's). */
+  threshold?: number;
+  /** The user whose plan validation recorded it (SDD §14.6): never the one who decides it. */
+  requestedBy?: string | null;
+  /** Why a decision waits when it is not the policy's mode: too little evidence (SDD §14.4, ADV-02). */
+  reasonCode?: ReasonCode;
+  /** The deciding policy's rules for a person's decision (SDD §14.6); none: the policy in force applies, as for data recorded before. */
+  rules?: { require_distinct_approver: boolean; require_override_reason: boolean };
+  /** The option the evidence is measured against, and the evidence (ADV-02). */
+  evidenceOption?: string | null;
+  evidence?: EvidenceItem[];
+  similarIncidents?: SimilarIncident[];
+}
+
+/** A strategy recommendation and its decision as the API stores them (SDD §4.2, §14.4). */
+export function strategyRecommendation(input: StrategyRecommendationInput): AdvisorRecommendation {
+  const { option, confidence, status } = input;
+  const others = input.options.filter((o) => o !== option);
+  const distribution: Record<string, number> =
+    option === null || confidence === null
+      ? {}
+      : Object.fromEntries([[option, confidence], ...others.map((o) => [o, Math.round(((1 - confidence) / others.length) * 100) / 100])]);
+  const byPolicy = status !== 'fallback_rules';
+  const policyId = input.policyId ?? GLOBAL_DEFAULT_POLICY;
+  return {
+    id: input.id,
+    created_at: input.at,
+    decision_type: 'migration_strategy',
+    subject: { kind: 'vm', id: input.migration.vm.source_id, name: input.migration.vm.name },
+    plan_id: input.migration.plan_id,
+    migration_id: input.migration.id,
+    provider_id: input.providerId,
+    model: option === null && confidence === null && input.fallback
+      ? { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null }
+      : { name: 'jev', version: JEV_MODEL, deployment: 'remote', endpoint_host: null },
+    recommendation: { option, confidence, distribution },
+    input_snapshot_sha256: input.snapshotSha256,
+    requested_by: input.requestedBy ?? null,
+    decision: {
+      final_option: status === 'auto_applied' ? option : status === 'pending_approval' ? null : input.deterministic,
+      status,
+      reason_code: input.reasonCode ?? REASON_OF[status],
+      reason_text: status === 'fallback_rules' ? (input.fallback ?? null) : null,
+      actor: byPolicy ? { kind: 'policy', id: policyId } : { kind: 'system', id: 'fallback' },
+      policy_id: byPolicy ? policyId : null,
+      threshold_used: byPolicy ? (input.threshold ?? JEV_MIN_CONFIDENCE) : null,
+      decided_at: input.at,
+      require_distinct_approver: byPolicy && input.rules ? input.rules.require_distinct_approver : null,
+      require_override_reason: byPolicy && input.rules ? input.rules.require_override_reason : null,
+    },
+    legacy: false,
+    legacy_text: null,
+    evidence_option: input.evidenceOption ?? null,
+    evidence: input.evidence ?? [],
+    similar_incidents: input.similarIncidents ?? [],
+    reasons: [],
+  };
+}
+
+type AuditEvent = Pick<Event, 'kind' | 'message' | 'actor' | 'data'>;
+
+function stateOf(d: AdvisorRecommendation['decision']) {
+  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used };
+}
+
+/** The event of the status a decision took, with what it replaced (SDD §14.5). */
+export function decisionEventOf(rec: AdvisorRecommendation, before: AdvisorRecommendation['decision'] | null): AuditEvent {
+  const d = rec.decision;
+  const actor = `${d.actor.kind}:${d.actor.id}`;
+  return {
+    kind: d.status === 'fallback_rules' ? 'decision.fallback' : `decision.${d.status}`,
+    message: `${rec.subject.name}: decision ${d.final_option ?? 'pending'} (${d.status}) by ${actor}`,
+    actor,
+    data: { target_id: rec.id, model_version: rec.model.version, before: before ? stateOf(before) : null, after: stateOf(d) },
+  };
+}
+
+/** A person's decision on a recommendation: approve its option or override it with another (SDD §14.6). */
+export function humanDecision(
+  rec: AdvisorRecommendation,
+  action: { kind: 'approve'; user: string } | { kind: 'override'; user: string; option: string; reason: string | null },
+  at: string,
+): AdvisorRecommendation {
+  const approve = action.kind === 'approve';
+  return {
+    ...rec,
+    decision: {
+      final_option: approve ? rec.recommendation.option : action.option,
+      status: approve ? 'approved' : 'overridden',
+      reason_code: approve ? 'APPROVED_BY_USER' : 'OVERRIDDEN_BY_USER',
+      reason_text: approve ? null : action.reason,
+      actor: { kind: 'user', id: action.user },
+      policy_id: rec.decision.policy_id ?? GLOBAL_DEFAULT_POLICY,
+      threshold_used: null,
+      decided_at: at,
+    },
+  };
+}
+
+/** The audit events the API emits for a recorded recommendation: created, then its decision (SDD §14.5). */
+export function auditEventsOf(rec: AdvisorRecommendation): AuditEvent[] {
+  const { option, confidence } = rec.recommendation;
+  return [
+    {
+      kind: 'recommendation.created',
+      message: `${rec.subject.name}: recommended ${option ?? 'nothing'} (${confidence === null ? 'no confidence' : `${Math.round(confidence * 100)}%`})`,
+      actor: 'system:advisor',
+      data: {
+        target_id: rec.id,
+        model_version: rec.model.version,
+        decision_type: rec.decision_type,
+        subject: rec.subject,
+        option,
+        confidence,
+        snapshot_sha256: rec.input_snapshot_sha256,
+      },
+    },
+    decisionEventOf(rec, null),
+  ];
+}
+
+/** The API's STRATEGY_REQUIREMENTS. */
+const STRATEGY_REQUIREMENTS = ['Estimated downtime is within the SLO', 'The source VM keeps running until cutover'];
+
+/** One-line strategy descriptions offered to Jev as candidates (demo copy of the API's). */
+const CANDIDATE_DESCRIPTIONS: Record<Strategy, string> = {
+  cold: 'Stop the VM, copy every disk, boot it on RHOSO: downtime grows with the used data.',
+  warm: 'Copy snapshots while the VM runs, then stop it and sync only changed blocks.',
+  storage_handover: 'Hand the volumes over in the shared storage without copying: a metadata-only cutover.',
+  vmware_cold: 'Stop the VMware VM and convert every disk with virt-v2v.',
+  vmware_warm: 'Copy with CBT while the VMware VM runs, then a final delta after shutdown.',
+};
+
+/** The advisor's input for a strategy choice, as the API snapshots it (SDD §14.5): the jev_decide arguments and the scope. */
+export function strategySnapshot(input: {
+  vm: VMRef;
+  plan: Plan;
+  estimates: Estimate[];
+  findings: Finding[];
+  scope: readonly string[];
+  deterministic: Strategy;
+  at: string;
+}): AdvisorSnapshot {
+  const { vm, plan, estimates, findings } = input;
+  const gib = (bytes: number) => `${(bytes / GiB).toFixed(1)} GiB`;
+  const disks = vm.disks
+    .map((d) => `${d.kind} ${d.size_gb} GiB${d.volume_type ? ` type ${d.volume_type}` : ''}${d.multiattach ? ' multi-attach' : ''}${d.encrypted ? ' encrypted' : ''}${d.independent ? ' independent' : ''}`)
+    .join('; ');
+  const rate = vm.change_rate_bps != null ? `${(vm.change_rate_bps / MiB).toFixed(1)} MiB/s measured` : 'unknown (default 2 MiB/s assumed)';
+  const estimateText = estimates
+    .map((e) => `${e.strategy}: downtime ${Math.round(e.downtime_s)} s, pre-copy ${Math.round(e.precopy_s)} s over ${e.passes} pass(es), ${e.eligible ? 'eligible' : `INELIGIBLE (${e.reasons.join('; ')})`}`)
+    .join('; ');
+  const eligible = estimates.filter((e) => e.eligible);
+  const payload = {
+    tool: 'jev_decide',
+    arguments: {
+      decision: `Which migration strategy should be used for VM ${vm.name} moving to RHOSO 18.0?`,
+      evidence:
+        `VM ${vm.name}: ${vm.vcpus} vCPU, ${vm.ram_mb} MB RAM, ${vm.disks.length} disk(s) [${disks}], provisioned ${gib(vm.disk_bytes)}, used ${gib(vm.used_bytes)}. ` +
+        `Guest write rate ${rate}. Downtime SLO ${plan.downtime_slo_s} s. Link ${Math.round(plan.link_bps / MiB)} MiB/s. ` +
+        `Findings: ${findings.map((f) => `${f.code} (${f.severity})`).join(', ') || 'none'}. Estimates: ${estimateText}.`,
+      priorities: `Minimize downtime within the SLO of ${plan.downtime_slo_s} s; prefer the simpler strategy when downtimes differ by less than 10 %; never pick an ineligible strategy`,
+      candidates: eligible.map((e) => ({ id: e.strategy, description: CANDIDATE_DESCRIPTIONS[e.strategy] })),
+      requirements: STRATEGY_REQUIREMENTS,
+      escalate_on_contradiction: true,
+    },
+    scope: [...input.scope],
+    options: eligible.map((e) => e.strategy),
+    deterministic: input.deterministic,
+    deterministic_reason: `${input.deterministic}: the deterministic choice of the selection policy`,
+  };
+  return { sha256: sha256Hex(canonicalJson(payload)), created_at: input.at, payload };
+}
 
 export function iso(ms: number): string {
   return new Date(Math.round(ms / 1000) * 1000).toISOString().replace('.000Z', 'Z');
@@ -136,7 +381,7 @@ export function makeVm(spec: VmSpec): VMRef {
     disks,
     nics: (spec.nics ?? [{ network: 'tenant-app' }]).map((n, i) => ({
       network: n.network ?? 'tenant-app',
-      mac: n.mac ?? `fa:16:3e:${(i + 10).toString(16)}:${spec.id.slice(-4, -2)}:${spec.id.slice(-2)}`,
+      mac: n.mac ?? `fa:16:3e:${(i + 10).toString(16).padStart(2, '0')}:${spec.id.slice(-4, -2)}:${spec.id.slice(-2)}`,
       fixed_ips: n.fixed_ips ?? [`10.20.${i + 1}.${(parseInt(spec.id.slice(-2), 16) % 200) + 10}`],
       vnic_type: n.vnic_type ?? 'normal',
       mtu: n.mtu === undefined ? 1450 : n.mtu,
@@ -180,7 +425,7 @@ const OS_VMS: VmSpec[] = [
   { id: 'os-0f72', name: 'analytics-node-2', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 14, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 362, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f73', name: 'analytics-node-3', project: 'analytics', flavor: 'm1.large', vcpus: 8, ram_mb: 32768, disks: [{ size_gb: 40, used_gb: 15, volume_type: 'ceph-ssd' }, { size_gb: 500, used_gb: 371, volume_type: 'ceph-ssd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark' } },
   { id: 'os-0f74', name: 'analytics-db', project: 'analytics', flavor: 'db.xlarge', vcpus: 16, ram_mb: 65536, disks: [{ size_gb: 50, used_gb: 17, volume_type: 'ceph-ssd' }, { size_gb: 400, used_gb: 260, volume_type: 'ceph-hdd' }], nics: [{ network: 'analytics' }], tags: { app: 'spark', tier: 'database' }, change_rate_mibps: 6 },
-  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', os_type: 'ubuntu 18.04', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500 }], tags: { app: 'bastion' } },
+  { id: 'os-1a01', name: 'jump-host-01', project: 'platform', flavor: 'm1.small', os_type: 'ubuntu 18.04', disks: [{ size_gb: 20, used_gb: 5 }], nics: [{ network: 'provider-ext', mtu: 1500, fixed_ips: ['203.0.113.25'] }], tags: { app: 'bastion' } },
   { id: 'os-1a02', name: 'build-runner-07', project: 'platform', flavor: 'm1.large', power_state: 'error', disks: [{ size_gb: 100 }], tags: { app: 'ci' } },
 ];
 
@@ -220,7 +465,7 @@ export function buildProviders(now: number): Provider[] {
       verify_tls: true,
       ca_cert_path: '/etc/pki/seamless/dc1-ca.pem',
       conversion_host: conversionHost('seamless-conv-src', '192.0.2.21'),
-      capabilities: { admin: true, compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
+      capabilities: { admin: true, roles: ['admin', 'member', 'reader'], compute_microversion: '2.79', ovn: false, volume_backends: DC1_STORAGE.map((b) => b.pool), storage_backends: DC1_STORAGE },
       status: 'ok',
       status_message: 'Keystone, Nova, Cinder, Neutron and Glance reachable.',
       last_checked_at: iso(now - 4 * 60_000),
@@ -302,6 +547,8 @@ export function buildProviders(now: number): Provider[] {
       conversion_host: conversionHost('seamless-conv-dst', '198.51.100.31'),
       capabilities: {
         admin: true,
+        // an admin token (SDD §10): jump-host-01 keeps its address on the shared provider-ext (§6.6)
+        roles: ['admin', 'member', 'reader'],
         compute_microversion: '2.95',
         ovn: true,
         volume_backends: PROD_STORAGE.map((b) => b.pool),
@@ -355,7 +602,29 @@ export function buildInventories(): Record<string, VMRef[] | DestinationInventor
       erp: { cores: 64, ram_mb: 262144, instances: 20, volumes: 40, gigabytes: 9000 },
     },
     projects: ['shop', 'finance', 'platform', 'analytics', 'erp', 'media'],
+    // where a NIC's addresses must lie (SDD §10): the mock VMs' addresses are in 10.20.0.0/16
+    subnets: [
+      ...['tenant-web', 'tenant-app', 'tenant-db', 'tenant-infra', 'analytics', 'erp-net'].map((network) => ({
+        id: `sub-${network}-v4`,
+        name: `${network}-v4`,
+        network,
+        network_id: `net-${network}`,
+        cidr: '10.20.0.0/16',
+        ipv6_address_mode: null,
+        ipv6_ra_mode: null,
+      })),
+      { id: 'sub-provider-ext-v4', name: 'provider-ext-v4', network: 'provider-ext', network_id: 'net-provider-ext', cidr: '203.0.113.0/24', ipv6_address_mode: null, ipv6_ra_mode: null },
+    ],
   };
+  // what a NIC's network name resolves to (SDD §10): the credential's own networks, and a provider network another project shares
+  destination.network_details = Object.entries(destination.networks).map(([name, mtu]) => ({
+    id: `net-${name}`,
+    name,
+    mtu,
+    project_id: name === 'provider-ext' ? 'admin' : 'migration',
+    own: name !== 'provider-ext',
+    shared: name === 'provider-ext',
+  }));
   return {
     'rhosp17-dc1': OS_VMS.map(makeVm),
     'vcenter-hq': VMW_VMS.map(makeVm),
@@ -392,12 +661,14 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
   const maxPasses = plan.max_sync_passes;
   let precopy = 0;
   let passes = 0;
-  let downtime = 0;
   let finalDelta = 0;
 
+  // the copy, or final sync, and the conversion: the parts of the downtime besides the fixed steps (SDD §9.1)
+  let copy = 0;
+  let conversion = 0;
   switch (strategy) {
     case 'cold':
-      downtime = PARAMS.shutdown_s + PARAMS.snapshot_s + U / L + PARAMS.create_s + PARAMS.boot_s;
+      copy = PARAMS.snapshot_s + U / L;
       break;
     case 'warm': {
       let t = PARAMS.snapshot_s + Math.max(U / L, D / S);
@@ -411,14 +682,15 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
         delta = Math.min(D, c * t);
       }
       finalDelta = delta;
-      downtime = PARAMS.shutdown_s + PARAMS.snapshot_s + Math.max(D / S, finalDelta / L) + PARAMS.create_s + PARAMS.boot_s;
+      copy = PARAMS.snapshot_s + Math.max(D / S, finalDelta / L);
       break;
     }
     case 'storage_handover':
-      downtime = PARAMS.shutdown_s + V * PARAMS.handover_per_volume_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = V * PARAMS.handover_per_volume_s;
       break;
     case 'vmware_cold':
-      downtime = PARAMS.shutdown_s + U / L + PARAMS.v2v_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = U / L;
+      conversion = PARAMS.v2v_s;
       break;
     case 'vmware_warm': {
       let t = U / L;
@@ -432,21 +704,32 @@ export function estimate(vm: VMRef, strategy: Strategy, plan: Plan, reasons: str
         delta = Math.min(D, c * t);
       }
       finalDelta = delta;
-      downtime = PARAMS.shutdown_s + finalDelta / L + PARAMS.v2v_inplace_s + PARAMS.create_s + PARAMS.boot_s;
+      copy = finalDelta / L;
+      conversion = PARAMS.v2v_inplace_s;
       break;
     }
   }
   const round = (n: number) => Math.round(n * 10) / 10;
+  // the API's keys (SDD §4, ADV-16): the rounded parts add up to the downtime
+  const downtime_parts = {
+    shutdown_s: PARAMS.shutdown_s,
+    copy_s: round(copy),
+    conversion_s: round(conversion),
+    create_s: PARAMS.create_s,
+    boot_s: PARAMS.boot_s,
+  };
+  const downtime = round(Object.values(downtime_parts).reduce((a, b) => a + b, 0));
   return {
     strategy,
     eligible: reasons.length === 0,
     reasons,
     precopy_s: round(precopy),
     passes,
-    downtime_s: round(downtime),
+    downtime_s: downtime,
     total_s: round(precopy + downtime),
     final_delta_bytes: Math.round(finalDelta),
     meets_slo: downtime <= plan.downtime_slo_s,
+    downtime_parts,
   };
 }
 
@@ -466,6 +749,11 @@ function storageReasons(vm: VMRef, plan: Plan, source: Provider, destination: Pr
   return reasons;
 }
 
+
+/** The VM with each NIC's addresses as the plan gives them (SDD §9.2): its override's, else its own. */
+function withPlannedAddresses(plan: Plan, vm: VMRef): VMRef {
+  return { ...vm, nics: vm.nics.map((nic) => ({ ...nic, fixed_ips: nicTarget(plan, vm.source_id, nic).addresses })) };
+}
 
 export function eligibility(
   vm: VMRef,
@@ -488,6 +776,10 @@ export function eligibility(
     const cold: string[] = [];
     if (vm.power_state === 'error') cold.push('Source VM is in error state');
     if (!source.conversion_host || !destination.conversion_host) cold.push('No conversion host configured on both clouds');
+    // through Nova os-migrate recreates each port with exactly one fixed IP; through Neutron every one (SDD §9.2)
+    const planned = withPlannedAddresses(plan, vm);
+    const oddPorts = portsWithoutOneFixedIp(planned);
+    if (oddPorts.length && plan.port_creation_mode !== 'neutron') cold.push(`Port(s) without exactly one fixed IP, which Nova cannot recreate: ${describePorts(oddPorts)}`);
     result.cold = cold;
     result.warm = [...cold, ...(multiattach ? ['VM has a multi-attach volume'] : [])];
     const handover: string[] = [];
@@ -496,6 +788,9 @@ export function eligibility(
     const unmapped = vm.disks.filter((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map));
     if (plan.handover.enabled && unmapped.length) handover.push('A volume type has no RHOSO backend mapping');
     if (multiattach) handover.push('VM has a multi-attach volume');
+    // through Nova the destination keeps one address per port; through Neutron every one (SDD §7.3 step 8)
+    const several = planned.nics.filter((n) => n.fixed_ips.length > 1);
+    if (several.length && plan.port_creation_mode !== 'neutron') handover.push(`Port(s) with several fixed IPs, of which one would be kept: ${describePorts(several)}`);
     if (vm.disks.some((d) => d.encrypted)) handover.push('Encrypted volumes cannot be unmanaged by Cinder');
     handover.push(...storageReasons(vm, plan, source, destination));
     if (!source.capabilities.admin || !destination.capabilities.admin) handover.push('Admin access is required on both clouds');
@@ -511,12 +806,95 @@ export function eligibility(
 // Pre-flight findings (subset of SDD §9.3)
 // -------------------------------------------------------------------------------------------
 
+const NIC_OVERRIDE_REMEDIATION: Record<string, string> = {
+  MAP_NIC_OVERRIDE_INVALID:
+    "Fix the VM's network overrides on its migration page: an existing RHOSO network, addresses inside its subnets, each given once in the plan. VMware VMs take none.",
+  MAP_NIC_OVERRIDE: 'Nothing to do: each NIC goes where its override says.',
+};
+
+/** The API's catalog remediations of the network checks (SDD §9.3). */
+const NETWORK_REMEDIATION = {
+  MAP_NETWORK_AMBIGUOUS:
+    "Send the NIC to a name one RHOSO network carries: one of the credential's project, or the only one of that name - map its network to such a name, or rename one of the networks.",
+  NET_ADDRESS_REFUSED:
+    'Give the NIC an address its RHOSO network takes: map its network to one whose subnets hold it, or set the address in a NIC override; for a SLAAC address keep the MAC (port_creation_mode "neutron").',
+  NET_PORT_NOT_PERMITTED:
+    "Send the NIC to a network of the credential's project: map its network to one, or set a NIC override on the VM's migration page. Another project's shared or external network takes it once the RHOSO credential has the admin role.",
+};
+
+/** Like the API (SDD §9.3): every entry of the VM checked before anything stops, with the API's messages. */
+function nicOverrideFindings(
+  vm: VMRef,
+  sourceKind: ProviderKind,
+  plan: Plan,
+  destinationNetworks: Record<string, number | null>,
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[] },
+): Array<['MAP_NIC_OVERRIDE' | 'MAP_NIC_OVERRIDE_INVALID', string]> {
+  const entries = plan.nic_overrides?.[vm.source_id] ?? {};
+  const macs = Object.keys(entries).sort();
+  if (!macs.length) return [];
+  if (sourceKind === 'vmware')
+    return [['MAP_NIC_OVERRIDE_INVALID', `${vm.name} is a VMware VM: the migration kit keeps the guest's network settings, so its NIC overrides cannot be applied (${macs.join(', ')}).`]];
+  const holders = new Map<string, Array<{ vmId: string; mac: string; name: string }>>();
+  for (const other of context.selected ?? [vm]) {
+    for (const n of other.nics) {
+      const target = nicTarget(plan, other.source_id, n);
+      for (const a of target.addresses) {
+        const key = `${target.network}|${canonicalIp(a)}`;
+        holders.set(key, [...(holders.get(key) ?? []), { vmId: other.source_id, mac: (n.mac ?? '').toLowerCase(), name: other.name }]);
+      }
+    }
+  }
+  const problems: string[] = [];
+  const applied: string[] = [];
+  for (const mac of macs) {
+    const nic = vm.nics.find((n) => n.mac?.toLowerCase() === mac);
+    if (!nic) {
+      problems.push(`${mac}: the VM has no NIC with this MAC`);
+      continue;
+    }
+    const { network, addresses } = nicTarget(plan, vm.source_id, nic);
+    if (!(network in destinationNetworks)) {
+      problems.push(
+        `${mac}: RHOSO has no network ${pyRepr(network)}` +
+          (entries[mac]?.network ? '' : ' yet: pre-staging would create it, but its subnets cannot be checked before; name an existing RHOSO network'),
+      );
+      continue;
+    }
+    // the network the cutover resolves the name to; MAP_NETWORK_AMBIGUOUS names one it cannot
+    const resolved = resolveNetwork(networkList({ networks: destinationNetworks, network_details: context.networkDetails }), network).network;
+    if (!resolved) continue;
+    const subnets = subnetsOf(context.subnets ?? [], resolved);
+    const cidrs = subnets.map((s) => s.cidr);
+    const outside = addresses.filter((a) => !cidrs.some((c) => ipInCidr(a, c)));
+    if (outside.length) problems.push(`${mac}: ${outside.join(', ')} ${outside.length === 1 ? 'lies' : 'lie'} in no subnet of ${pyRepr(network)}`);
+    const neutron = plan.port_creation_mode === 'neutron';
+    for (const a of addresses) {
+      const reserved = noHostAddress(a, cidrs);
+      if (reserved) problems.push(`${mac}: ${a} is ${reserved}, not a host address`);
+      else if (!outside.includes(a)) {
+        // on a SLAAC or DHCPv6-stateless subnet only what Neutron derives (SDD §6.6)
+        const why = addressRefusal(a, subnets, { neutron, mac });
+        if (why) problems.push(`${mac}: ${a} ${why}`);
+      }
+    }
+    for (const a of addresses)
+      for (const h of holders.get(`${network}|${canonicalIp(a)}`) ?? []) if (h.vmId !== vm.source_id || h.mac !== mac) problems.push(`${mac}: ${a} also goes to ${h.name} (${h.mac})`);
+    applied.push(`${mac} (${nic.network}) -> ${network}: ${addresses.join(', ')}`);
+  }
+  if (problems.length) return [['MAP_NIC_OVERRIDE_INVALID', `NIC override(s) of ${vm.name} cannot be applied: ${problems.join('; ')}.`]];
+  if (!applied.length) return [];
+  return [['MAP_NIC_OVERRIDE', `NIC override(s): ${applied.join('; ')}.`]];
+}
+
 export function preflight(
   vm: VMRef,
   sourceKind: ProviderKind,
   plan: Plan,
   destinationNetworks: Record<string, number | null>,
   selectedNames: string[],
+  /** The destination's subnets, its networks with their owners, its token's roles and the plan's VMs, for the NIC checks (SDD §9.3). */
+  context: { subnets?: DestinationSubnet[]; selected?: VMRef[]; networkDetails?: DestinationNetwork[]; roles?: string[] } = {},
 ): Finding[] {
   const findings: Finding[] = [];
   const add = (code: string, severity: Finding['severity'], message: string, remediation: string | null, strategies: Strategy[] = []) =>
@@ -530,16 +908,78 @@ export function preflight(
     add('SRC_VM_MULTIATTACH', 'warning', 'A multi-attach volume is attached; warm and storage handover are not possible.', 'Detach the shared volume or migrate cold during a window.', ['warm', 'storage_handover']);
   if (vm.disks[0] && (vm.disks[0].kind === 'image_root' || vm.disks[0].kind === 'ephemeral'))
     add('SRC_VM_EPHEMERAL_ROOT', 'info', 'Root disk is image-backed; each warm pass snapshots the server to Glance.', 'Expect slower pre-copy passes (boot_disk_copy).', ['warm']);
+  // every NIC's RHOSO network as the cutover resolves its name (SDD §7.3 step 0, §9.3); a VMware NIC's too: Seamless gives
+  // the migration kit the network it resolves (§7.2)
+  const seen = networkList({ networks: destinationNetworks, network_details: context.networkDetails });
+  const resolved = new Map<Nic, DestinationNetwork>();
+  const ambiguous: string[] = [];
+  for (const nic of vm.nics) {
+    // the VMware kit keeps the guest's network settings: no NIC override moves its NICs (SDD §7.2)
+    const target = sourceKind === 'vmware' ? (plan.mappings.networks[nic.network] ?? nic.network) : nicTarget(plan, vm.source_id, nic).network;
+    const { network, why } = resolveNetwork(seen, target);
+    if (network) resolved.set(nic, network);
+    else if (why) ambiguous.push(`${(nic.mac ?? '?').toLowerCase()} (${nic.network}): ${why}`);
+  }
+  if (ambiguous.length)
+    add('MAP_NETWORK_AMBIGUOUS', 'blocker', `The cutover cannot tell these RHOSO networks apart: ${ambiguous.join('; ')}.`, NETWORK_REMEDIATION.MAP_NETWORK_AMBIGUOUS);
+  // whether the credential may put each NIC's port on its resolved network, as the API (SDD §6.6, §9.3); the VMware
+  // migration kit creates every port with the NIC's MAC (§7.2)
+  const denied: string[] = [];
+  for (const nic of vm.nics) {
+    const network = resolved.get(nic);
+    const why = network ? portRefusal(network, context.roles) : null;
+    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
+  }
+  if (denied.length)
+    add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
   for (const nic of vm.nics) {
     const mapped = plan.mappings.networks[nic.network] ?? nic.network;
-    if (sourceKind !== 'vmware' && !(mapped in destinationNetworks))
+    // a NIC its override sends elsewhere is checked by MAP_NIC_OVERRIDE_INVALID (SDD §9.3)
+    if (sourceKind !== 'vmware' && !nicOverride(plan, vm.source_id, nic.mac)?.network && !(mapped in destinationNetworks))
       add('MAP_NETWORK_MISSING', 'blocker', `Network ${nic.network} has no mapping and no same-named RHOSO network.`, 'Add a network mapping in the plan.');
-    const dstMtu = destinationNetworks[mapped];
+    const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[nicTarget(plan, vm.source_id, nic).network];
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
       add('NET_MTU_SHRINK', 'warning', `Destination MTU ${dstMtu} is smaller than the source NIC MTU ${nic.mtu} on ${nic.network}.`, 'Lower the guest MTU or enable jumbo frames on the OVN underlay.');
     if (['direct', 'direct-physical', 'macvtap'].includes(nic.vnic_type))
       add('NET_SRIOV_PORT', 'warning', `Port on ${nic.network} uses vnic_type ${nic.vnic_type}.`, 'Re-create SR-IOV ports on RHOSO manually.');
   }
+  const oddPorts = portsWithoutOneFixedIp(withPlannedAddresses(plan, vm));
+  if (sourceKind !== 'vmware' && oddPorts.length && plan.port_creation_mode !== 'neutron')
+    add(
+      'NET_PORT_IPS',
+      'warning',
+      `NIC(s) without exactly one fixed IP: ${describePorts(oddPorts)}. Cold and warm migration cannot recreate them; storage handover keeps one address per port.`,
+      'Turn on "Keep MAC addresses and every fixed IP" in the plan (port_creation_mode "neutron"), give each such port exactly one fixed IP before the cutover, or migrate the VM by storage handover when its ports have at most one address each.',
+    );
+  // a NIC without an override keeps its own addresses: Neutron must take them on its resolved network (SDD §9.3, §6.6)
+  if (sourceKind !== 'vmware' && context.subnets?.length) {
+    const neutron = plan.port_creation_mode === 'neutron';
+    const refused: string[] = [];
+    for (const nic of vm.nics) {
+      const network = resolved.get(nic);
+      if (!network || nicOverride(plan, vm.source_id, nic.mac)) continue;
+      const subnets = subnetsOf(context.subnets, network);
+      for (const address of neutron ? nic.fixed_ips : nic.fixed_ips.slice(0, 1)) {
+        const why = addressRefusal(address, subnets, { neutron, mac: nic.mac });
+        if (why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${address} ${why}`);
+      }
+    }
+    if (refused.length)
+      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their RHOSO network: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+  }
+  // the VMware migration kit sends a NIC's IPv4 guest addresses only, all with one subnet of its network (SDD §7.2, §9.3)
+  if (sourceKind === 'vmware' && context.subnets?.length) {
+    const refused: string[] = [];
+    for (const nic of vm.nics) {
+      const network = resolved.get(nic);
+      const why = network ? kitSubnet(nic, subnetsOf(context.subnets, network)).why : null;
+      if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${why}`);
+    }
+    if (refused.length)
+      add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their RHOSO network: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);
+  }
+  for (const [code, message] of nicOverrideFindings(vm, sourceKind, plan, destinationNetworks, context))
+    add(code, code === 'MAP_NIC_OVERRIDE' ? 'info' : 'blocker', message, NIC_OVERRIDE_REMEDIATION[code] ?? null);
   if ('pci_passthrough:alias' in vm.flavor_extra_specs)
     add('VM_PCI_PASSTHROUGH', 'blocker', 'Flavor requests PCI passthrough.', 'Provide an equivalent PCI alias on RHOSO compute nodes.');
   if ('resources:VGPU' in vm.flavor_extra_specs)
@@ -567,6 +1007,16 @@ export function preflight(
   }
   if (plan.handover.enabled && sourceKind !== 'vmware' && vm.disks.some((d) => !d.volume_type || !(d.volume_type in plan.handover.backend_map)))
     add('HANDOVER_BACKEND_UNMAPPED', 'info', 'Handover is enabled but a volume type has no RHOSO backend mapping.', 'Add the volume type to the handover backend map.', ['storage_handover']);
+  // like the API (SDD §9.3, ADV-18): a database VM verified only by its boot
+  if (isDatabase(vm) && probesFor(vm.source_id, plan).probes.length === 0) {
+    const suggested = suggestProbes(vm);
+    add(
+      'APP_PROBE_MISSING',
+      'warning',
+      `${vm.name} is a database VM without an application probe: verification would check only that it booted.${suggested.length ? ` Suggested: ${describeProbes(suggested)}.` : ''}`,
+      "Add an application probe for its service to the plan, for every VM or for this one (probe_overrides), or use the suggested probe on the plan page.",
+    );
+  }
   return findings;
 }
 
@@ -583,6 +1033,7 @@ export function defaultPlanFields(now: number) {
     selection_policy: 'min_downtime' as const,
     downtime_slo_s: 600,
     require_approval: true,
+    require_distinct_approver: true,
     auto_cutover: false,
     cutover_window: null,
     keep_warm_interval_s: 900,
@@ -599,9 +1050,16 @@ export function defaultPlanFields(now: number) {
       timeout_s: 600,
       auto_rollback: true,
       use_advisor: true,
+      app_probes: [],
     },
+    probe_overrides: {},
+    finalize_warning_h: 72,
     prestage_resources: ['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules'],
+    port_creation_mode: 'nova' as const,
+    nic_overrides: {} as Plan['nic_overrides'],
     waves: [],
+    // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
+    derived_status: 'draft' as const,
     created_at: iso(now),
     updated_at: iso(now),
   };
@@ -624,6 +1082,16 @@ interface MigrationSpec {
   error?: string | null;
   reviewReason?: string | null;
   notes?: Array<Omit<AdvisorNote, 'created_at'> & { ago: number }>;
+  /** The strategy recommendation recorded when the migration was validated (SDD §14.4), and what a person decided later (§14.6). */
+  rec?: {
+    option: Strategy | null;
+    confidence: number | null;
+    status: StrategyDecision;
+    deterministic: Strategy;
+    fallback?: string;
+    policyId?: string;
+    then?: { kind: 'approve'; user: string; after: number } | { kind: 'override'; user: string; option: Strategy; reason: string; after: number };
+  };
   attempts?: number;
   destination?: string | null;
   checkpoint?: string | null;
@@ -666,30 +1134,34 @@ const PLAN_SPECS: PlanSpec[] = [
     ],
     migrations: [
       {
+        rec: { option: 'warm', confidence: 0.74, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e21', vm: 'os-0a11', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 2 * H, progress: 100,
         passes: [{ kind: 'full', changedGiB: 12, durationS: 128 }, { kind: 'delta', changedGiB: 0.42, durationS: 84 }, { kind: 'final', changedGiB: 0.05, durationS: 81 }],
         downtimeStartedAgo: 2 * H + 212, downtimeS: 212, approvals: [{ actor: 'sari', ago: 2 * H + 300, comment: 'Pilot approved in CAB-2291' }], cutoverRequested: true,
-        destination: 'b7e2c0f4-1d2a-4c55-9a1e-6f4c2d8e9a01', checkpoint: 'verify',
+        destination: 'b7e2c0f4-1d2a-4c55-9a1e-6f4c2d8e9a01', checkpoint: 'verified',
         notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as stateless_web: name matches ^web- and tag tier=web.', confidence: null, data: { tier: 'stateless_web' }, ago: 3 * D }],
       },
       {
+        rec: { option: 'warm', confidence: 0.81, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e22', vm: 'os-0a12', strategy: 'warm', phase: 'verifying', wave: 'wave-1', enteredAgo: 70, progress: 100,
         passes: [{ kind: 'full', changedGiB: 14, durationS: 131 }, { kind: 'delta', changedGiB: 0.51, durationS: 86 }, { kind: 'final', changedGiB: 0.06, durationS: 83 }],
-        downtimeStartedAgo: 250, approvals: [{ actor: 'sari', ago: 400 }], cutoverRequested: true, destination: '2f9d6b1e-77c4-4f0e-8d3a-0c5b9e7a6d12', checkpoint: 'cutover',
+        downtimeStartedAgo: 250, approvals: [{ actor: 'sari', ago: 400, comment: 'Checked the pre-flight findings with the web team' }], cutoverRequested: true, destination: '2f9d6b1e-77c4-4f0e-8d3a-0c5b9e7a6d12', checkpoint: 'cutover',
         notes: [{ kind: 'verification', source: 'jev', summary: 'Both claims verified: the guest finished booting and no filesystem errors were reported.', confidence: 0.88, data: { results: [{ claim: 'The guest operating system finished booting', verdict: 'verified' }] }, ago: 30 }],
       },
       {
+        rec: { option: 'warm', confidence: 0.69, status: 'auto_applied', deterministic: 'cold' },
         id: 'mig-3c1a0f9e23', vm: 'os-0a13', strategy: 'warm', phase: 'cutover', wave: 'wave-1', enteredAgo: 95, progress: 62,
         passes: [{ kind: 'full', changedGiB: 13, durationS: 129 }, { kind: 'delta', changedGiB: 0.47, durationS: 85 }, { kind: 'final', changedGiB: 0.05, durationS: 0, open: true }],
-        downtimeStartedAgo: 95, approvals: [{ actor: 'sari', ago: 180, comment: 'Inside change window' }], cutoverRequested: true, checkpoint: 'precopy',
+        downtimeStartedAgo: 95, approvals: [{ actor: 'sari', ago: 180, comment: 'Inside the change window agreed with the owner' }], cutoverRequested: true, checkpoint: 'precopy',
       },
       {
         id: 'mig-5d7e2b4a10', vm: 'os-0d51', strategy: 'warm', phase: 'precopy', wave: 'wave-2', enteredAgo: 31 * 60, progress: 37,
         passes: [{ kind: 'full', changedGiB: 0, durationS: 0, open: true }], checkpoint: 'prestage',
-        notes: [{ kind: 'strategy', source: 'jev', summary: 'Warm recommended over cold: estimated downtime 4m 12s vs 1h 01m; storage handover not eligible (no shared Ceph).', confidence: 0.67, data: { selected: 'warm', candidates: ['cold', 'warm'], probabilities: { warm: 0.67, cold: 0.33 } }, ago: 2 * H }],
+        rec: { option: 'warm', confidence: 0.67, status: 'auto_applied', deterministic: 'warm' },
       },
       {
         id: 'mig-5d7e2b4a11', vm: 'os-0d52', strategy: 'warm', phase: 'syncing', wave: 'wave-2', enteredAgo: 14 * 60, progress: 48,
+        rec: { option: null, confidence: null, status: 'fallback_rules', deterministic: 'warm', fallback: 'advisor unavailable: jev_decide timed out after 20 s' },
         passes: [{ kind: 'full', changedGiB: 316, durationS: 2590 }, { kind: 'delta', changedGiB: 12.6, durationS: 1132 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
       },
@@ -702,6 +1174,11 @@ const PLAN_SPECS: PlanSpec[] = [
       {
         id: 'mig-5d7e2b4a13', vm: 'os-0c41', strategy: 'cold', phase: 'ready', wave: 'wave-2', enteredAgo: 2 * H,
         checkpoint: null,
+        // applied automatically, then overridden by a person with a reason (ADV-04)
+        rec: {
+          option: 'warm', confidence: 0.83, status: 'auto_applied', deterministic: 'cold',
+          then: { kind: 'override', user: 'bayu', option: 'cold', reason: 'Domain controllers move cold: the AD replication window was rehearsed that way', after: 40 * 60 },
+        },
         notes: [{ kind: 'classification', source: 'rules', summary: 'Classified as infrastructure_service: os_type windows2019 and tag app=active-directory.', confidence: null, data: { tier: 'infrastructure_service' }, ago: 3 * D }],
       },
       { id: 'mig-7a9b1c3d40', vm: 'os-0b22', strategy: 'cold', phase: 'validating', wave: 'wave-3', enteredAgo: 6 },
@@ -728,7 +1205,11 @@ const PLAN_SPECS: PlanSpec[] = [
         passes: [{ kind: 'full', changedGiB: 64, durationS: 520 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
       },
-      { id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H },
+      {
+        id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H,
+        // below the threshold, then approved by a person: the recommended option runs
+        rec: { option: 'vmware_warm', confidence: 0.55, status: 'below_threshold', deterministic: 'vmware_cold', then: { kind: 'approve', user: 'sari', after: 20 * 60 } },
+      },
       {
         id: 'mig-9e4f6a8b52', vm: 'vm-5002', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-2', enteredAgo: 5 * H,
         approvals: [{ actor: 'sari', ago: 4 * H, comment: 'Pre-approved for the Saturday window' }],
@@ -754,9 +1235,13 @@ const PLAN_SPECS: PlanSpec[] = [
     migrations: [
       {
         id: 'mig-b2c4d6e870', vm: 'os-0f71', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H,
-        notes: [{ kind: 'strategy', source: 'jev', summary: 'Storage handover recommended: metadata-only cutover (≈ 4 min) regardless of the 540 GiB of disks.', confidence: 0.71, data: { selected: 'storage_handover', candidates: ['storage_handover', 'warm'], probabilities: { storage_handover: 0.71, warm: 0.29 } }, ago: 3 * H }],
+        notes: [{ kind: 'strategy', source: 'jev', summary: 'Storage handover recommended: metadata-only cutover (≈ 4 min) regardless of the 540 GiB of disks.', confidence: 0.71, data: { selected: 'storage_handover', applied: true, deterministic: 'storage_handover', candidates: ['storage_handover', 'warm'], probabilities: { storage_handover: 0.71, warm: 0.29 } }, ago: 3 * H }],
       },
-      { id: 'mig-b2c4d6e871', vm: 'os-0f72', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
+      {
+        id: 'mig-b2c4d6e871', vm: 'os-0f72', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H,
+        // the Finance policy asks a person first: the migration waits (ADV-04)
+        rec: { option: 'storage_handover', confidence: 0.86, status: 'pending_approval', deterministic: 'storage_handover', policyId: FINANCE_POLICY_ID },
+      },
       { id: 'mig-b2c4d6e872', vm: 'os-0f73', strategy: 'storage_handover', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
       { id: 'mig-b2c4d6e873', vm: 'os-0f74', strategy: 'warm', phase: 'ready', wave: 'wave-1', enteredAgo: 3 * H },
     ],
@@ -789,12 +1274,17 @@ const PLAN_SPECS: PlanSpec[] = [
     migrations: [
       {
         id: 'mig-d4e6f8a090', vm: 'os-0e65', strategy: 'cold', phase: 'finalized', wave: 'wave-1', enteredAgo: 7 * D, progress: 100,
-        downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200 }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
+        // the Advisor spec's example (ADV-01): Jev's warm at 57% is under the 60% threshold, so cold is kept
+        rec: { option: 'warm', confidence: 0.57, status: 'below_threshold', deterministic: 'cold' },
+        // a cold copy is recorded as a full pass while the source is stopped, as the API's executors record it
+        passes: [{ kind: 'full', changedGiB: 6, durationS: 49 }],
+        downtimeStartedAgo: 8 * D + 900, downtimeS: 418, approvals: [{ actor: 'sari', ago: 8 * D + 1200, comment: 'Approved in CAB-2217; the owner signed off the downtime' }], cutoverRequested: true, destination: '0c4e8a2b-5f1d-4e93-b7a6-3d2f1e0c9b88', checkpoint: 'finalize',
       },
       {
         id: 'mig-d4e6f8a091', vm: 'os-0a14', strategy: 'warm', phase: 'completed', wave: 'wave-1', enteredAgo: 8 * D, progress: 100,
+        rec: { option: 'warm', confidence: 0.88, status: 'auto_applied', deterministic: 'cold' },
         passes: [{ kind: 'full', changedGiB: 9, durationS: 96 }, { kind: 'delta', changedGiB: 0.31, durationS: 63 }, { kind: 'final', changedGiB: 0.04, durationS: 61 }],
-        downtimeStartedAgo: 8 * D + 188, downtimeS: 188, approvals: [{ actor: 'sari', ago: 8 * D + 600 }], cutoverRequested: true, destination: '9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', checkpoint: 'verify',
+        downtimeStartedAgo: 8 * D + 188, downtimeS: 188, approvals: [{ actor: 'sari', ago: 8 * D + 600, comment: 'Backups verified this morning; cut over in the window' }], cutoverRequested: true, destination: '9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', checkpoint: 'verify',
       },
     ],
   },
@@ -806,12 +1296,12 @@ const PLAN_SPECS: PlanSpec[] = [
     destination: 'rhoso-prod',
     status: 'failed',
     createdAgo: 2 * D,
-    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true }, downtime_slo_s: 900 },
+    overrides: { verification: { tcp_ports: [22, 8080], windows_tcp_ports: [3389], probe_address: 'fixed', console_success_patterns: ['login:'], timeout_s: 600, auto_rollback: false, use_advisor: true, app_probes: [] }, downtime_slo_s: 900 },
     waves: [{ id: 'wave-1', name: 'Legacy', vms: ['os-0e61', 'os-0e63', 'os-0e66', 'os-0e67'], max_parallel: 2 }],
     migrations: [
       {
         id: 'mig-e5f7a9b1a0', vm: 'os-0e61', strategy: 'cold', phase: 'failed', wave: 'wave-1', enteredAgo: 33 * 60, progress: 100,
-        downtimeStartedAgo: 41 * 60, approvals: [{ actor: 'sari', ago: 45 * 60 }], cutoverRequested: true, destination: '5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9', checkpoint: 'cutover', attempts: 1,
+        downtimeStartedAgo: 41 * 60, approvals: [{ actor: 'sari', ago: 45 * 60, comment: 'Agreed with the application team for this evening' }], cutoverRequested: true, destination: '5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9', checkpoint: 'cutover', attempts: 1,
         error: 'Verification failed: console pattern "login:" not matched within 600 s; tcp:22 connection refused.',
         reviewReason: 'Jev contradicted "The guest operating system finished booting" (console shows a kernel panic).',
         notes: [
@@ -829,12 +1319,12 @@ const PLAN_SPECS: PlanSpec[] = [
       },
       {
         id: 'mig-e5f7a9b1a1', vm: 'os-0e63', strategy: 'cold', phase: 'rolling_back', wave: 'wave-1', enteredAgo: 4 * 60, progress: 40,
-        downtimeStartedAgo: 19 * 60, approvals: [{ actor: 'sari', ago: 25 * 60 }], cutoverRequested: true, checkpoint: 'cutover',
+        downtimeStartedAgo: 19 * 60, approvals: [{ actor: 'sari', ago: 25 * 60, comment: 'Change CHG-2088 approved; DBA on call for the cutover' }], cutoverRequested: true, checkpoint: 'cutover',
         error: 'Import failed: volume attach timed out on the destination conversion host.',
       },
       {
         id: 'mig-e5f7a9b1a2', vm: 'os-0e66', strategy: 'cold', phase: 'rolled_back', wave: 'wave-1', enteredAgo: 3 * H, progress: 0,
-        downtimeStartedAgo: 3 * H + 1260, downtimeS: 1260, approvals: [{ actor: 'sari', ago: 4 * H }], cutoverRequested: true, checkpoint: 'rollback', attempts: 1,
+        downtimeStartedAgo: 3 * H + 1260, downtimeS: 1260, approvals: [{ actor: 'sari', ago: 4 * H, comment: 'Approved for the maintenance window; rollback plan reviewed' }], cutoverRequested: true, checkpoint: 'rollback', attempts: 1,
         error: 'Rolled back by bayu: tcp:8080 closed after boot; application config references the old database host.',
       },
       { id: 'mig-e5f7a9b1a3', vm: 'os-0e67', strategy: 'cold', phase: 'cancelled', wave: 'wave-1', enteredAgo: 1 * D },
@@ -923,9 +1413,12 @@ interface ScheduledPass {
  */
 function schedulePasses(m: MigrationSpec, enteredAt: number, downtimeStartedAt: number | null): ScheduledPass[] {
   const specs = m.passes ?? [];
-  const open = specs.find((p) => p.open && p.kind !== 'final');
-  const final = specs.find((p) => p.kind === 'final');
-  const done = specs.filter((p) => !p.open && p.kind !== 'final');
+  // the pass a cutover runs with the source stopped: a warm migration's final sync, a cold one's copy (SDD §4.2)
+  const singleShot = m.strategy === 'cold' || m.strategy === 'vmware_cold';
+  const atCutover = (p: (typeof specs)[number]) => p.kind === 'final' || (singleShot && p.kind === 'full');
+  const open = specs.find((p) => p.open && !atCutover(p));
+  const final = specs.find(atCutover);
+  const done = specs.filter((p) => !p.open && !atCutover(p));
   let cursor: number;
   if (open) cursor = enteredAt - 60_000;
   else if (m.phase === 'awaiting_cutover') cursor = enteredAt - 30_000;
@@ -946,11 +1439,57 @@ function schedulePasses(m: MigrationSpec, enteredAt: number, downtimeStartedAt: 
   return scheduled;
 }
 
+/** Phases a warm migration reaches only once its passes converged (SDD §5.3). */
+const PAST_CONVERGENCE: ReadonlySet<Phase> = new Set(['awaiting_cutover', 'cutover', 'verifying', 'completed', 'finalized']);
+
+/**
+ * The rule that ended a warm fixture's passes, in the API's order (SDD §5.3): the threshold (not for
+ * CBT passes), an estimate within the SLO, the pass limit — so the record and its numbers agree (§5.5).
+ */
+function fixtureConvergedBy(strategy: Strategy, phase: Phase, passes: SyncPass[], estimate: Estimate | null, plan: Plan): ConvergedBy | null {
+  if ((strategy !== 'warm' && strategy !== 'vmware_warm') || !PAST_CONVERGENCE.has(phase)) return null;
+  const last = passes.filter((p) => p.kind !== 'final' && p.ended_at !== null).at(-1);
+  if (!last) return null;
+  if (strategy !== 'vmware_warm' && last.bytes_changed <= plan.convergence_threshold_bytes) return 'threshold';
+  if (estimate && estimate.downtime_s <= plan.downtime_slo_s) return 'slo';
+  return last.number >= plan.max_sync_passes ? 'max_passes' : null;
+}
+
+/**
+ * The last verification of a fixture (SDD §7.5): passed for one that completed, failed for one whose
+ * error says verification failed; no application probe, as the fixture plans configure none.
+ */
+function fixtureVerification(phase: Phase, endedAt: number | null, error: string | null): VerificationRecord | null {
+  const passed = phase === 'completed' || phase === 'finalized';
+  if (!passed && !error?.startsWith('Verification failed')) return null;
+  const at = iso(endedAt ?? Date.parse('2026-10-08T00:00:00Z'));
+  const checks = passed
+    ? [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+        { name: 'tcp:22', ok: true, detail: 'connected in 4 ms' },
+        { name: 'console', ok: true, detail: "matched 'login:'" },
+      ]
+    : [
+        { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+        { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+        { name: 'tcp:22', ok: false, detail: 'connection refused' },
+        { name: 'console', ok: false, detail: 'no success pattern in the last 200 console lines' },
+      ];
+  return { at, passed, checks, probes: [], warnings: [] };
+}
+
 export interface Fixtures {
   providers: Provider[];
   inventories: Record<string, VMRef[] | DestinationInventory>;
   plans: Plan[];
   migrations: Migration[];
+  /** Stored recommendations (document kind `recommendation`, SDD §14.4). */
+  recommendations: AdvisorRecommendation[];
+  /** Redacted advisor inputs (document kind `advisor_snapshot`, SDD §14.5). */
+  snapshots: AdvisorSnapshot[];
+  /** Stored advisor policies (document kind `advisor_policy`, SDD §14.6). */
+  policies: AdvisorPolicy[];
   events: Event[];
 }
 
@@ -959,7 +1498,27 @@ export function buildFixtures(now: number): Fixtures {
   const inventories = buildInventories();
   const plans: Plan[] = [];
   const migrations: Migration[] = [];
+  const recommendations: AdvisorRecommendation[] = [];
+  const snapshots: AdvisorSnapshot[] = [];
   const pending: Array<Omit<Event, 'seq'>> = [];
+  const policyAt = iso(now - 4 * D * 1000);
+  const policies: AdvisorPolicy[] = [
+    {
+      id: FINANCE_POLICY_ID,
+      name: 'Finance — approval required',
+      scope: { provider_ids: ['rhosp17-dc1'], plan_ids: [] },
+      decision_types: ['migration_strategy'],
+      mode: 'always_require_approval',
+      threshold: JEV_MIN_CONFIDENCE,
+      min_evidence_for_auto_apply: 0,
+      require_override_reason: true,
+      require_distinct_approver: true,
+      created_at: policyAt,
+      updated_at: policyAt,
+      updated_by: 'rina',
+    },
+  ];
+  pending.push({ ts: policyAt, kind: 'policy.created', plan_id: null, migration_id: null, actor: 'user:rina', message: 'advisor policy pol-finance created', data: { target_id: FINANCE_POLICY_ID, before: null, after: policies[0] } });
   const emit = (e: Omit<Event, 'seq'>) => pending.push(e);
 
   for (const spec of PLAN_SPECS) {
@@ -1063,13 +1622,26 @@ export function buildFixtures(now: number): Fixtures {
         actual_downtime_s: m.downtimeS ?? null,
         approvals: (m.approvals ?? []).map((a) => ({ actor: a.actor, at: iso(now - a.ago * 1000), comment: a.comment ?? null })),
         cutover_requested: m.cutoverRequested ?? false,
+        // maker-checker (SDD §5.4, ADV-17): requested by one person, approved by another, before the approval
+        cutover_requested_by: m.cutoverRequested ? REQUESTED_BY : null,
+        cutover_requested_at: m.cutoverRequested ? iso(now - (Math.max(...(m.approvals ?? []).map((a) => a.ago), m.enteredAgo) + 120) * 1000) : null,
         force_window: false,
         advisor_notes: (m.notes ?? []).map(({ ago, ...note }) => ({ ...note, created_at: iso(now - ago * 1000) })),
+        advisor_hold: null,
+        converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
+        force_cutover: null,
+        data_issues: [],
+        downtime_model_s: null,
+        verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
+        suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),
+        source_running_at: null,
         review_required: Boolean(m.reviewReason),
         review_reason: m.reviewReason ?? null,
         destination_server_id: m.destination ?? null,
         error: m.error ?? null,
         attempts: m.attempts ?? 0,
+        // a fixture's earlier attempts ran its strategy (SDD §14.4)
+        attempt_strategies: Array<Strategy>(m.attempts ?? 0).fill(m.strategy),
         created_at: iso(migCreatedAt),
         updated_at: iso(enteredAt),
       };
@@ -1094,13 +1666,52 @@ export function buildFixtures(now: number): Fixtures {
       if (migration.error) {
         emit({ ts: iso(enteredAt - 1000), kind: 'migration.error', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${vm.name}: ${migration.error}`, data: {} });
       }
+      if (m.rec) {
+        // recorded when the validation ended (SDD §14.4)
+        const validated = history.find((c) => c.from_phase === 'validating')?.at ?? iso(migCreatedAt);
+        const snapshot = strategySnapshot({ vm, plan, estimates, findings, scope: estimates.filter((e) => e.eligible).map((e) => e.strategy), deterministic: m.rec.deterministic, at: validated });
+        snapshots.push(snapshot);
+        const eligible = estimates.filter((e) => e.eligible).map((e) => e.strategy);
+        const evidenceOption = m.rec.option && eligible.includes(m.rec.option as Strategy) ? m.rec.option : m.rec.deterministic;
+        const kind = providers.find((p) => p.id === plan.source_provider_id)?.kind ?? 'openstack';
+        const rec = strategyRecommendation({
+          id: `rec-${m.id.slice(4)}01`,
+          at: validated,
+          migration,
+          providerId: plan.source_provider_id,
+          option: m.rec.option,
+          confidence: m.rec.confidence,
+          evidenceOption,
+          evidence: buildStrategyEvidence(vm, plan, kind, estimates, findings, evidenceOption, null, migration.id),
+          similarIncidents: FIXTURE_INCIDENTS[evidenceOption] ?? [],
+          options: eligible,
+          status: m.rec.status,
+          deterministic: m.rec.deterministic,
+          fallback: m.rec.fallback,
+          snapshotSha256: snapshot.sha256,
+          policyId: m.rec.policyId,
+          // the fixtures' validations ran as the operator (SDD §14.6): the admin may decide what waits
+          requestedBy: VALIDATED_BY,
+        });
+        for (const event of auditEventsOf(rec)) emit({ ts: validated, plan_id: plan.id, migration_id: m.id, ...event });
+        let decided = rec;
+        const then = m.rec.then;
+        if (then) {
+          const at = iso(Date.parse(validated) + then.after * 1000);
+          decided = humanDecision(rec, then.kind === 'approve' ? then : { ...then, reason: then.reason }, at);
+          emit({ ts: at, plan_id: plan.id, migration_id: m.id, ...decisionEventOf(decided, rec.decision) });
+          if (then.kind === 'override') plan.strategy_overrides = { ...plan.strategy_overrides, [vm.source_id]: then.option };
+        }
+        recommendations.push(decided);
+        if (decided.decision.status === 'pending_approval') migration.advisor_hold = decided.id;
+      }
       for (const note of migration.advisor_notes) {
         const kind = note.kind === 'screen' ? 'advisor.verification' : `advisor.${note.kind}`;
         emit({ ts: note.created_at, kind, plan_id: plan.id, migration_id: m.id, actor: note.source === 'memory' ? 'agentmemory' : 'advisor', message: `${vm.name}: ${note.summary}`, data: { source: note.source, confidence: note.confidence } });
       }
     }
 
-    if (plan.status !== 'draft') emit({ ts: iso(createdAt + 30 * 60_000), kind: 'plan.validated', plan_id: plan.id, migration_id: null, actor: 'rina', message: `Plan "${plan.name}" validated`, data: {} });
+    if (plan.status !== 'draft') emit({ ts: iso(createdAt + 30 * 60_000), kind: 'plan.validated', plan_id: plan.id, migration_id: null, actor: VALIDATED_BY, message: `Plan "${plan.name}" validated`, data: {} });
     if (['running', 'paused', 'completed', 'failed'].includes(plan.status))
       emit({ ts: iso(createdAt + 60 * 60_000), kind: 'plan.started', plan_id: plan.id, migration_id: null, actor: 'bayu', message: `Plan "${plan.name}" started`, data: {} });
     if (plan.status === 'paused') emit({ ts: iso(now - 20 * 60_000), kind: 'plan.paused', plan_id: plan.id, migration_id: null, actor: 'bayu', message: `Plan "${plan.name}" paused: vCenter degraded`, data: {} });
@@ -1122,7 +1733,8 @@ export function buildFixtures(now: number): Fixtures {
   });
   emit({ ts: iso(now - 7 * D * 1000 + 600_000), kind: 'memory.lesson_saved', plan_id: 'plan-2d5c8b93', migration_id: 'mig-d4e6f8a091', actor: 'agentmemory', message: 'Lesson saved: warm, <50G, 3 passes, estimate 3m 40s vs actual 3m 08s', data: { type: 'fact' } });
 
+  for (const plan of plans) plan.derived_status = derivePlanStatus(plan, migrations);
   pending.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
   const events: Event[] = pending.map((e, i) => ({ ...e, seq: i + 1 }));
-  return { providers, inventories, plans, migrations, events };
+  return { providers, inventories, plans, migrations, recommendations, snapshots, policies, events };
 }

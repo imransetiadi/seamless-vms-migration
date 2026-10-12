@@ -79,4 +79,5 @@ extend-immutable-calls = [
   "fastapi.Query",
   "fastapi.Body",
   "seamless_migrate.api.deps.require_role",
+  "seamless_migrate.api.deps.require_permission",
 ]

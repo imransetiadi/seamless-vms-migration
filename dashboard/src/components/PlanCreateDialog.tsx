@@ -4,17 +4,19 @@ import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
-import { cn } from '../lib/cn';
 import { heldElsewhere } from '../lib/holds';
+import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { FAMILY_LABELS, handoverTargets, resolveDestination, splitHost, storageBackends, volumeTypeFamilies } from '../lib/storage';
 import { providerStatusMeta, STRATEGY_LABELS } from '../lib/status';
 import { Button } from './Button';
+import { Checkbox } from './Checkbox';
 import { ErrorBanner } from './ErrorBanner';
 import { SelectField, TextAreaField, TextField } from './Field';
 import { Modal } from './Modal';
+import { ProbeListEditor } from './ProbeListEditor';
 import { LoadingBlock } from './Skeleton';
 import { VmTable } from './VmTable';
 
@@ -33,6 +35,8 @@ interface FormState {
   policy: SelectionPolicy;
   sloMinutes: string;
   requireApproval: boolean;
+  /** Maker-checker (SDD §5.4): the cutover's requester never counts as its approver. */
+  requireDistinctApprover: boolean;
   autoCutover: boolean;
   windowStart: string;
   windowEnd: string;
@@ -46,6 +50,8 @@ interface FormState {
   keepWarmMinutes: string;
   /** Which of the default resources are pre-staged at the destination (SDD §4.2, §7.2). */
   prestage: string[];
+  /** Recreate ports through Neutron with their MAC, every fixed IP and their security groups (SDD §4.2 port_creation_mode). */
+  keepPorts: boolean;
   /** Optional estimator overrides (SDD §9.1): empty = planning default. */
   scanMiBps: string;
   parallelDisks: string;
@@ -57,6 +63,8 @@ interface FormState {
   tcpPorts: string;
   windowsTcpPorts: string;
   autoRollback: boolean;
+  /** Hours a migration may wait in Completed before it is flagged for finalize (SDD §8.1, ADV-19). */
+  finalizeWarningH: string;
   /** Source project -> RHOSO project (SDD §4.3 mappings). */
   projects: string;
   /** Verification (SDD §7.5): where the probes connect, how long they try, what the console must show. */
@@ -64,6 +72,8 @@ interface FormState {
   timeoutMinutes: string;
   consolePatterns: string;
   useAdvisor: boolean;
+  /** The application probes of every VM (SDD §7.5, ADV-18); a VM's own are set on its migration page. */
+  appProbes: ProbeDraft[];
   /** Storage handover (SDD §7.3): volume type -> RHOSO backend chosen by the operator. */
   handoverEnabled: boolean;
   handoverMap: Record<string, string>;
@@ -79,7 +89,7 @@ const STEP_TIMES = [
 type StepTimeKey = (typeof STEP_TIMES)[number]['key'];
 const NO_STEP_TIMES = Object.fromEntries(STEP_TIMES.map(({ key }) => [key, ''])) as Record<StepTimeKey, string>;
 
-type FieldKey = 'keepWarm' | 'projects' | 'timeout' | 'windowsPorts' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
+type FieldKey = 'keepWarm' | 'finalizeReminder' | 'projects' | 'timeout' | 'windowsPorts' | 'appProbes' | 'name' | 'source' | 'destination' | 'vms' | 'slo' | 'window' | 'networks' | 'flavors' | 'volumeTypes' | 'link' | 'threshold' | 'passes' | 'scan' | 'parallel' | 'changeRate' | 'aggregateScan' | 'ports' | 'handover' | (typeof STEP_TIMES)[number]['field'];
 type Errors = Partial<Record<FieldKey, string>>;
 
 function initialForm(sourceId = '', vmIds: string[] = []): FormState {
@@ -94,6 +104,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     policy: 'min_downtime',
     sloMinutes: '10',
     requireApproval: true,
+    requireDistinctApprover: true,
     autoCutover: false,
     windowStart: '',
     windowEnd: '',
@@ -105,6 +116,7 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     maxPasses: '5',
     keepWarmMinutes: '15',
     prestage: [...DEFAULT_PRESTAGE],
+    keepPorts: false,
     scanMiBps: '',
     parallelDisks: '',
     changeMiBps: '',
@@ -113,11 +125,14 @@ function initialForm(sourceId = '', vmIds: string[] = []): FormState {
     tcpPorts: '22',
     windowsTcpPorts: '3389',
     autoRollback: true,
+    // TODO(ADV-19): confirm 72 h — the owner's open question 14 (the API's default, SDD §4.2)
+    finalizeWarningH: '72',
     projects: '',
     probeAddress: DEFAULT_VERIFICATION.probe_address,
     timeoutMinutes: plain(DEFAULT_VERIFICATION.timeout_s / 60),
     consolePatterns: DEFAULT_VERIFICATION.console_success_patterns.join('\n'),
     useAdvisor: DEFAULT_VERIFICATION.use_advisor,
+    appProbes: [],
     handoverEnabled: false,
     handoverMap: {},
   };
@@ -146,8 +161,20 @@ const PRESTAGE_LABEL: Record<string, string> = {
   router_interfaces: 'Router interfaces',
   security_groups: 'Security groups',
   security_group_rules: 'Security group rules',
+  flavors: 'Flavors',
+  keypairs: 'Keypairs',
 };
-const isDefaultPrestage = (resource: string): boolean => DEFAULT_PRESTAGE.includes(resource);
+/** Offered as well but off by default, each scoped to the plan (SDD §7.2, §16), with what it does. */
+const OPTIONAL_PRESTAGE_NOTE: Record<string, string> = {
+  flavors:
+    "Off by default. Creates the flavors of the plan's VMs that RHOSO lacks, with the same size and extra specs, instead of matching the smallest fitting one; a RHOSO flavor is never changed.",
+  keypairs:
+    "Off by default. Imports the VMs' keypairs the migration user lacks at RHOSO (name and public key), when the source migration user owns them; otherwise the VM is blocked until the keypair exists.",
+};
+const OPTIONAL_PRESTAGE = Object.keys(OPTIONAL_PRESTAGE_NOTE);
+/** Every resource the form offers, in the order they are created. */
+const OFFERED_PRESTAGE = [...DEFAULT_PRESTAGE, ...OPTIONAL_PRESTAGE];
+const isOfferedPrestage = (resource: string): boolean => OFFERED_PRESTAGE.includes(resource);
 
 /** Estimator overrides the form does not edit (it edits those of SDD §16); they are kept. */
 function withoutFormOverrides(overrides: Record<string, number> | undefined): Record<string, number> {
@@ -169,6 +196,7 @@ function formFromPlan(plan: Plan): FormState {
     policy: plan.selection_policy,
     sloMinutes: plain(plan.downtime_slo_s / 60),
     requireApproval: plan.require_approval,
+    requireDistinctApprover: plan.require_distinct_approver,
     autoCutover: plan.auto_cutover,
     windowStart: plan.cutover_window ? toLocalInput(plan.cutover_window.start) : '',
     windowEnd: plan.cutover_window ? toLocalInput(plan.cutover_window.end) : '',
@@ -179,7 +207,8 @@ function formFromPlan(plan: Plan): FormState {
     thresholdGiB: plain(plan.convergence_threshold_bytes / GiB),
     maxPasses: String(plan.max_sync_passes),
     keepWarmMinutes: plain(plan.keep_warm_interval_s / 60),
-    prestage: plan.prestage_resources.filter(isDefaultPrestage),
+    prestage: plan.prestage_resources.filter(isOfferedPrestage),
+    keepPorts: plan.port_creation_mode === 'neutron',
     scanMiBps: plan.estimator_overrides.scan_bps ? plain(plan.estimator_overrides.scan_bps / MiB) : '',
     parallelDisks: plan.estimator_overrides.parallel_disks ? String(plan.estimator_overrides.parallel_disks) : '',
     changeMiBps: plan.estimator_overrides.change_rate_bps ? plain(plan.estimator_overrides.change_rate_bps / MiB) : '',
@@ -190,11 +219,13 @@ function formFromPlan(plan: Plan): FormState {
     tcpPorts: v.tcp_ports.join(', '),
     windowsTcpPorts: (v.windows_tcp_ports ?? []).join(', '),
     autoRollback: v.auto_rollback,
+    finalizeWarningH: String(plan.finalize_warning_h),
     projects: formatMappings(plan.mappings.projects),
     probeAddress: v.probe_address,
     timeoutMinutes: plain(v.timeout_s / 60),
     consolePatterns: v.console_success_patterns.join('\n'),
     useAdvisor: v.use_advisor,
+    appProbes: v.app_probes.map(toDraft),
     handoverEnabled: plan.handover.enabled,
     handoverMap: { ...plan.handover.backend_map },
   };
@@ -203,35 +234,6 @@ function formFromPlan(plan: Plan): FormState {
 function strategiesFor(kind: ProviderKind | undefined): Strategy[] {
   if (kind === 'vmware') return ['vmware_cold', 'vmware_warm'];
   return ['cold', 'warm', 'storage_handover'];
-}
-
-interface CheckboxProps {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-  hint?: string;
-  disabled?: boolean;
-  /** Id of the text that says why the box is disabled. */
-  describedBy?: string;
-}
-
-function Checkbox({ checked, onChange, label, hint, disabled = false, describedBy }: CheckboxProps) {
-  return (
-    <label className={cn('flex min-h-11 items-start gap-2.5 py-1', disabled ? 'cursor-not-allowed' : 'cursor-pointer')}>
-      <input
-        type="checkbox"
-        className="mt-1 size-4 shrink-0 cursor-pointer accent-accent disabled:cursor-not-allowed disabled:opacity-50"
-        checked={checked}
-        disabled={disabled}
-        aria-describedby={describedBy}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <span className={cn('text-sm text-foreground', disabled && 'opacity-70')}>
-        {label}
-        {hint && <span className="block text-xs text-muted-foreground">{hint}</span>}
-      </span>
-    </label>
-  );
 }
 
 /** `aria-describedby` for a field shown read-only; nothing otherwise, so the field keeps its own hint and error. */
@@ -257,10 +259,12 @@ export interface PlanCreateDialogProps {
   plan?: Plan;
   /** Called once the edited plan was saved, so the page can announce it (SDD §16). */
   onSaved?: () => void;
+  /** VMs whose failed migration still needs the plan's destination for its rollback (SDD §12). */
+  failedVms?: string[];
 }
 
 /** Create a draft plan (POST /plans, operator). Validation happens on submit with an error summary. */
-export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved }: PlanCreateDialogProps) {
+export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds, plan, onSaved, failedVms = [] }: PlanCreateDialogProps) {
   const titleId = useId();
   const id = (key: string) => `plan-create-${key}`;
   const providers = useProviders();
@@ -268,6 +272,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const patch = usePatchPlan(plan?.id ?? '');
   const editing = Boolean(plan);
   const saving = editing ? patch : create;
+  // SDD §12: a failed migration's rollback acts on the clouds its attempt used
+  const destinationLocked = editing && failedVms.length > 0;
+  const destinationReason =
+    failedVms.length === 1
+      ? `The failed migration of ${failedVms[0]} still needs this destination for its rollback: roll it back or cancel it first.`
+      : `The failed migrations of ${failedVms.join(', ')} still need this destination for their rollback: roll them back or cancel them first.`;
   const navigate = useNavigate();
   // the approval policy is approver-only (SDD §12): below it the form shows the plan's policy read-only
   const canSetPolicy = hasRole(useRole(), 'approver');
@@ -375,7 +385,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     const flavors = parseMappings(f.flavors);
     const volumeTypes = parseMappings(f.volumeTypes);
     const projects = parseMappings(f.projects);
-    const formatHint = 'Use one "source = destination" pair per line.';
+    const formatHint = 'Use one "source = destination" pair per line; put a name in double quotes when it contains =, -> or →.';
     if (!networks) e.networks = formatHint;
     if (!flavors) e.flavors = formatHint;
     if (!volumeTypes) e.volumeTypes = formatHint;
@@ -395,6 +405,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     // at least a minute: a shorter interval would run delta passes back to back (SDD §5.4)
     const keepWarm = f.keepWarmMinutes.trim() === '' ? Number.NaN : Number(f.keepWarmMinutes);
     if (!(keepWarm >= 1)) e.keepWarm = 'Enter the keep-warm interval in minutes (1 or more).';
+    // whole hours, 1 or more, like the API (SDD §4.2)
+    const finalizeWarningH = f.finalizeWarningH.trim() === '' ? Number.NaN : Number(f.finalizeWarningH);
+    if (!Number.isInteger(finalizeWarningH) || finalizeWarningH < 1) e.finalizeReminder = 'Enter the finalize reminder in whole hours (1 or more).';
     const overrides: Record<string, number> = {};
     if (f.scanMiBps.trim()) {
       const scan = Number(f.scanMiBps);
@@ -428,6 +441,9 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.ports = 'Use port numbers from 1 to 65535, separated by commas.';
     const windowsPorts = f.windowsTcpPorts.split(/[\s,]+/).filter(Boolean).map(Number);
     if (windowsPorts.some((p) => !Number.isInteger(p) || p < 1 || p > 65535)) e.windowsPorts = 'Use port numbers from 1 to 65535, separated by commas.';
+    // like the API (SDD §12): what it refuses, the first problem at a time
+    const appProbes = parseDrafts(f.appProbes);
+    if (appProbes.problems.length) e.appProbes = appProbes.problems[0];
     const backendMap: Record<string, string> = {};
     if (f.handoverEnabled && source?.kind !== 'vmware') {
       const missing = handoverTypes.filter((t) => !chosenTarget(t, f));
@@ -449,9 +465,12 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         default_strategy: f.defaultStrategy,
         // a VM taken out of the plan takes its override with it
         strategy_overrides: Object.fromEntries(Object.entries(f.overrides).filter(([vmId]) => f.vmIds.has(vmId))),
+        // a VM's own probes are kept, and go with the VM when it leaves the plan (SDD §7.5)
+        probe_overrides: Object.fromEntries(Object.entries(plan?.probe_overrides ?? {}).filter(([vmId]) => f.vmIds.has(vmId))),
         selection_policy: f.policy,
         downtime_slo_s: Math.round(slo * 60),
         require_approval: f.requireApproval,
+        require_distinct_approver: f.requireDistinctApprover,
         auto_cutover: f.autoCutover,
         cutover_window: f.windowStart ? { start: new Date(f.windowStart).toISOString(), end: new Date(f.windowEnd).toISOString() } : null,
         mappings: { networks: networks ?? {}, flavors: flavors ?? {}, volume_types: volumeTypes ?? {}, projects: projects ?? {} },
@@ -460,8 +479,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
         convergence_threshold_bytes: Math.round(threshold * GiB),
         max_sync_passes: passes,
         keep_warm_interval_s: Math.round(keepWarm * 60),
+        finalize_warning_h: finalizeWarningH,
         // the defaults in their creation order, then what the plan already pre-stages beyond them (kept)
-        prestage_resources: [...DEFAULT_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isDefaultPrestage(r))],
+        prestage_resources: [...OFFERED_PRESTAGE.filter((r) => f.prestage.includes(r)), ...(plan?.prestage_resources ?? []).filter((r) => !isOfferedPrestage(r))],
+        port_creation_mode: f.keepPorts ? 'neutron' : 'nova',
         estimator_overrides: { ...withoutFormOverrides(plan?.estimator_overrides), ...overrides },
         verification: {
           ...DEFAULT_VERIFICATION,
@@ -473,6 +494,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           timeout_s: Math.round(timeoutMinutes * 60),
           console_success_patterns: consolePatterns,
           use_advisor: f.useAdvisor,
+          app_probes: appProbes.probes,
         },
       },
     };
@@ -528,6 +550,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     threshold: id('threshold'),
     passes: id('passes'),
     keepWarm: id('keep-warm'),
+    finalizeReminder: id('finalize-reminder'),
     scan: id('scan'),
     parallel: id('parallel'),
     changeRate: id('changeRate'),
@@ -538,13 +561,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
     boot: id('boot'),
     ports: id('ports'),
     windowsPorts: id('windows-ports'),
+    appProbes: id('app-probes'),
     handover: handoverTypes.length ? id(`handover-${handoverTypes[0]}`) : id('handover'),
   };
-  const advancedHasErrors = ['keepWarm', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'handover'].some((k) => k in errors);
+  const advancedHasErrors = ['keepWarm', 'finalizeReminder', 'window', 'networks', 'flavors', 'volumeTypes', 'projects', 'timeout', 'link', 'threshold', 'passes', 'scan', 'parallel', 'changeRate', 'aggregateScan', 'shutdown', 'snapshot', 'create', 'boot', 'ports', 'windowsPorts', 'appProbes', 'handover'].some((k) => k in errors);
 
   return (
     <Modal open={open} onClose={onClose} labelledBy={titleId} size="lg" dismissible={!saving.isPending} initialFocusRef={nameRef}>
-      <form onSubmit={submit} noValidate className="flex flex-col">
+      <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
             {plan ? 'Edit plan' : 'New migration plan'}
@@ -558,7 +582,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           </p>
         </div>
 
-        <div className="flex flex-col gap-6 px-5 py-4">
+        {/* the body scrolls between the title and the actions: they never cover the focused control (SDD §16) */}
+        <div className="relative flex min-h-0 flex-col gap-6 overflow-y-auto px-5 py-4">
           {errorEntries.length > 0 && (
             <div ref={summaryRef} tabIndex={-1} role="alert" aria-labelledby={id('summary')} className="rounded-md border border-status-danger/40 bg-status-danger/10 p-3 outline-hidden">
               <p id={id('summary')} className="flex items-center gap-2 font-medium text-foreground">
@@ -570,7 +595,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   <li key={key}>
                     <a
                       href={`#${targetFor[key]}`}
-                      className="text-foreground underline underline-offset-4"
+                      className="inline-block py-1 text-foreground underline underline-offset-4"
                       onClick={(e) => {
                         e.preventDefault();
                         if (advancedHasErrors) (document.getElementById(id('advanced')) as HTMLDetailsElement | null)?.setAttribute('open', '');
@@ -613,6 +638,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 required
                 value={form.destinationId}
                 onChange={(e) => set('destinationId', e.target.value)}
+                disabled={destinationLocked}
+                hint={destinationLocked ? destinationReason : undefined}
                 error={errors.destination}
                 options={[
                   { value: '', label: 'Choose a destination…' },
@@ -676,22 +703,25 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 </div>
               </div>
             )}
-            {held.size > 0 && (
-              <div role="status" aria-labelledby={id('held')} className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
-                <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
-                <div className="min-w-0">
-                  <p id={id('held')} className="font-medium text-foreground">
-                    Another plan holds {held.size === 1 ? 'a selected VM' : `${held.size} selected VMs`}: validation refuses {held.size === 1 ? 'it' : 'them'}
-                  </p>
-                  <ul className="mt-1 text-muted-foreground">
-                    {[...held.values()].flat().map((holder) => (
-                      <li key={holder}>{holder}</li>
-                    ))}
-                  </ul>
-                  <p className="mt-1 text-muted-foreground">Finish, roll back or cancel the migration in that plan, or leave the VM out.</p>
+            {/* a live region already in the form: one inserted together with its text is not reliably read (SDD §16) */}
+            <div role="status" aria-labelledby={id('held')} className="empty:-mt-2">
+              {held.size > 0 && (
+                <div className="flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+                  <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+                  <div className="min-w-0">
+                    <p id={id('held')} className="font-medium text-foreground">
+                      Another plan holds {held.size === 1 ? 'a selected VM' : `${held.size} selected VMs`}: validation refuses {held.size === 1 ? 'it' : 'them'}
+                    </p>
+                    <ul className="mt-1 text-muted-foreground">
+                      {[...held.values()].flat().map((holder) => (
+                        <li key={holder}>{holder}</li>
+                      ))}
+                    </ul>
+                    <p className="mt-1 text-muted-foreground">Finish, roll back or cancel the migration in that plan, or leave the VM out.</p>
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </fieldset>
 
           <Fieldset legend="Strategy and downtime">
@@ -791,6 +821,14 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 label="Require approval"
                 hint="An approver must approve every cutover."
                 disabled={!canSetPolicy}
+                describedBy={canSetPolicy ? undefined : id('policy-reason')}
+              />
+              <Checkbox
+                checked={form.requireDistinctApprover}
+                onChange={(v) => set('requireDistinctApprover', v)}
+                label="Require a distinct approver"
+                hint={form.requireApproval ? 'The approver who requests a cutover cannot approve it.' : 'Applies when approval is required.'}
+                disabled={!canSetPolicy || !form.requireApproval}
                 describedBy={canSetPolicy ? undefined : id('policy-reason')}
               />
               <Checkbox
@@ -965,11 +1003,41 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                     />
                   ))}
                 </div>
-                {plan && plan.prestage_resources.some((r) => !isDefaultPrestage(r)) && (
+                {OPTIONAL_PRESTAGE.map((resource) => (
+                  <div key={resource}>
+                    <Checkbox
+                      label={PRESTAGE_LABEL[resource] ?? resource}
+                      checked={form.prestage.includes(resource)}
+                      disabled={source?.kind === 'vmware'}
+                      describedBy={id(`prestage-${resource}-note`)}
+                      onChange={(on) => set('prestage', on ? [...form.prestage, resource] : form.prestage.filter((r) => r !== resource))}
+                    />
+                    <p id={id(`prestage-${resource}-note`)} className="pl-7 text-xs text-muted-foreground">
+                      {OPTIONAL_PRESTAGE_NOTE[resource]}
+                    </p>
+                  </div>
+                ))}
+                {plan && plan.prestage_resources.some((r) => !isOfferedPrestage(r)) && (
                   <p className="text-xs text-muted-foreground">
-                    Also pre-staged: {plan.prestage_resources.filter((r) => !isDefaultPrestage(r)).join(', ')} (set through the API; kept).
+                    Also pre-staged: {plan.prestage_resources.filter((r) => !isOfferedPrestage(r)).join(', ')} (set through the API; kept).
                   </p>
                 )}
+              </Fieldset>
+              <Fieldset legend="Ports">
+                <div>
+                  <Checkbox
+                    label="Keep MAC addresses and every fixed IP"
+                    checked={form.keepPorts}
+                    disabled={source?.kind === 'vmware'}
+                    describedBy={id('ports-note')}
+                    onChange={(on) => set('keepPorts', on)}
+                  />
+                  <p id={id('ports-note')} className="pl-7 text-xs text-muted-foreground">
+                    {source?.kind === 'vmware'
+                      ? 'VMware sources ignore this: the migration kit recreates the NICs.'
+                      : 'Off by default. Cold, warm and storage handover migrations recreate each port through Neutron with its MAC address, all its fixed IPs and its security groups, instead of one fixed IP and a new MAC. The ports then outlive their server: delete them with it.'}
+                  </p>
+                </div>
               </Fieldset>
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField id={id('ports')} label="Verification TCP ports" value={form.tcpPorts} onChange={(e) => set('tcpPorts', e.target.value)} error={errors.ports} hint="Linux and other guests. Comma separated, e.g. 22, 443." />
@@ -982,7 +1050,27 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                   hint="RDP 3389 or WinRM 5985. Windows guests skip the console check."
                 />
                 <Checkbox checked={form.autoRollback} onChange={(v) => set('autoRollback', v)} label="Roll back automatically" hint="When verification fails after the source was stopped." />
+                <TextField
+                  id={id('finalize-reminder')}
+                  label="Finalize reminder (hours)"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  step={1}
+                  value={form.finalizeWarningH}
+                  onChange={(e) => set('finalizeWarningH', e.target.value)}
+                  error={errors.finalizeReminder}
+                  hint="A verified VM waiting longer than this for finalize is flagged: finalize it or roll it back."
+                />
               </div>
+              <ProbeListEditor
+                id={id('app-probes')}
+                legend="Application probes of every VM"
+                drafts={form.appProbes}
+                onChange={(drafts) => set('appProbes', drafts)}
+                hint="Checked after the boot: a refused port or a wrong HTTP status fails the verification, an address the control plane cannot reach asks for review. A VM's own probes, set on its migration page, replace these."
+                error={errors.appProbes}
+              />
               <div className="grid gap-3 sm:grid-cols-2">
                 <SelectField
                   id={id('probe')}
@@ -1072,8 +1160,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
           {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} />}
         </div>
 
-        <div className="sticky bottom-0 flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
-          <Button size="lg" onClick={onClose} disabled={saving.isPending}>
+        <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">
+          <Button size="lg" onClick={onClose} disabledReason={saving.isPending ? 'Wait for the request to finish.' : null}>
             Cancel
           </Button>
           <Button size="lg" type="submit" variant="primary" loading={saving.isPending}>

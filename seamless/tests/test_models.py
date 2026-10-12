@@ -116,6 +116,64 @@ def test_provider_id_regex_enforced():
             make_provider(id=bad)
 
 
+def test_plan_port_creation_mode_is_nova_unless_neutron_is_chosen():
+    """SDD §4.2: "nova" keeps today's ports; "neutron" recreates each with its MAC, every fixed
+    IP and its security groups; nothing else is a mode."""
+    assert make_plan().port_creation_mode == "nova"
+    assert make_plan(port_creation_mode="neutron").port_creation_mode == "neutron"
+    with pytest.raises(ValidationError, match="port_creation_mode"):
+        make_plan(port_creation_mode="ovs")
+
+
+def test_plan_nic_overrides_keep_lower_case_macs_and_canonical_addresses():
+    """SDD §4.2: per VM and NIC MAC (stored lower case) a RHOSO network and addresses; null keeps
+    the mapping or the NIC's own; the addresses in their canonical form."""
+    from seamless_migrate.domain.models import invalid_plan_settings
+
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {
+                "FA:16:3E:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["fd00:0::0005"]},
+                "fa:16:3e:00:00:02": {"network": "rhoso-dmz"},
+            }
+        }
+    )
+    entries = plan.nic_overrides["vm-1"]
+    assert sorted(entries) == ["fa:16:3e:00:00:01", "fa:16:3e:00:00:02"]
+    assert entries["fa:16:3e:00:00:01"].fixed_ips == ["fd00::5"]
+    assert entries["fa:16:3e:00:00:02"].fixed_ips is None
+    assert invalid_plan_settings(plan) == []
+    assert make_plan().nic_overrides == {}
+
+
+def test_plan_nic_overrides_refuse_what_cannot_be_applied():
+    """SDD §12: a key that is no MAC, an entry with neither field, an empty address list, a value
+    that is no IP address and the same address twice are refused (422)."""
+    from seamless_migrate.domain.models import invalid_plan_settings
+
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {
+                "not-a-mac": {"network": "rhoso-dmz"},
+                "fa:16:3e:00:00:01": {},
+                "fa:16:3e:00:00:02": {"fixed_ips": []},
+                "fa:16:3e:00:00:03": {"fixed_ips": ["10.0.0.300", "10.0.0.5", "10.0.0.5"]},
+                "fa:16:3e:00:00:04": {"network": ""},
+            }
+        }
+    )
+    problems = invalid_plan_settings(plan)
+    assert problems == [
+        "nic_overrides[vm-1][fa:16:3e:00:00:01]: give a network, addresses or both",
+        "nic_overrides[vm-1][fa:16:3e:00:00:02]: fixed_ips must list at least one address "
+        "(leave it out to keep the NIC's own)",
+        "nic_overrides[vm-1][fa:16:3e:00:00:03]: not an IP address: 10.0.0.300",
+        "nic_overrides[vm-1][fa:16:3e:00:00:03]: 10.0.0.5 given twice",
+        "nic_overrides[vm-1][fa:16:3e:00:00:04]: network must not be empty",
+        "nic_overrides[vm-1][not-a-mac]: not a MAC address",
+    ]
+
+
 def test_plan_defaults_match_sdd():
     plan = make_plan()
     assert plan.default_strategy == "auto"
@@ -188,3 +246,29 @@ def test_keep_sync_history_drops_the_oldest_passes_between_the_first_and_the_lat
     assert next_pass_number(m) == 31
     keep_sync_history(m, keep_first=5)  # at the bound nothing more is dropped
     assert len(m.sync_passes) == 25 and m.sync_bytes_dropped == sum(range(6, 11))
+
+
+def test_prestage_resources_name_resources_os_migrate_can_pre_stage():
+    """SDD §4.2: an entry without an export/import playbook pair (a typo) or naming the
+    workloads themselves is refused; the defaults and "flavors" pass."""
+    from seamless_migrate.domain.models import DEFAULT_PRESTAGE, invalid_plan_settings
+
+    assert invalid_plan_settings(make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors"])) == []
+    assert invalid_plan_settings(make_plan(prestage_resources=[])) == []
+    assert invalid_plan_settings(
+        make_plan(prestage_resources=["networks", "flavours", "workloads"])
+    ) == ["prestage_resources: cannot pre-stage 'flavours', 'workloads'"]
+
+
+def test_prestage_resources_are_the_playbook_pairs_of_the_collection():
+    from pathlib import Path
+
+    from seamless_migrate.domain.models import PRESTAGE_RESOURCES
+
+    playbooks = Path(__file__).resolve().parents[2] / "playbooks"
+    pairs = {
+        p.stem.removeprefix("export_")
+        for p in playbooks.glob("export_*.yml")
+        if (playbooks / ("import_" + p.stem.removeprefix("export_") + ".yml")).exists()
+    }
+    assert set(PRESTAGE_RESOURCES) == pairs - {"workloads"}

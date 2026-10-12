@@ -82,9 +82,18 @@ export function formatPct(value: number | null | undefined, decimals = 1): strin
   return `${rounded.toFixed(decimals).replace(/\.0+$/, '')}%`;
 }
 
+// one formatter per precision: building an Intl.NumberFormat costs far more than using one, and tables and tiles
+// format thousands of numbers each time a live event redraws them
+const numberFormats = new Map<number, Intl.NumberFormat>();
+
 export function formatNumber(value: number | null | undefined, maximumFractionDigits = 0): string {
   if (!isNumber(value)) return DASH;
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits }).format(value);
+  let format = numberFormats.get(maximumFractionDigits);
+  if (!format) {
+    format = new Intl.NumberFormat('en-US', { maximumFractionDigits });
+    numberFormats.set(maximumFractionDigits, format);
+  }
+  return format.format(value);
 }
 
 /** Milliseconds since the epoch for an ISO timestamp / Date / epoch number, or null when invalid. */
@@ -141,4 +150,24 @@ export function secondsBetween(
   const b = toMillis(end ?? Date.now());
   if (a === null || b === null) return null;
   return Math.max(0, (b - a) / 1000);
+}
+
+/** Control characters as Python's repr escapes them. */
+const REPR_ESCAPES: Record<string, string> = { '\\': '\\\\', '\t': '\\t', '\n': '\\n', '\r': '\\r' };
+
+/**
+ * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
+ * holds a single quote and no double one, with backslashes and control characters escaped.
+ */
+export function pyRepr(value: string): string {
+  const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
+  let body = '';
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if (ch in REPR_ESCAPES) body += REPR_ESCAPES[ch];
+    else if (code < 0x20 || code === 0x7f) body += `\\x${code.toString(16).padStart(2, '0')}`;
+    else if (ch === quote) body += `\\${ch}`;
+    else body += ch;
+  }
+  return quote + body + quote;
 }

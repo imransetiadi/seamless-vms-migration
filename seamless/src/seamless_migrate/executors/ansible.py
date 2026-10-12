@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -18,16 +19,34 @@ import re
 import signal
 import sys
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from ..ai.redaction import redact_cut, redact_tail
 from ..config import Settings
 from ..domain.enums import ProviderKind, Strategy, SyncPassKind
-from ..domain.models import Mappings, Plan, Provider, SyncPass, next_pass_number, utcnow
+from ..domain.models import (
+    Mappings,
+    Migration,
+    NicOverride,
+    Plan,
+    Provider,
+    SyncPass,
+    next_pass_number,
+    utcnow,
+)
+from ..planning.networks import (
+    kit_ipv4,
+    kit_network_key,
+    kit_network_value,
+    kit_subnet,
+    port_refusal,
+    resolve_network,
+)
 from ..providers.base import ProviderError
 from ..providers.vmware import parse_endpoint
 from ..security.secrets import (
@@ -133,6 +152,230 @@ def apply_mappings(doc: dict[str, Any], mappings: Mappings) -> dict[str, Any]:
     return out
 
 
+def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Return a copy of an exported ``workloads.yml`` whose servers recreate their ports in
+    ``mode`` (``plan.port_creation_mode``, SDD §7.2)."""
+    out = copy.deepcopy(doc)
+    for resource in out.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        if not isinstance(resource.get("_migration_params"), dict):
+            resource["_migration_params"] = {}
+        resource["_migration_params"]["port_creation_mode"] = mode
+    return out
+
+
+def ports_without_security_groups(doc: dict[str, Any]) -> list[str]:
+    """The networks of server ports exported without their security groups, by an os-migrate
+    from before SDD §6.6's rule: Neutron would give such a port the project's default group."""
+    missing: list[str] = []
+    for resource in doc.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        for port in (resource.get("params") or {}).get("ports") or []:
+            params = port.get("params") or {}
+            if params.get("security_group_refs") is None:
+                missing.append(str((params.get("network_ref") or {}).get("name") or "?"))
+    return missing
+
+
+def _ip_version(address: str) -> int | None:
+    try:
+        return ipaddress.ip_address(address).version
+    except ValueError:
+        return None
+
+
+def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride]) -> dict[str, Any]:
+    """Return a copy of an exported ``workloads.yml`` whose server ports with an entry (by MAC,
+    lower case) go to the entry's network, their addresses - the entry's, else their own - as
+    address-only fixed IP references that Neutron places by subnet (SDD §7.2, §6.6).
+
+    A floating IP on a port's former address stays there when the port keeps the address, else
+    moves to its new address of the same IP version: os-migrate attaches it by that address.
+    ``PermanentStepError`` when one that must move finds no such address or several, or when an
+    entry's MAC is no exported port's (the VM's NICs changed since validation): raised after the
+    export, before the import stops the source.
+    """
+    out = copy.deepcopy(doc)
+    applied: set[str] = set()
+    for resource in out.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        server = resource.get("params") or {}
+        moved: dict[str, tuple[str, list[str]]] = {}  # former address -> (MAC, new addresses)
+        for port in server.get("ports") or []:
+            params = port.get("params") or {}
+            mac = str(params.get("mac_address") or "").lower()
+            entry = entries.get(mac)
+            if entry is None:
+                continue
+            applied.add(mac)
+            former = [ref.get("ip_address") for ref in params.get("fixed_ips_refs") or []]
+            if entry.network:
+                params["network_ref"] = {**(params.get("network_ref") or {}), "name": entry.network}
+            addresses = entry.fixed_ips if entry.fixed_ips is not None else former
+            params["fixed_ips_refs"] = [{"ip_address": address} for address in addresses]
+            # what a warm cutover exports again for, should the entry be removed (SDD §7.2)
+            if not isinstance(port.get("_migration_params"), dict):
+                port["_migration_params"] = {}
+            port["_migration_params"]["nic_override"] = True
+            for address in former:
+                moved[str(address)] = (mac, list(addresses))
+        for fip in server.get("floating_ips") or []:
+            params = fip.get("params") or {}
+            address = str(params.get("fixed_ip_address") or "")
+            if address not in moved:
+                continue
+            mac, addresses = moved[address]
+            if address in addresses:
+                # the port keeps it (NicOverride writes addresses canonically, as Neutron does):
+                # os-migrate attaches the floating IP there
+                continue
+            version = _ip_version(address)
+            same = [a for a in addresses if _ip_version(a) == version]
+            if len(same) != 1:
+                count = (
+                    f"{len(same)} IPv{version} addresses" if same else f"no IPv{version} address"
+                )
+                raise PermanentStepError(
+                    f"the floating IP on {address} cannot follow NIC {mac}: its override gives it "
+                    f"{count}; give the NIC exactly one, so the floating IP moves to it"
+                )
+            params["fixed_ip_address"] = same[0]
+    unknown = sorted(set(entries) - applied)
+    if unknown:
+        raise PermanentStepError(
+            "the export has no port with the MAC of the NIC override(s) "
+            f"{', '.join(unknown)}: the VM's NICs changed since validation; validate the plan again"
+        )
+    return out
+
+
+def _overridden_ports(doc: dict[str, Any]) -> bool:
+    """Whether a server port of the export carries a NIC override applied at the export (marked
+    ``_migration_params.nic_override``, SDD §7.2)."""
+    return any(
+        bool((port.get("_migration_params") or {}).get("nic_override"))
+        for resource in doc.get("resources") or []
+        if resource.get("type") == SERVER_TYPE
+        for port in (resource.get("params") or {}).get("ports") or []
+    )
+
+
+def _scoped_ref(ref: dict[str, Any], network: dict[str, Any]) -> dict:
+    # os-migrate searches the credential's own project for %auth%, and every network it sees
+    # for a reference without a project (SDD §7.2)
+    scope = "%auth%" if network.get("own") else None
+    return {**ref, "project_name": scope, "domain_name": scope}
+
+
+def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str) -> dict:
+    name = ref.get("name")
+    network, why = resolve_network(networks, str(name))
+    if network is None:
+        raise PermanentStepError(
+            f"{what} cannot go to RHOSO network {name!r}: "
+            + (why or f"there is no network named {name!r}")
+        )
+    return _scoped_ref(ref, network)
+
+
+def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
+    RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
+    keeps ``%auth%`` as the reference's project and domain, another project's - the only one of
+    its name - neither; every fixed IP reference becomes address-only, so Neutron finds the
+    address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port whose
+    network does not resolve: raised before the import stops the source. A floating IP's that does
+    not resolve keeps its reference: in auto mode a detached floating IP with the address needs
+    no network, and the destination check judges it before the stop."""
+    out = copy.deepcopy(doc)
+    for resource in out.get("resources") or []:
+        if resource.get("type") != SERVER_TYPE:
+            continue
+        server = resource.get("params") or {}
+        for port in server.get("ports") or []:
+            params = port.get("params") or {}
+            what = f"the port {params.get('mac_address')} of {server.get('name')}"
+            params["network_ref"] = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            params["fixed_ips_refs"] = [
+                {"ip_address": ref["ip_address"]}
+                for ref in params.get("fixed_ips_refs") or []
+                if ref.get("ip_address")
+            ]
+        for fip in server.get("floating_ips") or []:
+            params = fip.get("params") or {}
+            ref = params.get("floating_network_ref")
+            network = resolve_network(networks, str(ref.get("name")))[0] if ref else None
+            if network is not None:
+                params["floating_network_ref"] = _scoped_ref(ref, network)
+    return out
+
+
+#: Beside the export: what its rewrite applied (SDD §7.2 export record).
+EXPORT_RECORD = "rewrite.json"
+
+
+def export_record(
+    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None
+) -> dict[str, Any]:
+    """The export record (SDD §7.2): the mappings a rewrite applies - the plan's overlaid with the
+    migration's resolved ones - and the VM's NIC override entries."""
+    return {
+        "mappings": mappings.model_dump(mode="json"),
+        "nic_overrides": {
+            mac: entry.model_dump(mode="json") for mac, entry in (nic_overrides or {}).items()
+        },
+    }
+
+
+def _read_export_record(osm: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads((osm / EXPORT_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _apply_port_mode(
+    osm: Path,
+    mode: str,
+    cutover: bool,
+    nic_overrides: bool = False,
+    networks: Sequence[dict[str, Any]] | None = None,
+    record: dict[str, Any] | None = None,
+    exports: bool = False,
+) -> bool:
+    """Write the plan's port_creation_mode into an existing export before a run, and resolve its
+    network references again with the destination's ``networks`` when given, unless the run
+    replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
+
+    True when the run must export the workload again: a cutover in "neutron" mode whose ports were
+    exported without their security groups, or of a VM with NIC overrides, or that had some at the
+    export (a port marked ``nic_override``: an entry removed since); or, given the plan's
+    ``record``, an export whose record differs from it or that has none. The export replaces the
+    server in place, so the file stays for a rollback should the new export fail.
+    """
+    path = osm / "workloads.yml"
+    if not path.exists():
+        return False
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    reexport = (
+        cutover
+        and (
+            (mode == "neutron" and bool(ports_without_security_groups(doc)))
+            or nic_overrides
+            or _overridden_ports(doc)
+        )
+    ) or (record is not None and _read_export_record(osm) != record)
+    doc = set_port_creation_mode(doc, mode)
+    # a new export is resolved after it instead: the one it replaces may no longer resolve
+    if networks and not (reexport or exports):
+        doc = resolve_network_refs(doc, networks)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    return reexport
+
+
 def effective_mappings(plan_mappings: Mappings, resolved: Mappings | None) -> Mappings:
     """Plan mappings overlaid with what preflight resolved for the migration (SDD §7.2).
 
@@ -202,8 +445,11 @@ def _common_openstack_vars(
     return out
 
 
-def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
-    """Non-secret extra-vars for running ``step`` (credentials go to ``secrets.yml``)."""
+def build_vars(
+    step: StepName, ctx: StepContext, network_map: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Non-secret extra-vars for running ``step`` (credentials go to ``secrets.yml``); a VMware
+    run's ``network_map`` is what ``_vmware_network_map`` resolved (SDD §7.2)."""
     step = StepName(step)
     m = ctx.migration
     rdir = run_dir(ctx.settings, ctx.plan.id, m.id)
@@ -213,8 +459,10 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
         out: dict[str, Any] = {
             "vcenter_hostname": host,
             "vms_list": [m.vm.name],
-            "network_map": dict(mappings.networks),
-            "used_mapped_networks": bool(mappings.networks),
+            # every NIC by the kit's key to the RHOSO network and subnet Seamless resolved: the kit
+            # drops a NIC its map lacks, and without the map sends every NIC to an unset variable
+            "network_map": dict(network_map or {}),
+            "used_mapped_networks": True,
             "use_fixed_ips": True,
             "os_migrate_vmw_data_dir": str(rdir),
             "already_deploy_conversion_host": True,
@@ -238,8 +486,10 @@ def build_vars(step: StepName, ctx: StepContext) -> dict[str, Any]:
     )
     # SDD §6.4: keep mapped volume types (apply_mappings rewrote them to RHOSO types)
     out["os_migrate_workloads_preserve_volume_type"] = bool(ctx.plan.mappings.volume_types)
-    if m.strategy == Strategy.cold and step == StepName.ROLLBACK:
-        # the cold path records no destination server id: the rollback matches by name
+    if m.strategy == Strategy.cold and step == StepName.ROLLBACK and m.downtime_started_at:
+        # the cold path records no destination server id: the rollback matches by name — only
+        # after the stop, since the role creates the server after it; before it a same-named
+        # server is not this migration's (a cutover refused or skipped for a collision, SDD §7.2)
         out["os_migrate_rollback_match_by_name"] = True
     if step == StepName.ROLLBACK and ctx.options.get("delete_dest_volumes"):
         # cleanup after a cancel: the destination volumes of the abandoned pass go too
@@ -264,22 +514,28 @@ def _mark_unsafe(value: Any) -> Any:
     if isinstance(value, str):
         return _Unsafe(value)
     if isinstance(value, dict):
-        return {key: _mark_unsafe(item) for key, item in value.items()}
+        return {
+            (_Unsafe(key) if isinstance(key, str) else key): _mark_unsafe(item)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_mark_unsafe(item) for item in value]
     return value
 
 
-def ansible_yaml(data: Any, *, sort_keys: bool = True) -> str:
+def ansible_yaml(data: dict[str, Any], *, sort_keys: bool = True) -> str:
     """YAML for the files Ansible reads (``-e @vars.yml``, ``-e @secrets.yml``, the inventory).
 
     Ansible templates every string it reads, so a VM name (chosen by whoever runs the source VM),
     a mapping value or a password holding ``{{ … }}`` or ``{% … %}`` would run as Jinja on the
     control plane, where ``lookup('pipe', …)`` executes commands next to every cloud credential.
-    Every string value is written ``!unsafe`` so Ansible keeps it verbatim (SDD §7.2, Security.md
-    C1-05); mapping keys — the variable names — stay plain.
+    Every string — every value, and every key of a nested mapping, which ``dict2items`` turns into
+    a value (a source network's name keys ``network_map``) — is written ``!unsafe`` so Ansible
+    keeps it verbatim (SDD §7.2, Security.md C1-05); only the top-level keys, the variable names
+    (the inventory's group names), stay plain.
     """
-    return yaml.dump(_mark_unsafe(data), Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
+    marked = {key: _mark_unsafe(value) for key, value in data.items()}
+    return yaml.dump(marked, Dumper=_AnsibleInputDumper, sort_keys=sort_keys)
 
 
 def _inventory(conversion_host: dict[str, Any] | None = None) -> str:
@@ -366,6 +622,26 @@ def build_secret_vars(
         raise PermanentStepError(f"credentials unavailable: {exc}") from None
 
 
+def _warm_sync_pass(entry: dict[str, Any], m: Migration, started: Any) -> SyncPass:
+    """A pass of the warm state file as the migration records it."""
+    return SyncPass(
+        number=int(entry.get("number") or next_pass_number(m)),
+        kind=SyncPassKind(entry.get("kind") or "delta"),
+        started_at=entry.get("started_at") or started,
+        ended_at=entry.get("ended_at") or utcnow(),
+        bytes_scanned=int(entry.get("bytes_scanned") or 0),
+        bytes_changed=int(entry.get("bytes_changed") or 0),
+        bytes_transferred=int(entry.get("bytes_transferred") or 0),
+        duration_s=entry.get("duration_s"),
+    )
+
+
+def workload_file_stem(name: str) -> str:
+    """The stem of a VM's progress and log files, as ``import_workload_prelim`` names them
+    (SDD §7.2): ``%`` -> ``%25``, ``/`` -> ``%2F``, NUL -> ``%00``, nothing else changes."""
+    return name.replace("%", "%25").replace("/", "%2F").replace("\0", "%00")
+
+
 def _read_progress(path: Path) -> float | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -421,6 +697,8 @@ class AnsibleExecutor:
         destination: Provider,
         *,
         deploy_conversion_hosts: bool | None = None,
+        prestage_flavors: list[str] | None = None,
+        prestage_keypairs: list[str] | None = None,
     ) -> None:
         if source.kind == ProviderKind.vmware:
             return  # the kit prepares its own conversion host
@@ -430,6 +708,12 @@ class AnsibleExecutor:
         for resource in plan.prestage_resources:
             if not _RESOURCE.match(resource):
                 raise PermanentStepError(f"invalid prestage resource {resource!r}")
+            if resource == "flavors" and not prestage_flavors:
+                # only the plan's flavors RHOSO lacks, never os-migrate's every-flavor default:
+                # its import rewrites a same-named destination flavor's extra specs (SDD §7.2)
+                continue
+            if resource == "keypairs" and not prestage_keypairs:
+                continue  # only the plan's keypairs the destination credential lacks (SDD §7.2)
             playbooks += [_Playbook(f"export_{resource}.yml"), _Playbook(f"import_{resource}.yml")]
         if deploy_conversion_hosts is None:
             hosts = [source.conversion_host, destination.conversion_host]
@@ -437,13 +721,21 @@ class AnsibleExecutor:
         if deploy_conversion_hosts:
             playbooks.append(_Playbook("deploy_conversion_hosts.yml"))
         variables = _common_openstack_vars(source, destination, osm, osm)
+        for key, names in (
+            ("os_migrate_flavors_filter", prestage_flavors),
+            ("os_migrate_keypairs_filter", prestage_keypairs),
+        ):
+            if names:
+                variables[key] = [{"regex": "^" + re.escape(name) + "$"} for name in names]
         await self._execute(
             pdir, osm, variables, source, destination, _inventory(), playbooks, None, None
         )
 
     # -- steps ---------------------------------------------------------------------------------
-    def _playbooks(self, step: StepName, strategy: Strategy, osm: Path) -> list[_Playbook]:
-        exported = (osm / "workloads.yml").exists()
+    def _playbooks(
+        self, step: StepName, strategy: Strategy, osm: Path, reexport: bool = False
+    ) -> list[_Playbook]:
+        exported = (osm / "workloads.yml").exists() and not reexport
         export = [] if exported else [_Playbook("export_workloads.yml")]
         if strategy == Strategy.cold:
             if step == StepName.CUTOVER:
@@ -477,11 +769,44 @@ class AnsibleExecutor:
             return await self._vmware_rollback(ctx)
         rdir = run_dir(self.settings, ctx.plan.id, ctx.migration.id)
         osm = rdir / "osm"
-        playbooks = self._playbooks(step, strategy, osm)
+        reexport = False
+        networks: list[dict[str, Any]] | None = None
+        if strategy in (Strategy.cold, Strategy.warm):
+            vm_id = ctx.migration.vm.source_id
+            nics = ctx.plan.nic_overrides.get(vm_id)
+            # a warm cutover re-run that finishes the recorded destination server runs on the
+            # export as it is: its ports exist, and the plan cannot change while the source is
+            # stopped (SDD §7.2)
+            finishing = (
+                strategy == Strategy.warm
+                and step == StepName.CUTOVER
+                and bool(
+                    ((await asyncio.to_thread(_read_warm_state, osm, vm_id)) or {}).get(
+                        "destination_server_id"
+                    )
+                )
+            )
+            judged = step != StepName.ROLLBACK and not finishing
+            if judged:
+                networks = await self._destination_networks(ctx)
+            mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
+            reexport = await asyncio.to_thread(
+                _apply_port_mode,
+                osm,
+                ctx.plan.port_creation_mode,
+                step == StepName.CUTOVER and not finishing,
+                bool(nics),
+                networks,
+                export_record(mappings, nics) if judged else None,
+                any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
+            )
+        playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
         if not playbooks:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        # the kit powers the VM off at the cutover: its networks are settled before it runs
+        network_map = await self._vmware_network_map(ctx) if strategy in VMWARE else None
         passes_before = 0
         if strategy == Strategy.warm:
             state_before = await asyncio.to_thread(
@@ -492,13 +817,14 @@ class AnsibleExecutor:
         stop_skipped = await self._execute(
             rdir,
             osm,
-            build_vars(step, ctx),
+            build_vars(step, ctx, network_map),
             ctx.source,
             ctx.destination,
             build_inventory(ctx),
             playbooks,
             ctx,
             effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
+            networks,
         )
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -551,6 +877,22 @@ class AnsibleExecutor:
             state = await asyncio.to_thread(_read_warm_state, osm, m.vm.source_id)
             if not state or not state.get("passes"):
                 raise PermanentStepError("the warm state file has no recorded pass")
+            if (
+                len(state["passes"]) <= passes_before
+                and step == StepName.CUTOVER
+                and state.get("destination_server_id")
+            ):
+                # a re-run after an attempt that ran the final pass and created the server,
+                # then failed: the role finished that server (SDD §6.5), the cutover is done -
+                # with the final pass when the migration does not list it yet (SDD §7.2)
+                last = state["passes"][-1]
+                listed = {p.number for p in m.sync_passes}
+                final = None
+                if last.get("kind") == "final" and int(last.get("number") or 0) not in listed:
+                    final = _warm_sync_pass(last, m, started)
+                return StepResult(
+                    sync_pass=final, destination_server_id=state["destination_server_id"]
+                )
             if len(state["passes"]) <= passes_before:
                 # the role skipped the workload (prelim reported no change): re-reporting the
                 # previous pass would feed a phantom pass into convergence and the estimate
@@ -558,23 +900,33 @@ class AnsibleExecutor:
                     f"the playbook recorded no new pass for {m.vm.name} (the workload was "
                     "skipped); check the destination for a same-named server"
                 )
-            last = state["passes"][-1]
-            sync_pass = SyncPass(
-                number=int(last.get("number") or next_pass_number(m)),
-                kind=SyncPassKind(last.get("kind") or "delta"),
-                started_at=last.get("started_at") or started,
-                ended_at=last.get("ended_at") or utcnow(),
-                bytes_scanned=int(last.get("bytes_scanned") or 0),
-                bytes_changed=int(last.get("bytes_changed") or 0),
-                bytes_transferred=int(last.get("bytes_transferred") or 0),
-                duration_s=last.get("duration_s"),
-            )
+            sync_pass = _warm_sync_pass(state["passes"][-1], m, started)
             if step == StepName.CUTOVER:
                 server = state.get("destination_server_id") or await self._lookup_server(ctx)
                 return StepResult(sync_pass=sync_pass, destination_server_id=server)
             return StepResult(sync_pass=sync_pass)
         if step == StepName.CUTOVER:
-            return StepResult(destination_server_id=await self._lookup_server(ctx))
+            server = await self._lookup_server(ctx)
+            if strategy != Strategy.cold:
+                return StepResult(destination_server_id=server)
+            # SDD §7.2: the copy the state file reported as progress is the cutover's full pass -
+            # the VM's used bytes, what its 100 % stands for - so bytes_transferred stays the
+            # listed passes (§5.5 invariant 2); the copy dominates the step's duration
+            ended = utcnow()
+            copied = m.bytes_total or m.vm.used_bytes
+            return StepResult(
+                sync_pass=SyncPass(
+                    number=next_pass_number(m),
+                    kind=SyncPassKind.full,
+                    started_at=started,
+                    ended_at=ended,
+                    bytes_scanned=m.vm.disk_bytes,
+                    bytes_changed=copied,
+                    bytes_transferred=copied,
+                    duration_s=(ended - started).total_seconds(),
+                ),
+                destination_server_id=server,
+            )
         # vmware_warm CBT passes: the kit does not report byte counts to the control plane
         ended = utcnow()
         number = next_pass_number(m)
@@ -587,6 +939,94 @@ class AnsibleExecutor:
                 duration_s=(ended - started).total_seconds(),
             )
         )
+
+    async def _destination_networks(self, ctx: StepContext) -> list[dict[str, Any]] | None:
+        """The destination's networks for this run's network references (SDD §7.2); None when
+        they cannot be read - the references stay as exported, and the destination check (§6.6)
+        still looks them up before the source stops."""
+        try:
+            inventory = await self.providers.get(ctx.destination).inventory()
+        except ProviderError as exc:
+            await ctx.log(
+                f"could not read the destination's networks ({exc}): the network references "
+                "stay as exported"
+            )
+            return None
+        # none listed (an older provider): nothing to resolve against
+        return list(getattr(inventory, "network_details", None) or [])
+
+    async def _vmware_network_map(self, ctx: StepContext) -> dict[str, str]:
+        """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
+        "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
+        mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
+        holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
+        resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
+        take, two NICs one key would send to different values - a NIC with no IPv4 address takes
+        any of its network's; networks that cannot be read are a transient failure."""
+        try:
+            inventory = await self.providers.get(ctx.destination).inventory()
+        except ProviderError as exc:
+            raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
+        networks = list(getattr(inventory, "network_details", None) or [])
+        subnets = list(getattr(inventory, "subnets", None) or [])
+        roles = ctx.destination.capabilities.get("roles")
+        vm = ctx.migration.vm
+        out: dict[str, str] = {}
+        problems: list[str] = []
+        bare: list[tuple[str, str, str]] = []
+
+        def claim(what: str, key: str, value: str, any_subnet: bool = False) -> None:
+            have = out.setdefault(key, value)
+            # a value is "{network id},{subnet id}", or the network's id alone
+            if have != value and not (
+                any_subnet and have.partition(",")[0] == value.partition(",")[0]
+            ):
+                problems.append(
+                    f"{what} shares the migration kit's key {key!r} with another NIC that goes to "
+                    f"{have}, not {value}"
+                )
+
+        for nic in vm.nics:
+            # the plan's mapping of its port group, else the same name: the kit keeps the guest's
+            # network settings, so no NIC override moves it
+            name = ctx.plan.mappings.networks.get(nic.network, nic.network)
+            what = f"the NIC {nic.mac or '?'} of {vm.name}"
+            network, why = resolve_network(networks, name)
+            if network is None:
+                problems.append(
+                    f"{what} cannot go to RHOSO network {name!r}: "
+                    + (why or f"there is no network named {name!r}")
+                )
+                continue
+            refused = port_refusal(network, roles)
+            if refused:
+                problems.append(
+                    f"{what} cannot go to RHOSO network {name!r} "
+                    f"(project {network.get('project_id')}): {refused}"
+                )
+                continue
+            own = [s for s in subnets if s.get("network_id") == network.get("id")]
+            subnet, why = kit_subnet(nic, own)
+            if why:
+                problems.append(f"{what} on {name!r}: {why}")
+                continue
+            key, value = kit_network_key(nic), kit_network_value(network, subnet)
+            if key is None:
+                # the kit would drop a distributed port group's NIC that a name keys
+                problems.append(
+                    f"{what} was validated before the migration kit's key of its port group was "
+                    "recorded: validate the plan again"
+                )
+            elif kit_ipv4(nic.fixed_ips):
+                claim(what, key, value)
+            else:
+                # needs no particular subnet: it takes the one another NIC of its key needs
+                bare.append((what, key, value))
+        for what, key, value in bare:
+            claim(what, key, value, any_subnet=True)
+        if problems:
+            raise PermanentStepError("; ".join(problems))
+        return out
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         try:
@@ -679,6 +1119,7 @@ class AnsibleExecutor:
         playbooks: Sequence[_Playbook],
         ctx: StepContext | None,
         mappings: Mappings | None,
+        networks: Sequence[dict[str, Any]] | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped."""
         vars_path = workdir / "vars.yml"
@@ -707,12 +1148,19 @@ class AnsibleExecutor:
             await asyncio.to_thread(prepare)
             env = await asyncio.to_thread(self._env)
             for playbook in playbooks:
+                if playbook.name == "export_workloads.yml":
+                    # written again once the rewrite of the new export finishes (SDD §7.2)
+                    remove_quietly(osm / EXPORT_RECORD)
                 stop_skipped |= await self._run_playbook(
                     playbook, workdir, inventory_path, vars_path, secrets_path, ctx, osm, env
                 )
                 if playbook.name == "export_workloads.yml" and (ctx or mappings) is not None:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
-                    await asyncio.to_thread(self._rewrite_workloads, osm, mappings, planned)
+                    mode = ctx.plan.port_creation_mode if ctx is not None else None
+                    nics = ctx.plan.nic_overrides.get(planned or "") if ctx is not None else None
+                    await asyncio.to_thread(
+                        self._rewrite_workloads, osm, mappings, planned, mode, nics, networks
+                    )
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
@@ -720,9 +1168,17 @@ class AnsibleExecutor:
 
     @staticmethod
     def _rewrite_workloads(
-        osm: Path, mappings: Mappings | None, planned_id: str | None = None
+        osm: Path,
+        mappings: Mappings | None,
+        planned_id: str | None = None,
+        port_mode: str | None = None,
+        nic_overrides: Mapping[str, NicOverride] | None = None,
+        networks: Sequence[dict[str, Any]] | None = None,
     ) -> None:
-        """Keep only the planned server of the export and apply the mappings (SDD §7.2)."""
+        """Keep only the planned server of the export, apply the mappings, the VM's NIC
+        overrides and the plan's port_creation_mode, and resolve the network references against
+        the destination's ``networks``; once all of it succeeded, write the export record (SDD
+        §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -748,7 +1204,26 @@ class AnsibleExecutor:
             ]
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
+        if port_mode is not None:
+            doc = set_port_creation_mode(doc, port_mode)
+        # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if nic_overrides:
+            doc = apply_nic_overrides(doc, nic_overrides)
+            path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if networks:
+            doc = resolve_network_refs(doc, networks)
+            path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
+        if missing:
+            # written first: a rollback reads the planned server from it
+            raise PermanentStepError(
+                "os-migrate exported the ports on " + ", ".join(missing) + " without their "
+                "security groups: recreated through Neutron they would get the project's default "
+                "group. Update the os-migrate collection, or recreate the ports with Nova."
+            )
+        record = export_record(mappings or Mappings(), nic_overrides)
+        (osm / EXPORT_RECORD).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
 
     def _playbook_arg(self, name: str) -> str:
         if name.endswith(".yml"):
@@ -812,7 +1287,7 @@ class AnsibleExecutor:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 lines.append(line)
                 if ctx is not None and line.strip():
-                    await ctx.log(line[:2000])
+                    await ctx.log(line)  # whole: the orchestrator redacts, then cuts (SDD §4)
                 if watch_stop and STOP_TASK.match(line):
                     # SDD §7.2: the downtime clock starts when the source-stop task starts…
                     watch_stop = False
@@ -851,9 +1326,14 @@ class AnsibleExecutor:
             if ctx is None:
                 # prestage has no migration to log to: keep the tail in the service log
                 log.warning(
-                    "%s failed (exit %s); last lines:\n%s", name, returncode, output[-4000:]
+                    "%s failed (exit %s); last lines:\n%s",
+                    name,
+                    returncode,
+                    redact_tail(output, 4000),
                 )
-            raise classify_failure(output)(f"{name} failed (exit {returncode}): {detail[:500]}")
+            raise classify_failure(output)(
+                f"{name} failed (exit {returncode}): {redact_cut(detail, 500)}"
+            )
         return stop_skipped
 
     @staticmethod
@@ -870,7 +1350,7 @@ class AnsibleExecutor:
     async def _tail(self, ctx: StepContext | None, osm: Path) -> None:
         if ctx is None:
             return
-        state_file = osm / "workload_logs" / f"{ctx.migration.vm.name}.state"
+        state_file = osm / "workload_logs" / f"{workload_file_stem(ctx.migration.vm.name)}.state"
         total = ctx.migration.bytes_total or ctx.migration.vm.used_bytes
         last: float | None = None
         while True:

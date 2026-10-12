@@ -1,20 +1,30 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
-import { createMockFetch, MockServer } from './mock';
+import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { forcedDowntime } from '../lib/forcedEstimate';
+import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
 import { streamEvents } from './stream';
 import {
   ADVISOR_NOTE_KINDS,
+  AUDIT_EVENT_KINDS,
   ADVISOR_NOTE_SOURCES,
   PHASES,
   PLAN_STATUSES,
   PROVIDER_STATUSES,
   SEVERITIES,
   STRATEGIES,
+  type AdvisorPolicy,
+  type AdvisorRecommendation,
+  type AdvisorStatus,
   type Event,
   type Migration,
   type Plan,
   type Provider,
+  type PlanFinalizeResult,
+  type RecommendationPage,
+  type Stats,
   type VMRef,
+  type Wave,
 } from './types';
 
 const NOW = Date.parse('2026-10-08T12:00:00Z');
@@ -26,6 +36,12 @@ function setup(token: string | null = 'admin') {
 }
 
 /** Inventory VMs of `providerId` that no migration of the fixtures uses: free for a new plan. */
+/** Maker-checker (SDD §5.4, ADV-17): an approval by someone other than the approver persona who requested the cutover. */
+async function secondApprover(server: MockServer, migrationId: string): Promise<void> {
+  const admin = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+  await admin.post(`/migrations/${migrationId}/approve`, { comment: 'Second approver: findings and window checked' });
+}
+
 function freeVms(server: MockServer, providerId: string, count: number): VMRef[] {
   const inventory = (server as unknown as { inventories: Record<string, VMRef[]> }).inventories[providerId] ?? [];
   const taken = new Set(server.migrations.map((m) => m.vm.source_id));
@@ -271,6 +287,86 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it('reopens a completed plan at a retry, and refuses one whose provider is gone, like the API (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = 'completed';
+    const retried = await client.post<Migration>(`/migrations/${rolled.id}/retry`);
+    expect(retried.phase).toBe('ready');
+    expect(plan.status).toBe('running');
+    const reopened = server.events.filter((e) => e.kind === 'plan.updated' && e.plan_id === plan.id);
+    expect(reopened.at(-1)).toMatchObject({ actor: expect.any(String), data: { status: 'running' }, message: expect.stringContaining(`retry of ${rolled.vm.name}`) });
+
+    // a completed plan's providers may be deleted (SDD §12): the reopened plan would need them
+    const again = setup('operator');
+    const gone = byPhase(again.server, 'rolled_back');
+    const completed = again.server.plans.find((p) => p.id === gone.plan_id)!;
+    completed.status = 'completed';
+    const destination = again.server.providers.findIndex((p) => p.id === completed.destination_provider_id);
+    again.server.providers.splice(destination, 1);
+    await expect(again.client.post(`/migrations/${gone.id}/retry`)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(`provider '${completed.destination_provider_id}' no longer exists`),
+    });
+    expect(completed.status).toBe('completed');
+    expect(again.server.migrations.find((m) => m.id === gone.id)?.phase).toBe('rolled_back');
+  });
+
+  it.each(['draft', 'validated', 'running', 'paused', 'failed'] as const)('leaves a %s plan as it is at a retry, like the API (SDD §5.1)', async (status) => {
+    const { server, client } = setup('operator');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    plan.status = status;
+    const before = server.events.length;
+    await client.post(`/migrations/${rolled.id}/retry`);
+    expect(plan.status).toBe(status);
+    expect(server.events.slice(before).filter((e) => e.kind === 'plan.updated')).toEqual([]);
+  });
+
+  it('refuses to start a waved plan while a migration belongs to no wave, like the API (SDD §9.4)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'validated' && p.waves.length > 0)!;
+    const [added, replanned] = server.migrations.filter((m) => m.plan_id === plan.id && !['completed', 'finalized', 'cancelled', 'rolled_back'].includes(m.phase));
+    added!.wave_id = null; // a VM added after the waves were planned
+    replanned!.wave_id = 'wave-gone'; // its wave was planned away
+    await expect(client.post(`/plans/${plan.id}/start`)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(`2 migration(s) belong to no wave: ${added!.vm.name}, ${replanned!.vm.name}`),
+    });
+    expect(plan.status).toBe('validated');
+  });
+
+  it('keeps a requested cutover waiting for a closed window unless an approver bypasses it, like the API (SDD §5.4)', async () => {
+    const { server, client } = setup('approver');
+    const m = server.migrations.find((x) => x.vm.name === 'ad-dc-01')!; // cold, ready, in a running plan
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.require_approval = false;
+    plan.auto_cutover = false;
+    plan.cutover_window = { start: new Date(NOW + 3_600_000).toISOString(), end: new Date(NOW + 7_200_000).toISOString() };
+    await client.post(`/migrations/${m.id}/cutover`, {});
+    server.tick();
+    expect(m.phase).toBe('ready'); // requested, but its window opens in an hour
+    await client.post(`/migrations/${m.id}/cutover`, { force_window: true });
+    server.tick();
+    expect(m.phase).toBe('cutover');
+  });
+
+  it("records a strategy change as the plan's override, so a re-validation keeps it, like the API (SDD §5.4)", async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'validated')!;
+    const m = server.migrations.find((x) => x.plan_id === plan.id && x.phase === 'ready' && x.estimates.filter((e) => e.eligible).length >= 2)!;
+    const chosen = m.estimates.find((e) => e.eligible && e.strategy !== m.strategy)!.strategy;
+    await client.put(`/migrations/${m.id}/strategy`, { strategy: chosen });
+    expect(plan.strategy_overrides[m.vm.source_id]).toBe(chosen);
+    expect(server.events.filter((e) => e.kind === 'plan.updated').at(-1)).toMatchObject({
+      plan_id: plan.id,
+      data: { strategy_overrides: { [m.vm.source_id]: chosen } },
+    });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.migrations.find((x) => x.id === m.id)!.strategy).toBe(chosen);
+  });
+
   it('keeps the downtime clock of a retried cutover and never cancels a stopped source (SDD §5.1/§5.2)', async () => {
     const { server, client } = setup('operator');
     const failed = byPhase(server, 'failed');
@@ -284,16 +380,100 @@ describe('mock API', () => {
     expect(retried.downtime_started_at).toBe(stoppedAt);
     await expect(client.post(`/migrations/${failed.id}/cancel`, {})).rejects.toMatchObject({ status: 409, message: expect.stringMatching(/source VM is stopped/) });
 
-    // the next cutover counts from the first stop
+    // the next cutover counts from the first stop, and the clock does not start again (like the API)
+    const started = () => server.events.filter((e) => e.migration_id === failed.id && e.kind === 'migration.downtime_started').length;
+    const startedBefore = started();
     const plan = server.plans.find((p) => p.id === failed.plan_id)!;
     plan.status = 'running';
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${failed.id}/cutover`, {});
+    await secondApprover(server, failed.id); // maker-checker (ADV-17): the requester's approval does not count
     server.tick();
     const again = server.migrations.find((m) => m.id === failed.id)!;
     expect(again.phase).toBe('cutover');
     expect(again.downtime_started_at).toBe(stoppedAt);
+    expect(started()).toBe(startedBefore);
+  });
+
+  it('clears what the earlier attempt found about itself at a retry, and keeps an open clock with its model seconds, like the API (SDD §5.1, §5.2)', async () => {
+    const { server, client } = setup('operator');
+    const failed = byPhase(server, 'failed');
+    // the failed fixture stopped its source: its clock is open
+    expect([failed.downtime_started_at !== null, failed.downtime_ended_at]).toEqual([true, null]);
+    Object.assign(failed, {
+      data_issues: ['DOWNTIME_BELOW_FINAL_SYNC: 0 s of downtime around a 100 s final sync'],
+      converged_by: 'slo',
+      review_required: true,
+      review_reason: 'application probe unreachable from the control plane: 10.0.0.5:80',
+      checkpoint: 'cutover',
+      downtime_model_s: 600,
+    });
+    const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
+    expect([retried.data_issues, retried.converged_by, retried.review_required, retried.review_reason, retried.checkpoint]).toEqual([[], null, false, null, null]);
+    expect(retried.downtime_model_s).toBe(600);
+  });
+
+  it('starts no held migration, on a cutover request or a tick, like the API (SDD §5.4, §14.6)', async () => {
+    const { server, client } = setup('approver');
+    const m = byPhase(server, 'ready');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    Object.assign(plan, { status: 'running', require_approval: false, auto_cutover: false, cutover_window: null, waves: [] });
+    Object.assign(m, { strategy: 'cold', wave_id: null, advisor_hold: 'rec-held-0001' });
+    await client.post(`/migrations/${m.id}/cutover`, {});
+    server.tick();
+    expect(m.phase).toBe('ready');
+    m.advisor_hold = null; // a person decided
+    server.tick();
+    expect(m.phase).toBe('cutover');
+  });
+
+  /** Two ready warm migrations of one running plan, in the waves given (ids no fixture migration carries). */
+  function waved(waves: (a: Migration, b: Migration) => Wave[]) {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => server.migrations.filter((m) => m.plan_id === p.id && m.phase === 'ready').length >= 2)!;
+    const [a, b] = server.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'ready') as [Migration, Migration];
+    Object.assign(plan, { status: 'running', require_approval: false, auto_cutover: true, cutover_window: null, waves: waves(a, b) });
+    for (const m of [a, b]) Object.assign(m, { strategy: 'warm', advisor_hold: null, wave_id: plan.waves.find((w) => w.vm_ids.includes(m.vm.source_id))!.id });
+    return { server, a, b };
+  }
+
+  it('starts a migration only once the waves it depends on are complete, like the API (SDD §8)', () => {
+    const { server, a, b } = waved((a, b) => [
+      { id: 'wave-t1', name: 'Pilot', order: 1, vm_ids: [a.vm.source_id], depends_on: [], max_parallel: 5 },
+      { id: 'wave-t2', name: 'Wave 2', order: 2, vm_ids: [b.vm.source_id], depends_on: ['wave-t1'], max_parallel: 5 },
+    ]);
+    server.tick();
+    expect([a.phase, b.phase]).toEqual(['precopy', 'ready']);
+    a.phase = 'completed'; // the pilot wave is complete
+    server.tick();
+    expect(b.phase).toBe('precopy');
+    // a retry in the pilot makes it incomplete again: a migration already waiting for its cutover waits too, as the
+    // API ticks only active waves
+    Object.assign(a, { phase: 'ready', advisor_hold: 'rec-held-0002' });
+    b.phase = 'awaiting_cutover';
+    server.tick();
+    expect(b.phase).toBe('awaiting_cutover');
+    a.phase = 'completed';
+    server.tick();
+    expect(b.phase).toBe('cutover');
+  });
+
+  it("starts no more of a wave's migrations than its max_parallel, like the API (SDD §8)", () => {
+    const { server, a, b } = waved((a, b) => [
+      { id: 'wave-t1', name: 'Pilot', order: 1, vm_ids: [a.vm.source_id, b.vm.source_id], depends_on: [], max_parallel: 1 },
+    ]);
+    server.tick();
+    expect([a.phase, b.phase].sort()).toEqual(['precopy', 'ready']);
+  });
+
+  it('records the strategy of the attempt a retry retries, oldest first, like the API (SDD §4.2, §14.4)', async () => {
+    const { server, client } = setup('operator');
+    const failed = byPhase(server, 'failed');
+    expect([failed.strategy, failed.attempts]).toEqual(['cold', 1]);
+    failed.attempt_strategies = ['warm']; // its first attempt ran warm
+    const retried = await client.post<Migration>(`/migrations/${failed.id}/retry`);
+    expect([retried.attempts, retried.attempt_strategies]).toEqual([2, ['warm', 'cold']]);
   });
 
   it('counts bytes over every pass while migrations run and reports the running step in progress events, like the API (SDD §4.2, §4.3)', () => {
@@ -381,7 +561,8 @@ describe('mock API', () => {
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${m.id}/cutover`, {});
-    for (let t = 0; t < 200 && m.phase === 'cutover'; t++) server.tick();
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
+    for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
     expect(m.phase).toBe('verifying');
     expect(m.sync_passes.at(-1)).toMatchObject({ kind: 'full', bytes_transferred: m.vm.used_bytes });
     expect(m.bytes_transferred).toBe(m.vm.used_bytes);
@@ -426,6 +607,7 @@ describe('mock API', () => {
     plan.cutover_window = null;
     const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
     await approver.post(`/migrations/${m.id}/cutover`, {});
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
     for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
     expect(m.phase).toBe('verifying');
     expect(m.sync_passes.map((p) => p.number)).toEqual([...kept.slice(0, plan.max_sync_passes), ...kept.slice(plan.max_sync_passes + 1), last + 1]);
@@ -440,6 +622,14 @@ describe('mock API', () => {
     waiting.phase = 'awaiting_cutover';
     await expect(client.patch(`/plans/${plan.id}`, { description: 'move' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining(waiting.vm.name) });
     await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({ status: 409 });
+    // each VM with what releases it, in the API's words: a completed one is finalized or rolled back
+    waiting.phase = 'completed';
+    const finalize = `finalize or roll back the completed migration (${waiting.vm.name})`;
+    await expect(client.patch(`/plans/${plan.id}`, { description: 'move' })).rejects.toMatchObject({ status: 409, message: `${finalize} before editing the plan` });
+    await expect(client.post(`/plans/${plan.id}/waves/auto`, { max_wave_size: 5 })).rejects.toMatchObject({
+      status: 409,
+      message: `${finalize} before re-planning the waves`,
+    });
   });
 
   it('lets only an approver change the approval policy of a plan (SDD §12)', async () => {
@@ -492,6 +682,29 @@ describe('mock API', () => {
     expect(server.migrations.filter((m) => m.plan_id === plan.id).map((m) => m.id).sort()).toEqual(ids);
   });
 
+  it("blocks a NIC on another project's network that the RHOSO token may not put a port on, judged with its roles like the API (SDD §9.3, §10)", async () => {
+    const { server, client } = setup('operator');
+    const [vm] = freeVms(server, 'rhosp17-dc1', 1);
+    // the VM moved to the shared provider-ext, an address of its subnet
+    vm!.nics = [{ ...vm!.nics[0]!, network: 'provider-ext', fixed_ips: ['203.0.113.77'] }];
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Shared network',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: [vm!.source_id],
+    });
+    const codes = async () => {
+      await client.post(`/plans/${plan.id}/validate`);
+      return server.migrations.find((m) => m.plan_id === plan.id)!.findings.map((f) => f.code);
+    };
+    // the mock's admin token may
+    expect(await codes()).not.toContain('NET_PORT_NOT_PERMITTED');
+    const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
+    destination.capabilities = { ...destination.capabilities, roles: ['member', 'reader'] };
+    expect(await codes()).toContain('NET_PORT_NOT_PERMITTED');
+    expect(server.migrations.find((m) => m.plan_id === plan.id)!.phase).toBe('blocked');
+  });
+
   it('cancels the migration of a VM taken out of a plan at the next validation, and refuses it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const [keep, drop] = freeVms(server, 'rhosp17-dc1', 2);
@@ -522,6 +735,116 @@ describe('mock API', () => {
     });
   });
 
+  it('answers 502 for a VM the source no longer reports, before changing anything, like the API (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const [keep] = freeVms(server, 'rhosp17-dc1', 1);
+    const plan = await client.post<Plan>('/plans', {
+      name: 'Vanished',
+      source_provider_id: 'rhosp17-dc1',
+      destination_provider_id: 'rhoso-prod',
+      vm_ids: [keep!.source_id, 'vm-gone-0001'],
+    });
+    await expect(client.post(`/plans/${plan.id}/validate`)).rejects.toMatchObject({
+      status: 502,
+      message: "VM 'vm-gone-0001': VM 'vm-gone-0001' not found",
+    });
+    expect(server.migrations.filter((m) => m.plan_id === plan.id)).toEqual([]);
+    expect(server.plans.find((p) => p.id === plan.id)!.status).toBe('draft');
+  });
+
+  it('refuses a list page outside the bounds the API takes, with its words (SDD §12)', async () => {
+    const { client } = setup('viewer');
+    const refused = (path: string, message: string) => expect(client.get(path)).rejects.toMatchObject({ status: 422, message });
+    await refused('/plans?limit=0', 'query.limit: Input should be greater than or equal to 1');
+    await refused('/plans?limit=1001', 'query.limit: Input should be less than or equal to 1000');
+    await refused('/plans?offset=-1', 'query.offset: Input should be greater than or equal to 0');
+    await refused('/migrations?limit=5001', 'query.limit: Input should be less than or equal to 5000');
+    await refused('/migrations?limit=two', 'query.limit: Input should be a valid integer, unable to parse string as an integer');
+    await refused('/events?limit=1001', 'query.limit: Input should be less than or equal to 1000');
+    await refused('/events?limit=0', 'query.limit: Input should be greater than or equal to 1');
+    // in bounds, a page
+    expect(await client.get<unknown[]>('/plans?limit=1000')).toEqual(expect.any(Array));
+    expect((await client.get<unknown[]>('/migrations?limit=2&offset=1')).length).toBe(2);
+    expect((await client.get<unknown[]>('/events?limit=3')).length).toBe(3);
+  });
+
+  it("checks a provider route's role before it looks the provider up, like the API (SDD §12, §13.2)", async () => {
+    const as = (token: string) => setup(token).client;
+    const refused = (call: Promise<unknown>, status: number) => expect(call).rejects.toMatchObject({ status });
+    await refused(as('operator').delete('/providers/nope'), 403);
+    await refused(as('operator').patch('/providers/nope', { name: 'x' }), 403);
+    await refused(as('operator').put('/providers/nope/credentials', { username: 'u' }), 403);
+    await refused(as('viewer').post('/providers/nope/check'), 403);
+    // with the role, an unknown provider is 404
+    await refused(as('admin').delete('/providers/nope'), 404);
+    await refused(as('operator').post('/providers/nope/check'), 404);
+    await refused(as('viewer').get('/providers/nope'), 404);
+  });
+
+  it('refuses an edit naming a field a plan cannot change, before anything else, like the API (SDD §12)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'draft' || p.status === 'validated')!;
+    const before = JSON.stringify(plan);
+    await expect(client.patch(`/plans/${plan.id}`, { description: 'x', status: 'running', waves: [], id: 'plan-00000000' })).rejects.toMatchObject({
+      status: 422,
+      message: 'fields cannot be changed: id, status, waves',
+    });
+    expect(JSON.stringify(plan)).toBe(before);
+    // the API's PLAN_EDITABLE_FIELDS, field for field
+    expect([...PLAN_EDITABLE_FIELDS].sort()).toEqual([
+      'auto_cutover',
+      'convergence_threshold_bytes',
+      'cutover_window',
+      'default_strategy',
+      'description',
+      'destination_provider_id',
+      'downtime_slo_s',
+      'estimator_overrides',
+      'finalize_warning_h',
+      'handover',
+      'keep_warm_interval_s',
+      'link_bps',
+      'mappings',
+      'max_sync_passes',
+      'name',
+      'nic_overrides',
+      'port_creation_mode',
+      'prestage_resources',
+      'probe_overrides',
+      'require_approval',
+      'require_distinct_approver',
+      'selection_policy',
+      'source_provider_id',
+      'strategy_overrides',
+      'verification',
+      'vm_ids',
+    ]);
+  });
+
+  it('refuses the plans the API refuses on create and on edit, with its words (SDD §12)', async () => {
+    const { client } = setup('approver');
+    const base = { name: 'Checked', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: ['vm-b', 'vm-a'] };
+    const refused = async (body: Record<string, unknown>, message: string) =>
+      expect(client.post('/plans', { ...base, ...body })).rejects.toMatchObject({ status: 422, message });
+    await refused({ vm_ids: ['vm-b', 'vm-a', 'vm-b', 'vm-a', 'vm-c'] }, 'vm_ids lists a VM more than once: vm-a, vm-b');
+    await refused({ cutover_window: { start: '2026-10-08T14:00:00Z', end: '2026-10-08T12:00:00Z' } }, 'cutover_window: end must be after start');
+    await refused({ verification: { tcp_ports: [22, 0, 70000] } }, 'verification.tcp_ports [0, 70000] outside 1-65535');
+    await refused(
+      { verification: { windows_tcp_ports: [3389, 65536], timeout_s: -5 } },
+      'verification.windows_tcp_ports [65536] outside 1-65535; verification.timeout_s must not be negative (got -5)',
+    );
+    // a pre-stage name without an export/import playbook pair, or the workloads themselves (SDD §4.2)
+    await refused({ prestage_resources: ['networks', 'flavours', 'workloads'] }, "prestage_resources: cannot pre-stage 'flavours', 'workloads'");
+    await expect(client.post('/plans', { ...base, name: 'Flavors', prestage_resources: ['networks', 'flavors'] })).resolves.toMatchObject({ prestage_resources: ['networks', 'flavors'] });
+    // an edit is checked on the plan it would store, kept fields included
+    const plan = await client.post<Plan>('/plans', base);
+    await expect(client.patch(`/plans/${plan.id}`, { cutover_window: { start: '2026-10-08T14:00:00Z', end: '2026-10-08T14:00:00Z' } })).rejects.toMatchObject({
+      status: 422,
+      message: 'cutover_window: end must be after start',
+    });
+    await expect(client.patch(`/plans/${plan.id}`, { vm_ids: ['vm-a', 'vm-a'] })).rejects.toMatchObject({ status: 422, message: 'vm_ids lists a VM more than once: vm-a' });
+  });
+
   it('refuses a VM another plan holds, at validation and at a retry that would take it back (SDD §5.4)', async () => {
     const { server, client } = setup('operator');
     const first = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
@@ -535,7 +858,7 @@ describe('mock API', () => {
     await expect(client.post(`/plans/${second.id}/validate`)).rejects.toMatchObject({
       status: 409,
       code: 'conflict',
-      message: expect.stringContaining(`${held.vm.name} (plan "${first.name}", ${held.phase})`),
+      message: expect.stringContaining(`${held.vm.name} (plan "${first.name}", ${first.id}, ${held.phase})`),
     });
     // a rolled-back migration lets its VM go; its retry would take it back
     held.phase = 'rolled_back';
@@ -543,6 +866,33 @@ describe('mock API', () => {
     expect(report.migrations.map((m) => m.vm_name)).toEqual([held.vm.name]);
     await expect(client.post(`/migrations/${held.id}/retry`)).rejects.toMatchObject({ status: 409, message: expect.stringContaining('Second wave') });
     expect(held.phase).toBe('rolled_back');
+  });
+
+  it('refuses to cancel a migration being validated, and cancels it once its VM left the plan, like the API (SDD §5.1, §5.4)', async () => {
+    const { server, client } = setup('operator');
+    const plan = server.plans.find((p) => p.status === 'draft')!;
+    await client.post(`/plans/${plan.id}/validate`);
+    const [kept, dropped] = server.migrations.filter((m) => m.plan_id === plan.id);
+    // an interrupted validation left both in validating
+    kept!.phase = 'validating';
+    dropped!.phase = 'validating';
+    await expect(client.post(`/migrations/${dropped!.id}/cancel`, {})).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('validate the plan again'),
+    });
+    await client.patch(`/plans/${plan.id}`, { vm_ids: [kept!.vm.source_id] });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(dropped!.phase).toBe('cancelled');
+    expect(dropped!.phase_history.at(-1)?.reason).toBe('removed from the plan');
+    expect(kept!.phase).not.toBe('validating'); // taken over by the validation (SDD §5.4)
+  });
+
+  it('refuses a similar-incident search outside the bounds the API accepts (SDD §12)', async () => {
+    const { client } = setup('operator');
+    for (const body of [{ query: '' }, { query: 'x'.repeat(2001) }, { query: 'disk', limit: 0 }, { query: 'disk', limit: 21 }]) {
+      await expect(client.post('/advisor/similar-incidents', body), JSON.stringify(body).slice(0, 40)).rejects.toMatchObject({ status: 422 });
+    }
+    await expect(client.post('/advisor/similar-incidents', { query: 'x'.repeat(2000), limit: 20 })).resolves.toMatchObject({ hits: expect.any(Array) });
   });
 
   it('lets a never-validated plan hold nothing, and a retry go ahead once the other plan lets the VM go (SDD §5.4)', async () => {
@@ -606,9 +956,12 @@ describe('mock API', () => {
       vm_ids: mine.map((m) => m.vm.source_id),
     });
     const [a, b] = mine.map((m) => m.vm.name).sort();
+    // the two plans share a name: each is named by its id too (SDD §5.4)
+    const [p, q] = [first.id, legacy.id].sort();
+    const named = (vm: string) => `${vm} (plan "${first.name}", ${p}, ready), ${vm} (plan "${first.name}", ${q}, ready)`;
     await expect(client.post(`/plans/${third.id}/validate`)).rejects.toMatchObject({
       status: 409,
-      message: `2 VM(s) already have a migration in another plan: ${a} (plan "${first.name}", ready), ${b} (plan "${first.name}", ready); finish, roll back or cancel it there, or remove the VM from vm_ids`,
+      message: `2 VM(s) already have a migration in another plan: ${named(a!)}, ${named(b!)}; finish, roll back or cancel it there, or remove the VM from vm_ids`,
     });
   });
 
@@ -627,6 +980,13 @@ describe('mock API', () => {
     ).rejects.toMatchObject({ status: 400, code: 'bad_request' });
     const result = await client.post<Migration>(`/migrations/${completed.id}/finalize`, { confirm: completed.vm.name });
     expect(result.phase).toBe('finalized');
+    expect(result.checkpoint).toBe('finalized'); // the API's value (SDD §8.1)
+    // like the API (SDD §12): the phase is checked first - a migration that is not completed answers 409, whatever its name
+    const ready = byPhase(server, 'ready');
+    await expect(client.post(`/migrations/${ready.id}/finalize`, { confirm: 'wrong' })).rejects.toMatchObject({
+      status: 409,
+      message: 'only completed migrations can be finalized (ready)',
+    });
   });
 
   it('refuses to start a plan with blocked migrations', async () => {
@@ -720,15 +1080,98 @@ describe('mock API', () => {
     expect(dropped.phase).toBe('cancelled');
   });
 
-  it('keeps a provider a failed plan uses from deletion like the API; a completed plan releases it (SDD §12)', () => {
+  it('pages events back with `before`, like the API: with tail, the page below a seq; 0 is refused (SDD §12)', () => {
+    const { server } = setup('viewer');
+    const get = (q: string) => server.handle('GET', '/events', new URLSearchParams(q), undefined, 'viewer');
+    const all = server.events.filter((e) => e.seq > 0);
+    const newest = get('tail=true&limit=2').body as { seq: number }[];
+    const older = get(`tail=true&limit=2&before=${newest[0]!.seq}`).body as { seq: number }[];
+    expect(older.map((e) => e.seq)).toEqual(all.slice(-4, -2).map((e) => e.seq));
+    expect(get('tail=true&before=0')).toMatchObject({ status: 422 });
+  });
+
+  it('refuses a secret name the control plane could not read, like the API: on POST and on the PATCH fields set (SDD §13.3)', () => {
     const { server } = setup('admin');
-    for (const p of server.plans) p.status = 'completed';
+    const call = (method: string, path: string, body: unknown) => server.handle(method, path, new URLSearchParams(), body, 'admin');
+    const vcenter = { id: 'vc-x', name: 'vCenter X', kind: 'vmware', role: 'source', endpoint: 'https://vc.example/sdk', distribution: 'vmware' };
+    expect(call('POST', '/providers', { ...vcenter, credentials_secret: '../etc' })).toMatchObject({ status: 422 });
+    expect(call('POST', '/providers', { ...vcenter, credentials_secret: 'vc-x.prod_1' })).toMatchObject({ status: 201, body: { credentials_secret: 'vc-x.prod_1' } });
+    const host = { manage: false, address: '10.0.0.5', ssh_key_secret: 'has space' };
+    expect(call('PATCH', '/providers/vc-x', { conversion_host: host })).toMatchObject({ status: 422 });
+    expect(call('PATCH', '/providers/vc-x', { conversion_host: { ...host, ssh_key_secret: 'conv-key' } })).toMatchObject({ status: 200 });
+    // another provider's managed secret is refused, the own allowed (SDD §13.3)
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-w', credentials_secret: 'provider-vc-x' })).toMatchObject({ status: 422 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-v', credentials_secret: 'provider-vc-v' })).toMatchObject({ status: 201 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-u', credentials_secret: 'name\n' })).toMatchObject({ status: 422 });
+    // an id whose managed names are another provider's is refused (SDD §13.3)
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-x-ssh' })).toMatchObject({ status: 409 });
+    expect(call('POST', '/providers', { ...vcenter, id: 'vc-x-sshd' })).toMatchObject({ status: 201 });
+    // only the fields a PATCH sets are checked
+    server.providers.find((p) => p.id === 'vc-x')!.credentials_secret = 'old name';
+    expect(call('PATCH', '/providers/vc-x', { name: 'vCenter X2' })).toMatchObject({ status: 200 });
+  });
+
+  it('keeps a provider while a plan still needs it, like the API: until it completes and its VMs are finalized (SDD §12)', () => {
+    const { server } = setup('admin');
     const plan = server.plans[0]!;
-    plan.status = 'failed';
     const id = plan.source_provider_id;
-    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(409);
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    const mine = server.migrations.filter((m) => users.some((p) => p.id === m.plan_id));
+    for (const m of mine) m.phase = 'finalized';
+    const remove = () => server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin');
+    const tail = 'a plan needs its providers until it completes and its VMs are finalized';
+    // a failed plan can be started again (SDD §8)
+    plan.status = 'failed';
+    expect(remove()).toMatchObject({ status: 409, body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", failed); ${tail}` } } });
+    // a completed VM can be rolled back until it is finalized, and its rollback needs the provider (SDD §8.1)
     plan.status = 'completed';
-    expect(server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin').status).toBe(204);
+    const [first, second] = mine.filter((m) => m.plan_id === plan.id);
+    first!.phase = 'completed';
+    expect(remove()).toMatchObject({ status: 409, body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", 1 VM not finalized); ${tail}` } } });
+    second!.phase = 'failed';
+    expect(remove().body).toMatchObject({ error: { message: expect.stringContaining(`("${plan.name}", 2 VMs not finalized)`) } });
+    // in creation order, whatever the list order; ten at most, then how many more
+    const other = users.find((p) => p.id !== plan.id)!;
+    other.status = 'draft';
+    const [older, newer] = [plan, other].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    server.plans.reverse();
+    const why = (p: Plan) => (p.id === plan.id ? '2 VMs not finalized' : 'draft');
+    expect(remove().body).toMatchObject({
+      error: { message: `provider is used by plan(s) that still need it: ${older!.id} ("${older!.name}", ${why(older!)}), ${newer!.id} ("${newer!.name}", ${why(newer!)}); ${tail}` },
+    });
+    const later = Date.parse(newer!.created_at);
+    for (let i = 0; i < 9; i++) {
+      server.plans.push({ ...other, id: `plan-extra00${i}`, name: `extra ${i}`, created_at: new Date(later + (i + 1) * 1000).toISOString() });
+    }
+    const listed = (remove().body as { error: { message: string } }).error.message;
+    expect(listed).toContain('plan-extra007 ("extra 7", draft) and 1 more; ');
+    expect(listed).not.toContain('plan-extra008');
+    server.plans.splice(server.plans.findIndex((p) => p.id === 'plan-extra000'), 9);
+    other.status = 'completed';
+    // a rolled-back VM lets it go: a retry refuses when the provider is gone (SDD §5.1)
+    first!.phase = 'rolled_back';
+    second!.phase = 'cancelled';
+    expect(remove().status).toBe(204);
+  });
+
+  it('refuses a rollback whose provider no longer exists, like the API: nothing changes (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const done = byPhase(server, 'completed');
+    const plan = server.plans.find((p) => p.id === done.plan_id)!;
+    server.providers.splice(server.providers.findIndex((p) => p.id === plan.destination_provider_id), 1);
+    await expect(client.post(`/migrations/${done.id}/rollback`, { reason: 'app broken' })).rejects.toMatchObject({
+      status: 409,
+      message: `${done.vm.name} cannot be rolled back: the plan's destination provider '${plan.destination_provider_id}' no longer exists`,
+    });
+    expect(done.phase).toBe('completed');
+    // a migration that cannot roll back says so first, like the API
+    const ready = server.migrations.find((m) => m.plan_id === plan.id && m.id !== done.id)!;
+    ready.phase = 'ready';
+    await expect(client.post(`/migrations/${ready.id}/rollback`, { reason: 'x' })).rejects.toMatchObject({
+      status: 409,
+      message: `Cannot move ${ready.vm.name} from ready to rolling_back.`,
+    });
   });
 
   it('accepts approvals and cutover requests in the phases the API does (SDD §5.4)', () => {
@@ -756,5 +1199,1054 @@ describe('mock API', () => {
       expect(result.status).toBe(200);
       expect(plan.status).toBe('draft');
     }
+  });
+});
+
+describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => {
+  const list = (client: ApiClient, query: Record<string, string | number | undefined> = {}) => client.get<RecommendationPage>('/advisor/recommendations', { query });
+
+  it('lists stored and legacy recommendations newest first, a legacy entry for each strategy note', async () => {
+    const { server, client } = setup('viewer');
+    const page = await list(client);
+    expect([page.offset, page.limit, page.total]).toEqual([0, 50, page.items.length]);
+    const order = page.items.map((r) => `${r.created_at} ${r.id}`);
+    expect(order).toEqual([...order].sort().reverse());
+    const strategyNotes = server.migrations.flatMap((m) => m.advisor_notes.filter((n) => n.kind === 'strategy'));
+    const legacy = page.items.filter((r) => r.legacy);
+    expect(strategyNotes.length).toBeGreaterThan(0);
+    expect(legacy.map((r) => r.legacy_text)).toEqual(expect.arrayContaining(strategyNotes.map((n) => n.summary)));
+    expect(legacy).toHaveLength(strategyNotes.length);
+    expect(legacy.every((r) => r.id.startsWith('rec-legacy-') && r.decision.actor.id === 'legacy')).toBe(true);
+  });
+
+  it('seeds every decision status, and the spec example: 57% under a 60% threshold keeps cold', async () => {
+    const { client } = setup('viewer');
+    const stored = (await list(client)).items.filter((r) => !r.legacy);
+    expect(new Set(stored.map((r) => r.decision.status))).toEqual(new Set(['auto_applied', 'below_threshold', 'fallback_rules', 'pending_approval', 'approved', 'overridden']));
+    const kept = stored.find((r) => r.decision.status === 'below_threshold')!;
+    expect([kept.recommendation.option, kept.recommendation.confidence, kept.decision.threshold_used, kept.decision.final_option]).toEqual(['warm', 0.57, 0.6, 'cold']);
+    const fallback = stored.find((r) => r.decision.status === 'fallback_rules')!;
+    expect([fallback.model.name, fallback.recommendation.option, fallback.decision.actor]).toEqual(['rules', null, { kind: 'system', id: 'fallback' }]);
+  });
+
+  it('runs every fixture migration on the final option of its newest decision', () => {
+    const server = new MockServer({ now: () => NOW });
+    const newest = new Map<string, AdvisorRecommendation>();
+    for (const r of server.recommendations) {
+      const seen = newest.get(r.migration_id!);
+      if (!seen || seen.created_at < r.created_at) newest.set(r.migration_id!, r);
+    }
+    expect(newest.size).toBeGreaterThan(0);
+    for (const [id, r] of newest) {
+      const m = server.migrations.find((x) => x.id === id)!;
+      // a decision that waits has no final option yet: the migration keeps the deterministic choice and is held
+      if (r.decision.final_option === null) expect([r.decision.status, m.advisor_hold], id).toEqual(['pending_approval', r.id]);
+      else expect(m.strategy, id).toBe(r.decision.final_option);
+    }
+  });
+
+  it('filters by migration, plan and decision type, and pages with limit and offset', async () => {
+    const { client } = setup('viewer');
+    const all = await list(client, { limit: 200 });
+    const target = all.items.find((r) => !r.legacy)!;
+    const mine = await list(client, { migration_id: target.migration_id! });
+    expect(mine.items.length).toBeGreaterThan(0);
+    expect(mine.items.every((r) => r.migration_id === target.migration_id)).toBe(true);
+    expect((await list(client, { plan_id: target.plan_id! })).total).toBe(all.items.filter((r) => r.plan_id === target.plan_id).length);
+    expect(await list(client, { decision_type: 'workload_tier' })).toMatchObject({ items: [], total: 0 });
+    const second = await list(client, { limit: 2, offset: 2 });
+    expect(second.items.map((r) => r.id)).toEqual(all.items.slice(2, 4).map((r) => r.id));
+    expect(second).toMatchObject({ total: all.total, offset: 2, limit: 2 });
+  });
+
+  it('refuses a limit outside 1-200, a negative offset and an unknown decision type with 422', async () => {
+    const { client } = setup('viewer');
+    for (const query of [{ limit: 0 }, { limit: 201 }, { limit: 'many' }, { offset: -1 }, { offset: 1.5 }, { decision_type: 'strategy' }]) {
+      await expect(list(client, query), JSON.stringify(query)).rejects.toMatchObject({ status: 422, code: 'validation_error' });
+    }
+  });
+
+  it('gets one recommendation by id, a legacy one too, and answers 404 for an unknown id', async () => {
+    const { client } = setup('viewer');
+    const { items } = await list(client, { limit: 200 });
+    for (const r of [items.find((x) => !x.legacy)!, items.find((x) => x.legacy)!]) {
+      expect(await client.get<AdvisorRecommendation>(`/advisor/recommendations/${r.id}`)).toEqual(r);
+    }
+    await expect(client.get('/advisor/recommendations/rec-000000000000')).rejects.toMatchObject({ status: 404 });
+    await expect(client.get('/advisor/recommendations/rec-legacy-mig-b2c4d6e870-9')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('asks for a token, like the API', async () => {
+    const { client } = setup('nobody');
+    await expect(list(client)).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe('mock audit trail, like the API (SDD §14.5)', () => {
+  it('lists only audit events with audit=true, newest last', async () => {
+    const { client } = setup('viewer');
+    const audit = await client.get<Event[]>('/events', { query: { audit: true, tail: true, limit: 1000 } });
+    expect(audit.length).toBeGreaterThan(0);
+    expect(audit.every((e) => (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind))).toBe(true);
+    expect(audit.map((e) => e.seq)).toEqual([...audit.map((e) => e.seq)].sort((a, b) => a - b));
+  });
+
+  it('seeds one recommendation.created and one decision event per status a decision took', () => {
+    const server = new MockServer({ now: () => NOW });
+    for (const rec of server.recommendations) {
+      const mine = server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind);
+      const current = rec.decision.status === 'fallback_rules' ? 'decision.fallback' : `decision.${rec.decision.status}`;
+      expect(mine[0], rec.id).toBe('recommendation.created');
+      expect(mine.at(-1), rec.id).toBe(current);
+      // a person's decision follows the validation's: two decision events, else one
+      expect(mine.length, rec.id).toBe(['approved', 'overridden'].includes(rec.decision.status) ? 3 : 2);
+      expect(server.snapshots.has(rec.input_snapshot_sha256!), rec.id).toBe(true);
+    }
+  });
+
+  it('serves an input snapshot anyone can re-hash, 404 unknown, 422 malformed', async () => {
+    const { server, client } = setup('viewer');
+    const sha = server.recommendations[0]!.input_snapshot_sha256!;
+    const snapshot = await client.get<{ sha256: string; payload: unknown }>(`/advisor/snapshots/${sha}`);
+    expect(sha256Hex(canonicalJson(snapshot.payload))).toBe(sha);
+    await expect(client.get(`/advisor/snapshots/${'0'.repeat(64)}`)).rejects.toMatchObject({ status: 404 });
+    await expect(client.get('/advisor/snapshots/not-a-hash')).rejects.toMatchObject({ status: 422 });
+  });
+});
+
+describe('mock advisor policies, approval and override, like the API (SDD §14.6)', () => {
+  const ADMIN = 'admin';
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const recOf = (server: MockServer, vm: string) => server.recommendations.filter((r) => r.subject.name === vm).at(-1)!;
+
+  it('seeds the Finance policy and decisions that wait, were approved and were overridden', () => {
+    const server = new MockServer({ now: () => NOW });
+    expect(server.policies.map((p) => [p.name, p.mode, p.scope.provider_ids, p.require_override_reason])).toEqual([
+      ['Finance — approval required', 'always_require_approval', ['rhosp17-dc1'], true],
+    ]);
+    const waiting = recOf(server, 'analytics-node-2');
+    expect([waiting.decision.status, waiting.decision.final_option, waiting.decision.policy_id]).toEqual(['pending_approval', null, 'pol-finance']);
+    expect(server.migrations.find((m) => m.vm.name === 'analytics-node-2')!.advisor_hold).toBe(waiting.id);
+    const approved = recOf(server, 'vm-hr-portal');
+    expect([approved.decision.status, approved.decision.final_option, approved.decision.actor]).toEqual(['approved', 'vmware_warm', { kind: 'user', id: 'sari' }]);
+    expect(server.events.filter((e) => e.data.target_id === approved.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.below_threshold', 'decision.approved']);
+    const overridden = recOf(server, 'ad-dc-01');
+    expect([overridden.decision.status, overridden.decision.final_option, (overridden.decision.reason_text?.length ?? 0) >= 10]).toEqual(['overridden', 'cold', true]);
+    expect(server.plans.find((p) => p.id === 'plan-4f2a9c1e')!.strategy_overrides).toMatchObject({ 'os-0c41': 'cold' });
+    const policyCreated = server.events.filter((e) => e.kind === 'policy.created');
+    expect(policyCreated.map((e) => [e.actor, e.data.target_id])).toEqual([['user:rina', 'pol-finance']]);
+  });
+
+  it('decides under the Finance policy: the decision waits and holds the migration, whatever the confidence', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'cold', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const rec = recOf(server, 'analytics-db');
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.reason_code]).toEqual(['pending_approval', null, 'POLICY_REQUIRES_APPROVAL']);
+    expect([db.advisor_hold, db.strategy]).toEqual([rec.id, 'warm']);
+    expect(server.events.filter((e) => e.data.target_id === rec.id).map((e) => e.kind)).toEqual(['recommendation.created', 'decision.pending_approval']);
+  });
+
+  it('starts a held migration only once a human decides: approve, then the run goes on', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    await as(server, 'operator').post(`/plans/${plan.id}/start`);
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(db.phase).toBe('ready');
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(`/advisor/recommendations/${recOf(server, 'analytics-db').id}/approve`, {});
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.actor.id]).toEqual(['approved', 'warm', 'rina']);
+    expect(db.advisor_hold).toBeNull();
+    server.tick();
+    expect(db.phase).toBe('precopy');
+  });
+
+  it('runs an overridden option, keeps it in the plan and needs the reason the policy asks for', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    const id = recOf(server, 'analytics-db').id;
+    const url = `/advisor/recommendations/${id}/override`;
+    for (const reason of [undefined, '', 'too short', ' '.repeat(12)]) {
+      await expect(as(server, ADMIN).post(url, { option: 'cold', reason }), String(reason)).rejects.toMatchObject({ status: 422 });
+    }
+    await expect(as(server, ADMIN).post(url, { option: 'storage_handover', reason: 'No shared Ceph between the clouds' })).rejects.toMatchObject({ status: 422 });
+    const rec = await as(server, ADMIN).post<AdvisorRecommendation>(url, { option: 'cold', reason: 'The change window fits a cold cutover' });
+    expect([rec.decision.status, rec.decision.final_option, rec.decision.reason_text]).toEqual(['overridden', 'cold', 'The change window fits a cold cutover']);
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    expect([db.strategy, db.advisor_hold]).toEqual(['cold', null]);
+    expect(server.plans.find((p) => p.id === 'plan-c81d44a0')!.strategy_overrides).toMatchObject({ [db.vm.source_id]: 'cold' });
+    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({ kind: 'decision.overridden', actor: 'user:rina', data: { before: { status: 'pending_approval' } } });
+  });
+
+  it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    const id = held.advisor_hold!;
+    for (const token of ['viewer', 'operator', 'approver']) {
+      await expect(as(server, token).post(`/advisor/recommendations/${id}/approve`, {})).rejects.toMatchObject({ status: 403 });
+    }
+    await expect(as(server, 'operator').put(`/migrations/${held.id}/strategy`, { strategy: 'warm' })).rejects.toMatchObject({ status: 409, message: expect.stringContaining('waits for approval') });
+    await expect(as(server, ADMIN).post('/advisor/recommendations/rec-legacy-mig-b2c4d6e870-0/approve', {})).rejects.toMatchObject({ status: 409 });
+    await expect(as(server, ADMIN).post(`/advisor/recommendations/${recOf(server, 'web-01').id}/approve`, {})).rejects.toMatchObject({ status: 409 });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate'); // a newer recommendation for analytics-db
+    const older = server.recommendations.filter((r) => r.subject.name === 'analytics-db');
+    expect(older.length).toBeGreaterThan(0);
+  });
+
+  it('lists the policies with the built-in default and audits every change by advisor.policy.manage', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const list = await as(server, 'viewer').get<{ items: unknown[]; default: { id: string; mode: string; threshold: number } }>('/advisor/policies');
+    expect([list.items.length, list.default.id, list.default.mode, list.default.threshold]).toEqual([1, 'global-default', 'auto_apply_above_threshold', 0.6]);
+    const spec = { name: 'Analytics — stricter', scope: { provider_ids: [], plan_ids: ['plan-c81d44a0'] }, decision_types: ['migration_strategy'], mode: 'auto_apply_above_threshold', threshold: 0.8, min_evidence_for_auto_apply: 0, require_override_reason: false };
+    await expect(as(server, 'approver').post('/advisor/policies', spec)).rejects.toMatchObject({ status: 403 });
+    for (const bad of [{ scope: { provider_ids: ['rhosp17-dc1'], plan_ids: ['plan-c81d44a0'] } }, { scope: { provider_ids: ['nope'], plan_ids: [] } }, { threshold: 1.5 }, { name: '' }]) {
+      await expect(as(server, ADMIN).post('/advisor/policies', { ...spec, ...bad }), JSON.stringify(bad)).rejects.toMatchObject({ status: 422 });
+    }
+    const created = await as(server, ADMIN).post<{ id: string }>('/advisor/policies', spec);
+    await as(server, ADMIN).put(`/advisor/policies/${created.id}`, { ...spec, threshold: 0.85 });
+    await as(server, ADMIN).delete(`/advisor/policies/${created.id}`);
+    await expect(as(server, ADMIN).delete(`/advisor/policies/${created.id}`)).rejects.toMatchObject({ status: 404 });
+    expect(server.events.filter((e) => e.data.target_id === created.id).map((e) => [e.kind, e.actor])).toEqual([
+      ['policy.created', 'user:rina'],
+      ['policy.updated', 'user:rina'],
+      ['policy.deleted', 'user:rina'],
+    ]);
+  });
+});
+
+describe('mock validation decides like the API (SDD §14.4)', () => {
+  function validating(advice: { option: string | null; confidence: number | null }) {
+    const advise = vi.fn(() => advice);
+    const server = new MockServer({ now: () => NOW, seed: 1, advise });
+    server.policies.length = 0; // these run under the built-in global default (SDD §14.6)
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    // the analytics plan: analytics-db ties cold and warm (nothing meets the SLO), the handover nodes do not
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    return { server, client, plan, db, advise, before: server.recommendations.length };
+  }
+
+  it('records the decision on an automatic choice between strategies, and the migration runs its final option', async () => {
+    const { server, client, plan, db, advise, before } = validating({ option: 'cold', confidence: 0.8 });
+    expect(db.strategy).toBe('warm');
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(advise).toHaveBeenCalledTimes(1);
+    const [rec, ...more] = server.recommendations.slice(before);
+    expect(more).toEqual([]);
+    expect(rec).toMatchObject({
+      decision_type: 'migration_strategy',
+      subject: { kind: 'vm', id: db.vm.source_id, name: 'analytics-db' },
+      plan_id: plan.id,
+      migration_id: db.id,
+      provider_id: plan.source_provider_id,
+      model: { name: 'jev' },
+      recommendation: { option: 'cold', confidence: 0.8 },
+      decision: { final_option: 'cold', status: 'auto_applied', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
+    });
+    expect(db.strategy).toBe('cold');
+    // SDD §14.5: recommendation.created, then exactly one decision event; advisor.strategy is gone
+    const audit = server.events.filter((e) => e.migration_id === db.id && (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind));
+    expect(audit.map((e) => [e.kind, e.actor])).toEqual([
+      ['recommendation.created', 'system:advisor'],
+      ['decision.auto_applied', 'policy:global-default'],
+    ]);
+    expect(audit[0]!.data).toMatchObject({ target_id: rec!.id, model_version: 'jev-1.13.0', option: 'cold', confidence: 0.8, snapshot_sha256: rec!.input_snapshot_sha256 });
+    expect(audit[1]!.data).toEqual({
+      target_id: rec!.id,
+      model_version: 'jev-1.13.0',
+      before: null,
+      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
+    });
+    expect(server.events.filter((e) => e.migration_id === db.id && e.kind === 'advisor.strategy')).toEqual([]);
+    // the input snapshot is named by the SHA-256 of its canonical JSON
+    const snapshot = server.snapshots.get(rec!.input_snapshot_sha256!)!;
+    expect(sha256Hex(canonicalJson(snapshot.payload))).toBe(snapshot.sha256);
+    expect(snapshot.payload).toMatchObject({ tool: 'jev_decide', scope: ['cold', 'warm'], deterministic: 'warm' });
+  });
+
+  it('keeps the deterministic choice when the confidence is below the threshold', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'cold', confidence: 0.57 });
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(server.recommendations.slice(before).map((r) => [r.recommendation.option, r.decision.status, r.decision.final_option])).toEqual([['cold', 'below_threshold', 'warm']]);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it('falls back to the rules when the advisor gives no answer', async () => {
+    const { server, client, plan, db, before } = validating({ option: null, confidence: null });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect([rec!.model.name, rec!.decision.status, rec!.decision.final_option, rec!.decision.actor.id]).toEqual(['rules', 'fallback_rules', 'warm', 'fallback']);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it.each([
+    ['an option outside the scope', 'storage_handover'],
+    ['an escape hatch', 'ask_user'],
+  ])('falls back to the rules on %s, which is no usable answer', async (_, option) => {
+    const { server, client, plan, db, before } = validating({ option, confidence: 0.9 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect([rec!.model.name, rec!.decision.status, rec!.decision.final_option]).toEqual(['jev', 'fallback_rules', 'warm']);
+    expect(rec!.decision.reason_text).toContain(option);
+    expect(db.strategy).toBe('warm');
+  });
+
+  it('asks nothing when the plan or an override makes the choice', async () => {
+    const { server, client, plan, advise, before } = validating({ option: 'cold', confidence: 0.9 });
+    plan.default_strategy = 'warm';
+    await client.post(`/plans/${plan.id}/validate`);
+    expect(advise).not.toHaveBeenCalled();
+    expect(server.recommendations).toHaveLength(before);
+  });
+
+  it('simulates the advisor the same way every time, without drawing from the seeded random stream', async () => {
+    const runs = await Promise.all(
+      [1, 2].map(async () => {
+        const server = new MockServer({ now: () => NOW, seed: 1 });
+        const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+        const before = server.recommendations.length;
+        await client.post('/plans/plan-c81d44a0/validate');
+        const [rec] = server.recommendations.slice(before);
+        return { rec: rec!.recommendation, next: (server as unknown as { rand: () => number }).rand() };
+      }),
+    );
+    expect(runs[0]).toEqual(runs[1]);
+    expect(runs[0]!.rec.confidence).toBeGreaterThanOrEqual(0.5);
+    expect(runs[0]!.rec.confidence).toBeLessThan(0.95);
+    expect(runs[0]!.next).toBe((new MockServer({ now: () => NOW, seed: 1 }) as unknown as { rand: () => number }).rand());
+  });
+});
+
+describe('mock maker-checker, like the API (SDD §5.4, §14.6, ADV-17)', () => {
+  const ADMIN_TOKEN = 'admin';
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const OWN_CUTOVER = 'You requested this cutover. Another approver must approve it.';
+  const OWN_DECISION = 'You requested this decision. Another approver must decide it.';
+
+  it('records a cutover request without an approval, refuses the requester\'s approval and opens the gate on another approver\'s', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'storage_handover', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    await as(server, 'operator').post('/plans/plan-c81d44a0/start');
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    const requested = await as(server, 'approver').post<Migration>(`/migrations/${node.id}/cutover`, { comment: 'Window agreed with the data team' });
+    expect([requested.cutover_requested, requested.cutover_requested_by, requested.approvals]).toEqual([true, 'sari', []]);
+    expect(requested.cutover_requested_at).not.toBeNull();
+    expect(server.events.filter((e) => e.migration_id === node.id && e.kind === 'migration.action').at(-1)!.data.comment).toBe('Window agreed with the data team');
+    await expect(as(server, 'approver').post(`/migrations/${node.id}/approve`, { comment: 'mine' })).rejects.toMatchObject({ status: 409, message: OWN_CUTOVER });
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(node.phase).toBe('ready');
+    await as(server, ADMIN_TOKEN).post(`/migrations/${node.id}/approve`, { comment: 'Checked the handover findings' });
+    for (let i = 0; i < 3 && node.phase === 'ready'; i += 1) server.tick();
+    expect(node.phase).toBe('cutover');
+  });
+
+  it('refuses a decision while the plan sets the VM\'s strategy, and a second approve, like the API (SDD §14.6)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const held = server.migrations.find((m) => m.advisor_hold)!;
+    const recId = held.advisor_hold!;
+    const plan = server.plans.find((p) => p.id === held.plan_id)!;
+    plan.strategy_overrides = { ...plan.strategy_overrides, [held.vm.source_id]: 'cold' };
+    const pinned = `The plan sets the strategy of ${held.vm.name} (cold): change it in the plan.`;
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {})).rejects.toMatchObject({ status: 409, message: pinned });
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/override`, { option: 'cold', reason: 'the owner chose cold' })).rejects.toMatchObject({
+      status: 409,
+      message: pinned,
+    });
+    const { [held.vm.source_id]: _, ...rest } = plan.strategy_overrides;
+    plan.strategy_overrides = rest;
+    await as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {});
+    const approvals = server.events.filter((e) => e.kind === 'decision.approved').length;
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${recId}/approve`, {})).rejects.toMatchObject({
+      status: 409,
+      message: 'The decision is already approved.',
+    });
+    expect(server.events.filter((e) => e.kind === 'decision.approved')).toHaveLength(approvals);
+    // another option is still a person's call while nothing started
+    const overridden = await as(server, ADMIN_TOKEN).post<AdvisorRecommendation>(`/advisor/recommendations/${recId}/override`, {
+      option: 'cold',
+      reason: 'the owner chose cold',
+    });
+    expect(overridden.decision.status).toBe('overridden');
+  });
+
+  it('clears the advisor hold of a migration it cancels, like the API (SDD §14.6)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const held = server.migrations.find((m) => m.advisor_hold)!;
+    await as(server, 'operator').post(`/migrations/${held.id}/cancel`, { reason: 'not this one' });
+    expect([held.phase, held.advisor_hold]).toEqual(['cancelled', null]);
+    // and a validation that cancels the migration of a VM that left the plan
+    const other = new MockServer({ now: () => NOW, seed: 1 });
+    const kept = other.migrations.find((m) => m.advisor_hold)!;
+    const plan = other.plans.find((p) => p.id === kept.plan_id)!;
+    plan.vm_ids = plan.vm_ids.filter((id) => id !== kept.vm.source_id);
+    await as(other, 'operator').post(`/plans/${plan.id}/validate`);
+    expect([kept.phase, kept.advisor_hold]).toEqual(['cancelled', null]);
+  });
+
+  it('refuses the approval of the approver who forced the cutover, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const warm = byPhase(server, 'syncing');
+    await as(server, ADMIN_TOKEN).post(`/migrations/${warm.id}/cutover`, { comment: 'Window agreed' });
+    await as(server, 'approver').post(`/migrations/${warm.id}/force-cutover`, { reason: 'the window closes in ten minutes' });
+    await expect(as(server, 'approver').post(`/migrations/${warm.id}/approve`, { comment: 'my own force' })).rejects.toMatchObject({
+      status: 409,
+      message: 'You forced this cutover. Another approver must approve it.',
+    });
+    expect(warm.approvals.map((a) => a.actor)).not.toContain('sari');
+  });
+
+  it("does not count an approval the requester gave before requesting: the gate waits for another approver's", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'storage_handover', confidence: 0.99 }) });
+    await as(server, 'operator').post('/plans/plan-c81d44a0/validate');
+    await as(server, 'operator').post('/plans/plan-c81d44a0/start');
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    await as(server, 'approver').post(`/migrations/${node.id}/approve`, { comment: 'Findings checked with the data team' });
+    await as(server, 'approver').post(`/migrations/${node.id}/cutover`, {});
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect([node.phase, node.approvals.map((a) => a.actor), node.cutover_requested_by]).toEqual(['ready', ['sari'], 'sari']);
+  });
+
+  it('treats a request as an approval, as before, when the plan needs no distinct approver', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const node = server.migrations.find((m) => m.vm.name === 'analytics-node-1')!;
+    server.plans.find((p) => p.id === node.plan_id)!.require_distinct_approver = false;
+    const requested = await as(server, 'approver').post<Migration>(`/migrations/${node.id}/cutover`, {});
+    expect(requested.approvals.map((a) => a.actor)).toEqual(['sari']);
+  });
+
+  it('keeps the rules of the policy that took a decision when the policy is relaxed later, like the API (SDD §14.6)', async () => {
+    const relax = (server: MockServer) => {
+      for (const p of server.policies) Object.assign(p, { require_distinct_approver: false, require_override_reason: false });
+    };
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, ADMIN_TOKEN).post('/plans/plan-c81d44a0/validate');
+    const rec = server.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([rec.requested_by, rec.decision.require_distinct_approver, rec.decision.require_override_reason]).toEqual(['rina', true, true]);
+    relax(server);
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({ status: 409, message: OWN_DECISION });
+    // validated by another user: the override still needs its reason
+    const other = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(other, 'operator').post('/plans/plan-c81d44a0/validate');
+    const held = other.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    relax(other);
+    await expect(as(other, ADMIN_TOKEN).post(`/advisor/recommendations/${held.id}/override`, { option: 'cold' })).rejects.toMatchObject({ status: 422 });
+    const overridden = await as(other, ADMIN_TOKEN).post<AdvisorRecommendation>(`/advisor/recommendations/${held.id}/override`, {
+      option: 'cold',
+      reason: 'The change window fits a cold cutover',
+    });
+    // the rules go on with a person's decision
+    expect([overridden.decision.require_distinct_approver, overridden.decision.require_override_reason]).toEqual([true, true]);
+    // the fallback took no policy's decision: it records no rules, so the policy in force applies
+    const unavailable = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: null, confidence: null }) });
+    await as(unavailable, 'operator').post('/plans/plan-c81d44a0/validate');
+    const fallback = unavailable.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([fallback.decision.status, fallback.decision.require_distinct_approver, fallback.decision.require_override_reason]).toEqual(['fallback_rules', null, null]);
+  });
+
+  it('names the validating user as the requester of a decision, who then neither approves nor overrides it', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => ({ option: 'warm', confidence: 0.99 }) });
+    await as(server, ADMIN_TOKEN).post('/plans/plan-c81d44a0/validate');
+    const rec = server.recommendations.filter((r) => r.subject.name === 'analytics-db').at(-1)!;
+    expect([rec.requested_by, rec.decision.status]).toEqual(['rina', 'pending_approval']);
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/approve`, {})).rejects.toMatchObject({ status: 409, message: OWN_DECISION });
+    await expect(as(server, ADMIN_TOKEN).post(`/advisor/recommendations/${rec.id}/override`, { option: 'cold', reason: 'The change window fits a cold cutover' })).rejects.toMatchObject({
+      status: 409,
+      message: OWN_DECISION,
+    });
+  });
+
+  it('defaults a policy to a distinct approver and keeps Distinct approver approver-only on a plan', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const spec = { name: 'Four eyes', scope: { provider_ids: [], plan_ids: [] }, decision_types: [], mode: 'always_require_approval', threshold: 0.6 };
+    const created = await as(server, ADMIN_TOKEN).post<{ require_distinct_approver: boolean }>('/advisor/policies', spec);
+    expect(created.require_distinct_approver).toBe(true);
+    const draft = server.plans.find((p) => p.status === 'draft')!;
+    await expect(as(server, 'operator').patch(`/plans/${draft.id}`, { require_distinct_approver: false })).rejects.toMatchObject({ status: 403 });
+    const patched = await as(server, 'approver').patch<{ require_distinct_approver: boolean }>(`/plans/${draft.id}`, { require_distinct_approver: false });
+    expect(patched.require_distinct_approver).toBe(false);
+  });
+
+  it('seeds requests and approvals by two people, with comments an operator would write', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const requested = server.migrations.filter((m) => m.cutover_requested);
+    expect(requested.length).toBeGreaterThan(3);
+    for (const m of requested) {
+      expect(m.cutover_requested_by, m.vm.name).toBeTruthy();
+      expect(m.approvals.every((a) => a.actor !== m.cutover_requested_by), m.vm.name).toBe(true);
+    }
+    for (const a of server.migrations.flatMap((m) => m.approvals)) expect((a.comment ?? '').length, a.actor).toBeGreaterThanOrEqual(15);
+    // the fixtures' validations ran as the operator: the admin persona may decide what waits
+    expect(new Set(server.recommendations.filter((r) => !r.legacy).map((r) => r.requested_by))).toEqual(new Set(['bayu']));
+  });
+});
+
+describe('mock convergence, Force cutover and data checks, like the API (SDD §5.3–§5.5, ADV-16)', () => {
+  const GiB = 2 ** 30;
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const REASON = 'The change window closes in 20 minutes';
+
+  it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {
+    const { client } = setup('viewer');
+    expect(await client.get<{ demo: boolean; demo_speed: number | null }>('/health')).toMatchObject({ demo: true, demo_speed: 1 });
+  });
+
+  it('records a Force cutover with the last pass and the estimate, and a request that is no approval', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    expect([m.phase, m.strategy, m.converged_by, m.force_cutover]).toEqual(['syncing', 'warm', null, null]);
+    // the API's figure (SDD §5.4): the downtime after the running pass, as the dialog shows it - not the converged estimate
+    const expected = forcedDowntime(m, server.plans.find((p) => p.id === m.plan_id)!);
+    expect(Math.abs(expected - m.estimate!.downtime_s)).toBeGreaterThan(60);
+    const forced = await as(server, 'approver').post<Migration>(`/migrations/${m.id}/force-cutover`, { reason: `  ${REASON}  ` });
+    expect(forced.force_cutover).toEqual({
+      actor: 'sari',
+      at: new Date(NOW).toISOString(),
+      reason: REASON,
+      delta_bytes: Math.round(12.6 * GiB),
+      estimated_downtime_s: expected,
+    });
+    // maker-checker (SDD §5.4, ADV-17): the forcer requested the cutover; another approver approves it
+    expect([forced.cutover_requested, forced.cutover_requested_by, forced.approvals]).toEqual([true, 'sari', []]);
+    expect(server.events.at(-1)).toMatchObject({
+      kind: 'migration.force_cutover',
+      actor: 'sari',
+      migration_id: m.id,
+      data: { reason: REASON, delta_bytes: Math.round(12.6 * GiB), estimated_downtime_s: expected },
+    });
+    // the running pass finishes, then the migration waits for the gate with the rule recorded
+    for (let i = 0; i < 200 && m.phase === 'syncing'; i += 1) server.tick();
+    expect([m.phase, m.converged_by]).toEqual(['awaiting_cutover', 'force']);
+    expect(m.sync_passes.at(-1)!.kind).toBe('delta');
+  });
+
+  it('records a Force cutover as an approval too when the plan needs no distinct approver', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    server.plans.find((p) => p.id === m.plan_id)!.require_distinct_approver = false;
+    const forced = await as(server, 'approver').post<Migration>(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    expect(forced.approvals).toEqual([{ actor: 'sari', at: new Date(NOW).toISOString(), comment: REASON }]);
+  });
+
+  it('forces a migration once, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!; // syncing
+    await as(server, 'approver').post(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    const first = m.force_cutover;
+    // rina, another approver, would take sari's place: sari's own approval would count again
+    await expect(as(server, 'admin').post(`/migrations/${m.id}/force-cutover`, { reason: 'I would rather force it myself' })).rejects.toMatchObject({
+      status: 409,
+      message: 'Already forced by sari: the cutover follows the running pass.',
+    });
+    expect(m.force_cutover).toEqual(first);
+    expect(server.events.filter((e) => e.migration_id === m.id && e.kind === 'migration.force_cutover')).toHaveLength(1);
+  });
+
+  it('refuses what the API refuses: a short reason, a converged or single-shot migration, an operator', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const syncing = 'mig-5d7e2b4a11';
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: ' too short ' })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'approver').post(`/migrations/${syncing}/force-cutover`, { reason: 'x'.repeat(2001) })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'operator').post(`/migrations/${syncing}/force-cutover`, { reason: REASON })).rejects.toMatchObject({ status: 403 });
+    for (const id of ['mig-5d7e2b4a12', 'mig-5d7e2b4a13']) {
+      await expect(as(server, 'approver').post(`/migrations/${id}/force-cutover`, { reason: REASON })).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringMatching(/^a Force cutover applies to a warm migration in pre-copy or syncing, not to (warm in awaiting_cutover|cold in ready)$/),
+      });
+    }
+    expect(server.migrations.find((x) => x.id === syncing)!.force_cutover).toBeNull();
+  });
+
+  it('records the rule that ended the passes: the threshold, or the pass limit (SDD §5.3)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    for (let i = 0; i < 400 && m.phase === 'syncing'; i += 1) server.tick();
+    expect(m.phase).toBe('awaiting_cutover');
+    const last = m.sync_passes.at(-1)!;
+    expect(m.converged_by).toBe(last.bytes_changed <= plan.convergence_threshold_bytes ? 'threshold' : 'max_passes');
+
+    const limited = new MockServer({ now: () => NOW, seed: 1 });
+    const other = limited.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    limited.plans.find((p) => p.id === other.plan_id)!.convergence_threshold_bytes = 0;
+    for (let i = 0; i < 400 && other.phase === 'syncing'; i += 1) limited.tick();
+    expect([other.phase, other.converged_by]).toEqual(['awaiting_cutover', 'max_passes']);
+  });
+
+  it('never ends CBT passes on the threshold: the pass limit decides in the mock, which has no SLO rule (SDD §5.4)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b50')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    expect([m.strategy, m.phase]).toEqual(['vmware_warm', 'syncing']);
+    for (let i = 0; i < 600 && m.phase === 'syncing'; i += 1) server.tick();
+    expect([m.phase, m.converged_by]).toEqual(['awaiting_cutover', 'max_passes']);
+    // a pass below the threshold did not end them
+    expect(m.sync_passes.slice(0, -1).some((p) => p.kind === 'delta' && p.bytes_changed <= plan.convergence_threshold_bytes)).toBe(true);
+  });
+
+  it('clears a Force cutover with the request on re-validation and a strategy change, like the API (SDD §5.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a11')!;
+    await as(server, 'approver').post(`/migrations/${m.id}/force-cutover`, { reason: REASON });
+    // the API clears it with the request it belongs to (SDD §5.4): a strategy change is the operator's way
+    m.phase = 'ready';
+    await as(server, 'operator').put(`/migrations/${m.id}/strategy`, { strategy: 'cold' });
+    expect([m.force_cutover, m.cutover_requested]).toEqual([null, false]);
+  });
+
+  it('leaves migrations whose numbers do not hold out of the downtime figures and counts them (SDD §5.5)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const client = as(server, 'viewer');
+    const before = await client.get<Stats>('/stats?plan_id=plan-4f2a9c1e');
+    expect(before.data_inconsistent).toBe(0);
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e21')!;
+    m.data_issues = ['DOWNTIME_BELOW_FINAL_SYNC: 6 s of downtime around a 258 s final sync'];
+    m.actual_downtime_s = 99_999;
+    const after = await client.get<Stats>('/stats?plan_id=plan-4f2a9c1e');
+    expect(after.data_inconsistent).toBe(1);
+    expect(after.max_downtime_s ?? 0).toBeLessThan(99_999);
+    // still counted as completed: only its downtime is left out
+    expect(after.completed).toBe(before.completed);
+  });
+
+  it('records the model seconds of a cutover, at wall speed, and counts the downtime from them like the API (SDD §5.2)', () => {
+    let clock = NOW;
+    const server = new MockServer({ now: () => clock, seed: 1 });
+    const m = server.migrations.find((x) => x.id === 'mig-3c1a0f9e23')!;
+    expect(m.phase).toBe('cutover');
+    for (let i = 0; i < 200 && m.phase !== 'completed'; i += 1) {
+      clock += 1000;
+      server.tick();
+    }
+    expect(m.phase).toBe('completed');
+    expect(m.downtime_model_s).not.toBeNull();
+    expect(m.actual_downtime_s!).toBeGreaterThanOrEqual(m.downtime_model_s!);
+    expect(m.data_issues).toEqual([]);
+  });
+});
+
+describe('mock application probes, like the API (SDD §7.5, §9.3, §9.6, ADV-18)', () => {
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const tcp = (port: number) => ({ kind: 'tcp' as const, port, path: '/', expect_status: null });
+  const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
+
+  it('flags database VMs without an application probe at validation and records the suggestion', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const mysql = byName(server, 'db-mysql-02');
+    expect(mysql.findings.find((f) => f.code === 'APP_PROBE_MISSING')).toMatchObject({
+      severity: 'warning',
+      message: 'db-mysql-02 is a database VM without an application probe: verification would check only that it booted. Suggested: TCP 3306.',
+    });
+    expect(mysql.suggested_probes).toEqual([tcp(3306)]);
+    expect(byName(server, 'analytics-db').suggested_probes).toEqual([]);
+    const web = byName(server, 'web-01');
+    expect(web.findings.map((f) => f.code)).not.toContain('APP_PROBE_MISSING');
+    expect(web.suggested_probes).toEqual([{ kind: 'http', port: 80, path: '/', expect_status: null }]);
+  });
+
+  it('refuses the probes the API refuses and keeps those it accepts', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const operator = as(server, 'operator');
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    await expect(
+      operator.patch(`/plans/${plan.id}`, { verification: { ...plan.verification, app_probes: [tcp(70000)] } }),
+    ).rejects.toMatchObject({ status: 422, message: expect.stringContaining('70000') });
+    const db = byName(server, 'analytics-db');
+    const saved = await operator.patch<Plan>(`/plans/${plan.id}`, { probe_overrides: { [db.vm.source_id]: [tcp(5432)] } });
+    expect(saved.probe_overrides).toEqual({ [db.vm.source_id]: [tcp(5432)] });
+    expect(saved.status).toBe('draft');
+    // a validation clears the finding of the VM that now has a probe, and suggests anew
+    db.suggested_probes = [tcp(1)];
+    await operator.post(`/plans/${plan.id}/validate`);
+    for (let i = 0; i < 5; i += 1) server.tick();
+    expect(byName(server, 'analytics-db').findings.map((f) => f.code)).not.toContain('APP_PROBE_MISSING');
+    expect(byName(server, 'analytics-db').suggested_probes).toEqual([]);
+  });
+
+  it('records a failed boot check as a failed verification, whatever ports the plan probes', () => {
+    for (const ports of [[22], []]) {
+      const clock = { t: NOW };
+      const server = new MockServer({ now: () => clock.t, seed: 3 });
+      const m = byName(server, 'web-02');
+      const plan = server.plans.find((p) => p.id === m.plan_id)!;
+      plan.verification = { ...plan.verification, tcp_ports: ports };
+      // the one verification in ten that fails on its boot checks
+      (server as unknown as { rand: () => number }).rand = () => 0.01;
+      verifyNow(server, m, clock);
+      expect(m.phase, String(ports)).toBe('rolling_back');
+      expect(m.verification!.passed, String(ports)).toBe(false);
+      const failed = m.verification!.checks.filter((c) => !c.ok && !c.skipped).map((c) => c.name);
+      expect(failed, String(ports)).toEqual(ports.length ? ['tcp:22'] : ['console']);
+      expect(m.error).toBe(`Verification failed: ${ports.length ? 'tcp:22 (connection refused)' : 'console (no success pattern in the last 200 console lines)'}`);
+    }
+  });
+
+  it("runs none of a VM's services when it carries the demo fault, like the demo (SDD §7.4)", () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    m.vm = { ...m.vm, name: 'orders-db-02', tags: { role: 'postgresql', 'demo-fault': 'app-down' } };
+    server.plans.find((p) => p.id === m.plan_id)!.probe_overrides = { [m.vm.source_id]: [tcp(5432)] };
+    verifyNow(server, m, clock);
+    expect(m.verification!.probes.map((p) => p.result)).toEqual(['failed']);
+  });
+
+  function verifyNow(server: MockServer, m: Migration, clock: { t: number }) {
+    for (let i = 0; i < 40 && m.phase === 'verifying'; i += 1) {
+      clock.t += 1000;
+      server.tick();
+    }
+  }
+
+  it("records the verification with every probe's result; a database without one needs review", () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    expect(m.phase).toBe('verifying');
+    m.vm = { ...m.vm, name: 'db-web-02', tags: { tier: 'database' } };
+    verifyNow(server, m, clock);
+    expect(m.phase).toBe('completed');
+    expect(m.checkpoint).toBe('verified'); // the API's value (SDD §8.1)
+    expect(m.verification).toMatchObject({ passed: true, probes: [] });
+    // the plan's boot checks run as before: its TCP ports, then the console (SDD §7.5)
+    expect(m.verification!.checks.map((c) => c.name)).toEqual(['server_active', 'ports_up', 'tcp:22', 'console']);
+    expect([m.review_required, m.review_reason]).toEqual([true, 'database VM without an application probe: only its boot was verified']);
+  });
+
+  it('fails the verification when a probe is refused, and rolls back as the plan says', () => {
+    const clock = { t: NOW };
+    const server = new MockServer({ now: () => clock.t, seed: 3 });
+    const m = byName(server, 'web-02');
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.probe_overrides = { [m.vm.source_id]: [tcp(80), tcp(9999)] };
+    verifyNow(server, m, clock);
+    expect(m.phase).toBe('rolling_back');
+    expect(m.verification!.passed).toBe(false);
+    expect(m.verification!.probes.map((p) => [p.target.split(':').at(-1), p.result])).toEqual([
+      ['80', 'passed'],
+      ['9999', 'failed'],
+    ]);
+    expect(m.error).toContain('app:tcp:9999');
+  });
+});
+
+describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
+  function as(server: MockServer, token: string) {
+    return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  }
+  const byName = (server: MockServer, name: string) => server.migrations.find((m) => m.vm.name === name)!;
+
+  it('returns every plan with its derived status and the finalize reminder', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const pilot = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    pilot.status = 'validated';
+    const viewer = as(server, 'viewer');
+    const one = await viewer.get<Plan>(`/plans/${pilot.id}`);
+    expect([one.status, one.derived_status, one.finalize_warning_h]).toEqual(['validated', 'completed', 72]);
+    const all = await viewer.get<Plan[]>('/plans');
+    expect(all.find((p) => p.id === pilot.id)!.derived_status).toBe('completed');
+    expect(all.every((p) => typeof p.derived_status === 'string')).toBe(true);
+    // derived on every answer, never stored: the plan's last VM awaiting finalize is finalized
+    byName(server, 'web-cache-01').phase = 'finalized';
+    expect((await viewer.get<Plan>(`/plans/${pilot.id}`)).derived_status).toBe('finalized');
+    expect((await viewer.get<Plan[]>('/plans')).find((p) => p.id === pilot.id)!.derived_status).toBe('finalized');
+  });
+
+  it('splits completed into awaiting finalize and finalized', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const stats = await as(server, 'viewer').get<Stats>('/stats?plan_id=plan-2d5c8b93');
+    expect([stats.completed, stats.awaiting_finalize, stats.finalized]).toEqual([2, 1, 1]);
+  });
+
+  it('finalizes a wave or the plan with one approval, refusing what the API refuses', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const url = `/plans/${plan.id}/finalize`;
+    await expect(as(server, 'operator').post(url, { wave_id: null, confirm: plan.name })).rejects.toMatchObject({ status: 403 });
+    await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: 'nope' })).rejects.toMatchObject({ status: 400 });
+    await expect(as(server, 'approver').post(url, { wave_id: 'wave-9', confirm: wave.name })).rejects.toMatchObject({ status: 404 });
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(url, { wave_id: wave.id, confirm: wave.name, delete_source: false });
+    expect(out).toEqual({ finalized: [web01.id], skipped: [] });
+    expect(web01.phase).toBe('finalized');
+    const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
+    expect(batch).toMatchObject({ actor: 'sari', plan_id: plan.id, data: { wave_id: wave.id, finalized: ['web-01'], skipped: [] } });
+    await expect(as(server, 'approver').post(url, { wave_id: wave.id, confirm: wave.name })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('refuses to roll back a completed migration whose finalize began deleting the source, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const web01 = byName(server, 'web-01');
+    expect(web01.phase).toBe('completed');
+    web01.checkpoint = 'finalizing';
+    await expect(as(server, 'operator').post(`/migrations/${web01.id}/rollback`, { reason: 'revert to the source' })).rejects.toMatchObject({
+      status: 409,
+      message: 'the finalize began deleting the source VM: finalize it again',
+    });
+    expect(web01.phase).toBe('completed');
+  });
+
+  it("refuses to change a plan's providers while one of its migrations is failed, like the API (SDD §12)", async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const failed = server.migrations.find((m) => m.phase === 'failed')!;
+    const plan = server.plans.find((p) => p.id === failed.plan_id)!;
+    // a failed migration whose cutover stopped its source holds the whole plan; this one ran on
+    failed.downtime_started_at = null;
+    failed.downtime_ended_at = null;
+    if (!['draft', 'validated'].includes(plan.status)) plan.status = 'validated';
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id && x.id !== failed.id)) {
+      Object.assign(m, { phase: 'ready', downtime_started_at: null, downtime_ended_at: null });
+    }
+    const operator = as(server, 'operator');
+    await expect(operator.patch(`/plans/${plan.id}`, { destination_provider_id: 'dst-other' })).rejects.toMatchObject({
+      status: 409,
+      message: `roll back or cancel the failed migration (${failed.vm.name}) before changing the plan's providers: its rollback acts on the clouds its attempt used`,
+    });
+    await expect(operator.patch(`/plans/${plan.id}`, { source_provider_id: 'src-other' })).rejects.toMatchObject({ status: 409 });
+    // the rest stays editable for the retry, and repeating a provider changes nothing
+    expect((await operator.patch<Plan>(`/plans/${plan.id}`, { description: 'fix the mapping' })).description).toBe('fix the mapping');
+    await operator.patch(`/plans/${plan.id}`, { destination_provider_id: plan.destination_provider_id });
+    failed.phase = 'rolled_back';
+    expect((await operator.patch<Plan>(`/plans/${plan.id}`, { destination_provider_id: 'dst-other' })).destination_provider_id).toBe('dst-other');
+  });
+
+  it('skips a VM whose finalize fails and finalizes the others, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    const other = server.migrations.find((m) => m.plan_id === plan.id && m.id !== web01.id && m.phase === 'syncing')!;
+    other.phase = 'completed';
+    const internals = server as unknown as { migrationAction: (...args: unknown[]) => unknown };
+    const real = internals.migrationAction.bind(server);
+    internals.migrationAction = (me, m, action, input) => {
+      if (action === 'finalize' && (m as Migration).id === web01.id) throw new Error('source cleanup failed: HTTP 409');
+      return real(me, m, action, input);
+    };
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: null, confirm: plan.name });
+    const reason = 'finalize failed: source cleanup failed: HTTP 409';
+    expect(out).toEqual({ finalized: [other.id], skipped: [{ migration_id: web01.id, reason }] });
+    expect([web01.phase, other.phase]).toEqual(['completed', 'finalized']);
+    const batch = server.events.filter((e) => e.kind === 'plan.finalized').at(-1)!;
+    expect(batch.message).toBe(`${plan.name}: 1 finalized by sari, 1 skipped`);
+    expect(batch.data).toEqual({ wave_id: null, finalized: [other.vm.name], skipped: [{ vm: 'web-01', migration_id: web01.id, reason }] });
+  });
+
+  it('declares the item key jev_classify sends, never the VM\'s id, like the API (SDD §14.2, §13.4)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const res = server.handle('GET', '/advisor/data-sent', new URLSearchParams(), undefined, 'viewer');
+    const items = (res.body as { items: Array<{ decision_type: string; fields: Array<{ key: string; label: string }> }> }).items;
+    const classify = items.find((i) => i.decision_type === 'workload_tier')!;
+    expect(classify.fields.map((f) => f.key)).toEqual(['id', 'name', 'os', 'tags', 'disks', 'flavor']);
+    expect(classify.fields[0]!.label).toContain("not the VM's id");
+  });
+
+  it('reports an advisor status the API can produce: an available service carries no last error (SDD §14.3)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const status = server.handle('GET', '/advisor/status', new URLSearchParams(), undefined, 'viewer').body as AdvisorStatus;
+    // the API clears last_error with each answered call: an error sits only beside "unavailable"
+    for (const service of [status.jev, status.memory]) expect([service.available, service.last_error]).toEqual([true, null]);
+  });
+
+  it('clears the source-running flag and the demo power at a rollback, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    await as(server, 'operator').post(`/demo/vms/${cache.vm.source_id}/power`, { state: 'on' });
+    server.tick();
+    expect(cache.source_running_at).not.toBeNull();
+    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    expect(cache.source_running_at).toBeNull();
+    // the power the demo set goes with it: completed again (a retry cut it over), the source the cutover
+    // stopped is not flagged by the old setting
+    cache.phase = 'completed';
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+  });
+
+  it('leaves the closed downtime clock of a completed migration it rolls back alone, like the API (SDD §5.2)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    // completed: verification closed its clock
+    const { actual_downtime_s: actual, downtime_ended_at: endedAt } = cache;
+    expect([cache.phase, endedAt !== null]).toEqual(['completed', true]);
+    const ended = () => server.events.filter((e) => e.migration_id === cache.id && e.kind === 'migration.downtime_ended').length;
+    const before = ended();
+    await as(server, 'operator').post(`/migrations/${cache.id}/rollback`, { reason: 'the application misbehaves on RHOSO' });
+    for (let i = 0; i < 40 && cache.phase !== 'rolled_back'; i++) server.tick();
+    expect(cache.phase).toBe('rolled_back');
+    expect([cache.actual_downtime_s, cache.downtime_ended_at, ended()]).toEqual([actual, endedAt, before]);
+  });
+
+  it('powers a fake source VM on and off, and the next watch flags its completed migration', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const cache = byName(server, 'web-cache-01');
+    const url = `/demo/vms/${cache.vm.source_id}/power`;
+    await expect(as(server, 'viewer').post(url, { state: 'on' })).rejects.toMatchObject({ status: 403 });
+    await expect(as(server, 'operator').post(url, { state: 'sideways' })).rejects.toMatchObject({ status: 422 });
+    await expect(as(server, 'operator').post('/demo/vms/os-nope/power', { state: 'on' })).rejects.toMatchObject({ status: 404 });
+    // a finished migration's source is stopped
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+    const on = await as(server, 'operator').post<VMRef>(url, { state: 'on' });
+    expect(on.power_state).toBe('running');
+    server.tick();
+    expect(cache.source_running_at).not.toBeNull();
+    expect(server.events.filter((e) => e.kind === 'migration.source_running').map((e) => e.migration_id)).toEqual([cache.id]);
+    await as(server, 'operator').post(url, { state: 'off' });
+    server.tick();
+    expect(cache.source_running_at).toBeNull();
+    // stopped again: recorded once, so every view drops the alert (SDD §8.1)
+    server.tick();
+    const stopped = server.events.filter((e) => e.kind === 'migration.source_stopped');
+    expect(stopped.map((e) => [e.migration_id, e.data])).toEqual([[cache.id, { power_state: 'stopped' }]]);
+  });
+
+  it('refuses the demo power route outside demo mode, like the API', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    server.health = { ...server.health, demo: false, demo_speed: null };
+    await expect(as(server, 'operator').post(`/demo/vms/${byName(server, 'web-cache-01').vm.source_id}/power`, { state: 'on' })).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('mock evidence, like the API (SDD §14.4, ADV-02)', () => {
+  function validating(advice: { option: string | null; confidence: number | null }, minimum: number | null = null) {
+    const server = new MockServer({ now: () => NOW, seed: 1, advise: () => advice });
+    server.policies.length = 0;
+    if (minimum !== null) server.policies.push(strict(minimum));
+    const client = new ApiClient({ getToken: () => 'operator', fetchImpl: createMockFetch(server) });
+    // the analytics plan: analytics-db ties cold and warm (nothing meets the SLO)
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
+    return { server, client, plan, db, before: server.recommendations.length };
+  }
+  function strict(minimum: number): AdvisorPolicy {
+    const at = '2026-10-08T00:00:00Z';
+    return {
+      id: 'pol-strict',
+      name: 'Strict',
+      scope: { provider_ids: [], plan_ids: [] },
+      decision_types: [],
+      mode: 'auto_apply_above_threshold',
+      threshold: 0.6,
+      min_evidence_for_auto_apply: minimum,
+      require_override_reason: false,
+      require_distinct_approver: true,
+      created_at: at,
+      updated_at: at,
+      updated_by: 'rina',
+    };
+  }
+
+  it('records the evidence validation held, measured against the recommended option, with what memory knew', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'warm', confidence: 0.8 });
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    expect(rec!.evidence_option).toBe('warm');
+    expect(rec!.evidence.map((i) => [i.key, i.effect])).toEqual([
+      ['downtime_estimate', 'opposes'], // nothing meets the plan's SLO
+      ['mappings', 'supports'],
+      ['findings', 'opposes'], // NET_MTU_SHRINK and APP_PROBE_MISSING apply to warm
+      ['guest_os', 'context'],
+      ['disk_total', 'context'],
+      ['disk_count', 'context'],
+      ['write_rate', 'context'],
+      ['cutover_window', 'context'],
+      ['source_kind', 'context'],
+    ]);
+    expect(rec!.evidence.find((i) => i.key === 'disk_total')!.value).toBe(db.vm.disk_bytes);
+    const refs = new Set([db.vm.source_id, db.id, plan.id, plan.source_provider_id]);
+    expect(rec!.evidence.every((i) => refs.has(i.source.ref_id))).toBe(true);
+    // the query "warm rhel9 200-500G" finds the mock memory's two incidents that say "warm"; at most 3
+    expect(rec!.similar_incidents.map((i) => i.title)).toEqual(['Warm pass never converged on a busy PostgreSQL VM', 'VMware CBT reset after snapshot consolidation']);
+    expect(rec!.reasons).toEqual([]);
+  });
+
+  it('never applies on its own a decision below the policy minimum', async () => {
+    const { server, client, plan, before } = validating({ option: 'cold', confidence: 0.99 }, 99);
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    // measured against the advisor's option, not the deterministic warm
+    expect(rec!.evidence_option).toBe('cold');
+    expect([rec!.decision.status, rec!.decision.reason_code, rec!.decision.final_option]).toEqual(['pending_approval', 'INSUFFICIENT_EVIDENCE', null]);
+    const bearing = rec!.evidence.filter((i) => i.effect !== 'context').length;
+    server.policies[0] = strict(bearing);
+    await client.post(`/plans/${plan.id}/validate`);
+    const newest = server.recommendations.at(-1)!;
+    expect([newest.decision.status, newest.decision.final_option]).toEqual(['auto_applied', 'cold']);
+  });
+
+  it('counts the attempts a VM made before, with the strategy they ran', async () => {
+    const { server, client, plan, db, before } = validating({ option: 'warm', confidence: 0.8 });
+    // SDD §14.4: the attempts' own strategies, not the migration's now - a validation set it to cold after two warm attempts
+    db.attempts = 2;
+    db.attempt_strategies = ['warm', 'warm'];
+    db.strategy = 'cold';
+    await client.post(`/plans/${plan.id}/validate`);
+    const [rec] = server.recommendations.slice(before);
+    const earlier = rec!.evidence.find((i) => i.key === 'earlier_runs')!;
+    expect([earlier.value, earlier.effect, earlier.display, earlier.source]).toEqual([2, 'opposes', '2 earlier attempts with Warm migration', { kind: 'run', ref_id: db.id }]);
+  });
+
+  it('asks a new policy for three evidence items unless told otherwise, like the API', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const admin = new ApiClient({ getToken: () => 'admin', fetchImpl: createMockFetch(server) });
+    const created = await admin.post<AdvisorPolicy>('/advisor/policies', { name: 'Default minimum', mode: 'auto_apply_above_threshold', threshold: 0.7 });
+    expect(created.min_evidence_for_auto_apply).toBe(3);
+  });
+
+  it('gives every stored fixture recommendation its evidence', () => {
+    const server = new MockServer({ now: () => NOW });
+    const stored = server.recommendations.filter((r) => !r.legacy);
+    expect(stored.length).toBeGreaterThan(0);
+    for (const rec of stored) {
+      expect(rec.evidence_option, rec.id).not.toBeNull();
+      expect(rec.evidence.some((i) => i.key === 'disk_total'), rec.id).toBe(true);
+    }
+  });
+});
+
+describe('mock plans: port_creation_mode (SDD §4.2, §12)', () => {
+  it('is nova unless chosen, and refuses any other mode with the API 422', async () => {
+    const { client } = setup('operator');
+    const body = { name: 'ports', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    await expect(client.post('/plans', body)).resolves.toMatchObject({ port_creation_mode: 'nova' });
+    await expect(client.post('/plans', { ...body, port_creation_mode: 'neutron' })).resolves.toMatchObject({ port_creation_mode: 'neutron' });
+    await expect(client.post('/plans', { ...body, port_creation_mode: 'ovs' })).rejects.toMatchObject({
+      status: 422,
+      message: "port_creation_mode: Input should be 'nova' or 'neutron'",
+    });
+  });
+});
+
+describe('mock plans: nic_overrides (SDD §4.2, §12)', () => {
+  it('stores lower-case MACs with both fields, and refuses what the API refuses with its messages', async () => {
+    const { client } = setup('operator');
+    const body = { name: 'nics', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', { ...body, nic_overrides: { 'vm-1': { 'FA:16:3E:00:00:01': { network: 'tenant-web' } } } });
+    expect(created.nic_overrides).toEqual({ 'vm-1': { 'fa:16:3e:00:00:01': { network: 'tenant-web', fixed_ips: null } } });
+    await expect(client.post('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: [] }, 'not-a-mac': { network: 'x' } } } })).rejects.toMatchObject({
+      status: 422,
+      message:
+        "nic_overrides[vm-1][fa:16:3e:00:00:01]: fixed_ips must list at least one address (leave it out to keep the NIC's own); nic_overrides[vm-1][not-a-mac]: not a MAC address",
+    });
+  });
+
+  it("stores addresses in the API's canonical form and finds a repeat however it is written", async () => {
+    const { client } = setup('operator');
+    const body = { name: 'nics', source_provider_id: 'rhosp17-dc1', destination_provider_id: 'rhoso-prod', vm_ids: [] };
+    const created = await client.post<Plan>('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: ['FD00:0::0009', '10.20.1.9'] } } } });
+    expect(created.nic_overrides['vm-1']?.['fa:16:3e:00:00:01']?.fixed_ips).toEqual(['fd00::9', '10.20.1.9']);
+    await expect(client.post('/plans', { ...body, nic_overrides: { 'vm-1': { 'fa:16:3e:00:00:01': { fixed_ips: ['fd00::5', 'FD00:0::0005', '10.20.1.300'] } } } })).rejects.toMatchObject({
+      status: 422,
+      message: 'nic_overrides[vm-1][fa:16:3e:00:00:01]: not an IP address: 10.20.1.300; nic_overrides[vm-1][fa:16:3e:00:00:01]: fd00::5 given twice',
+    });
   });
 });

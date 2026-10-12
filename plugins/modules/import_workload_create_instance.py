@@ -272,6 +272,9 @@ def run_module():
                 state.destination_server_id, ignore_missing=True
             )
             if existing is not None:
+                # created by an earlier run that may have failed while the server
+                # booted or got its floating IPs: finish it, never create another
+                ser_server.finish(conn, existing)
                 module.exit_json(
                     changed=False,
                     server_id=existing.id,

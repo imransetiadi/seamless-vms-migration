@@ -1,5 +1,12 @@
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Severity, Strategy
-from seamless_migrate.domain.models import HandoverConfig, Mappings, Nic
+from seamless_migrate.domain.models import (
+    DEFAULT_PRESTAGE,
+    AppProbe,
+    HandoverConfig,
+    Mappings,
+    Nic,
+    VerificationConfig,
+)
 from seamless_migrate.planning.preflight import (
     CATALOG,
     DestinationInventory,
@@ -44,7 +51,9 @@ def dst_inv(**kw) -> DestinationInventory:
     return DestinationInventory(**data)
 
 
-def check(vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, destination=DST):
+def check(
+    vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, destination=DST, dst_caps=None
+):
     vm = vm or make_vm()
     return run_preflight(
         vm,
@@ -54,6 +63,7 @@ def check(vm=None, plan=None, src=None, dst=None, all_vms=None, source=SRC, dest
         all_vms if all_vms is not None else [vm],
         source=source,
         destination=destination,
+        dst_caps=dst_caps,
     )
 
 
@@ -75,11 +85,20 @@ def test_catalog_is_complete():
         "MAP_NETWORK_PRESTAGED",
         "MAP_FLAVOR_MISSING",
         "MAP_FLAVOR_AUTO",
+        "MAP_FLAVOR_PRESTAGED",
+        "DST_KEYPAIR_MISSING",
+        "MAP_KEYPAIR_PRESTAGED",
         "MAP_VOLUME_TYPE_MISSING",
         "DST_QUOTA_INSUFFICIENT",
         "DST_PROJECT_MISSING",
         "NET_MTU_SHRINK",
         "NET_SRIOV_PORT",
+        "NET_PORT_IPS",
+        "MAP_NETWORK_AMBIGUOUS",
+        "NET_ADDRESS_REFUSED",
+        "NET_PORT_NOT_PERMITTED",
+        "MAP_NIC_OVERRIDE_INVALID",
+        "MAP_NIC_OVERRIDE",
         "VM_PCI_PASSTHROUGH",
         "VM_VGPU",
         "VOL_ENCRYPTED",
@@ -93,6 +112,7 @@ def test_catalog_is_complete():
         "GUEST_CONVERSION_UNSUPPORTED",
         "CONV_HOST_MISSING",
         "HANDOVER_BACKEND_UNMAPPED",
+        "APP_PROBE_MISSING",
     }
 
 
@@ -223,6 +243,58 @@ def test_finding_map_flavor_missing():
     assert all(x.code != "MAP_FLAVOR_MISSING" for x in check(vm, plan=mapped))
 
 
+def test_finding_map_flavor_prestaged():
+    """SDD §9.3: with "flavors" pre-staged a flavor RHOSO lacks is created with the same name
+    and specs: an info finding, no automatic match, no blocker."""
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "flavors"])
+    for vm in (
+        make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192),  # would be auto-matched
+        make_vm(flavor="m1.huge", vcpus=64, ram_mb=262144),  # nothing fits
+    ):
+        found = check(vm, plan=prestage)
+        f = only(found, "MAP_FLAVOR_PRESTAGED")
+        assert f.severity == Severity.info and repr(vm.flavor) in f.message
+        assert all(x.code not in ("MAP_FLAVOR_MISSING", "MAP_FLAVOR_AUTO") for x in found)
+        assert resolve_mappings(vm, prestage, dst_inv()) == Mappings()
+    # a same-named destination flavor is used as it is: never pre-staged over
+    same = make_vm(flavor="m1.large", vcpus=4, ram_mb=8192)
+    assert all(not x.code.startswith("MAP_FLAVOR") for x in check(same, plan=prestage))
+    # an explicit mapping wins
+    mapped = make_plan(
+        prestage_resources=[*DEFAULT_PRESTAGE, "flavors"],
+        mappings=Mappings(flavors={"custom.4x8": "m1.large"}),
+    )
+    vm = make_vm(flavor="custom.4x8", vcpus=4, ram_mb=8192)
+    assert all(not x.code.startswith("MAP_FLAVOR") for x in check(vm, plan=mapped))
+    # without "flavors" in the list the automatic match stays
+    assert only(check(vm), "MAP_FLAVOR_AUTO")
+
+
+def test_finding_dst_keypair_missing_and_prestaged():
+    """SDD §9.3: a key_name the destination credential does not own fails the cutover's
+    destination check, so it blocks - unless pre-staging imports it, which needs "keypairs" in
+    the list and the source credential to own it (os-migrate exports only its own)."""
+    vm = make_vm(key_name="ops-key")
+    src = src_inv(keypairs=["ops-key"])
+    f = only(check(vm, src=src), "DST_KEYPAIR_MISSING")
+    assert f.severity == Severity.blocker and "'ops-key'" in f.message
+    prestage = make_plan(prestage_resources=[*DEFAULT_PRESTAGE, "keypairs"])
+    found = check(vm, plan=prestage, src=src)
+    assert only(found, "MAP_KEYPAIR_PRESTAGED").severity == Severity.info
+    assert all(x.code != "DST_KEYPAIR_MISSING" for x in found)
+    # owned by another user: pre-staging cannot export it
+    other = check(vm, plan=prestage, src=src_inv(keypairs=[]))
+    f = only(other, "DST_KEYPAIR_MISSING")
+    assert "another user" in f.message.lower()
+    assert all(x.code != "MAP_KEYPAIR_PRESTAGED" for x in other)
+    # the destination credential owns it, or the VM has no keypair: nothing to say
+    for quiet in (
+        check(vm, src=src, dst=dst_inv(keypairs=["ops-key"])),
+        check(make_vm(key_name=None), plan=prestage, src=src),
+    ):
+        assert all("KEYPAIR" not in x.code for x in quiet)
+
+
 def test_finding_map_flavor_auto_records_resolved_mapping():
     dst = dst_inv(
         flavors=[
@@ -288,6 +360,206 @@ def test_mapping_targets_must_exist_in_the_destination():
         )
     )
     assert all(not x.code.startswith("MAP_") for x in check(vm, plan=good))
+
+
+def test_finding_net_port_ips_names_each_nic_with_its_addresses():
+    """SDD §9.3: a NIC without exactly one fixed IP (dual-stack included) is named with its
+    addresses; VMware NICs go through the migration kit and are not checked."""
+    vm = make_vm(
+        nics=[
+            Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"], mtu=1500),
+            Nic(network="db-net", fixed_ips=[], mtu=9000),
+            Nic(network="app-net", fixed_ips=["10.0.0.6"], mtu=1500),
+        ]
+    )
+    f = only(check(vm), "NET_PORT_IPS")
+    assert f.severity == Severity.warning
+    assert "app-net (10.0.0.5, fd00::5)" in f.message and "db-net (no fixed IP)" in f.message
+    assert "10.0.0.6" not in f.message
+    assert all(x.code != "NET_PORT_IPS" for x in check(make_vm()))
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    assert all(x.code != "NET_PORT_IPS" for x in check(vm, source=vmware))
+
+
+def test_finding_net_port_ips_only_in_nova_port_mode():
+    """SDD §9.3: in "neutron" mode cold and warm keep every address, so nothing is said; the
+    handover's eligibility reason remains. In "nova" mode the remediation offers "neutron"."""
+    vm = make_vm(nics=[Nic(network="app-net", fixed_ips=["10.0.0.5", "fd00::5"], mtu=1500)])
+    nova = only(check(vm), "NET_PORT_IPS")
+    assert "neutron" in (nova.remediation or "").lower()
+    neutron = make_plan(port_creation_mode="neutron")
+    assert all(x.code != "NET_PORT_IPS" for x in check(vm, plan=neutron))
+
+
+def override_dst(**kw):
+    """A destination with a DMZ network beside app-net, and their subnets (SDD §11)."""
+    return dst_inv(
+        networks={"app-net": 1500, "rhoso-dmz": 1442},
+        subnets=[
+            {"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"},
+            {"name": "dmz-v4", "network": "rhoso-dmz", "cidr": "192.168.10.0/24"},
+            {"name": "dmz-v6", "network": "rhoso-dmz", "cidr": "fd00:10::/64"},
+        ],
+        **kw,
+    )
+
+
+def test_finding_map_nic_override_names_where_each_nic_goes():
+    """SDD §9.3: an applicable entry is info naming the NIC, its RHOSO network and addresses; the
+    MTU check and the port rule look at where the NIC goes."""
+    vm = make_vm(source_id="vm-1")
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+        }
+    )
+    found = check(vm, plan=plan, dst=override_dst())
+    info = only(found, "MAP_NIC_OVERRIDE")
+    assert info.severity == Severity.info
+    assert "fa:16:3e:00:00:01 (app-net) -> rhoso-dmz: 192.168.10.5" in info.message
+    assert all(f.code != "MAP_NIC_OVERRIDE_INVALID" for f in found)
+    # rhoso-dmz has MTU 1442: smaller than the NIC's 1500
+    assert "rhoso-dmz" in only(found, "NET_MTU_SHRINK").message
+
+
+def test_a_nic_override_settles_the_network_and_address_count():
+    """A NIC sent elsewhere is not a MAP_NETWORK_MISSING; a dual-stack NIC given one address is no
+    NET_PORT_IPS in nova mode; a network-only entry keeps the NIC's own addresses."""
+    from seamless_migrate.domain.models import Nic
+
+    nic = Nic(network="lost-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5", "fd00::5"])
+    vm = make_vm(source_id="vm-1", nics=[nic])
+    plan = make_plan(
+        nic_overrides={
+            "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}}
+        }
+    )
+    codes = [f.code for f in check(vm, plan=plan, dst=override_dst())]
+    assert "MAP_NETWORK_MISSING" not in codes and "MAP_NETWORK_PRESTAGED" not in codes
+    assert "NET_PORT_IPS" not in codes
+    kept = make_plan(
+        nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz"}}},
+        port_creation_mode="neutron",
+    )
+    found = check(vm, plan=kept, dst=override_dst())
+    # its own 10.0.0.5 lies in no subnet of rhoso-dmz
+    invalid = only(found, "MAP_NIC_OVERRIDE_INVALID")
+    assert "10.0.0.5" in invalid.message and "rhoso-dmz" in invalid.message
+
+
+def test_finding_map_nic_override_invalid_names_each_problem():
+    """SDD §9.3: an unknown MAC, a network RHOSO lacks, an address in no subnet of the target
+    network and an address another NIC of the plan gets block the VM; on a VMware source any entry
+    does - the migration kit keeps the guest's network settings."""
+    from seamless_migrate.domain.models import Nic
+
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"]),
+            Nic(network="app-net", mac="fa:16:3e:00:00:02", fixed_ips=["10.0.0.6"]),
+            Nic(network="app-net", mac="fa:16:3e:00:00:03", fixed_ips=["10.0.0.7"]),
+        ],
+    )
+    other = make_vm(source_id="vm-2", name="db-01")  # keeps 10.0.0.5 on app-net
+    plan = make_plan(
+        vm_ids=["vm-1", "vm-2"],
+        nic_overrides={
+            "vm-1": {
+                "fa:16:3e:00:00:99": {"network": "rhoso-dmz"},
+                "fa:16:3e:00:00:01": {"network": "rhoso-missing"},
+                "fa:16:3e:00:00:02": {"fixed_ips": ["172.16.0.9"]},
+                "fa:16:3e:00:00:03": {"fixed_ips": ["10.0.0.5"]},
+            }
+        },
+    )
+    f = only(
+        check(vm, plan=plan, dst=override_dst(), all_vms=[vm, other]), "MAP_NIC_OVERRIDE_INVALID"
+    )
+    assert f.severity == Severity.blocker
+    assert "fa:16:3e:00:00:99: the VM has no NIC with this MAC" in f.message
+    assert "fa:16:3e:00:00:01: RHOSO has no network 'rhoso-missing'" in f.message
+    assert "fa:16:3e:00:00:02: 172.16.0.9 lies in no subnet of 'app-net'" in f.message
+    assert "fa:16:3e:00:00:03: 10.0.0.5 also goes to db-01" in f.message
+    # addresses only, on a network pre-staging would create: its subnets cannot be checked yet
+    lost = make_vm(
+        source_id="vm-3",
+        nics=[Nic(network="lost-net", mac="fa:16:3e:00:00:05", fixed_ips=["10.9.0.5"])],
+    )
+    later = make_plan(nic_overrides={"vm-3": {"fa:16:3e:00:00:05": {"fixed_ips": ["10.9.0.6"]}}})
+    f = only(check(lost, plan=later, dst=override_dst()), "MAP_NIC_OVERRIDE_INVALID")
+    assert "fa:16:3e:00:00:05: RHOSO has no network 'lost-net' yet" in f.message
+    assert "name an existing RHOSO network" in f.message
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    vmw = only(check(vm, plan=plan, dst=override_dst(), source=vmware), "MAP_NIC_OVERRIDE_INVALID")
+    assert "migration kit keeps the guest's network settings" in vmw.message
+
+
+def test_finding_map_nic_override_invalid_refuses_what_neutron_gives_no_vm():
+    """SDD §9.3, as Neutron's check_subnet_ip for a port created with no owner: an IPv4 subnet's
+    network address (at any prefix length) and its broadcast address below a /31 are no host
+    addresses - a typo like 192.168.10.0 would otherwise fail after the source stops - while an
+    IPv6 subnet's first address is taken (review NC-08)."""
+    from seamless_migrate.domain.models import Nic
+
+    dst = dst_inv(
+        networks={"app-net": 1500, "rhoso-dmz": 1500, "rhoso-p2p": 1500},
+        subnets=[
+            {"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"},
+            {"name": "dmz-v4", "network": "rhoso-dmz", "cidr": "192.168.10.0/24"},
+            {"name": "dmz-v6", "network": "rhoso-dmz", "cidr": "fd00:10::/64"},
+            {"name": "p2p-v4", "network": "rhoso-p2p", "cidr": "10.255.0.0/31"},
+            {"name": "wide-v6", "network": "rhoso-p2p", "cidr": "fd99::/16"},
+        ],
+    )
+    macs = [f"fa:16:3e:00:00:0{i}" for i in range(1, 5)]
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac=m, fixed_ips=[f"10.0.0.{i + 5}"]) for i, m in enumerate(macs)
+        ],
+    )
+
+    def entries(*targets):
+        return {
+            "vm-1": {
+                m: {"network": n, "fixed_ips": a} for m, (n, a) in zip(macs, targets, strict=True)
+            }
+        }
+
+    reserved = make_plan(
+        nic_overrides=entries(
+            ("rhoso-dmz", ["192.168.10.0"]),
+            ("rhoso-dmz", ["192.168.10.255", "fd00:10::"]),
+            ("rhoso-dmz", ["192.168.10.7", "fd00:10::7"]),
+            ("rhoso-p2p", ["10.255.0.0"]),
+        )
+    )
+    f = only(check(vm, plan=reserved, dst=dst), "MAP_NIC_OVERRIDE_INVALID")
+    assert (
+        "fa:16:3e:00:00:01: 192.168.10.0 is the network address of 192.168.10.0/24, "
+        "not a host address" in f.message
+    )
+    assert "fa:16:3e:00:00:02: 192.168.10.255 is the broadcast address of 192.168.10.0/24" in (
+        f.message
+    )
+    assert "fd00:10::" not in f.message
+    assert "fa:16:3e:00:00:04: 10.255.0.0 is the network address of 10.255.0.0/31" in f.message
+    # one problem per address; the NIC with host addresses has none
+    assert f.message.count("not a host address") == 3
+    assert "fa:16:3e:00:00:03" not in f.message and "in no subnet" not in f.message
+    # host addresses: a /31 and an IPv6 subnet have no broadcast address
+    hosts = make_plan(
+        nic_overrides=entries(
+            ("rhoso-dmz", ["192.168.10.1"]),
+            ("rhoso-dmz", ["192.168.10.254"]),
+            ("rhoso-dmz", ["fd00:10::1", "fd00:10::ffff:ffff:ffff:ffff"]),
+            ("rhoso-p2p", ["10.255.0.1", "fd99:ffff:ffff:ffff:ffff:ffff:ffff:ffff"]),
+        )
+    )
+    found = check(vm, plan=hosts, dst=dst)
+    assert all(x.code != "MAP_NIC_OVERRIDE_INVALID" for x in found), found
+    assert only(found, "MAP_NIC_OVERRIDE").severity == Severity.info
 
 
 def test_vmware_sources_are_never_prestaged():
@@ -572,6 +844,34 @@ def test_finding_handover_backend_unmapped():
     assert check(plan=ok) == []
 
 
+def test_finding_app_probe_missing_for_a_database_vm_without_an_application_probe():
+    """SDD §9.3, ADV-18: a database VM verified only by its boot is flagged at validation."""
+    db = make_vm(source_id="vm-db", name="ledger-db-01", tags={"role": "postgresql"})
+    f = only(check(vm=db), "APP_PROBE_MISSING")
+    assert f.severity == Severity.warning and f.strategies == []
+    assert f.message == (
+        "ledger-db-01 is a database VM without an application probe: verification would check only "
+        "that it booted. Suggested: TCP 5432."
+    )
+    probe = AppProbe(kind="tcp", port=5432)
+
+    def flagged(plan):
+        return "APP_PROBE_MISSING" in [x.code for x in check(vm=db, plan=plan)]
+
+    # a probe for every VM, or one for this VM, clears it; an empty override does not
+    assert not flagged(make_plan(verification=VerificationConfig(app_probes=[probe])))
+    assert not flagged(make_plan(probe_overrides={"vm-db": [probe]}))
+    assert flagged(
+        make_plan(
+            verification=VerificationConfig(app_probes=[probe]), probe_overrides={"vm-db": []}
+        )
+    )
+    # a database that names no engine gets no suggestion; a web VM is never flagged
+    plain = only(check(vm=make_vm(name="dc2-db-01")), "APP_PROBE_MISSING")
+    assert plain.message.endswith("verification would check only that it booted.")
+    assert "APP_PROBE_MISSING" not in [x.code for x in check()]
+
+
 def test_catalog_matches_sdd_9_3():
     """Every finding code of SDD §9.3 is in the catalog and vice versa, with the severity the
     table states for its row (rows only; info variants named inside a row are checked by code)."""
@@ -587,3 +887,318 @@ def test_catalog_matches_sdd_9_3():
         r"^\| `([A-Z0-9_]+)` \| (blocker|warning|info)", section, re.M
     ):
         assert CATALOG[code].severity == severity, code
+
+
+def net(network_id, name, own=True, mtu=1500, project_id=None, shared=None, external=False):
+    """A DestinationInventory.network_details entry (SDD §10); another project's is shared
+    unless said otherwise."""
+    return {
+        "id": network_id,
+        "name": name,
+        "mtu": mtu,
+        "project_id": project_id or ("finance-id" if own else f"{network_id}-owner"),
+        "own": own,
+        "shared": (not own) if shared is None else shared,
+        "external": external,
+    }
+
+
+def subnet_of(network_id, name, cidr, mode=None):
+    return {
+        "name": f"{network_id}-{cidr}",
+        "network": name,
+        "network_id": network_id,
+        "cidr": cidr,
+        "ipv6_address_mode": mode,
+        "ipv6_ra_mode": mode,
+    }
+
+
+def resolved_dst(details, subnets=(), **kw):
+    names = {}
+    for d in details:
+        names[d["name"]] = d["mtu"]
+    return dst_inv(networks=names, network_details=list(details), subnets=list(subnets), **kw)
+
+
+def test_finding_map_network_ambiguous_resolves_a_name_as_the_cutover_does():
+    """SDD §9.3, §7.3 step 0: the credential's own network of the name, else the only one it
+    sees; several of its project, or several elsewhere and none of its project, block."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-app"}))
+    two_own = check(vm, plan=plan, dst=resolved_dst([net("a", "rhoso-app"), net("b", "rhoso-app")]))
+    f = only(two_own, "MAP_NETWORK_AMBIGUOUS")
+    assert f.severity == Severity.blocker
+    assert "fa:16:3e:00:00:01 (app-net)" in f.message
+    assert "2 networks of the credential's project are named 'rhoso-app'" in f.message
+    elsewhere = resolved_dst([net("a", "rhoso-app", own=False), net("b", "rhoso-app", own=False)])
+    f = only(check(vm, plan=plan, dst=elsewhere), "MAP_NETWORK_AMBIGUOUS")
+    assert "2 networks of other projects are named 'rhoso-app' (a-owner, b-owner)" in f.message
+    # the credential's own among others, or another project's shared one alone: resolved
+    for details in (
+        [net("x", "rhoso-app", own=False), net("a", "rhoso-app")],
+        [net("x", "rhoso-app", own=False)],
+    ):
+        codes = [x.code for x in check(vm, plan=plan, dst=resolved_dst(details))]
+        assert "MAP_NETWORK_AMBIGUOUS" not in codes and "MAP_NETWORK_MISSING" not in codes
+    # a VMware NIC too: Seamless resolves its port group's network for the migration kit (§7.2)
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    codes = [x.code for x in check(vm, plan=plan, dst=elsewhere, source=vmware)]
+    assert "MAP_NETWORK_AMBIGUOUS" in codes
+    # an override to such a name: the ambiguity alone, no empty MAP_NIC_OVERRIDE
+    moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-app"}}})
+    codes = [x.code for x in check(vm, plan=moved, dst=elsewhere)]
+    assert "MAP_NETWORK_AMBIGUOUS" in codes
+    assert "MAP_NIC_OVERRIDE" not in codes and "MAP_NIC_OVERRIDE_INVALID" not in codes
+
+
+def test_finding_net_address_refused_checks_a_nics_own_addresses_on_its_network():
+    """SDD §9.3, §6.6: a NIC without an override keeps addresses Neutron must take on its resolved
+    network - Nova keeps the first only; on a SLAAC subnet the kept MAC's EUI-64 address through
+    Neutron, none through Nova."""
+    nic = Nic(
+        network="app-net",
+        mac="fa:16:3e:00:00:01",
+        fixed_ips=["10.0.0.5", "fd00:20::f816:3eff:fe00:1"],
+    )
+    vm = make_vm(source_id="vm-1", nics=[nic])
+    details = [net("app", "app-net")]
+    v4 = subnet_of("app", "app-net", "10.0.0.0/24")
+    slaac = subnet_of("app", "app-net", "fd00:20::/64", "slaac")
+    nova, neutron = make_plan(), make_plan(port_creation_mode="neutron")
+    # Nova keeps 10.0.0.5 only, which its subnet holds
+    assert "NET_ADDRESS_REFUSED" not in [
+        x.code for x in check(vm, plan=nova, dst=resolved_dst(details, [v4]))
+    ]
+    f = only(
+        check(
+            vm, plan=nova, dst=resolved_dst(details, [subnet_of("app", "app-net", "10.9.0.0/24")])
+        ),
+        "NET_ADDRESS_REFUSED",
+    )
+    assert f.severity == Severity.blocker
+    assert "fa:16:3e:00:00:01 on 'app-net': 10.0.0.5 is no host address of any subnet" in f.message
+    # through Neutron every address, the SLAAC one as the kept MAC derives it
+    assert "NET_ADDRESS_REFUSED" not in [
+        x.code for x in check(vm, plan=neutron, dst=resolved_dst(details, [v4, slaac]))
+    ]
+    other = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5", "fd00:20::5"])
+        ],
+    )
+    f = only(
+        check(other, plan=neutron, dst=resolved_dst(details, [v4, slaac])), "NET_ADDRESS_REFUSED"
+    )
+    assert "fd00:20::5 is not fd00:20::f816:3eff:fe00:1" in f.message
+    # through Nova a SLAAC address alone: Neutron takes none (a new MAC)
+    v6 = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["fd00:20::f816:3eff:fe00:1"])
+        ],
+    )
+    f = only(check(v6, plan=nova, dst=resolved_dst(details, [v4, slaac])), "NET_ADDRESS_REFUSED")
+    assert "SLAAC or DHCPv6-stateless" in f.message
+    # not checked: a NIC with an override (MAP_NIC_OVERRIDE_*), a network pre-staging creates, an
+    # inventory without subnets, a VMware VM
+    entry = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "app-net"}}})
+    gone = resolved_dst(details, [subnet_of("app", "app-net", "10.9.0.0/24")])
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, plan=entry, dst=gone)]
+    later = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="new-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    codes = [x.code for x in check(later, dst=gone)]
+    assert "MAP_NETWORK_PRESTAGED" in codes and "NET_ADDRESS_REFUSED" not in codes
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in check(vm, dst=resolved_dst(details))]
+    # a VMware NIC's IPv4 address is checked by the migration kit's rule (its own test)
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    assert "NET_ADDRESS_REFUSED" in [x.code for x in check(vm, dst=gone, source=vmware)]
+
+
+def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
+    """SDD §9.3, §6.6: another project's network takes a NIC only when it is shared with the
+    credential's project or external, and from a token with the admin or advsvc role - Neutron's
+    policy lets only those, or the network's project, choose the address or MAC the cutover asks
+    for after the source stops. Without reported roles only the first half is judged."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="FA:16:3E:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-net"}))
+    member = {"admin": False, "roles": ["member", "reader"]}
+
+    def found(network, caps, plan=plan, **kw):
+        dst = resolved_dst([network], [subnet_of(network["id"], "rhoso-net", "10.0.0.0/24")])
+        return check(vm, plan=plan, dst=dst, dst_caps=caps, **kw)
+
+    shared = net("p", "rhoso-net", own=False, project_id="project-admin")
+    external = net(
+        "e", "rhoso-net", own=False, project_id="project-admin", shared=False, external=True
+    )
+    private = net("b", "rhoso-net", own=False, project_id="project-b", shared=False)
+    f = only(found(shared, member), "NET_PORT_NOT_PERMITTED")
+    assert f.severity == Severity.blocker and f.remediation
+    assert f.message == (
+        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+        "'rhoso-net' (project project-admin): Neutron lets only the admin or advsvc role, or that "
+        "project, choose a port's address or MAC there, and the credential's token has neither."
+    )
+    assert only(found(external, member), "NET_PORT_NOT_PERMITTED").message == f.message
+    # with the admin or advsvc role a shared network takes it, an unshared external one only from
+    # the admin role: Nova attaches it for no other (review RT-03)
+    for roles in (["admin", "member", "reader"], ["advsvc"]):
+        assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, {"roles": roles})]
+    assert "NET_PORT_NOT_PERMITTED" not in [
+        x.code for x in found(external, {"roles": ["admin", "member", "reader"]})
+    ]
+    assert "Nova lets only the admin role attach such a network" in (
+        only(found(external, {"roles": ["advsvc"]}), "NET_PORT_NOT_PERMITTED").message
+    )
+    # another project's private network never does: the admin sees it, the VM must not land there
+    for caps in (member, {"admin": True, "roles": ["admin"]}, None, {}):
+        f = only(found(private, caps), "NET_PORT_NOT_PERMITTED")
+        assert f.message == (
+            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+            "'rhoso-net' (project project-b): it is neither shared with the credential's project "
+            "nor external."
+        )
+    # no reported roles (a destination checked by another implementation): that half is not judged
+    for caps in (None, {"admin": True}):
+        assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, caps)]
+    # the credential's own network, whatever the roles - unless it is external and not shared
+    own = net("o", "rhoso-net")
+    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own, member)]
+    own_external = net("x", "rhoso-net", project_id="project-me", shared=False, external=True)
+    assert only(found(own_external, member), "NET_PORT_NOT_PERMITTED").message == (
+        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+        "'rhoso-net' (project project-me): it is external and not shared, and Nova lets only the "
+        "admin role attach such a network to a server; the credential's token lacks it."
+    )
+    assert "NET_PORT_NOT_PERMITTED" not in [
+        x.code for x in found(own_external, {"roles": ["admin"]})
+    ]
+    own_shared_external = {**own_external, "shared": True}
+    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own_shared_external, member)]
+    # a NIC override's network is judged the same way
+    moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-net"}}})
+    assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, plan=moved)]
+    # a VMware NIC too: the migration kit creates every port with the NIC's MAC (§7.2)
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, source=vmware)]
+
+
+def test_finding_net_address_refused_checks_a_vmware_nic_by_the_migration_kits_rule():
+    """SDD §9.3, §7.2: the kit sends a VMware NIC's IPv4 guest addresses only, all with one subnet
+    of its network: each must be a host address there, and one subnet must hold them all."""
+    vmware = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    details = [net("prod", "dc2-prod")]
+    first = subnet_of("prod", "dc2-prod", "10.2.0.0/24")
+    second = subnet_of("prod", "dc2-prod", "10.2.1.0/24")
+    plan = make_plan(mappings=Mappings(networks={"DC2-Prod": "dc2-prod"}))
+
+    def found(*addresses, subnets=(first, second)):
+        vm = make_vm(
+            source_id="vm-1",
+            nics=[Nic(network="DC2-Prod", mac="00:50:56:AA:BB:CC", fixed_ips=list(addresses))],
+        )
+        return check(vm, plan=plan, dst=resolved_dst(details, subnets), source=vmware)
+
+    # one subnet holds them; an IPv6 address the kit never sends is not judged
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("10.2.1.5", "10.2.1.6", "fd00::5")]
+    f = only(found("10.2.0.5", "10.2.1.5"), "NET_ADDRESS_REFUSED")
+    assert f.message == (
+        "Neutron would refuse these addresses on their RHOSO network: 00:50:56:aa:bb:cc on "
+        "'dc2-prod': 10.2.0.5, 10.2.1.5 lie in different subnets of the port's network: the "
+        "migration kit gives a NIC's IPv4 addresses one subnet."
+    )
+    f = only(found("10.2.0.255"), "NET_ADDRESS_REFUSED")
+    assert (
+        "00:50:56:aa:bb:cc on 'dc2-prod': 10.2.0.255 is no host address of any subnet" in f.message
+    )
+    # no IPv4 address at all: nothing to refuse
+    assert "NET_ADDRESS_REFUSED" not in [x.code for x in found("fe80::1")]
+    # the kit keeps the guest's network settings: a NIC override (itself refused) never moves
+    # a VMware NIC, which is judged on the network its port group maps to (§7.2)
+    elsewhere = make_plan(
+        mappings=Mappings(networks={"DC2-Prod": "dc2-prod"}),
+        nic_overrides={"vm-1": {"00:50:56:aa:bb:cc": {"network": "twice"}}},
+    )
+    twice = details + [net("t1", "twice"), net("t2", "twice")]
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="DC2-Prod", mac="00:50:56:AA:BB:CC", fixed_ips=["10.2.0.5"])],
+    )
+    codes = [
+        x.code
+        for x in check(vm, plan=elsewhere, dst=resolved_dst(twice, [first, second]), source=vmware)
+    ]
+    assert "MAP_NIC_OVERRIDE_INVALID" in codes and "MAP_NETWORK_AMBIGUOUS" not in codes
+
+
+def test_mtu_and_nic_override_subnets_follow_the_resolved_network():
+    """SDD §9.3: same-named networks of other projects lend neither their MTU nor their subnets
+    (review NIC-03: an address in another project's network of that name passed validation)."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[
+            Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["192.168.10.5"], mtu=1500)
+        ],
+    )
+    details = [
+        net("own-dmz", "rhoso-dmz", mtu=1500),
+        net("other-dmz", "rhoso-dmz", own=False, mtu=1400),
+    ]
+    subnets = [
+        subnet_of("own-dmz", "rhoso-dmz", "192.168.10.0/24"),
+        subnet_of("other-dmz", "rhoso-dmz", "10.2.0.0/24"),
+    ]
+    # the name->MTU view kept the other project's 1400
+    dst = dst_inv(networks={"rhoso-dmz": 1400}, network_details=details, subnets=subnets)
+    moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz"}}})
+    found = check(vm, plan=moved, dst=dst)
+    assert "NET_MTU_SHRINK" not in [x.code for x in found]
+    assert only(found, "MAP_NIC_OVERRIDE").severity == Severity.info
+    elsewhere = make_plan(
+        nic_overrides={
+            "vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["10.2.0.9"]}}
+        }
+    )
+    f = only(check(vm, plan=elsewhere, dst=dst), "MAP_NIC_OVERRIDE_INVALID")
+    assert "fa:16:3e:00:00:01: 10.2.0.9 lies in no subnet of 'rhoso-dmz'" in f.message
+
+
+def test_finding_map_nic_override_invalid_follows_neutron_on_slaac_subnets():
+    """SDD §9.3, §6.6: an override's address on a SLAAC subnet - the kept MAC's EUI-64 address in
+    "neutron" mode, none in "nova" mode."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="fa:16:3e:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    dst = resolved_dst(
+        [net("app", "app-net")],
+        [
+            subnet_of("app", "app-net", "10.0.0.0/24"),
+            subnet_of("app", "app-net", "fd00:20::/64", "slaac"),
+        ],
+    )
+
+    def entry(address, mode):
+        return make_plan(
+            nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"fixed_ips": ["10.0.0.6", address]}}},
+            port_creation_mode=mode,
+        )
+
+    eui = "fd00:20::f816:3eff:fe00:1"
+    assert "MAP_NIC_OVERRIDE_INVALID" not in [
+        x.code for x in check(vm, plan=entry(eui, "neutron"), dst=dst)
+    ]
+    f = only(check(vm, plan=entry("fd00:20::5", "neutron"), dst=dst), "MAP_NIC_OVERRIDE_INVALID")
+    assert f"fa:16:3e:00:00:01: fd00:20::5 is not {eui}" in f.message
+    f = only(check(vm, plan=entry(eui, "nova"), dst=dst), "MAP_NIC_OVERRIDE_INVALID")
+    assert "SLAAC or DHCPv6-stateless" in f.message

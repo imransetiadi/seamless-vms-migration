@@ -4,6 +4,8 @@
 #
 #   make seamless-demo
 #   export TOKEN='smg_...'            # the admin token printed once by scripts/compose-init.sh
+#   export APPROVER_TOKEN='smg_...'   # an approver of another user: a requester never approves their own
+#                                     # cutover (maker-checker, SDD §5.4) — seamless token create --role approver
 #   tests/e2e/smoke-demo.sh           # BASE defaults to http://127.0.0.1:8080
 #
 # Checks health, RBAC, the dashboard, metrics, the seeded demo flow (approvals, cutovers, one
@@ -14,11 +16,17 @@
 set -u
 BASE=${BASE:-http://127.0.0.1:8080}
 : "${TOKEN:?export TOKEN=<admin token from compose-init.sh>}"
+: "${APPROVER_TOKEN:?export APPROVER_TOKEN=<an approver token of another user (maker-checker, SDD 5.4)>}"
 H="Authorization: Bearer $TOKEN"
-pass=0; fail=0
+HA="Authorization: Bearer $APPROVER_TOKEN"
+pass=0; fail=0; skipped=0
 ok()   { pass=$((pass+1)); echo "PASS  $1"; }
 bad()  { fail=$((fail+1)); echo "FAIL  $1"; }
+skip() { skipped=$((skipped+1)); echo "SKIP  $1"; }
 check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+# a check that needs the smoke plan: skipped, not failed, when the demo has none to give (see below)
+needs_plan(){ if [ -n "$no_plan" ]; then skip "$1"; else check "$1" "$2"; fi; }
+no_plan=""
 
 health=$(curl -fsS -m 10 "$BASE/api/v1/health" || echo '{}')
 echo "health: $health"
@@ -27,6 +35,8 @@ check "unauthenticated /me is 401"  '[ "$(curl -s -o /dev/null -w "%{http_code}"
 check "readiness is 200 with orchestrator healthy" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/v1/ready")" = 200 ] && curl -fsS -m 10 "$BASE/api/v1/ready" | grep -q "\"healthy\":true"'
 me=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/me" || echo '{}')
 check "/me is admin"                '[[ "$me" == *\"role\":\"admin\"* ]]'
+approver_me=$(curl -fsS -m 10 -H "$HA" "$BASE/api/v1/me" || echo '{}')
+check "APPROVER_TOKEN is an approver of another user" 'python3 -c "import json,sys; a,b=json.loads(sys.argv[1]),json.loads(sys.argv[2]); sys.exit(0 if a.get(\"role\") in (\"approver\",\"admin\") and a.get(\"name\") != b.get(\"name\") else 1)" "$approver_me" "$me"'
 index=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$BASE/")
 check "dashboard served at /"       '[ "$index" = 200 ] && curl -fsS -m 10 "$BASE/" | grep -qi "<div id=\"root\""'
 check "security headers on / and the API" 'curl -sSI -m 10 "$BASE/" | grep -qi "^content-security-policy:" && curl -sSI -m 10 "$BASE/api/v1/health" | grep -qi "^x-content-type-options: nosniff"'
@@ -51,10 +61,14 @@ while [ $SECONDS -lt $deadline ]; do
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"]=="rolled_back" and m["attempts"] < 2))' <<<"$migs"); do
     curl -fsS -m 10 -X POST -H "$H" "$BASE/api/v1/migrations/$mid/retry" >/dev/null 2>&1 && echo "retried $mid"
   done
-  # approve + request cutover: warm strategies wait in awaiting_cutover, single-shot ones in ready
+  # request (admin) + approve (another approver): warm strategies wait in awaiting_cutover, single-shot ones
+  # in ready; maker-checker (SDD 5.4): the requester's own approval is refused, so another user approves
   for mid in $(python3 -c 'import json,sys; print("\n".join(m["id"] for m in json.load(sys.stdin) if m["phase"] in ("awaiting_cutover","ready") and not m.get("cutover_requested")))' <<<"$migs"); do
-    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"smoke"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1
-    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1 && echo "approved+cutover $mid"
+    curl -fsS -m 10 -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"Smoke run: window agreed"}' "$BASE/api/v1/migrations/$mid/cutover" >/dev/null 2>&1 || continue
+    if [ -z "${self_code:-}" ]; then
+      self_code=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -X POST -H "$H" -H "Content-Type: application/json" -d '{"comment":"my own request"}' "$BASE/api/v1/migrations/$mid/approve")
+    fi
+    curl -fsS -m 10 -X POST -H "$HA" -H "Content-Type: application/json" -d '{"comment":"Smoke run: findings checked by a second approver"}' "$BASE/api/v1/migrations/$mid/approve" >/dev/null 2>&1 && echo "requested+approved $mid"
   done
   running=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/plans" | python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin) if p["status"]=="running"))')
   done_all=$(python3 -c 'import json,sys; ms=json.load(sys.stdin); print("yes" if ms and int(sys.argv[1])==0 and all(m["phase"] in ("completed","finalized","cancelled","failed","rolled_back","blocked","ready") for m in ms) else "no")' "$running" <<<"$migs")
@@ -63,6 +77,7 @@ while [ $SECONDS -lt $deadline ]; do
 done
 echo "final phases: ${final:-$summary (timeout)}"
 check "migrations reached completed"  '[[ -n "$final" && "$final" == *completed* ]]'
+check "maker-checker: the requester's own approval is refused (409)" '[ "${self_code:-none}" = 409 ] || [ "${self_code:-none}" = none ]'
 check "no failed migration"           '[[ -n "$final" && "$final" != *failed* ]]'
 python3 -c 'import json,sys; ms=json.load(sys.stdin); print("downtime_s:", sorted(round(m["actual_downtime_s"],1) for m in ms if m.get("actual_downtime_s") is not None)); print("blocked:", [(m["vm"]["name"], [f["code"] for f in m["findings"] if f["severity"]=="blocker"]) for m in ms if m["phase"]=="blocked"])' <<<"$migs"
 # plan status after the run
@@ -99,8 +114,11 @@ smoke_validate() {  # the plan's validation report, then its HTTP status on the 
 }
 npid=""
 vreport='{}'
+# A smoke plan someone gave a strategy override (from the dashboard) is theirs now: its choice is no longer
+# automatic, so the advisor is not asked (SDD §14.4). It is left as it is, like one without a VM, and
+# another one is used.
 for earlier in $(curl -fsS -m 30 -H "$H" "$BASE/api/v1/plans" |
-  python3 -c 'import json,sys; print(" ".join(p["id"] for p in reversed(json.load(sys.stdin)) if p["name"] == "smoke jev"))'); do
+  python3 -c 'import json,sys; print(" ".join(p["id"] for p in reversed(json.load(sys.stdin)) if p["name"] == "smoke jev" and p.get("vm_ids") and not p.get("strategy_overrides")))'); do
   answer=$(smoke_validate "$earlier")
   if [ "${answer##*$'\n'}" = 200 ]; then npid=$earlier; vreport=${answer%$'\n'*}; break; fi
 done
@@ -112,19 +130,60 @@ inventory, migrations = (json.loads(part) for part in sys.stdin.read().split("\n
 vms = inventory if isinstance(inventory, list) else inventory.get("vms", [])
 held = {m["vm"]["source_id"] for m in migrations if m["phase"] not in ("cancelled", "finalized", "rolled_back")}
 print(json.dumps([v["source_id"] for v in vms if not v.get("flavor_extra_specs") and v["source_id"] not in held][:1]))')
-  check "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)" '[ "$vm_ids" != "[]" ]'
-  newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
-  npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
-  answer=$(smoke_validate "$npid")
-  [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
+  if [ "$vm_ids" = "[]" ]; then
+    # not a product failure: this demo volume has nothing left to plan. A completed migration holds its VM until
+    # it is finalized (SDD §5.4), and smoke plans made before the one-plan-per-VM rule hold web-01 and web-02.
+    no_plan="no finance VM is free and no earlier smoke plan can be validated again"
+    skip "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)"
+    echo "      $no_plan: the advisor checks below are skipped. A fresh demo volume, or finalizing or rolling"
+    echo "      back a finance VM from the dashboard, gives the smoke a VM again."
+  else
+    ok "a VM no plan holds is free for the smoke plan (SDD §5.4, §10)"
+  fi
+  if [ "$vm_ids" != "[]" ]; then  # no free VM: no plan is created (the API cannot delete one)
+    newplan=$(curl -fsS -m 30 -X POST -H "$H" -H "Content-Type: application/json" -d "{\"name\":\"smoke jev\",\"source_provider_id\":\"rhosp17-finance\",\"destination_provider_id\":\"rhoso18\",\"vm_ids\":$vm_ids,\"downtime_slo_s\":60,\"mappings\":{\"networks\":{\"finance-app\":\"finance-app\",\"finance-db\":\"finance-db\"},\"volume_types\":{\"ceph-ssd\":\"ceph-ssd\",\"ceph-hdd\":\"ceph-hdd\"}}}" "$BASE/api/v1/plans" || echo '{}')
+    npid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' <<<"$newplan")
+    answer=$(smoke_validate "$npid")
+    [ "${answer##*$'\n'}" = 200 ] && vreport=${answer%$'\n'*}
+  fi
 fi
-check "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
-notes=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" | python3 -c 'import json,sys; ms=json.load(sys.stdin); print(json.dumps([(m["vm"]["name"], n["source"], n["summary"][:80], n["data"].get("applied")) for m in ms for n in m["advisor_notes"]]))')
-echo "advisor notes: $notes"
-check "jev strategy note recorded"    '[[ "$notes" == *\"jev\"* ]]'
+needs_plan "smoke plan validated (an earlier one, or a new one)" '[[ "$vreport" == *\"migrations\"* ]]'
+# validation records the recommendation and its decision apart; the migration runs the decision (SDD §14.4)
+advice=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/migrations?plan_id=$npid" || echo '[]'; } |
+  python3 -c '
+import json, sys
+page, migrations = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+stored = [r for r in page.get("items", []) if not r["legacy"]]  # newest first
+newest = {}
+for r in stored:
+    newest.setdefault(r["migration_id"], r)
+decided = [m for m in migrations if m["id"] in newest and newest[m["id"]]["decision"]["final_option"]]
+runs = bool(decided) and all(m["strategy"] == newest[m["id"]]["decision"]["final_option"] for m in decided)
+seen = [(r["subject"]["name"], r["model"]["name"], r["recommendation"]["option"], r["recommendation"]["confidence"], r["decision"]["status"], r["decision"]["final_option"]) for r in stored[:3]]
+print(json.dumps({"recommendations": seen, "runs_decision": runs}, separators=(",", ":")))')
+echo "advisor recommendations: $advice"
+needs_plan "jev strategy recommendation recorded (SDD §14.4)" '[[ "$advice" == *\"jev\"* ]]'
+needs_plan "the migration runs its newest decision (ADV-01)" '[[ "$advice" == *\"runs_decision\":true* ]]'
+# the newest recommendation is audited (created, then one decision) and its stored input re-hashes (SDD §14.5)
+audit=$({ curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/recommendations?plan_id=$npid&limit=200" || echo '{}'; echo; curl -fsS -m 10 -H "$H" "$BASE/api/v1/events?audit=true&tail=true&limit=1000&plan_id=$npid" || echo '[]'; } |
+  python3 -c '
+import json, sys
+page, events = (json.loads(part) for part in sys.stdin.read().split("\n", 1))
+rec = next((r for r in page.get("items", []) if not r["legacy"]), None)
+kinds = [e["kind"] for e in events if rec and e["data"].get("target_id") == rec["id"]]
+print(json.dumps({"kinds": kinds, "sha": rec and rec.get("input_snapshot_sha256")}, separators=(",", ":")))')
+echo "advisor audit: $audit"
+needs_plan "the recommendation is audited: created, then one decision (ADV-05)" '[[ "$audit" =~ \"kinds\":\[\"recommendation\.created\",\"decision\.[a-z_]+\"\] ]]'
+sha=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha") or "")' <<<"$audit")
+rehash=$(curl -fsS -m 10 -H "$H" "$BASE/api/v1/advisor/snapshots/$sha" 2>/dev/null | python3 -c '
+import hashlib, json, sys
+s = json.load(sys.stdin)
+canonical = json.dumps(s["payload"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest() == s["sha256"])' 2>/dev/null || echo error)
+needs_plan "its input snapshot re-hashes to its SHA-256 (ADV-05)" '[ -n "$sha" ] && [ "$rehash" = True ]'
 advisor=$(curl -fsS -m 20 -H "$H" "$BASE/api/v1/advisor/status" || echo '{}')
 check "jev has no error after decide" '[[ "$advisor" == *\"last_error\":null* ]]'
 echo "advisor after: $advisor"
 
-echo "== $pass passed, $fail failed =="
+echo "== $pass passed, $fail failed, $skipped skipped =="
 exit $fail

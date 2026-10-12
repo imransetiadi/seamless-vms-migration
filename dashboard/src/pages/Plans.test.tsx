@@ -13,6 +13,63 @@ describe('Plans page', () => {
     expect(screen.getByRole('button', { name: /new plan/i })).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it("keeps each plan's done count and clouds under its name for a phone, where their columns are hidden (SDD §16)", async () => {
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
+    const link = await screen.findByRole('link', { name: 'DC1 → RHOSO production rollout' });
+    const header = link.closest('th')!;
+    await waitFor(() => expect(within(header).getByText(/^\d+\/10 done$/)).toBeInTheDocument());
+    expect(within(header).getByText(/RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production/)).toBeInTheDocument();
+    // shown only below the sm breakpoint, where the Done and clouds columns are hidden; no minimum width there
+    expect(within(header).getByText(/done$/).closest('.sm\\:hidden')).not.toBeNull();
+    expect(header.className).not.toMatch(/(^|\s)min-w-48/);
+  });
+
+  it('shows each plan with the status its migrations tell, and filters by it (SDD §8.1, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    plan.status = 'validated'; // a re-validated finished plan
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('link', { name: plan.name })).closest('tr')!;
+    expect(row).toHaveTextContent('Completed');
+    expect(row).not.toHaveTextContent('Validated');
+    await user.selectOptions(screen.getByLabelText(/^status/i), 'completed');
+    expect(screen.getByRole('link', { name: plan.name })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText(/^status/i), 'validated');
+    expect(screen.queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
+  });
+
+  it('says the providers are unavailable when the list shows provider ids instead of names (SDD §16)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/providers'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/providers are unavailable/i);
+    expect(within(alert).getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("puts the focus on the page's heading when a successful Retry takes the failure away (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    let failing = true;
+    server.handle = (method, path, query, body, token) =>
+      failing && method === 'GET' && path === '/plans'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused once for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const alert = await screen.findByRole('alert');
+    failing = false;
+    await user.click(within(alert).getByRole('button', { name: /retry/i }));
+    await screen.findByRole('table', { name: /migration plans/i });
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Plans' })).toHaveFocus());
+  });
+
   it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
@@ -217,6 +274,17 @@ describe('Plans page', () => {
     expect(within(dialog).getByLabelText(/cutover window start/i)).toBeDisabled();
   });
 
+  it('says how many plans its filters show from a live region already on the page, also when none match (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer' });
+    const n = server.plans.length;
+    const status = await screen.findByText(`Showing ${n} of ${n} plans`);
+    expect(status).toHaveAttribute('role', 'status');
+    await user.type(screen.getByRole('searchbox', { name: /search plans/i }), 'zzzz-no-match');
+    expect(status).toHaveTextContent(`Showing 0 of ${n} plans`);
+    expect(screen.getByText('No plans match these filters')).toBeInTheDocument();
+  });
+
   it('names a selected VM that another plan holds, as validation would refuse it (SDD §5.4, §16)', async () => {
     const server = createTestServer();
     const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
@@ -230,7 +298,24 @@ describe('Plans page', () => {
     await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
 
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
-    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
+  });
+
+  it('announces a VM another plan holds from a live region already in the form (SDD §16)', async () => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    const checkbox = await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` });
+    const regions = within(dialog).getAllByRole('status');
+    await user.click(checkbox);
+    const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
+    // a live region inserted together with its text is not reliably read
+    expect(regions).toContain(note);
   });
 
   it('says in the form that the providers are unavailable, with Retry, instead of empty cloud lists (SDD §16)', async () => {
@@ -287,7 +372,7 @@ describe('Plans page', () => {
     server.handle = handle;
     await user.click(within(alert).getByRole('button', { name: /retry/i }));
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
-    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${held.phase})`);
+    expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -340,8 +425,11 @@ describe('Plans page', () => {
     await user.clear(keepWarm);
     await user.type(keepWarm, '30');
     const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
-    expect(within(prestage).getAllByRole('checkbox')).toHaveLength(6);
+    expect(within(prestage).getAllByRole('checkbox')).toHaveLength(8);
     expect(within(prestage).getByRole('checkbox', { name: /^security group rules/i })).toBeChecked();
+    // flavors and keypairs are opt-in (SDD §16)
+    expect(within(prestage).getByRole('checkbox', { name: /^flavors/i })).not.toBeChecked();
+    expect(within(prestage).getByRole('checkbox', { name: /^keypairs/i })).not.toBeChecked();
     await user.click(within(prestage).getByRole('checkbox', { name: /^security group rules/i }));
     await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
 
@@ -349,6 +437,32 @@ describe('Plans page', () => {
     const created = server.plans.find((p) => p.name === 'Warm wave')!;
     expect(created.keep_warm_interval_s).toBe(1800);
     expect(created.prestage_resources).toEqual(['networks', 'subnets', 'routers', 'router_interfaces', 'security_groups']);
+  });
+
+  it("pre-stages the plan's flavors RHOSO lacks when asked, after the defaults (SDD §16)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Flavors too');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
+    const flavors = within(prestage).getByRole('checkbox', { name: /^flavors/i });
+    expect(flavors).toHaveAccessibleDescription(/flavors of the plan's vms that rhoso lacks/i);
+    await user.click(flavors);
+    const keypairs = within(prestage).getByRole('checkbox', { name: /^keypairs/i });
+    expect(keypairs).toHaveAccessibleDescription(/keypairs the migration user lacks at rhoso/i);
+    await user.click(keypairs);
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Flavors too')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Flavors too')!.prestage_resources).toEqual([
+      'networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules', 'flavors', 'keypairs',
+    ]);
   });
 
   it('sets a per-VM strategy override; a VM taken out of the plan loses its override (SDD §16)', async () => {
@@ -428,6 +542,48 @@ describe('Plans page', () => {
     expect(within(dialog).getByLabelText(/^keep-warm interval/i)).toHaveAttribute('aria-invalid', 'true');
   });
 
+  it('refuses a finalize reminder that is not whole hours, 1 or more (SDD §4.2, ADV-19)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const reminder = within(dialog).getByLabelText(/^finalize reminder \(hours\)/i);
+    expect(reminder).toHaveValue(72);
+    for (const value of ['0', '1.5']) {
+      await user.clear(reminder);
+      await user.type(reminder, value);
+      await user.click(within(dialog).getByRole('button', { name: /^create plan/i }));
+      const summary = await within(dialog).findByRole('alert');
+      expect(summary).toHaveTextContent('Enter the finalize reminder in whole hours (1 or more).');
+      expect(within(dialog).getByLabelText(/^finalize reminder \(hours\)/i)).toHaveAttribute('aria-invalid', 'true');
+    }
+  });
+
+  it('keeps MAC addresses and every fixed IP when asked, off by default (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
+
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.type(within(dialog).getByLabelText(/^name/i), 'Ports kept');
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+    await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+    await user.click(within(dialog).getByText(/^advanced:/i));
+    const ports = within(dialog).getByRole('group', { name: /^ports$/i });
+    const keep = within(ports).getByRole('checkbox', { name: /^keep mac addresses and every fixed ip/i });
+    expect(keep).not.toBeChecked();
+    expect(keep).toHaveAccessibleDescription(/through neutron with its mac address, all its fixed ips and its security groups/i);
+    expect(keep).toHaveAccessibleDescription(/outlive their server/i);
+    expect(keep).toHaveAccessibleDescription(/cold, warm and storage handover/i);
+    await user.click(keep);
+    await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+
+    await waitFor(() => expect(server.plans.some((p) => p.name === 'Ports kept')).toBe(true));
+    expect(server.plans.find((p) => p.name === 'Ports kept')!.port_creation_mode).toBe('neutron');
+  });
+
   it('says a VMware source pre-stages nothing (SDD §7.2)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });
@@ -438,6 +594,10 @@ describe('Plans page', () => {
     const prestage = within(dialog).getByRole('group', { name: /pre-staged at the destination/i });
     expect(prestage).toHaveTextContent(/vmware sources pre-stage nothing/i);
     for (const box of within(prestage).getAllByRole('checkbox')) expect(box).toBeDisabled();
+    // the migration kit recreates the NICs (SDD §16)
+    const keep = within(within(dialog).getByRole('group', { name: /^ports$/i })).getByRole('checkbox', { name: /^keep mac addresses/i });
+    expect(keep).toBeDisabled();
+    expect(keep).toHaveAccessibleDescription(/vmware sources ignore this/i);
   });
 
   it('refuses a negative verification timeout and a malformed project mapping, and opens the advanced section', async () => {

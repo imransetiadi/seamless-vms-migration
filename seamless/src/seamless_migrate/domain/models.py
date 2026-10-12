@@ -6,7 +6,9 @@ serialize as ISO-8601 strings ending in ``Z``; naive inputs are interpreted as U
 
 from __future__ import annotations
 
+import ipaddress
 import math
+import re
 import secrets
 from collections import Counter
 from collections.abc import Sequence
@@ -24,7 +26,18 @@ from pydantic import (
 )
 
 from ..guest_os import GuestOS, identify
-from .enums import Phase, PlanStatus, ProviderKind, ProviderRole, Severity, Strategy, SyncPassKind
+from .enums import (
+    DecisionStatus,
+    DecisionType,
+    Phase,
+    PlanStatus,
+    ProviderKind,
+    ProviderRole,
+    ReasonCode,
+    Severity,
+    Strategy,
+    SyncPassKind,
+)
 
 GIB = 2**30
 #: Fraction of the provisioned size assumed used when a disk does not report usage (SDD §4.2).
@@ -50,6 +63,14 @@ def new_plan_id() -> str:
 
 def new_migration_id() -> str:
     return f"mig-{secrets.token_hex(5)}"
+
+
+def new_recommendation_id() -> str:
+    return f"rec-{secrets.token_hex(6)}"
+
+
+def new_policy_id() -> str:
+    return f"pol-{secrets.token_hex(6)}"
 
 
 class _Model(BaseModel):
@@ -140,6 +161,9 @@ class Nic(_Model):
     fixed_ips: list[str] = Field(default_factory=list)
     vnic_type: str = "normal"
     mtu: int | None = None
+    #: VMware: what the migration kit maps the NIC by - its distributed port group's key, else its
+    #: device summary (a standard port group's name); None for OpenStack (SDD §4, §7.2)
+    network_key: str | None = None
 
 
 PowerState = Literal["running", "stopped", "paused", "error", "transitioning", "unknown"]
@@ -182,6 +206,8 @@ class VMRef(_Model):
         return value
 
     change_rate_bps: float | None = None
+    #: the Nova keypair the server boots with (OpenStack); VMware: None (SDD §4.1)
+    key_name: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -233,6 +259,71 @@ class CutoverWindow(_Model):
 DEFAULT_CONSOLE_PATTERNS = ["login:", "Cloud-init v\\. .* finished", "Reached target .*Multi-User"]
 
 
+ProbeKind = Literal["tcp", "http", "https"]
+
+
+#: a NIC override's key: six hex pairs, lower case (SDD §4.2, §12)
+_MAC = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}")
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+class NicOverride(_Model):
+    """A VM NIC's network and addresses at RHOSO (SDD §4.2): None keeps where the plan maps its
+    network, or its own addresses."""
+
+    network: str | None = None
+    fixed_ips: list[str] | None = None
+
+    @field_validator("fixed_ips")
+    @classmethod
+    def _canonical(cls, value: list[str] | None) -> list[str] | None:
+        """Valid addresses in their canonical form ("fd00:0::0005" is "fd00::5"); the others stay
+        as given, for invalid_plan_settings to name."""
+        if value is None:
+            return None
+        return [str(ipaddress.ip_address(a)) if _is_ip(a) else a for a in value]
+
+
+class AppProbe(_Model):
+    """An application probe (SDD §7.5, ADV-18): a TCP connect, or an HTTP(S) GET of ``path``."""
+
+    kind: ProbeKind
+    port: int
+    #: http(s) only
+    path: str = "/"
+    #: http(s) only: the status that passes; None = any 2xx or 3xx
+    expect_status: int | None = None
+
+
+class ProbeResult(_Model):
+    """What one application probe found (SDD §7.5): unreachable is not failed (ADV-18)."""
+
+    target: str
+    kind: ProbeKind
+    result: Literal["passed", "failed", "unreachable"]
+    #: the time to the service's answer; None when it did not answer
+    latency_ms: float | None = None
+    at: UTCDateTime
+    detail: str = ""
+
+
+class VerificationRecord(_Model):
+    """The last verification of a migration: its checks and probe results (SDD §7.5)."""
+
+    at: UTCDateTime
+    passed: bool
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    probes: list[ProbeResult] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class VerificationConfig(_Model):
     tcp_ports: list[int] = Field(default_factory=list)
     # Windows guests probe these instead and skip the console check (SDD §7.5)
@@ -244,6 +335,8 @@ class VerificationConfig(_Model):
     timeout_s: int = 600
     auto_rollback: bool = True
     use_advisor: bool = True
+    #: the application probes of every VM; Plan.probe_overrides replaces them per VM (ADV-18)
+    app_probes: list[AppProbe] = Field(default_factory=list)
 
 
 class Wave(_Model):
@@ -263,6 +356,19 @@ DEFAULT_PRESTAGE = [
     "security_groups",
     "security_group_rules",
 ]
+#: What a plan may pre-stage (SDD §4.2): the collection's export_<r>/import_<r> playbook pairs,
+#: never the workloads themselves; the defaults first, then the others in their creation order
+PRESTAGE_RESOURCES = (
+    *DEFAULT_PRESTAGE,
+    "flavors",
+    "keypairs",
+    "images",
+    "projects",
+    "users",
+    "users_keypairs",
+    "user_project_role_assignments",
+    "detached_volumes",
+)
 
 
 class PlanSpec(_Model):
@@ -279,6 +385,8 @@ class PlanSpec(_Model):
     selection_policy: Literal["min_downtime", "simplest_meeting_slo"] = "min_downtime"
     downtime_slo_s: int = Field(default=600, ge=1)
     require_approval: bool = True
+    #: maker-checker (SDD §5.4, ADV-17): the cutover's requester never counts as its approver
+    require_distinct_approver: bool = True
     auto_cutover: bool = False
     cutover_window: CutoverWindow | None = None
     #: at least a minute: a shorter interval would run delta passes back to back
@@ -290,10 +398,98 @@ class PlanSpec(_Model):
     estimator_overrides: dict[str, float] = Field(default_factory=dict)
     handover: HandoverConfig = Field(default_factory=HandoverConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
+    #: per VM (source id): its application probes instead of verification.app_probes; [] = none
+    probe_overrides: dict[str, list[AppProbe]] = Field(default_factory=dict)
+    #: hours a migration may wait in completed before it is flagged for finalize (SDD §8.1, ADV-19);
+    #: TODO(ADV-19): confirm 72 h — the owner's open question 14
+    finalize_warning_h: int = Field(default=72, ge=1)
     prestage_resources: list[str] = Field(default_factory=lambda: list(DEFAULT_PRESTAGE))
+    #: "neutron": OpenStack cold/warm recreate every port with its MAC, all its fixed IPs and its
+    #: security groups (SDD §6.6, §7.2, §9.2); "nova": one fixed IP per port and a new MAC
+    port_creation_mode: Literal["nova", "neutron"] = "nova"
+    #: per VM (source id), per NIC MAC (lower case): its network and addresses at RHOSO; OpenStack
+    #: sources (SDD §4.2, §7.2, §7.3, §9.2, §9.3)
+    nic_overrides: dict[str, dict[str, NicOverride]] = Field(default_factory=dict)
+
+    def nic_override(self, vm_id: str, mac: str | None) -> NicOverride | None:
+        """The plan's override of a VM's NIC, by its MAC (SDD §4.2)."""
+        if not mac:
+            return None
+        return (self.nic_overrides.get(vm_id) or {}).get(mac.lower())
+
+    def nic_target(self, vm_id: str, nic: Nic) -> tuple[str, list[str]]:
+        """Where a VM's NIC goes at RHOSO (SDD §9.2, §9.3): its override's network, else the
+        plan's mapping of its network; its override's addresses, else its own."""
+        entry = self.nic_override(vm_id, nic.mac)
+        network = (entry.network if entry is not None else None) or self.mappings.networks.get(
+            nic.network, nic.network
+        )
+        if entry is not None and entry.fixed_ips is not None:
+            return network, list(entry.fixed_ips)
+        return network, list(nic.fixed_ips)
+
+    @field_validator("nic_overrides")
+    @classmethod
+    def _lower_case_macs(
+        cls, value: dict[str, dict[str, NicOverride]]
+    ) -> dict[str, dict[str, NicOverride]]:
+        return {
+            vm: {mac.lower(): entry for mac, entry in nics.items()} for vm, nics in value.items()
+        }
 
 
 PlanCreate = PlanSpec
+
+#: SDD §12: what one probe list may hold, and the longest http(s) path
+MAX_PROBES_PER_VM = 10
+MAX_PROBE_PATH = 200
+
+
+def _nic_override_problems(overrides: dict[str, dict[str, NicOverride]]) -> list[str]:
+    """What makes a NIC override unusable before any cloud is asked (SDD §12)."""
+    problems: list[str] = []
+    for vm_id, nics in overrides.items():
+        for mac in sorted(nics):
+            entry, where = nics[mac], f"nic_overrides[{vm_id}][{mac}]"
+            if not _MAC.fullmatch(mac):
+                problems.append(f"{where}: not a MAC address")
+            if entry.network is None and entry.fixed_ips is None:
+                problems.append(f"{where}: give a network, addresses or both")
+            if entry.network is not None and not entry.network.strip():
+                problems.append(f"{where}: network must not be empty")
+            if entry.fixed_ips is None:
+                continue
+            if not entry.fixed_ips:
+                problems.append(
+                    f"{where}: fixed_ips must list at least one address "
+                    "(leave it out to keep the NIC's own)"
+                )
+            bad = [a for a in entry.fixed_ips if not _is_ip(a)]
+            if bad:
+                problems.append(f"{where}: not an IP address: {', '.join(bad)}")
+            twice = sorted({a for a in entry.fixed_ips if entry.fixed_ips.count(a) > 1})
+            if twice:
+                problems.append(f"{where}: {', '.join(twice)} given twice")
+    return problems
+
+
+def _probe_problems(where: str, probes: Sequence[AppProbe]) -> list[str]:
+    problems = [
+        f"{where}: port {p.port} outside 1-65535" for p in probes if not 1 <= p.port <= 65535
+    ]
+    problems += [
+        f"{where}: path {p.path!r} must start with '/' (at most {MAX_PROBE_PATH} characters)"
+        for p in probes
+        if p.kind != "tcp" and (not p.path.startswith("/") or len(p.path) > MAX_PROBE_PATH)
+    ]
+    problems += [
+        f"{where}: expect_status {p.expect_status} outside 100-599"
+        for p in probes
+        if p.expect_status is not None and not 100 <= p.expect_status <= 599
+    ]
+    if len(probes) > MAX_PROBES_PER_VM:
+        problems.append(f"{where}: {len(probes)} probes, at most {MAX_PROBES_PER_VM}")
+    return problems
 
 
 def repeated_vm_ids(vm_ids: Sequence[str]) -> list[str]:
@@ -317,6 +513,14 @@ def invalid_plan_settings(spec: PlanSpec) -> list[str]:
         problems.append(
             f"verification.timeout_s must not be negative (got {verification.timeout_s})"
         )
+    # application probes (SDD §7.5, §12, ADV-18)
+    problems += _probe_problems("verification.app_probes", verification.app_probes)
+    for vm_id, probes in spec.probe_overrides.items():
+        problems += _probe_problems(f"probe_overrides[{vm_id}]", probes)
+    problems += _nic_override_problems(spec.nic_overrides)
+    unknown = [r for r in spec.prestage_resources if r not in PRESTAGE_RESOURCES]
+    if unknown:
+        problems.append(f"prestage_resources: cannot pre-stage {', '.join(map(repr, unknown))}")
     window = spec.cutover_window
     if window is not None and window.end <= window.start:
         problems.append("cutover_window: end must be after start")
@@ -377,6 +581,9 @@ class Estimate(_Model):
     total_s: float
     final_delta_bytes: int
     meets_slo: bool
+    #: shutdown_s, copy_s (final sync or full copy), conversion_s, create_s, boot_s: they add up to
+    #: downtime_s (SDD §4, §9.1, ADV-16)
+    downtime_parts: dict[str, float] = Field(default_factory=dict)
 
 
 AdvisorKind = Literal["strategy", "classification", "verification", "similar_incidents", "screen"]
@@ -389,6 +596,182 @@ class AdvisorNote(_Model):
     confidence: float | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: UTCDateTime = Field(default_factory=utcnow)
+
+
+class AdvisorActor(_Model):
+    """Who took a decision: ``policy:<id>``, ``user:<name>`` or ``system:fallback`` (SDD §14.4)."""
+
+    kind: Literal["policy", "user", "system"]
+    id: str
+
+
+class AdvisorModelInfo(_Model):
+    name: Literal["jev", "rules"]
+    version: str
+    deployment: Literal["on_prem", "remote", "unknown"] = "unknown"
+    endpoint_host: str | None = None
+
+
+class RecommendedOption(_Model):
+    option: str | None = None
+    #: 0..1 - the only number compared with a threshold (SDD §14.4)
+    confidence: float | None = None
+    #: raw probabilities per option, shown only in Details
+    distribution: dict[str, float] = Field(default_factory=dict)
+
+
+class Decision(_Model):
+    final_option: str | None = None
+    status: DecisionStatus
+    reason_code: ReasonCode
+    reason_text: str | None = None
+    actor: AdvisorActor
+    policy_id: str | None = None
+    threshold_used: float | None = None
+    decided_at: UTCDateTime = Field(default_factory=utcnow)
+    #: the deciding policy's rules for a person's approve or override, as they were then (SDD
+    #: §14.6); None: the fallback, or a decision stored before - the policy in force applies
+    require_distinct_approver: bool | None = None
+    require_override_reason: bool | None = None
+
+
+class AdvisorSubject(_Model):
+    kind: Literal["vm", "plan", "wave"]
+    id: str
+    name: str
+
+
+EvidenceSourceKind = Literal["inventory", "preflight", "estimate", "plan", "provider", "run"]
+EvidenceEffect = Literal["supports", "opposes", "context"]
+
+
+class EvidenceSource(_Model):
+    """Where an evidence item comes from: the VM, the migration, the plan or the provider."""
+
+    kind: EvidenceSourceKind
+    ref_id: str = Field(min_length=1)
+
+
+class EvidenceItem(_Model):
+    """One fact a recommendation rests on, built by code, never by the model (SDD §14.4, ADV-02)."""
+
+    key: str
+    label: str
+    value: str | int | float | bool | None = None
+    display: str
+    #: measured against the recommendation's ``evidence_option``
+    effect: EvidenceEffect
+    #: relevance, 0..100: the card shows the heaviest
+    weight: int = Field(ge=0, le=100)
+    source: EvidenceSource
+
+
+class SimilarIncident(_Model):
+    """A past incident agentmemory knew when the recommendation was recorded (SDD §14.3)."""
+
+    title: str
+    content: str = Field(max_length=1000)
+    score: float | None = None
+
+
+class AdvisorReason(_Model):
+    """A reason Jev gave that names one of the recommendation's evidence items."""
+
+    key: str
+    text: str
+
+
+class AdvisorRecommendation(_Model):
+    """A recommendation and the decision taken on it, stored apart (document kind
+    ``recommendation``, SDD §4.2, §14.4). The engine reads only the decision."""
+
+    id: str = Field(default_factory=new_recommendation_id)
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    decision_type: DecisionType
+    subject: AdvisorSubject
+    plan_id: str | None = None
+    migration_id: str | None = None
+    #: the plan's source provider
+    provider_id: str | None = None
+    model: AdvisorModelInfo
+    recommendation: RecommendedOption
+    decision: Decision
+    #: the redacted input the recommendation rests on (document kind ``advisor_snapshot``, §14.5)
+    input_snapshot_sha256: str | None = None
+    #: the user whose plan validation recorded it: never the one who decides it (SDD §14.6)
+    requested_by: str | None = None
+    legacy: bool = False
+    legacy_text: str | None = None
+    #: the option every evidence effect is measured against (SDD §14.4, ADV-02)
+    evidence_option: str | None = None
+    #: what validation knew when it was recorded, heaviest first
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    #: at most 3, searched once when it was recorded
+    similar_incidents: list[SimilarIncident] = Field(default_factory=list)
+    #: Jev's reasons that name one of the evidence keys
+    reasons: list[AdvisorReason] = Field(default_factory=list)
+
+
+class AdvisorSnapshot(_Model):
+    """A redacted advisor input, stored once under the SHA-256 of its canonical JSON (SDD §14.5)."""
+
+    sha256: str
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    payload: dict[str, Any]
+
+    @property
+    def id(self) -> str:
+        return self.sha256
+
+
+class PolicyScope(_Model):
+    """Where a policy applies: plans or source providers; neither = everywhere (SDD §14.6)."""
+
+    provider_ids: list[str] = Field(default_factory=list)
+    plan_ids: list[str] = Field(default_factory=list)
+
+
+class AdvisorPolicySpec(_Model):
+    """A policy as it is written (POST/PUT /advisor/policies, SDD §12, §14.6)."""
+
+    name: str = Field(min_length=1, max_length=200)
+    scope: PolicyScope = Field(default_factory=PolicyScope)
+    #: none = every decision type
+    decision_types: list[DecisionType] = Field(default_factory=list)
+    mode: Literal["auto_apply_above_threshold", "always_require_approval"]
+    threshold: float = Field(ge=0, le=1)
+    #: the evidence items that support or oppose (SDD §14.4): a new policy asks for 3 (ADV-02); the
+    #: built-in default asks for none
+    min_evidence_for_auto_apply: int = Field(default=3, ge=0, le=100)
+    require_override_reason: bool = True
+    #: maker-checker (ADV-17): the decision's requester neither approves nor overrides it
+    require_distinct_approver: bool = True
+
+    @model_validator(mode="after")
+    def _one_scope_level(self) -> AdvisorPolicySpec:
+        if self.scope.provider_ids and self.scope.plan_ids:
+            raise ValueError("a policy scopes either providers or plans, not both")
+        return self
+
+
+class AdvisorPolicy(AdvisorPolicySpec):
+    """A stored advisor policy (document kind ``advisor_policy``, SDD §4.2, §14.6)."""
+
+    id: str = Field(default_factory=new_policy_id)
+    created_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_at: UTCDateTime = Field(default_factory=utcnow)
+    updated_by: str
+
+
+class ForceCutover(_Model):
+    """A cutover before convergence, asked for with a reason (SDD §5.4, ADV-16)."""
+
+    actor: str
+    at: UTCDateTime
+    reason: str
+    #: the last pass's bytes_changed, and the estimated final downtime, when it was asked for
+    delta_bytes: int
+    estimated_downtime_s: float
 
 
 class Approval(_Model):
@@ -432,14 +815,34 @@ class Migration(_Model):
     actual_downtime_s: float | None = None
     approvals: list[Approval] = Field(default_factory=list)
     cutover_requested: bool = False
+    #: who asked for the cutover first, and when (SDD §5.4): never the approver that counts
+    cutover_requested_by: str | None = None
+    cutover_requested_at: UTCDateTime | None = None
     #: cutover window bypass granted with the request (SDD §5.4 rule 2); persisted
     force_window: bool = False
     advisor_notes: list[AdvisorNote] = Field(default_factory=list)
+    #: the recommendation whose decision waits for approval: no start meanwhile (SDD §5.4, §14.6)
+    advisor_hold: str | None = None
+    #: the convergence rule that ended the passes (SDD §5.3, ADV-16)
+    converged_by: Literal["threshold", "slo", "max_passes", "force"] | None = None
+    force_cutover: ForceCutover | None = None
+    #: the model seconds a simulated cutover spent with the source stopped (demo, SDD §5.2)
+    downtime_model_s: float | None = None
+    #: invariant violations found when it completed (SDD §5.5)
+    data_issues: list[str] = Field(default_factory=list)
+    #: the last verification: its checks and application probe results (SDD §7.5, ADV-18)
+    verification: VerificationRecord | None = None
+    #: the rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan
+    suggested_probes: list[AppProbe] = Field(default_factory=list)
+    #: completed, not finalized: when its source VM was seen running again (SDD §8.1, ADV-19)
+    source_running_at: UTCDateTime | None = None
     review_required: bool = False
     review_reason: str | None = None
     destination_server_id: str | None = None
     error: str | None = None
     attempts: int = 0
+    #: each retried attempt's strategy, oldest first: the evidence names them (SDD §14.4)
+    attempt_strategies: list[Strategy] = Field(default_factory=list)
     created_at: UTCDateTime = Field(default_factory=utcnow)
     updated_at: UTCDateTime = Field(default_factory=utcnow)
 

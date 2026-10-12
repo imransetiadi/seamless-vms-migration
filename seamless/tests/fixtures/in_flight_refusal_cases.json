@@ -1,0 +1,214 @@
+{
+ "_comment": "The 409 of PATCH /plans/{id} and POST /plans/{id}/waves/auto while a migration of the plan is in flight (SDD §12): each VM with what releases it. Shared by seamless/tests/test_in_flight.py and dashboard/src/api/mock.test.ts. Each case: the blocking migrations (VM name, phase, whether the source VM is stopped) and the change they block -> the message.",
+ "cases": [
+  {
+   "migrations": [
+    {
+     "vm": "web-01",
+     "phase": "awaiting_cutover",
+     "source_stopped": false
+    }
+   ],
+   "before": "editing the plan",
+   "expected": "finish, roll back or cancel the migration in flight (web-01) before editing the plan",
+   "note": "1. one migration waiting for its cutover: the wording before the groups"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "dc2-12",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-11",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-10",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-09",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-08",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-07",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-06",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-05",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-04",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-03",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-02",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "dc2-01",
+     "phase": "completed",
+     "source_stopped": false
+    }
+   ],
+   "before": "editing the plan",
+   "expected": "finalize or roll back the completed migrations (dc2-01, dc2-02, dc2-03, dc2-04, dc2-05, dc2-06, dc2-07, dc2-08, dc2-09, dc2-10 and 2 more) before editing the plan",
+   "note": "2. a completed migration is finished and cannot be cancelled: finalize or roll back (SDD §8.1); ten names, sorted, then how many more"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "db-01",
+     "phase": "failed",
+     "source_stopped": true
+    }
+   ],
+   "before": "re-planning the waves",
+   "expected": "roll back or retry the failed migration whose source VM is stopped (db-01) before re-planning the waves",
+   "note": "3. a failed cutover left the source stopped: a cancel is refused (SDD §5.1)"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "web-02",
+     "phase": "completed",
+     "source_stopped": false
+    },
+    {
+     "vm": "app-02",
+     "phase": "precopy",
+     "source_stopped": false
+    },
+    {
+     "vm": "db-01",
+     "phase": "failed",
+     "source_stopped": true
+    },
+    {
+     "vm": "app-01",
+     "phase": "verifying",
+     "source_stopped": false
+    },
+    {
+     "vm": "web-01",
+     "phase": "completed",
+     "source_stopped": false
+    }
+   ],
+   "before": "editing the plan",
+   "expected": "roll back or retry the failed migration whose source VM is stopped (db-01); finish, roll back or cancel the migrations in flight (app-01, app-02); finalize or roll back the completed migrations (web-01, web-02) before editing the plan",
+   "note": "4. most urgent first: a stopped source (the VM is down), then the migrations in flight, then those awaiting finalize"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "app-03",
+     "phase": "ready",
+     "source_stopped": true
+    }
+   ],
+   "before": "editing the plan",
+   "expected": "finish, roll back or cancel the migration in flight (app-03) before editing the plan",
+   "note": "5. a retry keeps a stopped source's clock open (SDD §5.2): the plan cuts it over when it runs"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "sync-10",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-09",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-08",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-07",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-06",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-05",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-04",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-03",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-02",
+     "phase": "syncing",
+     "source_stopped": false
+    },
+    {
+     "vm": "sync-01",
+     "phase": "syncing",
+     "source_stopped": false
+    }
+   ],
+   "before": "re-planning the waves",
+   "expected": "finish, roll back or cancel the migrations in flight (sync-01, sync-02, sync-03, sync-04, sync-05, sync-06, sync-07, sync-08, sync-09, sync-10) before re-planning the waves",
+   "note": "6. exactly ten names: none left out"
+  },
+  {
+   "migrations": [
+    {
+     "vm": "db-02",
+     "phase": "failed",
+     "source_stopped": true
+    },
+    {
+     "vm": "db-01",
+     "phase": "failed",
+     "source_stopped": true
+    }
+   ],
+   "before": "editing the plan",
+   "expected": "roll back or retry the failed migrations whose source VM is stopped (db-01, db-02) before editing the plan",
+   "note": "7. two failed cutovers that stopped their sources"
+  }
+ ]
+}

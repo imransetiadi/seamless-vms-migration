@@ -76,10 +76,50 @@ class PlanStatus(StrEnum):
     failed = "failed"
 
 
+class DerivedPlanStatus(StrEnum):
+    """The plan status every view shows (SDD §8.1, ADV-19): the lifecycle told by its migrations."""
+
+    draft = "draft"
+    validated = "validated"
+    running = "running"
+    paused = "paused"
+    completed = "completed"
+    finalized = "finalized"
+    failed = "failed"
+
+
 class SyncPassKind(StrEnum):
     full = "full"
     delta = "delta"
     final = "final"
+
+
+class DecisionType(StrEnum):
+    """What an advisor recommendation decides (SDD §14.4)."""
+
+    migration_strategy = "migration_strategy"
+    workload_tier = "workload_tier"
+    verification_review = "verification_review"
+    console_screening = "console_screening"
+
+
+class DecisionStatus(StrEnum):
+    auto_applied = "auto_applied"
+    pending_approval = "pending_approval"
+    approved = "approved"
+    overridden = "overridden"
+    below_threshold = "below_threshold"
+    fallback_rules = "fallback_rules"
+
+
+class ReasonCode(StrEnum):
+    ABOVE_THRESHOLD_AUTO_APPLY = "ABOVE_THRESHOLD_AUTO_APPLY"
+    POLICY_REQUIRES_APPROVAL = "POLICY_REQUIRES_APPROVAL"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    APPROVED_BY_USER = "APPROVED_BY_USER"
+    OVERRIDDEN_BY_USER = "OVERRIDDEN_BY_USER"
+    BELOW_THRESHOLD_DEFAULT_KEPT = "BELOW_THRESHOLD_DEFAULT_KEPT"
+    ADVISOR_UNAVAILABLE_FALLBACK = "ADVISOR_UNAVAILABLE_FALLBACK"
 
 
 #: Strategies considered per source family (SDD §9.2).

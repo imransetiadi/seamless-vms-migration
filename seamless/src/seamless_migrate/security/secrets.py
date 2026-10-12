@@ -28,6 +28,12 @@ class SecretNotFound(LookupError):
     """The named secret (or a required key of it) is not configured."""
 
 
+def valid_secret_name(name: str) -> bool:
+    """A name this module reads (SDD §13.3): 1-128 letters, digits, ``.``, ``_`` or ``-``,
+    starting with a letter or digit - never a path."""
+    return bool(_NAME.fullmatch(name)) and name not in (".", "..")
+
+
 def _env_prefix(name: str) -> str:
     return "SEAMLESS_SECRET_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_"
 
@@ -37,7 +43,7 @@ def read_secret(
 ) -> dict[str, str]:
     """All keys of secret ``name`` (SDD §13.3 order): mounted files under ``secrets_dir``, then
     the Kubernetes store, then ``SEAMLESS_SECRET_{NAME}_{KEY}`` variables. ``{}`` when absent."""
-    if not name or not _NAME.match(name) or name in (".", ".."):
+    if not name or not valid_secret_name(name):
         raise SecretNotFound(f"invalid secret name {name!r}")
     values: dict[str, str] = {}
     directory = Path(settings.secrets_dir) / name
@@ -48,12 +54,15 @@ def read_secret(
                 continue
             values[entry.name] = entry.read_text(encoding="utf-8").strip()
     if not values and settings.secret_store == "kubernetes":
-        from .secret_store import KubernetesSecretStore, SecretStoreError
+        from .secret_store import KubernetesSecretStore, SecretStoreError, kubernetes_name
 
-        try:
-            values = KubernetesSecretStore(settings.k8s_namespace).read(name) or {}
-        except SecretStoreError as exc:
-            raise SecretNotFound(f"secret {name!r}: {exc}") from None
+        # a name the store cannot hold (upper-case, '_') is not there: the variables come next
+        # (SDD §13.3)
+        if kubernetes_name(name):
+            try:
+                values = KubernetesSecretStore(settings.k8s_namespace).read(name) or {}
+            except SecretStoreError as exc:
+                raise SecretNotFound(f"secret {name!r}: {exc}") from None
     if not values:
         source = os.environ if env is None else env
         prefix = _env_prefix(name)
@@ -93,7 +102,7 @@ def resolve_private_key(name: str, settings: Settings, env: Mapping[str, str] | 
 
     Read from ``{secrets_dir}/{name}/private_key`` or ``SEAMLESS_SECRET_{NAME}_PRIVATE_KEY``.
     """
-    if not name or not _NAME.match(name) or name in (".", ".."):
+    if not name or not valid_secret_name(name):
         raise SecretNotFound(f"invalid secret name {name!r}")
     path = Path(settings.secrets_dir) / name / "private_key"
     if path.is_file():

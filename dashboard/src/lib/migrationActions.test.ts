@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, migrationActions, nextStep, type MigrationActionKey } from './migrationActions';
+import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, uncountedReason, type MigrationActionKey } from './migrationActions';
+import { OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+const FORCED = { actor: 'rina', at: '2026-10-08T11:00:00Z', reason: 'The change window closes in 20 minutes', delta_bytes: 2 ** 30, estimated_downtime_s: 320 };
 
 function migration(phase: Phase, overrides: Partial<Migration> = {}, strategy: Strategy = 'warm'): Migration {
   return { ...base, phase, strategy, cutover_requested: false, downtime_started_at: null, downtime_ended_at: null, ...overrides };
@@ -16,8 +18,9 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   blocked: ['cancel'],
   // a warm cutover may be requested before it converged; it starts once it does (SDD §5.4, §16)
   ready: ['approve', 'cutover', 'cancel'],
-  precopy: ['approve', 'cutover', 'cancel'],
-  syncing: ['approve', 'cutover', 'cancel'],
+  // a Force cutover skips convergence while the passes run (SDD §5.4, ADV-16)
+  precopy: ['approve', 'cutover', 'force-cutover', 'cancel'],
+  syncing: ['approve', 'cutover', 'force-cutover', 'cancel'],
   awaiting_cutover: ['approve', 'cutover', 'sync', 'cancel'],
   cutover: ['rollback'],
   verifying: ['rollback'],
@@ -53,6 +56,15 @@ describe('migrationActions rules', () => {
     expect(verifying.reason).toMatch(/completed/i);
   });
 
+  it('keeps Rollback from a completed migration whose finalize began deleting the source, and offers Finalize again (SDD §8.1)', () => {
+    const interrupted = migrationActions(migration('completed', { checkpoint: 'finalizing' }), 'approver');
+    expect(interrupted.rollback.enabled).toBe(false);
+    expect(interrupted.rollback.reason).toBe('The finalize began deleting the source VM: finalize it again.');
+    expect(interrupted.finalize.enabled).toBe(true);
+    // a completed migration whose finalize never began keeps its rollback
+    expect(migrationActions(migration('completed', { checkpoint: 'verified' }), 'approver').rollback.enabled).toBe(true);
+  });
+
   it('lets single-shot strategies cut over from ready (SDD §5.2)', () => {
     expect(migrationActions(migration('ready', {}, 'cold'), 'approver').cutover.enabled).toBe(true);
     // a warm migration may be requested from ready too: it cuts over once pre-copy converged
@@ -68,6 +80,12 @@ describe('migrationActions rules', () => {
     for (const phase of ['cutover', 'verifying', 'completed'] as const) {
       expect(migrationActions(migration(phase), 'approver').approve.reason).toMatch(/cutover has started/i);
     }
+  });
+
+  it('says to validate the plan again instead of cancelling a migration being validated (SDD §5.1)', () => {
+    const cancel = migrationActions(migration('validating'), 'operator').cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toMatch(/being validated: validate the plan again/i);
   });
 
   it('does not request a cutover twice', () => {
@@ -152,6 +170,133 @@ describe('migrationActions rules', () => {
     const warm = nextStep(migration('ready', open), null);
     expect(warm.text).toMatch(/still stopped/i);
     expect(warm.text).not.toMatch(/source VM keeps running/i);
+  });
+
+  it('names the advisor decision as the next step while it waits for approval: nothing starts meanwhile (SDD §5.4, §14.6)', () => {
+    for (const strategy of ['cold', 'warm', 'storage_handover'] as const) {
+      const step = nextStep(migration('ready', { strategy, advisor_hold: 'rec-000000000001' }), null);
+      expect(step.text, strategy).toBe("Ready. Next: approve or override the advisor's decision (admin); nothing starts before that.");
+      expect(step.action, strategy).toBeNull();
+    }
+  });
+
+  it("keeps Approve from the cutover's requester when the plan requires a distinct approver (SDD §5.4, ADV-17)", () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const requested = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: '2026-10-08T11:00:00Z', approvals: [] });
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: true }, now, 'sari').approve).toEqual({ enabled: false, reason: OWN_CUTOVER });
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: true }, now, 'rina').approve.enabled).toBe(true);
+    expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
+    // while the plan is loading, the API's default holds: a distinct approver
+    expect(migrationActions(requested, 'approver', undefined, now, 'sari').approve.enabled).toBe(false);
+  });
+
+  it('counts the approvals the gate counts: all but the requester\'s under a distinct approver (SDD §5.4)', () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const at = '2026-10-08T11:00:00Z';
+    const m = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: at, approvals: [{ actor: 'sari', at, comment: null }, { actor: 'rina', at, comment: 'Checked' }] });
+    expect(countedApprovals(m, { ...plan, require_distinct_approver: true }).map((a) => a.actor)).toEqual(['rina']);
+    expect(countedApprovals(m, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
+    // stored before ADV-17: no requester, every approval counts
+    expect(countedApprovals({ ...m, cutover_requested_by: null }, { ...plan, require_distinct_approver: true })).toHaveLength(2);
+  });
+
+  it('holds the approver who forced the cutover to the requester\'s rule, also when another user requested it (SDD §5.4)', () => {
+    const plan = fx.plans.find((p) => p.id === base.plan_id)!;
+    const at = '2026-10-08T11:00:00Z';
+    const forced = migration('awaiting_cutover', {
+      cutover_requested: true,
+      cutover_requested_by: 'bob',
+      cutover_requested_at: at,
+      force_cutover: { actor: 'sari', at, reason: 'the window closes', delta_bytes: 0, estimated_downtime_s: 60 },
+      approvals: [{ actor: 'sari', at, comment: null }, { actor: 'rina', at, comment: 'Checked' }],
+    });
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const distinct = { ...plan, require_distinct_approver: true };
+    expect(migrationActions(forced, 'approver', distinct, now, 'sari').approve).toEqual({ enabled: false, reason: OWN_FORCE });
+    expect(migrationActions(forced, 'approver', distinct, now, 'rina').approve.enabled).toBe(true);
+    expect(migrationActions(forced, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
+    expect(countedApprovals(forced, distinct).map((a) => a.actor)).toEqual(['rina']);
+    expect(countedApprovals(forced, { ...plan, require_distinct_approver: false }).map((a) => a.actor)).toEqual(['sari', 'rina']);
+    // why an approval does not count (SDD §5.4, §16): the forcer forced it, the requester requested it, and a forcer
+    // who also requested it (the force is the request when none was made) forced it
+    expect([uncountedReason(forced, 'sari'), uncountedReason(forced, 'bob')]).toEqual(['forced the cutover', 'requested the cutover']);
+    expect(uncountedReason({ ...forced, cutover_requested_by: 'sari' }, 'sari')).toBe('forced the cutover');
+  });
+
+  it('says that a requested cutover waits for another approver, and that a request is not an approval (ADV-17)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const waiting = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'sari', cutover_requested_at: '2026-10-08T11:00:00Z', approvals: [] });
+    expect(nextStep(waiting, plan)).toEqual({ text: 'Cutover requested by sari. Next: another approver approves it; keep-warm syncs run meanwhile.', action: 'approve' });
+    // a request stored before ADV-17 names nobody: no 'requested by null'
+    expect(nextStep(migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: null, approvals: [] }), plan).text).not.toMatch(/null/);
+    expect(nextStep(migration('awaiting_cutover', { approvals: [] }), plan).text).toBe(
+      'Converged. Next: an approver requests the cutover and another approves it; keep-warm syncs run meanwhile.',
+    );
+    const cold = migration('ready', { approvals: [], estimate: { ...base.estimate!, downtime_s: 300 } }, 'cold');
+    expect(nextStep(cold, plan).text).toBe('Ready. Next: an approver requests the cutover and another approves it; the source VM stops for about 5 min.');
+    expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
+  });
+
+  it('offers Force cutover to an approver while the passes of a warm migration run, and says why elsewhere (SDD §5.4, ADV-16)', () => {
+    expect(migrationActions(migration('syncing'), 'approver')['force-cutover']).toEqual({ enabled: true, reason: null });
+    expect(migrationActions(migration('precopy'), 'approver')['force-cutover'].enabled).toBe(true);
+    expect(migrationActions(migration('syncing'), 'operator')['force-cutover']).toEqual({ enabled: false, reason: 'Requires the approver role.' });
+    for (const phase of ['ready', 'awaiting_cutover', 'cutover', 'completed'] as const) {
+      expect(migrationActions(migration(phase), 'approver')['force-cutover'], phase).toEqual({
+        enabled: false,
+        reason: 'A Force cutover skips convergence: it applies while pre-copy or delta passes run.',
+      });
+    }
+    expect(migrationActions(migration('ready', {}, 'cold'), 'approver')['force-cutover']).toEqual({ enabled: false, reason: 'Only a warm migration has passes to skip.' });
+    const forced = migration('syncing', { force_cutover: FORCED });
+    expect(migrationActions(forced, 'approver')['force-cutover']).toEqual({ enabled: false, reason: 'Already forced by rina: the cutover follows the running pass.' });
+  });
+
+  it('says a forced cutover follows the running pass, and who approves it (SDD §5.4, ADV-16, ADV-17)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const forced = migration('syncing', { force_cutover: FORCED, cutover_requested: true, cutover_requested_by: 'rina', cutover_requested_at: FORCED.at, approvals: [] });
+    expect(nextStep(forced, plan)).toEqual({ text: 'Cutover forced by rina. Next: another approver approves it; it starts after the running pass.', action: 'approve' });
+    const approved = { ...forced, approvals: [{ actor: 'sari', at: FORCED.at, comment: null }] };
+    expect(nextStep(approved, plan)).toEqual({ text: 'Cutover forced by rina: it starts after the running pass, once the window and a free cutover slot allow.', action: null });
+    expect(nextStep({ ...forced, phase: 'precopy' }, { ...plan, require_approval: false }).text).toBe(
+      'Cutover forced by rina: it starts after the running pass, once the window and a free cutover slot allow.',
+    );
+  });
+
+  it('says how long a completed migration has waited, and asks for finalize past the plan reminder (SDD §8.1, ADV-19)', () => {
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    const completed = (hoursAgo: number) =>
+      migration('completed', {
+        phase_history: [
+          { from_phase: 'cutover', to_phase: 'verifying', at: new Date(now - (hoursAgo + 1) * 3_600_000).toISOString(), reason: '', actor: 'orchestrator' },
+          { from_phase: 'verifying', to_phase: 'completed', at: new Date(now - hoursAgo * 3_600_000).toISOString(), reason: '', actor: 'orchestrator' },
+        ],
+      });
+    const plan = { ...(fx.plans[0] as Plan), finalize_warning_h: 72 };
+    expect(nextStep(completed(10), plan, now)).toEqual({
+      text: 'Verified on RHOSO 10 h ago. Next: finalize to clean up the source (approver), or roll back if needed.',
+      action: 'finalize',
+    });
+    expect(nextStep(completed(80), plan, now)).toEqual({
+      text: 'Verified on RHOSO 3 d ago. It has waited in Completed longer than the plan allows (72 h): finalize it or roll it back.',
+      action: 'finalize',
+    });
+    // longer than, not as long as; the plan sets the reminder
+    expect(nextStep(completed(72), plan, now).text).not.toMatch(/longer than/);
+    expect(nextStep(completed(80), { ...plan, finalize_warning_h: 96 }, now).text).not.toMatch(/longer than/);
+    expect(nextStep(completed(100), { ...plan, finalize_warning_h: 96 }, now).text).toMatch(/allows \(96 h\)/);
+    // without its plan the reminder is unknown, so nothing is claimed
+    expect(nextStep(completed(80), null, now).text).not.toMatch(/longer than/);
+    // the source runs again: no finalize advice until it is stopped (SDD §8.1)
+    expect(nextStep({ ...completed(80), source_running_at: '2026-10-08T11:00:00Z' }, plan, now)).toEqual({
+      text: 'The source VM runs again, so its data diverges from RHOSO. Next: stop it in the source cloud, or roll it back; finalize once it is stopped.',
+      action: null,
+    });
+    // no transition into Completed recorded: no time is claimed either
+    expect(nextStep(migration('completed', { phase_history: [] }), plan, now).text).toBe(
+      'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.',
+    );
   });
 
   it('names the next step', () => {

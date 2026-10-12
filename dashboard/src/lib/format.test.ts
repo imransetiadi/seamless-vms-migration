@@ -8,7 +8,19 @@ import {
   formatPct,
   formatRate,
   formatRelative,
+  pyRepr,
 } from './format';
+
+describe('pyRepr', () => {
+  it("quotes a name as the API's messages do (Python's repr of a str)", () => {
+    expect(pyRepr('tenant-web')).toBe("'tenant-web'");
+    expect(pyRepr("bob's-net")).toBe('"bob\'s-net"');
+    expect(pyRepr('say "hi"')).toBe('\'say "hi"\'');
+    expect(pyRepr('both \' and "')).toBe("'both \\' and \"'");
+    expect(pyRepr('back\\slash')).toBe("'back\\\\slash'");
+    expect(pyRepr('tab\there')).toBe("'tab\\there'");
+  });
+});
 
 describe('formatBytes (IEC units)', () => {
   it('renders an em dash for missing or non-finite values', () => {
@@ -145,5 +157,24 @@ describe('formatDateTime / formatNumber', () => {
   it('groups thousands', () => {
     expect(formatNumber(1234567)).toBe('1,234,567');
     expect(formatNumber(null)).toBe('—');
+  });
+
+  it('builds one number formatter per precision, not one per call (tables redraw on live events)', () => {
+    const Original = Intl.NumberFormat;
+    let built = 0;
+    // a counting stand-in for the constructor; the real formatter does the work
+    const Counting = function (this: unknown, ...args: ConstructorParameters<typeof Intl.NumberFormat>) {
+      built += 1;
+      return new Original(...args);
+    } as unknown as typeof Intl.NumberFormat;
+    Intl.NumberFormat = Counting;
+    try {
+      const out = [];
+      for (let i = 0; i < 50; i += 1) out.push(formatNumber(1234.5678 + i), formatNumber(1234.5678 + i, 2));
+      expect(out.slice(0, 2)).toEqual(['1,235', '1,234.57']);
+      expect(built).toBeLessThanOrEqual(2);
+    } finally {
+      Intl.NumberFormat = Original;
+    }
   });
 });

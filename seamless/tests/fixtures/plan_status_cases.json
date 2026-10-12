@@ -1,0 +1,168 @@
+{
+ "_comment": "The plan status every view shows (SDD §8.1, ADV-19), shared by seamless/tests/test_plan_status.py and dashboard/src/api/mockPlanStatus.test.ts. Each case: the stored lifecycle status and the phases of the plan's migrations -> the derived status.",
+ "cases": [
+  {
+   "stored": "draft",
+   "phases": [
+    "finalized"
+   ],
+   "expected": "draft",
+   "note": "1. a draft plan is a draft (an edited plan is validated again), whatever its migrations did"
+  },
+  {
+   "stored": "validated",
+   "phases": [],
+   "expected": "validated",
+   "note": "2. no migration: the stored status"
+  },
+  {
+   "stored": "running",
+   "phases": [],
+   "expected": "running"
+  },
+  {
+   "stored": "running",
+   "phases": [
+    "completed",
+    "syncing"
+   ],
+   "expected": "running",
+   "note": "3. a migration at work: running, or paused when the plan is"
+  },
+  {
+   "stored": "paused",
+   "phases": [
+    "awaiting_cutover",
+    "ready"
+   ],
+   "expected": "paused"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "cutover"
+   ],
+   "expected": "running",
+   "note": "re-validated while a cutover still ran"
+  },
+  {
+   "stored": "running",
+   "phases": [
+    "rolling_back"
+   ],
+   "expected": "running"
+  },
+  {
+   "stored": "running",
+   "phases": [
+    "completed",
+    "ready"
+   ],
+   "expected": "running",
+   "note": "4. a running or paused plan with a migration still to start keeps its status"
+  },
+  {
+   "stored": "paused",
+   "phases": [
+    "ready",
+    "failed"
+   ],
+   "expected": "paused"
+  },
+  {
+   "stored": "running",
+   "phases": [
+    "completed",
+    "failed"
+   ],
+   "expected": "failed",
+   "note": "5. a failed migration, nothing at work"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "failed",
+    "ready"
+   ],
+   "expected": "failed"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed",
+    "completed"
+   ],
+   "expected": "completed",
+   "note": "the demo's DC2 plan after a re-validation"
+  },
+  {
+   "stored": "completed",
+   "phases": [
+    "completed",
+    "finalized",
+    "rolled_back"
+   ],
+   "expected": "completed",
+   "note": "6. all done: completed while one awaits finalize, else finalized"
+  },
+  {
+   "stored": "completed",
+   "phases": [
+    "finalized",
+    "rolled_back"
+   ],
+   "expected": "finalized"
+  },
+  {
+   "stored": "completed",
+   "phases": [
+    "rolled_back"
+   ],
+   "expected": "completed",
+   "note": "nothing migrated: nothing to finalize"
+  },
+  {
+   "stored": "completed",
+   "phases": [
+    "finalized",
+    "cancelled"
+   ],
+   "expected": "finalized",
+   "note": "cancelled migrations do not count"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "cancelled"
+   ],
+   "expected": "validated"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "ready",
+    "blocked"
+   ],
+   "expected": "validated",
+   "note": "7. otherwise the stored status"
+  },
+  {
+   "stored": "failed",
+   "phases": [
+    "ready"
+   ],
+   "expected": "failed",
+   "note": "pre-staging failed (SDD §8)"
+  }
+ ]
+}

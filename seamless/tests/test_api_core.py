@@ -1,3 +1,4 @@
+import inspect
 import re
 
 import pytest
@@ -5,8 +6,9 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, Role
-from seamless_migrate.store import Store
+from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, ROLES, SOURCE, Api, api_settings
+from tests.factories import make_migration
 
 
 @pytest.fixture
@@ -25,7 +27,14 @@ def test_health_public_reports_db(api, monkeypatch):
     assert res.status_code == 200
     body = res.json()
     orchestrator = body.pop("orchestrator")
-    assert body == {"status": "ok", "version": "0.1.0", "demo": True, "db": "ok"}
+    # demo_speed: the dashboard runs a demo's downtime clock in model time (SDD §12, ADV-16)
+    assert body == {
+        "status": "ok",
+        "version": "0.1.0",
+        "demo": True,
+        "demo_speed": 1e7,
+        "db": "ok",
+    }
     assert orchestrator["running"] is True and orchestrator["healthy"] is True
     assert orchestrator["ticks"] >= 0
     assert orchestrator["last_tick_age_s"] is None or orchestrator["last_tick_age_s"] >= 0
@@ -295,13 +304,13 @@ def test_metrics_format(api, tmp_path):
 def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     svc = api.client.app.state.services
     assert api.get("/api/v1/stats").status_code == 200
-    migrations_list = svc._doc_cache["migration"][1]
-    plans_list = svc._doc_cache["plan"][1]
+    migrations_list = svc._doc_cache["migration"].rows
+    plans_list = svc._doc_cache["plan"].rows
     assert api.get("/api/v1/metrics").status_code == 200
     assert api.get("/api/v1/stats?plan_id=plan-x").status_code == 200
     # nothing changed: the same list objects served every call (no reload)
-    assert svc._doc_cache["migration"][1] is migrations_list
-    assert svc._doc_cache["plan"][1] is plans_list
+    assert svc._doc_cache["migration"].rows is migrations_list
+    assert svc._doc_cache["plan"].rows is plans_list
     # a new plan document moves the stamp of "plan" only
     assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
     assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
@@ -317,9 +326,44 @@ def test_stats_and_metrics_reuse_the_document_cache_until_a_change(api):
     )
     assert created.status_code == 201, created.text
     assert api.get("/api/v1/stats").status_code == 200
-    assert svc._doc_cache["plan"][1] is not plans_list
-    assert [p.id for p in svc._doc_cache["plan"][1]] == [created.json()["id"]]
-    assert svc._doc_cache["migration"][1] is migrations_list
+    assert svc._doc_cache["plan"].rows is not plans_list
+    assert [p.id for p in svc._doc_cache["plan"].rows] == [created.json()["id"]]
+    assert svc._doc_cache["migration"].rows is migrations_list
+
+
+def test_the_document_cache_reloads_only_the_documents_that_changed(api, monkeypatch):
+    """SDD §11: during a run a write lands every second; /stats reloads that document, not all."""
+    svc = api.client.app.state.services
+    kept, changed, gone = (make_migration() for _ in range(3))
+    for m in (kept, changed, gone):
+        api.store.put("migration", m)
+    assert api.get("/api/v1/stats").json()["total"] == 3
+    before = {m.id: m for m in svc._doc_cache["migration"].rows}
+
+    api.store.put(
+        "migration", changed.model_copy(update={"phase": Phase.syncing}), expected_version=1
+    )
+    api.store.delete("migration", gone.id)
+    added = make_migration()
+    api.store.put("migration", added)
+    # what the API's cache loads (the orchestrator's tick, in the same app, has a cache of its own)
+    loaded: list[str] = []
+    real_get_many = AsyncStore.get_many
+
+    async def counting_get_many(self, kind, ids, model_cls):
+        if any(f.filename.endswith("deps.py") for f in inspect.stack(0)):
+            loaded.extend(ids)
+        return await real_get_many(self, kind, ids, model_cls)
+
+    monkeypatch.setattr(AsyncStore, "get_many", counting_get_many)
+    stats = api.get("/api/v1/stats").json()
+
+    after = svc._doc_cache["migration"].rows
+    assert [m.id for m in after] == [kept.id, changed.id, added.id]  # creation order
+    assert after[0] is before[kept.id]  # not reloaded
+    assert after[1].phase == Phase.syncing
+    assert sorted(loaded) == sorted([changed.id, added.id])
+    assert stats["total"] == 3 and stats["by_phase"].get("syncing") == 1
 
 
 def test_stats_shape(api):
@@ -337,6 +381,9 @@ def test_stats_shape(api):
         "p95_downtime_s",
         "max_downtime_s",
         "slo_compliance_pct",
+        "data_inconsistent",
+        "awaiting_finalize",
+        "finalized",
         "downtime_by_strategy",
         "throughput_series",
     }
@@ -350,9 +397,27 @@ def test_stats_shape(api):
 def test_advisor_status_and_similar_incidents_without_memory(api):
     status = api.get("/api/v1/advisor/status").json()
     assert status == {
-        "jev": {"mode": "off", "available": False, "last_error": None},
+        "jev": {
+            "mode": "off",
+            "available": False,
+            "last_error": None,
+            # ADV-06 (SDD §13.4): where the model runs, and whether the console may go there
+            "deployment": "remote",
+            "endpoint_host": None,
+            "console_sent": False,
+        },
         "memory": {"enabled": False, "available": False, "last_error": None},
     }
+    sent = api.get("/api/v1/advisor/data-sent").json()["items"]
+    assert [(i["decision_type"], i["tool"]) for i in sent] == [
+        ("migration_strategy", "jev_decide"),
+        ("workload_tier", "jev_classify"),
+        ("verification_review", "jev_verify"),
+        ("console_screening", "jev_screen"),
+    ]
+    assert all(i["sent"] is False for i in sent), "Jev is off: nothing is sent"
+    keys = [f["key"] for f in sent[0]["fields"]]
+    assert "estimates" in keys and all(f["label"] for f in sent[0]["fields"])
     res = api.post("/api/v1/advisor/similar-incidents", Role.operator, json={"query": "x"})
     assert res.status_code == 200 and res.json() == {"hits": []}
 
@@ -375,6 +440,26 @@ def test_spa_fallback_serves_index(tmp_path):
         api_404 = client.get("/api/v1/does-not-exist")
         assert api_404.status_code == 404 and api_404.json()["error"]["code"] == "not_found"
         assert "nope" not in client.get("/..%2Fsecret.txt").text
+    store.dispose()
+
+
+def test_a_wrong_method_on_an_api_route_is_405_where_the_dashboard_is_served(tmp_path):
+    """SDD §12: 405 `method_not_allowed` for a method an API route does not take - the
+    dashboard's GET fallback must not turn a GET on a POST-only route into a 404."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><title>Seamless</title>")
+    settings, _ = api_settings(tmp_path, dashboard_dir=dist)
+    store = Store(f"sqlite:///{tmp_path / 'spa405.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/api/v1/plans/plan-00000001/start", "/api/v1/migrations/mig-1/cutover"):
+            res = client.get(path)
+            assert (res.status_code, res.json()["error"]["code"]) == (405, "method_not_allowed")
+        # an unknown API path stays 404, the dashboard's own routes stay the dashboard
+        missing = client.get("/api/v1/does-not-exist")
+        assert (missing.status_code, missing.json()["error"]["code"]) == (404, "not_found")
+        assert client.get("/plans/plan-00000001").status_code == 200
     store.dispose()
 
 
@@ -479,7 +564,11 @@ def test_security_headers_and_api_docs_exposure(tmp_path):
             assert res.headers["x-content-type-options"] == "nosniff", path
             assert res.headers["x-frame-options"] == "DENY"
             assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
-            assert "fonts.gstatic.com" in res.headers["content-security-policy"]
+            # the dashboard bundles its fonts (SDD §16): fonts and styles come from this server only
+            csp = res.headers["content-security-policy"]
+            directives = dict(d.strip().split(" ", 1) for d in csp.split(";"))
+            assert directives["font-src"] == "'self'", path
+            assert directives["style-src"] == "'self' 'unsafe-inline'", path
         docs = client.get("/api/docs")
         assert docs.status_code == 200 and "swagger" in docs.text.lower()
         csp = docs.headers["content-security-policy"]
@@ -624,3 +713,68 @@ async def test_body_limit_counts_streamed_chunks():
         await BodyLimitMiddleware(inner, max_bytes=10)(scope, receive, send)
     assert refused.value.status_code == 413
     assert seen == [4, 4]  # the third chunk (12 > 10 bytes) never reached the app
+
+
+@pytest.mark.parametrize(
+    ("where", "console"),
+    [
+        ({}, False),  # remote by default: the console excerpt stays local (SDD §13.4)
+        ({"jev_deployment": "on_prem", "jev_endpoint_host": "jev.dc1.example.internal"}, True),
+        ({"console_screening_send_to_remote": True}, True),
+    ],
+)
+def test_the_advisor_says_where_its_model_runs_and_what_it_receives(tmp_path, where, console):
+    """ADV-06: with Jev on, the status names the deployment and the console's fate; the data-sent
+    listing agrees."""
+    settings, tokens = api_settings(
+        tmp_path, jev_mode="http", jev_url="http://jev.invalid:8080/mcp", **where
+    )
+    store = Store(f"sqlite:///{tmp_path / 'where.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        api = Api(client, store, settings, tokens)
+        jev = api.get("/api/v1/advisor/status").json()["jev"]
+        assert (jev["deployment"], jev["endpoint_host"], jev["console_sent"]) == (
+            where.get("jev_deployment", "remote"),
+            where.get("jev_endpoint_host"),
+            console,
+        )
+        items = {
+            i["decision_type"]: i for i in api.get("/api/v1/advisor/data-sent").json()["items"]
+        }
+        assert items["migration_strategy"]["sent"] is True
+        assert items["console_screening"]["sent"] is console
+        verify_keys = [f["key"] for f in items["verification_review"]["fields"]]
+        assert ("console" in verify_keys) is console
+    store.dispose()
+
+
+def test_plans_refuse_a_resource_they_cannot_pre_stage(api):
+    """SDD §4.2, §12: POST and PATCH /plans refuse a pre-stage name without an export/import
+    playbook pair (422); "flavors" is accepted."""
+    assert api.post("/api/v1/providers", json=SOURCE).status_code == 201
+    assert api.post("/api/v1/providers", json=DESTINATION).status_code == 201
+    body = {
+        "name": "prestage",
+        "source_provider_id": SOURCE["id"],
+        "destination_provider_id": DESTINATION["id"],
+        "vm_ids": ["vm-1"],
+    }
+    refused = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "prestage_resources": ["flavours"]}
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"] == {
+        "code": "validation_error",
+        "message": "prestage_resources: cannot pre-stage 'flavours'",
+    }
+    created = api.post(
+        "/api/v1/plans", Role.operator, json={**body, "prestage_resources": ["networks", "flavors"]}
+    )
+    assert created.status_code == 201, created.text
+    patched = api.client.patch(
+        f"/api/v1/plans/{created.json()['id']}",
+        headers=api.h(Role.operator),
+        json={"prestage_resources": ["workloads"]},
+    )
+    assert patched.status_code == 422 and "'workloads'" in patched.json()["error"]["message"]

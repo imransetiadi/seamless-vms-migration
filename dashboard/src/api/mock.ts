@@ -11,10 +11,19 @@
  * (429); any other token is rejected with 401. Every refusal is audited as `auth.denied` like the API.
  */
 import { DEFAULT_API_BASE } from './client';
+import { forcedDowntime } from '../lib/forcedEstimate';
 import { canTransition, hasDataPath } from '../lib/fsm';
-import { hasRole } from '../lib/roles';
+import { guestOsOf } from '../lib/guestOs';
+import { capabilityRoles } from '../lib/networks';
+import { canonicalIp, isIpAddress } from '../lib/nics';
+import { blocksPlanChange, inFlightRefusal } from '../lib/inFlight';
+import { countedApprovals } from '../lib/migrationActions';
+import { resolvePolicy } from '../lib/policies';
+import { probesFor } from '../lib/probes';
+import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
+import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import {
   buildFixtures,
   defaultPlanFields,
@@ -22,13 +31,35 @@ import {
   estimate,
   GiB,
   iso,
+  JEV_MIN_CONFIDENCE,
   MiB,
   preflight,
   prng,
+  auditEventsOf,
+  decisionEventOf,
+  humanDecision,
+  strategyRecommendation,
+  strategySnapshot,
+  type StrategyDecision,
 } from './mockData';
+import { buildStrategyEvidence, evidenceCount } from './mockEvidence';
+import { derivePlanStatus } from './mockPlanStatus';
+import { isDatabase, suggestProbes } from './mockProbes';
 import type {
+  AppProbe,
   Health,
+  ProbeKind,
+  ProbeResult,
+  VerificationCheck,
+  AdvisorPolicy,
+  AdvisorPolicySpec,
+  AdvisorRecommendation,
+  ReasonCode,
+  AdvisorSnapshot,
   AdvisorStatus,
+  ConvergedBy,
+  DataSentItem,
+  DecisionType,
   DestinationInventory,
   Estimate,
   Event,
@@ -38,6 +69,7 @@ import type {
   Plan,
   PlanCreate,
   Provider,
+  RecommendationPage,
   Role,
   Stats,
   Strategy,
@@ -46,7 +78,26 @@ import type {
   VMRef,
   Wave,
 } from './types';
-import { ACTION_TEXT_MAX, PHASES, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, STRATEGIES, SYNC_PASSES_LATEST } from './types';
+import {
+  ACTION_TEXT_MAX,
+  ADVISOR_LIMIT_MAX,
+  ADVISOR_QUERY_MAX,
+  AUDIT_EVENT_KINDS,
+  DECISION_TYPES,
+  FORCE_REASON_MIN,
+  MAX_PROBE_PATH,
+  MAX_PROBES_PER_VM,
+  OVERRIDE_REASON_MIN,
+  PHASES,
+  POLICY_MODES,
+  PLAN_DESCRIPTION_MAX,
+  PLAN_NAME_MAX,
+  PROBE_KINDS,
+  RECOMMENDATION_LIMIT_DEFAULT,
+  RECOMMENDATION_LIMIT_MAX,
+  STRATEGIES,
+  SYNC_PASSES_LATEST,
+} from './types';
 
 interface MockResponse {
   status: number;
@@ -69,6 +120,10 @@ const SINGLE_SHOT: ReadonlySet<Strategy> = new Set(['cold', 'storage_handover', 
 /** orchestrator.APPROVABLE and CUTOVER_REQUESTABLE (SDD §5.4). */
 const APPROVABLE: ReadonlySet<Phase> = new Set(['pending', 'validating', 'blocked', 'ready', 'precopy', 'syncing', 'awaiting_cutover', 'failed', 'rolled_back']);
 const CUTOVER_REQUESTABLE: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
+/** A migration in these stopped its source (its cutover did, SDD §8.1). */
+const STOPPED_SOURCE: ReadonlySet<Phase> = new Set(['cutover', 'verifying', 'completed', 'finalized']);
+/** orchestrator.FORCEABLE (SDD §5.4, ADV-16). */
+const FORCEABLE: ReadonlySet<Phase> = new Set(['precopy', 'syncing']);
 const SIMPLICITY: Record<Strategy, number> = { cold: 0, storage_handover: 1, warm: 2, vmware_cold: 0, vmware_warm: 1 };
 const MAX_EVENTS = 5000;
 
@@ -95,14 +150,383 @@ function percentile(sorted: number[], p: number): number | null {
 export interface MockServerOptions {
   now?: () => number;
   seed?: number;
+  /**
+   * The advisor's answer on an automatic choice between the strategies of `scope` (jev_decide in the
+   * API, SDD §14.2); a null option and confidence is no answer. Defaults to `simulatedAdvice`.
+   */
+  advise?: (vm: VMRef, scope: readonly Strategy[], estimates: readonly Estimate[]) => SimulatedAdvice;
+}
+
+export interface SimulatedAdvice {
+  option: string | null;
+  confidence: number | null;
+}
+
+/**
+ * Demo mode's stand-in for Jev: the scope's shortest downtime at a confidence of 0.50-0.94 that
+ * depends on the VM alone, so it is the same every time and never draws from the seeded stream.
+ */
+export function simulatedAdvice(vm: VMRef, scope: readonly Strategy[], estimates: readonly Estimate[]): SimulatedAdvice {
+  let hash = 2166136261; // FNV-1a over the VM id
+  for (const char of vm.source_id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0;
+  const downtime = (s: Strategy) => estimates.find((e) => e.strategy === s)?.downtime_s ?? Infinity;
+  const option = [...scope].sort((a, b) => downtime(a) - downtime(b))[0] ?? null;
+  return { option, confidence: 0.5 + (hash % 45) / 100 };
+}
+
+/** selector.advisor_scope (SDD §9.2, §14.2): the strategies the advisor may choose between; empty = no advice. */
+function advisorScope(estimates: readonly Estimate[], policy: Plan['selection_policy']): Strategy[] {
+  const eligible = estimates.filter((e) => e.eligible);
+  if (!eligible.length) return [];
+  const bySimplicity = (list: Estimate[]) => list.map((e) => e.strategy).sort((a, b) => SIMPLICITY[a] - SIMPLICITY[b]);
+  if (!eligible.some((e) => e.meets_slo)) return bySimplicity(eligible);
+  if (policy === 'simplest_meeting_slo') return [];
+  const best = Math.min(...eligible.map((e) => e.downtime_s));
+  const ties = eligible.filter((e) => e.downtime_s - best < Math.max(60, best * 0.1));
+  return ties.length >= 2 ? bySimplicity(ties) : [];
+}
+
+/**
+ * What the API's serializers send (GET /advisor/data-sent, SDD §13.4): the server generates it from its field
+ * specs; the mock repeats it for a remote model whose console stays local.
+ */
+const LOCAL_CONSOLE = 'The console excerpt stays in this installation: the advisor is remote and SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE is off.';
+const DATA_SENT: DataSentItem[] = [
+  {
+    decision_type: 'migration_strategy',
+    tool: 'jev_decide',
+    fields: [
+      { key: 'decision', label: 'The question, naming the VM' },
+      { key: 'vm', label: 'VM name, vCPU, RAM and number of disks' },
+      { key: 'disks', label: 'Each disk: kind, size, volume type, multi-attach, encrypted, independent' },
+      { key: 'size', label: 'Provisioned and used size' },
+      { key: 'write_rate', label: 'Guest write rate, measured or assumed' },
+      { key: 'slo', label: "The plan's downtime SLO" },
+      { key: 'link', label: "The plan's link bandwidth" },
+      { key: 'findings', label: 'Pre-flight finding codes and severities' },
+      { key: 'estimates', label: 'Per strategy: downtime, pre-copy, passes and eligibility with its reasons' },
+      { key: 'priorities', label: "Minimize downtime within the plan's SLO; the simpler strategy on near ties" },
+      { key: 'candidates', label: 'The eligible strategies with their descriptions' },
+      { key: 'requirements', label: 'The two requirements every strategy must meet' },
+    ],
+    sent: true,
+    note: null,
+  },
+  {
+    decision_type: 'workload_tier',
+    tool: 'jev_classify',
+    fields: [
+      { key: 'id', label: "The item's place in the batch (item-1, item-2 …), not the VM's id" },
+      { key: 'name', label: 'VM name' },
+      { key: 'os', label: 'Guest OS' },
+      { key: 'tags', label: 'Tags' },
+      { key: 'disks', label: 'Disk sizes' },
+      { key: 'flavor', label: 'Flavor, or vCPU and RAM' },
+    ],
+    sent: true,
+    note: null,
+  },
+  {
+    decision_type: 'verification_review',
+    tool: 'jev_verify',
+    fields: [
+      { key: 'claims', label: 'The two boot claims to verify' },
+      { key: 'checks', label: 'Each verification check: name, result and detail' },
+    ],
+    sent: true,
+    note: LOCAL_CONSOLE,
+  },
+  { decision_type: 'console_screening', tool: 'jev_screen', fields: [{ key: 'console', label: 'The last 6,000 characters of the console, redacted' }], sent: false, note: LOCAL_CONSOLE },
+];
+
+/** Drop the cutover request with its requester and the window bypass granted with it (SDD §5.4). */
+function clearRequest(m: Migration): void {
+  m.cutover_requested = false;
+  m.cutover_requested_by = null;
+  m.cutover_requested_at = null;
+  m.force_window = false;
+  // a Force cutover belongs to the request too (ADV-16)
+  m.force_cutover = null;
+}
+
+/** The API's `_probe_problems` (SDD §12, ADV-18): the application probes it refuses, with its words. */
+function probeProblemsOf(where: string, value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const probes = value as Array<Partial<AppProbe>>;
+  const problems = probes.filter((p) => !PROBE_KINDS.includes(p.kind as ProbeKind)).map((p) => `${where}: kind ${JSON.stringify(p.kind)} is not one of tcp, http, https`);
+  problems.push(...probes.filter((p) => typeof p.port !== 'number' || p.port < 1 || p.port > 65535).map((p) => `${where}: port ${String(p.port)} outside 1-65535`));
+  problems.push(
+    ...probes
+      .filter((p) => p.kind !== 'tcp' && typeof p.path === 'string' && (!p.path.startsWith('/') || p.path.length > MAX_PROBE_PATH))
+      .map((p) => `${where}: path ${JSON.stringify(p.path)} must start with '/' (at most ${MAX_PROBE_PATH} characters)`),
+  );
+  problems.push(
+    ...probes
+      .filter((p) => typeof p.expect_status === 'number' && (p.expect_status < 100 || p.expect_status > 599))
+      .map((p) => `${where}: expect_status ${String(p.expect_status)} outside 100-599`),
+  );
+  if (probes.length > MAX_PROBES_PER_VM) problems.push(`${where}: ${probes.length} probes, at most ${MAX_PROBES_PER_VM}`);
+  return problems;
+}
+
+/** The API's `PLAN_EDITABLE_FIELDS` (SDD §12): what a `PlanCreate` and a PATCH may carry. */
+export const PLAN_EDITABLE_FIELDS: ReadonlySet<string> = new Set([
+  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'created_at', 'updated_at'].includes(key)),
+  'name',
+  'source_provider_id',
+  'destination_provider_id',
+  'vm_ids',
+]);
+
+/** Python's `repr` of a list of numbers, as the API's messages print one. */
+function pyList(values: number[]): string {
+  return `[${values.join(', ')}]`;
+}
+
+/**
+ * The API's `check_plan_spec` after the text lengths (SDD §12), on the plan it would store: a VM listed twice, then
+ * the settings that would fail every verification or never open the cutover gate (`invalid_plan_settings`), in its
+ * order and words.
+ */
+/** What a plan may pre-stage, as the API's PRESTAGE_RESOURCES (SDD §4.2): the collection's playbook pairs, never workloads. */
+const PRESTAGE_RESOURCES = [
+  'networks', 'subnets', 'routers', 'router_interfaces', 'security_groups', 'security_group_rules',
+  'flavors', 'keypairs', 'images', 'projects', 'users', 'users_keypairs', 'user_project_role_assignments', 'detached_volumes',
+];
+
+function refusePlanSpec(spec: Record<string, unknown>): void {
+  const ids = Array.isArray(spec.vm_ids) ? (spec.vm_ids as string[]) : [];
+  const counts = new Map<string, number>();
+  for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+  const repeated = [...counts].filter(([, n]) => n > 1).map(([id]) => id).sort();
+  if (repeated.length) throw new HttpError(422, 'validation_error', `vm_ids lists a VM more than once: ${repeated.slice(0, 10).join(', ')}`);
+  const verification = (spec.verification ?? {}) as { tcp_ports?: unknown; windows_tcp_ports?: unknown; timeout_s?: unknown; app_probes?: unknown };
+  const problems: string[] = [];
+  for (const name of ['tcp_ports', 'windows_tcp_ports'] as const) {
+    const ports = Array.isArray(verification[name]) ? (verification[name] as number[]) : [];
+    const bad = ports.filter((port) => !(port >= 1 && port <= 65535));
+    if (bad.length) problems.push(`verification.${name} ${pyList(bad)} outside 1-65535`);
+  }
+  if (typeof verification.timeout_s === 'number' && verification.timeout_s < 0) {
+    problems.push(`verification.timeout_s must not be negative (got ${verification.timeout_s})`);
+  }
+  problems.push(...probeProblemsOf('verification.app_probes', verification.app_probes));
+  const overrides = (spec.probe_overrides ?? {}) as Record<string, unknown>;
+  problems.push(...Object.entries(overrides).flatMap(([vmId, probes]) => probeProblemsOf(`probe_overrides[${vmId}]`, probes)));
+  // like the API (SDD §12): what makes a NIC override unusable, named by VM and MAC
+  const nicOverrides = (spec.nic_overrides ?? {}) as Record<string, Record<string, { network?: string | null; fixed_ips?: string[] | null }>>;
+  for (const [vmId, nics] of Object.entries(nicOverrides)) {
+    for (const mac of Object.keys(nics ?? {}).sort()) {
+      const entry = nics[mac] ?? {};
+      const where = `nic_overrides[${vmId}][${mac}]`;
+      const network = entry.network ?? null;
+      const ips = entry.fixed_ips ?? null;
+      if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac)) problems.push(`${where}: not a MAC address`);
+      if (network === null && ips === null) problems.push(`${where}: give a network, addresses or both`);
+      if (network !== null && !network.trim()) problems.push(`${where}: network must not be empty`);
+      if (ips === null) continue;
+      if (!ips.length) problems.push(`${where}: fixed_ips must list at least one address (leave it out to keep the NIC's own)`);
+      const bad = ips.filter((a) => !isIpAddress(a));
+      if (bad.length) problems.push(`${where}: not an IP address: ${bad.join(', ')}`);
+      const twice = [...new Set(ips.filter((a, i) => ips.indexOf(a) !== i))].sort();
+      if (twice.length) problems.push(`${where}: ${twice.join(', ')} given twice`);
+    }
+  }
+  const prestage = Array.isArray(spec.prestage_resources) ? (spec.prestage_resources as string[]) : [];
+  const unknown = prestage.filter((r) => !PRESTAGE_RESOURCES.includes(r));
+  if (unknown.length) problems.push(`prestage_resources: cannot pre-stage ${unknown.map((r) => `'${r}'`).join(', ')}`);
+  if (spec.port_creation_mode !== undefined && !['nova', 'neutron'].includes(spec.port_creation_mode as string))
+    problems.push("port_creation_mode: Input should be 'nova' or 'neutron'");
+  const window = spec.cutover_window as { start?: string; end?: string } | null | undefined;
+  if (window?.start && window.end && Date.parse(window.end) <= Date.parse(window.start)) problems.push('cutover_window: end must be after start');
+  if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+}
+
+/**
+ * Like the API's model (SDD §4.2): NIC override keys are stored lower case, each entry with both fields and its valid
+ * addresses in their canonical form ("FD00:0::0005" is "fd00::5"), before anything is checked.
+ */
+function withCanonicalNicOverrides(input: Record<string, unknown>): Record<string, unknown> {
+  if (!input.nic_overrides || typeof input.nic_overrides !== 'object') return input;
+  const overrides = input.nic_overrides as Record<string, Record<string, { fixed_ips?: unknown }>>;
+  const canonical = (entry: { fixed_ips?: unknown }) =>
+    Array.isArray(entry.fixed_ips) ? { ...entry, fixed_ips: entry.fixed_ips.map((a) => (typeof a === 'string' ? canonicalIp(a) : a)) } : entry;
+  return {
+    ...input,
+    nic_overrides: Object.fromEntries(
+      Object.entries(overrides).map(([vm, nics]) => [
+        vm,
+        Object.fromEntries(Object.entries(nics ?? {}).map(([mac, entry]) => [mac.toLowerCase(), { network: null, fixed_ips: null, ...canonical(entry ?? {}) }])),
+      ]),
+    ),
+  };
+}
+
+/**
+ * The simulated guest's answer to an application probe, like the demo's fake destination (SDD §7.4):
+ * it runs its suggested services and SSH (RDP on Windows); `demo-fault: app-down` runs none of its own.
+ */
+function simulatedProbe(vm: VMRef, probe: AppProbe, address: string, at: string): ProbeResult {
+  const listening = new Set([guestOsOf(vm).family === 'windows' ? 3389 : 22]);
+  if (vm.tags['demo-fault'] !== 'app-down') for (const p of suggestProbes(vm)) listening.add(p.port);
+  const target = probe.kind === 'tcp' ? `${address}:${probe.port}` : `${probe.kind}://${address}:${probe.port}${probe.path}`;
+  if (!listening.has(probe.port)) return { target, kind: probe.kind, result: 'failed', latency_ms: null, at, detail: `${address}:${probe.port} refused the connection` };
+  if (probe.kind === 'tcp') return { target, kind: probe.kind, result: 'passed', latency_ms: 3, at, detail: `connected to ${address}:${probe.port}` };
+  const ok = probe.expect_status === null || probe.expect_status === 200;
+  return { target, kind: probe.kind, result: ok ? 'passed' : 'failed', latency_ms: 3, at, detail: ok ? 'HTTP 200' : `HTTP 200, expected ${probe.expect_status}` };
+}
+
+/** The phase-history reason of a rule, like the API's _converged (SDD §5.3). */
+function convergedReason(m: Migration, plan: Plan, rule: ConvergedBy): string {
+  switch (rule) {
+    case 'force':
+      return `Force cutover by ${m.force_cutover?.actor ?? 'an approver'}: ${m.force_cutover?.reason ?? ''}`;
+    case 'threshold':
+      return 'converged: last pass below the threshold';
+    case 'slo':
+      return 'converged: the estimated downtime fits the SLO';
+    case 'max_passes':
+      return `max_sync_passes (${plan.max_sync_passes}) reached`;
+  }
+}
+
+/**
+ * The rule that ends the passes after `pass`, in the API's order (SDD §5.3, §5.4): a Force cutover, the
+ * threshold (not for CBT passes), the pass limit. The mock leaves out the SLO rule: its passes run in
+ * seconds, which would converge every VM after its full copy and leave the chart without deltas.
+ */
+function convergedBy(m: Migration, plan: Plan, pass: SyncPass): ConvergedBy | null {
+  if (m.force_cutover) return 'force';
+  if (m.strategy !== 'vmware_warm' && pass.bytes_changed <= plan.convergence_threshold_bytes) return 'threshold';
+  return m.sync_passes.length >= plan.max_sync_passes ? 'max_passes' : null;
+}
+
+/** knowledge.size_bucket: the profile bucket a memory query names (SDD §14.3). */
+function sizeBucket(diskBytes: number): string {
+  const gib = diskBytes / 2 ** 30;
+  if (gib < 50) return '<50G';
+  if (gib < 200) return '50-200G';
+  return gib <= 500 ? '200-500G' : '>500G';
+}
+
+/** The part of a policy decide() needs (SDD §14.4, §14.6). */
+interface PolicyRule {
+  id: string;
+  mode: AdvisorPolicy['mode'];
+  threshold: number;
+  min_evidence_for_auto_apply: number;
+  require_override_reason: boolean;
+  require_distinct_approver: boolean;
+}
+
+const GLOBAL_DEFAULT: PolicyRule = {
+  id: 'global-default',
+  mode: 'auto_apply_above_threshold',
+  threshold: JEV_MIN_CONFIDENCE,
+  min_evidence_for_auto_apply: 0,
+  require_override_reason: false,
+  require_distinct_approver: true,
+};
+
+/** The policy in force for a plan's strategy decisions (SDD §14.6), or the built-in default. */
+function policyFor(policies: readonly AdvisorPolicy[], plan: Plan): PolicyRule {
+  const winner = resolvePolicy(policies, plan.id, plan.source_provider_id, 'migration_strategy');
+  return winner
+    ? {
+        id: winner.id,
+        mode: winner.mode,
+        threshold: winner.threshold,
+        min_evidence_for_auto_apply: winner.min_evidence_for_auto_apply,
+        require_override_reason: winner.require_override_reason,
+        require_distinct_approver: winner.require_distinct_approver,
+      }
+    : GLOBAL_DEFAULT;
+}
+
+/**
+ * decide() (SDD §14.4): no usable advice, a policy that asks a person, below the threshold, fewer facts that
+ * support or oppose than the policy's minimum (ADV-02), else applied.
+ */
+function decided(
+  advice: SimulatedAdvice,
+  scope: readonly Strategy[],
+  policy: PolicyRule,
+  evidence: number,
+): { status: StrategyDecision; fallback?: string; reason?: ReasonCode } {
+  if (advice.option === null) return { status: 'fallback_rules', fallback: 'advisor unavailable: Jev gave no answer' };
+  if (!scope.includes(advice.option as Strategy)) {
+    return { status: 'fallback_rules', fallback: `${advice.option} is not among the options it may choose (${scope.join(', ')})` };
+  }
+  if (policy.mode === 'always_require_approval') return { status: 'pending_approval' };
+  if (advice.confidence === null || advice.confidence < policy.threshold) return { status: 'below_threshold' };
+  if (evidence < policy.min_evidence_for_auto_apply) return { status: 'pending_approval', reason: 'INSUFFICIENT_EVIDENCE' };
+  return { status: 'auto_applied' };
+}
+
+/** Strategy notes of earlier versions read as recommendations, like the API's listing: nothing is copied (SDD §14.4). */
+function legacyRecommendations(m: Migration): AdvisorRecommendation[] {
+  return m.advisor_notes
+    .filter((note) => note.kind === 'strategy')
+    .map((note, index): AdvisorRecommendation => {
+      const data = note.data;
+      const option = typeof data.selected === 'string' ? data.selected : null;
+      const deterministic = typeof data.deterministic === 'string' ? data.deterministic : null;
+      const probabilities = typeof data.probabilities === 'object' && data.probabilities !== null ? (data.probabilities as Record<string, unknown>) : {};
+      const [status, reason_code, final_option] =
+        data.applied === true && option !== null
+          ? (['auto_applied', 'ABOVE_THRESHOLD_AUTO_APPLY', option] as const)
+          : note.source === 'rules'
+            ? (['fallback_rules', 'ADVISOR_UNAVAILABLE_FALLBACK', deterministic] as const)
+            : (['below_threshold', 'BELOW_THRESHOLD_DEFAULT_KEPT', deterministic] as const);
+      return {
+        id: `rec-legacy-${m.id}-${index}`,
+        created_at: note.created_at,
+        decision_type: 'migration_strategy',
+        subject: { kind: 'vm', id: m.vm.source_id, name: m.vm.name },
+        plan_id: m.plan_id,
+        migration_id: m.id,
+        provider_id: null,
+        model: note.source === 'jev' ? { name: 'jev', version: 'unknown', deployment: 'unknown', endpoint_host: null } : { name: 'rules', version: 'rules', deployment: 'unknown', endpoint_host: null },
+        recommendation: {
+          option,
+          confidence: note.confidence,
+          distribution: Object.fromEntries(Object.entries(probabilities).filter((entry): entry is [string, number] => typeof entry[1] === 'number')),
+        },
+        decision: { final_option, status, reason_code, reason_text: null, actor: { kind: 'system', id: 'legacy' }, policy_id: null, threshold_used: null, decided_at: note.created_at },
+        input_snapshot_sha256: null,
+        requested_by: null,
+        legacy: true,
+        legacy_text: note.summary,
+        evidence_option: null,
+        evidence: [],
+        similar_incidents: [],
+        reasons: [],
+      };
+    });
+}
+
+/** An integer query parameter the API validates (422 outside `min`..`max`, SDD §12). */
+function intParam(query: URLSearchParams, name: string, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  const raw = query.get(name);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  // the API's words for a query parameter it refuses (FastAPI's validation, SDD §12)
+  const refuse = (why: string) => new HttpError(422, 'validation_error', `query.${name}: Input should be ${why}`);
+  if (!/^-?\d+$/.test(raw.trim())) throw refuse('a valid integer, unable to parse string as an integer');
+  if (value < min) throw refuse(`greater than or equal to ${min}`);
+  if (value > max) throw refuse(`less than or equal to ${max}`);
+  return value;
 }
 
 /** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
+/** Phases in which a step runs for the migration (the API's ACTIVE_STEP_PHASES): they fill a wave's max_parallel. */
+const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
 const REVALIDATABLE: ReadonlySet<Phase> = new Set(['pending', 'blocked', 'ready']);
 /** Phases whose migration validation cancels when its VM leaves vm_ids, like the API (SDD §5.4). */
-const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed']);
+// a migration found in validating is a leftover of an interrupted validation (SDD §5.4)
+const REMOVABLE: ReadonlySet<Phase> = new Set([...REVALIDATABLE, 'failed', 'validating']);
 /** At most `limit` holders from `heldElsewhere`, and how many are left out (the API's wording). */
 function holdersText(held: Map<string, string[]>, limit = 10): string {
   const entries = [...held.values()].flat().sort();
@@ -117,7 +541,28 @@ function keepSyncHistory(m: Migration, keepFirst: number): void {
   m.sync_bytes_dropped += dropped.reduce((sum, p) => sum + p.bytes_transferred, 0);
 }
 /** Plan fields that decide whether a cutover needs a human (SDD §12): approver-only. */
-const POLICY_FIELDS = ['require_approval', 'auto_cutover', 'cutover_window'] as const;
+const POLICY_FIELDS = ['require_approval', 'require_distinct_approver', 'auto_cutover', 'cutover_window'] as const;
+/** A secret name the control plane reads (SDD §13.3): never a path. */
+const SECRET_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+/** Like the API: a named secret must be readable; only the fields the request sets are checked (SDD §13.3). */
+function checkSecretNames(input: Record<string, unknown>, fields: Set<string>, providerId: string): void {
+  const names: Array<[string, unknown]> = [];
+  if (fields.has('credentials_secret')) names.push(['credentials_secret', input.credentials_secret]);
+  const host = input.conversion_host as { ssh_key_secret?: unknown } | null | undefined;
+  if (fields.has('conversion_host') && host) names.push(['conversion_host.ssh_key_secret', host.ssh_key_secret]);
+  const bad = names.filter(([, name]) => name !== null && name !== undefined && !(typeof name === 'string' && SECRET_NAME.test(name))).map(([field]) => field);
+  if (bad.length) {
+    throw new HttpError(422, 'validation_error', `${bad.join(', ')}: a secret name is 1-128 letters, digits, '.', '_' or '-', starting with a letter or digit`);
+  }
+  // provider-* names are the secrets Seamless stores for each provider: only the provider's own (SDD §13.3)
+  const own: Record<string, string> = { credentials_secret: `provider-${providerId}`, 'conversion_host.ssh_key_secret': `provider-${providerId}-ssh` };
+  const taken = names.filter(([field, name]) => typeof name === 'string' && name.startsWith('provider-') && name !== own[field]).map(([field]) => field);
+  if (taken.length) {
+    throw new HttpError(422, 'validation_error', `${taken.join(', ')}: provider-* names belong to the secrets Seamless stores for each provider; this one is another provider's`);
+  }
+}
+
 const PROVIDER_EDITABLE = new Set(['name', 'endpoint', 'cloud', 'credentials_secret', 'region', 'verify_tls', 'ca_cert_path', 'conversion_host', 'distribution']);
 const DISTRIBUTION_KIND: Record<string, string> = { openstack_community: 'openstack', kolla: 'openstack', rhosp: 'openstack', rhoso: 'rhoso', vmware: 'vmware' };
 
@@ -135,6 +580,8 @@ export class MockServer {
     status: 'ok',
     version: '0.1.0-mock',
     demo: true,
+    // the simulation's model time is its wall time: passes, downtimes and clocks share one base (ADV-16)
+    demo_speed: 1,
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
   };
@@ -142,8 +589,17 @@ export class MockServer {
   readonly inventories: Record<string, VMRef[] | DestinationInventory>;
   readonly plans: Plan[];
   readonly migrations: Migration[];
+  /** Stored recommendations; strategy notes of earlier versions are listed beside them (SDD §14.4). */
+  readonly recommendations: AdvisorRecommendation[];
+  /** Redacted advisor inputs by SHA-256, written once (SDD §14.5). */
+  readonly snapshots: Map<string, AdvisorSnapshot>;
+  /** Stored advisor policies (SDD §14.6). */
+  readonly policies: AdvisorPolicy[];
   readonly events: Event[];
+  /** Source power states the demo set (POST /demo/vms/…/power, SDD §8.1). */
+  private readonly power = new Map<string, 'running' | 'stopped'>();
   private seq: number;
+  private readonly advise: NonNullable<MockServerOptions['advise']>;
   private readonly listeners = new Set<(event: Event) => void>();
   private readonly rand: () => number;
   private readonly now: () => number;
@@ -163,8 +619,12 @@ export class MockServer {
     this.inventories = fixtures.inventories;
     this.plans = fixtures.plans;
     this.migrations = fixtures.migrations;
+    this.recommendations = fixtures.recommendations;
+    this.snapshots = new Map(fixtures.snapshots.map((snapshot) => [snapshot.sha256, snapshot]));
+    this.policies = fixtures.policies;
     this.events = fixtures.events;
     this.seq = this.events.at(-1)?.seq ?? 0;
+    this.advise = options.advise ?? simulatedAdvice;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -204,6 +664,7 @@ export class MockServer {
 
   /** One simulation step (1 s of demo time). */
   tick(): void {
+    this.watchSources();
     const now = this.now();
     for (const m of this.migrations) {
       const plan = this.plans.find((p) => p.id === m.plan_id);
@@ -219,10 +680,16 @@ export class MockServer {
           this.advanceTransfer(m, plan, m.phase === 'precopy' ? 1.4 : 4);
           break;
         case 'ready':
-          if (plan.status === 'running' && SINGLE_SHOT.has(m.strategy) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          // like the API's tick and _begin (SDD §5.4, §8): no held migration, only an active wave with room
+          if (plan.status !== 'running' || !this.mayBegin(m, plan)) break;
+          if (SINGLE_SHOT.has(m.strategy)) {
+            if (this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          } else {
+            this.transition(m, 'precopy', 'pre-copy started', 'orchestrator');
+          }
           break;
         case 'awaiting_cutover':
-          if (plan.status === 'running' && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+          if (plan.status === 'running' && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
           break;
         case 'cutover':
           this.advanceCutover(m, plan);
@@ -347,26 +814,40 @@ export class MockServer {
       data: { ...pass },
     });
     m.checkpoint = m.phase === 'precopy' ? 'precopy' : 'sync';
-    if (m.phase === 'precopy') {
+    const rule = convergedBy(m, plan, pass);
+    if (rule) {
+      // like the API's _converge (SDD §5.3): the rule is recorded, from pre-copy too
+      m.converged_by = rule;
+      m.progress_pct = 100;
+      this.transition(m, 'awaiting_cutover', convergedReason(m, plan, rule), 'orchestrator');
+    } else if (m.phase === 'precopy') {
       this.transition(m, 'syncing', 'pass 1 complete; delta passes until convergence', 'orchestrator');
       this.startPass(m, 'delta');
-      return;
-    }
-    const converged = pass.bytes_changed <= plan.convergence_threshold_bytes || m.sync_passes.length >= plan.max_sync_passes;
-    if (converged) {
-      m.progress_pct = 100;
-      this.transition(m, 'awaiting_cutover', 'converged: last delta below the threshold', 'orchestrator');
     } else {
       this.startPass(m, 'delta');
     }
   }
 
+  /**
+   * Like the API's tick and _begin (SDD §5.4, §8): a migration starts a step only when no advisor decision holds it
+   * and its wave is active (every wave it depends on complete) - from ready also only with room under its wave's
+   * max_parallel.
+   */
+  private mayBegin(m: Migration, plan: Plan): boolean {
+    if (m.advisor_hold || !isWaveActive(plan, m.wave_id, this.migrations)) return false;
+    const wave = m.phase === 'ready' ? plan.waves.find((w) => w.id === m.wave_id) : undefined;
+    if (!wave) return true;
+    const running = this.migrations.filter((x) => x.plan_id === plan.id && x.wave_id === wave.id && ACTIVE_STEP_PHASES.has(x.phase)).length;
+    return running < wave.max_parallel;
+  }
+
   private gateOpen(m: Migration, plan: Plan): boolean {
-    const approved = !plan.require_approval || m.approvals.length > 0;
+    const approved = !plan.require_approval || countedApprovals(m, plan).length > 0;
     const requested = plan.auto_cutover || m.cutover_requested;
     const window = plan.cutover_window;
     const now = this.now();
-    const inWindow = !window || (now >= Date.parse(window.start) && now <= Date.parse(window.end)) || m.cutover_requested;
+    // like the API (SDD §5.4): only an approver's force_window lets a requested cutover start outside the window
+    const inWindow = !window || (now >= Date.parse(window.start) && now <= Date.parse(window.end)) || m.force_window;
     const cutovers = this.migrations.filter((x) => x.phase === 'cutover').length;
     return approved && requested && inWindow && cutovers < 3;
   }
@@ -374,13 +855,13 @@ export class MockServer {
   private beginCutover(m: Migration, plan: Plan): void {
     this.transition(m, 'cutover', 'cutover gate satisfied', 'orchestrator');
     if (!m.downtime_started_at || m.downtime_ended_at) {
-      // a retried cutover keeps the clock of the first stop (SDD §5.2)
+      // a retried cutover keeps the clock of the first stop (SDD §5.2): the clock starts only here
       m.downtime_started_at = new Date(this.now()).toISOString();
       m.downtime_ended_at = null;
       m.actual_downtime_s = null;
+      this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
     }
     m.progress_pct = 0;
-    this.emit({ kind: 'migration.downtime_started', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: source VM stopped — downtime clock started`, data: {} });
     // a cold copy is recorded as a full pass, as the API's executors record it
     if (m.strategy === 'warm' || m.strategy === 'vmware_warm') this.startPass(m, 'final');
     else if (m.strategy === 'cold' || m.strategy === 'vmware_cold') this.startPass(m, 'full');
@@ -430,39 +911,81 @@ export class MockServer {
       this.emit({ kind: 'migration.sync_pass', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${pass.kind} pass changed ${(pass.bytes_changed / GiB).toFixed(2)} GiB`, data: { ...pass } });
     }
     m.destination_server_id = `${hex(this.rand, 8)}-${hex(this.rand, 4)}-4${hex(this.rand, 3)}-a${hex(this.rand, 3)}-${hex(this.rand, 12)}`;
+    // like the simulated executor (SDD §5.2): the seconds the source stayed stopped for the step, here at wall speed
+    if (m.downtime_started_at) m.downtime_model_s = Math.round((this.now() - Date.parse(m.downtime_started_at)) / 100) / 10;
     m.checkpoint = 'cutover';
     this.transition(m, 'verifying', 'destination server created', 'orchestrator');
   }
 
   private finishVerification(m: Migration, plan: Plan): void {
-    if (this.rand() < 0.1) {
-      m.error = 'Verification failed: tcp:22 connection refused after 600 s.';
+    const at = new Date(this.now()).toISOString();
+    // one verification in ten fails on the boot checks (an exercised rollback path), like the demo
+    const flaky = this.rand() < 0.1;
+    const windows = guestOsOf(m.vm).family === 'windows';
+    const ports = windows ? plan.verification.windows_tcp_ports : plan.verification.tcp_ports;
+    const configured = probesFor(m.vm.source_id, plan).probes;
+    const address = m.vm.nics[0]?.fixed_ips[0] ?? '10.20.0.10';
+    const probes = configured.map((probe) => simulatedProbe(m.vm, probe, address, at));
+    const checks: VerificationCheck[] = [
+      { name: 'server_active', ok: true, detail: 'status ACTIVE' },
+      { name: 'ports_up', ok: true, detail: '1/1 ports ACTIVE' },
+      ...ports.map((port) => ({ name: `tcp:${port}`, ok: !flaky, detail: flaky ? 'connection refused' : `connected to ${address}:${port}` })),
+      ...configured.map((probe, i) => {
+        const result = probes[i]!;
+        return { name: `app:${probe.kind}:${probe.port}`, ok: result.result === 'passed', detail: result.detail, ...(result.result === 'unreachable' ? { skipped: true } : {}) };
+      }),
+      // a boot that fails without a TCP port to show it shows on the console
+      ...(windows
+        ? []
+        : [flaky && ports.length === 0 ? { name: 'console', ok: false, detail: 'no success pattern in the last 200 console lines' } : { name: 'console', ok: true, detail: "matched 'login:'" }]),
+    ];
+    const refused = checks.filter((c) => !c.ok && !c.skipped);
+    m.verification = { at, passed: refused.length === 0, checks, probes, warnings: [] };
+    if (refused.length) {
+      // a failed check — a boot check, or a refused application probe (SDD §7.5, ADV-18) — fails the
+      // verification, and the plan's automatic rollback runs
+      m.error = `Verification failed: ${refused.map((c) => `${c.name} (${c.detail})`).join('; ')}`;
       this.emit({ kind: 'migration.error', plan_id: plan.id, migration_id: m.id, actor: 'orchestrator', message: `${m.vm.name}: ${m.error}`, data: {} });
-      this.transition(m, 'failed', 'verification failed', 'orchestrator');
-      m.advisor_notes.push({
-        kind: 'similar_incidents',
-        source: 'memory',
-        summary: '1 similar incident: sshd bound to the old fixed IP after migration.',
-        confidence: null,
-        data: { hits: [{ title: 'sshd ListenAddress pinned to the source IP', content: 'Remove ListenAddress or use 0.0.0.0; re-run verification.', score: 0.77 }] },
-        created_at: new Date(this.now()).toISOString(),
-      });
-      this.emit({ kind: 'advisor.similar_incidents', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `${m.vm.name}: 1 similar incident found`, data: {} });
+      this.transition(m, 'failed', 'verification failed', 'orchestrator', { verification: m.verification });
+      if (flaky) {
+        m.advisor_notes.push({
+          kind: 'similar_incidents',
+          source: 'memory',
+          summary: '1 similar incident: sshd bound to the old fixed IP after migration.',
+          confidence: null,
+          data: { hits: [{ title: 'sshd ListenAddress pinned to the source IP', content: 'Remove ListenAddress or use 0.0.0.0; re-run verification.', score: 0.77 }] },
+          created_at: new Date(this.now()).toISOString(),
+        });
+        this.emit({ kind: 'advisor.similar_incidents', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `${m.vm.name}: 1 similar incident found`, data: {} });
+      }
       if (plan.verification.auto_rollback) {
         m.progress_pct = 0;
         this.transition(m, 'rolling_back', 'automatic rollback after failed verification', 'orchestrator');
       }
       return;
     }
-    m.checkpoint = 'verify';
-    this.transition(m, 'completed', 'verification passed', 'orchestrator');
+    // what the rules ask review for (SDD §7.5): an unreachable probe, a database VM that only booted
+    const unreachable = probes.filter((p) => p.result === 'unreachable').map((p) => p.target);
+    const review = unreachable.length
+      ? `application probe unreachable from the control plane: ${unreachable.join(', ')}`
+      : isDatabase(m.vm) && configured.length === 0
+        ? 'database VM without an application probe: only its boot was verified'
+        : null;
+    if (review) {
+      m.review_required = true;
+      m.review_reason = review;
+    }
+    m.checkpoint = 'verified';
+    this.transition(m, 'completed', 'verification passed', 'orchestrator', { verification: m.verification });
     this.endDowntime(m);
     this.emit({ kind: 'memory.lesson_saved', plan_id: plan.id, migration_id: m.id, actor: 'agentmemory', message: `Lesson saved: ${m.strategy}, actual downtime ${Math.round(m.actual_downtime_s ?? 0)} s`, data: { type: 'fact' } });
     this.maybeCompletePlan(plan);
   }
 
   private endDowntime(m: Migration): void {
-    if (!m.downtime_started_at) return;
+    // only an open clock ends: a completed migration's verification closed its clock, which its rollback leaves
+    // alone, like the API (SDD §5.2)
+    if (!m.downtime_started_at || m.downtime_ended_at) return;
     const now = this.now();
     m.downtime_ended_at = new Date(now).toISOString();
     m.actual_downtime_s = Math.round((now - Date.parse(m.downtime_started_at)) / 100) / 10;
@@ -483,7 +1006,7 @@ export class MockServer {
   // Domain helpers
   // ---------------------------------------------------------------------------------------
 
-  private transition(m: Migration, to: Phase, reason: string, actor: string): void {
+  private transition(m: Migration, to: Phase, reason: string, actor: string, data: Record<string, unknown> = {}): void {
     if (!canTransition(m.phase, to)) {
       throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to ${to}.`);
     }
@@ -492,8 +1015,10 @@ export class MockServer {
     const from = m.phase;
     m.phase = to;
     m.updated_at = at;
+    // like the API (SDD §14.6): a cancelled migration takes no advisor decision
+    if (to === 'cancelled') m.advisor_hold = null;
     if (to !== 'precopy' && to !== 'syncing' && to !== 'cutover') this.dropRunningPass(m);
-    this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason } });
+    this.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor, message: `${m.vm.name}: ${from} → ${to}`, data: { from_phase: from, to_phase: to, reason, ...data } });
   }
 
   private sourceFor(plan: Plan): Provider {
@@ -514,11 +1039,18 @@ export class MockServer {
     const dst = this.inventories[destination.id];
     const networks = dst && !Array.isArray(dst) ? dst.networks : {};
     const names = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm.name);
-    m.findings = preflight(m.vm, source.kind, plan, networks, names);
+    const subnets = dst && !Array.isArray(dst) ? (dst.subnets ?? []) : [];
+    const networkDetails = dst && !Array.isArray(dst) ? dst.network_details : undefined;
+    const selected = this.migrations.filter((x) => x.plan_id === plan.id).map((x) => x.vm);
+    // the destination's token roles, as its check reported them (SDD §9.3, §10)
+    const roles = capabilityRoles(destination.capabilities);
+    m.findings = preflight(m.vm, source.kind, plan, networks, names, { subnets, selected, networkDetails, roles });
     const elig = eligibility(m.vm, source.kind, plan, source, destination, m.findings);
     m.estimates = (Object.keys(elig) as Strategy[]).map((s) => estimate(m.vm, s, plan, elig[s] ?? []));
     m.strategy = this.select(m, plan);
     m.estimate = m.estimates.find((e) => e.strategy === m.strategy) ?? null;
+    // what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+    m.suggested_probes = suggestProbes(m.vm);
   }
 
   private select(m: Migration, plan: Plan): Strategy {
@@ -535,15 +1067,78 @@ export class MockServer {
   /** A fresh assessment or strategy needs a fresh approval (SDD §5.4): nothing given before carries over. */
   private clearApprovals(m: Migration): void {
     m.approvals = [];
-    m.cutover_requested = false;
-    m.force_window = false;
+    clearRequest(m);
   }
 
   private finishValidation(m: Migration, plan: Plan, actor: string): void {
+    // the attempts so far, with the strategies they ran: evaluate() chooses anew (SDD §14.4, ADV-02)
+    const earlier = m.attempts > 0 ? { id: m.id, attempts: m.attempts, attempt_strategies: [...m.attempt_strategies] } : null;
     this.evaluate(m, plan);
+    const rec = this.decideStrategy(m, plan, actor, earlier);
+    // like the API (SDD §5.4, §14.6): a waiting decision holds the migration from this write on
+    m.advisor_hold = rec?.decision.status === 'pending_approval' ? rec.id : null;
     this.clearApprovals(m);
     const blocked = m.findings.some((f) => f.severity === 'blocker');
     this.transition(m, blocked ? 'blocked' : 'ready', blocked ? 'blocker findings present' : 'pre-flight passed', actor);
+    if (rec) {
+      // like the API (SDD §14.5): recommendation.created, then the first decision event
+      this.recommendations.push(rec);
+      for (const event of auditEventsOf(rec)) this.emit({ plan_id: plan.id, migration_id: m.id, ...event });
+    }
+  }
+
+  /**
+   * Like validate_plan (SDD §14.4): an automatic choice whose advisor scope is not empty goes to the
+   * advisor, decide() takes the decision, and the migration runs its final option.
+   */
+  private decideStrategy(
+    m: Migration,
+    plan: Plan,
+    actor: string,
+    earlier: Pick<Migration, 'id' | 'attempts' | 'attempt_strategies'> | null,
+  ): AdvisorRecommendation | null {
+    const automatic = plan.default_strategy === 'auto' && !(m.vm.source_id in plan.strategy_overrides);
+    const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy);
+    const scope = advisorScope(m.estimates, plan.selection_policy);
+    if (!automatic || !scope.length || eligible.length < 2) return null;
+    const advice = this.advise(m.vm, scope, m.estimates);
+    const policy = policyFor(this.policies, plan);
+    // the facts measured against the recommended option, or the deterministic one (SDD §14.4, ADV-02)
+    const evidenceOption = advice.option && eligible.includes(advice.option as Strategy) ? advice.option : m.strategy;
+    const evidence = buildStrategyEvidence(m.vm, plan, this.sourceFor(plan).kind, m.estimates, m.findings, evidenceOption, earlier, m.id);
+    const { status, fallback, reason } = decided(advice, scope, policy, evidenceCount(evidence));
+    const query = `${evidenceOption} ${m.vm.os_type ?? 'unknown OS'} ${sizeBucket(m.vm.disk_bytes)}`;
+    const at = new Date(this.now()).toISOString();
+    const recorded = this.recommendations.filter((r) => r.migration_id === m.id).length;
+    // the advisor's input, named by the SHA-256 of its canonical JSON and written once (SDD §14.5)
+    const snapshot = strategySnapshot({ vm: m.vm, plan, estimates: m.estimates, findings: m.findings, scope, deterministic: m.strategy, at });
+    if (!this.snapshots.has(snapshot.sha256)) this.snapshots.set(snapshot.sha256, snapshot);
+    const rec = strategyRecommendation({
+      id: `rec-${m.id.slice(4)}${(recorded + 1).toString(16).padStart(2, '0')}`,
+      at,
+      migration: m,
+      providerId: plan.source_provider_id,
+      option: advice.option,
+      confidence: advice.confidence,
+      options: eligible,
+      status,
+      deterministic: m.strategy,
+      fallback,
+      snapshotSha256: snapshot.sha256,
+      policyId: policy.id,
+      threshold: policy.threshold,
+      rules: { require_distinct_approver: policy.require_distinct_approver, require_override_reason: policy.require_override_reason },
+      requestedBy: actor,
+      reasonCode: reason,
+      evidenceOption,
+      evidence,
+      similarIncidents: this.similarIncidents(query, 3).hits.slice(0, 3),
+    });
+    // a decision that waits keeps the deterministic choice and holds the migration (SDD §14.6)
+    const final = (rec.decision.final_option ?? m.strategy) as Strategy;
+    m.strategy = final;
+    m.estimate = m.estimates.find((e) => e.strategy === final) ?? null;
+    return rec;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -637,7 +1232,9 @@ export class MockServer {
       } else {
         const provider = this.providers.find((p) => p.id === id);
         if (!provider) {
-          this.require(token, 'viewer', path);
+          // like the API (SDD §12, §13.2): the route's role first, then the lookup
+          const writes = (!sub && (method === 'PATCH' || method === 'DELETE')) || ((sub === 'credentials' || sub === 'conversion-key') && method === 'PUT');
+          this.require(token, writes ? 'admin' : sub === 'check' && method === 'POST' ? 'operator' : 'viewer', path);
           throw new HttpError(404, 'not_found', `Provider ${id} not found.`);
         }
         if (!sub && method === 'GET') {
@@ -649,11 +1246,16 @@ export class MockServer {
         if (sub === 'conversion-key' && method === 'PUT') return this.setConversionKey(this.require(token, 'admin', path), provider, input);
         if (!sub && method === 'DELETE') {
           const me = this.require(token, 'admin', path);
-          const inUse = this.plans.some(
-            // like the API (SDD §12): only a completed plan releases its providers; a failed one can start again
-            (p) => (p.source_provider_id === id || p.destination_provider_id === id) && p.status !== 'completed',
-          );
-          if (inUse) throw new HttpError(409, 'conflict', `${provider.name} is referenced by a plan that is not finished.`);
+          const users = this.plansThatNeed(id);
+          if (users.length) {
+            const rest = users.length - 10;
+            throw new HttpError(
+              409,
+              'conflict',
+              `provider is used by plan(s) that still need it: ${users.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+                'a plan needs its providers until it completes and its VMs are finalized',
+            );
+          }
           this.providers.splice(this.providers.indexOf(provider), 1);
           this.emit({ kind: 'provider.deleted', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name} deleted`, data: {} });
           return { status: 204 };
@@ -669,7 +1271,8 @@ export class MockServer {
             } else {
               provider.status = 'ok';
               provider.status_message = 'All services reachable.';
-              provider.capabilities = { admin: true, compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
+              // an OpenStack check also reports its token's roles (SDD §10)
+              provider.capabilities = { admin: true, ...(provider.kind === 'vmware' ? {} : { roles: ['admin', 'member', 'reader'] }), compute_microversion: '2.95', ovn: true, volume_backends: ['ceph-ssd'] };
             }
           }
           this.emit({ kind: 'provider.checked', plan_id: null, migration_id: null, actor: me.name, message: `${provider.name}: ${provider.status}`, data: { status: provider.status } });
@@ -684,27 +1287,13 @@ export class MockServer {
     }
 
     if (root === 'plans') {
-      if (!id) {
-        if (method === 'GET') {
-          this.require(token, 'viewer', path);
-          // SDD §12: status filter and limit/offset paging, like the migrations list
-          const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
-          const offset = Number(query.get('offset') ?? 0);
-          const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
-          return ok(rows.slice(offset, offset + limit));
-        }
-        if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);
-      } else {
-        if (!sub && method === 'GET') {
-          this.require(token, 'viewer', path);
-          return ok(this.plan(id));
-        }
-        if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
-        if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
-        if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
-        if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
-        if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
-      }
+      const res = this.routePlans(method, path, query, input, token, id, sub, subsub);
+      if (res) return this.withDerivedStatus(res);
+    }
+
+    if (root === 'demo' && id === 'vms' && sub && subsub === 'power' && method === 'POST') {
+      this.require(token, 'operator', path);
+      return this.demoPower(sub, input);
     }
 
     if (root === 'migrations') {
@@ -716,8 +1305,9 @@ export class MockServer {
             (!query.get('phase') || m.phase === query.get('phase')) &&
             (!query.get('wave_id') || m.wave_id === query.get('wave_id')),
         );
-        const offset = Number(query.get('offset') ?? 0);
-        const limit = query.get('limit') === null ? rows.length : Number(query.get('limit'));
+        // the API's bounds (SDD §12): limit 1…5000, default all; offset from 0
+        const limit = intParam(query, 'limit', rows.length, 1, 5000);
+        const offset = intParam(query, 'offset', 0, 0);
         return ok(rows.slice(offset, offset + limit));
       }
       if (id && !sub && method === 'GET') {
@@ -729,7 +1319,7 @@ export class MockServer {
         return this.setStrategy(me, this.migration(id), input);
       }
       if (id && sub && method === 'POST') {
-        const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'finalize' ? 'approver' : 'operator';
+        const min: Role = sub === 'approve' || sub === 'cutover' || sub === 'force-cutover' || sub === 'finalize' ? 'approver' : 'operator';
         const me = this.require(token, min, path);
         return this.migrationAction(me, this.migration(id), sub, input);
       }
@@ -738,11 +1328,21 @@ export class MockServer {
     if (root === 'events' && method === 'GET' && !id) {
       this.require(token, 'viewer', path);
       const since = Number(query.get('since') ?? 0) || 0;
-      const limit = Math.min(1000, Math.max(1, Number(query.get('limit') ?? 500) || 500));
+      // before: only events below that seq, so tail + before is the page before the oldest shown (SDD §12)
+      const before = query.has('before') ? Number(query.get('before')) : Infinity;
+      if (!(before >= 1)) throw new HttpError(422, 'validation_error', 'before: Input should be greater than or equal to 1.');
+      const limit = intParam(query, 'limit', 500, 1, 1000); // the API's bounds, never clamped (SDD §12)
       const planId = query.get('plan_id');
       const migrationId = query.get('migration_id');
+      // audit: only the audit events (SDD §14.5)
+      const audit = query.get('audit') === 'true';
       const matching = this.events.filter(
-        (e) => e.seq > since && (!planId || e.plan_id === planId) && (!migrationId || e.migration_id === migrationId),
+        (e) =>
+          e.seq > since &&
+          e.seq < before &&
+          (!planId || e.plan_id === planId) &&
+          (!migrationId || e.migration_id === migrationId) &&
+          (!audit || (AUDIT_EVENT_KINDS as readonly string[]).includes(e.kind)),
       );
       // tail: the newest `limit` matching events instead of the first, still ascending (SDD §12)
       return ok(query.get('tail') === 'true' ? matching.slice(-limit) : matching.slice(0, limit));
@@ -757,14 +1357,49 @@ export class MockServer {
       if (id === 'status' && method === 'GET') {
         this.require(token, 'viewer', path);
         const status: AdvisorStatus = {
-          jev: { mode: 'http', available: true, last_error: null },
-          memory: { enabled: true, available: true, last_error: 'Timed out after 5 s (recovered on retry)' },
+          // like a compose stack: the jev sidecar forwards to the remote TypeSafe API (SDD §13.4)
+          jev: { mode: 'http', available: true, last_error: null, deployment: 'remote', endpoint_host: null, console_sent: false },
+          // like the API (SDD §14.3): an answered call clears the last error
+          memory: { enabled: true, available: true, last_error: null },
         };
         return ok(status);
       }
+      if (id === 'data-sent' && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok({ items: DATA_SENT });
+      }
+      if (id === 'policies') {
+        if (!sub && method === 'GET') {
+          this.require(token, 'viewer', path);
+          const builtin: AdvisorPolicy = { ...GLOBAL_DEFAULT, name: 'Global default', scope: { provider_ids: [], plan_ids: [] }, decision_types: [], min_evidence_for_auto_apply: 0, created_at: '1970-01-01T00:00:00Z', updated_at: '1970-01-01T00:00:00Z', updated_by: 'system' };
+          return ok({ items: this.policies, default: builtin });
+        }
+        if (!sub && method === 'POST') return this.createPolicy(this.require(token, 'admin', path), input);
+        if (sub && method === 'PUT') return this.replacePolicy(this.require(token, 'admin', path), sub, input);
+        if (sub && method === 'DELETE') return this.deletePolicy(this.require(token, 'admin', path), sub);
+      }
+      if (id === 'recommendations' && sub && (subsub === 'approve' || subsub === 'override') && method === 'POST') {
+        return this.decideRecommendation(this.require(token, 'admin', path), sub, subsub, input);
+      }
+      if (id === 'snapshots' && sub !== undefined && method === 'GET') {
+        this.require(token, 'viewer', path);
+        if (!/^[0-9a-f]{64}$/.test(sub)) throw new HttpError(422, 'validation_error', "sha256: String should match pattern '^[0-9a-f]{64}$'");
+        const snapshot = this.snapshots.get(sub);
+        if (!snapshot) throw new HttpError(404, 'not_found', `advisor_snapshot ${sub} not found`);
+        return ok(snapshot);
+      }
+      if (id === 'recommendations' && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok(sub === undefined ? this.listRecommendations(query) : this.recommendation(sub));
+      }
       if (id === 'similar-incidents' && method === 'POST') {
         this.require(token, 'operator', path);
-        return ok(this.similarIncidents(String(input.query ?? ''), Number(input.limit ?? 5) || 5));
+        // like the API (SDD §12): a query of 1-2000 characters, 1-20 results
+        const queryText = typeof input.query === 'string' ? input.query : '';
+        const limit = input.limit === undefined ? 5 : Number(input.limit);
+        if (!queryText || queryText.length > ADVISOR_QUERY_MAX) throw new HttpError(422, 'validation_error', `query must be 1-${ADVISOR_QUERY_MAX} characters.`);
+        if (!Number.isInteger(limit) || limit < 1 || limit > ADVISOR_LIMIT_MAX) throw new HttpError(422, 'validation_error', `limit must be 1-${ADVISOR_LIMIT_MAX}.`);
+        return ok(this.similarIncidents(queryText, limit));
       }
     }
 
@@ -781,11 +1416,167 @@ export class MockServer {
   // Route handlers
   // ---------------------------------------------------------------------------------------
 
+  /** A policy as the API accepts it (SDD §12, §14.6): 422 otherwise. */
+  private policySpec(input: Record<string, unknown>): AdvisorPolicySpec {
+    const scope = (typeof input.scope === 'object' && input.scope !== null ? input.scope : {}) as Record<string, unknown>;
+    const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
+    const spec: AdvisorPolicySpec = {
+      name: typeof input.name === 'string' ? input.name : '',
+      scope: { provider_ids: list(scope.provider_ids), plan_ids: list(scope.plan_ids) },
+      decision_types: list(input.decision_types) as AdvisorPolicySpec['decision_types'],
+      mode: input.mode as AdvisorPolicySpec['mode'],
+      threshold: Number(input.threshold),
+      // a new policy asks for 3 facts unless told otherwise, like the API (SDD §4.2, ADV-02)
+      min_evidence_for_auto_apply: input.min_evidence_for_auto_apply === undefined ? 3 : Number(input.min_evidence_for_auto_apply),
+      require_override_reason: input.require_override_reason === undefined ? true : Boolean(input.require_override_reason),
+      require_distinct_approver: input.require_distinct_approver === undefined ? true : Boolean(input.require_distinct_approver),
+    };
+    const problems: string[] = [];
+    if (!spec.name.trim() || spec.name.length > 200) problems.push('name: 1-200 characters');
+    if (!POLICY_MODES.includes(spec.mode)) problems.push(`mode: one of ${POLICY_MODES.join(', ')}`);
+    if (!Number.isFinite(spec.threshold) || spec.threshold < 0 || spec.threshold > 1) problems.push('threshold: 0 to 1');
+    if (!Number.isInteger(spec.min_evidence_for_auto_apply) || spec.min_evidence_for_auto_apply < 0 || spec.min_evidence_for_auto_apply > 100) problems.push('min_evidence_for_auto_apply: 0 to 100');
+    if (spec.decision_types.some((t) => !DECISION_TYPES.includes(t))) problems.push('decision_types: unknown type');
+    if (spec.scope.provider_ids.length && spec.scope.plan_ids.length) problems.push('a policy scopes either providers or plans, not both');
+    const unknown = [...spec.scope.provider_ids.filter((id) => !this.providers.some((p) => p.id === id)), ...spec.scope.plan_ids.filter((id) => !this.plans.some((p) => p.id === id))];
+    if (unknown.length) problems.push(`unknown provider or plan: ${unknown.join(', ')}`);
+    if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
+    return spec;
+  }
+
+  private auditPolicy(me: Me, kind: string, id: string, before: AdvisorPolicy | null, after: AdvisorPolicy | null): void {
+    this.emit({ kind, plan_id: null, migration_id: null, actor: `user:${me.name}`, message: `advisor policy ${id} ${kind.replace('policy.', '')}`, data: { target_id: id, before, after } });
+  }
+
+  private createPolicy(me: Me, input: Record<string, unknown>): MockResponse {
+    const at = new Date(this.now()).toISOString();
+    const policy: AdvisorPolicy = { ...this.policySpec(input), id: `pol-${hex(this.rand, 12)}`, created_at: at, updated_at: at, updated_by: me.name };
+    this.policies.push(policy);
+    this.auditPolicy(me, 'policy.created', policy.id, null, policy);
+    return ok(policy, 201);
+  }
+
+  private replacePolicy(me: Me, id: string, input: Record<string, unknown>): MockResponse {
+    const index = this.policies.findIndex((p) => p.id === id);
+    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    const before = this.policies[index]!;
+    const after: AdvisorPolicy = { ...this.policySpec(input), id, created_at: before.created_at, updated_at: new Date(this.now()).toISOString(), updated_by: me.name };
+    this.policies[index] = after;
+    this.auditPolicy(me, 'policy.updated', id, before, after);
+    return ok(after);
+  }
+
+  private deletePolicy(me: Me, id: string): MockResponse {
+    const index = this.policies.findIndex((p) => p.id === id);
+    if (index < 0) throw new HttpError(404, 'not_found', `advisor_policy ${id} not found`);
+    const [before] = this.policies.splice(index, 1);
+    this.auditPolicy(me, 'policy.deleted', id, before!, null);
+    return { status: 204 };
+  }
+
+  /** Approve or override an advisor decision, like the API (SDD §14.6). */
+  private decideRecommendation(me: Me, recId: string, action: 'approve' | 'override', input: Record<string, unknown>): MockResponse {
+    if (recId.startsWith('rec-legacy-')) throw new HttpError(409, 'conflict', 'a legacy entry is history: it cannot be approved or overridden');
+    const index = this.recommendations.findIndex((r) => r.id === recId);
+    if (index < 0) throw new HttpError(404, 'not_found', `recommendation ${recId} not found`);
+    const rec = this.recommendations[index]!;
+    const m = this.migrations.find((x) => x.id === rec.migration_id);
+    if (!m) throw new HttpError(409, 'conflict', `recommendation ${recId} decides nothing a person can change yet`);
+    const newest = this.recommendations.filter((r) => r.migration_id === m.id).reduce((a, b) => (b.created_at > a.created_at || (b.created_at === a.created_at && b.id > a.id) ? b : a));
+    if (newest.id !== recId) throw new HttpError(409, 'conflict', `a newer recommendation (${newest.id}) replaced ${recId}`);
+    const plan = this.plan(m.plan_id);
+    const policy = policyFor(this.policies, plan);
+    // like the API (SDD §14.6): the rules of the policy that took the decision, as they were then; the policy in
+    // force only for a decision that recorded none
+    const distinct = rec.decision.require_distinct_approver ?? policy.require_distinct_approver;
+    const reasonRequired = rec.decision.require_override_reason ?? policy.require_override_reason;
+    // maker-checker (SDD §14.6, ADV-17): the validating user does not decide what their validation asked
+    if (distinct && rec.requested_by === me.name) throw new HttpError(409, 'conflict', OWN_DECISION);
+    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
+    if (reason && reason.length > ACTION_TEXT_MAX) throw new HttpError(422, 'validation_error', `reason: at most ${ACTION_TEXT_MAX} characters.`);
+    if (action === 'override' && reasonRequired && (reason ?? '').length < OVERRIDE_REASON_MIN) {
+      throw new HttpError(422, 'validation_error', `policy ${rec.decision.policy_id ?? policy.id} requires an override reason of at least ${OVERRIDE_REASON_MIN} characters`);
+    }
+    if (!['pending', 'blocked', 'ready'].includes(m.phase)) throw new HttpError(409, 'conflict', `the strategy cannot change in ${m.phase}`);
+    // like the API (SDD §14.6): the plan's own choice stands over the newest recommendation, and an approved
+    // decision is not approved again (one event per decision status change)
+    const pinned = plan.strategy_overrides[m.vm.source_id];
+    if (pinned) throw new HttpError(409, 'conflict', `The plan sets the strategy of ${m.vm.name} (${pinned}): change it in the plan.`);
+    if (action === 'approve' && rec.decision.status === 'approved') throw new HttpError(409, 'conflict', 'The decision is already approved.');
+    const eligible = m.estimates.filter((e) => e.eligible).map((e) => e.strategy as string);
+    const at = new Date(this.now()).toISOString();
+    let decided: AdvisorRecommendation;
+    if (action === 'approve') {
+      const recommended = rec.recommendation.option;
+      if (recommended === null || !eligible.includes(recommended)) {
+        throw new HttpError(409, 'conflict', `nothing to approve: ${recommended ?? 'no option'} is not an eligible option`);
+      }
+      decided = humanDecision(rec, { kind: 'approve', user: me.name }, at);
+    } else {
+      const option = String(input.option ?? '');
+      if (!eligible.includes(option)) throw new HttpError(422, 'validation_error', `${option} is not an eligible option`);
+      decided = humanDecision(rec, { kind: 'override', user: me.name, option, reason }, at);
+    }
+    decided.decision.policy_id = policy.id;
+    // the rules go on with a person's decision: a later one follows them too (SDD §14.6)
+    decided.decision.require_distinct_approver = distinct;
+    decided.decision.require_override_reason = reasonRequired;
+    this.recommendations[index] = decided;
+    const final = decided.decision.final_option as Strategy;
+    const changed = final !== m.strategy;
+    m.strategy = final;
+    m.estimate = m.estimates.find((e) => e.strategy === final) ?? null;
+    m.advisor_hold = null;
+    if (changed) this.clearApprovals(m);
+    m.updated_at = at;
+    if (action === 'override') {
+      plan.strategy_overrides = { ...plan.strategy_overrides, [m.vm.source_id]: final };
+      plan.updated_at = at;
+      this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name}: strategy override for ${m.vm.name}`, data: { strategy_overrides: { [m.vm.source_id]: final } } });
+    }
+    this.emit({ plan_id: plan.id, migration_id: m.id, ...decisionEventOf(decided, rec.decision) });
+    if (changed) this.emit({ kind: 'migration.action', plan_id: plan.id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: strategy set to ${final} by the advisor decision`, data: { action: 'strategy', strategy: final } });
+    return ok(decided);
+  }
+
+  /** Stored and legacy recommendations, newest first (SDD §12, §14.4). */
+  private allRecommendations(): AdvisorRecommendation[] {
+    const items = [...this.recommendations, ...this.migrations.flatMap(legacyRecommendations)];
+    return items.sort((a, b) => (a.created_at === b.created_at ? (a.id < b.id ? 1 : -1) : a.created_at < b.created_at ? 1 : -1));
+  }
+
+  private listRecommendations(query: URLSearchParams): RecommendationPage {
+    const limit = intParam(query, 'limit', RECOMMENDATION_LIMIT_DEFAULT, 1, RECOMMENDATION_LIMIT_MAX);
+    const offset = intParam(query, 'offset', 0, 0);
+    const type = query.get('decision_type');
+    if (type !== null && !DECISION_TYPES.includes(type as DecisionType)) {
+      throw new HttpError(422, 'validation_error', `decision_type: Input should be ${DECISION_TYPES.map((t) => `'${t}'`).join(', ')}.`);
+    }
+    const migrationId = query.get('migration_id');
+    const planId = query.get('plan_id');
+    const items = this.allRecommendations().filter(
+      (r) => (migrationId === null || r.migration_id === migrationId) && (planId === null || r.plan_id === planId) && (type === null || r.decision_type === type),
+    );
+    return { items: items.slice(offset, offset + limit), total: items.length, offset, limit };
+  }
+
+  private recommendation(id: string): AdvisorRecommendation {
+    const found = this.allRecommendations().find((r) => r.id === id);
+    if (!found) throw new HttpError(404, 'not_found', `recommendation ${id} not found`);
+    return found;
+  }
+
   private createProvider(me: Me, input: Record<string, unknown>): MockResponse {
     const id = String(input.id ?? '');
     if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(id)) throw new HttpError(422, 'validation_error', 'id: must match ^[a-z0-9][a-z0-9-]{1,62}$.');
     if (this.providers.some((p) => p.id === id)) throw new HttpError(409, 'conflict', `provider '${id}' already exists`);
+    // like the API: provider-{id} and provider-{id}-ssh must stay apart from every other provider's (SDD §13.3)
+    const clash = this.providers.find((p) => id === `${p.id}-ssh` || p.id === `${id}-ssh`);
+    if (clash) {
+      throw new HttpError(409, 'conflict', `provider id '${id}' would share a secret with provider '${clash.id}': Seamless stores a provider's secrets as provider-<id> and provider-<id>-ssh`);
+    }
     checkDistribution(input);
+    checkSecretNames(input, new Set(['credentials_secret', 'conversion_host']), id);
     const defaults: Partial<Provider> = {
       cloud: null,
       credentials_secret: null,
@@ -819,6 +1610,7 @@ export class MockServer {
     );
     if (users.length) throw new HttpError(409, 'conflict', `provider is used by running or paused plan(s): ${users.map((p) => p.id).join(', ')}`);
     checkDistribution({ ...provider, ...input });
+    checkSecretNames(input, new Set(Object.keys(input)), provider.id);
     Object.assign(provider, input, { status: 'unknown', status_message: null, last_checked_at: null, capabilities: {} });
     this.emit({ kind: 'provider.updated', plan_id: null, migration_id: null, actor: me.name, message: `provider ${provider.id} updated`, data: { provider_id: provider.id, fields: Object.keys(input).sort() } });
     return ok(provider);
@@ -887,7 +1679,129 @@ export class MockServer {
     if (problems.length) throw new HttpError(422, 'validation_error', problems.join('; '));
   }
 
-  private createPlan(me: Me, input: Record<string, unknown>): MockResponse {
+  private routePlans(
+    method: string,
+    path: string,
+    query: URLSearchParams,
+    input: Record<string, unknown>,
+    token: string | null,
+    id: string | undefined,
+    sub: string | undefined,
+    subsub: string | undefined,
+  ): MockResponse | null {
+    if (!id) {
+      if (method === 'GET') {
+        this.require(token, 'viewer', path);
+        // SDD §12: status filter and limit/offset paging, like the migrations list
+        const rows = this.plans.filter((p) => !query.get('status') || p.status === query.get('status'));
+        // the API's bounds (SDD §12): limit 1…1000, default all; offset from 0
+        const limit = intParam(query, 'limit', rows.length, 1, 1000);
+        const offset = intParam(query, 'offset', 0, 0);
+        return ok(rows.slice(offset, offset + limit));
+      }
+      if (method === 'POST') return this.createPlan(this.require(token, 'operator', path), input);
+      return null;
+    }
+    if (!sub && method === 'GET') {
+      this.require(token, 'viewer', path);
+      return ok(this.plan(id));
+    }
+    if (!sub && method === 'PATCH') return this.patchPlan(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'waves' && subsub === 'auto' && method === 'POST') return this.autoWaves(this.require(token, 'operator', path), this.plan(id), input);
+    if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
+    return null;
+  }
+
+  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19). */
+  private withDerivedStatus(res: MockResponse): MockResponse {
+    const out = (plan: Plan): Plan => ({ ...plan, derived_status: derivePlanStatus(plan, this.migrations) });
+    const isPlan = (value: unknown): value is Plan => typeof value === 'object' && value !== null && 'vm_ids' in value && 'waves' in value;
+    if (Array.isArray(res.body)) return { ...res, body: res.body.map((item: unknown) => (isPlan(item) ? out(item) : item)) };
+    return isPlan(res.body) ? { ...res, body: out(res.body) } : res;
+  }
+
+  /** POST /plans/{id}/finalize (SDD §8.1): every completed migration of a wave or the plan, one approval. */
+  private finalizePlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    const waveId = typeof input.wave_id === 'string' ? input.wave_id : null;
+    const wave = waveId ? plan.waves.find((w) => w.id === waveId) : null;
+    if (waveId && !wave) throw new HttpError(404, 'not_found', `wave '${waveId}' not found`);
+    const name = wave ? wave.name : plan.name;
+    if (input.confirm !== name) throw new HttpError(400, 'bad_request', `confirm must equal the name '${name}'`);
+    const scope = wave ? new Set(wave.vm_ids) : null;
+    const waiting = this.migrations
+      .filter((m) => m.plan_id === plan.id && m.phase === 'completed' && (!scope || scope.has(m.vm.source_id)))
+      .sort((a, b) => a.vm.name.localeCompare(b.vm.name));
+    if (waiting.length === 0) throw new HttpError(409, 'conflict', `no completed migration to finalize in ${name}`);
+    const finalized: Migration[] = [];
+    const skipped: Array<{ migration_id: string; reason: string }> = [];
+    for (const m of waiting) {
+      // like the API: one VM's error skips that VM, never the others (SDD §8.1)
+      try {
+        this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
+        finalized.push(m);
+      } catch (e) {
+        const reason = e instanceof HttpError ? e.message : `finalize failed: ${e instanceof Error ? e.message : String(e)}`;
+        skipped.push({ migration_id: m.id, reason });
+      }
+    }
+    const names = new Map(waiting.map((m) => [m.id, m.vm.name]));
+    this.emit({
+      kind: 'plan.finalized',
+      plan_id: plan.id,
+      migration_id: null,
+      actor: me.name,
+      message: `${name}: ${finalized.length} finalized by ${me.name}${skipped.length ? `, ${skipped.length} skipped` : ''}`,
+      data: { wave_id: waveId, finalized: finalized.map((m) => m.vm.name), skipped: skipped.map((s) => ({ vm: names.get(s.migration_id), ...s })) },
+    });
+    return ok({ finalized: finalized.map((m) => m.id), skipped });
+  }
+
+  /** The power state of a source VM: what the demo set, else stopped once its cutover stopped it (SDD §8.1). */
+  sourcePower(sourceId: string): 'running' | 'stopped' {
+    const set = this.power.get(sourceId);
+    if (set) return set;
+    const m = this.migrations.find((x) => x.vm.source_id === sourceId && x.phase !== 'cancelled' && x.phase !== 'rolled_back');
+    if (m && (STOPPED_SOURCE.has(m.phase) || (m.downtime_started_at && !m.downtime_ended_at))) return 'stopped';
+    const vm = Object.values(this.inventories).flatMap((inv) => (Array.isArray(inv) ? inv : [])).find((v) => v.source_id === sourceId);
+    return vm?.power_state === 'running' ? 'running' : 'stopped';
+  }
+
+  /** POST /demo/vms/{source_id}/power (demo mode only, SDD §8.1). */
+  private demoPower(sourceId: string, input: Record<string, unknown>): MockResponse {
+    if (!this.health.demo) throw new HttpError(404, 'not_found', 'no such route outside demo mode');
+    if (input.state !== 'on' && input.state !== 'off') throw new HttpError(422, 'validation_error', "state: Input should be 'on' or 'off'");
+    const vm = Object.values(this.inventories).flatMap((inv) => (Array.isArray(inv) ? inv : [])).find((v) => v.source_id === sourceId);
+    if (!vm) throw new HttpError(404, 'not_found', `source VM '${sourceId}' not found`);
+    this.power.set(sourceId, input.state === 'on' ? 'running' : 'stopped');
+    return ok({ ...vm, power_state: this.sourcePower(sourceId) });
+  }
+
+  /** The source watch (SDD §8.1): a completed migration's source VM seen running is flagged once, and
+   * cleared once seen stopped again; each change is an event. */
+  private watchSources(): void {
+    for (const m of this.migrations) {
+      if (m.phase !== 'completed') continue;
+      const running = this.sourcePower(m.vm.source_id) === 'running';
+      if (running === (m.source_running_at !== null)) continue;
+      m.source_running_at = running ? new Date(this.now()).toISOString() : null;
+      this.emit({
+        kind: running ? 'migration.source_running' : 'migration.source_stopped',
+        plan_id: m.plan_id,
+        migration_id: m.id,
+        actor: 'orchestrator',
+        message: running
+          ? `${m.vm.name}: the source VM runs again - its data diverges from RHOSO; stop it, or roll back`
+          : `${m.vm.name}: the source VM is stopped again`,
+        data: { power_state: running ? 'running' : 'stopped' },
+      });
+    }
+  }
+
+  private createPlan(me: Me, raw: Record<string, unknown>): MockResponse {
+    const input = withCanonicalNicOverrides(raw);
     this.refusePolicyChange(me, input, defaultPlanFields(this.now()));
     this.refuseLongPlanTexts(input);
     const body = input as unknown as PlanCreate;
@@ -895,6 +1809,7 @@ export class MockServer {
     if (!body.source_provider_id || !body.destination_provider_id) throw new HttpError(422, 'validation_error', 'source_provider_id and destination_provider_id are required.');
     // like the API (SDD §12): vm_ids is required; an empty list is a plan to fill later (the form asks for a VM)
     if (!Array.isArray(body.vm_ids)) throw new HttpError(422, 'validation_error', 'vm_ids: Field required');
+    refusePlanSpec({ ...defaultPlanFields(this.now()), ...input });
     const source = this.providers.find((p) => p.id === body.source_provider_id && p.role === 'source');
     const destination = this.providers.find((p) => p.id === body.destination_provider_id && p.role === 'destination');
     if (!source || !destination) throw new HttpError(400, 'bad_request', 'Unknown source or destination provider.');
@@ -915,25 +1830,53 @@ export class MockServer {
     return ok(plan, 201);
   }
 
-  /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409). */
-  private refuseInFlight(plan: Plan, what: string): void {
-    const inFlight = new Set(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
-    const busy = this.migrations
-      .filter((m) => m.plan_id === plan.id && (inFlight.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at)))
-      .map((m) => m.vm.name)
-      .sort();
-    if (busy.length) throw new HttpError(409, 'conflict', `migrations in flight: ${busy.slice(0, 10).join(', ')}; finish, roll back or cancel them before ${what}`);
+  /**
+   * The plans that still need a provider, like the API (SDD §12), in creation order with why: one that has not
+   * completed (a failed one can start again), or a completed one with a migration that holds its VM — it can be
+   * rolled back until it is finalized, and its rollback needs both providers (§8.1).
+   */
+  private plansThatNeed(providerId: string): string[] {
+    const plans = this.plans
+      .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return plans.flatMap((p) => {
+      if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
+      const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
+      return n ? [`${p.id} ("${p.name}", ${n} VM${n === 1 ? '' : 's'} not finalized)`] : [];
+    });
   }
 
-  private patchPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+  /** SDD §12: no plan edit or re-wave while a migration of the plan is in flight (409), each VM with what releases it. */
+  private refuseInFlight(plan: Plan, before: string): void {
+    const busy = this.migrations.filter((m) => m.plan_id === plan.id && blocksPlanChange(m));
+    if (busy.length) throw new HttpError(409, 'conflict', inFlightRefusal(busy, before));
+  }
+
+  private patchPlan(me: Me, plan: Plan, raw: Record<string, unknown>): MockResponse {
+    const input = withCanonicalNicOverrides(raw);
+    // like the API (SDD §12): the body is a partial PlanCreate, a field it cannot change is refused first
+    const unknown = Object.keys(input).filter((key) => !PLAN_EDITABLE_FIELDS.has(key)).sort();
+    if (unknown.length) throw new HttpError(422, 'validation_error', `fields cannot be changed: ${unknown.join(', ')}`);
     this.refusePolicyChange(me, input, plan as unknown as Record<string, unknown>);
     this.refuseLongPlanTexts(input);
     if (!['draft', 'validated'].includes(plan.status)) throw new HttpError(409, 'conflict', `Plans can only be edited in draft or validated (this plan is ${plan.status}).`);
     this.refuseInFlight(plan, 'editing the plan');
-    for (const key of Object.keys(input)) {
-      if (['id', 'waves', 'status', 'created_at', 'updated_at'].includes(key)) continue;
-      (plan as unknown as Record<string, unknown>)[key] = input[key];
+    // like the API (SDD §12): a failed migration's rollback acts on the clouds its attempt used
+    const providers = ['source_provider_id', 'destination_provider_id'] as const;
+    if (providers.some((field) => field in input && input[field] !== plan[field])) {
+      const failed = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'failed').map((m) => m.vm.name);
+      if (failed.length) {
+        const noun = failed.length === 1 ? 'migration' : 'migrations';
+        throw new HttpError(
+          409,
+          'conflict',
+          `roll back or cancel the failed ${noun} (${failed.slice(0, 10).join(', ')}) before changing the plan's providers: its rollback acts on the clouds its attempt used`,
+        );
+      }
     }
+    // like the API (SDD §12): the plan it would store is checked, kept fields included
+    refusePlanSpec({ ...(plan as unknown as Record<string, unknown>), ...input });
+    for (const key of Object.keys(input)) (plan as unknown as Record<string, unknown>)[key] = input[key];
     plan.status = 'draft';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" updated`, data: { fields: Object.keys(input) } });
@@ -968,7 +1911,8 @@ export class MockServer {
 
   /**
    * The VMs of `vmIds` that migrations of other plans with the same source hold (SDD §5.4), by source
-   * id: `name (plan "…", phase)` once per holder — plans validated before the rule may hold a VM twice.
+   * id: `name (plan "…", plan-id, phase)` once per holding plan, like the API — plans validated before the rule may
+   * hold a VM twice, and plan names need not be unique.
    */
   private heldElsewhere(plan: Plan, vmIds: readonly string[]): Map<string, string[]> {
     const others = new Map(this.plans.filter((p) => p.id !== plan.id && p.source_provider_id === plan.source_provider_id).map((p) => [p.id, p]));
@@ -976,7 +1920,7 @@ export class MockServer {
     for (const m of this.migrations) {
       if (!others.has(m.plan_id) || !vmIds.includes(m.vm.source_id) || RELEASES_VM.has(m.phase)) continue;
       const holders = held.get(m.vm.source_id) ?? new Set<string>();
-      holders.add(`${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.phase})`);
+      holders.add(`${m.vm.name} (plan "${others.get(m.plan_id)?.name}", ${m.plan_id}, ${m.phase})`);
       held.set(m.vm.source_id, holders);
     }
     return new Map([...held].map(([id, holders]) => [id, [...holders].sort()]));
@@ -1011,13 +1955,24 @@ export class MockServer {
       actual_downtime_s: null,
       approvals: [],
       cutover_requested: false,
+      cutover_requested_by: null,
+      cutover_requested_at: null,
       force_window: false,
       advisor_notes: [],
+      advisor_hold: null,
+      converged_by: null,
+      force_cutover: null,
+      data_issues: [],
+      downtime_model_s: null,
+      verification: null,
+      suggested_probes: [],
+      source_running_at: null,
       review_required: false,
       review_reason: null,
       destination_server_id: null,
       error: null,
       attempts: 0,
+      attempt_strategies: [],
       created_at: created,
       updated_at: created,
     };
@@ -1032,6 +1987,10 @@ export class MockServer {
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
     // the API's order of checks (orchestrator.validate_plan, SDD §5.4): nothing changes before they pass
+    // like the API (orchestrator._vms, SDD §12): a VM the source no longer reports is a provider error, before anything changes
+    const known = new Set(((this.inventories[plan.source_provider_id] ?? []) as VMRef[]).map((v) => v.source_id));
+    const gone = plan.vm_ids.find((id) => !known.has(id));
+    if (gone !== undefined) throw new HttpError(502, 'provider_error', `VM '${gone}': VM '${gone}' not found`);
     const cancelled = plan.vm_ids.flatMap((id) => (byVm.get(id)?.phase === 'cancelled' ? [byVm.get(id)!.vm.name] : [])).sort();
     if (cancelled.length) {
       throw new HttpError(400, 'bad_request', `${cancelled.length} VM(s) have a cancelled migration: ${cancelled.slice(0, 10).join(', ')}; remove them from vm_ids or create a new plan for them`);
@@ -1060,8 +2019,9 @@ export class MockServer {
       const vm = inventory.find((v) => v.source_id === vmId);
       const m = byVm.get(vmId) ?? (vm ? this.createMigration(plan, vm, me.name) : undefined);
       if (!m) continue;
-      if (REVALIDATABLE.has(m.phase)) {
-        this.transition(m, 'validating', 'plan validation started', me.name);
+      // like the API (SDD §5.4): a leftover of an interrupted validation is taken over
+      if (REVALIDATABLE.has(m.phase) || m.phase === 'validating') {
+        if (m.phase !== 'validating') this.transition(m, 'validating', 'plan validation started', me.name);
         this.finishValidation(m, plan, me.name);
       }
       validated.push(m);
@@ -1083,9 +2043,17 @@ export class MockServer {
     if (!['validated', 'paused', 'failed'].includes(plan.status)) throw new HttpError(409, 'conflict', `Only validated, paused or failed plans can start (this plan is ${plan.status}).`);
     const blocked = this.migrations.filter((m) => m.plan_id === plan.id && m.phase === 'blocked');
     if (blocked.length) throw new HttpError(409, 'conflict', `${blocked.length} migration(s) are blocked: ${blocked.map((m) => m.vm.name).join(', ')}.`);
+    if (plan.waves.length) {
+      // like the API (SDD §9.4): a VM added after the waves were planned would start outside every wave's order
+      const waveIds = new Set(plan.waves.map((w) => w.id));
+      const stray = this.migrations.filter((m) => m.plan_id === plan.id && !WAVE_COMPLETE_PHASES.has(m.phase) && !(m.wave_id && waveIds.has(m.wave_id)));
+      if (stray.length) {
+        throw new HttpError(409, 'conflict', `${stray.length} migration(s) belong to no wave: ${stray.slice(0, 10).map((m) => m.vm.name).join(', ')}; re-run the automatic wave planning or add them to a wave`);
+      }
+    }
     plan.status = 'running';
     plan.updated_at = new Date(this.now()).toISOString();
-    for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {
+    for (const m of this.migrations.filter((x) => x.plan_id === plan.id && x.phase === 'ready' && !x.advisor_hold && (x.strategy === 'warm' || x.strategy === 'vmware_warm'))) {
       this.transition(m, 'precopy', 'wave started', 'orchestrator');
     }
     this.emit({ kind: 'plan.started', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" started`, data: {} });
@@ -1104,13 +2072,21 @@ export class MockServer {
     const strategy = input.strategy as Strategy;
     if (!STRATEGIES.includes(strategy)) throw new HttpError(422, 'validation_error', 'Unknown strategy.');
     if (!['pending', 'ready', 'blocked'].includes(m.phase)) throw new HttpError(409, 'conflict', `Strategy can only change in pending, ready or blocked (now ${m.phase}).`);
+    if (m.advisor_hold) {
+      throw new HttpError(409, 'conflict', `the advisor's decision (${m.advisor_hold}) waits for approval: approve or override it (advisor.approve)`);
+    }
     const est: Estimate | undefined = m.estimates.find((e) => e.strategy === strategy);
     if (!est || !est.eligible) throw new HttpError(400, 'bad_request', `${strategy} is not eligible for ${m.vm.name}${est?.reasons.length ? `: ${est.reasons.join('; ')}` : ''}.`);
     m.strategy = strategy;
     m.estimate = est;
     this.clearApprovals(m);
     m.updated_at = new Date(this.now()).toISOString();
+    // like the API (SDD §5.4): the choice is the plan's override for the VM, so a re-validation keeps it
+    const plan = this.plan(m.plan_id);
+    plan.strategy_overrides = { ...plan.strategy_overrides, [m.vm.source_id]: strategy };
+    plan.updated_at = m.updated_at;
     this.emit({ kind: 'migration.action', plan_id: m.plan_id, migration_id: m.id, actor: me.name, message: `${m.vm.name}: strategy set to ${strategy}`, data: { action: 'strategy', strategy } });
+    this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name}: strategy override for ${m.vm.name}`, data: { strategy_overrides: { [m.vm.source_id]: strategy } } });
     return ok(m);
   }
 
@@ -1135,19 +2111,60 @@ export class MockServer {
       case 'approve':
         // the API's APPROVABLE and message (SDD §5.4)
         if (!APPROVABLE.has(m.phase)) throw new HttpError(409, 'conflict', `a migration in ${m.phase} cannot be approved`);
+        // maker-checker (SDD §5.4, ADV-17): the requester never approves their own cutover
+        if (plan.require_distinct_approver && m.cutover_requested_by === me.name) throw new HttpError(409, 'conflict', OWN_CUTOVER);
+        // and the approver who forced it (SDD §5.4)
+        if (plan.require_distinct_approver && m.force_cutover?.actor === me.name) throw new HttpError(409, 'conflict', OWN_FORCE);
         approve();
         break;
       case 'cutover': {
         // the API's CUTOVER_REQUESTABLE and message: a warm migration requested early cuts over once it converges
         if (!CUTOVER_REQUESTABLE.has(m.phase)) throw new HttpError(409, 'conflict', `cutover cannot be requested in ${m.phase}`);
-        approve();
+        // the request is an approval only without a distinct approver (SDD §5.4)
+        if (!plan.require_distinct_approver) approve();
+        if (!m.cutover_requested_by) {
+          m.cutover_requested_by = me.name;
+          m.cutover_requested_at = new Date(this.now()).toISOString();
+        }
         m.cutover_requested = true;
         m.force_window = m.force_window || Boolean(input.force_window);
-        record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window) });
+        record(input.force_window ? 'cutover requested (window bypassed)' : 'cutover requested', { force_window: Boolean(input.force_window), comment });
         // only a converged warm migration or a ready single-shot one enters the cutover (SDD §5.4); an
         // early request waits for convergence
         const waiting = m.phase === 'awaiting_cutover' || (m.phase === 'ready' && SINGLE_SHOT.has(m.strategy));
-        if (plan.status === 'running' && waiting && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+        if (plan.status === 'running' && waiting && this.mayBegin(m, plan) && this.gateOpen(m, plan)) this.beginCutover(m, plan);
+        break;
+      }
+      case 'force-cutover': {
+        // the API's ForceCutoverRequest and force_cutover (SDD §5.4, §12, ADV-16)
+        const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+        if (reason.length < FORCE_REASON_MIN) throw new HttpError(422, 'validation_error', `reason: at least ${FORCE_REASON_MIN} characters.`);
+        if (!FORCEABLE.has(m.phase) || SINGLE_SHOT.has(m.strategy)) {
+          throw new HttpError(409, 'conflict', `a Force cutover applies to a warm migration in pre-copy or syncing, not to ${m.strategy} in ${m.phase}`);
+        }
+        // forced once, like the API (SDD §5.4): a second forcer would take the first one's place
+        if (m.force_cutover) throw new HttpError(409, 'conflict', `Already forced by ${m.force_cutover.actor}: the cutover follows the running pass.`);
+        const last = m.sync_passes.filter((p) => p.ended_at !== null).at(-1);
+        const at = new Date(this.now()).toISOString();
+        // the API's figure (SDD §5.4): the downtime after the running pass, as the Force cutover dialog shows it
+        const force = { actor: me.name, at, reason, delta_bytes: last?.bytes_changed ?? 0, estimated_downtime_s: forcedDowntime(m, plan) };
+        m.force_cutover = force;
+        // a request too, under maker-checker like POST …/cutover (SDD §5.4, ADV-17)
+        if (!plan.require_distinct_approver) m.approvals.push({ actor: me.name, at, comment: reason });
+        if (!m.cutover_requested_by) {
+          m.cutover_requested_by = me.name;
+          m.cutover_requested_at = at;
+        }
+        m.cutover_requested = true;
+        this.emit({
+          kind: 'migration.force_cutover',
+          plan_id: m.plan_id,
+          migration_id: m.id,
+          actor: me.name,
+          message: `cutover of ${m.vm.name} forced by ${me.name}: ${reason}`,
+          // in the audit trail like the API (SDD §14.5): its target is the migration
+          data: { target_id: m.id, vm: m.vm.name, reason, delta_bytes: force.delta_bytes, estimated_downtime_s: force.estimated_downtime_s },
+        });
         break;
       }
       case 'sync':
@@ -1159,6 +2176,23 @@ export class MockServer {
       case 'rollback': {
         const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
         if (!reason) throw new HttpError(422, 'validation_error', 'reason is required.');
+        if (!canTransition(m.phase, 'rolling_back')) throw new HttpError(409, 'conflict', `Cannot move ${m.vm.name} from ${m.phase} to rolling_back.`);
+        // like the API (SDD §8.1): a finalize that began deleting the source is finalized again, never rolled back
+        if (m.phase === 'completed' && m.checkpoint === 'finalizing') {
+          throw new HttpError(409, 'conflict', 'the finalize began deleting the source VM: finalize it again');
+        }
+        // like the API (SDD §5.1): without its providers a rollback fails, and a migration whose cutover
+        // stopped its source could then be neither rolled back, retried nor cancelled
+        const plan = this.plan(m.plan_id);
+        for (const [role, id] of [['source', plan.source_provider_id], ['destination', plan.destination_provider_id]] as const) {
+          if (!this.providers.some((p) => p.id === id)) {
+            throw new HttpError(409, 'conflict', `${m.vm.name} cannot be rolled back: the plan's ${role} provider '${id}' no longer exists`);
+          }
+        }
+        // like the API (SDD §8.1): the rollback starts the source on purpose - a migration that completes again is
+        // watched afresh, and the power the demo set goes with it
+        m.source_running_at = null;
+        this.power.delete(m.vm.source_id);
         this.transition(m, 'rolling_back', reason, me.name);
         m.progress_pct = 0;
         record('rollback requested', { reason });
@@ -1166,24 +2200,50 @@ export class MockServer {
       }
       case 'retry': {
         if (m.phase !== 'failed' && m.phase !== 'rolled_back') throw new HttpError(409, 'conflict', `Cannot retry ${m.vm.name} while ${m.phase}.`);
-        const held = this.heldElsewhere(this.plan(m.plan_id), [m.vm.source_id]);
+        const plan = this.plan(m.plan_id);
+        const held = this.heldElsewhere(plan, [m.vm.source_id]);
         if (held.size) throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: a migration in another plan holds the VM: ${holdersText(held)}; finish, roll back or cancel it there first`);
+        // only a completed plan's providers can be deleted, and the retry reopens such a plan: it needs them (SDD §5.1, §12)
+        for (const [role, id] of [['source', plan.source_provider_id], ['destination', plan.destination_provider_id]] as const) {
+          if (!this.providers.some((p) => p.id === id)) {
+            throw new HttpError(409, 'conflict', `${m.vm.name} cannot be retried: the plan's ${role} provider '${id}' no longer exists; create a new plan for the VM`);
+          }
+        }
+        const reopen = plan.status === 'completed';
         this.transition(m, 'ready', 'retry requested', me.name);
         m.attempts += 1;
+        // the strategy of the attempt being retried: the evidence names it, even after a later validation chose another (SDD §14.4)
+        m.attempt_strategies = [...m.attempt_strategies, m.strategy];
         if (!m.downtime_started_at || m.downtime_ended_at) {
-          // a closed clock starts afresh; an open one means the source is still stopped (SDD §5.2)
+          // a closed clock starts afresh, with the model seconds the next cutover reports; an open one means the
+          // source is still stopped, and keeps its model seconds (SDD §5.2)
           m.downtime_started_at = null;
           m.downtime_ended_at = null;
           m.actual_downtime_s = null;
+          m.downtime_model_s = null;
         }
         m.error = null;
-        m.cutover_requested = false;
-        m.force_window = false;
+        clearRequest(m);
+        // like the API's retry (SDD §5.1): what the earlier attempt found about itself goes with it
+        m.data_issues = [];
+        m.converged_by = null;
+        m.review_required = false;
+        m.review_reason = null;
+        m.checkpoint = null;
         m.progress_pct = 0;
+        if (reopen) {
+          plan.status = 'running';
+          plan.updated_at = new Date(this.now()).toISOString();
+          this.emit({ kind: 'plan.updated', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} reopened: retry of ${m.vm.name}`, data: { status: 'running' } });
+        }
         record('retry requested');
         break;
       }
       case 'cancel': {
+        if (m.phase === 'validating') {
+          // like the API (SDD §5.1): a validation may be moving it
+          throw new HttpError(409, 'conflict', `${m.vm.name} is being validated and cannot be cancelled; validate the plan again - it finishes the migration, or cancels it once its VM left vm_ids`);
+        }
         if (m.downtime_started_at && !m.downtime_ended_at) {
           // SDD §5.1: never leave a stopped source behind
           const advice = m.phase === 'failed' ? 'roll back or retry' : 'cut it over';
@@ -1199,9 +2259,11 @@ export class MockServer {
         break;
       }
       case 'finalize': {
+        // like the API (SDD §12): the phase first, then the typed name
+        if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
-        m.checkpoint = 'finalize';
+        m.checkpoint = 'finalized'; // the API's checkpoint values (SDD §8.1)
         record('finalized', { delete_source: Boolean(input.delete_source) });
         break;
       }
@@ -1237,7 +2299,9 @@ export class MockServer {
     const mine = this.migrations.filter((m) => !planId || m.plan_id === planId);
     const byPhase: Partial<Record<Phase, number>> = {};
     for (const m of mine) byPhase[m.phase] = (byPhase[m.phase] ?? 0) + 1;
-    const downtimes = mine.filter((m) => m.actual_downtime_s !== null && m.downtime_ended_at !== null);
+    // like the API (SDD §5.5): verified downtimes only, and a migration whose numbers do not hold is counted, not measured
+    const done = mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized');
+    const downtimes = done.filter((m) => m.actual_downtime_s !== null && m.data_issues.length === 0);
     const values = downtimes.map((m) => m.actual_downtime_s ?? 0).sort((a, b) => a - b);
     const sloOf = (m: Migration) => this.plans.find((p) => p.id === m.plan_id)?.downtime_slo_s ?? 600;
     const byStrategy: Partial<Record<Strategy, number>> = {};
@@ -1265,6 +2329,9 @@ export class MockServer {
       p95_downtime_s: percentile(values, 95),
       max_downtime_s: values.length ? (values.at(-1) ?? null) : null,
       slo_compliance_pct: downtimes.length ? Math.round((downtimes.filter((m) => (m.actual_downtime_s ?? 0) <= sloOf(m)).length / downtimes.length) * 1000) / 10 : null,
+      data_inconsistent: done.filter((m) => m.data_issues.length > 0).length,
+      awaiting_finalize: mine.filter((m) => m.phase === 'completed').length,
+      finalized: mine.filter((m) => m.phase === 'finalized').length,
       downtime_by_strategy: byStrategy,
       throughput_series: series,
     };

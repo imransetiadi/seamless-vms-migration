@@ -123,7 +123,8 @@ _OPENSTACK: tuple[_Spec, ...] = (
         "rhel8",
         network="finance-db",
         rate_mib=12.0,
-        tags=(("app", "billing"), ("role", "oracle")),
+        # the demo's application failure (ADV-18): its Oracle listener never starts on RHOSO
+        tags=(("app", "billing"), ("role", "oracle"), ("demo-fault", "app-down")),
     ),
     _Spec(
         "billing-legacy-01",
@@ -282,6 +283,8 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
                 network=spec.network,
                 mac="00:50:56:" + ":".join(f"{rng.randrange(256):02x}" for _ in range(3)),
                 fixed_ips=[f"10.2.{0 if spec.network == 'DC2-Prod' else 9}.{20 + index}"],
+                # a standard port group's NIC: the kit maps it by its summary, the name (SDD §7.2)
+                network_key=spec.network,
             )
         ],
         power_state="running",
@@ -304,6 +307,15 @@ class FakeSourceProvider:
         else:
             self._vms = [_openstack_vm(s, rng, i) for i, s in enumerate(_OPENSTACK)]
         self._by_id = {vm.source_id: vm for vm in self._vms}
+        #: power states the demo changed (SDD §8.1): a simulated cutover stops the source, a
+        #: rollback starts it, the demo power control either; the registry keeps one fake each
+        self._power: dict[str, str] = {}
+
+    def _as_now(self, vm: VMRef) -> VMRef:
+        copy = vm.model_copy(deep=True)
+        if vm.source_id in self._power:
+            copy.power_state = self._power[vm.source_id]  # type: ignore[assignment]
+        return copy
 
     async def check(self) -> dict[str, Any]:
         if self.kind == ProviderKind.vmware:
@@ -319,22 +331,28 @@ class FakeSourceProvider:
             }
         return {
             "admin": True,
+            "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.88",
             "ovn": True,
             **_storage_caps(_SOURCE_POOLS.values()),
         }
 
     async def list_vms(self) -> list[VMRef]:
-        return [vm.model_copy(deep=True) for vm in self._vms]
+        return [self._as_now(vm) for vm in self._vms]
 
     async def get_vm(self, source_id: str) -> VMRef:
         try:
-            return self._by_id[source_id].model_copy(deep=True)
+            return self._as_now(self._by_id[source_id])
         except KeyError:
             raise ProviderError(f"VM {source_id!r} not found") from None
 
     async def power_on(self, source_id: str) -> None:
         await self.get_vm(source_id)
+        self._power[source_id] = "running"
+
+    async def power_off(self, source_id: str) -> None:
+        await self.get_vm(source_id)
+        self._power[source_id] = "stopped"
 
     async def delete_server(self, source_id: str) -> None:
         await self.get_vm(source_id)
@@ -353,8 +371,10 @@ class FakeDestinationProvider:
         self.deleted: set[str] = set()
 
     async def check(self) -> dict[str, Any]:
+        # an admin token (SDD §10): the demo's shared provider network takes its ports (§6.6)
         return {
             "admin": True,
+            "roles": ["admin", "member", "reader"],
             "compute_microversion": "2.95",
             "ovn": True,
             **_storage_caps(_DESTINATION_POOLS),
@@ -376,17 +396,45 @@ class FakeDestinationProvider:
             "volumes": 1000,
             "gigabytes": 200_000,
         }
+        # the credential's own networks, and a provider network another project shares (SDD §10)
+        networks = [
+            ("finance-app", 1500, True, "10.20.1.0/24"),
+            ("finance-db", 8942, True, "10.20.2.0/24"),
+            ("dc2-prod", 1500, True, "10.2.0.0/24"),
+            ("dc2-dmz", 1442, True, "10.2.9.0/24"),
+            ("provider-vlan100", 1500, False, "172.16.100.0/24"),
+        ]
         return DestinationInventory(
-            networks={
-                "finance-app": 1500,
-                "finance-db": 8942,
-                "dc2-prod": 1500,
-                "dc2-dmz": 1442,
-            },
+            networks={name: mtu for name, mtu, _, _ in networks},
             flavors=flavors,
             volume_types=["ceph-ssd", "ceph-hdd", "netapp-nfs", "__DEFAULT__"],
             quotas={"finance": dict(free), "dc2": dict(free)},
             projects=["finance", "dc2"],
+            network_details=[
+                {
+                    "id": f"net-{name}",
+                    "name": name,
+                    "mtu": mtu,
+                    "project_id": "project-demo" if own else "project-admin",
+                    "own": own,
+                    "shared": not own,
+                    "external": False,
+                }
+                for name, mtu, own, _ in networks
+            ],
+            # the demo VMs' addresses lie in these (SDD §10): NIC addresses validate against them
+            subnets=[
+                {
+                    "id": f"sub-{name}-v4",
+                    "name": f"{name}-v4",
+                    "network": name,
+                    "network_id": f"net-{name}",
+                    "cidr": cidr,
+                    "ipv6_address_mode": None,
+                    "ipv6_ra_mode": None,
+                }
+                for name, _, _, cidr in networks
+            ],
         )
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
@@ -405,6 +453,26 @@ class FakeDestinationProvider:
             "[  OK  ] Reached target Multi-User System.\n"
             f"Red Hat Enterprise Linux 9.4 (Plow)\n{server_id} login: "
         )
+
+    async def probe_service(self, server_id: str, vm: VMRef, probe: Any, address: str) -> Any:
+        """The simulated guest's answer to an application probe (SDD §7.4, ADV-18): it runs its
+        suggested services (§9.6) and SSH, or RDP on Windows, and answers HTTP 200; a VM tagged
+        ``demo-fault: app-down`` runs none of its application services."""
+        # imported here: the verifier and the probe rules import the providers' module
+        from ..planning.probes import suggest_probes
+        from ..verification import ProbeAnswer
+
+        listening = {3389 if vm.guest_os.family == "windows" else 22}
+        if vm.tags.get("demo-fault") != "app-down":
+            listening |= {p.port for p in suggest_probes(vm)}
+        where = f"{address}:{probe.port}"
+        if probe.port not in listening:
+            return ProbeAnswer("failed", f"{where} refused the connection", False)
+        if probe.kind == "tcp":
+            return ProbeAnswer("passed", f"connected to {where}", True)
+        if probe.expect_status not in (None, 200):
+            return ProbeAnswer("failed", f"HTTP 200, expected {probe.expect_status}", True)
+        return ProbeAnswer("passed", "HTTP 200", True)
 
     async def delete_server(self, server_id: str) -> None:
         self.deleted.add(server_id)

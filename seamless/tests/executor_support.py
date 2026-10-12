@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from seamless_migrate.config import Settings
-from seamless_migrate.domain.models import Migration, Plan, Provider
+from seamless_migrate.domain.models import Migration, Plan, Provider, utcnow
 from seamless_migrate.executors.base import StepContext
 
 
@@ -21,7 +21,8 @@ class Recorder:
 
     async def mark_downtime_start(self, at=None) -> None:
         self.downtime_marks += 1
-        self.downtime_at.append(at)
+        # when the source stopped: the executor's time, or now as the orchestrator would take it
+        self.downtime_at.append(at or utcnow())
 
     async def log(self, line: str) -> None:
         self.logs.append(line)

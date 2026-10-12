@@ -45,6 +45,20 @@
             import_workloads_warm_destination.servers | length == 0
             or (import_workloads_warm_destination.servers | first).status | upper == 'ERROR'
 
+        # An earlier attempt may have failed after Nova created the server (a
+        # timeout while it booted, an error adding its floating IPs): finish it
+        # (ACTIVE, missing floating IPs), never create another (SDD §6.5).
+        - name: Finish the recorded destination server
+          os_migrate.os_migrate.import_workload_create_instance:
+            cloud: dst
+            validate_certs: "{{ os_migrate_dst_validate_certs | default(omit) }}"
+            ca_cert: "{{ os_migrate_dst_ca_cert | default(omit) }}"
+            client_cert: "{{ os_migrate_dst_client_cert | default(omit) }}"
+            client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
+            data: "{{ item }}"
+            block_device_mapping: []
+            warm_state_dir: "{{ os_migrate_warm_state_dir }}"
+
         - name: Report a workload that was already cut over
           ansible.builtin.debug:
             msg: >-

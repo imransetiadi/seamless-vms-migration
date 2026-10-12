@@ -157,6 +157,34 @@ def test_create_instance_module_reuses_a_recorded_server(tmp_path):
     create.assert_not_called()
 
 
+def test_create_instance_module_finishes_a_recorded_server(tmp_path):
+    """SDD §6.5: a re-run after the first attempt failed once Nova had created the server
+    (a timeout while it booted, an error adding floating IPs) waits for that server and adds
+    the floating IPs it lacks, instead of only reporting it."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    finished = []
+
+    def record_fips(self, conn, sdk_srv):
+        finished.append(sdk_srv.id)
+
+    with mock.patch.object(server.Server, "create") as create, mock.patch.object(
+        server.Server, "_create_floating_ips", record_fips
+    ):
+        result = fake.run_module(create_module, _create_instance_args(state_dir), dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["server_id"] == "dst-srv"
+    create.assert_not_called()
+    assert finished == ["dst-srv"]
+    assert ("wait_for_server", {"server": "dst-srv"}) in [
+        (c[0], {"server": c[1].get("server")}) for c in dst.calls_to("wait_for_server")
+    ]
+
+
 # --- rollback ------------------------------------------------------------------
 
 
@@ -170,6 +198,7 @@ def test_rollback_deletes_recorded_server_and_keeps_volumes(tmp_path):
         "deleted_server_id": "dst-srv",
         "deleted_volume_ids": [],
         "kept_volume_ids": [],
+        "deleted_port_ids": [],
         "state_deleted": False,
     }
     assert "dst-srv" not in dst.servers and "other" in dst.servers
@@ -302,6 +331,59 @@ def test_rollback_can_match_the_destination_server_by_exact_name(tmp_path):
         WarmRollback(dst, state, server_name="vm1", match_by_name=True, timeout=5).run()
 
 
+def test_rollback_deletes_the_ports_neutron_port_mode_created(tmp_path):
+    """SDD 6.6: Nova keeps ports it did not create when their server is deleted. The rollback
+    deletes those of the workload's source ports - unbound, or bound to the deleted server -
+    and keeps every other port."""
+    dst, state_dir = migrated(tmp_path)
+    dst.add_port("p1", "fa:16:3e:00:00:01", description="os-migrate:sp-1", device_id="dst-srv")
+    dst.add_port("p2", "fa:16:3e:00:00:02", description="os-migrate:sp-2")
+    dst.add_port("p-other-vm", "fa:16:3e:00:00:09", description="os-migrate:sp-9")
+    dst.add_port("p-in-use", "fa:16:3e:00:00:03", description="os-migrate:sp-2", device_id="other")
+    dst.add_port("p-operator", "fa:16:3e:00:00:04", device_id="dst-srv")
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), source_port_ids=["sp-1", "sp-2"], timeout=5
+    ).run()
+
+    assert result["deleted_server_id"] == "dst-srv"
+    assert result["deleted_port_ids"] == ["p1", "p2"]
+    assert set(dst.ports) == {"p-other-vm", "p-in-use", "p-operator"}
+
+
+def test_rollback_deletes_the_ports_of_a_cutover_that_created_no_server(tmp_path):
+    """A cutover can fail between creating the ports and creating the server: there is no
+    server to delete, the ports go anyway."""
+    dst, state_dir = migrated(tmp_path, record=False)
+    dst.add_port("p1", "fa:16:3e:00:00:01", description="os-migrate:sp-1")
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), source_port_ids=["sp-1"], timeout=5
+    ).run()
+
+    assert result["deleted_server_id"] is None
+    assert result["deleted_port_ids"] == ["p1"] and result["changed"] is True
+    assert "dst-srv" in dst.servers  # neither recorded nor matched by name: not this workload's
+    assert not dst.ports
+
+
+def test_rollback_checks_each_port_itself_before_deleting_it(tmp_path):
+    """A cloud that ignored the description filter would list every port: only the
+    workload's marked ports are deleted all the same."""
+    dst, state_dir = migrated(tmp_path)
+    dst.add_port("p1", "fa:16:3e:00:00:01", description="os-migrate:sp-1")
+    dst.add_port("p-unmarked", "fa:16:3e:00:00:05")
+    dst.add_port("p-other-vm", "fa:16:3e:00:00:09", description="os-migrate:sp-9")
+    dst.network.ports = lambda **query: list(dst.ports.values())
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), source_port_ids=["sp-1"], timeout=5
+    ).run()
+
+    assert result["deleted_port_ids"] == ["p1"]
+    assert set(dst.ports) == {"p-unmarked", "p-other-vm"}
+
+
 def test_rollback_module(tmp_path):
     from ansible_collections.os_migrate.os_migrate.plugins.modules import (
         import_workload_rollback as rollback_module,
@@ -325,3 +407,28 @@ def test_rollback_module(tmp_path):
 
     again = fake.run_module(rollback_module, args, dst)
     assert again["changed"] is False
+
+
+def test_rollback_module_deletes_the_workloads_neutron_ports(tmp_path):
+    """The module names the workload's source ports from its data (SDD 6.6)."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_rollback as rollback_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    dst.add_port("p1", "fa:16:3e:00:00:01", description="os-migrate:sp-1", device_id="dst-srv")
+    dst.add_port("p-other-vm", "fa:16:3e:00:00:09", description="os-migrate:sp-9")
+    port = {
+        "type": "openstack.network.ServerPort",
+        "params": {"mac_address": "fa:16:3e:00:00:01"},
+        "_info": {"id": "sp-1", "device_id": "srv-1", "device_owner": "compute:nova"},
+    }
+    args = {"cloud": "dst", "data": fake.workload_data(ports=[port]), "state_dir": state_dir}
+
+    result = fake.run_module(rollback_module, args, dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["deleted_port_ids"] == ["p1"]
+    assert set(dst.ports) == {"p-other-vm"}
+    again = fake.run_module(rollback_module, args, dst)
+    assert again["changed"] is False and again["deleted_port_ids"] == []

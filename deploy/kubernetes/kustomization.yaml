@@ -103,7 +103,8 @@ patches:
   # ADJUST to your cluster: the pod and service networks below are the kubeadm/kind defaults
   # (kubectl cluster-info dump | grep -m2 -E -- '--(cluster-cidr|service-cluster-ip-range)'); k3s uses
   # 10.42.0.0/16 and 10.43.0.0/16. Calico's default pool 192.168.0.0/16 often overlaps lab networks where
-  # the clouds live — except it only when no OpenStack/vCenter endpoint or conversion host is in it.
+  # the clouds live — except it only when no OpenStack/vCenter endpoint, conversion host or migrated VM (its
+  # verification checks, SDD 7.5) is in it.
   # Outbound to clouds and conversion hosts, but never to a pod or Service of this cluster (and not to
   # OpenShift's ranges, which are ordinary private addresses here).
   - target:

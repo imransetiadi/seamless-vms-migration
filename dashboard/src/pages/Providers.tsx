@@ -60,9 +60,10 @@ function Capabilities({ capabilities }: { capabilities: Record<string, unknown> 
               ? value.join(', ')
               : String(value);
         return (
-          <li key={key} className="inline-flex max-w-full items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
+          <li key={key} className="inline-flex max-w-full items-baseline gap-1 rounded-sm border border-border px-1.5 py-0.5 text-xs text-foreground">
             <span className="text-muted-foreground">{label}</span>
-            <span className="num truncate">{text}</span>
+            {/* wraps on a narrow screen: never cut off with an ellipsis (SDD §16) */}
+            <span className="num min-w-0 wrap-break-word">{text}</span>
           </li>
         );
       })}
@@ -225,8 +226,14 @@ function ProviderCard({
       <ConfirmDialog
         open={confirmDelete}
         tone="danger"
+        icon={Trash2}
         title={`Delete ${provider.name}?`}
-        description="This removes the provider from Seamless together with the credentials and SSH key stored for it. The cloud itself is untouched. Plans that still use it must finish first."
+        subject={`Provider ${provider.id}`}
+        consequences={[
+          { kind: 'removed', text: 'the provider in Seamless, with the sign-in details and SSH key stored for it' },
+          { kind: 'kept', text: 'the cloud itself: nothing changes there' },
+          { kind: 'then', text: 'plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it' },
+        ]}
         confirmLabel="Delete provider"
         requireText={provider.id}
         pending={remove.isPending}
@@ -262,11 +269,13 @@ function FleetSummary({ providers, canCheck, onAnnounce }: { providers: Provider
   const checkAll = useCheckAllProviders();
   const counts = SUMMARY_ORDER.map((status) => ({ status, count: providers.filter((p) => p.status === status).length })).filter((c) => c.count > 0);
   const missing = providers.filter((p) => !p.credentials_secret && !p.cloud).length;
-  // a check request that failed is named and counted, never left out (SDD §16)
-  const failed = checkAll.data?.failed ?? [];
+  // a check request that failed is named and counted, never left out (SDD §16); the names stay while a retry runs,
+  // until its answer replaces them, so Retry keeps the focus
+  const [failed, setFailed] = useState<Array<{ id: string; error: unknown }>>([]);
   const check = (ids: string[]) =>
     checkAll.mutate(ids, {
       onSuccess: ({ checked, failed: notChecked }) => {
+        setFailed(notChecked);
         const healthy = checked.filter((p) => p.status === 'ok').length;
         const count = notChecked.length ? `${checked.length} of ${ids.length}` : `${checked.length}`;
         onAnnounce(

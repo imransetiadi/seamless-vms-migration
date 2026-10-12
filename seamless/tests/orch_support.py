@@ -51,6 +51,8 @@ class StaticDestination:
         self.status = "ACTIVE"
         self.console: str | None = "[  OK  ] Reached target Multi-User System.\nweb-01 login: "
         self.deleted: list[str] = []
+        #: the simulated guest's answer per probed port (SDD §7.5): passed, failed or unreachable
+        self.services: dict[int, str] = {}
 
     async def check(self) -> dict[str, Any]:
         return {"admin": True, "compute_microversion": "2.95", "ovn": True}
@@ -70,6 +72,8 @@ class StaticDestination:
             volume_types=["ceph-ssd", "ceph-hdd"],
             quotas={},
             projects=["finance"],
+            # the test VMs' addresses (10.0.0.<i>): NIC overrides validate against it (SDD §11)
+            subnets=[{"name": "app-v4", "network": "app-net", "cidr": "10.0.0.0/24"}],
         )
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
@@ -80,6 +84,17 @@ class StaticDestination:
 
     async def console_log(self, server_id: str, lines: int = 200) -> str | None:
         return self.console
+
+    async def probe_service(self, server_id: str, vm: Any, probe: Any, address: str) -> Any:
+        from seamless_migrate.verification import ProbeAnswer
+
+        result = self.services.get(probe.port, "failed")
+        detail = {
+            "passed": f"connected to {address}:{probe.port}",
+            "failed": f"{address}:{probe.port} refused the connection",
+            "unreachable": f"{address}:{probe.port} unreachable (TimeoutError)",
+        }[result]
+        return ProbeAnswer(result, detail, result == "passed")
 
     async def delete_server(self, server_id: str) -> None:
         self.deleted.append(server_id)
@@ -231,6 +246,16 @@ class Harness:
                 return plan
             if asyncio.get_running_loop().time() > deadline:
                 raise AssertionError(f"plan {plan_id} is {plan.status}, wanted {status}")
+            await asyncio.sleep(0.01)
+
+    async def wait_kind(self, kind: str, count: int = 1, timeout: float = 10.0) -> None:
+        """Until the trail holds ``count`` events of ``kind``. A state is written before its event
+        (the plan's completion: its status, then ``plan.completed``, SDD §8), so a test that counts
+        events waits for them - stopping on the state alone cancels the event still to come."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while (seen := self.kinds().count(kind)) < count:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(f"{seen} {kind} events, wanted {count}")
             await asyncio.sleep(0.01)
 
     def kinds(self) -> list[str]:

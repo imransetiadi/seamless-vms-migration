@@ -124,8 +124,9 @@ class Server(osm_resource.Resource):
         sdk_params = self.sdk_params(conn)
         port_creation_mode = self.migration_params()["port_creation_mode"]
 
-        # Simple port creation via Nova. Subsequently we may add
-        # support for advanced port creation via Neutron.
+        # Nova creates each port with one fixed IP, or (port_creation_mode
+        # neutron) Neutron with its MAC, every fixed IP and its security
+        # groups (SDD 6.6).
         self.update_sdk_params_networks_simple(conn, sdk_params, port_creation_mode)
 
         if not self.migration_params()["data_copy"]:
@@ -140,6 +141,13 @@ class Server(osm_resource.Resource):
             on_create(sdk_srv)
         # Wait for the server before we attach Floating IPs, otherwise
         # we may hit "Instance network is not ready yet" error.
+        sdk_srv = conn.compute.wait_for_server(sdk_srv, failures=["ERROR"], wait=600)
+        self._create_floating_ips(conn, sdk_srv)
+        return sdk_srv
+
+    def finish(self, conn, sdk_srv):
+        """Finish a server created by an earlier, interrupted run (SDD §6.5):
+        wait for it to be ACTIVE, then add the floating IPs it lacks."""
         sdk_srv = conn.compute.wait_for_server(sdk_srv, failures=["ERROR"], wait=600)
         self._create_floating_ips(conn, sdk_srv)
         return sdk_srv
@@ -381,7 +389,10 @@ class Server(osm_resource.Resource):
         return refs
 
     def dst_prerequisites_errors(self, conn, filters=None):
-        """Get messages for unmet destination cloud prerequisites including keypairs.
+        """Get messages for unmet destination cloud prerequisites including keypairs,
+        every port's network, subnets and addresses, and the floating IPs (SDD 6.6): run
+        before the source is stopped, they are looked up as the import will look them up
+        after it.
 
         Returns: list of strings (error messages), empty when prerequisites
         are met
@@ -402,4 +413,18 @@ class Server(osm_resource.Resource):
             ) as e:
                 errors.append(f"Destination keypair prerequisites not met: {e}")
 
+        # an export from before a migration param existed takes its class default
+        migration_params = {**self.migration_param_defaults, **self.migration_params()}
+        for port_data in params.get("ports") or []:
+            errors.extend(
+                ServerPort.from_data(port_data).dst_port_errors(
+                    conn, migration_params["port_creation_mode"]
+                )
+            )
+        for fip_data in params.get("floating_ips") or []:
+            errors.extend(
+                ServerFloatingIP.from_data(fip_data).dst_errors(
+                    conn, migration_params["floating_ip_mode"]
+                )
+            )
         return errors

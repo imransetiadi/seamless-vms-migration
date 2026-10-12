@@ -1,9 +1,8 @@
-"""agentmemory REST client and the shared redaction helper (SDD §13.4, §14.3)."""
+"""agentmemory REST client (SDD §14.3); every body passes the redaction layer (§13.4)."""
 
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -11,54 +10,9 @@ from typing import Any
 import httpx
 
 from ..config import Settings
+from .redaction import redact, redact_payload
 
 log = logging.getLogger(__name__)
-
-REDACTED = "[REDACTED]"
-_KEYWORDS = (
-    r"password|passwd|pwd|pass|secret|client[_-]?secret|token|auth[_-]?token|x-auth-token|"
-    r"api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|credentials?"
-)
-#: A credential key may carry a prefix joined by ``_``/``-``/``.`` (``OS_PASSWORD``,
-#: ``vcenter_password``, ``ansible_become_pass``, ``AWS_SECRET_ACCESS_KEY``, ``auth.password``).
-_KEY = r"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*(?:" + _KEYWORDS + r")(?![A-Za-z0-9])"
-_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    # PEM blocks (keys, certificates)
-    (
-        re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S),
-        "[REDACTED PEM]",
-    ),
-    # credentials embedded in URLs: scheme://user:pass@host
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"), r"\1[REDACTED]@"),
-    # Authorization headers (any scheme)
-    (re.compile(r"(?i)\b(authorization)\s*[:=]\s*(?:\w+\s+)?[^\s,;'\"]+"), r"\1: " + REDACTED),
-    # bare bearer tokens
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer " + REDACTED),
-    # key=value / key: value / "key": "value" (the key possibly prefixed, e.g. OS_PASSWORD)
-    (
-        re.compile(r"(?i)([\"']?" + _KEY + r"[\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&}]+)"),
-        r"\1" + REDACTED,
-    ),
-    # CLI form: --os-password hunter2 / --password=hunter2 / -p hunter2 is too ambiguous
-    (
-        re.compile(r"(?i)(--[a-z0-9-]*(?:password|passwd|secret|token|api-key|key)\s+)([^\s]+)"),
-        r"\1" + REDACTED,
-    ),
-    # well-known token shapes: seamless API tokens, Keystone fernet tokens, JWTs
-    (re.compile(r"\bsmg_[A-Za-z0-9_-]{16,}"), REDACTED),
-    (re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
-)
-
-
-def redact(text: str, redact_names: Sequence[str] | None = None) -> str:
-    """Remove secrets (and optionally VM names) before text leaves the control plane."""
-    out = str(text)
-    for pattern, replacement in _PATTERNS:
-        out = pattern.sub(replacement, out)
-    for name in sorted({n for n in (redact_names or []) if n}, key=len, reverse=True):
-        out = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", "[vm]", out)
-    return out
 
 
 @dataclass(frozen=True)
@@ -149,12 +103,20 @@ class MemoryClient:
             base_url=self.url, headers=headers, timeout=self._timeout, transport=self._transport
         )
 
-    def _clean(self, text: str, names: Sequence[str] | None) -> str:
-        return redact(text, names if self.redact_names else None)
+    def _body(self, body: dict[str, Any], names: Sequence[str] | None) -> dict[str, Any]:
+        """Every request body passes the redaction layer (SDD §13.4)."""
+        redacted: dict[str, Any] = redact_payload(body, names if self.redact_names else None)
+        return redacted
 
     def _failed(self, what: str, exc: Exception) -> None:
         self.available = False
-        self.last_error = redact(f"{what}: {type(exc).__name__}: {exc}")[:300]
+        if isinstance(exc, httpx.TimeoutException):
+            # worded like Jev's timeouts: the Advisor page shows it
+            text = f"{what} timed out after {self._timeout:g} s"
+        else:
+            detail = str(exc).strip()
+            text = f"{what}: {type(exc).__name__}" + (f": {detail}" if detail else "")
+        self.last_error = redact(text)[:300]
         log.warning("agentmemory %s failed: %s", what, self.last_error)
 
     def _ok(self) -> None:
@@ -170,13 +132,16 @@ class MemoryClient:
         *,
         names: Sequence[str] | None = None,
     ) -> bool:
-        body = {
-            "content": self._clean(content, names),
-            "type": type,
-            "concepts": [self._clean(c, names) for c in concepts],
-            "files": list(files or []),
-            "project": self.project,
-        }
+        body = self._body(
+            {
+                "content": content,
+                "type": type,
+                "concepts": list(concepts),
+                "files": list(files or []),
+                "project": self.project,
+            },
+            names,
+        )
         try:
             async with self._client() as client:
                 response = await client.post("/agentmemory/remember", json=body)
@@ -193,7 +158,7 @@ class MemoryClient:
     async def search(
         self, query: str, limit: int = 5, *, names: Sequence[str] | None = None
     ) -> list[MemoryHit]:
-        body = {"query": self._clean(query, names), "limit": limit, "project": self.project}
+        body = self._body({"query": query, "limit": limit, "project": self.project}, names)
         try:
             async with self._client() as client:
                 response = await client.post("/agentmemory/smart-search", json=body)

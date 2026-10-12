@@ -1,4 +1,6 @@
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
@@ -12,6 +14,7 @@ from seamless_migrate.executors.handover import (
     HandoverExecutor,
     _cinder_bootable,
     _mark_boot,
+    port_description,
 )
 from tests.executor_support import make_ctx
 from tests.factories import make_disk, make_migration, make_plan, make_provider, make_vm
@@ -101,6 +104,8 @@ class FakeCompute:
 
     def get_server(self, server_id):
         self.c.record("get_server", server_id)
+        if server_id not in self.c.servers:
+            raise NotFoundException(f"No Server found for {server_id}")
         return self.c.servers[server_id]
 
     def stop_server(self, server):
@@ -111,6 +116,9 @@ class FakeCompute:
         self.c.record("start_server", server.id)
 
     def wait_for_server(self, server, status="ACTIVE", failures=None, interval=2, wait=120):
+        if self.c.crash_wait == "server":
+            self.c.crash_wait = None
+            raise Crash("wait_for_server")
         return server
 
     def volume_attachments(self, server):
@@ -145,6 +153,11 @@ class FakeCompute:
         return res
 
     def find_flavor(self, name, ignore_missing=True):
+        # by default every flavor exists
+        if self.c.flavor_names is not None and name not in self.c.flavor_names:
+            if ignore_missing:
+                return None
+            raise NotFoundException(f"No Flavor found for {name}")
         return NS(id=f"flavor-{name}", name=name)
 
     def create_server(self, **params):
@@ -196,6 +209,9 @@ class FakeBlockStorage:
             self.c.crash_wait = None
             raise Crash("wait_for_delete")
         return res
+
+    def types(self):
+        return [NS(id=f"type-{name}", name=name) for name in self.c.type_names]
 
     def backend_pools(self):
         if self.c.pools is None:
@@ -256,8 +272,19 @@ class FakeNetwork:
     def __init__(self, cloud):
         self.c = cloud
 
-    def ports(self, device_id=None):
-        return [p for p in self.c.ports.values() if device_id is None or p.device_id == device_id]
+    def ports(
+        self, device_id=None, description=None, network_id=None, fixed_ips=None, mac_address=None
+    ):
+        held = [v.split("=", 1)[1] for v in fixed_ips or [] if v.startswith("ip_address=")]
+        return [
+            p
+            for p in self.c.ports.values()
+            if (device_id is None or p.device_id == device_id)
+            and (description is None or getattr(p, "description", "") == description)
+            and (network_id is None or getattr(p, "network_id", None) == network_id)
+            and (mac_address is None or getattr(p, "mac_address", None) == mac_address)
+            and all(a in [ip.get("ip_address") for ip in p.fixed_ips or []] for a in held)
+        ]
 
     def get_port(self, port_id):
         if port_id not in self.c.ports:
@@ -266,22 +293,90 @@ class FakeNetwork:
 
     def create_port(self, **attrs):
         self.c.record("create_port", attrs.get("mac_address"))
+        self.c.port_attrs.append(attrs)
         port = NS(
-            id=f"{self.c.name}-port-{len(self.c.ports) + 1}",
+            id=f"{self.c.name}-port-{len(self.c.port_attrs)}",
             network_id=attrs["network_id"],
             mac_address=attrs.get("mac_address") or "fa:16:3e:ff:ff:ff",
             fixed_ips=list(attrs.get("fixed_ips") or []),
             device_id="",
             created_by_nova=False,
+            description=attrs.get("description", ""),
+            security_group_ids=list(attrs.get("security_group_ids") or []),
+            is_port_security_enabled=attrs.get("is_port_security_enabled", True),
+            # Neutron's: the token's project unless an admin names another
+            project_id=attrs.get("project_id") or self.c.current_project_id,
         )
         self.c.ports[port.id] = port
         return port
 
+    def delete_port(self, port, ignore_missing=True):
+        port_id = getattr(port, "id", port)
+        self.c.record("delete_port", port_id)
+        self.c.ports.pop(port_id, None)
+
+    def get_security_group(self, group_id):
+        return NS(id=group_id, name=self.c.security_groups[group_id])
+
+    def find_security_group(self, name, ignore_missing=True, project_id=None):
+        self.c.group_lookups.append((name, project_id))
+        return NS(id=f"{self.c.name}-sg-{name}", name=name)
+
+    def security_groups(self, name=None, project_id=None):
+        """Neutron's security group list filtered by name and owner; by default every name is one
+        group of the credential's own project."""
+        listed = self.c.group_list
+        if listed is None:
+            listed = [
+                NS(id=f"{self.c.name}-sg-{name}", name=name, project_id=self.c.current_project_id)
+            ]
+        return [
+            g
+            for g in listed
+            if (name is None or g.name == name)
+            and (project_id is None or g.project_id == project_id)
+        ]
+
     def get_network(self, network_id):
         return NS(id=network_id, name="app-net")
 
-    def find_network(self, name, ignore_missing=True):
-        return NS(id=f"{self.c.name}-net-{name}", name=name)
+    def networks(self, name=None, project_id=None):
+        """Neutron's network list filtered by name and owner; by default every name is one
+        network of the credential's own project."""
+        listed = self.c.network_list
+        if listed is None:
+            listed = [
+                NS(id=f"{self.c.name}-net-{name}", name=name, project_id=self.c.current_project_id)
+            ]
+        return [
+            n
+            for n in listed
+            if (name is None or n.name == name)
+            and (project_id is None or n.project_id == project_id)
+        ]
+
+    def subnets(self, network_id=None):
+        """By default a network's subnets hold every address; a test lists its own."""
+        if self.c.subnet_list is None:
+            return [
+                NS(
+                    id="any-v4",
+                    network_id=network_id,
+                    cidr="0.0.0.0/0",
+                    ipv6_address_mode=None,
+                    ipv6_ra_mode=None,
+                ),
+                NS(
+                    id="any-v6",
+                    network_id=network_id,
+                    cidr="::/0",
+                    ipv6_address_mode=None,
+                    ipv6_ra_mode=None,
+                ),
+            ]
+        return [
+            sn for sn in self.c.subnet_list if network_id is None or sn.network_id == network_id
+        ]
 
 
 CEPH = {"vendor_name": "Open Source", "storage_protocol": "ceph"}
@@ -297,10 +392,24 @@ class FakeCloud:
         self.servers = servers or {}
         self.volumes = volumes or {}
         self.crash_on = crash_on
-        self.crash_wait = None  # "delete" or "status": crash once inside that block-storage wait
+        # "delete" or "status": crash once inside that block-storage wait; "server": inside Nova's
+        self.crash_wait = None
         self.created = []
         self.managed = []
         self.ports = {}
+        self.port_attrs = []
+        self.security_groups = {}
+        self.group_lookups = []
+        self.group_list = None
+        # Nova's flavors (None: every name), and Cinder's types: the source's and the mapped one
+        self.flavor_names = None
+        self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
+        self.current_project_id = f"{name}-project"
+        # keystoneauth: the role names of the token (the handover's admin credential)
+        self.roles = ["admin", "member", "reader"]
+        self.session = NS(auth=NS(get_access=lambda session: NS(role_names=list(self.roles))))
+        self.network_list = None
+        self.subnet_list = None
         self.image_metadata = {}
         self.deleted_by_nova = []
         self.refuse_metadata = False
@@ -368,7 +477,10 @@ def source_cloud(calls, crash_on=None):
         ],
         device_id="srv-1",
         created_by_nova=True,
+        security_group_ids=["sg-1"],
+        is_port_security_enabled=True,
     )
+    cloud.security_groups["sg-1"] = "web"
     return cloud
 
 
@@ -621,6 +733,39 @@ async def test_handover_rollback_with_empty_journal_is_a_noop(tmp_path):
     }
 
 
+async def test_handover_rollback_starts_a_source_whose_stop_was_sent(tmp_path):
+    """SDD §7.3 step 1, review RT-10: Nova accepted the stop, then the wait for SHUTOFF failed;
+    the stop is journaled as sent, so the rollback starts the source again instead of reading an
+    empty journal as nothing to roll back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "server"  # the wait for SHUTOFF dies after the stop was sent
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["src"].servers["srv-1"].status == "SHUTOFF"
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [("src", "start_server", "srv-1")]
+    assert result.details == {"source_running": True}
+    # a retry instead of the rollback: the stop step runs again (it is not done until the wait
+    # succeeds), sends no second stop to the stopped source, and the handover completes
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "retry")
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    retried = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert retried.destination_server_id
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+    # a source already stopped before the handover: no stop was sent, nothing to start again
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "stopped")
+    clouds["src"].servers["srv-1"].status = "SHUTOFF"
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [] and result.details["note"] == "nothing to roll back"
+
+
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
     """Crash before the server was deleted: the volumes are still attached and managed; the
     rollback sets the journaled delete_on_termination back and starts the source."""
@@ -736,6 +881,423 @@ async def test_handover_keeps_a_port_without_addresses(tmp_path):
     assert clouds["dst"].created[0]["networks"] == [{"uuid": "dst-net-rhoso-app"}]
 
 
+def neutron(plan):
+    """The plan keeping each port's MAC, every fixed IP and its security groups (SDD §4.2)."""
+    return plan.model_copy(update={"port_creation_mode": "neutron"})
+
+
+async def test_handover_in_neutron_mode_creates_each_port_with_its_mac_addresses_and_groups(
+    tmp_path,
+):
+    """SDD §7.3 steps 2 and 8: the definition records the port's security groups by name and its
+    port-security flag; the destination port is created first, through Neutron, with the MAC,
+    both addresses, the groups found in the destination project and the §6.6 description, and
+    Nova boots the server on it."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    result = await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    [port] = saved["networks"]
+    assert (port["security_groups"], port["port_security_enabled"]) == (["web"], True)
+    assert clouds["dst"].port_attrs == [
+        {
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:00:00:01",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+            "security_group_ids": ["dst-sg-web"],
+            "is_port_security_enabled": True,
+            "description": "os-migrate:port-1",
+        }
+    ]
+    assert clouds["dst"].group_lookups == [("web", "dst-project")]
+    [dst_port] = clouds["dst"].ports.values()
+    assert clouds["dst"].created[0]["networks"] == [{"port": dst_port.id}]
+    assert dst_port.device_id == result.destination_server_id
+    steps = [op for op in ops(calls) if op[0] == "dst"]
+    assert steps[-2:] == [
+        ("dst", "create_port", "fa:16:3e:00:00:01"),
+        ("dst", "create_server", "web-01"),
+    ]
+
+
+async def test_handover_in_neutron_mode_leaves_out_the_addresses_neutron_derives(tmp_path):
+    """SDD §7.3 step 8, §6.6 (review NC-01, NC-09): Neutron 2023.1 allocates a SLAAC subnet's
+    EUI-64 address of the kept MAC on every port it creates, and a sent one is allocated twice;
+    step 8 never sends it, and a resume still knows the port Neutron gave such an address."""
+    eui = "fd00::f816:3eff:fe00:1"
+    net = "dst-net-rhoso-app"
+    slaac_network = [subnet(net, "10.0.0.0/24"), subnet(net, "fd00::/64", "slaac")]
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-1"].fixed_ips = [
+        {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+        {"subnet_id": "sub-v6", "ip_address": eui},
+    ]
+    clouds["dst"].subnet_list = slaac_network
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    [attrs] = clouds["dst"].port_attrs
+    assert attrs["fixed_ips"] == [{"ip_address": "10.0.0.5"}]
+
+    # a port created before a crash, to which Neutron added the EUI-64 address of a SLAAC
+    # subnet the source port had none on: still the one step 8 boots on
+    other, calls2, clouds2, plan2, mig2, settings2 = setup(tmp_path / "resume")
+    clouds2["src"].ports["port-1"].fixed_ips = [{"subnet_id": "sub-v4", "ip_address": "10.0.0.5"}]
+    clouds2["dst"].subnet_list = slaac_network
+    clouds2["dst"].ports["earlier"] = NS(
+        id="earlier",
+        network_id=net,
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": eui}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+        project_id="dst-project",
+    )
+    await other.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].port_attrs == []
+    assert clouds2["dst"].created[0]["networks"] == [{"port": "earlier"}]
+
+
+async def test_handover_rollback_leaves_out_the_slaac_address_of_a_source_port(tmp_path):
+    """SDD §7.3 rollback: the source port is recreated with its MAC and fixed IPs but the one on a
+    SLAAC subnet, which the source's Neutron derives from the MAC itself - sent, it is refused or
+    allocated twice, with the source server already deleted."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    clouds["src"].ports["port-1"].fixed_ips = [
+        {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+        {"subnet_id": "sub-v6", "ip_address": "fd00::f816:3eff:fe00:1"},
+    ]
+    clouds["src"].subnet_list = [
+        NS(
+            id="sub-v4",
+            network_id="net-1",
+            cidr="10.0.0.0/24",
+            ipv6_address_mode=None,
+            ipv6_ra_mode=None,
+        ),
+        NS(
+            id="sub-v6",
+            network_id="net-1",
+            cidr="fd00::/64",
+            ipv6_address_mode="slaac",
+            ipv6_ra_mode="slaac",
+        ),
+    ]
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert attrs["fixed_ips"] == [{"subnet_id": "sub-v4", "ip_address": "10.0.0.5"}]
+    assert attrs["mac_address"] == "fa:16:3e:00:00:01"
+
+
+async def test_handover_in_neutron_mode_resumes_on_the_port_it_created(tmp_path):
+    """A crash after the port and before the server: the resume boots on the journaled port, and
+    a port created but not yet journaled is found by its description, unbound."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "create_port"] == [
+        ("dst", "create_port", "fa:16:3e:00:00:01")
+    ]
+    [dst_port] = clouds["dst"].ports.values()
+    assert clouds["dst"].created[-1]["networks"] == [{"port": dst_port.id}]
+
+    other, calls2, clouds2, plan2, mig2, settings2 = setup(tmp_path / "unjournaled")
+    clouds2["dst"].ports["earlier"] = NS(
+        id="earlier",
+        network_id="dst-net-rhoso-app",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+        project_id="dst-project",
+    )
+    await other.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].port_attrs == []
+    assert clouds2["dst"].created[0]["networks"] == [{"port": "earlier"}]
+
+
+async def test_handover_in_neutron_mode_never_boots_on_a_port_that_is_not_its_own(tmp_path):
+    """SDD §7.3 step 8: the admin credential sees every project's ports, and an earlier cold or
+    warm migration of the same VM may have left one with the description: only an unbound port
+    on the target network, in the credential's project, with the MAC and exactly the addresses
+    is used."""
+    leftovers = {
+        "other-net": {"network_id": "dst-net-elsewhere"},
+        "other-mac": {"mac_address": "fa:16:3e:99:99:99"},
+        "other-ips": {"fixed_ips": [{"ip_address": "10.0.0.77"}]},
+        "other-project": {"project_id": "someone-else"},
+        "bound": {"device_id": "another-server"},
+    }
+    for name, change in leftovers.items():
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        port = {
+            "id": name,
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:00:00:01",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+            "device_id": "",
+            "created_by_nova": False,
+            "description": "os-migrate:port-1",
+            "project_id": "dst-project",
+        }
+        clouds["dst"].ports[name] = NS(**{**port, **change})
+        ctx = make_ctx(neutron(plan), mig, SRC, DST, settings)[0]
+        if name == "other-net":
+            # on another network it holds nothing of ours: step 8 creates the port
+            await executor.run(StepName.CUTOVER, ctx)
+            [created] = clouds["dst"].port_attrs
+            assert created["network_id"] == "dst-net-rhoso-app", name
+            assert clouds["dst"].created[0]["networks"] != [{"port": name}], name
+            continue
+        # it holds an address or the MAC on the target network: Neutron would refuse step 8's
+        # port, so step 0 refuses before anything stops - and nothing boots on it
+        with pytest.raises(PermanentStepError, match=f"is held by port {name}"):
+            await executor.run(StepName.CUTOVER, ctx)
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+        assert clouds["dst"].created == [], name
+
+
+async def test_handover_rollback_recreates_source_ports_with_their_security_groups(tmp_path):
+    """SDD §7.3 step 2 and rollback: every port's security group ids and port-security flag are
+    journaled, and a recreated source port gets them back - Nova applies a server's groups only
+    to ports it creates, so it would land in the project's default group."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert (
+        saved["networks"][0]["security_group_ids"],
+        saved["networks"][0]["port_security_enabled"],
+    ) == (
+        ["sg-1"],
+        True,
+    )
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert (attrs["security_group_ids"], attrs["is_port_security_enabled"]) == (["sg-1"], True)
+
+
+async def test_handover_rollback_of_a_definition_without_port_groups_recreates_the_port(tmp_path):
+    """A run journaled before §7.3 step 2 recorded the port's groups: its rollback recreates the
+    port with its MAC and addresses and leaves the groups to Neutron, as before."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, crash_on="unmanage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="unmanage"):
+        await executor.run(StepName.CUTOVER, ctx)
+    definition = executor.run_dir(ctx) / "source-server.json"
+    legacy = json.loads(definition.read_text())
+    for n in legacy["networks"]:
+        n.pop("security_group_ids")
+        n.pop("port_security_enabled")
+    definition.write_text(json.dumps(legacy))
+    await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["src"].port_attrs
+    assert attrs == {
+        "network_id": "net-1",
+        "mac_address": "fa:16:3e:00:00:01",
+        "fixed_ips": [
+            {"subnet_id": "sub-v4", "ip_address": "10.0.0.5"},
+            {"subnet_id": "sub-v6", "ip_address": "fd00::5"},
+        ],
+    }
+
+
+async def test_handover_rollback_in_neutron_mode_deletes_the_destination_ports(tmp_path):
+    """SDD §7.3 rollback: Nova keeps the ports it did not create; the rollback deletes them after
+    the destination server - also when the cutover failed before the server existed."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(neutron(plan), mig, SRC, DST, settings)
+    cut = await executor.run(StepName.CUTOVER, ctx)
+    [dst_port] = clouds["dst"].ports
+    calls.clear()
+    mig.destination_server_id = cut.destination_server_id
+    await executor.run(StepName.ROLLBACK, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert ops(calls)[:3] == [
+        ("dst", "delete_server", "dst-new-1"),
+        ("dst", "delete_port", dst_port),
+        ("dst", "unmanage", "dst-vol-2"),
+    ]
+    assert clouds["dst"].ports == {}
+
+    early, _, clouds2, plan2, mig2, settings2 = setup(
+        tmp_path / "early", dst_crash_on="create_server"
+    )
+    with pytest.raises(PermanentStepError):
+        await early.run(StepName.CUTOVER, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert len(clouds2["dst"].ports) == 1
+    await early.run(StepName.ROLLBACK, make_ctx(neutron(plan2), mig2, SRC, DST, settings2)[0])
+    assert clouds2["dst"].ports == {}
+
+
+async def test_handover_in_neutron_mode_keeps_port_security_off_and_a_port_without_address(
+    tmp_path,
+):
+    """A second port with port security off, no group and no address: created as it was, with
+    an explicit empty address list (Neutron allocates none) and port security off."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].ports["port-2"] = NS(
+        id="port-2",
+        network_id="net-1",
+        mac_address="fa:16:3e:00:00:02",
+        fixed_ips=[],
+        device_id="srv-1",
+        created_by_nova=True,
+        security_group_ids=[],
+        is_port_security_enabled=False,
+    )
+    await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    second = clouds["dst"].port_attrs[1]
+    assert (second["mac_address"], second["fixed_ips"]) == ("fa:16:3e:00:00:02", [])
+    assert (second["security_group_ids"], second["is_port_security_enabled"]) == ([], False)
+    assert [n["port"] for n in clouds["dst"].created[0]["networks"]] == list(clouds["dst"].ports)
+
+
+async def test_handover_rollback_deletes_only_its_own_ports_even_if_the_filter_is_ignored(
+    tmp_path,
+):
+    """A Neutron that ignored the description filter would list every port: the rollback still
+    deletes only the port step 8 created for this migration."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="create_server")
+    clouds["dst"].ports["foreign"] = NS(
+        id="foreign",
+        network_id="x",
+        mac_address="fa:16:3e:99:99:99",
+        fixed_ips=[],
+        device_id="",
+        created_by_nova=False,
+        description="",
+    )
+    clouds["dst"].ports["other-vm"] = NS(
+        id="other-vm",
+        network_id="x",
+        mac_address="fa:16:3e:99:99:98",
+        fixed_ips=[],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-9",
+    )
+    with pytest.raises(PermanentStepError):
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    unfiltered = clouds["dst"].network.ports
+    clouds["dst"].network.ports = lambda device_id=None, description=None: unfiltered()
+    await executor.run(StepName.ROLLBACK, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert set(clouds["dst"].ports) == {"foreign", "other-vm"}
+
+
+def overridden(plan, entry, **kw):
+    """The plan with a NIC override for the handover VM's port (SDD §4.2)."""
+    return plan.model_copy(update={"nic_overrides": {"srv-1": {"fa:16:3e:00:00:01": entry}}, **kw})
+
+
+async def test_handover_step_8_sends_an_overridden_nic_where_its_entry_says(tmp_path):
+    """SDD §7.3 step 8: the port's entry decides its network and addresses - Nova gets its one
+    address in "nova" mode, Neutron every address in "neutron" mode; a network-only entry keeps
+    the port's own addresses."""
+    from seamless_migrate.domain.models import NicOverride
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5"])
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "nova")
+    await executor.run(
+        StepName.CUTOVER, make_ctx(overridden(plan, entry), mig, SRC, DST, settings)[0]
+    )
+    assert clouds["dst"].created[0]["networks"] == [
+        {"uuid": "dst-net-rhoso-dmz", "fixed_ip": "192.168.10.5"}
+    ]
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "neutron")
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)[
+        0
+    ]
+    await executor.run(StepName.CUTOVER, ctx)
+    [attrs] = clouds["dst"].port_attrs
+    assert (attrs["network_id"], attrs["fixed_ips"]) == (
+        "dst-net-rhoso-dmz",
+        [{"ip_address": "192.168.10.5"}],
+    )
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "network-only")
+    only_net = overridden(plan, NicOverride(network="rhoso-dmz"), port_creation_mode="neutron")
+    await executor.run(StepName.CUTOVER, make_ctx(only_net, mig, SRC, DST, settings)[0])
+    [attrs] = clouds["dst"].port_attrs
+    assert (attrs["network_id"], attrs["fixed_ips"]) == (
+        "dst-net-rhoso-dmz",
+        [{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+    )
+
+
+async def test_handover_in_neutron_mode_resumes_on_the_port_its_nic_override_gives(tmp_path):
+    """SDD §7.3 step 8: a resume compares an earlier port with what step 8 would create - the
+    override's network and addresses, in any order, the MAC in any case; one on the mapped network
+    is not its port. A stale earlier port with the NIC's own addresses holds the MAC on the
+    override's network: step 0 refuses before anything stops (Neutron would refuse the MAC)."""
+    from seamless_migrate.domain.models import NicOverride
+
+    entry = NicOverride(network="rhoso-dmz", fixed_ips=["192.168.10.5", "fd00:10::5"])
+    leftover = {
+        "mac_address": "fa:16:3e:00:00:01",
+        "device_id": "",
+        "created_by_nova": False,
+        "description": "os-migrate:port-1",
+        "project_id": "dst-project",
+    }
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "reuse")
+    clouds["dst"].ports["mapped-network"] = NS(
+        id="mapped-network",
+        network_id="dst-net-rhoso-app",
+        fixed_ips=[{"ip_address": "192.168.10.5"}, {"ip_address": "fd00:10::5"}],
+        **leftover,
+    )
+    clouds["dst"].ports["its-own"] = NS(
+        id="its-own",
+        network_id="dst-net-rhoso-dmz",
+        fixed_ips=[{"ip_address": "fd00:10::5"}, {"ip_address": "192.168.10.5"}],
+        **{**leftover, "mac_address": "FA:16:3E:00:00:01"},
+    )
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx[0])
+    assert clouds["dst"].port_attrs == []
+    assert clouds["dst"].created[0]["networks"] == [{"port": "its-own"}]
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "stale")
+    clouds["dst"].ports["own-addresses"] = NS(
+        id="own-addresses",
+        network_id="dst-net-rhoso-dmz",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        **leftover,
+    )
+    ctx = make_ctx(overridden(plan, entry, port_creation_mode="neutron"), mig, SRC, DST, settings)
+    with pytest.raises(
+        PermanentStepError, match="MAC fa:16:3e:00:00:01 is held by port own-addresses"
+    ):
+        await executor.run(StepName.CUTOVER, ctx[0])
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    assert clouds["dst"].port_attrs == []
+
+
+def test_destination_nic_of_a_definition_journaled_with_its_first_address_only():
+    """A definition from before every address was journaled keeps its first address."""
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-app"}))
+    port = {"network": "app-net", "fixed_ip": "10.0.0.5", "mac_address": "fa:16:3e:00:00:01"}
+    assert HandoverExecutor._destination_nic(plan, "srv-1", port) == ("rhoso-app", ["10.0.0.5"])
+    bare = {"network": "app-net", "fixed_ip": None}
+    assert HandoverExecutor._destination_nic(plan, "srv-1", bare) == ("rhoso-app", [])
+
+
+async def test_handover_in_nova_mode_records_no_port_groups(tmp_path):
+    """The default mode is unchanged: no security-group lookups, Nova creates the port."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    await executor.run(StepName.CUTOVER, ctx)
+    saved = json.loads((executor.run_dir(ctx) / "source-server.json").read_text())
+    assert "security_groups" not in saved["networks"][0]
+    assert clouds["dst"].port_attrs == [] and clouds["dst"].group_lookups == []
+
+
 async def test_handover_resume_after_a_crash_while_unmanaging_waits_instead_of_failing(tmp_path):
     """The control plane died while Cinder was unmanaging the first volume: the resume knows the
     unmanage was sent and does not trip over the volume Cinder no longer knows (SDD §7.3)."""
@@ -768,6 +1330,71 @@ async def test_handover_resume_after_a_crash_while_managing_waits_for_the_same_v
     ]
     bdm = clouds["dst"].created[0]["block_device_mapping"]
     assert [(b["uuid"], b["boot_index"]) for b in bdm] == [("dst-vol-2", 0), ("dst-vol-1", -1)]
+
+
+async def test_handover_resume_after_a_crash_while_creating_waits_for_the_same_server(tmp_path):
+    """The control plane died while Nova built the destination server: the resume waits for that
+    server instead of creating a second one on the same volumes (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-1"
+    assert [op for op in ops(calls) if op[1] == "create_server"] == [
+        ("dst", "create_server", "web-01")
+    ]
+    assert sorted(clouds["dst"].servers) == ["dst-new-1"]
+
+
+async def test_handover_resume_creates_the_server_again_when_the_one_sent_is_gone(tmp_path):
+    """A server Nova accepted but lost (deleted while nobody waited) is created again."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["dst"].compute.delete_server("dst-new-1")
+    result = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.destination_server_id == "dst-new-2"
+    assert sorted(clouds["dst"].servers) == ["dst-new-2"]
+
+
+async def test_handover_rollback_after_a_crash_while_creating_deletes_that_server(tmp_path):
+    """The destination server a crashed create left is known to the journal: the rollback deletes
+    it before it unmanages the volumes it holds (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["dst"].crash_wait = "server"
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="create the destination server"):
+        await executor.run(StepName.CUTOVER, ctx)
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls)[0] == ("dst", "delete_server", "dst-new-1")
+    assert clouds["dst"].servers == {}
+    assert ("dst", "unmanage", "dst-vol-1") in ops(calls)
+    assert result.details["source_running"] is True
+
+
+async def test_handover_rollback_resume_after_a_crash_while_recreating_the_source_waits_for_it(
+    tmp_path,
+):
+    """The rollback crashed while Nova built the recreated source server: its resume waits for
+    that server instead of creating a second one (SDD §7.3)."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path, dst_crash_on="manage")
+    ctx, _ = make_ctx(plan, mig, SRC, DST, settings)
+    with pytest.raises(PermanentStepError, match="manage vol-data in RHOSO"):
+        await executor.run(StepName.CUTOVER, ctx)
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="recreate the source server"):
+        await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert result.details["vm"]["source_id"] == "src-new-1"
+    assert [op for op in ops(calls) if op[1] == "create_server"] == [
+        ("src", "create_server", "web-01")
+    ]
+    assert sorted(clouds["src"].servers) == ["src-new-1"]
 
 
 async def test_handover_rollback_after_a_crash_while_managing_unmanages_that_volume(tmp_path):
@@ -1097,6 +1724,19 @@ async def test_handover_readiness_reports_references_without_changing_anything(t
     assert calls == []
 
 
+def test_an_http_error_body_is_redacted_before_it_is_cut():
+    """SDD §13.4: an HTTP error body is redacted over its cut plus 16384 characters before it is
+    cut to 300 — a URL whose password the cut splits would otherwise reach Migration.error."""
+    from seamless_migrate.executors.handover import _checked
+
+    body = "x" * 270 + "\n postgresql://svc:Sup3rS3cretPw@db.example:5432/seamless"
+    with pytest.raises(RuntimeError) as failed:
+        _checked(NS(status_code=500, text=body), "attach the volume")
+    message = str(failed.value)
+    assert message.startswith("attach the volume: HTTP 500: xxx") and "\n" not in message
+    assert "Sup3r" not in message and "[REDACTED]" in message
+
+
 def test_existing_server_and_write_json_helpers(tmp_path):
     from seamless_migrate.executors.handover import _existing_server, _write_json
 
@@ -1126,3 +1766,341 @@ def test_existing_server_and_write_json_helpers(tmp_path):
         _write_json(target, {"bad": object()})
     assert json.loads(target.read_text()) == {"a": [1, 2], "b": 1}, "atomic: old content kept"
     assert [p.name for p in target.parent.iterdir()] == ["journal.json"], "temp file removed"
+
+
+def test_port_description_matches_the_collection():
+    """SDD §6.6/§7.3: the handover marks the ports it creates through Neutron as the collection
+    does - one convention for every such port (plugins/module_utils/server_port.py, loaded
+    without its imports)."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/server_port.py"
+    ).read_text()
+    tree = ast.parse(source)
+    func = next(n for n in tree.body if getattr(n, "name", None) == "port_description")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), "server_port.py", "exec"), namespace)
+    for port_id in ("port-1", "8b0c01a1-205f-490b-a4fc-ee8f44711bc7"):
+        assert port_description(port_id) == namespace["port_description"](port_id)
+
+
+def subnet(network_id, cidr, mode=None):
+    return NS(
+        id=f"sub-{cidr}",
+        network_id=network_id,
+        cidr=cidr,
+        ipv6_address_mode=mode,
+        ipv6_ra_mode=mode,
+    )
+
+
+async def test_handover_step_0_refuses_a_network_step_8_could_not_resolve(tmp_path):
+    """SDD §7.3 step 0: step 8 takes the credential's own network of that name, else the only one
+    it sees; none, several in its project, or several elsewhere refuse before the stop."""
+    cases = {
+        "none": [],
+        "two-own": [
+            NS(id="a", name="rhoso-app", project_id="dst-project"),
+            NS(id="b", name="rhoso-app", project_id="dst-project"),
+        ],
+        "two-elsewhere": [
+            NS(id="a", name="rhoso-app", project_id="tenant-a"),
+            NS(id="b", name="rhoso-app", project_id="tenant-b"),
+        ],
+    }
+    for name, listed in cases.items():
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert "rhoso-app" in str(refused.value), name
+        assert "port-1" in str(refused.value), name
+        # the VM keeps running: nothing was stopped
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+
+
+async def test_handover_step_0_refuses_a_security_group_step_8_could_not_find(tmp_path):
+    """SDD §7.3 step 0: step 8 asks for the server's groups by name (Nova looks each up in the
+    project, `default` aside) and in "neutron" mode for each port's groups; one the destination
+    credential's project has none or several of refuses before the stop, not after step 4 deleted
+    the source server."""
+    web = NS(id="sg-a", name="web", project_id="dst-project")
+    twice = [web, NS(id="sg-b", name="web", project_id="dst-project")]
+    # the server's groups, in either mode: here only another project has 'web'
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "server")
+    clouds["src"].servers["srv-1"].security_groups = [{"name": "default"}, {"name": "web"}]
+    clouds["dst"].group_list = [NS(id="sg-c", name="web", project_id="tenant-b")]
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "the server: RHOSO has no security group named 'web' in the credential's project" in (
+        str(refused.value)
+    )
+    assert "'default'" not in str(refused.value)
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # in "neutron" mode each port's groups too: two of the project carry the port's 'web'
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "port")
+    clouds["dst"].group_list = twice
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+    assert "port port-1: RHOSO has 2 security groups named 'web' in the credential's project" in (
+        str(refused.value)
+    )
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # through Nova the port's own groups are never asked for: the same destination passes
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "nova")
+    clouds["dst"].group_list = twice
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["dst"].created
+
+
+async def test_handover_creates_the_server_with_the_flavor_preflight_matched(tmp_path):
+    """SDD §7.3 step 8, review RT-01: with no flavor mapped, the flavor preflight matched for the
+    migration (its resolved mappings, §7.2) is the server's; a plan mapping still wins."""
+    matched = Mappings(flavors={"m1.small": "rhoso.medium"})
+    for name, flavors, expected in (
+        ("matched", {}, "flavor-rhoso.medium"),
+        ("mapped", {"m1.small": "rhoso.small"}, "flavor-rhoso.small"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        # RHOSO has no flavor of the source's name: step 0 checks the one step 8 uses
+        clouds["dst"].flavor_names = {"rhoso.medium", "rhoso.small"}
+        mappings = plan.mappings.model_copy(update={"flavors": flavors})
+        plan = plan.model_copy(update={"mappings": mappings})
+        mig = mig.model_copy(update={"resolved_mappings": matched})
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["flavor_id"] == expected, name
+
+
+async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp_path):
+    """SDD §7.3 step 0, review RT-01/RT-02: steps 6 and 8 run after step 4 deleted the source
+    server; a flavor or a volume type they would ask RHOSO for and it lacks refuses before the
+    stop."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "flavor")
+    clouds["dst"].flavor_names = {"rhoso.large"}
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "the server's flavor 'm1.small': RHOSO has no flavor named 'rhoso.small'" in (
+        str(refused.value)
+    )
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # ceph-ssd is unmapped and RHOSO lacks a type of that name; ceph-hdd maps to rbd-hdd, it has
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "type")
+    clouds["dst"].type_names = ("rbd-hdd",)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "volume vol-root: RHOSO has no volume type named 'ceph-ssd'" in str(refused.value)
+    # vol-data is checked under its mapped type, which RHOSO has
+    assert "vol-data" not in str(refused.value)
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+
+
+async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
+    """SDD §7.3 step 8: the credential's own network of that name among same-named ones of other
+    projects, and a shared one another project owns when it is the only one of that name."""
+    own = NS(id="own-net", name="rhoso-app", project_id="dst-project")
+    other = NS(id="other-net", name="rhoso-app", project_id="tenant-b")
+    shared = NS(id="shared-net", name="rhoso-app", project_id="admin-project", is_shared=True)
+    for name, listed, expected in (
+        ("own", [other, own], "own-net"),
+        ("shared", [shared], "shared-net"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["networks"] == [
+            {"uuid": expected, "fixed_ip": "10.0.0.5"}
+        ], name
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / f"{name}-neutron")
+        clouds["dst"].network_list = listed
+        await executor.run(StepName.CUTOVER, make_ctx(neutron(plan), mig, SRC, DST, settings)[0])
+        [attrs] = clouds["dst"].port_attrs
+        assert attrs["network_id"] == expected, name
+
+
+async def test_handover_step_0_refuses_a_network_the_credential_may_not_put_a_port_on(tmp_path):
+    """SDD §7.3 step 0, §6.6: another project's network takes the port only when it is shared with
+    the credential's project or external, and from a token with the admin or advsvc role. The
+    admin credential sees every project's private networks: step 8 must never use one."""
+    private = NS(
+        id="private-net",
+        name="rhoso-app",
+        project_id="tenant-b",
+        is_shared=False,
+        is_router_external=False,
+    )
+    shared = NS(
+        id="shared-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=True,
+        is_router_external=False,
+    )
+    external = NS(
+        id="ext-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=False,
+        is_router_external=True,
+    )
+    for name, listed, roles, refusal in (
+        (
+            "private",
+            [private],
+            ["admin", "member", "reader"],
+            "'rhoso-app' (project tenant-b): it is neither shared with the credential's project "
+            "nor external",
+        ),
+        (
+            "member",
+            [shared],
+            ["member", "reader"],
+            "'rhoso-app' (project admin-project): Neutron lets only the admin or advsvc role, or "
+            "that project, choose a port's address or MAC there",
+        ),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        clouds["dst"].roles = roles
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert refusal in str(refused.value), name
+        assert "port-1" in str(refused.value), name
+        # the VM keeps running: nothing was stopped
+        assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+    for name, listed, roles in (
+        ("shared", [shared], ["admin"]),
+        ("external", [external], ["admin"]),
+        ("advsvc", [shared], ["advsvc"]),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = listed
+        clouds["dst"].roles = roles
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["networks"][0]["uuid"] == listed[0].id, name
+
+
+async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):
+    """SDD §7.3 step 0 and §6.6: each address step 8 gives a port must be one Neutron takes on
+    that network - a host address of its subnets; on a SLAAC subnet only the kept MAC's EUI-64
+    address in "neutron" mode, and no explicit address through Nova (a new MAC)."""
+    from seamless_migrate.domain.models import NicOverride
+
+    net = "dst-net-rhoso-app"
+
+    async def cutover(name, subnets, plan_of=lambda p: p):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].subnet_list = subnets
+        ctx = make_ctx(plan_of(plan), mig, SRC, DST, settings)[0]
+        try:
+            await executor.run(StepName.CUTOVER, ctx)
+        except PermanentStepError as exc:
+            assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+            return str(exc)
+        return None
+
+    v4 = subnet(net, "10.0.0.0/24")
+    # the port's own 10.0.0.5 (Nova takes its first address)
+    assert await cutover("ok", [v4]) is None
+    refused = await cutover("outside", [subnet(net, "10.9.0.0/24")])
+    assert "10.0.0.5 is no host address of any subnet" in refused
+    entry = NicOverride(fixed_ips=["10.0.0.0"])
+    refused = await cutover("network-address", [v4], lambda p: overridden(p, entry))
+    assert "10.0.0.0 is no host address" in refused
+    # SLAAC: the kept MAC fa:16:3e:00:00:01 derives fd00:20::f816:3eff:fe00:1 on fd00:20::/64
+    slaac = subnet(net, "fd00:20::/64", "slaac")
+    eui = NicOverride(fixed_ips=["10.0.0.5", "fd00:20::f816:3eff:fe00:1"])
+    other = NicOverride(fixed_ips=["10.0.0.5", "fd00:20::5"])
+    assert (
+        await cutover(
+            "eui64", [v4, slaac], lambda p: overridden(p, eui, port_creation_mode="neutron")
+        )
+        is None
+    )
+    refused = await cutover(
+        "not-eui64", [v4, slaac], lambda p: overridden(p, other, port_creation_mode="neutron")
+    )
+    assert "fd00:20::5 is not fd00:20::f816:3eff:fe00:1" in refused
+    v6_only = NicOverride(fixed_ips=["fd00:20::f816:3eff:fe00:1"])
+    refused = await cutover("nova-slaac", [v4, slaac], lambda p: overridden(p, v6_only))
+    assert "SLAAC or DHCPv6-stateless" in refused
+
+
+async def test_handover_step_0_looks_up_the_network_a_nic_override_names(tmp_path):
+    """SDD §7.3 step 0: the port's RHOSO network is its NIC override's when the entry names one;
+    the read-only report the lab runs says the same when it is given the plan."""
+    from seamless_migrate.domain.models import NicOverride
+
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    # the mapped rhoso-app resolves; the override's rhoso-dmz is in two other projects
+    clouds["dst"].network_list = [
+        NS(id="app", name="rhoso-app", project_id="dst-project"),
+        NS(id="dmz-a", name="rhoso-dmz", project_id="tenant-a"),
+        NS(id="dmz-b", name="rhoso-dmz", project_id="tenant-b"),
+    ]
+    moved = overridden(plan, NicOverride(network="rhoso-dmz"))
+    report = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map, moved)
+    [problem] = [p for p in report["problems"] if "port-1" in p]
+    assert "2 networks named 'rhoso-dmz', none in the credential's project" in problem
+    # without the plan the report checks the volumes only, as before
+    plain = await executor.readiness(SRC, DST, "srv-1", plan.handover.backend_map)
+    assert not [p for p in plain["problems"] if "port-1" in p]
+    with pytest.raises(PermanentStepError, match="rhoso-dmz"):
+        await executor.run(StepName.CUTOVER, make_ctx(moved, mig, SRC, DST, settings)[0])
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # the mapped network alone is fine
+    await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["dst"].created[0]["networks"] == [{"uuid": "app", "fixed_ip": "10.0.0.5"}]
+
+
+async def test_handover_step_0_refuses_an_address_or_mac_another_port_holds(tmp_path):
+    """SDD §7.3 step 0: Neutron refuses an address another port of the network holds, and in
+    "neutron" mode the MAC; only the unbound port an earlier attempt created is used again."""
+
+    def leftover(port_id, **change):
+        base = {
+            "id": port_id,
+            "network_id": "dst-net-rhoso-app",
+            "mac_address": "fa:16:3e:99:99:99",
+            "fixed_ips": [{"ip_address": "10.0.0.5"}],
+            "device_id": "other-vm",
+            "created_by_nova": True,
+            "description": "",
+            "project_id": "dst-project",
+        }
+        return NS(**{**base, **change})
+
+    async def cutover(name, ports, plan_of=lambda p: p):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        for port in ports:
+            clouds["dst"].ports[port.id] = port
+        try:
+            await executor.run(
+                StepName.CUTOVER, make_ctx(plan_of(plan), mig, SRC, DST, settings)[0]
+            )
+        except PermanentStepError as exc:
+            assert [op for op in ops(calls) if op[1] == "stop_server"] == [], name
+            return str(exc)
+        return None
+
+    refused = await cutover("nova-taken", [leftover("taken")])
+    assert (
+        "port port-1 (fa:16:3e:00:00:01) on 'rhoso-app': 10.0.0.5 is held by port taken" in refused
+    )
+    refused = await cutover("neutron-taken", [leftover("taken")], neutron)
+    assert "10.0.0.5 is held by port taken" in refused
+    # the earlier attempt's own unbound port: step 8 uses it again
+    mine = leftover(
+        "mine",
+        mac_address="fa:16:3e:00:00:01",
+        fixed_ips=[{"ip_address": "10.0.0.5"}, {"ip_address": "fd00::5"}],
+        device_id="",
+        created_by_nova=False,
+        description="os-migrate:port-1",
+    )
+    assert await cutover("neutron-mine", [mine], neutron) is None
+    # another port with the MAC: refused when the MAC is kept, not through Nova (a new MAC)
+    same = leftover(
+        "same-mac", mac_address="fa:16:3e:00:00:01", fixed_ips=[{"ip_address": "10.0.0.77"}]
+    )
+    refused = await cutover("neutron-mac", [same], neutron)
+    assert "MAC fa:16:3e:00:00:01 is held by port same-mac" in refused
+    assert await cutover("nova-mac", [same]) is None

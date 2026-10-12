@@ -1,20 +1,24 @@
 import {
   Activity,
   CircleCheck,
+  CircleHelp,
   CircleX,
   ClipboardList,
+  SearchX,
   TriangleAlert,
   type LucideIcon,
 } from 'lucide-react';
 import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useMigrations, usePlans, useStats } from '../api/hooks';
+import { useDemoSpeed, useMigrations, usePlans, useStats } from '../api/hooks';
 import type { Migration, Phase, Plan } from '../api/types';
+import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { DowntimeSloChart } from '../components/DowntimeSloChart';
 import { SelectField } from '../components/Field';
 import { MetricStrip } from '../components/MetricStrip';
+import { PendingApprovals } from '../components/PendingApprovals';
 import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseDistribution } from '../components/PhaseDistribution';
@@ -27,6 +31,7 @@ import { attentionItems } from '../lib/attention';
 import { cn } from '../lib/cn';
 import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
+import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
@@ -62,19 +67,22 @@ const DOWN_DETAIL: Partial<Record<Phase, string>> = {
  * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
  * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
  */
-function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
+function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
   const active = migrations
     .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
   const waiting = migrations.filter((m) => m.phase === 'awaiting_cutover').length;
-  const now = useNow(1000, active.length > 0);
+  // in demo mode the clocks run in model time, as on the migration page (SDD §16, ADV-16)
+  const speed = speedOf(useDemoSpeed());
+  const now = useNow(speed > 1 ? 250 : 1000, active.length > 0);
+  const demoNote = demoTimeText(speed);
 
   return (
     <Panel
       title="Downtime now"
       description={
         active.length
-          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.`
+          ? `${active.length} VM${active.length === 1 ? ' is' : 's are'} down; each clock stops when the VM boots verified on RHOSO or its source runs again.${demoNote ? ` ${demoNote}.` : ''}`
           : 'VMs whose source is stopped appear here with a running clock.'
       }
     >
@@ -92,7 +100,7 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
           {active.map((m) => {
             const plan = plans.get(m.plan_id);
             const slo = plan?.downtime_slo_s ?? null;
-            const elapsed = secondsBetween(m.downtime_started_at, now) ?? 0;
+            const elapsed = (secondsBetween(m.downtime_started_at, now) ?? 0) * speed;
             // the migration page's rule, with an icon beside the warning and the breach (SDD §16)
             const tone = slo ? sloTone(elapsed, slo) : 'success';
             const ToneIcon = SLO_ICONS[tone];
@@ -122,6 +130,13 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
                     {slo !== null && <span className="num text-sm text-muted-foreground">of {formatClock(slo)}</span>}
                   </p>
                 </div>
+                {slo === null && plansUnknown && (
+                  // a failed load never reads as a met SLO (SDD §16)
+                  <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                    <CircleHelp aria-hidden className="size-3.5" />
+                    SLO unknown: the plans could not be loaded.
+                  </p>
+                )}
                 {slo !== null && (
                   <div className="flex flex-col gap-1">
                     <div
@@ -159,13 +174,15 @@ function DowntimeNow({ migrations, plans }: { migrations: Migration[]; plans: Re
   );
 }
 
-function NeedsAttention({ migrations, plans }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan> }) {
-  const items = attentionItems(migrations, plans);
+function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
+  const items = attentionItems(migrations, plans, Date.now(), { plansUnknown });
   const shown = items.slice(0, 8);
   return (
     <Panel title="Needs attention" description="The next human action, most urgent first">
+      {/* without the plans, approvals and cutover requests cannot be told: never "nothing" (SDD §16) */}
+      {plansUnknown && <Unavailable what="plans" className={items.length ? 'mb-2' : undefined} />}
       {items.length === 0 ? (
-        <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, approvals or blockers are waiting." />
+        !plansUnknown && <EmptyState icon={CircleCheck} title="Nothing needs attention" description="No failures, reviews, cutover requests or blockers are waiting; approvals are in Pending approvals." />
       ) : (
         <>
           <ul className="-my-2 divide-y divide-border">
@@ -218,10 +235,10 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
         return (
           <li key={plan.id} className="flex min-w-0 flex-col gap-1.5 border-t border-border py-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <Link to={`/plans/${plan.id}`} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">
+              <Link to={`/plans/${plan.id}`} className="min-w-0 wrap-break-word font-medium text-foreground underline-offset-4 hover:underline">
                 {plan.name}
               </Link>
-              <PlanStatusBadge status={plan.status} />
+              <PlanStatusBadge status={plan.derived_status} />
             </div>
             {migrations && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">
@@ -247,7 +264,7 @@ export default function Overview() {
   const plansById = useMemo(() => new Map(plans.map((p) => [p.id, p])), [plans]);
   const migrations = migrationsQuery.data ?? [];
   const scopedPlans = planId ? plans.filter((p) => p.id === planId) : plans;
-  const activePlans = scopedPlans.filter((p) => p.status !== 'draft');
+  const activePlans = scopedPlans.filter((p) => p.derived_status !== 'draft');
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;
@@ -255,6 +272,8 @@ export default function Overview() {
   const plansUnknown = Boolean(plansQuery.error) && !plansQuery.data;
   const statsUnknown = Boolean(stats.error) && !s;
   const migrationsUnknown = Boolean(migrationsQuery.error) && !migrationsQuery.data;
+  // a plan id in the address that the loaded plans do not hold (mistyped, or an old link)
+  const unknownPlan = Boolean(planId) && Boolean(plansQuery.data) && !plansById.has(planId);
 
   const setPlan = (value: string) => {
     const next = new URLSearchParams(params);
@@ -263,7 +282,7 @@ export default function Overview() {
     setParams(next, { replace: true });
   };
 
-  return (
+  const header = (
     <>
       <PageHeader
         title="Overview"
@@ -274,19 +293,49 @@ export default function Overview() {
             className="w-full sm:w-72"
             value={planId}
             onChange={(e) => setPlan(e.target.value)}
-            options={[{ value: '', label: 'All plans' }, ...plans.map((p) => ({ value: p.id, label: p.name }))]}
+            options={[
+              { value: '', label: 'All plans' },
+              ...plans.map((p) => ({ value: p.id, label: p.name })),
+              // a plan in the address that the list does not hold stays chosen (SDD §16), as on Events
+              ...(planId && !plansById.has(planId) ? [{ value: planId, label: planId }] : []),
+            ]}
           />
         }
       />
 
       {plansQuery.error && <ErrorBanner error={plansQuery.error} title="Plans are unavailable" onRetry={() => void plansQuery.refetch()} className="mb-4" />}
+    </>
+  );
+
+  if (unknownPlan) {
+    // its figures would all be zero: never an all-clear page for a plan that does not exist (SDD §16)
+    return (
+      <>
+        {header}
+        <EmptyState
+          icon={SearchX}
+          title={`Plan ${planId} does not exist`}
+          description="It may have been mistyped or come from an old link."
+          action={
+            <Button variant="secondary" onClick={() => setPlan('')}>
+              Show all plans
+            </Button>
+          }
+        />
+      </>
+    );
+  }
+
+  return (
+    <>
+      {header}
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
 
       {!s ? (
         statsUnknown ? (
           <MetricStrip
             label="Key metrics"
-            metrics={['Migrations', 'In progress', 'Completed', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
+            metrics={['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
           />
         ) : (
           <Skeleton className="h-[86px]" />
@@ -294,14 +343,20 @@ export default function Overview() {
       ) : (
         <MetricStrip
           label="Key metrics"
-          className={cn(stats.isPlaceholderData && 'opacity-60')}
+          busy={stats.isPlaceholderData}
           metrics={[
-            { label: 'Migrations', value: formatNumber(s.total), hint: `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
+            { label: 'Migrations', value: formatNumber(s.total), hint: plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
-            { label: 'Completed', value: formatNumber(s.completed), hint: s.total ? `${formatPct((s.completed / s.total) * 100)} of all` : undefined },
+            // Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19)
+            { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; the source VM is kept' },
+            { label: 'Finalized', value: formatNumber(s.finalized), hint: s.total ? `${formatPct((s.finalized / s.total) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
-            { label: 'Average downtime', value: formatDuration(s.avg_downtime_s), hint: `p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}` },
-            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: 'verified cutovers within their plan SLO' },
+            {
+              label: 'Average downtime',
+              value: formatDuration(s.avg_downtime_s),
+              hint: [`p95 ${formatDuration(s.p95_downtime_s)}, max ${formatDuration(s.max_downtime_s)}`, leftOutText(s)].filter(Boolean).join('; '),
+            },
+            { label: 'SLO compliance', value: formatPct(s.slo_compliance_pct), hint: ['verified cutovers within their plan SLO', leftOutText(s)].filter(Boolean).join('; ') },
           ]}
         />
       )}
@@ -318,22 +373,31 @@ export default function Overview() {
             <Unavailable what="migrations" />
           </Panel>
         ) : (
-          <DowntimeNow migrations={migrations} plans={plansById} />
+          <DowntimeNow migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
         )}
-        <div className="min-w-0 xl:col-start-2 xl:row-span-2 xl:row-start-1">
-          {migrationsQuery.isPending ? (
+        <div className="flex min-w-0 flex-col gap-4 xl:col-start-2 xl:row-span-2 xl:row-start-1">
+          {migrationsQuery.isPending || plansQuery.isPending ? (
             <LoadingBlock label="Loading items that need attention…" />
-          ) : migrationsUnknown ? (
-            <Panel title="Needs attention" description="The next human action, most urgent first">
-              <Unavailable what="migrations" />
-            </Panel>
           ) : (
-            <NeedsAttention migrations={migrations} plans={plansById} />
+            <>
+              {/* a pending approval is listed once, here, not in Needs attention (SDD §16, ADV-20) */}
+              <PendingApprovals migrations={migrationsUnknown ? null : migrations} plans={plansById} plansUnknown={plansUnknown} />
+              {migrationsUnknown ? (
+                <Panel title="Needs attention" description="The next human action, most urgent first">
+                  <Unavailable what="migrations" />
+                </Panel>
+              ) : (
+                <NeedsAttention migrations={migrations} plans={plansById} plansUnknown={plansUnknown} />
+              )}
+            </>
           )}
         </div>
         <Panel title="Downtime vs SLO" description="Average verified downtime per strategy">
           {s ? (
-            <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+            <>
+              {plansUnknown && <Unavailable what="plans" className="mb-2" />}
+              <DowntimeSloChart byStrategy={s.downtime_by_strategy} sloS={sloS} sloLabel={sloLabel} />
+            </>
           ) : statsUnknown ? (
             <Unavailable what="statistics" />
           ) : (

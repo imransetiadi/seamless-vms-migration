@@ -1,15 +1,16 @@
-import { Ban, CalendarClock, CircleCheck, CircleX, ClipboardX, ShieldAlert, TriangleAlert } from 'lucide-react';
+import { Ban, Bot, CalendarClock, CircleCheck, CircleX, ClipboardX, Hourglass, Power, ShieldAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useEventTail, useMigration, usePlan, useSetStrategy } from '../api/hooks';
+import { useDemoSpeed, useEventTail, useMigration, usePlan, useRecommendations, useSetStrategy } from '../api/hooks';
 import { useLiveEvents } from '../api/live';
 import { useRole } from '../api/session';
-import type { Event, GuestOS, Migration, Phase, Plan, Role, Strategy, VerificationConfig } from '../api/types';
+import { RECOMMENDATION_LIMIT_MAX, type Event, type GuestOS, type Migration, type Phase, type Plan, type Role, type Strategy, type VerificationConfig } from '../api/types';
 import { AdvisorNotes } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { CalibrationPanel, ResolvedMappings } from '../components/CalibrationPanel';
+import { DemoSourcePower } from '../components/DemoSourcePower';
 import { DowntimeClock } from '../components/DowntimeClock';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -19,17 +20,25 @@ import { PageHeader } from '../components/PageHeader';
 import { Panel } from '../components/Panel';
 import { PhaseStepper } from '../components/PhaseStepper';
 import { ProgressBar } from '../components/ProgressBar';
+import { RecommendationActions } from '../components/RecommendationActions';
+import { RecommendationList } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
-import { PhaseBadge } from '../components/StatusBadge';
+import { PhaseBadge, StatusBadge } from '../components/StatusBadge';
 import { SyncPassChart } from '../components/SyncPassChart';
 import { Timeline } from '../components/Timeline';
+import { Unavailable } from '../components/Unavailable';
+import { NetworkPanel } from '../components/NetworkPanel';
+import { VerificationPanel } from '../components/VerificationPanel';
+import { decidable, nonStrategyNotes, optionLabel, waitingDecision } from '../lib/advisor';
+import { approvalKindLabel } from '../lib/approvals';
 import { cn } from '../lib/cn';
 import { formatBytes, formatDateTime, formatDuration, formatPct, formatRelative } from '../lib/format';
 import { guestOsOf, V2V_LABELS } from '../lib/guestOs';
-import { clearedByStrategyChange } from '../lib/migrationActions';
+import { clearedByStrategyChange, countedApprovals, uncountedReason } from '../lib/migrationActions';
 import { isActivePhase, isWarmStrategy, phaseMeta, preflightRan, runningStep } from '../lib/phase';
-import { hasRole } from '../lib/roles';
+import { can, hasRole, PERMISSIONS } from '../lib/roles';
 import { strategyLabel, STRATEGY_DESCRIPTIONS } from '../lib/status';
+import { useHashLanding } from '../lib/useHashLanding';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** Announces phase changes and every 10 % of progress — never every tick (aria-live polite). */
@@ -58,15 +67,33 @@ function useProgressAnnouncement(m: Migration | undefined): string {
   return text;
 }
 
+/** "CODE: text", as `check_invariants` writes an issue (SDD §5.5). */
+function splitIssue(issue: string): { code: string | null; text: string } {
+  const match = /^([A-Z][A-Z_]+): (.*)$/s.exec(issue);
+  return match ? { code: match[1] ?? null, text: match[2] ?? issue } : { code: null, text: issue };
+}
+
 /** Phases a retried cutover passes through while its source is still stopped (SDD §5.2). */
 const BEFORE_CUTOVER: ReadonlySet<Phase> = new Set(['ready', 'precopy', 'syncing', 'awaiting_cutover']);
 
 function Alerts({ m }: { m: Migration }) {
   const clockOpen = Boolean(m.downtime_started_at) && !m.downtime_ended_at;
   const sourceStopped = m.phase === 'failed' && clockOpen;
+  // the recommendation the migration waits on, while it can still take it (SDD §14.6)
+  const waiting = waitingDecision(m);
   const stillStopped = clockOpen && BEFORE_CUTOVER.has(m.phase);
   return (
     <div className="flex flex-col gap-2 empty:hidden">
+      {m.phase === 'completed' && m.source_running_at && (
+        // the source watch saw it running after the cutover (SDD §8.1, ADV-19)
+        <div role="alert" aria-label="Source VM running" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
+          <Power aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
+          <p className="text-foreground">
+            <strong className="font-semibold">The source VM runs again</strong> since {formatDateTime(m.source_running_at)}, so its data diverges from RHOSO: stop it,
+            or roll back.
+          </p>
+        </div>
+      )}
       {stillStopped && (
         <div role="alert" className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-3 text-sm">
           <ShieldAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
@@ -91,6 +118,41 @@ function Alerts({ m }: { m: Migration }) {
           <p className="wrap-break-word text-foreground">
             <strong className="font-semibold">Last error:</strong> {m.error}
           </p>
+        </div>
+      )}
+      {waiting && (
+        <div role="status" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <Hourglass aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <p className="wrap-break-word text-foreground">
+            <strong className="font-semibold">Waiting for advisor approval.</strong> The migration starts once a person approves or overrides the
+            advisor&apos;s decision.{' '}
+            <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className="underline underline-offset-4">
+              See the recommendation
+            </Link>
+          </p>
+        </div>
+      )}
+      {m.data_issues.length > 0 && (
+        // the invariants a completed migration broke (SDD §5.5): its numbers are counted, not measured
+        <div role="note" aria-label="Data inconsistent" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <div className="min-w-0 text-foreground">
+            <p>
+              <strong className="font-semibold">Data inconsistent.</strong> The numbers of this migration do not hold together, so the downtime
+              statistics leave it out.
+            </p>
+            <ul className="mt-1 list-disc pl-5">
+              {m.data_issues.map((issue) => {
+                const { code, text } = splitIssue(issue);
+                return (
+                  <li key={issue} className="wrap-break-word">
+                    {text}
+                    {code && <code className="text-xs text-muted-foreground"> ({code})</code>}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
         </div>
       )}
       {m.review_required && (
@@ -148,7 +210,13 @@ function ProgressPanel({ m }: { m: Migration }) {
           <dt className="text-muted-foreground">Checkpoint</dt>
           <dd className="num text-right">{m.checkpoint ?? '—'}</dd>
           <dt className="text-muted-foreground">Attempts</dt>
-          <dd className="num text-right">{m.attempts}</dd>
+          <dd className="num text-right">
+            {m.attempts}
+            {m.attempt_strategies.length > 0 && (
+              // a retry records the strategy of the attempt it retries (SDD §4.2, §14.4)
+              <span className="block text-xs text-muted-foreground">earlier: {m.attempt_strategies.map(strategyLabel).join(', then ')}</span>
+            )}
+          </dd>
         </dl>
       </div>
     </Panel>
@@ -190,6 +258,8 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
   const reasonFor = (strategy: Strategy, eligible: boolean): string | null => {
     if (!canChangeRole) return 'Requires the operator role.';
     if (!canChangePhase) return 'The strategy can change only while pending, ready or blocked.';
+    // the API refuses it while a decision waits (409, SDD §12, §14.6): say so instead of offering it
+    if (m.advisor_hold) return "The advisor's decision waits for approval: approve or override it first.";
     if (!eligible) return 'This strategy is not eligible for this VM.';
     if (strategy === m.strategy) return 'Already selected.';
     return null;
@@ -228,7 +298,7 @@ function EstimatesPanel({ m, role }: { m: Migration; role: Role | undefined }) {
               <tr key={e.strategy} className={cn(e.strategy === m.strategy && 'bg-accent/5')}>
                 <th scope="row" className="whitespace-nowrap" title={STRATEGY_DESCRIPTIONS[e.strategy]}>
                   {strategyLabel(e.strategy)}
-                  {e.strategy === m.strategy && <span className="block text-xs font-normal text-status-success">selected</span>}
+                  {e.strategy === m.strategy && <span className="block text-xs font-normal text-status-success">in use</span>}
                 </th>
                 <td>
                   {e.eligible ? (
@@ -309,6 +379,56 @@ function verificationProfile(family: GuestOS['family'], v: VerificationConfig | 
   return `Verified on ${tcp}the console log`;
 }
 
+/** This migration's recommendations, listed like the Advisor feed, and its other notes (SDD §14.4, §16). */
+function MigrationAdvisor({ m }: { m: Migration }) {
+  const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
+  const role = useRole();
+  const [decided, setDecided] = useState('');
+  const notes = nonStrategyNotes(m.advisor_notes);
+  if (recommendations.isPending) return <LoadingBlock rows={3} />;
+  const page = recommendations.data;
+  if (page && page.items.length === 0 && notes.length === 0) {
+    return <EmptyState icon={Bot} title="No advisor recommendations or notes for this migration." />;
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      <p role="status" aria-live="polite" className="sr-only">
+        {decided}
+      </p>
+      {recommendations.error ? (
+        <ErrorBanner error={recommendations.error} title="Recommendations are unavailable" onRetry={() => void recommendations.refetch()} />
+      ) : (
+        page &&
+        page.items.length > 0 && (
+          <div>
+            <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Recommendations</h3>
+            <RecommendationList
+              items={page.items}
+              showSubject={false}
+              actionsFor={(rec, focusAfterRef) =>
+                can(role, 'advisor.approve') && decidable(rec, m, page.items.find((r) => !r.legacy)?.id) ? (
+                  <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                ) : null
+              }
+            />
+            {page.total > page.items.length && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                The newest {page.items.length} of {page.total} are shown.
+              </p>
+            )}
+          </div>
+        )
+      )}
+      {notes.length > 0 && (
+        <div>
+          <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Notes</h3>
+          <AdvisorNotes notes={notes} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   const vm = m.vm;
   const osId = useId();
@@ -378,43 +498,112 @@ function VmDetails({ m, plan }: { m: Migration; plan?: Plan }) {
   );
 }
 
+function When({ at }: { at: string }) {
+  return (
+    <time dateTime={at} title={formatDateTime(at)} className="text-muted-foreground">
+      {formatRelative(at)}
+    </time>
+  );
+}
+
+/** The cutover request and the approvals in time order, saying which approval does not count (SDD §5.4, §16). */
+/** A person's advisor decisions (SDD §14.6): one waiting for approval, approved or overridden. */
+const PERSON_DECISIONS: ReadonlySet<string> = new Set(['pending_approval', 'approved', 'overridden']);
+
+/** The kind of an approval entry (SDD §16, ADV-20). */
+function Kind({ label }: { label: string }) {
+  return <p className="text-xs font-medium text-muted-foreground">{label}</p>;
+}
+
 function Approvals({ m, plan }: { m: Migration; plan: Plan | null | undefined }) {
+  const counted = new Set(countedApprovals(m, plan));
+  // the same query as the Advisor panel: the newest strategy decision is the one the migration runs (ADV-01)
+  const recommendations = useRecommendations({ migration_id: m.id, limit: RECOMMENDATION_LIMIT_MAX });
+  const newest = recommendations.data?.items.find((r) => !r.legacy && r.decision_type === 'migration_strategy');
+  const decision = newest && PERSON_DECISIONS.has(newest.decision.status) ? newest : null;
   // a cutover request shows whatever the approval policy, with its window bypass (SDD §16)
   const request = m.cutover_requested ? (
-    <div className="flex flex-col gap-0.5 text-xs">
-      <p className="inline-flex items-center gap-1 text-status-success">
-        <CircleCheck aria-hidden className="size-3.5 shrink-0" />
-        Cutover requested
+    <div className="flex flex-col gap-0.5 text-sm">
+      <Kind label="Cutover approval" />
+      <p className="inline-flex flex-wrap items-center gap-1">
+        <CircleCheck aria-hidden className="size-3.5 shrink-0 text-status-success" />
+        {/* a request stored before ADV-17 names nobody */}
+        <strong className="font-medium text-foreground">{m.cutover_requested_by ? `Requested by ${m.cutover_requested_by}` : 'Cutover requested'}</strong>
+        {m.cutover_requested_at && <When at={m.cutover_requested_at} />}
       </p>
       {m.force_window && (
-        <p className="inline-flex items-center gap-1 text-status-warning">
+        <p className="inline-flex items-center gap-1 text-xs text-status-warning">
           <CalendarClock aria-hidden className="size-3.5 shrink-0" />
           An approver allowed it to start outside the cutover window.
         </p>
       )}
     </div>
   ) : null;
-  if (m.approvals.length === 0) {
-    return (
-      <div className="flex flex-col gap-2">
-        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require approval.' : 'No approvals yet.'}</p>
-        {request}
-      </div>
-    );
-  }
-  return (
-    <ul className="flex flex-col gap-2">
-      {m.approvals.map((a, i) => (
-        <li key={`${a.actor}-${a.at}-${i}`} className="text-sm">
-          <span className="font-medium text-foreground">{a.actor}</span>{' '}
-          <time dateTime={a.at} title={formatDateTime(a.at)} className="text-muted-foreground">
-            {formatRelative(a.at)}
-          </time>
+  const entries = [
+    ...m.approvals.map((a, i) => ({
+      key: `approval-${i}`,
+      at: a.at,
+      node: (
+        <div className="text-sm">
+          <Kind label="Cutover approval" />
+          <p className="inline-flex flex-wrap items-center gap-1">
+            <strong className="font-medium text-foreground">Approved by {a.actor}</strong>
+            <When at={a.at} />
+          </p>
           {a.comment && <p className="wrap-break-word text-muted-foreground">“{a.comment}”</p>}
-        </li>
-      ))}
-      {request && <li>{request}</li>}
-    </ul>
+          {plan?.require_approval !== false && !counted.has(a) && <p className="text-xs text-status-warning">Does not count: {a.actor} {uncountedReason(m, a.actor)}.</p>}
+        </div>
+      ),
+    })),
+    ...(request ? [{ key: 'request', at: m.cutover_requested_at ?? '', node: request }] : []),
+    ...(decision
+      ? [
+          {
+            key: `decision-${decision.id}`,
+            at: decision.decision.decided_at,
+            node: (
+              <div className="text-sm">
+                <Kind label={approvalKindLabel({ kind: 'advisor_decision', decisionType: decision.decision_type })} />
+                {decision.decision.status === 'pending_approval' ? (
+                  <p className="text-foreground">
+                    Waits for approval ({PERMISSIONS['advisor.approve']}): approve or override it on{' '}
+                    <Link to={`/advisor/recommendations/${encodeURIComponent(decision.id)}`} className="underline underline-offset-4">
+                      its recommendation
+                    </Link>
+                    .
+                  </p>
+                ) : (
+                  <p className="inline-flex flex-wrap items-center gap-1">
+                    <strong className="font-medium text-foreground">
+                      {decision.decision.status === 'approved' ? 'Approved' : 'Overridden'} by {decision.decision.actor.id}
+                    </strong>
+                    {decision.decision.status === 'overridden' && decision.decision.final_option && (
+                      <span className="text-foreground">: {optionLabel(decision.decision.final_option)}</span>
+                    )}
+                    <When at={decision.decision.decided_at} />
+                  </p>
+                )}
+              </div>
+            ),
+          },
+        ]
+      : []),
+  ].sort((a, b) => (a.at && b.at ? Date.parse(a.at) - Date.parse(b.at) : a.at ? -1 : 1));
+  return (
+    <div className="flex flex-col gap-2">
+      {m.approvals.length === 0 && (
+        <p className="text-sm text-muted-foreground">{plan?.require_approval === false ? 'This plan does not require a cutover approval.' : 'No cutover approvals yet.'}</p>
+      )}
+      {/* built from the recommendations too: unknown when they could not be loaded, never left out (SDD §16) */}
+      {recommendations.error && !recommendations.data && <Unavailable what="recommendations" subject="Advisor decision" />}
+      {entries.length > 0 && (
+        <ul className="flex flex-col gap-2">
+          {entries.map((e) => (
+            <li key={e.key}>{e.node}</li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -425,8 +614,13 @@ export default function MigrationDetail() {
   const plan = usePlan(m?.plan_id);
   const history = useEventTail({ migration_id: migrationId }, 300);
   const role = useRole();
+  const demoSpeed = useDemoSpeed();
+  // a probe edit, announced from a live region already on the page (SDD §16)
+  const [probeAnnouncement, setProbeAnnouncement] = useState('');
   const [liveEvents, setLiveEvents] = useState<Event[]>([]);
   usePageTitle(m ? `${m.vm.name} · ${phaseMeta(m.phase).label}` : 'Migration');
+  // a link to its findings or estimates (#findings, #estimates) lands there once loaded (SDD §16, ADV-02)
+  useHashLanding(Boolean(m));
   const announcement = useProgressAnnouncement(m);
 
   useEffect(() => setLiveEvents([]), [migrationId]);
@@ -458,6 +652,8 @@ export default function MigrationDetail() {
   const p = plan.data;
   // SDD §16: without its plan the cutover window and approval policy are unknown
   const planUnavailable = Boolean(plan.error) && !p;
+  // until the plan is known the Cutover dialog could promise an approval the plan does not grant (SDD §16)
+  const planLoading = !p && !plan.error;
   const warm = isWarmStrategy(m.strategy);
   const wave = p?.waves.find((w) => w.id === m.wave_id);
 
@@ -469,6 +665,15 @@ export default function MigrationDetail() {
         meta={
           <>
             <PhaseBadge phase={m.phase} size="md" />
+            {m.data_issues.length > 0 && (
+              <StatusBadge
+                tone="warning"
+                icon={TriangleAlert}
+                label="Data inconsistent"
+                detail="The numbers of this migration do not hold together: the downtime statistics leave it out."
+                size="md"
+              />
+            )}
             <span className="text-sm text-foreground">{strategyLabel(m.strategy)}</span>
             {wave && <span className="text-sm text-muted-foreground">Wave {wave.order}: {wave.name}</span>}
             <code className="text-xs text-muted-foreground">{m.id}</code>
@@ -486,7 +691,8 @@ export default function MigrationDetail() {
         <Alerts m={m} />
 
         <Panel title="Next step">
-          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} />
+          <MigrationActions migration={m} plan={p} role={role} planUnavailable={planUnavailable} planLoading={planLoading} />
+          <DemoSourcePower key={m.id} migration={m} role={role} />
         </Panel>
 
         <section aria-label="Lifecycle" className="card p-4">
@@ -502,27 +708,48 @@ export default function MigrationDetail() {
               actualS={m.actual_downtime_s}
               sloS={p?.downtime_slo_s ?? null}
               estimateS={m.estimate?.downtime_s ?? null}
+              parts={m.estimate?.downtime_parts}
+              strategy={m.strategy}
+              demoSpeed={demoSpeed}
             />
           </Panel>
-          <Panel title="Approvals" description={p?.require_approval ? 'An approver must approve the cutover' : undefined}>
+          <Panel
+            title="Approvals"
+            description={p?.require_approval ? (p.require_distinct_approver ? 'An approver other than the requester must approve the cutover' : 'An approver must approve the cutover') : undefined}
+          >
             <Approvals m={m} plan={p} />
           </Panel>
         </div>
 
         {warm && (
-          <Panel title="Sync-pass convergence" description="Bytes changed per pass; cutover becomes possible once a delta is below the threshold">
+          <Panel title="Sync-pass convergence" description="Bytes changed per pass, the final sync after the source stopped, and the rules that allow the cutover">
             <SyncPassChart
               passes={m.sync_passes}
               thresholdBytes={p?.convergence_threshold_bytes ?? null}
               maxPasses={p?.max_sync_passes ?? null}
               droppedBytes={m.sync_bytes_dropped}
               running={runningStep(m)?.pass ?? null}
+              strategy={m.strategy}
+              sloS={p?.downtime_slo_s ?? null}
+              convergedBy={m.converged_by}
+              estimateS={m.estimate?.downtime_s ?? null}
+              force={m.force_cutover}
             />
           </Panel>
         )}
 
+        <Panel title="Network" description="Where each NIC goes in RHOSO: the plan's mapping, or this VM's override (SDD §9.3)">
+          <NetworkPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
+        </Panel>
+        <Panel title="Verification" description="What verification probes after the cutover, and what it found last (SDD §7.5)">
+          <VerificationPanel migration={m} plan={p} role={role} onSaved={setProbeAnnouncement} />
+        </Panel>
+        <p role="status" className="sr-only">
+          {probeAnnouncement}
+        </p>
+
         <div className="grid gap-4 xl:grid-cols-2">
-          <Panel title="Findings" description="Pre-flight checks (SDD §9.3)">
+          <Panel id="findings" title="Findings" description="Pre-flight checks (SDD §9.3)">
             <FindingsList
               findings={m.findings}
               emptyText={
@@ -534,12 +761,12 @@ export default function MigrationDetail() {
               }
             />
           </Panel>
-          <Panel title="Advisor notes" description="Jev, rules and agentmemory">
-            <AdvisorNotes notes={m.advisor_notes} />
+          <Panel title="Advisor" description="What the advisor recommended, what was decided, and its notes">
+            <MigrationAdvisor m={m} />
           </Panel>
         </div>
 
-        <Panel title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
+        <Panel id="estimates" title="Estimates" description="Every strategy considered for this VM (SDD §9.1)">
           <EstimatesPanel m={m} role={role} />
         </Panel>
 

@@ -51,6 +51,13 @@ SCRIPT = textwrap.dedent(
         else:
             record["vars"] = data
         merged.update(data)
+    # the port_creation_mode each server of workloads.yml had when the playbook started
+    workloads = Path(merged.get("os_migrate_data_dir") or ".") / "workloads.yml"
+    if merged.get("os_migrate_data_dir") and workloads.exists():
+        resources = (yaml.safe_load(workloads.read_text()) or {{}}).get("resources") or []
+        record["port_creation_mode"] = [
+            (r.get("_migration_params") or {{}}).get("port_creation_mode")
+            for r in resources if r.get("type") == "openstack.compute.Server"]
     log = Path(os.environ["ANSIBLE_FAKE_LOG"])
     with log.open("a") as fh:
         fh.write(json.dumps(record) + "\\n")
@@ -76,6 +83,7 @@ SCRIPT = textwrap.dedent(
                 "flavor_ref": {{"name": "m1.small", "project_name": "finance",
                                "domain_name": "Default"}},
                 "ports": [{{"params": {{
+                    "mac_address": "fa:16:3e:00:00:01",
                     "network_ref": {{"name": "app-net", "project_name": "finance",
                                     "domain_name": "Default"}},
                     "fixed_ips_refs": [{{"ip_address": "10.0.0.5", "subnet_ref": {{
@@ -88,6 +96,20 @@ SCRIPT = textwrap.dedent(
             "_info": {{"id": server_id}},
             "_migration_params": {{"boot_volume_params": {{"volume_type": "ceph-ssd"}}}},
         }}]}}
+        if os.environ.get("ANSIBLE_FAKE_PORT_SECURITY_GROUPS"):
+            # a collection that records each port's security groups (SDD §6.6)
+            for port in doc["resources"][0]["params"]["ports"]:
+                port["params"]["security_group_refs"] = [{{"name": "default",
+                    "project_name": "finance", "domain_name": "Default"}}]
+                port["params"]["is_port_security_enabled"] = True
+        floating = os.environ.get("ANSIBLE_FAKE_FLOATING")
+        if floating:
+            # "{{address}}@{{network}}": a floating IP on the port's 10.0.0.5
+            address, network = floating.split("@", 1)
+            doc["resources"][0]["params"]["floating_ips"] = [{{"params": {{
+                "fixed_ip_address": "10.0.0.5", "floating_ip_address": address,
+                "floating_network_ref": {{"name": network, "project_name": "admin",
+                                         "domain_name": "Default"}}}}}}]
         twin = os.environ.get("ANSIBLE_FAKE_TWIN_ID")
         if twin:
             # os-migrate exports by name: another server of the project with the same name
@@ -115,7 +137,9 @@ SCRIPT = textwrap.dedent(
                 "import_workloads_cutover.yml"):
         logs = osm / "workload_logs"
         logs.mkdir(exist_ok=True)
-        (logs / (name + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
+        # named as import_workload_prelim names it (SDD §7.2)
+        stem = name.replace("%", "%25").replace("/", "%2F").replace("\\0", "%00")
+        (logs / (stem + ".state")).write_text(json.dumps({{"/dev/vda": 50.0, "/dev/vdb": 100.0}}))
         time.sleep(float(os.environ.get("ANSIBLE_FAKE_SLEEP", "0.3")))
 
     if base in ("import_workloads_precopy.yml", "import_workloads_cutover.yml"):

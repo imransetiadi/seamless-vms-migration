@@ -3,12 +3,35 @@ import { createPortal } from 'react-dom';
 import { cn } from '../lib/cn';
 
 const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
 
+/** Inside a closed <details>, only its own summary is shown. */
+function inClosedDetails(el: HTMLElement): boolean {
+  for (let details = el.closest('details'); details; details = details.parentElement?.closest('details') ?? null) {
+    const ownSummary = el.tagName === 'SUMMARY' && el.parentElement === details;
+    if (!details.open && !ownSummary) return true;
+  }
+  return false;
+}
+
+/**
+ * What Tab reaches, in order: the trap wraps from the last to the first of these (SDD §16). A radio group is one
+ * stop — its checked radio, or its first while none is — and an element with tabindex -1, an inert or hidden one,
+ * or one in a closed <details> is none.
+ */
 function focusables(container: HTMLElement | null): HTMLElement[] {
   if (!container) return [];
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.hasAttribute('inert'));
+  const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]:not([disabled])'));
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => {
+    if (el.tabIndex < 0 || el.closest('[inert], [hidden]') || inClosedDetails(el)) return false;
+    if (!(el instanceof HTMLInputElement) || el.type !== 'radio' || !el.name) return true;
+    const group = radios.filter((radio) => radio.name === el.name && radio.form === el.form);
+    return el === (group.find((radio) => radio.checked) ?? group[0]);
+  });
 }
+
+// the open dialogs, the topmost last: Escape on the page closes that one only (SDD §16)
+const openDialogs: symbol[] = [];
 
 export interface ModalProps {
   open: boolean;
@@ -26,6 +49,10 @@ export interface ModalProps {
   /** When false, Escape does nothing (e.g. while a request is in flight). */
   dismissible?: boolean;
   size?: 'md' | 'lg';
+  /** `left`: a drawer along the left edge, the full height of the window (the phone navigation, SDD §16). */
+  placement?: 'center' | 'left';
+  /** A tap on the dimmed page closes the dialog (when it is dismissible). */
+  closeOnBackdrop?: boolean;
   children: ReactNode;
 }
 
@@ -43,9 +70,14 @@ export function Modal({
   returnFocusRef,
   dismissible = true,
   size = 'md',
+  placement = 'center',
+  closeOnBackdrop = false,
   children,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  // read by the page's Escape listener, which is set up once per opening
+  const closeRef = useRef({ onClose, dismissible });
+  closeRef.current = { onClose, dismissible };
 
   useEffect(() => {
     if (!open) return;
@@ -60,7 +92,21 @@ export function Modal({
     // read at close on purpose: the element the ref points to then takes the focus
     const returnTo = returnFocusRef;
 
+    // Escape closes the topmost dialog wherever the focus is — one that dropped to the page included; inside the
+    // panel its own handler does (SDD §16)
+    const token = Symbol('dialog');
+    openDialogs.push(token);
+    const onPageKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape' || openDialogs[openDialogs.length - 1] !== token) return;
+      if (event.target instanceof Node && panelRef.current?.contains(event.target)) return;
+      if (closeRef.current.dismissible) closeRef.current.onClose();
+    };
+    document.addEventListener('keydown', onPageKeyDown);
+
     return () => {
+      document.removeEventListener('keydown', onPageKeyDown);
+      const index = openDialogs.indexOf(token);
+      if (index >= 0) openDialogs.splice(index, 1);
       appRoot?.removeAttribute('inert');
       document.body.style.overflow = previousOverflow;
       (returnTo?.current ?? previouslyFocused)?.focus();
@@ -95,8 +141,18 @@ export function Modal({
   };
 
   return createPortal(
-    <div className="fixed inset-0 z-modal flex items-end justify-center p-3 sm:items-center sm:p-6">
-      <div aria-hidden className="absolute inset-0 bg-black/60" />
+    <div
+      className={cn(
+        'fixed inset-0 z-modal flex',
+        placement === 'left' ? 'items-stretch justify-start' : 'items-end justify-center p-3 sm:items-center sm:p-6',
+      )}
+    >
+      <div
+        aria-hidden
+        data-testid="modal-backdrop"
+        className="absolute inset-0 bg-black/60"
+        onClick={closeOnBackdrop && dismissible ? onClose : undefined}
+      />
       <div
         ref={panelRef}
         role={role}
@@ -106,8 +162,12 @@ export function Modal({
         tabIndex={-1}
         onKeyDown={onKeyDown}
         className={cn(
-          'card animate-dialog-in relative max-h-[calc(100dvh-1.5rem)] w-full overflow-y-auto shadow-xl outline-hidden',
-          size === 'md' ? 'max-w-lg' : 'max-w-3xl',
+          // a column: a form with min-h-0 shrinks to the panel and scrolls its own body between a header and its
+          // actions, which then never cover the focused control (WCAG 2.4.11, SDD §16); other content scrolls the panel
+          'relative flex flex-col overflow-y-auto shadow-xl outline-hidden',
+          placement === 'left'
+            ? 'animate-drawer-in h-dvh w-72 max-w-[85vw] border-r border-border bg-card'
+            : cn('card animate-dialog-in max-h-[calc(100dvh-1.5rem)] w-full', size === 'md' ? 'max-w-lg' : 'max-w-3xl'),
         )}
       >
         {children}

@@ -21,9 +21,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
-from ..domain.models import Plan, Provider, utcnow
+from ..domain.models import Mappings, Plan, Provider, utcnow
+from ..planning.ipam import address_refusal, requested_ips
+from ..planning.networks import port_refusal
 from ..storage import (
     StorageError,
     manage_reference,
@@ -31,7 +34,7 @@ from ..storage import (
     split_host,
     storage_family,
 )
-from .ansible import classify_failure, run_dir
+from .ansible import classify_failure, effective_mappings, run_dir
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
 log = logging.getLogger(__name__)
@@ -52,7 +55,8 @@ def _checked(response: Any, what: str) -> Any:
     (``Proxy.request(raise_exc=False)``), so a refusal would otherwise pass silently."""
     status = int(getattr(response, "status_code", 200) or 200)
     if status >= 400:
-        detail = str(getattr(response, "text", "") or "").strip().replace("\n", " ")[:300]
+        detail = redact_cut(str(getattr(response, "text", "") or "").strip(), 300)
+        detail = detail.replace("\n", " ")
         raise RuntimeError(f"{what}: HTTP {status}: {detail}")
     return response
 
@@ -125,6 +129,45 @@ def _existing_server(conn: Any, server_id: str) -> Any:
         if _not_found(exc):
             return None
         raise
+
+
+def _destination_network(conn: Any, name: str) -> Any:
+    """A port's RHOSO network as step 8 finds it (SDD §7.3 step 0): the credential's own network of
+    that name, else the only network of that name it sees - the admin credential sees every
+    project's, and a name can be in several."""
+    own = list(conn.network.networks(name=name, project_id=conn.current_project_id))
+    if len(own) == 1:
+        return own[0]
+    if own:
+        raise PermanentStepError(
+            f"RHOSO has {len(own)} networks named {name!r} in the credential's project"
+        )
+    seen = list(conn.network.networks(name=name))
+    if len(seen) == 1:
+        return seen[0]
+    if not seen:
+        raise PermanentStepError(f"RHOSO has no network named {name!r}")
+    projects = ", ".join(sorted({str(_attr(n, "project_id")) for n in seen}))
+    raise PermanentStepError(
+        f"RHOSO has {len(seen)} networks named {name!r}, none in the credential's project "
+        f"(projects {projects})"
+    )
+
+
+def _token_roles(conn: Any) -> set[str] | None:
+    """The role names of the credential's token, or None when it cannot tell (SDD §6.6)."""
+    try:
+        return set(conn.session.auth.get_access(conn.session).role_names or [])
+    except Exception:  # an auth plugin without access info: that half is not judged
+        log.debug("could not read the token's roles", exc_info=True)
+        return None
+
+
+def port_description(source_port_id: str) -> str:
+    """The description of a destination port created through Neutron for a source port: how a
+    resume finds it again and a rollback deletes it (SDD §6.6, §7.3 step 8). The collection's
+    ``server_port.port_description`` writes the same."""
+    return f"os-migrate:{source_port_id}"
 
 
 def _existing_port(conn: Any, port_id: str) -> Any:
@@ -237,7 +280,9 @@ class HandoverExecutor:
         raise PermanentStepError(f"step {step} does not apply to storage_handover")
 
     # -- cutover ---------------------------------------------------------------------------------
-    def _capture_definition(self, conn: Any, server_id: str) -> dict[str, Any]:
+    def _capture_definition(
+        self, conn: Any, server_id: str, port_creation_mode: str = "nova"
+    ) -> dict[str, Any]:
         server = conn.compute.get_server(server_id)
         flavor = _attr(server, "flavor") or {}
         networks = []
@@ -247,18 +292,29 @@ class HandoverExecutor:
                 {"subnet_id": ip.get("subnet_id"), "ip_address": ip.get("ip_address")}
                 for ip in _attr(port, "fixed_ips") or []
             ]
-            # every port with its id, MAC and addresses, for the rollback (SDD §7.3 step 2); the
-            # destination keeps the first address on the mapped network (step 8)
-            networks.append(
-                {
-                    "network_id": _attr(port, "network_id"),
-                    "network": _attr(network, "name"),
-                    "fixed_ip": fixed_ips[0]["ip_address"] if fixed_ips else None,
-                    "port_id": _attr(port, "id"),
-                    "mac_address": _attr(port, "mac_address"),
-                    "fixed_ips": fixed_ips,
-                }
-            )
+            # every port with its id, MAC, addresses, security group ids and port-security flag,
+            # for the rollback (SDD §7.3 step 2): Nova applies a server's groups only to the ports
+            # it creates. The destination keeps the first address on the mapped network, or every
+            # one through Neutron (step 8)
+            entry = {
+                "network_id": _attr(port, "network_id"),
+                "network": _attr(network, "name"),
+                "fixed_ip": fixed_ips[0]["ip_address"] if fixed_ips else None,
+                "port_id": _attr(port, "id"),
+                "mac_address": _attr(port, "mac_address"),
+                "fixed_ips": fixed_ips,
+                "security_group_ids": list(_attr(port, "security_group_ids") or []),
+                "port_security_enabled": _attr(port, "is_port_security_enabled"),
+            }
+            if port_creation_mode == "neutron":
+                # the destination looks them up by name in its own project (step 8)
+                entry["security_groups"] = sorted(
+                    {
+                        str(_attr(conn.network.get_security_group(g), "name"))
+                        for g in entry["security_group_ids"]
+                    }
+                )
+            networks.append(entry)
         attachments = []
         for att in conn.compute.volume_attachments(server):
             volume = conn.block_storage.get_volume(_attr(att, "volume_id"))
@@ -293,6 +349,7 @@ class HandoverExecutor:
             "availability_zone": _attr(server, "availability_zone"),
             "networks": networks,
             "attachments": attachments,
+            "port_creation_mode": port_creation_mode,
         }
 
     @staticmethod
@@ -344,11 +401,25 @@ class HandoverExecutor:
         return storage
 
     def _readiness(
-        self, src: Any, dst: Any, server_id: str, backend_map: dict[str, str]
+        self,
+        src: Any,
+        dst: Any,
+        server_id: str,
+        backend_map: dict[str, str],
+        plan: Plan | None = None,
+        mappings: Mappings | None = None,
     ) -> dict[str, Any]:
-        """Step 0 as a read-only report: what each volume would become, and every problem."""
-        attachments = self._capture_definition(src, server_id)["attachments"]
+        """Step 0 as a read-only report: what each volume would become, and every problem; with the
+        plan, also what would make step 6 or 8 fail on a port, a security group, the flavor or a
+        volume type - ``mappings`` as those steps apply them, the plan's by default."""
+        mode = plan.port_creation_mode if plan is not None else "nova"
+        definition = self._capture_definition(src, server_id, mode)
+        attachments = definition["attachments"]
         problems: list[str] = []
+        if plan is not None:
+            problems.extend(self._port_problems(dst, definition["networks"], plan, server_id))
+            problems.extend(self._group_problems(dst, definition))
+            problems.extend(self._lookup_problems(dst, definition, mappings or plan.mappings))
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -410,7 +481,13 @@ class HandoverExecutor:
         return {"server_id": server_id, "volumes": volumes, "problems": problems}
 
     async def readiness(
-        self, source: Provider, destination: Provider, server_id: str, backend_map: dict[str, str]
+        self,
+        source: Provider,
+        destination: Provider,
+        server_id: str,
+        backend_map: dict[str, str],
+        plan: Plan | None = None,
+        mappings: Mappings | None = None,
     ) -> dict[str, Any]:
         """Read-only handover check of one server (SDD §7.3 step 0): per volume its driver
         family, source pool, destination host and manage reference, and every problem that would
@@ -419,8 +496,130 @@ class HandoverExecutor:
         dst = await self._conn(destination)
         return await self._call(
             "check the handover readiness",
-            lambda: self._readiness(src, dst, server_id, backend_map),
+            lambda: self._readiness(src, dst, server_id, backend_map, plan, mappings),
         )
+
+    @staticmethod
+    def _port_problems(
+        dst: Any, networks: list[dict[str, Any]], plan: Plan, vm_id: str
+    ) -> list[str]:
+        """What would make step 8 fail on a port, or put it where it must not go, found while the
+        VM still runs (§7.3 step 0): its RHOSO network does not resolve with step 8's lookup, the
+        credential may not put a port there, or an address step 8 would give it is one Neutron
+        refuses there (§6.6)."""
+        neutron = plan.port_creation_mode == "neutron"
+        roles = _token_roles(dst)
+        problems: list[str] = []
+        for n in networks:
+            target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
+            where = f"port {n.get('port_id')} ({n.get('mac_address')})"
+            try:
+                network = _destination_network(dst, target)
+            except PermanentStepError as exc:
+                problems.append(f"{where}: {exc}")
+                continue
+            # another project's network only when shared or external, and from the admin or advsvc
+            # role: the admin credential sees every project's private networks (§6.6)
+            project = _attr(network, "project_id")
+            why_not = port_refusal(
+                {
+                    "own": project == dst.current_project_id,
+                    "shared": bool(_attr(network, "is_shared", False)),
+                    "external": bool(_attr(network, "is_router_external", False)),
+                },
+                roles,
+            )
+            if why_not:
+                problems.append(f"{where} on {target!r} (project {project}): {why_not}")
+            net_id = _attr(network, "id")
+            subnets = list(dst.network.subnets(network_id=net_id))
+            # Nova keeps one address per port (step 8)
+            given = addresses if neutron else addresses[:1]
+            for address in given:
+                why = address_refusal(address, subnets, neutron=neutron, mac=n.get("mac_address"))
+                if why:
+                    problems.append(f"{where} on {target!r}: {address} {why}")
+            # what another port of the network holds: Neutron refuses its address, and with the MAC
+            # kept the MAC - all but the earlier attempt's own port, which step 8 uses again
+            mine = (
+                {
+                    _attr(p, "id")
+                    for p in HandoverExecutor._earlier_ports(dst, n, network, addresses)
+                }
+                if neutron and n.get("port_id")
+                else set()
+            )
+            for address in given:
+                holders = [
+                    _attr(p, "id")
+                    for p in dst.network.ports(
+                        network_id=net_id, fixed_ips=[f"ip_address={address}"]
+                    )
+                    if address in [ip.get("ip_address") for ip in _attr(p, "fixed_ips") or []]
+                    and _attr(p, "id") not in mine
+                ]
+                if holders:
+                    problems.append(
+                        f"{where} on {target!r}: {address} is held by port {holders[0]}"
+                    )
+            mac = str(n.get("mac_address") or "").lower()
+            if neutron and mac:
+                holders = [
+                    _attr(p, "id")
+                    for p in dst.network.ports(network_id=net_id, mac_address=mac)
+                    if str(_attr(p, "mac_address") or "").lower() == mac
+                    and _attr(p, "id") not in mine
+                ]
+                if holders:
+                    problems.append(
+                        f"{where} on {target!r}: MAC {mac} is held by port {holders[0]}"
+                    )
+        return problems
+
+    @staticmethod
+    def _group_problems(dst: Any, definition: dict[str, Any]) -> list[str]:
+        """The security groups step 8 asks for by name that are not exactly one group of the
+        credential's project, found while the VM still runs (§7.3 step 0): the server's, which
+        Nova looks up by name (``default`` aside), and each port's, which ``definition`` names in
+        "neutron" mode only (step 2) and step 8 looks up for the port it creates. Step 8 runs after
+        the source server was deleted."""
+        askers: dict[str, list[str]] = {}
+        for name in definition.get("security_groups") or []:
+            if name != "default":
+                askers.setdefault(name, []).append("the server")
+        for n in definition["networks"]:
+            for name in n.get("security_groups") or []:
+                askers.setdefault(name, []).append(f"port {n.get('port_id')}")
+        problems: list[str] = []
+        for name, who in askers.items():
+            found = list(dst.network.security_groups(name=name, project_id=dst.current_project_id))
+            if len(found) != 1:
+                many = f"{len(found)} security groups" if found else "no security group"
+                problems.append(
+                    f"{', '.join(who)}: RHOSO has {many} named {name!r} in the credential's project"
+                )
+        return problems
+
+    @staticmethod
+    def _lookup_problems(dst: Any, definition: dict[str, Any], mappings: Mappings) -> list[str]:
+        """The flavor step 8 and the volume types step 6 would ask RHOSO for and it lacks, found
+        while the VM still runs (§7.3 step 0): both steps run after the source server was deleted.
+        Each is chosen as those steps choose it - the mapping, else the source's own name."""
+        problems: list[str] = []
+        source = definition["flavor"]
+        flavor = mappings.flavors.get(source, source)
+        if flavor and dst.compute.find_flavor(flavor, ignore_missing=True) is None:
+            problems.append(f"the server's flavor {source!r}: RHOSO has no flavor named {flavor!r}")
+        known = {str(_attr(t, "name")) for t in dst.block_storage.types()}
+        missing: dict[str, list[str]] = {}
+        for att in definition["attachments"]:
+            vtype = mappings.volume_types.get(att["volume_type"] or "", att["volume_type"])
+            if vtype and vtype not in known:
+                missing.setdefault(vtype, []).append(str(att["volume_id"]))
+        for vtype, volumes in missing.items():
+            which = f"volume {volumes[0]}" if len(volumes) == 1 else f"volumes {', '.join(volumes)}"
+            problems.append(f"{which}: RHOSO has no volume type named {vtype!r}")
+        return problems
 
     @staticmethod
     def _unmanage_blockers(src: Any, attachments: list[dict[str, Any]]) -> list[str]:
@@ -577,8 +776,9 @@ class HandoverExecutor:
     ) -> list[dict[str, str]]:
         """The source server's NICs for its recreation (SDD §7.3 rollback): a port a user created
         survives the server's deletion unbound and is used again; a port Nova created is gone and
-        is recreated with its MAC and every fixed IP (journaled, so a resume does not create it
-        twice). A definition journaled without ports keeps its network and first address."""
+        is recreated with its MAC, every fixed IP, its security groups and its port-security flag
+        (journaled, so a resume does not create it twice). A definition journaled without ports
+        keeps its network and first address."""
         nics: list[dict[str, str]] = []
         for n in networks:
             if not n.get("port_id"):
@@ -594,13 +794,118 @@ class HandoverExecutor:
                     port_id = n["port_id"]
                 else:
                     fixed_ips = [{k: v for k, v in ip.items() if v} for ip in n["fixed_ips"]]
-                    created = conn.network.create_port(
-                        network_id=n["network_id"],
-                        mac_address=n["mac_address"],
-                        fixed_ips=fixed_ips,
-                    )
+                    # never an address the source's Neutron derives from the kept MAC itself:
+                    # sent, it is refused or allocated twice (SLAAC, DHCPv6-stateless, §7.3)
+                    subnets = list(conn.network.subnets(network_id=n["network_id"]))
+                    attrs: dict[str, Any] = {
+                        "network_id": n["network_id"],
+                        "mac_address": n["mac_address"],
+                        "fixed_ips": requested_ips(fixed_ips, subnets),
+                    }
+                    # a definition journaled before step 2 recorded them has none
+                    if n.get("security_group_ids") is not None:
+                        attrs["security_group_ids"] = n["security_group_ids"]
+                    if n.get("port_security_enabled") is not None:
+                        attrs["is_port_security_enabled"] = n["port_security_enabled"]
+                    created = conn.network.create_port(**attrs)
                     port_id = str(_attr(created, "id"))
                 journal.mark(key, port_id=port_id)
+            nics.append({"port": journal.get(key)["port_id"]})
+        return nics
+
+    @staticmethod
+    def _earlier_ports(
+        conn: Any, n: dict[str, Any], network: Any, addresses: list[str]
+    ) -> list[Any]:
+        """The unbound port an earlier attempt of step 8 created for the journaled port ``n``, which
+        step 8 uses again: its description, on the target network, in the credential's project,
+        with the MAC and exactly the addresses. The admin credential sees every project's ports,
+        and a cold or warm migration of the same VM may have left one (§7.3)."""
+        description = port_description(n["port_id"])
+        mac = str(n.get("mac_address") or "").lower()
+        # not counting the addresses Neutron derives itself on SLAAC or DHCPv6-stateless subnets:
+        # it adds them to every port it creates (§6.6)
+        subnets = list(conn.network.subnets(network_id=_attr(network, "id")))
+        wanted = sorted(
+            ip["ip_address"]
+            for ip in requested_ips([{"ip_address": a} for a in addresses], subnets)
+        )
+        return [
+            p
+            for p in conn.network.ports(description=description)
+            if _attr(p, "description") == description
+            and not _attr(p, "device_id")
+            and _attr(p, "network_id") == _attr(network, "id")
+            and str(_attr(p, "mac_address") or "").lower() == mac
+            and sorted(
+                ip.get("ip_address")
+                for ip in requested_ips(list(_attr(p, "fixed_ips") or []), subnets)
+            )
+            == wanted
+            and _attr(p, "project_id") == conn.current_project_id
+        ]
+
+    @staticmethod
+    def _destination_nic(plan: Plan, vm_id: str, n: dict[str, Any]) -> tuple[str, list[str]]:
+        """A journaled port's RHOSO network and addresses (SDD §7.3 step 8): its NIC override's
+        network, else the mapped one; the override's addresses, else its own."""
+        entry = plan.nic_override(vm_id, n.get("mac_address"))
+        network = (entry.network if entry is not None else None) or plan.mappings.networks.get(
+            n["network"], n["network"]
+        )
+        if entry is not None and entry.fixed_ips is not None:
+            return network, list(entry.fixed_ips)
+        own = [ip["ip_address"] for ip in n.get("fixed_ips") or []]
+        # a definition journaled before every address was: its first one
+        return network, own or ([n["fixed_ip"]] if n.get("fixed_ip") else [])
+
+    @staticmethod
+    def _destination_ports(
+        conn: Any,
+        definition: dict[str, Any],
+        plan: Plan,
+        vm_id: str,
+        journal: _Journal,
+    ) -> list[dict[str, str]]:
+        """Each port created first through Neutron on the mapped network with its MAC, every fixed
+        IP, its security groups and its port-security flag (SDD §7.3 step 8), journaled: a resume
+        boots on the journaled port, or on the one a create sent before a crash made - unbound,
+        with its description, on the target network, in the credential's project, with the MAC and
+        exactly the addresses. Nova applies a server's security groups only to ports it creates."""
+        nics: list[dict[str, str]] = []
+        for n in definition["networks"]:
+            key = f"dst_port:{n['port_id']}"
+            if not journal.done(key):
+                description = port_description(n["port_id"])
+                target, addresses = HandoverExecutor._destination_nic(plan, vm_id, n)
+                network = _destination_network(conn, target)
+                project_id = conn.current_project_id
+                earlier = HandoverExecutor._earlier_ports(conn, n, network, addresses)
+                if earlier:
+                    port = earlier[0]
+                else:
+                    subnets = list(conn.network.subnets(network_id=_attr(network, "id")))
+                    attrs: dict[str, Any] = {
+                        "network_id": _attr(network, "id"),
+                        "mac_address": n["mac_address"],
+                        # by address: Neutron picks the destination subnet that holds it; never
+                        # one Neutron derives from the MAC itself (SLAAC, DHCPv6-stateless, §6.6)
+                        "fixed_ips": requested_ips([{"ip_address": a} for a in addresses], subnets),
+                        "security_group_ids": [
+                            _attr(
+                                conn.network.find_security_group(
+                                    name, ignore_missing=False, project_id=project_id
+                                ),
+                                "id",
+                            )
+                            for name in n.get("security_groups") or []
+                        ],
+                        "description": description,
+                    }
+                    if n.get("port_security_enabled") is not None:
+                        attrs["is_port_security_enabled"] = n["port_security_enabled"]
+                    port = conn.network.create_port(**attrs)
+                journal.mark(key, port_id=str(_attr(port, "id")))
             nics.append({"port": journal.get(key)["port_id"]})
         return nics
 
@@ -611,7 +916,23 @@ class HandoverExecutor:
         flavor: str,
         networks: list[dict[str, Any]],
         bdm: list[dict[str, Any]],
+        journal: _Journal,
+        sent: str,
     ) -> str:
+        """Create a server, journaled as ``sent`` with its id once Nova accepts it (SDD §7.3): after
+        a crash or a timeout while Nova builds it a resume waits for that server instead of
+        creating a second one on the same volumes; one Nova no longer knows is created again."""
+        if journal.done(sent):
+            server = _existing_server(conn, journal.get(sent)["server_id"])
+            if server is not None:
+                conn.compute.wait_for_server(
+                    server,
+                    status="ACTIVE",
+                    failures=["ERROR"],
+                    interval=self.poll_s,
+                    wait=self.wait_s,
+                )
+                return str(_attr(server, "id"))
         flavor_obj = conn.compute.find_flavor(flavor, ignore_missing=False)
         params: dict[str, Any] = {
             "name": definition["name"],
@@ -623,6 +944,7 @@ class HandoverExecutor:
         if definition.get("security_groups"):
             params["security_groups"] = [{"name": n} for n in definition["security_groups"]]
         server = conn.compute.create_server(**params)
+        journal.mark(sent, server_id=str(_attr(server, "id")))
         conn.compute.wait_for_server(
             server, status="ACTIVE", failures=["ERROR"], interval=self.poll_s, wait=self.wait_s
         )
@@ -633,13 +955,17 @@ class HandoverExecutor:
         journal = await asyncio.to_thread(_Journal, rdir / JOURNAL_FILE)
         src = await self._conn(ctx.source)
         dst = await self._conn(ctx.destination)
-        mappings = ctx.plan.mappings
+        # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
+        # (SDD §7.2)
+        mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
         backend_map = ctx.plan.handover.backend_map
         server_id = ctx.migration.vm.source_id
 
         if not journal.data["order"]:
             # step 0: everything that can be checked while the VM still runs (§7.3, §7.3.1)
-            report = await self.readiness(ctx.source, ctx.destination, server_id, backend_map)
+            report = await self.readiness(
+                ctx.source, ctx.destination, server_id, backend_map, ctx.plan, mappings
+            )
             if report["problems"]:
                 raise PermanentStepError(
                     "storage handover refused: " + "; ".join(report["problems"])
@@ -651,6 +977,8 @@ class HandoverExecutor:
                 server = src.compute.get_server(server_id)
                 if str(_attr(server, "status", "")).upper() != "SHUTOFF":
                     src.compute.stop_server(server)
+                    # Nova accepted it: should the wait fail, a rollback starts the source (§7.3)
+                    journal.mark("sent:stop_source")
                 src.compute.wait_for_server(
                     server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
                 )
@@ -661,8 +989,10 @@ class HandoverExecutor:
 
         definition_path = rdir / DEFINITION_FILE
         if not journal.done("save_definition"):
+            mode = ctx.plan.port_creation_mode
             definition = await self._call(
-                "record source definition", lambda: self._capture_definition(src, server_id)
+                "record source definition",
+                lambda: self._capture_definition(src, server_id, mode),
             )
             definition["storage"] = await asyncio.to_thread(
                 self._resolve_storage, src, dst, definition["attachments"], backend_map
@@ -766,18 +1096,29 @@ class HandoverExecutor:
         if not journal.done("create_server"):
 
             def create() -> str:
-                networks = []
-                for n in definition["networks"]:
-                    mapped = mappings.networks.get(n["network"], n["network"])
-                    net = {
-                        "uuid": _attr(dst.network.find_network(mapped, ignore_missing=False), "id")
-                    }
-                    if n.get("fixed_ip"):
-                        net["fixed_ip"] = n["fixed_ip"]
-                    networks.append(net)
+                # the mode the definition was recorded in (step 2), as a resume must keep it
+                vm_id = ctx.migration.vm.source_id
+                if definition.get("port_creation_mode") == "neutron":
+                    networks = self._destination_ports(dst, definition, ctx.plan, vm_id, journal)
+                else:
+                    networks = []
+                    for n in definition["networks"]:
+                        target, addresses = self._destination_nic(ctx.plan, vm_id, n)
+                        network = _destination_network(dst, target)
+                        net = {"uuid": _attr(network, "id")}
+                        # Nova keeps one address per port: its override's, else its first
+                        if addresses:
+                            net["fixed_ip"] = addresses[0]
+                        networks.append(net)
                 flavor = mappings.flavors.get(definition["flavor"], definition["flavor"])
                 return self._create_server(
-                    dst, definition, flavor, networks, self._bdm(attachments, dest_ids)
+                    dst,
+                    definition,
+                    flavor,
+                    networks,
+                    self._bdm(attachments, dest_ids),
+                    journal,
+                    "sent:create_server",
                 )
 
             new_id = await self._call("create the destination server", create)
@@ -808,8 +1149,10 @@ class HandoverExecutor:
         definition = await asyncio.to_thread(_read_json, definition_path)
         attachments: list[dict[str, Any]] = definition["attachments"]
 
-        if journal.done("create_server") and not journal.done("rb:delete_destination"):
-            dest_server = journal.get("create_server")["server_id"]
+        # a create only sent before a crash or a timeout left a server too (SDD §7.3)
+        dest_created = journal.get("create_server") or journal.get("sent:create_server")
+        if dest_created and not journal.done("rb:delete_destination"):
+            dest_server = dest_created["server_id"]
 
             def delete_destination() -> None:
                 server = _existing_server(dst, dest_server)
@@ -819,6 +1162,33 @@ class HandoverExecutor:
 
             await self._call("delete the destination server", delete_destination)
             await asyncio.to_thread(journal.mark, "rb:delete_destination")
+
+        if definition.get("port_creation_mode") == "neutron":
+            # step 8's ports through Neutron: Nova keeps them when it deletes their server, and a
+            # cutover can fail between them and the server (SDD §7.3 rollback)
+            deleted_server = (dest_created or {}).get("server_id")
+            for n in definition["networks"]:
+                key = f"rb:delete_dst_port:{n['port_id']}"
+                if journal.done(key):
+                    continue
+                journaled_id = journal.get(f"dst_port:{n['port_id']}").get("port_id")
+
+                def delete_ports(n: dict[str, Any] = n, journaled: Any = journaled_id) -> None:
+                    description = port_description(n["port_id"])
+                    ports = list(dst.network.ports(description=description))
+                    if journaled and journaled not in {_attr(p, "id") for p in ports}:
+                        port = _existing_port(dst, journaled)
+                        ports += [port] if port is not None else []
+                    for port in ports:
+                        ours = _attr(port, "id") == journaled or (
+                            _attr(port, "description") == description
+                        )
+                        bound = _attr(port, "device_id")
+                        if ours and (not bound or bound == deleted_server):
+                            dst.network.delete_port(port, ignore_missing=True)
+
+                await self._call(f"delete the destination port of {n['port_id']}", delete_ports)
+                await asyncio.to_thread(journal.mark, key)
 
         def managed_at_rhoso(vid: str) -> str | None:
             """The RHOSO volume a manage created, confirmed or only sent before a crash (§7.3)."""
@@ -914,6 +1284,8 @@ class HandoverExecutor:
                         definition["flavor"],
                         networks,
                         self._bdm(attachments, new_ids, keep_original=True),
+                        journal,
+                        "sent:rb:create_source",
                     ),
                 )
                 await asyncio.to_thread(journal.mark, "rb:create_source", server_id=created)

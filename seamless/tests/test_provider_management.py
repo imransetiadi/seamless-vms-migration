@@ -4,6 +4,7 @@ and the conversion-host key in the platform secret store, distributions, secret 
 import base64
 import json
 import logging
+import os
 import stat
 from datetime import UTC, datetime
 
@@ -130,6 +131,122 @@ def test_patch_is_refused_while_a_running_plan_uses_the_provider(api):
     assert patch(api, "/api/v1/providers/src-osp", {"name": "x"}).status_code == 200
 
 
+def test_credentials_are_recorded_however_often_a_check_races_the_record(api, monkeypatch):
+    """SDD §13.3: once the secret is written the change is recorded - never a 409 that leaves a
+    replaced secret unaudited, however many checks land between the route's read and its write."""
+    from seamless_migrate.store import AsyncStore
+
+    db_put = AsyncStore.put
+    raced: list[int] = []
+
+    async def put_after_a_check(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None and len(raced) < 8:
+            raced.append(expected_version)
+            provider = api.store.get("provider", model.id, Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", put_after_a_check)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    assert len(raced) == 8
+    assert api.store.get("provider", "src-osp", Provider).credentials_updated_at is not None
+    events = api.store.events(since_seq=0)
+    assert [e.kind for e in events].count("provider.credentials_updated") == 1
+
+
+def test_credentials_written_while_a_check_updates_the_provider_are_recorded(api, monkeypatch):
+    """SDD §13.3: a provider check finishing while the credentials are written bumps the
+    provider's version; the route retries its versioned write, so the change is recorded —
+    credentials_updated_at and one provider.credentials_updated event — and the provider returns
+    to unknown: that check tested the old credentials. A 409 here would leave a replaced secret
+    unaudited."""
+    write = FileSecretStore.write
+    checks: list[str] = []
+
+    def write_while_a_check_finishes(self, name, values, labels):
+        write(self, name, values, labels)
+        if not checks:
+            checks.append(name)
+            provider = api.store.get("provider", "src-osp", Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+
+    monkeypatch.setattr(FileSecretStore, "write", write_while_a_check_finishes)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    stored = api.store.get("provider", "src-osp", Provider)
+    assert (stored.credentials_secret, stored.status) == ("provider-src-osp", "unknown")
+    assert stored.credentials_updated_at is not None
+    recorded = [
+        e for e in api.store.events(since_seq=0) if e.kind == "provider.credentials_updated"
+    ]
+    assert [e.data["secret"] for e in recorded] == ["provider-src-osp"]
+
+    # a check that finishes between the route's read of the provider and its write: the
+    # versioned write conflicts and is retried on the fresh copy
+    from seamless_migrate.store import AsyncStore
+
+    db_put = AsyncStore.put
+    raced: list[int] = []
+
+    async def put_after_a_check(self, kind, model, expected_version=None):
+        if kind == "provider" and expected_version is not None and not raced:
+            raced.append(expected_version)
+            provider = api.store.get("provider", model.id, Provider)
+            api.store.put("provider", provider.model_copy(update={"status": "ok"}))
+        return await db_put(self, kind, model, expected_version=expected_version)
+
+    monkeypatch.setattr(AsyncStore, "put", put_after_a_check)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-2", "project_name": "finance"},
+    )
+    assert res.status_code == 200, res.text
+    assert (
+        raced and (api.settings.secrets_dir / "provider-src-osp" / "password").read_text() == "pw-2"
+    )
+    monkeypatch.setattr(AsyncStore, "put", db_put)
+
+    checks.clear()
+    key = "-----BEGIN OPENSSH PRIVATE KEY-----\nkey-material\n-----END OPENSSH PRIVATE KEY-----"
+    res = put(api, "/api/v1/providers/dst-rhoso/conversion-key", {"private_key": key})
+    assert res.status_code == 200, res.text
+    stored = api.store.get("provider", "dst-rhoso", Provider)
+    assert stored.conversion_key_updated_at is not None
+    assert stored.conversion_host is not None
+    assert stored.conversion_host.ssh_key_secret == "provider-dst-rhoso-ssh"
+
+
+def test_credentials_of_a_provider_deleted_meanwhile_answer_404_and_leave_no_secret(
+    api, monkeypatch
+):
+    """SDD §13.3: a provider deleted while its credentials are written answers 404, and the
+    secret just written is removed again — no secret outlives its provider."""
+    write = FileSecretStore.write
+
+    def write_while_the_provider_is_deleted(self, name, values, labels):
+        write(self, name, values, labels)
+        api.store.delete("provider", "src-osp")
+
+    monkeypatch.setattr(FileSecretStore, "write", write_while_the_provider_is_deleted)
+    res = put(
+        api,
+        "/api/v1/providers/src-osp/credentials",
+        {"username": "svc-migrate", "password": "pw-1", "project_name": "finance"},
+    )
+    assert res.status_code == 404, res.text
+    assert not (api.settings.secrets_dir / "provider-src-osp").exists()
+
+
 def test_openstack_credentials_are_write_only(api, caplog):
     secret = "s3cr3t-Keystone-pw"
     with caplog.at_level(logging.DEBUG):
@@ -228,6 +345,103 @@ def test_credential_validation_per_kind(api):
     }
 
 
+@pytest.mark.parametrize(
+    "bad", ["../etc", "-starts-with-dash", "has space", "a" * 129, ".", "..", "trailing\n"]
+)
+def test_a_secret_name_the_reader_could_not_use_is_refused(api, bad):
+    """SDD §13.3: credentials_secret and conversion_host.ssh_key_secret name a secret managed
+    outside Seamless; a name security.secrets would refuse to read is refused when written."""
+    created = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-named", "credentials_secret": bad}
+    )
+    assert created.status_code == 422, created.text
+    assert "credentials_secret" in created.json()["error"]["message"]
+    assert patch(api, "/api/v1/providers/src-osp", {"credentials_secret": bad}).status_code == 422
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": bad}
+    refused = patch(api, "/api/v1/providers/src-osp", {"conversion_host": host})
+    assert refused.status_code == 422 and "ssh_key_secret" in refused.json()["error"]["message"]
+
+
+def test_a_provider_stored_with_an_odd_secret_name_stays_editable(api):
+    """Only the fields a PATCH sets are checked: a provider stored before the rule stays usable."""
+    stored = api.store.get("provider", "src-osp", Provider)
+    api.store.put("provider", stored.model_copy(update={"credentials_secret": "old name"}))
+    renamed = patch(api, "/api/v1/providers/src-osp", {"name": "RHOSP 17.1 (finance, renamed)"})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["credentials_secret"] == "old name"
+    assert (
+        patch(api, "/api/v1/providers/src-osp", {"credentials_secret": "old name"}).status_code
+        == 422
+    )
+
+
+def test_an_id_whose_secret_names_are_another_providers_is_refused(api):
+    """SDD §13.3: provider-{id} and provider-{id}-ssh must stay apart: 'src-osp-ssh' would store its
+    credentials over src-osp's conversion key, and deleting it would remove that key."""
+    clash = api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-ssh"})
+    assert clash.status_code == 409, clash.text
+    assert "src-osp" in clash.json()["error"]["message"]
+    # the other way round: 'vc-a-ssh' first, then 'vc-a'
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-a-ssh"}).status_code == 201
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "vc-a"}).status_code == 409
+    # ids that only look alike are fine
+    assert api.post("/api/v1/providers", json={**VCENTER, "id": "src-osp-sshd"}).status_code == 201
+
+
+def test_a_provider_may_not_name_another_providers_secret(api):
+    """SDD §13.3: provider-* names belong to the providers the store writes them for; a check would
+    send another provider's credentials to this provider's endpoint."""
+    other = api.post(
+        "/api/v1/providers",
+        json={**VCENTER, "id": "vc-x", "credentials_secret": "provider-src-osp"},
+    )
+    assert other.status_code == 422 and "another provider" in other.json()["error"]["message"]
+    own = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-y", "credentials_secret": "provider-vc-y"}
+    )
+    assert own.status_code == 201, own.text
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "provider-dst-rhoso-ssh"}
+    assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 422
+    host["ssh_key_secret"] = "provider-src-osp-ssh"
+    assert patch(api, "/api/v1/providers/src-osp", {"conversion_host": host}).status_code == 200
+
+
+def test_provider_events_name_the_secrets_it_reads(api):
+    """SDD §13.3: the audit trail says which secret a provider reads, never a value."""
+    created = api.post(
+        "/api/v1/providers", json={**VCENTER, "id": "vc-z", "credentials_secret": "vcenter-dc9"}
+    )
+    assert created.status_code == 201, created.text
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "conv-dc9-key"}
+    assert patch(api, "/api/v1/providers/vc-z", {"conversion_host": host}).status_code == 200
+    events = api.store.events(since_seq=0, limit=100000)
+    made = next(
+        e for e in events if e.kind == "provider.created" and e.data["provider_id"] == "vc-z"
+    )
+    assert made.data["credentials_secret"] == "vcenter-dc9"
+    changed = [
+        e for e in events if e.kind == "provider.updated" and e.data["provider_id"] == "vc-z"
+    ]
+    assert changed[-1].data["ssh_key_secret"] == "conv-dc9-key"
+
+
+def test_a_secret_managed_outside_seamless_can_be_named(api):
+    """SDD §13.3, §16: the dialog names an existing secret; nothing is written to the store."""
+    created = api.post(
+        "/api/v1/providers",
+        json={**VCENTER, "id": "vc-named", "credentials_secret": "vcenter-dc2.prod_1"},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["credentials_secret"] == "vcenter-dc2.prod_1"
+    host = {"manage": False, "address": "10.0.0.5", "ssh_key_secret": "conv-key"}
+    patched = patch(
+        api, "/api/v1/providers/src-osp", {"conversion_host": host, "credentials_secret": "osp-src"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["conversion_host"]["ssh_key_secret"] == "conv-key"
+    assert patched.json()["credentials_secret"] == "osp-src"
+
+
 def test_conversion_key_is_write_only(api):
     bad = put(
         api, "/api/v1/providers/src-osp/conversion-key", {"private_key": "ssh-ed25519 " + "A" * 80}
@@ -296,6 +510,28 @@ def test_file_store_roundtrip(tmp_path):
         store.write("ok", {"bad key": "v"}, {})
 
 
+def test_file_store_root_lists_no_secret_names_to_other_users(tmp_path, monkeypatch):
+    """SDD §13.3: the store creates its root 0700 and tightens one it owns, so other local users
+    cannot list the secret names; a root it does not own (a mount) keeps its mode."""
+    fresh = tmp_path / "fresh" / "secrets"
+    FileSecretStore(fresh).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o700
+
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    os.chmod(loose, 0o755)
+    FileSecretStore(loose).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o700
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    os.chmod(foreign, 0o755)
+    monkeypatch.setattr(os, "geteuid", lambda: foreign.stat().st_uid + 1)
+    FileSecretStore(foreign).write("provider-x", {"username": "u"}, {})
+    assert stat.S_IMODE(foreign.stat().st_mode) == 0o755
+    assert FileSecretStore(foreign).read("provider-x") == {"username": "u"}
+
+
 def test_kubernetes_store_against_a_fake_api_server():
     secrets: dict[str, dict] = {}
     seen: list[tuple[str, str, str]] = []
@@ -352,6 +588,57 @@ def test_kubernetes_store_against_a_fake_api_server():
     )
     with pytest.raises(SecretStoreError, match="may not GET secrets in ns"):
         forbidden.read("provider-x")
+
+
+def test_kubernetes_store_reads_only_its_own_or_labelled_secrets():
+    """SDD §13.3: never the deployment's own Secrets (seamless-db, seamless-tokens, ...)."""
+
+    def secret(labels, **data):
+        encoded = {k: base64.b64encode(v.encode()).decode() for k, v in data.items()}
+        return {"metadata": {"labels": labels}, "data": encoded}
+
+    secrets = {
+        "seamless-db": secret(
+            {"app.kubernetes.io/part-of": "seamless-migrate"}, username="pg", password="x"
+        ),
+        "seamless-ext": secret({"seamless.io/provider-secret": "true"}, username="u", password="p"),
+        "seamless-own": secret(
+            {"app.kubernetes.io/managed-by": "seamless-migrate"}, username="o", password="q"
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        name = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=secrets[name]) if name in secrets else httpx.Response(404)
+
+    store = KubernetesSecretStore(
+        "ns", base_url="https://api.test", token="t", transport=httpx.MockTransport(handler)
+    )
+    assert store.read("db") is None
+    assert store.read("ext") == {"username": "u", "password": "p"}
+    assert store.read("own") == {"username": "o", "password": "q"}
+
+
+def test_a_name_the_kubernetes_store_cannot_hold_reads_the_variables(tmp_path, monkeypatch):
+    """SDD §13.3: upper-case or '_' is a valid secret name but not a Kubernetes one: the
+    variables are read instead of the read failing."""
+    settings = Settings(secrets_dir=tmp_path, secret_store="kubernetes", k8s_namespace="ns")
+    from seamless_migrate.security import secret_store as module
+
+    asked: list[str] = []
+
+    class FakeStore:
+        def __init__(self, namespace):
+            pass
+
+        def read(self, name):
+            asked.append(name)
+            raise module.SecretStoreError(f"invalid secret name {name!r}")
+
+    monkeypatch.setattr(module, "KubernetesSecretStore", FakeStore)
+    env = {"SEAMLESS_SECRET_VCENTER_DC2_USERNAME": "u", "SEAMLESS_SECRET_VCENTER_DC2_PASSWORD": "p"}
+    assert read_secret("Vcenter_DC2", settings, env) == {"username": "u", "password": "p"}
+    assert asked == []
 
 
 def test_read_secret_order_files_then_store_then_environment(tmp_path, monkeypatch):

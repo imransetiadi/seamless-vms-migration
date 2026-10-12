@@ -139,6 +139,10 @@ class FakeCompute:
     def flavors(self, details=True):
         return [NS(name="m1.small", vcpus=2, ram=4096, disk=20, extra_specs={})]
 
+    def keypairs(self, **_):
+        # the credential's own keypairs (Nova lists only those without user_id)
+        return [NS(name="ops-key"), NS(name="old-key")]
+
     def get_server_console_output(self, server_id, length=None):
         return {"output": "Booting...\nweb-01 login: "}
 
@@ -188,6 +192,20 @@ class FakeNetwork:
     def networks(self, **_):
         return list(self._networks.values())
 
+    def subnets(self, **_):
+        return [
+            NS(id="sub-1", name="app-subnet", network_id="net-1", cidr="10.0.0.0/24"),
+            NS(
+                id="sub-6",
+                name="app-v6",
+                network_id="net-1",
+                cidr="fd00::/64",
+                ipv6_address_mode="slaac",
+                ipv6_ra_mode="slaac",
+            ),
+            NS(id="sub-x", name="orphan", network_id="net-gone", cidr="192.0.2.0/24"),
+        ]
+
     def agents(self, **_):
         binary = "ovn-controller" if self._ovn else "neutron-openvswitch-agent"
         return [
@@ -216,6 +234,7 @@ def fake_conn(admin=True, ovn=True):
         },
         image={},
         metadata={"os_type": "rhel9", "app": "shop"},
+        key_name="ops-key",
         compute_host="compute-0",
         attachments=[
             NS(volume_id="vol-root", device="/dev/vda"),
@@ -253,13 +272,34 @@ def fake_conn(admin=True, ovn=True):
             status="ACTIVE",
         )
     ]
-    networks = [NS(id="net-1", name="app-net", mtu=1442)]
+    networks = [
+        NS(
+            id="net-1",
+            name="app-net",
+            mtu=1442,
+            project_id="proj-1",
+            is_shared=False,
+            is_router_external=False,
+        ),
+        NS(
+            id="net-9",
+            name="provider-vlan9",
+            mtu=1500,
+            project_id="admin-proj",
+            is_shared=True,
+            is_router_external=False,
+        ),
+    ]
+    # keystoneauth: conn.session.auth.get_access(conn.session).role_names (SDD §10)
+    roles = ["admin", "member", "reader"] if admin else ["member", "reader"]
+    auth = NS(get_access=lambda session: NS(role_names=roles))
     return NS(
         compute=FakeCompute([server], admin=admin),
         block_storage=FakeBlockStorage(volumes),
         network=FakeNetwork(ports, networks, ovn=ovn),
         identity=NS(get_project=lambda pid: NS(id=pid, name="finance")),
         current_project_id="proj-1",
+        session=NS(auth=auth),
     )
 
 
@@ -299,6 +339,7 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
         "finance",
         "m1.small",
     )
+    assert vm.key_name == "ops-key"  # SDD §4.1
     assert (vm.vcpus, vm.ram_mb, vm.power_state, vm.os_type, vm.host) == (
         2,
         4096,
@@ -334,7 +375,7 @@ async def test_openstack_provider_maps_server_to_vmref(stub_openstack, tmp_path)
     assert "login:" in await provider.console_log("srv-1")
     assert await provider.find_server("web-01") == "srv-1"
     inv = await provider.inventory()
-    assert inv.networks == {"app-net": 1442}
+    assert inv.networks == {"app-net": 1442, "provider-vlan9": 1500}
 
 
 def _fleet_conn(count=3):
@@ -512,6 +553,7 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps == {
         "admin": True,
+        "roles": ["admin", "member", "reader"],
         "compute_microversion": "2.95",
         "ovn": True,
         "volume_backends": ["hostgroup@ceph#ssd"],
@@ -527,6 +569,26 @@ async def test_openstack_check_reports_admin_and_ovn(stub_openstack):
     stub_openstack(fake_conn(admin=False, ovn=False))
     caps = await OpenStackProvider(make_provider(), settings()).check()
     assert caps["admin"] is False and caps["ovn"] is False
+    assert caps["roles"] == ["member", "reader"]
+
+
+async def test_openstack_check_leaves_out_roles_it_cannot_read(stub_openstack):
+    """SDD §10, §9.3: the token's role names are what NET_PORT_NOT_PERMITTED judges; a token
+    whose roles cannot be read reports none, so that half of the rule is not judged."""
+    conn = fake_conn()
+
+    def unreadable(session):
+        raise RuntimeError("the auth plugin keeps no access info")
+
+    conn.session = NS(auth=NS(get_access=unreadable))
+    stub_openstack(conn)
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert "roles" not in caps and caps["admin"] is True
+    conn.session = NS(
+        auth=NS(get_access=lambda session: NS(role_names=["reader", "admin", "admin"]))
+    )
+    caps = await OpenStackProvider(make_provider(), settings()).check()
+    assert caps["roles"] == ["admin", "reader"]
 
 
 async def test_openstack_check_reports_storage_backends_with_family(stub_openstack):
@@ -573,7 +635,8 @@ async def test_openstack_volume_disks_carry_their_cinder_pool(stub_openstack):
 
 
 async def test_openstack_destination_inventory(stub_openstack):
-    stub_openstack(fake_conn())
+    conn = fake_conn()
+    stub_openstack(conn)
     dst = OpenStackProvider(
         make_provider(id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination),
         settings(),
@@ -584,6 +647,107 @@ async def test_openstack_destination_inventory(stub_openstack):
         {"name": "m1.small", "vcpus": 2, "ram_mb": 4096, "disk_gb": 20, "extra_specs": {}}
     ]
     assert inv.volume_types == ["ceph-ssd", "ceph-hdd"]
+    # SDD §10: the destination credential's own keypairs (DST_KEYPAIR_MISSING)
+    assert inv.keypairs == ["old-key", "ops-key"]
+    # SDD §10: every network it sees, with its owner: what a NIC's network name resolves to;
+    # shared and external: whether the credential may put a port on another project's (§6.6)
+    assert inv.network_details == [
+        {
+            "id": "net-1",
+            "name": "app-net",
+            "mtu": 1442,
+            "project_id": "proj-1",
+            "own": True,
+            "shared": False,
+            "external": False,
+        },
+        {
+            "id": "net-9",
+            "name": "provider-vlan9",
+            "mtu": 1500,
+            "project_id": "admin-proj",
+            "own": False,
+            "shared": True,
+            "external": False,
+        },
+    ]
+    conn.network.get_network("net-9").is_router_external = True
+    assert (await dst.inventory()).network_details[1]["external"] is True
+    # the subnets it sees, by network name and id, where a NIC's addresses must lie
+    # each with its id: what a VMware NIC's network_map value names (SDD §10, §7.2)
+    assert inv.subnets == [
+        {
+            "id": "sub-1",
+            "name": "app-subnet",
+            "network": "app-net",
+            "network_id": "net-1",
+            "cidr": "10.0.0.0/24",
+            "ipv6_address_mode": None,
+            "ipv6_ra_mode": None,
+        },
+        {
+            "id": "sub-6",
+            "name": "app-v6",
+            "network": "app-net",
+            "network_id": "net-1",
+            "cidr": "fd00::/64",
+            "ipv6_address_mode": "slaac",
+            "ipv6_ra_mode": "slaac",
+        },
+    ]
+
+
+async def test_openstack_source_inventory_lists_the_credentials_keypairs(stub_openstack):
+    """SDD §11: what export_keypairs.yml can export - the source credential's own keypairs."""
+    stub_openstack(fake_conn())
+    inv = await OpenStackProvider(make_provider(), settings()).inventory()
+    assert isinstance(inv, SourceInventory)
+    assert inv.keypairs == ["old-key", "ops-key"]
+
+
+#: an SDK error whose 500-character cut falls inside the password of a URL
+SDK_ERROR = "x" * 479 + " https://svc:Sup3rS3cretPw@keystone.example:5000/v3 refused"
+
+
+async def test_openstack_errors_are_redacted_before_they_are_cut():
+    """SDD §13.4: a provider SDK's error message is redacted over its cut plus 16384 characters
+    before it is cut to 500 — a URL whose password the cut splits would otherwise reach a 502
+    answer, an event or Migration.error, as the later redaction no longer recognizes it."""
+
+    def failing_connect(provider, settings):
+        raise RuntimeError(SDK_ERROR)
+
+    provider = OpenStackProvider(make_provider(), settings(), connect_fn=failing_connect)
+    with pytest.raises(ProviderError) as failed:
+        await provider.check()
+    assert "Sup3r" not in str(failed.value) and "[REDACTED]" in str(failed.value)
+
+
+async def test_vmware_errors_are_redacted_before_they_are_cut(tmp_path):
+    """SDD §13.4: the same for the VMware provider."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("svc-migrate@vsphere.local\n")
+    (secret_dir / "password").write_text("pw\n")
+
+    def failing_connector(host, port, user, pwd, verify, ca_cert):
+        raise RuntimeError(SDK_ERROR)
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter",
+            kind=ProviderKind.vmware,
+            credentials_secret="vcenter-dc2",
+            endpoint="https://vcenter.dc2.example:8443/sdk",
+            cloud=None,
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=failing_connector,
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError) as failed:
+        await provider.list_vms()
+    assert "Sup3r" not in str(failed.value) and "[REDACTED]" in str(failed.value)
 
 
 async def test_openstack_connection_errors_become_provider_errors(monkeypatch):
@@ -613,7 +777,8 @@ class VirtualEthernetCard:
     def __init__(self, mac, network):
         self.key = 4000
         self.macAddress = mac
-        self.deviceInfo = NS(label="Network adapter 1")
+        # vSphere's summary of a NIC on a standard port group is the network's name
+        self.deviceInfo = NS(label="Network adapter 1", summary=network)
         self.backing = NS(deviceName=network)
 
 
@@ -717,6 +882,9 @@ async def test_vmware_provider_maps_vm(tmp_path):
         "00:50:56:aa:bb:cc",
         ["10.2.0.15", "fe80::1"],
     )
+    # SDD §4, §7.2: what the migration kit maps the NIC by - a standard port group's NIC by its
+    # device summary
+    assert nic.network_key == "DC2-Prod"
     assert vm.tags == {"app": "billing"}
     caps = await provider.check()
     assert caps["api_version"] == "8.0.2.0" and caps["cbt_enabled_vms"] == 1
@@ -1041,6 +1209,7 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
+    from seamless_migrate.providers import openstack as osp
     from seamless_migrate.providers.openstack import OpenStackProvider, _MapContext
 
     conn = fake_conn()
@@ -1068,16 +1237,20 @@ async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):
     conn.compute.get_server_console_output = lambda server_id, length=None: None
     assert await provider.console_log("srv-1") is None
 
-    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited
+    # deleting a server that is already gone is a no-op; an existing one is deleted and awaited,
+    # within the call's bound: a wait past it would report a timeout while the deletion goes on
+    # (SDD §8.1)
     waited = []
     conn.compute.delete_server = lambda server, ignore_missing=True: conn.compute.deleted.append(
         server.id
     )
-    conn.compute.wait_for_delete = lambda server, wait=600: waited.append(server.id)
+    conn.compute.wait_for_delete = lambda server, wait=600: waited.append((server.id, wait))
     await provider.delete_server("missing")
     assert conn.compute.deleted == []
     await provider.delete_server("web-01")
-    assert conn.compute.deleted == ["srv-1"] and waited == ["srv-1"]
+    [(server_id, wait)] = waited
+    assert conn.compute.deleted == ["srv-1"] and server_id == "srv-1"
+    assert 0 < wait < osp.PROVIDER_CALL_TIMEOUT_S
     assert await provider.find_server("web-01") == "srv-1"
     assert await provider.find_server("nope") is None
 
@@ -1127,7 +1300,8 @@ async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
 
     vm = fake_vcenter_vm()
     nic = vm.config.hardware.device[-1]
-    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7"))
+    nic.backing = NS(port=NS(portgroupKey="dvportgroup-7", portKey="12"))
+    nic.deviceInfo = NS(label="Network adapter 1", summary="DVSwitch: 50 2c 9e")
     vim = NS(
         VirtualMachine=VirtualMachine,
         vm=FAKE_VIM.vm,
@@ -1155,6 +1329,16 @@ async def test_vmware_endpoint_dvs_portgroups_and_transport_errors(tmp_path):
     )
     [mapped] = await provider.list_vms()
     assert mapped.nics[0].network == "DC2-DMZ"
+    # the migration kit maps a distributed port group's NIC by the port group's key (SDD §7.2)
+    assert mapped.nics[0].network_key == "dvportgroup-7"
+    # an NSX opaque network: Seamless names it by its id, the kit maps it by the device summary
+    nic.backing = NS(opaqueNetworkId="nsx-ls-1")
+    nic.deviceInfo = NS(label="Network adapter 1", summary="nsx.LogicalSwitch: 5ab3")
+    [mapped] = await provider.list_vms()
+    assert (mapped.nics[0].network, mapped.nics[0].network_key) == (
+        "nsx-ls-1",
+        "nsx.LogicalSwitch: 5ab3",
+    )
 
     # pyVmomi exceptions become ProviderError with the vSphere message
     def failing(**_):
@@ -1205,3 +1389,66 @@ async def test_vmware_power_on_times_out(tmp_path, monkeypatch):
     )
     with pytest.raises(ProviderError, match="timed out"):
         await provider.power_on("5012-abcd")
+
+
+async def test_fake_destination_inventory_resolves_every_demo_nic():
+    """SDD §10, §9.3: in demo mode every OpenStack demo VM's NIC resolves to one RHOSO network whose
+    subnets take its addresses, and that the demo's admin credential may use - the demo plans are
+    not blocked by MAP_NETWORK_AMBIGUOUS, NET_ADDRESS_REFUSED or NET_PORT_NOT_PERMITTED - and the
+    shared provider network is another project's."""
+    from seamless_migrate.planning.preflight import run_preflight
+    from tests.factories import make_plan
+
+    caps = await FakeDestinationProvider(seed=42).check()
+    assert "admin" in caps["roles"]
+    dst = await FakeDestinationProvider(seed=42).inventory()
+    ids = {n["id"] for n in dst.network_details}
+    assert all(s["network_id"] in ids for s in dst.subnets)
+    [shared] = [n for n in dst.network_details if not n["own"]]
+    assert (shared["name"], shared["shared"]) == ("provider-vlan100", True)
+    # the demo's seed (Settings.demo_seed) and another
+    for seed in (Settings().demo_seed, 7):
+        source = FakeSourceProvider(ProviderKind.openstack, seed=seed)
+        vms = await source.list_vms()
+        src = await source.inventory()
+        for mode in ("nova", "neutron"):
+            plan = make_plan(port_creation_mode=mode)
+            for vm in vms:
+                codes = [f.code for f in run_preflight(vm, plan, src, dst, vms, dst_caps=caps)]
+                assert "MAP_NETWORK_AMBIGUOUS" not in codes, (vm.name, codes)
+                assert "NET_ADDRESS_REFUSED" not in codes, (seed, vm.name, mode, codes)
+                assert "NET_PORT_NOT_PERMITTED" not in codes, (seed, vm.name, mode, codes)
+
+
+async def test_fake_vmware_vms_get_a_network_map_value_for_every_nic():
+    """SDD §7.2, §9.3: the demo's VMware plan (DC2-Prod and DC2-DMZ mapped) blocks none of its VMs
+    on the network findings, and the migration kit gets every NIC's network and subnet."""
+    from seamless_migrate.domain.models import Mappings
+    from seamless_migrate.planning.networks import (
+        kit_network_key,
+        kit_network_value,
+        kit_subnet,
+        resolve_network,
+    )
+    from seamless_migrate.planning.preflight import run_preflight
+    from tests.factories import make_plan, make_provider
+
+    dst_provider = FakeDestinationProvider(seed=42)
+    caps, dst = await dst_provider.check(), await dst_provider.inventory()
+    vcenter = make_provider(id="vc", kind=ProviderKind.vmware, cloud=None, credentials_secret="s")
+    source = FakeSourceProvider(ProviderKind.vmware, seed=Settings().demo_seed)
+    vms, src = await source.list_vms(), await source.inventory()
+    plan = make_plan(mappings=Mappings(networks={"DC2-Prod": "dc2-prod", "DC2-DMZ": "dc2-dmz"}))
+    for vm in vms:
+        codes = [
+            f.code for f in run_preflight(vm, plan, src, dst, vms, source=vcenter, dst_caps=caps)
+        ]
+        for code in ("MAP_NETWORK_AMBIGUOUS", "NET_ADDRESS_REFUSED", "NET_PORT_NOT_PERMITTED"):
+            assert code not in codes, (vm.name, codes)
+        for nic in vm.nics:
+            network, _ = resolve_network(dst.network_details, plan.nic_target(vm.source_id, nic)[0])
+            own = [s for s in dst.subnets if s["network_id"] == network["id"]]
+            subnet, why = kit_subnet(nic, own)
+            assert why is None, (vm.name, why)
+            assert kit_network_key(nic) == nic.network
+            assert kit_network_value(network, subnet) == f"{network['id']},{subnet['id']}"

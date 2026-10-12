@@ -6,8 +6,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import Role, Strategy
-from ..domain.models import PlanCreate, ValidationItem, ValidationReport
+from ..domain.enums import DecisionType, DerivedPlanStatus, Role, Strategy
+from ..domain.models import (
+    AdvisorPolicy,
+    AdvisorRecommendation,
+    Plan,
+    PlanCreate,
+    ValidationItem,
+    ValidationReport,
+)
 from ..stats import Stats, ThroughputPoint
 
 
@@ -62,6 +69,12 @@ class CutoverRequest(_Body):
     comment: str | None = Field(default=None, max_length=_TEXT)
 
 
+class ForceCutoverRequest(_Body):
+    """A cutover before convergence needs a reason (SDD §5.4, ADV-16)."""
+
+    reason: str = Field(min_length=10, max_length=_TEXT)
+
+
 class RollbackRequest(_Body):
     reason: str = Field(min_length=1, max_length=_TEXT)
 
@@ -79,6 +92,37 @@ class StrategyRequest(_Body):
     strategy: Strategy
 
 
+class PlanOut(Plan):
+    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle."""
+
+    derived_status: DerivedPlanStatus
+
+
+class PlanFinalizeRequest(_Body):
+    """Finalize a wave, or the whole plan, with one approval (SDD §8.1, ADV-19)."""
+
+    wave_id: str | None = Field(default=None, max_length=_TEXT)  # unknown: 404 (SDD §12)
+    #: the wave's name, or the plan's without wave_id
+    confirm: str = Field(max_length=_TEXT)
+    delete_source: bool = False
+
+
+class FinalizeSkip(BaseModel):
+    migration_id: str
+    reason: str
+
+
+class PlanFinalizeResult(BaseModel):
+    finalized: list[str]
+    skipped: list[FinalizeSkip]
+
+
+class DemoPowerRequest(_Body):
+    """Power a fake source VM on or off (demo mode only, SDD §8.1)."""
+
+    state: Literal["on", "off"]
+
+
 class SimilarIncidentsRequest(_Body):
     query: str = Field(min_length=1, max_length=2000)
     limit: int = Field(default=5, ge=1, le=20)
@@ -94,6 +138,13 @@ class SimilarIncidentsResponse(BaseModel):
     hits: list[Hit]
 
 
+class RecommendationPage(BaseModel):
+    items: list[AdvisorRecommendation]
+    total: int
+    offset: int
+    limit: int
+
+
 class OrchestratorHealth(BaseModel):
     running: bool
     last_tick_age_s: float | None
@@ -105,6 +156,8 @@ class Health(BaseModel):
     status: Literal["ok", "degraded"]
     version: str
     demo: bool
+    #: a demo's time compression: its downtime clock runs in model time (SDD §5.2, ADV-16)
+    demo_speed: float | None = None
     db: Literal["ok", "error"]
     orchestrator: OrchestratorHealth
 
@@ -118,6 +171,10 @@ class JevStatus(BaseModel):
     mode: str
     available: bool
     last_error: str | None = None
+    #: where the model runs, and whether the console excerpt may go there (SDD §13.4, ADV-06)
+    deployment: Literal["on_prem", "remote"] = "remote"
+    endpoint_host: str | None = None
+    console_sent: bool = False
 
 
 class MemoryStatus(BaseModel):
@@ -129,6 +186,25 @@ class MemoryStatus(BaseModel):
 class AdvisorStatus(BaseModel):
     jev: JevStatus
     memory: MemoryStatus
+
+
+class DataSentField(BaseModel):
+    key: str
+    label: str
+
+
+class DataSentItem(BaseModel):
+    """What one decision type sends to Jev, from the serializers' field specs (SDD §13.4)."""
+
+    decision_type: DecisionType
+    tool: str
+    fields: list[DataSentField]
+    sent: bool
+    note: str | None = None
+
+
+class DataSentList(BaseModel):
+    items: list[DataSentItem]
 
 
 class ErrorBody(BaseModel):
@@ -161,3 +237,19 @@ __all__ = [
     "ValidationReport",
     "WavesAutoRequest",
 ]
+
+
+class PolicyList(BaseModel):
+    """GET /advisor/policies: the stored policies and the built-in default (SDD §12, §14.6)."""
+
+    items: list[AdvisorPolicy]
+    default: AdvisorPolicy
+
+
+class OverrideRequest(BaseModel):
+    """POST /advisor/recommendations/{id}/override (SDD §12, §14.6)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option: Strategy
+    reason: str | None = Field(default=None, max_length=_TEXT)
