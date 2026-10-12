@@ -1276,6 +1276,84 @@ async def test_start_rejects_blocked_plan(tmp_path, store):
     assert started.status == PlanStatus.running
 
 
+def _refusing(settings, answers):
+    """A warm migration whose pre-copy and sync passes return these cutover_refusals in turn."""
+    executor = ScriptedExecutor(settings)
+    queue = list(answers)
+
+    def hook(step):
+        async def run(ctx):
+            result = await executor.sim.run(step, ctx)
+            result.cutover_refusals = queue.pop(0) if queue else None
+            return result
+
+        return run
+
+    executor.hooks.update(
+        {StepName.PRECOPY: hook(StepName.PRECOPY), StepName.SYNC: hook(StepName.SYNC)}
+    )
+    return executor
+
+
+def _refusals_at_each_pass(store, monkeypatch) -> list[list[str]]:
+    """The stored migration's cutover_refusals as each pass's event is written."""
+    seen: list[list[str]] = []
+    append = store.append_event
+
+    def recording(event):
+        if event.kind == "migration.sync_pass":
+            seen.append(store.get("migration", event.migration_id, Migration).cutover_refusals)
+        return append(event)
+
+    monkeypatch.setattr(store, "append_event", recording)
+    return seen
+
+
+async def test_a_warm_migration_keeps_what_the_cutover_will_refuse_until_its_cutover(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2: a warm pass records on the migration, before its event, what it met that the
+    cutover will refuse; a pass that learned nothing leaves it, and a successful cutover empties
+    it."""
+    settings = make_settings(tmp_path)
+    problem = "the NIC 00:50:56:00:00:01 of vm-1 on 'app-net': port port-old holds its MAC"
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300},
+        executor=_refusing(settings, [[problem], None]),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert [p.kind for p in done.sync_passes] == ["full", "delta", "final"]
+    assert seen == [[problem], [problem], []]
+    assert done.cutover_refusals == []
+
+
+async def test_a_warm_pass_that_meets_none_empties_the_cutover_refusals(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2: fixed while the passes run - the next pass's empty list replaces the problems."""
+    settings = make_settings(tmp_path)
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300},
+        executor=_refusing(settings, [["port p2 on network 'gone' does not resolve"], []]),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert seen == [["port p2 on network 'gone' does not resolve"], [], []]
+
+
 async def test_warm_flow_reaches_completed_with_downtime(tmp_path, store):
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}

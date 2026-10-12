@@ -2672,6 +2672,9 @@ class Orchestrator:
             )
             cur.progress_pct = 100.0
             cur.checkpoint = f"{step}:{next_pass_number(cur)}"
+            if result.cutover_refusals is not None:
+                # SDD §7.2: what this pass met that the cutover refuses, saved with the pass
+                cur.cutover_refusals = list(result.cutover_refusals)
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
             rule, why = self._converged(cur, plan)
             if rule is not None:
@@ -2700,6 +2703,8 @@ class Orchestrator:
                     cur.destination_server_id = result.destination_server_id
                     await self._save(cur, v)
                 return
+            # SDD §7.2: the cutover got past what the passes said it would refuse
+            cur.cutover_refusals = []
             if result.sync_pass is not None:
                 cur, v = await self._record_pass(cur, v, result.sync_pass, plan)
             cur.destination_server_id = result.destination_server_id or cur.destination_server_id

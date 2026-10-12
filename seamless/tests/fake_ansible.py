@@ -162,6 +162,11 @@ SCRIPT = textwrap.dedent(
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))
+        # the warm role's "Record what the cutover will refuse" (SDD 6.6, 7.2)
+        if (base == "import_workloads_precopy.yml" and not skipped_pass
+                and not os.environ.get("ANSIBLE_FAKE_NO_REFUSALS_FILE")):
+            refusals = json.loads(os.environ.get("ANSIBLE_FAKE_REFUSALS", "[]"))
+            (warm / (server_id + ".refusals.json")).write_text(json.dumps(refusals))
 
     failure = os.environ.get("ANSIBLE_FAKE_FAIL", "")
     if failure and (os.environ.get("ANSIBLE_FAKE_FAIL_ON", base) == base):

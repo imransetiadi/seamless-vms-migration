@@ -830,6 +830,9 @@ class Migration(_Model):
     downtime_model_s: float | None = None
     #: invariant violations found when it completed (SDD §5.5)
     data_issues: list[str] = Field(default_factory=list)
+    #: what the last warm pass met that the cutover refuses before the source stops (SDD §7.2):
+    #: each pass replaces it, a successful cutover empties it
+    cutover_refusals: list[str] = Field(default_factory=list)
     #: the last verification: its checks and application probe results (SDD §7.5, ADV-18)
     verification: VerificationRecord | None = None
     #: the rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan
@@ -894,6 +897,7 @@ class MigrationSummary(_Model):
     source_running_at: UTCDateTime | None
     findings: list[Finding]
     suggested_probes: list[AppProbe]
+    cutover_refusals: list[str]
     created_at: UTCDateTime
     updated_at: UTCDateTime
 
@@ -926,6 +930,7 @@ class MigrationSummary(_Model):
             source_running_at=m.source_running_at,
             findings=m.findings,
             suggested_probes=m.suggested_probes,
+            cutover_refusals=m.cutover_refusals,
             created_at=m.created_at,
             updated_at=m.updated_at,
         )

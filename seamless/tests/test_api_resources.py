@@ -863,6 +863,7 @@ SUMMARY_FIELDS = {
     "source_running_at",
     "findings",
     "suggested_probes",
+    "cutover_refusals",
     "created_at",
     "updated_at",
 }
@@ -916,6 +917,7 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api):
         actor="dewi", at=at, reason="the window closes", delta_bytes=7, estimated_downtime_s=60.0
     )
     awaiting.findings = [Finding(code="SRC_VM_MULTIATTACH", severity="warning", message="x")]
+    awaiting.cutover_refusals = ["the NIC of db-awaiting on 'app': port p holds its MAC"]
     awaiting.updated_at = at + timedelta(minutes=5)
     api.store.put("migration", awaiting)
     completed = migs["completed"]

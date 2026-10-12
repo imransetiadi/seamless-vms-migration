@@ -20,6 +20,7 @@ from seamless_migrate.executors.ansible import (
     KIT_PLAYBOOK,
     STOP_TASK,
     AnsibleExecutor,
+    Deferred,
     ansible_yaml,
     apply_mappings,
     build_inventory,
@@ -1161,6 +1162,54 @@ async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(
     }
 
 
+async def test_a_warm_pass_returns_the_refusals_its_destination_check_recorded(env, monkeypatch):
+    """SDD §6.6, §7.2: the warm role writes what the destination check found that the cutover
+    will refuse beside the warm state; the pass returns it for the migration, a later pass that
+    meets none returns none, and a run that left no such file is not read as the last one's."""
+    problem = "Destination prerequisites not met: port p2 on network 'gone' does not resolve"
+    monkeypatch.setenv("ANSIBLE_FAKE_REFUSALS", json.dumps([problem, problem]))
+    ctx, _ = ctx_for(env)
+    # once each
+    assert (await env.executor.run(StepName.PRECOPY, ctx)).cutover_refusals == [problem]
+    monkeypatch.delenv("ANSIBLE_FAKE_REFUSALS")
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+    # a stale file from an earlier pass is removed before the run
+    stale = run_dir(env) / "osm" / "workload_warm" / "srv-1.refusals.json"
+    stale.write_text(json.dumps(["stale"]))
+    monkeypatch.setenv("ANSIBLE_FAKE_NO_REFUSALS_FILE", "1")
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+    # not a pass: nothing to record
+    assert (await env.executor.run(StepName.CUTOVER, ctx)).cutover_refusals is None
+
+
+async def test_a_vmware_warm_pass_returns_what_the_cutover_will_refuse(env):
+    """SDD §7.2: a vmware_warm pass returns, once each, the problems it logs instead of refusing -
+    and a pass after they are fixed returns none."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_warm, "source": VCENTER, "mappings": Mappings()}
+    holder = {
+        "id": "port-old",
+        "name": "web-01-NIC-0-VLAN-app-net",
+        "network_id": net["id"],
+        "device_id": "",
+        "mac_address": "00:50:56:00:00:01",
+        "fixed_ips": ["10.0.0.9"],
+    }
+    env.registry.ports.append(holder)
+    held = (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    assert (await env.executor.run(StepName.PRECOPY, ctx)).cutover_refusals == [held]
+    env.registry.ports.remove(holder)
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+
+
 async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
     """SDD §7.2: the kit makes the ports only at the cutover, after the power-off. A vmware_warm
     pre-copy or sync run maps a NIC whose network the credential may not use, or whose MAC or
@@ -2205,6 +2254,9 @@ async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover
     assert "2 networks of the credential's project" in line
     # logged before the pass ran
     assert rec.logs.index(line) < rec.logs.index("running import_workloads_precopy.yml")
+    # and returned for the migration's cutover_refusals (SDD §7.2)
+    lead = "the cutover will refuse this before the source stops: "
+    assert result.cutover_refusals == [line[len(lead) :]]
     # kept as exported, the mapping applied: the destination check (SDD §6.6) warns about it
     [port] = exported_server(env)["params"]["ports"]
     assert port["params"]["network_ref"] == {
@@ -2217,9 +2269,10 @@ async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover
     assert (run_dir(env) / "osm" / "rewrite.json").exists()
 
     sync, rec = ctx_for(env)
-    await env.executor.run(StepName.SYNC, sync)
+    synced = await env.executor.run(StepName.SYNC, sync)
     assert [c["playbook"] for c in read_log(env.log)][2:] == ["import_workloads_precopy.yml"]
     assert sum(ln.startswith(problem) for ln in rec.logs) == 1
+    assert synced.cutover_refusals == [line[len(lead) :]]
 
     cutover, rec = ctx_for(env)
     with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
@@ -2251,7 +2304,9 @@ async def test_a_pass_logs_each_problem_it_defers_once():
         logged.append(line)
 
     ctx = SimpleNamespace(log=log)
-    deferred = ["the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"]
+    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"
+    deferred = Deferred()
+    deferred.append(problem)
     await AnsibleExecutor._log_deferred(ctx, deferred)
     await AnsibleExecutor._log_deferred(ctx, deferred)
     # a cutover defers nothing
@@ -2260,6 +2315,8 @@ async def test_a_pass_logs_each_problem_it_defers_once():
         "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
         "web-01 cannot go to RHOSO network 'gone'"
     ]
+    # logged once, and kept for the pass's cutover_refusals (SDD §7.2)
+    assert list(deferred) == [problem]
 
 
 async def test_an_unreadable_destination_keeps_the_exported_network_references(env):

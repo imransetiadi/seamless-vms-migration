@@ -672,6 +672,25 @@ def _read_progress(path: Path) -> float | None:
     return round(sum(values) / len(values), 2) if values else None
 
 
+class Deferred(list[str]):
+    """What a warm pre-copy or sync run meets that only the cutover's ports refuse (SDD §7.2):
+    each logged once, and all of it kept for the pass's cutover_refusals."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged = 0
+
+
+def _read_refusals(path: Path) -> list[str]:
+    """What the warm role recorded that the cutover will refuse (SDD §6.6): none when it wrote no
+    list of messages."""
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(problem) for problem in found] if isinstance(found, list) else []
+
+
 def _read_warm_state(osm: Path, server_id: str) -> dict[str, Any] | None:
     path = osm / "workload_warm" / f"{server_id}.json"
     try:
@@ -790,7 +809,9 @@ class AnsibleExecutor:
         networks: list[dict[str, Any]] | None = None
         # a warm pre-copy or sync run makes no port: what only the cutover's ports would meet is
         # logged, and the cutover refuses it before the source stops (SDD §7.2)
-        deferred: list[str] | None = [] if step in (StepName.PRECOPY, StepName.SYNC) else None
+        deferred: Deferred | None = (
+            Deferred() if step in (StepName.PRECOPY, StepName.SYNC) else None
+        )
         if strategy in (Strategy.cold, Strategy.warm):
             vm_id = ctx.migration.vm.source_id
             nics = ctx.plan.nic_overrides.get(vm_id)
@@ -839,6 +860,10 @@ class AnsibleExecutor:
             )
             passes_before = len((state_before or {}).get("passes") or [])
         started = utcnow()
+        refusals_file = osm / "workload_warm" / f"{ctx.migration.vm.source_id}.refusals.json"
+        if deferred is not None and strategy == Strategy.warm:
+            # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
+            remove_quietly(refusals_file)
         stop_skipped = await self._execute(
             rdir,
             osm,
@@ -860,7 +885,15 @@ class AnsibleExecutor:
                 "has a server with that name and nothing was migrated; delete or rename it, "
                 "or roll the migration back"
             )
-        return await self._result(step, strategy, ctx, osm, started, passes_before)
+        result = await self._result(step, strategy, ctx, osm, started, passes_before)
+        if deferred is not None:
+            # SDD §7.2: what this pass met that the cutover refuses before the source stops -
+            # what the executor deferred and, on the OpenStack warm path, the destination check's
+            found = list(deferred)
+            if strategy == Strategy.warm:
+                found += await asyncio.to_thread(_read_refusals, refusals_file)
+            result.cutover_refusals = list(dict.fromkeys(found))
+        return result
 
     async def _refuse_name_collision(self, ctx: StepContext) -> None:
         """Before the first cutover attempt, refuse a destination server that carries the VM's name.
@@ -1080,12 +1113,14 @@ class AnsibleExecutor:
         return out
 
     @staticmethod
-    async def _log_deferred(ctx: StepContext, deferred: list[str] | None) -> None:
-        """Log, once each, what a warm pass did not refuse and the cutover will (SDD §7.2)."""
-        for problem in deferred or ():
+    async def _log_deferred(ctx: StepContext, deferred: Deferred | None) -> None:
+        """Log, once each, what a warm pass did not refuse and the cutover will (SDD §7.2); the
+        list keeps it for the pass's cutover_refusals."""
+        if deferred is None:
+            return
+        for problem in deferred[deferred.logged :]:
             await ctx.log(f"the cutover will refuse this before the source stops: {problem}")
-        if deferred:
-            deferred.clear()
+        deferred.logged = len(deferred)
 
     @staticmethod
     async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
