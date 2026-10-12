@@ -40,6 +40,7 @@ from ..domain.models import (
     utcnow,
 )
 from ..planning.networks import (
+    kit_ipv4,
     kit_network_key,
     kit_network_value,
     kit_subnet,
@@ -960,8 +961,8 @@ class AnsibleExecutor:
         mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
         holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
         resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
-        take, two NICs one key would send to different values; networks that cannot be read are a
-        transient failure."""
+        take, two NICs one key would send to different values - a NIC with no IPv4 address takes
+        any of its network's; networks that cannot be read are a transient failure."""
         try:
             inventory = await self.providers.get(ctx.destination).inventory()
         except ProviderError as exc:
@@ -972,6 +973,19 @@ class AnsibleExecutor:
         vm = ctx.migration.vm
         out: dict[str, str] = {}
         problems: list[str] = []
+        bare: list[tuple[str, str, str]] = []
+
+        def claim(what: str, key: str, value: str, any_subnet: bool = False) -> None:
+            have = out.setdefault(key, value)
+            # a value is "{network id},{subnet id}", or the network's id alone
+            if have != value and not (
+                any_subnet and have.partition(",")[0] == value.partition(",")[0]
+            ):
+                problems.append(
+                    f"{what} shares the migration kit's key {key!r} with another NIC that goes to "
+                    f"{have}, not {value}"
+                )
+
         for nic in vm.nics:
             # the plan's mapping of its port group, else the same name: the kit keeps the guest's
             # network settings, so no NIC override moves it
@@ -997,11 +1011,13 @@ class AnsibleExecutor:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
             key, value = kit_network_key(nic), kit_network_value(network, subnet)
-            if out.setdefault(key, value) != value:
-                problems.append(
-                    f"{what} shares the migration kit's key {key!r} with another NIC that goes to "
-                    f"{out[key]}, not {value}"
-                )
+            if kit_ipv4(nic.fixed_ips):
+                claim(what, key, value)
+            else:
+                # needs no particular subnet: it takes the one another NIC of its key needs
+                bare.append((what, key, value))
+        for what, key, value in bare:
+            claim(what, key, value, any_subnet=True)
         if problems:
             raise PermanentStepError("; ".join(problems))
         return out

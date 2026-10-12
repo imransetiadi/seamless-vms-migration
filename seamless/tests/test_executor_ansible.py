@@ -101,7 +101,7 @@ class FakeImpl:
             raise ProviderError("networks: HTTP 503")
         return DestinationInventory(
             network_details=list(self.registry.networks),
-            subnets=[dst_subnet(n) for n in self.registry.networks],
+            subnets=[dst_subnet(n) for n in self.registry.networks] + self.registry.subnets,
         )
 
 
@@ -135,6 +135,8 @@ class FakeRegistry:
         self.existing = set(existing)
         # the credential's own networks the tests send ports to (SDD §7.2)
         self.networks = [dst_net(n) for n in ("rhoso-app", "rhoso-dmz", "app-net", "dc2-prod")]
+        # more subnets, after each network's one
+        self.subnets: list[dict] = []
         self.inventory_error = False
 
     def get(self, provider):
@@ -904,6 +906,61 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
         [std], error=TransientStepError
     )
     assert rec.downtime_marks == 1
+
+
+@pytest.mark.parametrize("bare_first", [True, False])
+async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_needs(
+    env, bare_first
+):
+    """SDD §7.2: the kit gives every NIC of one key one value. A NIC with no IPv4 address needs no
+    particular subnet, so it takes the one another NIC of its key needs, in either order; the run
+    stops before the kit only when NICs of the key need different values (review RT-06)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    env.registry.subnets.append({**dst_subnet(net, "10.1.0.0/24"), "id": "sub-b", "name": "b"})
+    bare = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:01",
+        fixed_ips=["fe80::1"],
+        network_key="dvportgroup-7",
+    )
+    in_b = Nic(
+        network="app-net",
+        mac="00:50:56:00:00:02",
+        fixed_ips=["10.1.0.5"],
+        network_key="dvportgroup-7",
+    )
+    nics = [bare, in_b] if bare_first else [in_b, bare]
+    # app-net unmapped: the RHOSO network of that name takes it
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+    ctx, _ = ctx_for(env, nics=nics, **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {"dvportgroup-7": f"{net['id']},sub-b"}
+
+    async def refused(nics):
+        ran = len(read_log(env.log))
+        c, r = ctx_for(env, name="db-01", nics=nics, **kit)
+        with pytest.raises(PermanentStepError) as exc:
+            await env.executor.run(StepName.CUTOVER, c)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and r.downtime_marks == 0
+        return str(exc.value)
+
+    # two addresses of one key in different subnets: the kit's one value cannot take both
+    in_a = in_b.model_copy(update={"mac": "00:50:56:00:00:03", "fixed_ips": ["10.0.0.5"]})
+    assert await refused([in_a, in_b] if bare_first else [in_b, in_a]) == (
+        "the NIC 00:50:56:00:00:02 of db-01 shares the migration kit's key 'dvportgroup-7' with "
+        f"another NIC that goes to {net['id']},sub-{net['id']}, not {net['id']},sub-b"
+        if bare_first
+        else "the NIC 00:50:56:00:00:03 of db-01 shares the migration kit's key 'dvportgroup-7' "
+        f"with another NIC that goes to {net['id']},sub-b, not {net['id']},sub-{net['id']}"
+    )
+    # a NIC with no IPv4 address on another network of the key: no subnet of app-net suits it
+    elsewhere = bare.model_copy(update={"network": "rhoso-dmz"})
+    dmz = next(n for n in env.registry.networks if n["name"] == "rhoso-dmz")
+    assert await refused([elsewhere, in_b] if bare_first else [in_b, elsewhere]) == (
+        "the NIC 00:50:56:00:00:01 of db-01 shares the migration kit's key 'dvportgroup-7' with "
+        f"another NIC that goes to {net['id']},sub-b, not {dmz['id']},sub-{dmz['id']}"
+    )
 
 
 async def test_vmware_warm_flags(env):
