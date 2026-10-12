@@ -10,7 +10,18 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
-from seamless_migrate.domain.models import Estimate, Migration, Plan, Provider, SyncPass, utcnow
+from seamless_migrate.domain.models import (
+    Approval,
+    Estimate,
+    Finding,
+    ForceCutover,
+    Migration,
+    PhaseChange,
+    Plan,
+    Provider,
+    SyncPass,
+    utcnow,
+)
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
@@ -822,6 +833,112 @@ def seed_migrations(store: Store) -> dict[str, Migration]:
         store.put("migration", m)
         out[key] = m
     return out
+
+
+SUMMARY_FIELDS = {
+    "id",
+    "plan_id",
+    "wave_id",
+    "vm",
+    "strategy",
+    "phase",
+    "phase_since",
+    "progress_pct",
+    "downtime_started_at",
+    "downtime_ended_at",
+    "approvals",
+    "cutover_requested",
+    "cutover_requested_by",
+    "force_cutover",
+    "force_window",
+    "advisor_hold",
+    "review_required",
+    "review_reason",
+    "error",
+    "source_running_at",
+    "findings",
+    "created_at",
+    "updated_at",
+}
+
+
+def test_a_summary_list_holds_the_fields_the_overview_reads(api):
+    """SDD §4, §12 GET /migrations?view=summary (perf audit PF-02): each migration as a
+    MigrationSummary - its list fields as the full list has them, phase_since the last
+    PhaseChange's time (created_at without one) - in the same order, filtered and paged alike."""
+    from datetime import timedelta
+
+    migs = seed_migrations(api.store)
+    awaiting = migs["awaiting"]
+    at = utcnow()
+    awaiting.phase_history = [
+        PhaseChange(
+            from_phase=None,
+            to_phase=Phase.pending,
+            at=at - timedelta(hours=3),
+            reason="created by validation",
+            actor="alice",
+        ),
+        PhaseChange(
+            from_phase=Phase.syncing,
+            to_phase=Phase.awaiting_cutover,
+            at=at,
+            reason="converged",
+            actor="system",
+        ),
+    ]
+    awaiting.approvals = [Approval(actor="rina", at=at, comment="checked")]
+    awaiting.cutover_requested, awaiting.cutover_requested_by = True, "bayu"
+    # every field told apart from the others, so a summary field copied from a wrong one shows
+    awaiting.vm = awaiting.vm.model_copy(update={"name": "db-awaiting"})
+    awaiting.wave_id, awaiting.progress_pct = "wave-0000beef", 42.5
+    awaiting.advisor_hold = "rec-000000000077"
+    awaiting.force_cutover = ForceCutover(
+        actor="dewi", at=at, reason="the window closes", delta_bytes=7, estimated_downtime_s=60.0
+    )
+    awaiting.findings = [Finding(code="SRC_VM_MULTIATTACH", severity="warning", message="x")]
+    awaiting.updated_at = at + timedelta(minutes=5)
+    api.store.put("migration", awaiting)
+    completed = migs["completed"]
+    completed.downtime_ended_at = completed.downtime_started_at + timedelta(minutes=9)
+    completed.source_running_at = at + timedelta(minutes=1)
+    api.store.put("migration", completed)
+    ready, failed = migs["ready"], migs["failed"]
+    ready.force_window = True
+    api.store.put("migration", ready)
+    failed.review_required, failed.review_reason = True, "a database VM without a probe"
+    api.store.put("migration", failed)
+
+    full = api.get("/api/v1/migrations").json()
+    listed = api.get("/api/v1/migrations", params={"view": "summary"})
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()
+    assert [r["id"] for r in rows] == [m["id"] for m in full]
+    for row, m in zip(rows, full, strict=True):
+        assert set(row) == SUMMARY_FIELDS, row["id"]
+        assert row["vm"] == {"source_id": m["vm"]["source_id"], "name": m["vm"]["name"]}
+        for field in SUMMARY_FIELDS - {"vm", "phase_since"}:
+            assert row[field] == m[field], (row["id"], field)
+        since = m["phase_history"][-1]["at"] if m["phase_history"] else m["created_at"]
+        assert row["phase_since"] == since, row["id"]
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[awaiting.id]["approvals"][0]["actor"] == "rina"
+    assert by_id[awaiting.id]["phase_since"] != by_id[awaiting.id]["created_at"]
+    # a third of the bytes or less, even for these small seeded migrations
+    assert len(listed.content) * 3 <= len(api.get("/api/v1/migrations").content)
+    # the full list stays the default; filters and pages apply to summaries too
+    assert api.get("/api/v1/migrations", params={"view": "full"}).json() == full
+    plan_id = awaiting.plan_id
+    assert [
+        r["id"]
+        for r in api.get(
+            "/api/v1/migrations",
+            params={"view": "summary", "plan_id": plan_id, "phase": "awaiting_cutover"},
+        ).json()
+    ] == [awaiting.id]
+    paged = api.get("/api/v1/migrations", params={"view": "summary", "limit": 2, "offset": 1})
+    assert [r["id"] for r in paged.json()] == [m["id"] for m in full[1:3]]
+    assert api.get("/api/v1/migrations", params={"view": "everything"}).status_code == 422
 
 
 def test_migration_actions_transitions(api):

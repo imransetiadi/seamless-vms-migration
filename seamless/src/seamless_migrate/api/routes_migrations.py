@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import TypeAdapter
 
 from ..domain.enums import Phase, Role
-from ..domain.models import Migration
+from ..domain.models import Migration, MigrationSummary
 from ..security.auth import Principal
 from .deps import require_role, services
 from .schemas import (
@@ -26,9 +26,10 @@ router = APIRouter(tags=["migrations"])
 #: the list as JSON in one pass: the store has validated each migration already, and a response
 #: model would dump, validate and serialize all of them again (44 ms against 21 ms per 1,000)
 _MIGRATION_LIST = TypeAdapter(list[Migration])
+_SUMMARY_LIST = TypeAdapter(list[MigrationSummary])
 
 
-@router.get("/migrations", response_model=list[Migration])
+@router.get("/migrations", response_model=list[Migration] | list[MigrationSummary])
 async def list_migrations(
     request: Request,
     plan_id: str | None = Query(default=None),
@@ -36,9 +37,11 @@ async def list_migrations(
     wave_id: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=5000),
     offset: int = Query(default=0, ge=0, le=2**63 - 1),
+    view: Literal["full", "summary"] = Query(default="full"),
     _: Principal = Depends(require_role(Role.viewer)),
 ) -> Response:
-    """Migrations in creation order; ``limit``/``offset`` page large plans (SDD §12).
+    """Migrations in creation order; ``limit``/``offset`` page large plans, ``view=summary`` gives
+    each as its MigrationSummary, the Overview's list fields (SDD §4, §12).
     ``response_model`` documents the body; the list is serialized once here."""
     filters: dict[str, Any] = {}
     if plan_id is not None:
@@ -50,6 +53,9 @@ async def list_migrations(
     rows = await services(request).db.list(
         "migration", Migration, limit=limit, offset=offset, **filters
     )
+    if view == "summary":
+        summaries = [MigrationSummary.of(m) for m in rows]
+        return Response(_SUMMARY_LIST.dump_json(summaries), media_type="application/json")
     return Response(_MIGRATION_LIST.dump_json(rows), media_type="application/json")
 
 
