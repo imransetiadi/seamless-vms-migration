@@ -238,6 +238,42 @@ describe('migrationActions rules', () => {
     expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
   });
 
+  const REFUSAL = "the NIC 00:50:56:40:d5:b3 of dc2-portal-02 on 'dc2-prod': port demo-port-1 holds 10.2.0.32";
+
+  it('says to fix what the cutover will refuse, then sync, while the migration waits for its cutover (SDD §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: false };
+    const fixFirst = {
+      text: 'Converged, but the cutover will refuse what the last pass found. Next: fix it, then sync so a pass looks again (operator); keep-warm syncs look too.',
+      action: 'sync',
+    };
+    expect(nextStep(migration('awaiting_cutover', { cutover_refusals: [REFUSAL] }), plan)).toEqual(fixFirst);
+    // requested or not: the requested cutover would refuse it as well (requesting stays possible)
+    const requested = migration('awaiting_cutover', { cutover_refusals: [REFUSAL], cutover_requested: true, cutover_requested_by: 'sari', approvals: [] });
+    expect(nextStep(requested, { ...plan, require_approval: true, require_distinct_approver: true })).toEqual(fixFirst);
+    // once a pass finds none, the cutover is next again
+    expect(nextStep(migration('awaiting_cutover', { cutover_refusals: [] }), plan).action).toBe('cutover');
+    // while the passes run, the next pass looks again by itself
+    expect(nextStep(migration('syncing', { cutover_refusals: [REFUSAL] }), plan).text).toBe('Delta passes run until the change rate converges.');
+  });
+
+  it("says a cutover failed on what it refused, and that the retry's pass looks again (SDD §16)", () => {
+    const refused = migration('failed', { cutover_refusals: [REFUSAL], error: `cutover: ${REFUSAL}` });
+    expect(nextStep(refused, null)).toEqual({
+      text: "Failed: the cutover refused what the passes found, before the source stopped. Next: fix it, then retry — the retry's pass looks again — or cancel.",
+      action: 'retry',
+    });
+    // another step's failure keeps its own next step, whatever the passes found, and so does a cutover that
+    // failed on something the passes did not find
+    expect(nextStep(migration('failed', { cutover_refusals: [REFUSAL], error: 'sync: the NBD export closed' }), null).text).toBe(
+      'Failed. Next: fix the cause and retry, or cancel.',
+    );
+    expect(nextStep(migration('failed', { cutover_refusals: [], error: 'cutover: a server named app-billing-01 exists' }), null).text).toBe(
+      'Failed. Next: fix the cause and retry, or cancel.',
+    );
+    // after the source stopped, rolling back comes first, as before
+    expect(nextStep(migration('failed', { cutover_refusals: [REFUSAL], error: `cutover: ${REFUSAL}`, downtime_started_at: '2026-10-08T11:00:00Z' }), null).action).toBe('rollback');
+  });
+
   it('offers Force cutover to an approver while the passes of a warm migration run, and says why elsewhere (SDD §5.4, ADV-16)', () => {
     expect(migrationActions(migration('syncing'), 'approver')['force-cutover']).toEqual({ enabled: true, reason: null });
     expect(migrationActions(migration('precopy'), 'approver')['force-cutover'].enabled).toBe(true);

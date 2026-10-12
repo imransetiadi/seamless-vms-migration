@@ -204,6 +204,13 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
         ? { text: 'Pre-copy is running while the source VM keeps running.', action: null }
         : { text: 'Delta passes run until the change rate converges.', action: null };
     case 'awaiting_cutover':
+      if (m.cutover_refusals.length > 0) {
+        // SDD §16: the next step agrees with the warning - requested or not, the cutover would refuse them
+        return {
+          text: 'Converged, but the cutover will refuse what the last pass found. Next: fix it, then sync so a pass looks again (operator); keep-warm syncs look too.',
+          action: 'sync',
+        };
+      }
       // a request stored before ADV-17 names nobody: the wait is the gate's, as before
       if (m.cutover_requested && m.cutover_requested_by && fourEyes(plan) && countedApprovals(m, plan).length === 0) {
         return { text: `Cutover requested by ${m.cutover_requested_by}. Next: another approver approves it; keep-warm syncs run meanwhile.`, action: 'approve' };
@@ -244,9 +251,17 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'finalized':
       return { text: 'Finalized. The migration is done.', action: null };
     case 'failed':
-      return m.downtime_started_at && !m.downtime_ended_at
-        ? { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' }
-        : { text: 'Failed. Next: fix the cause and retry, or cancel.', action: 'retry' };
+      if (m.downtime_started_at && !m.downtime_ended_at) {
+        return { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' };
+      }
+      if (m.cutover_refusals.length > 0 && m.error?.startsWith('cutover: ')) {
+        // SDD §16: the cutover's check refused what the passes found, before the source stopped
+        return {
+          text: "Failed: the cutover refused what the passes found, before the source stopped. Next: fix it, then retry — the retry's pass looks again — or cancel.",
+          action: 'retry',
+        };
+      }
+      return { text: 'Failed. Next: fix the cause and retry, or cancel.', action: 'retry' };
     case 'rolling_back':
       return { text: 'Rolling back: removing the destination VM and restarting the source.', action: null };
     case 'rolled_back':
