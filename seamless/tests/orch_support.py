@@ -248,6 +248,16 @@ class Harness:
                 raise AssertionError(f"plan {plan_id} is {plan.status}, wanted {status}")
             await asyncio.sleep(0.01)
 
+    async def wait_kind(self, kind: str, count: int = 1, timeout: float = 10.0) -> None:
+        """Until the trail holds ``count`` events of ``kind``. A state is written before its event
+        (the plan's completion: its status, then ``plan.completed``, SDD §8), so a test that counts
+        events waits for them - stopping on the state alone cancels the event still to come."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while (seen := self.kinds().count(kind)) < count:
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError(f"{seen} {kind} events, wanted {count}")
+            await asyncio.sleep(0.01)
+
     def kinds(self) -> list[str]:
         return [e.kind for e in self.store.events(since_seq=0, limit=100000)]
 

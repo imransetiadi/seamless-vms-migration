@@ -817,6 +817,7 @@ async def test_a_retry_reopens_a_plan_its_rollback_completed(tmp_path, store):
     assert (await h.plan(plan.id)).status == PlanStatus.running, "the retry reopens the plan"
     m = await h.wait_phase(mid, P.completed)
     await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.wait_kind("plan.completed", 2)
     await h.orch.stop()
     assert len(tries) == 2 and m.attempts == 1
     reopened = [
@@ -864,6 +865,7 @@ async def test_a_retry_after_the_ticks_snapshot_keeps_the_plan_running(tmp_path,
     await h.orch.start()
     m = await h.wait_phase(mid, P.completed)
     await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.wait_kind("plan.completed")
     await h.orch.stop()
     assert retried and retried[0].phase == P.ready
     assert len(tries) == 2 and m.attempts == 1
@@ -970,6 +972,7 @@ async def test_a_retry_during_the_plans_completion_reopens_it(tmp_path, store):
     await h.orch.start()
     m = await h.wait_phase(mid, P.completed)
     await h.wait_plan(plan.id, PlanStatus.completed)
+    await h.wait_kind("plan.completed", 2)
     await h.orch.stop()
     assert retries and (await retries[0]).phase == P.ready
     assert len(tries) == 2 and m.attempts == 1
