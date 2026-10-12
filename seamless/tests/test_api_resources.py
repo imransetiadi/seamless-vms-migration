@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
 from seamless_migrate.domain.models import (
+    AppProbe,
     Approval,
     Estimate,
     Finding,
@@ -843,7 +844,11 @@ SUMMARY_FIELDS = {
     "strategy",
     "phase",
     "phase_since",
+    "preflight_ran",
+    "eligible_strategies",
     "progress_pct",
+    "estimate",
+    "actual_downtime_s",
     "downtime_started_at",
     "downtime_ended_at",
     "approvals",
@@ -857,6 +862,7 @@ SUMMARY_FIELDS = {
     "error",
     "source_running_at",
     "findings",
+    "suggested_probes",
     "created_at",
     "updated_at",
 }
@@ -890,7 +896,20 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api):
     awaiting.approvals = [Approval(actor="rina", at=at, comment="checked")]
     awaiting.cutover_requested, awaiting.cutover_requested_by = True, "bayu"
     # every field told apart from the others, so a summary field copied from a wrong one shows
-    awaiting.vm = awaiting.vm.model_copy(update={"name": "db-awaiting"})
+    awaiting.vm = awaiting.vm.model_copy(update={"name": "db-awaiting", "project": "finance"})
+    awaiting.phase_history.insert(
+        1,
+        PhaseChange(
+            from_phase=Phase.validating,
+            to_phase=Phase.ready,
+            at=at - timedelta(hours=2),
+            reason="pre-flight passed",
+            actor="alice",
+        ),
+    )
+    awaiting.actual_downtime_s = 33.0
+    awaiting.estimate = awaiting.estimates[1]
+    awaiting.suggested_probes = [AppProbe(kind="tcp", port=5432)]
     awaiting.wave_id, awaiting.progress_pct = "wave-0000beef", 42.5
     awaiting.advisor_hold = "rec-000000000077"
     awaiting.force_cutover = ForceCutover(
@@ -905,8 +924,19 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api):
     api.store.put("migration", completed)
     ready, failed = migs["ready"], migs["failed"]
     ready.force_window = True
+
+    def change(src, dst, reason):
+        return PhaseChange(from_phase=src, to_phase=dst, at=at, reason=reason, actor="alice")
+
+    # a history that never reached an assessment, and one that reached it as blocked only
+    ready.phase_history = [change(None, Phase.pending, "created by validation")]
     api.store.put("migration", ready)
     failed.review_required, failed.review_reason = True, "a database VM without a probe"
+    failed.phase_history = [
+        change(None, Phase.pending, "created by validation"),
+        change(Phase.pending, Phase.validating, "pre-flight validation"),
+        change(Phase.validating, Phase.blocked, "blocked by VM_VGPU"),
+    ]
     api.store.put("migration", failed)
 
     full = api.get("/api/v1/migrations").json()
@@ -916,16 +946,31 @@ def test_a_summary_list_holds_the_fields_the_overview_reads(api):
     assert [r["id"] for r in rows] == [m["id"] for m in full]
     for row, m in zip(rows, full, strict=True):
         assert set(row) == SUMMARY_FIELDS, row["id"]
-        assert row["vm"] == {"source_id": m["vm"]["source_id"], "name": m["vm"]["name"]}
-        for field in SUMMARY_FIELDS - {"vm", "phase_since"}:
+        assert row["vm"] == {
+            "source_id": m["vm"]["source_id"],
+            "name": m["vm"]["name"],
+            "project": m["vm"]["project"],
+        }
+        derived = {"vm", "phase_since", "preflight_ran", "eligible_strategies"}
+        for field in SUMMARY_FIELDS - derived:
             assert row[field] == m[field], (row["id"], field)
         since = m["phase_history"][-1]["at"] if m["phase_history"] else m["created_at"]
         assert row["phase_since"] == since, row["id"]
+        assessed = any(c["to_phase"] in ("ready", "blocked") for c in m["phase_history"])
+        assert row["preflight_ran"] is assessed, row["id"]
+        eligible = [e["strategy"] for e in m["estimates"] if e["eligible"]]
+        assert row["eligible_strategies"] == eligible, row["id"]
     by_id = {r["id"]: r for r in rows}
     assert by_id[awaiting.id]["approvals"][0]["actor"] == "rina"
     assert by_id[awaiting.id]["phase_since"] != by_id[awaiting.id]["created_at"]
-    # a third of the bytes or less, even for these small seeded migrations
-    assert len(listed.content) * 3 <= len(api.get("/api/v1/migrations").content)
+    assert by_id[awaiting.id]["preflight_ran"] is True
+    assert by_id[migs["ready"].id]["preflight_ran"] is False
+    assert by_id[migs["failed"].id]["preflight_ran"] is True
+    assert by_id[migs["completed"].id]["preflight_ran"] is False  # seeded without a history
+    assert by_id[awaiting.id]["eligible_strategies"] == ["cold", "warm"]
+    # under half the bytes even for these small seeded migrations (a real one is mostly history,
+    # VM details, notes, estimates and passes)
+    assert len(listed.content) * 2 < len(api.get("/api/v1/migrations").content)
     # the full list stays the default; filters and pages apply to summaries too
     assert api.get("/api/v1/migrations", params={"view": "full"}).json() == full
     plan_id = awaiting.plan_id

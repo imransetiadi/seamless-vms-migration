@@ -854,17 +854,19 @@ class Migration(_Model):
 
 
 class SummaryVM(_Model):
-    """The VM of a migration summary: which one, by id and name (SDD §4)."""
+    """The VM of a migration summary: which one, by id and name, and its project (SDD §4)."""
 
     source_id: str
     name: str
+    project: str | None
 
 
 class MigrationSummary(_Model):
-    """A migration's fields that the Overview's lists read, as the Migration has them (SDD §4,
-    ``GET /migrations?view=summary``): no passes, estimates, notes, history or VM details.
-    ``phase_since`` is the last PhaseChange's time, when the phase it is in began, else the
-    creation time."""
+    """A migration's fields that the Overview's and the plan page's lists read, as the Migration has
+    them (SDD §4, ``GET /migrations?view=summary``): no passes, all the estimates, notes, history or
+    VM details. ``phase_since`` is the last PhaseChange's time, when the phase it is in began, else
+    the creation time; ``preflight_ran`` whether the history reaches ready or blocked;
+    ``eligible_strategies`` the estimates' eligible strategies, in their order."""
 
     id: str
     plan_id: str
@@ -873,7 +875,11 @@ class MigrationSummary(_Model):
     strategy: Strategy
     phase: Phase
     phase_since: UTCDateTime
+    preflight_ran: bool
+    eligible_strategies: list[Strategy]
     progress_pct: float
+    estimate: Estimate | None
+    actual_downtime_s: float | None
     downtime_started_at: UTCDateTime | None
     downtime_ended_at: UTCDateTime | None
     approvals: list[Approval]
@@ -887,6 +893,7 @@ class MigrationSummary(_Model):
     error: str | None
     source_running_at: UTCDateTime | None
     findings: list[Finding]
+    suggested_probes: list[AppProbe]
     created_at: UTCDateTime
     updated_at: UTCDateTime
 
@@ -896,11 +903,15 @@ class MigrationSummary(_Model):
             id=m.id,
             plan_id=m.plan_id,
             wave_id=m.wave_id,
-            vm=SummaryVM(source_id=m.vm.source_id, name=m.vm.name),
+            vm=SummaryVM(source_id=m.vm.source_id, name=m.vm.name, project=m.vm.project),
             strategy=m.strategy,
             phase=m.phase,
             phase_since=m.phase_history[-1].at if m.phase_history else m.created_at,
+            preflight_ran=any(c.to_phase in (Phase.ready, Phase.blocked) for c in m.phase_history),
+            eligible_strategies=[e.strategy for e in m.estimates if e.eligible],
             progress_pct=m.progress_pct,
+            estimate=m.estimate,
+            actual_downtime_s=m.actual_downtime_s,
             downtime_started_at=m.downtime_started_at,
             downtime_ended_at=m.downtime_ended_at,
             approvals=m.approvals,
@@ -914,6 +925,7 @@ class MigrationSummary(_Model):
             error=m.error,
             source_running_at=m.source_running_at,
             findings=m.findings,
+            suggested_probes=m.suggested_probes,
             created_at=m.created_at,
             updated_at=m.updated_at,
         )
