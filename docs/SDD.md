@@ -2388,7 +2388,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cutover, §5.4),
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
-  (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
+  (§5.4: that plan and the phase, from the migrations as summaries, read while the form is open), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
   with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
@@ -2426,13 +2426,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   own included) — is marked "not allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
-  edited. A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
+  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
   migration kit keeps the guest's network settings; its rows name the RHOSO network each NIC's port group goes
   to (the plan's mapping, else the same name, §7.2) with the guest's addresses, and a VMware VM that still has
   entries offers "Remove the overrides" (the same plan edit) —, a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
-  plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
+  plan edit, §12, gated like the Network panel's) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
   Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — those available now
   first, the next step's action first and primary, then the unavailable ones in a quieter, smaller row under
