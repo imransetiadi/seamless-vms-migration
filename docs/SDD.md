@@ -2544,7 +2544,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases.
   While the page is hidden (`document.visibilityState` `hidden`, a background tab) the batch waits: what its events
   would refresh or read again is refreshed once, as one batch, when the page is shown again; progress still patches
-  the cached figures in place. A batch that would read more than 50 migrations one by one - a long-hidden page in a
+  the cached figures in place. The window regaining focus reads again what the page shows that was read more than
+  5 s before, except what the open stream keeps fresh - the migration lists and pages, the plans, the figures, the
+  providers, the advisor's recommendations, notes and policies, the event lists: each of their changes comes as an
+  event, so a page shown again reads what its held events ask for, and a list whose changes the stream brought is not
+  read again (NFR-03). One of them whose last read failed is read again on focus, as they all are while the stream is
+  not open; what the stream does not keep (the signed-in user, the health, a provider's inventory, the advisor's
+  status and data sent) is read again on focus as before. A batch that would read more than 50 migrations one by one - a long-hidden page in a
   busy wave - refreshes the cached migration lists and pages instead: one read per list costs less than so many. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
