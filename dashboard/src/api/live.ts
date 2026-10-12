@@ -99,6 +99,15 @@ export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveSt
 }
 
 /**
+ * One flush: the queries it reads again (by hash), those a splice left to that read while it ran, and when it began.
+ */
+interface Batch {
+  refreshed: Set<string>;
+  relied: Set<string>;
+  at: number;
+}
+
+/**
  * Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. With `fetchMigration`,
  * `refreshMigration(id)` reads that one migration once per flush and puts it into the cached lists that hold it
  * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise.
@@ -113,7 +122,7 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
     pending.set(JSON.stringify(queryKey), queryKey);
     timer ??= setTimeout(flush, delayMs);
   };
-  const splice = async (id: string, read: (id: string) => Promise<Migration>) => {
+  const splice = async (id: string, read: (id: string) => Promise<Migration>, batch: Batch) => {
     let fresh: Migration;
     try {
       // read outside the migration's own query: one failed read never puts a loaded migration page into a failure;
@@ -127,6 +136,16 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
     if (disposed) return;
     queryClient.setQueryData<Migration>(['migration', id], fresh);
     for (const query of queryClient.getQueryCache().findAll({ queryKey: ['migrations'] })) {
+      // the same batch reads it again, after its events (SDD §16): that read shows them while it runs - should it
+      // fail, the list is read once more - and once it succeeded; a list it failed to read is treated as before
+      if (batch.refreshed.has(query.queryHash)) {
+        const { fetchStatus, dataUpdatedAt, errorUpdatedAt } = query.state;
+        if (fetchStatus === 'fetching') {
+          batch.relied.add(query.queryHash);
+          continue;
+        }
+        if (dataUpdatedAt >= batch.at && errorUpdatedAt < batch.at) continue;
+      }
       const list = query.state.data as Migration[] | undefined;
       // no data yet - its load failed, or the first one is under way: read it again, as before the splice (SDD §16)
       if (list === undefined) {
@@ -144,12 +163,15 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
   };
   const flush = () => {
     timer = null;
+    // the queries this batch reads again (the active ones invalidateQueries refetches), filled below before any splice
+    // reaches the lists - each awaits its read first
+    const batch: Batch = { refreshed: new Set(), relied: new Set(), at: Date.now() };
     const ids = [...migrations];
     migrations.clear();
     for (const id of ids) {
       // a read of it under way may have started before the event: it waits for the next batch
       if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
-      else if (fetchMigration) void splice(id, fetchMigration);
+      else if (fetchMigration) void splice(id, fetchMigration, batch);
     }
     const keys = [...pending.entries()];
     pending.clear();
@@ -158,7 +180,13 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
       // nor trusted to show this event, which may have come after its request: the key waits for the next batch,
       // and is refreshed once the running request is done (SDD §16)
       if (queryClient.isFetching({ queryKey }) > 0) pending.set(id, queryKey);
-      else void queryClient.invalidateQueries({ queryKey });
+      else {
+        const queries = queryClient.getQueryCache().findAll({ queryKey, type: 'active' });
+        for (const query of queries) batch.refreshed.add(query.queryHash);
+        void queryClient.invalidateQueries({ queryKey }).then(() => {
+          for (const query of queries) if (batch.relied.has(query.queryHash) && query.state.status === 'error') invalidate(query.queryKey);
+        });
+      }
     }
     if (pending.size > 0 || migrations.size > 0) timer ??= setTimeout(flush, delayMs);
   };
@@ -246,11 +274,13 @@ export function applyEventToCache(
     }
     return;
   }
-  if (kind.startsWith('migration.') || kind.startsWith('advisor.') || kind === 'memory.lesson_saved') {
+  // not memory.lesson_saved: a lesson changes no migration, list or figure, and the Events page and the timeline take
+  // it from the stream (SDD §16)
+  if (kind.startsWith('migration.') || kind.startsWith('advisor.')) {
     // advisor.strategy announces a recorded recommendation (SDD §14.4)
     if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);
     // one migration that exists already: read it alone and put it into the lists (SDD §16)
-    const one = kind !== 'migration.created' && kind !== 'memory.lesson_saved' ? event.migration_id : null;
+    const one = kind !== 'migration.created' ? event.migration_id : null;
     if (one && refreshMigration) refreshMigration(one);
     else {
       invalidate(['migrations']);
