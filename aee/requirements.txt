@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 # os-migrate fork = openstacksdk 4.5.0 + the merged owner_seen fix
 # (resource: Fix re-entrant alias resolution, Closes-Bug #2046838 ->
 # https://bugs.launchpad.net/openstacksdk/+bug/2046838), which is not yet in any

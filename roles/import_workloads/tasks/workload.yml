@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Import a workload
   block:
     - name: Preliminary setup for workload import

@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 # pylint: disable=consider-using-with
 from __future__ import absolute_import, division, print_function
 

@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 OS_MIGRATE_VERSION = "1.1.0"  # updated by build.sh
 
 # Main serialization sections

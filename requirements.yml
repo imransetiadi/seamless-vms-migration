@@ -1,4 +1,5 @@
 ---
+# Modified by the Seamless Migrate project, 2026.
 # Collections the Seamless Migrate control-plane image installs next to os_migrate.os_migrate
 # (seamless/Containerfile). The VMware migration kit is pinned: the Ansible executor
 # (seamless/src/seamless_migrate/executors/ansible.py, build_vars) hard-codes its variables

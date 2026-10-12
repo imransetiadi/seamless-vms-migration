@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 from __future__ import absolute_import, division, print_function
 

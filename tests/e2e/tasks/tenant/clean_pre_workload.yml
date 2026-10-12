@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Remove pre-workload test data
   ansible.builtin.file:
     path: "{{ os_migrate_data_dir }}/{{ item }}"

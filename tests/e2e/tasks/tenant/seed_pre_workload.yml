@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: create osm_net
   os_migrate.os_migrate.network:
     auth: "{{ item.auth }}"

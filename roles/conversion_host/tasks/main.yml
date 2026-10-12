@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Generate os_migrate conversion keypair
   ansible.builtin.include_tasks: generate_keypair.yml
   when: os_migrate_conversion_keypair_generate | bool

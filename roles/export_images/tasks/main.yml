@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 # NOTE: os_image_info doesn't support os_migrate_src_filters, we apply
 # the filters manually below.
 - name: Scan available images
