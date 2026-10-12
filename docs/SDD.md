@@ -1610,11 +1610,13 @@ lazy; reports CBT, snapshots, independent disks, tools state; `os_type` is the V
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
-12 VMware VMs with mixed CBT/snapshot/independent-disk states; a RHOSO destination with networks,
-flavors, volume types and quotas). `providers.registry.build(provider, settings)` returns the right
-implementation (fake when `settings.demo`). The demo seeds two running plans: the finance plan takes
-22 of the 24 OpenStack VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them
-(one VM, one migration across plans, §5.4) — and the VMware plan all 12 VMware VMs.
+13 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
+`demo-fault: cutover-refusal` (§7.4); a RHOSO destination with networks, flavors, volume types and
+quotas). `providers.registry.build(provider, settings)` returns the right implementation (fake when
+`settings.demo`). The demo seeds two running plans: the finance plan takes 22 of the 24 OpenStack
+VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
+across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
+for the operator to plan warm (§7.4).
 
 ---
 
