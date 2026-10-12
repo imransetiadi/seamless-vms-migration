@@ -1354,6 +1354,34 @@ async def test_a_warm_pass_that_meets_none_empties_the_cutover_refusals(
     assert seen == [["port p2 on network 'gone' does not resolve"], [], []]
 
 
+async def test_the_demo_fault_refuses_the_cutover_before_the_stop_until_a_pass_finds_it_fixed(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.4: through the orchestrator, the simulator's `demo-fault: cutover-refusal` - its
+    first two passes record what the cutover will refuse (§7.2), the cutover after them fails
+    before the source stops (no downtime, no rollback), and the retry's pass finds it fixed: the
+    list empties and the migration completes."""
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    nic = Nic(network="app-net", mac="00:50:56:00:00:01", mtu=1500, fixed_ips=["10.0.0.1"])
+    tagged = vm(1, "dc2-portal-02", nics=[nic], tags={"demo-fault": "cutover-refusal"})
+    h, plan = await setup(
+        tmp_path, store, [tagged], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}
+    )
+    refusal = (
+        "the NIC 00:50:56:00:00:01 of dc2-portal-02 on 'app-net': port demo-port-1 holds 10.0.0.1"
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    refused = await h.wait_phase(mid, P.failed)
+    assert refused.downtime_started_at is None and refused.error == f"cutover: {refusal}"
+    assert refused.cutover_refusals == [refusal], "a refused cutover keeps the list"
+    await h.orch.retry(mid, "alice")
+    done = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert seen[:3] == [[refusal], [refusal], []] and all(s == [] for s in seen[3:])
+    assert done.cutover_refusals == [] and done.downtime_started_at is not None
+
+
 async def test_warm_flow_reaches_completed_with_downtime(tmp_path, store):
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}

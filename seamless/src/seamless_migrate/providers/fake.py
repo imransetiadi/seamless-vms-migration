@@ -178,9 +178,10 @@ class _VSpec:
     independent: bool = False
     tools_ok: bool = True
     rate_mib: float = 1.0
+    tags: tuple[tuple[str, str], ...] = ()
 
 
-# 12 VMware VMs of the "DC2" datacenter with mixed CBT/snapshot/independent-disk states.
+# 13 VMware VMs of the "DC2" datacenter with mixed CBT/snapshot/independent-disk states.
 _VMWARE: tuple[_VSpec, ...] = (
     _VSpec("dc2-web-01", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", rate_mib=0.5),
     _VSpec("dc2-web-02", 2, 4096, (40,), "rhel9_64Guest", network="DC2-DMZ", cbt=False),
@@ -194,6 +195,16 @@ _VMWARE: tuple[_VSpec, ...] = (
     _VSpec("dc2-file-01", 4, 8192, (60, 500), "windows8Server64Guest", independent=True),
     _VSpec("dc2-legacy-01", 2, 4096, (40,), "windows2008_64Guest", tools_ok=False, snapshots=1),
     _VSpec("dc2-ci-01", 4, 8192, (120,), "rockylinux_64Guest", cbt=False, rate_mib=4.0),
+    # no seeded plan holds it: planned warm, its first passes meet what the cutover will refuse
+    # (SDD §7.4)
+    _VSpec(
+        "dc2-portal-02",
+        2,
+        4096,
+        (40,),
+        "rhel9_64Guest",
+        tags=(("app", "portal"), ("demo-fault", "cutover-refusal")),
+    ),
 )
 
 
@@ -294,6 +305,7 @@ def _vmware_vm(spec: _VSpec, rng: random.Random, index: int) -> VMRef:
         snapshot_count=spec.snapshots,
         tools_ok=spec.tools_ok,
         change_rate_bps=round(spec.rate_mib * rng.uniform(0.8, 1.2) * MIB, 1),
+        tags=dict(spec.tags),
     )
 
 

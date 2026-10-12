@@ -4,6 +4,7 @@ import pytest
 
 from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole, Strategy, SyncPassKind
+from seamless_migrate.domain.models import Nic
 from seamless_migrate.executors.base import PermanentStepError, StepName
 from seamless_migrate.executors.simulated import SimulatedExecutor
 from seamless_migrate.planning.estimator import params_for_plan
@@ -45,6 +46,82 @@ async def test_simulated_warm_pass_deltas_shrink():
     assert passes[1].bytes_changed == pytest.approx(expected, rel=0.11)
     assert rec.progress and rec.progress[-1][0] == 100.0
     assert rec.downtime_marks == 0, "pre-copy never stops the source"
+
+
+#: in the VMware executor's words (SDD §7.2): another port holds the NIC's address
+REFUSAL = (
+    "the NIC 00:50:56:aa:bb:cc of dc2-portal-02 on 'DC2-Prod': port demo-port-1 holds 10.2.0.32"
+)
+
+
+def faulty(strategy=Strategy.vmware_warm, mid="mig-0000000009", fixed_ips=("10.2.0.32",)):
+    """A demo VM tagged `demo-fault: cutover-refusal` (SDD §7.4)."""
+    vm = make_vm(
+        name="dc2-portal-02",
+        tags={"demo-fault": "cutover-refusal"},
+        nics=[Nic(network="DC2-Prod", mac="00:50:56:aa:bb:cc", fixed_ips=list(fixed_ips))],
+        disks=[make_disk(size_gb=40, used_gb=10.0)],
+        change_rate_bps=2**20,
+    )
+    return make_migration(id=mid, strategy=strategy, vm=vm)
+
+
+@pytest.mark.parametrize("strategy", [Strategy.warm, Strategy.vmware_warm])
+async def test_a_demo_vm_tagged_for_it_meets_what_the_cutover_will_refuse_until_its_third_pass(
+    strategy,
+):
+    """SDD §7.4: its first two warm passes report one cutover refusal, the later ones none - the
+    demo's fix while the passes run; an untagged VM's passes learn nothing of the kind."""
+    ex = SimulatedExecutor(FAST)
+    m = faulty(strategy)
+    seen = []
+    for step in (StepName.PRECOPY, StepName.SYNC, StepName.SYNC, StepName.SYNC):
+        ctx, _ = make_ctx(make_plan(), m, SRC, DST, FAST)
+        result = await ex.run(step, ctx)
+        seen.append(result.cutover_refusals)
+        m.sync_passes.append(result.sync_pass)
+    assert seen == [[REFUSAL], [REFUSAL], [], []]
+    ctx, _ = make_ctx(make_plan(), mig(), SRC, DST, FAST)
+    assert (await ex.run(StepName.PRECOPY, ctx)).cutover_refusals is None
+
+
+async def test_its_refusal_names_the_network_the_plan_maps_its_nic_to():
+    """SDD §7.4, §7.2: as the executor words it - the RHOSO network the plan maps the NIC's port
+    group to. A tagged VM whose NIC holds no address meets nothing another port could hold."""
+    ex = SimulatedExecutor(FAST)
+    plan = make_plan(mappings={"networks": {"DC2-Prod": "rhoso-prod"}})
+    ctx, _ = make_ctx(plan, faulty(), SRC, DST, FAST)
+    assert (await ex.run(StepName.PRECOPY, ctx)).cutover_refusals == [
+        REFUSAL.replace("'DC2-Prod'", "'rhoso-prod'")
+    ]
+    ctx, _ = make_ctx(make_plan(), faulty(fixed_ips=()), SRC, DST, FAST)
+    assert (await ex.run(StepName.PRECOPY, ctx)).cutover_refusals is None
+    ctx, rec = make_ctx(make_plan(), faulty(fixed_ips=()), SRC, DST, FAST)
+    assert (await ex.run(StepName.CUTOVER, ctx)).destination_server_id
+    assert rec.downtime_marks == 1
+
+
+async def test_its_cutover_refuses_before_the_source_stops_until_its_third_pass_ran():
+    """SDD §7.4: like the destination check (§6.6), the cutover refuses before the source stops
+    while the problem lasts; after the third pass it cuts over. Migrated cold it is not refused."""
+    ex = SimulatedExecutor(FAST)
+    m = faulty()
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, _ = make_ctx(make_plan(), m, SRC, DST, FAST)
+        m.sync_passes.append((await ex.run(step, ctx)).sync_pass)
+    ctx, rec = make_ctx(make_plan(), m, SRC, DST, FAST)
+    with pytest.raises(PermanentStepError) as exc:
+        await ex.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == REFUSAL
+    assert rec.downtime_marks == 0
+    ctx, _ = make_ctx(make_plan(), m, SRC, DST, FAST)
+    m.sync_passes.append((await ex.run(StepName.SYNC, ctx)).sync_pass)
+    ctx, rec = make_ctx(make_plan(), m, SRC, DST, FAST)
+    result = await ex.run(StepName.CUTOVER, ctx)
+    assert rec.downtime_marks == 1 and result.destination_server_id
+    ctx, rec = make_ctx(make_plan(), faulty(Strategy.cold), SRC, DST, FAST)
+    assert (await ex.run(StepName.CUTOVER, ctx)).destination_server_id
+    assert rec.downtime_marks == 1
 
 
 async def test_simulated_cutover_marks_downtime():

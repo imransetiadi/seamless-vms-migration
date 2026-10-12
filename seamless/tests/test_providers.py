@@ -48,8 +48,11 @@ async def test_fake_openstack_inventory_has_required_traits():
 async def test_fake_vmware_mixed_cbt():
     src = FakeSourceProvider(ProviderKind.vmware, seed=42)
     vms = await src.list_vms()
-    assert len(vms) == 12
+    assert len(vms) == 13
     assert {v.cbt_enabled for v in vms} == {True, False}
+    # SDD §7.4: the demo VM whose warm passes meet what the cutover will refuse
+    faults = {v.name: v.tags.get("demo-fault") for v in vms if v.tags.get("demo-fault")}
+    assert faults == {"dc2-portal-02": "cutover-refusal"}
     assert any(v.snapshot_count > 0 for v in vms) and any(v.snapshot_count == 0 for v in vms)
     assert any(d.independent for v in vms for d in v.disks)
     assert any(v.tools_ok is False for v in vms)

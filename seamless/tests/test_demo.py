@@ -387,3 +387,24 @@ async def test_the_demo_keeps_finished_sources_stopped_and_flags_one_powered_on(
     others = [m for m in done[1:] if m.plan_id == plan.id]
     for m in others:
         assert (await source.get_vm(m.vm.source_id)).power_state == "stopped", m.vm.name
+
+
+async def test_the_cutover_refusal_demo_vm_is_left_for_the_operator_to_plan(tmp_path, store):
+    """SDD §7.4: dc2-portal-02 carries `demo-fault: cutover-refusal`, and no seeded plan holds it -
+    the seeded plans and the smoke run are unchanged; planned warm from the dashboard it shows
+    what the cutover will refuse."""
+    from seamless_migrate.demo import VMWARE_PLAN
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    await services.orchestrator.stop()
+    held = {vm_id for p in store.list("plan", Plan) for vm_id in p.vm_ids}
+    plans = {p.name: p for p in store.list("plan", Plan)}
+    inventory = await FakeSourceProvider(ProviderKind.vmware, settings.demo_seed).list_vms()
+    [portal] = [vm for vm in inventory if vm.name == "dc2-portal-02"]
+    assert portal.tags.get("demo-fault") == "cutover-refusal"
+    assert portal.source_id not in held
+    assert len(plans[VMWARE_PLAN].vm_ids) == len(inventory) - 1

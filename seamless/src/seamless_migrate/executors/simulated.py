@@ -14,8 +14,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..config import Settings
-from ..domain.enums import Strategy, SyncPassKind
-from ..domain.models import Plan, Provider, SyncPass, next_pass_number, utcnow
+from ..domain.enums import WARM_STRATEGIES, Strategy, SyncPassKind
+from ..domain.models import Migration, Plan, Provider, SyncPass, next_pass_number, utcnow
 from ..planning.estimator import VMWARE_PASS_OVERHEAD_S, params_for_plan
 from ..providers.base import ProviderError
 from .base import PermanentStepError, StepContext, StepName, StepResult
@@ -26,6 +26,28 @@ PROGRESS_TICK_WALL_S = 0.5
 MAX_PROGRESS_TICKS = 40
 #: model seconds a simulated rollback takes, the source starting again at its end
 ROLLBACK_MODEL_S = 90.0
+
+
+#: SDD §7.4: a VM tagged ``demo-fault: cutover-refusal`` migrated warm meets, on its first passes, a
+#: problem the cutover refuses before the source stops - fixed before its third pass
+CUTOVER_REFUSAL_FAULT = "cutover-refusal"
+REFUSING_PASSES = 2
+
+
+def _demo_refusal(m: Migration, plan: Plan) -> str | None:
+    """What the demo VM tagged for it meets on its warm passes, as the VMware executor words it
+    (SDD §7.4, §7.2): another port of the RHOSO network the plan maps its NIC to holds the NIC's
+    address. None for any other migration, and when no NIC holds an address."""
+    vm = m.vm
+    if vm.tags.get("demo-fault") != CUTOVER_REFUSAL_FAULT or m.strategy not in WARM_STRATEGIES:
+        return None
+    nic = next((n for n in vm.nics if n.fixed_ips), None)
+    if nic is None:  # nothing another port could hold
+        return None
+    network = plan.mappings.networks.get(nic.network, nic.network)
+    return (
+        f"the NIC {nic.mac} of {vm.name} on {network!r}: port demo-port-1 holds {nic.fixed_ips[0]}"
+    )
 
 
 class SimulatedExecutor:
@@ -137,7 +159,7 @@ class SimulatedExecutor:
         started = utcnow()
         await ctx.log(f"simulated {'full' if first else 'delta'} pass {number} started")
         await self._elapse(ctx, duration, int(changed))
-        return StepResult(
+        result = StepResult(
             sync_pass=SyncPass(
                 number=number,
                 kind=SyncPassKind.full if first else SyncPassKind.delta,
@@ -149,12 +171,22 @@ class SimulatedExecutor:
                 duration_s=duration,
             )
         )
+        refusal = _demo_refusal(ctx.migration, ctx.plan)
+        if refusal is not None:
+            # SDD §7.4: met on the first passes, fixed before the third
+            result.cutover_refusals = [refusal] if number <= REFUSING_PASSES else []
+        return result
 
     async def _cutover(self, ctx: StepContext) -> StepResult:
         m = ctx.migration
         vm = m.vm
         p = params_for_plan(ctx.plan)
         rng = self._rng(ctx, StepName.CUTOVER)
+        refusal = _demo_refusal(m, ctx.plan)
+        if refusal is not None and next_pass_number(m) <= REFUSING_PASSES + 1:
+            # SDD §7.4: like the destination check (§6.6), refused before the source stops while
+            # the problem lasts - the third pass finds it fixed
+            raise PermanentStepError(refusal)
         await ctx.log("simulated cutover: stopping the source VM")
         await self._elapse(ctx, p.shutdown_s, 0)
         await self._source_power(ctx, on=False)
