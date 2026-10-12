@@ -470,6 +470,8 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             {"id": "sub-provider", "network_id": "net-provider", "cidr": "10.0.0.0/24"},
             {"id": "sub-private-b", "network_id": "net-private-b", "cidr": "10.0.0.0/24"},
             {"id": "sub-ext", "network_id": "net-ext", "cidr": "10.0.0.0/24"},
+            {"id": "sub-public", "network_id": "net-public", "cidr": "203.0.113.0/24"},
+            {"id": "sub-public-shared", "network_id": "net-public-shared", "cidr": "198.51.100.0/24"},
         ):
             self.dst.subnets[subnet["id"]] = fake.Obj(
                 {"ipv6_address_mode": None, "ipv6_ra_mode": None, **subnet}
@@ -477,6 +479,7 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         networks = {
             "app": "net-app", "slaac": "net-slaac", "p2p": "net-p2p", "public": "net-public",
             "provider": "net-provider", "private-b": "net-private-b", "ext": "net-ext",
+            "public-shared": "net-public-shared",
         }
         # the credential's own networks, and three of other projects: shared, private, external
         for net_id, project, shared, external in (
@@ -484,6 +487,7 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             ("net-slaac", self.dst.current_project_id, False, False),
             ("net-p2p", self.dst.current_project_id, False, False),
             ("net-public", self.dst.current_project_id, False, True),
+            ("net-public-shared", self.dst.current_project_id, True, True),
             ("net-provider", "project-admin", True, False),
             ("net-private-b", "project-b", False, False),
             ("net-ext", "project-admin", False, True),
@@ -584,11 +588,38 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             self.dst.roles = roles
             for mode in ("nova", "neutron"):
                 self.assertEqual(self.errors([network_port("p1", "provider", app)], mode=mode), [])
-                self.assertEqual(self.errors([network_port("p1", "ext", app)], mode=mode), [])
+                ext = self.errors([network_port("p1", "ext", app)], mode=mode)
+                if "admin" in roles:
+                    self.assertEqual(ext, [])
+                else:
+                    # Nova attaches an unshared external network for the admin role only (RT-03)
+                    [refused] = ext
+                    self.assertIn("Nova lets only the admin role attach such a network", refused)
                 # the admin sees every project's networks, yet never puts the VM on another
                 # tenant's private one
                 [private] = self.errors([network_port("p1", "private-b", app)], mode=mode)
                 self.assertIn("is neither shared with the credential's project nor external", private)
+
+    def test_refuses_an_unshared_external_network_to_a_token_without_admin(self):
+        """SDD 6.6, review RT-03: Nova (2023.1 network:attach_external_network, admin by
+        default) attaches an unshared external network to a server only for the admin role -
+        the credential's own network included - whether Nova or Neutron makes the port."""
+        public = [{"ip_address": "203.0.113.5"}]
+        for mode in ("nova", "neutron"):
+            [own] = self.errors([network_port("p1", "public", public)], mode=mode)
+            self.assertEqual(
+                "Destination prerequisites not met: port p1 on network 'public': the network is "
+                "external and not shared, and Nova lets only the admin role attach such a network "
+                "to a server; the destination credential's token lacks it",
+                own,
+            )
+        # shared, it is any token's to attach
+        shared = [{"ip_address": "198.51.100.5"}]
+        for mode in ("nova", "neutron"):
+            self.assertEqual(self.errors([network_port("p1", "public-shared", shared)], mode=mode), [])
+        self.dst.roles = ["admin"]
+        for mode in ("nova", "neutron"):
+            self.assertEqual(self.errors([network_port("p1", "public", public)], mode=mode), [])
 
     def test_refuses_an_address_neutron_would_refuse_on_the_port(self):
         def check(address, network="app", subnet=None, mode="nova"):

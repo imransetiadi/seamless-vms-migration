@@ -173,3 +173,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ports are recreated through Neutron (``port_creation_mode: neutron``), as
   ``create_or_update`` will. A group the destination lacks, or has several
   of, used to fail the import only after the source had stopped.
+- ``import_workload_dst_check`` refuses an external network that is not shared,
+  the credential's own included, unless its token has the ``admin`` role. Nova
+  attaches such a network to a server, as a requested network or through a
+  port, only for admins (2023.1 ``network:attach_external_network``), and
+  ``advsvc`` does not count; the import failed after the source had stopped.

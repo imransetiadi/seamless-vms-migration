@@ -40,22 +40,31 @@ def network_refusal(conn, network_id):
     None (SDD 6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and the
     import chooses every port's address or MAC, which Neutron lets only PORT_ROLES, or
-    the network's own project, choose."""
+    the network's own project, choose. An external network that is not shared, the
+    credential's own included, Nova attaches to a server for the admin role only."""
     network = conn.network.get_network(network_id)
     project = network["project_id"]
-    if project == conn.current_project_id:
-        return None
-    if not (network["is_shared"] or network["is_router_external"]):
-        return (
-            f"the network belongs to project {project} and is neither shared with the "
-            "credential's project nor external"
-        )
-    if not credential_roles(conn) & set(PORT_ROLES):
-        return (
-            f"the network belongs to project {project}, and Neutron lets only the admin or "
-            "advsvc role, or that project, choose a port's address or MAC there; the "
-            "destination credential's token has neither role"
-        )
+    roles = None
+    if project != conn.current_project_id:
+        if not (network["is_shared"] or network["is_router_external"]):
+            return (
+                f"the network belongs to project {project} and is neither shared with the "
+                "credential's project nor external"
+            )
+        roles = credential_roles(conn)
+        if not roles & set(PORT_ROLES):
+            return (
+                f"the network belongs to project {project}, and Neutron lets only the admin or "
+                "advsvc role, or that project, choose a port's address or MAC there; the "
+                "destination credential's token has neither role"
+            )
+    if network["is_router_external"] and not network["is_shared"]:
+        # Nova's network:attach_external_network, admin only by default (2023.1)
+        if "admin" not in (roles if roles is not None else credential_roles(conn)):
+            return (
+                "the network is external and not shared, and Nova lets only the admin role "
+                "attach such a network to a server; the destination credential's token lacks it"
+            )
     return None
 
 
