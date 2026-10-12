@@ -331,13 +331,17 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
             created_at: datetime, updated_at: datetime }
 
-MigrationSummary { id, plan_id, wave_id, vm: { source_id, name }, strategy, phase,
+MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strategy, phase,
                    phase_since: datetime,   # the last PhaseChange's `at`, when the phase it is in began; created_at without one
-                   progress_pct, downtime_started_at, downtime_ended_at, approvals, cutover_requested,
-                   cutover_requested_by, force_cutover, force_window, advisor_hold, review_required,
-                   review_reason, error, source_running_at, findings, created_at, updated_at }
+                   preflight_ran: bool,     # a validation assessed it: its history reaches ready or blocked
+                   eligible_strategies: list[Strategy],   # its estimates' eligible strategies, in their order
+                   progress_pct, estimate, actual_downtime_s, downtime_started_at, downtime_ended_at, approvals,
+                   cutover_requested, cutover_requested_by, force_cutover, force_window, advisor_hold,
+                   review_required, review_reason, error, source_running_at, findings, suggested_probes,
+                   created_at, updated_at }
                    # GET /migrations?view=summary (§12): a migration's fields as the Migration has them, those
-                   # the Overview's lists read (§16), without the passes, estimates, notes, history or VM details
+                   # the Overview's and the plan page's lists read (§16), without the passes, all the estimates,
+                   # notes, history or VM details
 
 Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|null,
         actor: str, message: str, data: dict = {} }
@@ -2356,7 +2360,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
   failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
-  `/plans/:id` (its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
+  `/plans/:id` (it reads its plan's migrations as summaries, `GET /migrations?plan_id=&view=summary` (§4): the table, the
+  waves, the finalize queue, the findings and the probe warnings read nothing else, and the actions on a decision
+  waiting for approval take the summary's eligible strategies; its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
   the counts) and no Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
