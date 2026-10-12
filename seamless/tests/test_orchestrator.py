@@ -3700,24 +3700,19 @@ async def test_validation_keeps_the_notes_a_migration_already_has(tmp_path, stor
     assert len(_recommendations(store)) == 2, "each validation adds a recommendation"
 
 
-async def test_similar_incidents_attached_on_failure(tmp_path, store):
-    seen = []
+ONE_INCIDENT = [
+    {"title": "Attach timeout on conv host", "content": "Raise os_migrate_timeout", "score": 0.9}
+]
+
+
+async def _fail_with_memory(tmp_path, store, seen: list[str], results: list[dict]):
+    """A warm migration whose pre-copy fails, with agentmemory answering ``results`` to the
+    similar-incident search."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
         if request.url.path.endswith("smart-search"):
-            return httpx.Response(
-                200,
-                json={
-                    "results": [
-                        {
-                            "title": "Attach timeout on conv host",
-                            "content": "Raise os_migrate_timeout",
-                            "score": 0.9,
-                        }
-                    ]
-                },
-            )
+            return httpx.Response(200, json={"results": results})
         return httpx.Response(201, json={"success": True})
 
     memory = MemoryClient("http://m", None, "p", transport=httpx.MockTransport(handler))
@@ -3732,6 +3727,12 @@ async def test_similar_incidents_attached_on_failure(tmp_path, store):
     plan = plan_for([vm(1)], default_strategy=Strategy.warm)
     store.put("plan", plan)
     await run_plan(h, plan)
+    return h, plan
+
+
+async def test_similar_incidents_attached_on_failure(tmp_path, store):
+    seen = []
+    h, plan = await _fail_with_memory(tmp_path, store, seen, ONE_INCIDENT)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
     for _ in range(100):
         m = await h.migration(m.id)
@@ -3743,6 +3744,54 @@ async def test_similar_incidents_attached_on_failure(tmp_path, store):
     assert note.source == "memory" and note.data["hits"][0]["title"].startswith("Attach")
     assert "advisor.similar_incidents" in h.kinds()
     assert seen.count("/agentmemory/remember") == 1
+
+
+async def test_the_similar_incidents_event_comes_after_the_note_is_saved(
+    tmp_path, store, monkeypatch
+):
+    """SDD §14.3: advisor.similar_incidents asks for the notes to be read again (§16), so it is
+    written once the note is on the migration - never while agentmemory is still asked."""
+    held: list[bool] = []
+    append = store.append_event
+
+    def recording(event: Event) -> Event:
+        if event.kind == "advisor.similar_incidents":
+            m = store.get("migration", event.migration_id, Migration)
+            held.append(any(n.kind == "similar_incidents" for n in m.advisor_notes))
+        return append(event)
+
+    monkeypatch.setattr(store, "append_event", recording)
+    h, plan = await _fail_with_memory(tmp_path, store, [], ONE_INCIDENT)
+    await h.wait_kind("advisor.similar_incidents")
+    await h.orch.stop()
+    assert held == [True]
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "advisor.similar_incidents"]
+    m = await h.migration(event.migration_id)
+    [note] = [n for n in m.advisor_notes if n.kind == "similar_incidents"]
+    assert (event.plan_id, event.actor) == (plan.id, "system")
+    assert (event.message, event.data) == (note.summary, note.data)
+    assert event.data["hits"][0]["title"] == "Attach timeout on conv host"
+
+
+async def test_a_failure_with_no_similar_incident_announces_none(tmp_path, store):
+    """SDD §14.3: agentmemory knows nothing like the failure - no note and no event announcing one,
+    and the failure is still remembered as a lesson."""
+    seen: list[str] = []
+    h, plan = await _fail_with_memory(tmp_path, store, seen, [])
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.failed)
+    deadline = asyncio.get_running_loop().time() + 10
+    while mid in h.orch._drivers:  # the driver leaves once the failure is handled to its end
+        assert asyncio.get_running_loop().time() < deadline, (
+            "the failure was not handled to its end"
+        )
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert mid not in h.orch._driver_crashes
+    m = await h.migration(mid)
+    assert not any(n.kind == "similar_incidents" for n in m.advisor_notes)
+    assert "advisor.similar_incidents" not in h.kinds()
+    assert seen.count("/agentmemory/remember") == 1 and "memory.lesson_saved" in h.kinds()
 
 
 async def test_verification_review_flags_without_flipping(tmp_path, store):

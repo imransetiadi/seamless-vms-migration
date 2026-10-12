@@ -2951,6 +2951,10 @@ class Orchestrator:
                     cur, v = await self._load(mid)
                     cur.advisor_notes.append(note)
                     await self._save(cur, v)
+                # SDD §14.3: announced once saved - the refresh it asks for (§16) reads the note
+                await self._emit(
+                    "advisor.similar_incidents", note.summary, migration=cur, data=note.data
+                )
 
 
 def phases(migrations: Iterable[Migration]) -> Counter[str]:
