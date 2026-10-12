@@ -606,7 +606,11 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   migration of every plan to show "migrations done"), and the plan form reads them only while open. The Advisor
   page reads no migration either: its notes come from `GET /advisor/notes` (33ca02a, 20 notes out of the API's
   document cache) and a waiting decision reads its migration alone (f1b52e7); at 1,000 VMs every migration was
-  4,127.7 KiB of its 4,230 KiB load. Prefer SSE-triggered
+  4,127.7 KiB of its 4,230 KiB load. The Overview (5f3e75b) and the plan page (c5e6896) read the migrations as
+  summaries (`GET /migrations?view=summary`, SDD §4): the fields their lists read, without the phase history, VM
+  details, advisor notes, every estimate and the passes - on the live demo 71 migrations were 350,000 bytes whole
+  and 59,903 as summaries (906 B each, before the plan page's fields joined them), and at 1,000 VMs the Overview
+  read 4,127.7 KiB of migrations and the plan page ≈ 4 MiB. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling; an event about one existing migration
   re-reads that migration alone and splices it into the cached lists (SDD §16, 376eec7): at 1,000 VMs a plan a
   full list is ≈ 4.5 MB (≈ 0.5 MB gzipped) per page and event, one migration ≈ 4.5 KB.
