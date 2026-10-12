@@ -557,6 +557,21 @@ describe('mock API', () => {
     expect(Date.parse(m.sync_passes.at(-1)!.started_at)).toBeGreaterThanOrEqual(restarted);
   });
 
+  it('empties what the passes said the cutover would refuse once the cutover gets past it, as the control plane does (SDD §7.2)', async () => {
+    const { server } = setup('approver');
+    const m = server.migrations.find((x) => x.strategy === 'cold' && x.phase === 'ready')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.status = 'running';
+    plan.cutover_window = null;
+    m.cutover_refusals = ["port p2 on network 'gone' does not resolve"];
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    await approver.post(`/migrations/${m.id}/cutover`, {});
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
+    for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
+    expect(m.phase).toBe('verifying');
+    expect(m.cutover_refusals).toEqual([]);
+  });
+
   it('records a cold copy as a full pass and keeps its bytes, as the API executors do (SDD §4.2)', async () => {
     const { server } = setup('approver');
     const m = server.migrations.find((x) => x.strategy === 'cold' && x.phase === 'ready')!;

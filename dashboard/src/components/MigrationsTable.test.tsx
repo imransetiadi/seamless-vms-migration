@@ -34,6 +34,20 @@ function rowFor(name: string): HTMLElement {
 }
 
 describe('MigrationsTable', () => {
+
+  it('marks a migration the cutover will refuse, with how many problems (SDD §16)', () => {
+    const migrations = fx.migrations.filter((m) => m.plan_id === plan.id).map((m) => ({ ...m, cutover_refusals: [] as string[] }));
+    const marked = migrations.find((m) => m.strategy === 'warm') as Migration;
+    marked.cutover_refusals = ["port p2 on network 'gone' does not resolve", "port p3 holds its MAC"];
+    render(
+      <MemoryRouter>
+        <MigrationsTable migrations={migrations} plan={plan} />
+      </MemoryRouter>,
+    );
+    const row = screen.getByRole('link', { name: marked.vm.name }).closest('tr') as HTMLElement;
+    expect(within(row).getByText('Cutover will refuse 2 problems')).toBeInTheDocument();
+    expect(screen.getAllByText(/^Cutover will refuse/)).toHaveLength(1);
+  });
   it('links every VM to its migration detail page', () => {
     renderTable();
     expect(rows()).toHaveLength(migrations.length);

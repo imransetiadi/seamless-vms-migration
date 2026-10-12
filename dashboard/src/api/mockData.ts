@@ -1108,6 +1108,8 @@ interface MigrationSpec {
   error?: string | null;
   reviewReason?: string | null;
   notes?: Array<Omit<AdvisorNote, 'created_at'> & { ago: number }>;
+  /** What the last warm pass met that the cutover will refuse before the source stops (SDD §7.2). */
+  refusals?: string[];
   /** The strategy recommendation recorded when the migration was validated (SDD §14.4), and what a person decided later (§14.6). */
   rec?: {
     option: Strategy | null;
@@ -1230,6 +1232,8 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-9e4f6a8b50', vm: 'vm-5001', strategy: 'vmware_warm', phase: 'syncing', wave: 'wave-1', enteredAgo: 9 * 60, progress: 71,
         passes: [{ kind: 'full', changedGiB: 64, durationS: 520 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
+        // a port another VM left behind holds the NIC's MAC: the pre-copy goes on, the cutover would refuse (SDD §7.2)
+        refusals: ["the NIC 00:50:56:9a:51:01 of vm-erp-app-01 on 'VM Network ERP': port port-3c1d holds its MAC 00:50:56:9a:51:01"],
       },
       {
         id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H,
@@ -1657,6 +1661,7 @@ export function buildFixtures(now: number): Fixtures {
         converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
         force_cutover: null,
         data_issues: [],
+        cutover_refusals: m.refusals ?? [],
         downtime_model_s: null,
         verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
         suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),

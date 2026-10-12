@@ -1,4 +1,4 @@
-import { SearchX } from 'lucide-react';
+import { SearchX, TriangleAlert } from 'lucide-react';
 import { memo, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { SEVERITIES, type Phase, type Plan, type Strategy, type MigrationLike } from '../api/types';
@@ -75,6 +75,13 @@ const MigrationRow = memo(function MigrationRow({ migration: m, override, wave }
       </td>
       <td>
         <FindingsSummary findings={m.findings} />
+        {m.cutover_refusals.length > 0 && (
+          // what the last warm pass met that the cutover refuses (SDD §7.2, §16)
+          <span className="mt-1 flex items-start gap-1 text-xs leading-tight text-status-warning">
+            <TriangleAlert aria-hidden className="mt-px size-3.5 shrink-0" />
+            Cutover will refuse {m.cutover_refusals.length} problem{m.cutover_refusals.length === 1 ? '' : 's'}
+          </span>
+        )}
       </td>
       <td className="num hidden whitespace-nowrap text-right md:table-cell">
         {m.actual_downtime_s !== null

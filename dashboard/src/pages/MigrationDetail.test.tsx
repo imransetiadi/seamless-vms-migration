@@ -25,6 +25,27 @@ describe('MigrationDetail', () => {
     expect(screen.getByText('Approved by approver-1')).toBeInTheDocument();
   });
 
+  it('warns what the cutover will refuse before the source stops, each problem listed, while the passes find it (SDD §7.2, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    const other = server.migrations.find((x) => x.phase === 'completed');
+    if (!m || !other) throw new Error('fixture: a warm migration awaiting cutover and a completed one');
+    const problems = [
+      "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC 00:50:56:00:00:01",
+      "Destination prerequisites not met: floating IP 203.0.113.7 on network 'ext' does not resolve",
+    ];
+    m.cutover_refusals = problems;
+    other.cutover_refusals = [];
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const note = await screen.findByRole('note', { name: 'Cutover will refuse' });
+    expect(note).toHaveTextContent('The cutover will refuse this before the source stops.');
+    for (const problem of problems) expect(within(note).getByText(problem)).toBeInTheDocument();
+    unmount();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${other.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByRole('heading', { level: 1 })).toBeInTheDocument();
+    expect(screen.queryByRole('note', { name: 'Cutover will refuse' })).toBeNull();
+  });
+
   it('names the strategy of each earlier attempt beside the attempts count (SDD §4.2, §14.4)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;

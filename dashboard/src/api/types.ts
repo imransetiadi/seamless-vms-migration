@@ -651,6 +651,11 @@ export interface Migration {
   force_cutover: ForceCutover | null;
   /** What the invariants found when it completed, one "CODE: text" each (SDD §5.5). */
   data_issues: string[];
+  /**
+   * What the last warm pass met that the cutover refuses before the source stops, one message each (SDD §7.2):
+   * each pre-copy or sync pass replaces it, a successful cutover empties it.
+   */
+  cutover_refusals: string[];
   /** Demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (SDD §5.2). */
   downtime_model_s: number | null;
   /** The last verification: its checks and application probe results (SDD §7.5, ADV-18). */
@@ -698,6 +703,7 @@ export const MIGRATION_SUMMARY_FIELDS = [
   'source_running_at',
   'findings',
   'suggested_probes',
+  'cutover_refusals',
   'created_at',
   'updated_at',
 ] as const;

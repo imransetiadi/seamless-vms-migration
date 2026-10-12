@@ -28,7 +28,7 @@ describe('summaryOf (SDD §4 MigrationSummary, perf audit PF-02)', () => {
     expect(summaryOf(m).phase_since).toBe(m.created_at);
   });
 
-  it("holds the API's 28 fields, no more (SDD §4)", () => {
+  it("holds the API's 29 fields, no more (SDD §4)", () => {
     expect([...MIGRATION_SUMMARY_FIELDS].sort()).toEqual(
       [
         'id',
@@ -57,6 +57,7 @@ describe('summaryOf (SDD §4 MigrationSummary, perf audit PF-02)', () => {
         'source_running_at',
         'findings',
         'suggested_probes',
+        'cutover_refusals',
         'created_at',
         'updated_at',
       ].sort(),

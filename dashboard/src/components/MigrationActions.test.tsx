@@ -358,6 +358,23 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
   });
 
+  it('repeats in the Cut over dialog what the cutover will refuse, and still lets the cutover be requested (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+    const problem = "the NIC 00:50:56:00:00:01 of app-billing-01 on 'app-net': port port-old holds its MAC";
+    migration.cutover_refusals = [problem];
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={"approver" as Role} />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^cut over/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01/i });
+    const refusals = within(dialog).getByRole('note', { name: 'Cutover will refuse' });
+    expect(refusals).toHaveTextContent(problem);
+    await user.click(within(dialog).getByRole('button', { name: /start cutover/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
+  });
+
   it('offers to ignore a closed window with the first cutover request (SDD §5.4)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

@@ -919,6 +919,8 @@ export class MockServer {
     // like the simulated executor (SDD §5.2): the seconds the source stayed stopped for the step, here at wall speed
     if (m.downtime_started_at) m.downtime_model_s = Math.round((this.now() - Date.parse(m.downtime_started_at)) / 100) / 10;
     m.checkpoint = 'cutover';
+    // like the control plane (SDD §7.2): the cutover got past what the passes said it would refuse
+    m.cutover_refusals = [];
     this.transition(m, 'verifying', 'destination server created', 'orchestrator');
   }
 
@@ -1993,6 +1995,7 @@ export class MockServer {
       converged_by: null,
       force_cutover: null,
       data_issues: [],
+      cutover_refusals: [],
       downtime_model_s: null,
       verification: null,
       suggested_probes: [],

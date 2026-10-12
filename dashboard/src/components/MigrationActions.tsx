@@ -267,6 +267,21 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           })
         }
       >
+        {m.cutover_refusals.length > 0 && (
+          // the passes found what the cutover will refuse (SDD §7.2): requesting stays possible, the cutover's own
+          // check stops it before the source VM stops (SDD §16)
+          <div role="note" aria-label="Cutover will refuse" className="rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-sm">
+            <p className="font-medium">The last pass found what the cutover will refuse:</p>
+            <ul className="mt-1 list-disc pl-5">
+              {m.cutover_refusals.map((problem) => (
+                <li key={problem} className="wrap-break-word">
+                  {problem}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1 text-xs text-muted-foreground">Fix it first: otherwise the cutover stops at its check, while the source VM still runs.</p>
+          </div>
+        )}
         {closedWindow && !forcing && plan?.cutover_window && (
           <label htmlFor={forceId} className="flex min-h-11 cursor-pointer items-start gap-2.5 rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-sm">
             <input id={forceId} type="checkbox" className="mt-1 size-4 accent-accent" checked={forceWindow} onChange={(e) => setForceWindow(e.target.checked)} />
