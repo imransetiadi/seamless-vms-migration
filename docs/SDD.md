@@ -331,6 +331,14 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
             created_at: datetime, updated_at: datetime }
 
+MigrationSummary { id, plan_id, wave_id, vm: { source_id, name }, strategy, phase,
+                   phase_since: datetime,   # the last PhaseChange's `at`: when the phase it is in began
+                   progress_pct, downtime_started_at, downtime_ended_at, approvals, cutover_requested,
+                   cutover_requested_by, force_cutover, force_window, advisor_hold, review_required,
+                   review_reason, error, source_running_at, findings, created_at, updated_at }
+                   # GET /migrations?view=summary (§12): a migration's fields as the Migration has them, those
+                   # the Overview's lists read (§16), without the passes, estimates, notes, history or VM details
+
 Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|null,
         actor: str, message: str, data: dict = {} }
 ```
@@ -1686,7 +1694,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0); creation order | `Migration[]` |
+| GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
@@ -2320,7 +2328,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
   the first eight rows of the chosen kind, as many as Needs attention shows, the rest behind "Show all ({n})" and
   folded back by "Show fewer" or by choosing another kind, so a plan of hundreds of VMs awaiting approval never stretches the Overview;
-  ADV-20), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of all its
+  ADV-20; the page reads the migrations as summaries, `GET /migrations?view=summary` (§4): what its rules read, not
+  every migration whole), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of all its
   migrations, from `Plan.migration_counts`, or of its VMs before validation; the list reads no migration —, clouds,
   SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
@@ -2522,7 +2531,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
   A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
   cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
-  as it is, so what reads only such lists does not draw again on every progress event.
+  as it is, so what reads only such lists does not draw again on every progress event. A summary list
+  (`view=summary`) takes the percentage alone: a summary holds neither the passes nor the bytes.
   Persisted events refresh the queries they affect in one batch per 400 ms. A `migration.phase` or
   `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases.
   While the page is hidden (`document.visibilityState` `hidden`, a background tab) the batch waits: what its events
@@ -2531,7 +2541,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   busy wave - refreshes the cached migration lists and pages instead: one read per list costs less than so many. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
-  holds it and is filtered by plan at most, instead of reading those lists again — at 1,000 VMs a plan (NFR-03) a
+  holds it and is filtered by plan at most - a summary list takes its summary, as the API builds it - instead of
+  reading those lists again — at 1,000 VMs a plan (NFR-03) a
   list is megabytes; a list filtered otherwise, one that does not hold the migration and one being read are
   refreshed as before, and every list is when that read fails. With neither that migration nor any migration list
   cached (a page that shows none), the event reads nothing. A list that the same batch refreshes is left alone:
