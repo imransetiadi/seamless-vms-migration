@@ -1765,7 +1765,11 @@ A stream sends each persisted event once, in `seq` order, also those another pro
 CLI beside a running server, §15): a stream given an event whose `seq` skips some first reads the store from the
 last `seq` it sent, so what was written in between comes before it, and each tick (`tick_s`, §8) the server
 compares the store's newest `seq` with the newest it published and has every stream read what it lacks - another
-process's events reach an open page within about a tick, also while the server itself emits nothing.
+process's events reach an open page within about a tick, also while the server itself emits nothing. A skipped
+`seq` the store does not hold yet, before an event created less than 2 s earlier, may be another process's insert
+not committed yet (PostgreSQL need not commit in `seq` order): the stream sends what comes before it and holds the
+rest, reading the store again every 50 ms, until it appears or 2 s have passed - a `seq` that never comes (a
+rolled-back insert) holds the stream back that once, and an older gap (pruned events) not at all.
 
 The dashboard build (`SEAMLESS_DASHBOARD_DIR`, default `<repo>/dashboard/dist` when present) is
 served at `/` with SPA fallback for non-`/api` paths.
