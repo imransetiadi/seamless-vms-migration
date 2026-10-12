@@ -609,7 +609,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   4,127.7 KiB of its 4,230 KiB load. The Overview (5f3e75b) and the plan page (c5e6896) read the migrations as
   summaries (`GET /migrations?view=summary`, SDD §4): the fields their lists read, without the phase history, VM
   details, advisor notes, every estimate and the passes - on the live demo 71 migrations were 350,000 bytes whole
-  and 59,903 as summaries (906 B each; 84,729, 1,193 B each, once the plan page's fields joined them, 4ee8507 the
+  (4.9 KB each) and 59,903 as summaries (844 B each on the wire; 84,729, 1,193 B each, once the plan page's fields joined them, 4ee8507 the
   last reader), and at 1,000 VMs the Overview
   read 4,127.7 KiB of migrations and the plan page ≈ 4 MiB. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling; an event about one existing migration
