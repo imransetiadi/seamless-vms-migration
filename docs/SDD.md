@@ -2491,7 +2491,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   refuse; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
-  (`force_window`, §4.2); until the migration's plan is
+  (`force_window`, §4.2); a request that waits for another approver — maker-checker, and no approval counts but
+  the requester's own — is not a start, so its Cut over dialog asks "Request the cutover of {vm}?" with Request
+  cutover and says the source stops once another approver approves it; until the migration's plan is
   loaded Cutover stays unavailable — its window and approval policy are unknown, and the dialog would promise an
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
