@@ -1993,9 +1993,10 @@ body `{query, limit, project}`; parses hits tolerantly from `results|memories|it
 
 `KnowledgeService`:
 * `on_failure(migration, step, error)` → `search(f"{strategy} {step} {error_class}: {msg[:200]}")`,
-  attaches up to 3 hits as `AdvisorNote(kind="similar_incidents", source="memory")`, emits
-  `advisor.similar_incidents`; also `remember` type `bug` with concepts `["seamless", strategy,
-  step]`.
+  returns up to 3 hits as `AdvisorNote(kind="similar_incidents", source="memory")`; also `remember` type `bug`
+  with concepts `["seamless", strategy, step]`. The orchestrator attaches the note to the migration and only then
+  emits `advisor.similar_incidents` (the note's summary and data): the event comes after the note it announces, so
+  the refresh it asks for (§16) reads the note.
 * `on_completed(migration)` → `remember` type `fact`: profile (os_type, disk size bucket
   `<50G|50-200G|200-500G|>500G`, strategy), passes, final delta, estimated vs actual downtime.
 * `on_rolled_back(migration, reason)` → `remember` type `workflow`.
