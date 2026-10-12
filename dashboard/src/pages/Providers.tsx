@@ -203,14 +203,15 @@ function ProviderCard({
             })
           }
         >
-          Check
+          {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16) */}
+          Check<span className="sr-only"> {provider.name}</span>
         </Button>
         <Link to={`/inventory/${provider.id}`} className={buttonClassName('ghost', 'md')}>
           <HardDrive aria-hidden className="size-4" />
-          Inventory
+          Inventory<span className="sr-only"> of {provider.name}</span>
         </Link>
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
-          Edit
+          Edit<span className="sr-only"> {provider.name}</span>
         </Button>
         <Button
           variant="ghost"
@@ -219,7 +220,7 @@ function ProviderCard({
           className="ml-auto"
           disabledReason={canEdit ? null : 'Deleting a provider requires the admin role.'}
         >
-          Delete
+          Delete<span className="sr-only"> {provider.name}</span>
         </Button>
       </footer>
 
