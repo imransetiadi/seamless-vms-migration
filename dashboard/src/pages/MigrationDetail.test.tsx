@@ -756,10 +756,12 @@ describe('MigrationDetail', () => {
     const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
     const inventory = server.inventories['rhoso-prod'] as DestinationInventory;
     // another tenant's private network, which an admin's token would see: never, whatever the roles
-    inventory.networks = { ...inventory.networks, 'tenant-b-private': 1442 };
+    // and the credential's own external network that is not shared: Nova attaches it for the admin role only (review RT-03)
+    inventory.networks = { ...inventory.networks, 'tenant-b-private': 1442, 'own-ext': 1500 };
     inventory.network_details = [
       ...inventory.network_details!,
       { id: 'net-tenant-b', name: 'tenant-b-private', mtu: 1442, project_id: 'tenant-b', own: false, shared: false, external: false },
+      { id: 'net-own-ext', name: 'own-ext', mtu: 1500, project_id: 'shop', own: true, shared: false, external: true },
     ];
     // a member's token: another project's shared provider-ext is not allowed either
     const destination = server.providers.find((p) => p.id === 'rhoso-prod')!;
@@ -780,6 +782,11 @@ describe('MigrationDetail', () => {
     await user.selectOptions(select, 'tenant-b-private');
     expect(select).toHaveAccessibleDescription(
       "The RHOSO credential may not put a port on tenant-b-private (project tenant-b): it is neither shared with the credential's project nor external. Validation refuses it.",
+    );
+    expect(within(select).getByRole('option', { name: 'own-ext (not allowed)' })).toBeInTheDocument();
+    await user.selectOptions(select, 'own-ext');
+    expect(select).toHaveAccessibleDescription(
+      "The RHOSO credential may not put a port on own-ext (project shop): it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it. Validation refuses it.",
     );
   });
 

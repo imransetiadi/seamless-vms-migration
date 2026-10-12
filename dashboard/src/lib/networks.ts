@@ -32,13 +32,18 @@ export const PORT_ROLES = ['admin', 'advsvc'];
  * Why the destination credential may not put a port on `network`, or null, as the API's port_refusal (SDD §6.6): another
  * project's network takes it only when shared with the credential's project or external (an admin sees every project's
  * networks), and only from a token with the admin or advsvc role, since every recreated port asks for its address or MAC.
- * `roles` undefined (not reported) leaves that half unjudged.
+ * An external network that is not shared, the credential's own included, also needs the admin role: Nova attaches no
+ * other to a server. `roles` undefined (not reported) leaves the role halves unjudged.
  */
 export function portRefusal(network: DestinationNetwork, roles: readonly string[] | undefined): string | null {
-  if (network.own) return null;
-  if (!(network.shared || network.external)) return "it is neither shared with the credential's project nor external";
-  if (roles !== undefined && !roles.some((role) => PORT_ROLES.includes(role)))
-    return "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither";
+  if (!network.own) {
+    if (!(network.shared || network.external)) return "it is neither shared with the credential's project nor external";
+    if (roles !== undefined && !roles.some((role) => PORT_ROLES.includes(role)))
+      return "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither";
+  }
+  // Nova's network:attach_external_network, admin only by default (2023.1): the credential's own network included
+  if (network.external && !network.shared && roles !== undefined && !roles.includes('admin'))
+    return "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it";
   return null;
 }
 

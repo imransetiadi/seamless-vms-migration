@@ -42,6 +42,17 @@ describe('resolveNetwork (SDD §7.3 step 0, §9.3)', () => {
 describe('portRefusal (SDD §6.6, §9.3)', () => {
   const roleWhy = "Neutron lets only the admin or advsvc role, or that project, choose a port's address or MAC there, and the credential's token has neither";
   const privateWhy = "it is neither shared with the credential's project nor external";
+  const novaWhy =
+    "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it";
+
+  it('asks the admin role for an unshared external network, the credential\'s own included, as the API does (review RT-03)', () => {
+    const ownExternal = { ...net('x', 'rhoso-net', true), shared: false, external: true };
+    for (const roles of [['member', 'reader'], ['advsvc']]) expect(portRefusal(ownExternal, roles)).toBe(novaWhy);
+    expect(portRefusal(ownExternal, ['admin'])).toBeNull();
+    // shared, it is any token's to attach; no reported roles judge neither half
+    expect(portRefusal({ ...ownExternal, shared: true }, ['member'])).toBeNull();
+    expect(portRefusal(ownExternal, undefined)).toBeNull();
+  });
 
   it("lets another project's network take a port only when shared or external, and from the admin or advsvc role, as the API does", () => {
     const shared = net('p', 'rhoso-net', false, 'project-admin');
@@ -54,7 +65,8 @@ describe('portRefusal (SDD §6.6, §9.3)', () => {
     expect(portRefusal(external, member)).toBe(roleWhy);
     for (const roles of [['admin', 'member', 'reader'], ['advsvc']]) {
       expect(portRefusal(shared, roles)).toBeNull();
-      expect(portRefusal(external, roles)).toBeNull();
+      // Nova attaches an unshared external network for the admin role only (review RT-03)
+      expect(portRefusal(external, roles)).toBe(roles.includes('admin') ? null : novaWhy);
       // an admin sees another tenant's private network: the VM must never land there
       expect(portRefusal(tenant, roles)).toBe(privateWhy);
     }

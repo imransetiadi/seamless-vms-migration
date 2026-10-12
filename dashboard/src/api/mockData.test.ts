@@ -245,6 +245,14 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     for (const roles of [['admin', 'member', 'reader'], ['advsvc'], undefined]) expect(codes(run(shared, roles))).not.toContain('NET_PORT_NOT_PERMITTED');
     // a VMware NIC too: the migration kit creates every port with the NIC's MAC (SDD §7.2)
     expect(codes(run(shared, member, 'vmware'))).toContain('NET_PORT_NOT_PERMITTED');
+    // an unshared external network, the credential's own included, needs the admin role: Nova attaches it for no other (review RT-03)
+    const nova = "it is external and not shared, and Nova lets only the admin role attach such a network to a server; the credential's token lacks it.";
+    expect(run(external, ['advsvc']).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toContain(nova);
+    const ownExternal = { ...net('x', 'tenant-web', true, 'shop'), shared: false, external: true };
+    expect(run(ownExternal, member).find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
+      `The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on 'tenant-web' (project shop): ${nova}`,
+    );
+    expect(codes(run(ownExternal, ['admin']))).not.toContain('NET_PORT_NOT_PERMITTED');
   });
 
   it("writes a network's name and a missing project as the API's messages do (review NC-11)", () => {
