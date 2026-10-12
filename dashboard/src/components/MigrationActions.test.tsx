@@ -149,6 +149,53 @@ describe('MigrationActions', () => {
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
   });
 
+  it.each([
+    // [require_approval, require_distinct_approver, what the dialog says of an approval, whether the request records one]
+    [false, true, null, false], // a plan made without approval keeps the distinct-approver default
+    [false, false, 'This also records your approval', true],
+    [true, false, 'This also records your approval', true],
+    [true, true, 'Your request is not an approval', false],
+  ] as const)(
+    'claims an approval in the Cut over dialog only when the request records one (approval %s, distinct approver %s; SDD §5.4, §16)',
+    async (requireApproval, distinct, says, records) => {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      const migration = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-5003, ready
+      migration.approvals = [];
+      const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+      plan.require_approval = requireApproval;
+      plan.require_distinct_approver = distinct;
+      const role: Role = 'approver';
+      renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+      const group = screen.getByRole('group', { name: /migration actions/i });
+      await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
+      const dialog = await screen.findByRole('alertdialog');
+      for (const sentence of ['This also records your approval', 'Your request is not an approval']) {
+        if (sentence === says) expect(dialog).toHaveTextContent(sentence);
+        else expect(dialog).not.toHaveTextContent(sentence);
+      }
+      expect(dialog).toHaveTextContent(/the migration can be rolled back until it is finalized\./i);
+      await user.click(within(dialog).getByRole('button', { name: /^(start|request) cutover$/i }));
+      await waitFor(() => expect(server.migrations.find((x) => x.id === migration.id)?.cutover_requested).toBe(true));
+      // what the dialog said is what the request recorded
+      expect(server.migrations.find((x) => x.id === migration.id)!.approvals.some((a) => a.actor === 'sari')).toBe(records);
+    },
+  );
+
+  it('claims an approval in the Force cutover dialog only when forcing records one (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, server, migration } = setup('db-mysql-02', 'approver');
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    // a plan made without approval keeps the distinct-approver default: forcing records no approval
+    plan.require_approval = false;
+    plan.require_distinct_approver = true;
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    expect(dialog).not.toHaveTextContent('This also records your approval');
+    expect(dialog).not.toHaveTextContent('Another approver still approves the cutover');
+    expect(dialog).toHaveTextContent('The window and a free cutover slot still apply.');
+  });
+
   it('forces the cutover of a warm migration before it converged, with a reason (SDD §5.4, ADV-16)', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('db-mysql-02', 'approver');

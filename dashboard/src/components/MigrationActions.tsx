@@ -88,6 +88,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const me = useMe().data?.name;
   const availability = migrationActions(m, role, plan, undefined, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
+  // a request or a force records the user's approval only without a distinct approver (SDD §5.4, §16)
+  const recordsApproval = plan?.require_distinct_approver === false;
   if (planUnavailable && availability.cutover.enabled) {
     availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
   } else if (planLoading && availability.cutover.enabled) {
@@ -277,7 +279,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             {slo ? ` against an SLO of ${slo}` : ''}.{' '}
             {fourEyes
               ? 'Your request is not an approval: another approver approves the cutover. The migration can be rolled back until it is finalized.'
-              : 'This also records your approval; the migration can be rolled back until it is finalized.'}
+              : recordsApproval
+                ? 'This also records your approval; the migration can be rolled back until it is finalized.'
+                : 'The migration can be rolled back until it is finalized.'}
           </>
         }
         confirmLabel={forcing ? 'Cut over outside the window' : early || waitsForApprover ? 'Request cutover' : 'Start cutover'}
@@ -334,7 +338,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             {slo ? (forced !== null && plan && forced > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
             {fourEyes
               ? 'Another approver still approves the cutover; the window and a free cutover slot still apply.'
-              : 'This also records your approval; the window and a free cutover slot still apply.'}
+              : recordsApproval
+                ? 'This also records your approval; the window and a free cutover slot still apply.'
+                : 'The window and a free cutover slot still apply.'}
           </>
         }
         confirmLabel="Force cutover"
