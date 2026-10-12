@@ -1,7 +1,7 @@
 import { CircleCheck, CircleHelp, Clock, Pause, Play, Rows3, type LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { Migration, Plan } from '../api/types';
+import type { Plan, MigrationLike } from '../api/types';
 import type { Tone } from '../lib/phase';
 import { WAVE_COMPLETE_PHASES, waveMigrations, waveState } from '../lib/waves';
 import { EmptyState } from './EmptyState';
@@ -25,7 +25,7 @@ const STATE_META: Record<BoardState, { label: string; tone: Tone; icon: LucideIc
  * `migrations` is null when they could not be loaded: each wave then keeps what the plan says about it,
  * and its state and progress read as unknown, never as empty (SDD §16).
  */
-export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migrations: Migration[] | null; emptyAction?: ReactNode }) {
+export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migrations: readonly MigrationLike[] | null; emptyAction?: ReactNode }) {
   const waves = [...plan.waves].sort((a, b) => a.order - b.order);
   if (waves.length === 0) {
     return (

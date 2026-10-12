@@ -2,7 +2,7 @@ import { Activity, ShieldQuestion } from 'lucide-react';
 import { useRef, useState, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { usePatchPlan } from '../api/hooks';
-import type { AppProbe, Migration, Plan } from '../api/types';
+import type { AppProbe, Plan, MigrationLike } from '../api/types';
 import type { Availability } from '../lib/planActions';
 import { describeProbes, probesFor, withVmProbes } from '../lib/probes';
 import { Button } from './Button';
@@ -11,7 +11,7 @@ import { Panel } from './Panel';
 
 export interface ProbeWarningsProps {
   plan: Plan;
-  migrations: Migration[];
+  migrations: readonly MigrationLike[];
   /** The plan's Edit availability (SDD §12): using a suggestion edits the plan. */
   edit: Availability;
   onSaved?: (text: string) => void;
@@ -25,7 +25,7 @@ export interface ProbeWarningsProps {
  */
 export function ProbeWarnings({ plan, migrations, edit, onSaved, focusAfterRef }: ProbeWarningsProps) {
   const patch = usePatchPlan(plan.id);
-  const [asking, setAsking] = useState<{ m: Migration; probes: AppProbe[] } | null>(null);
+  const [asking, setAsking] = useState<{ m: MigrationLike; probes: AppProbe[] } | null>(null);
   // read by the dialog as it closes: empty on Cancel, the plan's heading once the probe was saved (SDD §16)
   const afterRef = useRef<HTMLElement | null>(null);
   // a VM the plan now probes is left out: its finding stays until the next validation (SDD §16)

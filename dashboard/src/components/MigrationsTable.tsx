@@ -1,7 +1,7 @@
 import { SearchX } from 'lucide-react';
 import { memo, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { SEVERITIES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
+import { SEVERITIES, type Phase, type Plan, type Strategy, type MigrationLike } from '../api/types';
 import { formatDuration, formatNumber, formatPct } from '../lib/format';
 import { isActivePhase, PHASE_ORDER, phaseMeta, phaseSortKey } from '../lib/phase';
 import { nextSort, sortBy, type SortState } from '../lib/sort';
@@ -18,7 +18,7 @@ import { PhaseBadge } from './StatusBadge';
 type SortKey = 'vm' | 'phase' | 'strategy' | 'wave' | 'progress' | 'estimate' | 'findings' | 'downtime';
 
 export interface MigrationsTableProps {
-  migrations: Migration[];
+  migrations: readonly MigrationLike[];
   /** Supplies wave names and order. */
   plan?: Plan | null;
   caption?: string;
@@ -27,13 +27,13 @@ export interface MigrationsTableProps {
   emptyAction?: ReactNode;
 }
 
-function findingScore(m: Migration): number {
+function findingScore(m: Pick<MigrationLike, 'findings'>): number {
   // blockers dominate, then warnings, then info.
   return SEVERITIES.reduce((score, severity, i) => score + m.findings.filter((f) => f.severity === severity).length * 1000 ** (2 - i), 0);
 }
 
 interface MigrationRowProps {
-  migration: Migration;
+  migration: MigrationLike;
   /** The plan overrides this VM's strategy. */
   override: boolean;
   /** The wave cell's text, or null when the plan has no waves (the column is not shown). */

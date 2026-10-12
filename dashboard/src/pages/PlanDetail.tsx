@@ -18,7 +18,7 @@ import {
 import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useMigrations, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
+import { useMigrationSummaries, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorPolicy, Plan, Provider, ValidationReport } from '../api/types';
 import { AdvisorApprovals } from '../components/AdvisorApprovals';
@@ -261,7 +261,8 @@ function ReportBanner({ report }: { report: ValidationReport }) {
 export default function PlanDetail() {
   const { planId = '' } = useParams();
   const plan = usePlan(planId);
-  const migrations = useMigrations({ plan_id: planId });
+  // summaries: what its lists read, not every migration whole (SDD §16, perf audit PF-02)
+  const migrations = useMigrationSummaries({ plan_id: planId });
   const providers = useProviders();
   const stats = useStats(planId);
   const policies = usePolicies();

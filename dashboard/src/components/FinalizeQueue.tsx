@@ -2,7 +2,7 @@ import { AlarmClock, BadgeCheck, Power, TriangleAlert } from 'lucide-react';
 import { useId, useState, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { useFinalizePlan } from '../api/hooks';
-import type { Migration, Plan, PlanFinalizeResult, Wave } from '../api/types';
+import type { Plan, PlanFinalizeResult, Wave, MigrationLike } from '../api/types';
 import { completedSince, inScope, isOverdue, queueByWave, type SkippedVm } from '../lib/finalize';
 import { formatDateTime, formatRelative } from '../lib/format';
 import type { Availability } from '../lib/planActions';
@@ -23,7 +23,7 @@ function vms(n: number): string {
 
 export interface FinalizeQueueProps {
   plan: Plan;
-  migrations: Migration[];
+  migrations: readonly MigrationLike[];
   /** The plan's Finalize availability (approver, a VM awaiting finalize; SDD §8.1). */
   gate: Availability;
   /** The page header already offers Finalize all (a Completed plan): the panel does not repeat it. */
@@ -119,7 +119,7 @@ export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize 
 
 export interface FinalizePlanDialogProps {
   plan: Plan;
-  migrations: Migration[];
+  migrations: readonly MigrationLike[];
   /** Open while set. */
   scope: FinalizeScope | null;
   onClose: () => void;

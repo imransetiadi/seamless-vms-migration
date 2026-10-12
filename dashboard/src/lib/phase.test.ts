@@ -94,6 +94,14 @@ describe('preflightRan', () => {
     }
     expect(preflightRan({ phase: 'cancelled', phase_history: history('pending', 'validating', 'blocked', 'cancelled') })).toBe(true);
   });
+
+  it("takes a summary's word for a cancelled migration, as the API read its history (SDD §4, perf audit PF-02)", () => {
+    expect(preflightRan({ phase: 'cancelled', preflight_ran: true })).toBe(true);
+    expect(preflightRan({ phase: 'cancelled', preflight_ran: false })).toBe(false);
+    // the phase alone decides the others, whatever the summary says
+    expect(preflightRan({ phase: 'validating', preflight_ran: true })).toBe(false);
+    expect(preflightRan({ phase: 'ready', preflight_ran: false })).toBe(true);
+  });
 });
 
 describe('runningStep', () => {

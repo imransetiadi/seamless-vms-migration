@@ -679,7 +679,11 @@ export const MIGRATION_SUMMARY_FIELDS = [
   'strategy',
   'phase',
   'phase_since',
+  'preflight_ran',
+  'eligible_strategies',
   'progress_pct',
+  'estimate',
+  'actual_downtime_s',
   'downtime_started_at',
   'downtime_ended_at',
   'approvals',
@@ -693,20 +697,27 @@ export const MIGRATION_SUMMARY_FIELDS = [
   'error',
   'source_running_at',
   'findings',
+  'suggested_probes',
   'created_at',
   'updated_at',
 ] as const;
 
 /**
- * `GET /migrations?view=summary` (SDD §4, §12): the fields of a migration the Overview's lists read - no passes,
- * estimates, notes, history or VM details. `phase_since` is the last phase change's time, when the phase it is in
- * began, else the creation time.
+ * `GET /migrations?view=summary` (SDD §4, §12): the fields of a migration the Overview's and the plan page's lists
+ * read - no passes, all the estimates, notes, history or VM details. `phase_since` is the last phase change's time,
+ * when the phase it is in began, else the creation time; `preflight_ran` whether the history reaches ready or
+ * blocked; `eligible_strategies` the estimates' eligible strategies, in their order.
  */
 export interface MigrationSummary
-  extends Pick<Migration, Exclude<(typeof MIGRATION_SUMMARY_FIELDS)[number], 'vm' | 'phase_since'>> {
-  vm: Pick<VMRef, 'source_id' | 'name'>;
+  extends Pick<Migration, Exclude<(typeof MIGRATION_SUMMARY_FIELDS)[number], 'vm' | 'phase_since' | 'preflight_ran' | 'eligible_strategies'>> {
+  vm: Pick<VMRef, 'source_id' | 'name' | 'project'>;
   phase_since: Timestamp;
+  preflight_ran: boolean;
+  eligible_strategies: Strategy[];
 }
+
+/** A migration or its summary: what a list page reads of either (SDD §4, §16). */
+export type MigrationLike = Migration | MigrationSummary;
 
 // ---------------------------------------------------------------------------------------------
 // §4.3 Event kinds

@@ -14,7 +14,26 @@ async function actionButton(name: RegExp) {
   return within(actions).getByRole('button', { name });
 }
 
+/** Every GET the page makes, as its path and query under /api/v1. */
+function recordingReads(reads: string[]) {
+  return (mock: typeof fetch): typeof fetch =>
+    (input, init) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+      return mock(input, init);
+    };
+}
+
 describe('PlanDetail', () => {
+  it("reads its plan's migrations as summaries, and none alone for the decisions it offers (SDD §16, perf audit PF-02)", async () => {
+    const reads: string[] = [];
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-c81d44a0', path: '/plans/:planId', token: 'admin', wrapFetch: recordingReads(reads) });
+    const panel = await screen.findByRole('region', { name: 'Waiting for advisor approval' });
+    // the actions take the summary's eligible strategies
+    expect(await within(panel).findByRole('button', { name: 'Approve' })).toBeInTheDocument();
+    expect(await screen.findByRole('table', { name: /migrations/i })).toBeInTheDocument();
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?plan_id=plan-c81d44a0&view=summary']);
+  });
+
   it('shows the settings summary, waves board and migrations table', async () => {
     renderPlan('plan-4f2a9c1e');
 

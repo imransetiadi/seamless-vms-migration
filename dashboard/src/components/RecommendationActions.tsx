@@ -1,13 +1,16 @@
 import { Replace, ThumbsUp } from 'lucide-react';
 import { useRef, useState, type RefObject } from 'react';
 import { useDecideRecommendation, useMe, usePlan, usePolicies } from '../api/hooks';
-import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type Strategy } from '../api/types';
+import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type MigrationSummary, type Strategy, type VMRef } from '../api/types';
 import { optionLabel } from '../lib/advisor';
 import { resolvePolicy } from '../lib/policies';
 import { OWN_DECISION } from '../lib/roles';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { SelectField, TextAreaField } from './Field';
+
+/** What the actions read of a migration, or of its summary: its plan, its VM and the strategies eligible now (SDD §4). */
+export type ActionMigration = Pick<Migration, 'plan_id'> & { vm: Pick<VMRef, 'source_id'> } & (Pick<Migration, 'estimates'> | Pick<MigrationSummary, 'eligible_strategies'>);
 
 /**
  * Approve the advisor's option or override it with another eligible one (SDD §14.6). Callers render it
@@ -20,7 +23,7 @@ export function RecommendationActions({
   onDecided,
 }: {
   rec: AdvisorRecommendation;
-  migration: Migration;
+  migration: ActionMigration;
   /** Where focus goes after a decision, when these actions may go with it (SDD §16). */
   focusAfterRef?: RefObject<HTMLElement>;
   /** Says what was decided, for the page's live region. */
@@ -29,7 +32,8 @@ export function RecommendationActions({
   const decide = useDecideRecommendation(rec.id);
   const policies = usePolicies();
   const [open, setOpen] = useState<'approve' | 'override' | null>(null);
-  const eligible = migration.estimates.filter((e) => e.eligible).map((e) => e.strategy);
+  // a summary names them as the API reads its estimates (SDD §4)
+  const eligible = 'eligible_strategies' in migration ? migration.eligible_strategies : migration.estimates.filter((e) => e.eligible).map((e) => e.strategy);
   const recommended = rec.recommendation.option;
   const canApprove = recommended !== null && eligible.includes(recommended as Strategy);
   // another eligible option: running the recommended one is approving it (SDD §16)

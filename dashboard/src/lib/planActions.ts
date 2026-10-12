@@ -1,4 +1,4 @@
-import type { Migration, Plan, Role } from '../api/types';
+import type { MigrationLike, Plan, Role } from '../api/types';
 import { blocksPlanChange, releaseGroups } from './inFlight';
 import { hasRole } from './roles';
 import { WAVE_COMPLETE_PHASES } from './waves';
@@ -24,7 +24,7 @@ function names(list: string[]): string {
  * plans (the API answers 409 while a migration is blocked or, in a plan with waves, belongs to no wave);
  * pause running plans.
  */
-export function planActions(plan: Plan, role: Role | undefined, migrations: Migration[]): Record<PlanActionKey, Availability> {
+export function planActions(plan: Plan, role: Role | undefined, migrations: readonly MigrationLike[]): Record<PlanActionKey, Availability> {
   const allowed = hasRole(role, 'operator');
   const gate = (ok: boolean, reason: string): Availability => {
     if (!allowed) return { enabled: false, reason: ROLE_REASON };

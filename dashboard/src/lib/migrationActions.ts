@@ -1,4 +1,4 @@
-import type { Approval, Migration, Phase, Plan, Role } from '../api/types';
+import type { Approval, Migration, MigrationLike, Phase, Plan, Role } from '../api/types';
 import { completedSince, isOverdue } from './finalize';
 import { formatRelative } from './format';
 import { canTransition } from './fsm';
@@ -264,7 +264,7 @@ function count(n: number, noun: string): string {
 }
 
 /** What validating the plan again would clear, e.g. "2 approvals and 1 cutover request"; null when nothing (SDD §5.4, §16). */
-export function clearedByValidation(migrations: readonly Migration[]): string | null {
+export function clearedByValidation(migrations: readonly MigrationLike[]): string | null {
   const touched = migrations.filter((m) => REVALIDATABLE.has(m.phase));
   const approvals = touched.reduce((n, m) => n + m.approvals.length, 0);
   const requests = touched.filter((m) => m.cutover_requested).length;
