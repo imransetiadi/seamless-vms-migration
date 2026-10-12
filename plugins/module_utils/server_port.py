@@ -269,9 +269,16 @@ class ServerPort(osm_resource.Resource):
         # Nova creates its ports with a new MAC; a port created through Neutron keeps the
         # source MAC
         neutron = port_creation_mode == "neutron"
-        if neutron:
+        if neutron and params.get("security_group_refs") is None:
+            # an export from before the rule, which create_or_update refuses (SDD 6.6)
+            errors.append(
+                f"Destination prerequisites not met: {where}: it was exported without its "
+                "security groups; export the workload again before recreating its ports "
+                "through Neutron"
+            )
+        elif neutron:
             # create_or_update looks the port's groups up for the port it creates (SDD 6.6)
-            for ref in params.get("security_group_refs") or []:
+            for ref in params["security_group_refs"]:
                 try:
                     reference.security_group_id(conn, ref)
                 except (

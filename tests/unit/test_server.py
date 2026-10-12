@@ -694,6 +694,25 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             self.assertIn("More than one SecurityGroup exists with the name 'twice'", twice)
             self.assertEqual(self.errors([port("gone")], mode="nova"), [])
 
+    def test_refuses_a_neutron_port_exported_without_its_security_groups(self):
+        """SDD 6.6: create_or_update refuses a port exported without security_group_refs (an
+        export from before that rule), after the stop; the check refuses it before. Through Nova
+        the port's own groups are never used (review RT-05)."""
+        for missing in ("absent", "null"):
+            port = network_port("p1", "app", [{"ip_address": "10.0.0.5"}])
+            if missing == "absent":
+                del port["params"]["security_group_refs"]
+            else:
+                port["params"]["security_group_refs"] = None
+            [error] = self.errors([port], mode="neutron")
+            self.assertIn("Destination prerequisites not met: port p1 on network 'app'", error)
+            self.assertIn("exported without its security groups", error)
+            self.assertEqual(self.errors([port], mode="nova"), [])
+        # a port without any group (port security off) is no old export
+        port = network_port("p1", "app", [{"ip_address": "10.0.0.5"}])
+        self.assertEqual(port["params"]["security_group_refs"], [])
+        self.assertEqual(self.errors([port], mode="neutron"), [])
+
     def test_follows_neutron_on_slaac_and_dhcpv6_stateless_subnets(self):
         def check(address, mode, mac="fa:16:3e:00:00:01"):
             port = network_port("p1", "slaac", [{"ip_address": address}], mac=mac)

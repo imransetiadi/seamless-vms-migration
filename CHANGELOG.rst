@@ -185,3 +185,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   refused, by ``import_workload_dst_check`` before the source stops and by
   ``create_or_update`` before Nova is asked for the server. Before, the import
   failed only after the source had stopped.
+- ``import_workload_dst_check`` refuses, before the source stops, a port
+  exported without ``security_group_refs`` when the ports are recreated
+  through Neutron (``port_creation_mode: neutron``). Such an export predates
+  that field. ``create_or_update`` refuses the port rather than give it the
+  project's default group, and that refusal came only after the source had
+  stopped. Export the workload again. A port with an empty list, such as one
+  with port security off, is not affected.
