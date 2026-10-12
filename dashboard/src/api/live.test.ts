@@ -55,6 +55,40 @@ describe('applyEventToCache', () => {
     expect(invalidate).not.toHaveBeenCalled();
   });
 
+  it('leaves a cached list that does not hold the migration untouched, so nothing reading it is told of a change (SDD §16, perf PF-05)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.parse('2026-10-08T12:00:00Z'));
+      const { queryClient, invalidate } = setup();
+      const other = fx.migrations.find((m) => m.plan_id !== migration.plan_id)!;
+      const elsewhere = [other];
+      queryClient.setQueryData(['migrations', { plan_id: other.plan_id }], elsewhere);
+      // a list of every plan holds it among others
+      queryClient.setQueryData(['migrations', {}], [other, migration]);
+      const before = queryClient.getQueryState(['migrations', { plan_id: other.plan_id }])!.dataUpdatedAt;
+      const notified = vi.fn();
+      const observer = new QueryObserver(queryClient, { queryKey: ['migrations', { plan_id: other.plan_id }], enabled: false, notifyOnChangeProps: 'all' });
+      const unsubscribe = observer.subscribe(notified);
+      vi.setSystemTime(Date.parse('2026-10-08T12:00:05Z'));
+      applyEventToCache(queryClient, progressEvent({ pct: 41, bytes_done: MiB }), invalidate);
+      // the event's data is the pass that ended (SDD §4.3)
+      const ended = { number: 9, kind: 'delta', started_at: '2026-10-08T12:00:00Z', ended_at: '2026-10-08T12:00:04Z', bytes_scanned: 0, bytes_changed: 0, bytes_transferred: MiB, duration_s: 4 };
+      applyEventToCache(queryClient, { ...progressEvent(ended), seq: 60, kind: 'migration.sync_pass' }, invalidate);
+      expect(queryClient.getQueryData(['migrations', { plan_id: other.plan_id }])).toBe(elsewhere);
+      expect(queryClient.getQueryState(['migrations', { plan_id: other.plan_id }])!.dataUpdatedAt).toBe(before);
+      expect(notified).not.toHaveBeenCalled();
+      // the lists that hold it are patched, the others in them kept as they are
+      expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.progress_pct).toBe(41);
+      const all = queryClient.getQueryData<Migration[]>(['migrations', {}])!;
+      expect(all[1]?.progress_pct).toBe(41);
+      expect(all[1]?.sync_passes.some((p) => p.number === 9)).toBe(true);
+      expect(all[0]).toBe(other);
+      unsubscribe();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('adds the pass a sync_pass event carries, so the next step does not drop the transferred figure (SDD §4.3, §16)', () => {
     const base = { started_at: '2026-10-08T10:00:00Z', bytes_scanned: 0, bytes_changed: 0 };
     const m: Migration = {

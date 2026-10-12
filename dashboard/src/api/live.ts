@@ -211,6 +211,15 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
   };
 }
 
+/**
+ * An updater for the cached migration lists that patches the one migration in a list that holds it. A list that does
+ * not hold it gets `undefined`, which TanStack Query takes as "no update": its data, `dataUpdatedAt` and observers are
+ * left alone, so nothing reading it draws again on every progress event (SDD §16).
+ */
+function holding(id: string, patch: (m: Migration) => Migration) {
+  return (old: Migration[] | undefined): Migration[] | undefined => (old?.some((m) => m.id === id) ? old.map(patch) : undefined);
+}
+
 /** Applies one streamed event to the query cache. */
 export function applyEventToCache(
   queryClient: QueryClient,
@@ -236,7 +245,7 @@ export function applyEventToCache(
     const patch = (m: Migration): Migration =>
       m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done === null ? m.bytes_transferred : endedPassBytes(m) + done } : m;
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, holding(id, patch));
     return;
   }
 
@@ -252,7 +261,7 @@ export function applyEventToCache(
         return { ...m, sync_passes: passes, bytes_transferred: endedPassBytes({ ...m, sync_passes: passes }) };
       };
       queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, holding(id, patch));
     }
   }
 
