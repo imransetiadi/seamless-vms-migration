@@ -21,6 +21,27 @@ describe('pyRepr', () => {
     expect(pyRepr('back\\slash')).toBe("'back\\\\slash'");
     expect(pyRepr('tab\there')).toBe("'tab\\there'");
   });
+
+  it('escapes what Python does not print, as Python 3.11 and 3.13 write it (review RT-08)', () => {
+    // str.isprintable() is false for Cc, Cf, Cs, Co, Cn, Zl, Zp and Zs (the ASCII space aside): \xhh, \uhhhh, \Uhhhhhhhh
+    expect(pyRepr('net\u00a0a')).toBe("'net\\xa0a'");
+    expect(pyRepr('net\u2028b')).toBe("'net\\u2028b'");
+    expect(pyRepr('net\u0085c')).toBe("'net\\x85c'");
+    expect(pyRepr('zero\u200bwidth')).toBe("'zero\\u200bwidth'");
+    expect(pyRepr('ideo\u3000space')).toBe("'ideo\\u3000space'");
+    expect(pyRepr('priv\ue000use')).toBe("'priv\\ue000use'");
+    expect(pyRepr('astral\u{F0000}priv')).toBe("'astral\\U000f0000priv'");
+    expect(pyRepr('greek\u0378gap')).toBe("'greek\\u0378gap'");
+    expect(pyRepr('lone\ud800half')).toBe("'lone\\ud800half'");
+    expect(pyRepr('soft\u00adhyphen')).toBe("'soft\\xadhyphen'");
+    expect(pyRepr('bom\ufeffmark')).toBe("'bom\\ufeffmark'");
+    expect(pyRepr('para\u2029sep')).toBe("'para\\u2029sep'");
+    expect(pyRepr("nbsp\u00a0'q")).toBe('"nbsp\\xa0\'q"');
+    // what Python prints stays as it is
+    expect(pyRepr('emoji\u{1F600}ok')).toBe("'emoji\u{1F600}ok'");
+    expect(pyRepr('caf\u00e9')).toBe("'caf\u00e9'");
+    expect(pyRepr('a b')).toBe("'a b'");
+  });
 });
 
 describe('formatBytes (IEC units)', () => {

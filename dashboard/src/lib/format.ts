@@ -168,18 +168,30 @@ export function pyNames(items: Iterable<string>): string {
 /** Control characters as Python's repr escapes them. */
 const REPR_ESCAPES: Record<string, string> = { '\\': '\\\\', '\t': '\\t', '\n': '\\n', '\r': '\\r' };
 
+/** What Python's `str.isprintable()` rejects, the ASCII space aside: control, format, surrogate, private-use and unassigned
+ * characters and the separators. "Unassigned" is as the browser's Unicode knows it: a character newer than the API's
+ * Python (3.11: Unicode 14) is printed here where the API escapes it. */
+const NOT_PRINTABLE = /^[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$/u;
+
+/** A character's escape as Python's repr writes it: \xhh, \uhhhh or \Uhhhhhhhh. */
+function pyEscape(code: number): string {
+  const hex = code.toString(16);
+  if (code < 0x100) return `\\x${hex.padStart(2, '0')}`;
+  if (code < 0x10000) return `\\u${hex.padStart(4, '0')}`;
+  return `\\U${hex.padStart(8, '0')}`;
+}
+
 /**
  * A name quoted as the API's messages quote it, Python's `repr` of a str: in single quotes, in double quotes when it
- * holds a single quote and no double one, with backslashes and control characters escaped.
+ * holds a single quote and no double one, with backslashes escaped and what Python does not print written as an escape.
  */
 export function pyRepr(value: string): string {
   const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
   let body = '';
   for (const ch of value) {
-    const code = ch.codePointAt(0)!;
     if (ch in REPR_ESCAPES) body += REPR_ESCAPES[ch];
-    else if (code < 0x20 || code === 0x7f) body += `\\x${code.toString(16).padStart(2, '0')}`;
     else if (ch === quote) body += `\\${ch}`;
+    else if (ch !== ' ' && NOT_PRINTABLE.test(ch)) body += pyEscape(ch.codePointAt(0)!);
     else body += ch;
   }
   return quote + body + quote;
