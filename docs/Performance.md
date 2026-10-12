@@ -599,9 +599,11 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   an idle overview costs one aggregate query; when it moved — a running plan writes a migration about every
   second — they read `(id, version)` and load only the documents that changed (`Store.versions`, `get_many`,
   61483aa): with 2 × 1,000 migrations on SQLite a call after one write fell from ≈ 220 ms to ≈ 7 ms CPU. `GET /plans` filters by `status` and pages like `/migrations`; it and
-  `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one `SELECT DISTINCT` over the indexed
+  `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one query over the indexed
   `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
-  226 → 39 ms and 153 → 32 ms CPU. Prefer SSE-triggered
+  226 → 39 ms and 153 → 32 ms CPU. The same query, grouped and counted since 282a81b, gives each plan its
+  `migration_counts`, so the dashboard's Plans list reads no migration (a4e40b0; before, it read every
+  migration of every plan to show "migrations done"), and the plan form reads them only while open. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling; an event about one existing migration
   re-reads that migration alone and splices it into the cached lists (SDD §16, 376eec7): at 1,000 VMs a plan a
   full list is ≈ 4.5 MB (≈ 0.5 MB gzipped) per page and event, one migration ≈ 4.5 KB.
