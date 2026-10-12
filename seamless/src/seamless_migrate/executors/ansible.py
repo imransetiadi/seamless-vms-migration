@@ -1011,7 +1011,13 @@ class AnsibleExecutor:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
             key, value = kit_network_key(nic), kit_network_value(network, subnet)
-            if kit_ipv4(nic.fixed_ips):
+            if key is None:
+                # the kit would drop a distributed port group's NIC that a name keys
+                problems.append(
+                    f"{what} was validated before the migration kit's key of its port group was "
+                    "recorded: validate the plan again"
+                )
+            elif kit_ipv4(nic.fixed_ips):
                 claim(what, key, value)
             else:
                 # needs no particular subnet: it takes the one another NIC of its key needs

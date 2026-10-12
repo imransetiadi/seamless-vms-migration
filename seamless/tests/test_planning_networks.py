@@ -23,10 +23,12 @@ def nic(*addresses, key=None):
     )
 
 
-def test_kit_network_key_is_the_nics_recorded_key_else_its_network_name():
+def test_kit_network_key_is_the_nics_recorded_key_or_none():
     assert kit_network_key(nic(key="dvportgroup-7")) == "dvportgroup-7"
-    # a VM inventoried before the key was recorded: a standard port group's name
-    assert kit_network_key(nic()) == "DC2-Prod"
+    # a VM validated before the key was recorded: never its port group's name, which the kit
+    # does not look a distributed port group's NIC up by (SDD §7.2, review RT-12)
+    assert kit_network_key(nic()) is None
+    assert kit_network_key(nic(key="")) is None
 
 
 def test_kit_ipv4_keeps_what_the_kit_sends_neutron():

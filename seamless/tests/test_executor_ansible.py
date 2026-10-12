@@ -55,6 +55,10 @@ VCENTER = make_provider(
     credentials_secret="vcenter-dc2",
     conversion_host=None,
 )
+# a NIC as the VMware provider records it: a standard port group's key is its name (SDD §4)
+VMW_NICS = [
+    Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net")
+]
 MAPPINGS = Mappings(
     networks={"app-net": "rhoso-app", "DC2-Prod": "dc2-prod"},
     flavors={"m1.small": "rhoso.small"},
@@ -716,7 +720,14 @@ async def test_generated_ansible_input_is_never_templated(env, strategy, source)
     networks = {**MAPPINGS.networks, JINJA_NAME: "rhoso-app"}
     mappings = MAPPINGS.model_copy(update={"networks": networks})
     # a port group named by whoever runs vCenter keys the kit's network_map (SDD §7.2)
-    nics = [Nic(network=JINJA_NAME, mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])]
+    nics = [
+        Nic(
+            network=JINJA_NAME,
+            mac="00:50:56:00:00:01",
+            fixed_ips=["10.0.0.5"],
+            network_key=JINJA_NAME,
+        )
+    ]
     ctx, _ = ctx_for(
         env, strategy=strategy, source=source, name=JINJA_NAME, mappings=mappings, nics=nics
     )
@@ -908,6 +919,29 @@ async def test_vmware_runs_give_the_kit_every_nic_by_its_key_and_refuse_before_i
     assert rec.downtime_marks == 1
 
 
+async def test_vmware_refuses_a_nic_validated_before_its_kit_key_was_recorded(env):
+    """SDD §7.2: the kit looks a NIC on a distributed port group up by the group's key and drops
+    one the map lacks. A NIC record without the key (a VM validated before it was recorded) is
+    refused before the kit, never keyed by its port group's name (review RT-12)."""
+    old = Nic(network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"])
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+    ctx, rec = ctx_for(env, nics=[old], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == (
+        "the NIC 00:50:56:00:00:01 of web-01 was validated before the migration kit's key of its "
+        "port group was recorded: validate the plan again"
+    )
+    # nothing ran: the VM keeps running
+    assert read_log(env.log) == [] and rec.downtime_marks == 0
+    # validated again, the record carries the key
+    ctx, _ = ctx_for(env, nics=[old.model_copy(update={"network_key": "dvportgroup-7"})], **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-7": "net-app-net-mine,sub-net-app-net-mine"
+    }
+
+
 @pytest.mark.parametrize("bare_first", [True, False])
 async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_needs(
     env, bare_first
@@ -964,7 +998,7 @@ async def test_vmware_nics_of_one_key_take_the_subnet_the_one_with_an_address_ne
 
 
 async def test_vmware_warm_flags(env):
-    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER)
+    ctx, rec = ctx_for(env, strategy=Strategy.vmware_warm, source=VCENTER, nics=VMW_NICS)
     await env.executor.run(StepName.PRECOPY, ctx)
     first = read_log(env.log)[-1]
     assert first["playbook"] == KIT_PLAYBOOK == "os_migrate.vmware_migration_kit.migration"
@@ -992,7 +1026,11 @@ async def test_vmware_warm_flags(env):
 
     # the warm cutover above created the server: a cold cutover of the same VM is a resume
     cold_ctx, _ = ctx_for(
-        env, strategy=Strategy.vmware_cold, source=VCENTER, downtime_started_at=utcnow()
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=VMW_NICS,
+        downtime_started_at=utcnow(),
     )
     await env.executor.run(StepName.CUTOVER, cold_ctx)
     cold = read_log(env.log)[-1]["vars"]
@@ -1317,7 +1355,7 @@ async def test_vmware_conversion_host_key_secret(env, monkeypatch):
     mig = make_migration(
         id="mig-00000000aa",
         plan_id=plan.id,
-        vm=make_vm(source_id="srv-1", name="web-01"),
+        vm=make_vm(source_id="srv-1", name="web-01", nics=VMW_NICS),
         strategy=Strategy.vmware_warm,
     )
     ctx, _ = make_ctx(plan, mig, VCENTER, keyed, env.settings)

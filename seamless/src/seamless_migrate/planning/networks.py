@@ -70,10 +70,11 @@ def resolve_network(
     )
 
 
-def kit_network_key(nic: Nic) -> str:
+def kit_network_key(nic: Nic) -> str | None:
     """What the VMware migration kit maps ``nic`` by in its network_map (SDD §7.2): the NIC's
-    ``network_key``, else (a VM inventoried before it was recorded) its network's name."""
-    return nic.network_key or nic.network
+    ``network_key``; None on a VM validated before it was recorded, never its network's name -
+    the kit looks a NIC on a distributed port group up by the group's key."""
+    return nic.network_key or None
 
 
 def kit_ipv4(addresses: Iterable[str]) -> list[str]:
