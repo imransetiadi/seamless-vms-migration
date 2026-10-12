@@ -389,6 +389,54 @@ async def test_the_demo_keeps_finished_sources_stopped_and_flags_one_powered_on(
         assert (await source.get_vm(m.vm.source_id)).power_state == "stopped", m.vm.name
 
 
+async def test_a_demo_plan_with_the_dashboards_default_tcp_ports_verifies(tmp_path, store):
+    """SDD §7.4: the New plan dialog verifies TCP 22 (3389 on Windows) by default; the demo's guests
+    answer those checks, so a plan made from the dashboard completes instead of rolling back on a
+    real connection to a simulated address."""
+    import asyncio
+
+    from seamless_migrate.domain.models import VerificationConfig
+
+    settings = Settings(
+        data_dir=tmp_path / "data", demo=True, demo_speed=1e6, demo_failure_rate=0.0, tick_s=0.01
+    )
+    services = build_services(settings, store)
+    await seed_demo(store, settings, services.orchestrator)
+    vms = await FakeSourceProvider(ProviderKind.openstack, settings.demo_seed).list_vms()
+    report = next(vm for vm in vms if vm.name == "report-01")
+    plan = Plan(
+        name="from the dashboard",
+        source_provider_id="rhosp17-finance",
+        destination_provider_id="rhoso18",
+        vm_ids=[report.source_id],
+        mappings=Mappings(
+            networks={"finance-app": "finance-app", "finance-db": "finance-db"},
+            volume_types={"ceph-ssd": "ceph-ssd", "ceph-hdd": "ceph-hdd"},
+        ),
+        require_approval=False,
+        auto_cutover=True,
+        verification=VerificationConfig(tcp_ports=[22], windows_tcp_ports=[3389], timeout_s=60),
+    )
+    store.put("plan", plan)
+    orch = services.orchestrator
+    await orch.validate_plan(plan.id, "tester")
+    await orch.start_plan(plan.id, "tester")
+    await orch.start()
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+        m = None
+        while loop.time() < deadline:
+            m = next(x for x in store.list("migration", Migration) if x.plan_id == plan.id)
+            if m.phase in (Phase.completed, Phase.failed, Phase.rolled_back):
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await orch.stop()
+    assert m is not None and m.phase == Phase.completed, (m.phase, m.error)
+    assert {c["name"]: c["ok"] for c in m.verification.checks}["tcp:22"] is True
+
+
 async def test_the_cutover_refusal_demo_vm_is_left_for_the_operator_to_plan(tmp_path, store):
     """SDD §7.4: dc2-portal-02 carries `demo-fault: cutover-refusal`, and no seeded plan holds it -
     the seeded plans and the smoke run are unchanged; planned warm from the dashboard it shows
