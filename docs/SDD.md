@@ -2350,7 +2350,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   dashboard builds both from the routes it already reads (no approvals route). On the Overview a pending approval
   is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request or a
   closed window once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
-  is unknown (Pending approvals then says its cutover approvals are unavailable).
+  is unknown (Pending approvals then says its cutover approvals are unavailable). A warm migration whose passes
+  found what its cutover will refuse (`cutover_refusals`, in `precopy`, `syncing` or `awaiting_cutover`) is listed
+  there ahead of what it waits for, as the plan list marks it — "Cutover will refuse {n} problem(s)" — with "fix
+  it, then Sync now" once it waits for its cutover and "fix it before it converges" while its passes run (the next
+  pass looks again); an approval it still needs stays in Pending approvals.
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
