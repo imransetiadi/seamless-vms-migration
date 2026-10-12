@@ -1,7 +1,7 @@
 import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
-import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
+import { applyEventToCache, createBatchedInvalidator, documentVisibility, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
 import type { Event, Migration } from './types';
 
@@ -667,6 +667,169 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       expect(client.getQueryState(key)?.status).toBe('success');
       unsubscribe();
       batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("the browser's page visibility (SDD §16, perf audit PF-03)", () => {
+  it("is hidden only for document.visibilityState 'hidden', and hears the page shown again on visibilitychange", () => {
+    const state = vi.spyOn(Document.prototype, 'visibilityState', 'get');
+    try {
+      state.mockReturnValue('visible');
+      expect(documentVisibility.hidden()).toBe(false);
+      state.mockReturnValue('hidden');
+      expect(documentVisibility.hidden()).toBe(true);
+      const shown = vi.fn();
+      const stop = documentVisibility.onVisible(shown);
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).not.toHaveBeenCalled(); // still hidden
+      state.mockReturnValue('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).toHaveBeenCalledTimes(1);
+      stop();
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).toHaveBeenCalledTimes(1);
+    } finally {
+      state.mockRestore();
+    }
+    // jsdom, like a page in front, is not hidden: the batch flushes as before
+    expect(document.visibilityState).not.toBe('hidden');
+    expect(documentVisibility.hidden()).toBe(false);
+  });
+});
+
+describe('a hidden page holds the live-event batch (SDD §16, perf audit PF-03)', () => {
+  it('reads nothing while the page is hidden and refreshes once, as one batch, when it is shown again', async () => {
+    vi.useFakeTimers();
+    try {
+      const fx2 = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
+      const one = fx2.migrations.find((m) => m.phase === 'precopy') as Migration;
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(['migrations', {}], [one]);
+      const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+      const fetchMigration = vi.fn(async () => one);
+      let hidden = true;
+      let shown: (() => void) | null = null;
+      const stopWatching = vi.fn();
+      const visibility = {
+        hidden: () => hidden,
+        onVisible: (listener: () => void) => {
+          shown = listener;
+          return stopWatching;
+        },
+      };
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration, visibility);
+      const timers = vi.spyOn(globalThis, 'setTimeout');
+      batch.invalidate(['plans']);
+      batch.invalidate(['stats']);
+      batch.invalidate(['plans']);
+      batch.refreshMigration(one.id);
+      await vi.advanceTimersByTimeAsync(5000);
+      // a background tab: nothing is read again, and no batch timer wakes it
+      expect(spy).not.toHaveBeenCalled();
+      expect(fetchMigration).not.toHaveBeenCalled();
+      expect(timers.mock.calls.filter(([, ms]) => ms === 400)).toEqual([]);
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy.mock.calls.map(([filters]) => filters?.queryKey)).toEqual([['plans'], ['stats']]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      // shown with nothing waiting: nothing more is read
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy).toHaveBeenCalledTimes(2);
+      batch.dispose();
+      expect(stopWatching).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a migration once the page is shown again, also when nothing else waits', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const page = { ...(buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration), id: 'mig-0000000001' };
+      // its page is cached, so the read is wanted (PF-04)
+      queryClient.setQueryData(['migration', page.id], page);
+      const fetchMigration = vi.fn(async () => page);
+      let hidden = true;
+      let shown: (() => void) | null = null;
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration, {
+        hidden: () => hidden,
+        onVisible: (listener) => {
+          shown = listener;
+          return () => {};
+        },
+      });
+      batch.refreshMigration('mig-0000000001');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).toHaveBeenCalledWith('mig-0000000001');
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds a batch whose timer started before the page was hidden', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+      let hidden = false;
+      let shown: (() => void) | null = null;
+      const batch = createBatchedInvalidator(queryClient, 400, undefined, {
+        hidden: () => hidden,
+        onVisible: (listener) => {
+          shown = listener;
+          return () => {};
+        },
+      });
+      batch.invalidate(['plans']);
+      hidden = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(spy).not.toHaveBeenCalled();
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy).toHaveBeenCalledTimes(1);
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('a batch with many migrations to read (SDD §16, perf audit PF-03)', () => {
+  async function batchOf(count: number) {
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // a cached list, so the reads are wanted (PF-04)
+    queryClient.setQueryData(['migrations', {}], [base]);
+    const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+    const fetchMigration = vi.fn(async (id: string) => ({ ...base, id }));
+    const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+    for (let n = 0; n < count; n++) batch.refreshMigration(`mig-${String(n).padStart(10, '0')}`);
+    await vi.advanceTimersByTimeAsync(400);
+    batch.dispose();
+    return { fetchMigration, invalidated: spy.mock.calls.map(([filters]) => filters?.queryKey) };
+  }
+
+  it('reads up to 50 migrations one by one, and past 50 reads the lists and pages again instead', async () => {
+    vi.useFakeTimers();
+    try {
+      const fifty = await batchOf(50);
+      expect(fifty.fetchMigration).toHaveBeenCalledTimes(50);
+      expect(fifty.invalidated).not.toContainEqual(['migrations']);
+      const many = await batchOf(51);
+      expect(many.fetchMigration).not.toHaveBeenCalled();
+      expect(many.invalidated).toEqual(expect.arrayContaining([['migrations'], ['migration']]));
     } finally {
       vi.useRealTimers();
     }

@@ -107,20 +107,56 @@ interface Batch {
   at: number;
 }
 
+/** The most migrations one batch reads one by one; past it the batch reads the lists and pages again (SDD §16). */
+export const MAX_SPLICED = 50;
+
+/** Whether the page is hidden (a background tab), and a way to hear when it is shown again (SDD §16). */
+export interface PageVisibility {
+  hidden(): boolean;
+  /** Calls `listener` when the page is shown again; returns how to stop. */
+  onVisible(listener: () => void): () => void;
+}
+
+/** The browser's page visibility: `document.visibilityState` and its `visibilitychange` event. */
+export const documentVisibility: PageVisibility = {
+  hidden: () => typeof document !== 'undefined' && document.visibilityState === 'hidden',
+  onVisible: (listener) => {
+    if (typeof document === 'undefined') return () => {};
+    const onChange = () => {
+      if (document.visibilityState !== 'hidden') listener();
+    };
+    document.addEventListener('visibilitychange', onChange);
+    return () => document.removeEventListener('visibilitychange', onChange);
+  },
+};
+
 /**
  * Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. With `fetchMigration`,
  * `refreshMigration(id)` reads that one migration once per flush and puts it into the cached lists that hold it
- * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise.
+ * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise. While the page is hidden
+ * the flush waits, and runs once when the page is shown again (§16).
  */
-export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400, fetchMigration?: (id: string) => Promise<Migration>) {
+export function createBatchedInvalidator(
+  queryClient: QueryClient,
+  delayMs = 400,
+  fetchMigration?: (id: string) => Promise<Migration>,
+  visibility: PageVisibility = documentVisibility,
+) {
   const pending = new Map<string, QueryKey>();
   const migrations = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+  // a background tab reads nothing again: what waits is flushed once the page is shown (SDD §16)
+  const schedule = () => {
+    if (!visibility.hidden()) timer ??= setTimeout(flush, delayMs);
+  };
+  const stopWatching = visibility.onVisible(() => {
+    if (!disposed && (pending.size > 0 || migrations.size > 0)) timer ??= setTimeout(flush, 0);
+  });
   const invalidate = (queryKey: QueryKey) => {
     if (disposed) return;
     pending.set(JSON.stringify(queryKey), queryKey);
-    timer ??= setTimeout(flush, delayMs);
+    schedule();
   };
   const splice = async (id: string, read: (id: string) => Promise<Migration>, batch: Batch) => {
     let fresh: Migration;
@@ -163,11 +199,19 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
   };
   const flush = () => {
     timer = null;
+    // hidden since the timer started: it waits for the page to be shown
+    if (visibility.hidden()) return;
     // the queries this batch reads again (the active ones invalidateQueries refetches), filled below before any splice
     // reaches the lists - each awaits its read first
     const batch: Batch = { refreshed: new Set(), relied: new Set(), at: Date.now() };
-    const ids = [...migrations];
+    let ids = [...migrations];
     migrations.clear();
+    if (ids.length > MAX_SPLICED) {
+      // more than one by one is worth - a long-hidden page in a busy wave: the lists and pages are read again (SDD §16)
+      pending.set(JSON.stringify(['migrations']), ['migrations']);
+      pending.set(JSON.stringify(['migration']), ['migration']);
+      ids = [];
+    }
     // a page that caches neither a migration nor any migration list takes no read (SDD §16)
     const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).length > 0;
     for (const id of ids) {
@@ -191,7 +235,7 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
         });
       }
     }
-    if (pending.size > 0 || migrations.size > 0) timer ??= setTimeout(flush, delayMs);
+    if (pending.size > 0 || migrations.size > 0) schedule();
   };
   return {
     invalidate,
@@ -202,10 +246,11 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
         return;
       }
       migrations.add(id);
-      timer ??= setTimeout(flush, delayMs);
+      schedule();
     },
     dispose() {
       disposed = true;
+      stopWatching();
       if (timer) clearTimeout(timer);
       timer = null;
       pending.clear();
