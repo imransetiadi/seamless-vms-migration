@@ -328,6 +328,9 @@ def test_warm_playbooks_story(env):
     assert sync["state_dir"] == env.state_dir
     assert env.state("srv-1")["passes"][0]["kind"] == "full"
     assert env.state("srv-1")["pending_snapshot"] is None
+    # a pass makes no port or floating IP: their problems are warnings there (SDD 6.6)
+    check = next(c["args"] for c in calls if c["module"] == "import_workload_dst_check")
+    assert check["network_as_warnings"] is True
 
     # 2. Another pre-copy pass is a delta pass.
     rc, out, calls = env.run("import_workloads_precopy")
@@ -351,6 +354,9 @@ def test_warm_playbooks_story(env):
     ]
     sync = next(c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
     assert sync["pass_kind"] == "final"
+    # the cutover's check refuses them before the source stops
+    check = next(c["args"] for c in calls if c["module"] == "import_workload_dst_check")
+    assert "network_as_warnings" not in check
     create = next(c["args"] for c in calls if c["module"] == "import_workload_create_instance")
     assert create["warm_state_dir"] == env.state_dir
     assert [m["uuid"] for m in create["block_device_mapping"]] == ["dvol-vm1"]

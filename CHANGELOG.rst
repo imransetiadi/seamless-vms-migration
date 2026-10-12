@@ -192,3 +192,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   project's default group, and that refusal came only after the source had
   stopped. Export the workload again. A port with an empty list, such as one
   with port security off, is not affected.
+- ``import_workload_dst_check`` takes ``network_as_warnings`` (default
+  ``false``), and the warm pre-copy role sets it before each pre-copy or sync
+  pass. A pass makes no port or floating IP, so their problems are now
+  warnings in its log, which say the cutover will refuse them, and only the
+  server's own prerequisites (flavor, image, security groups, key pair) fail
+  it. Before, such a problem failed a pass that may copy a disk for hours,
+  although it could be fixed while the copy ran. The cutover's check still
+  refuses it before the source stops.

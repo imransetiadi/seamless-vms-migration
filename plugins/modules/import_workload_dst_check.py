@@ -59,6 +59,14 @@ options:
     required: false
     type: dict
     default: {}
+  network_as_warnings:
+    description:
+      - Report the problems of the workload's ports and floating IPs as warnings instead of
+        failing. A warm pre-copy or sync pass creates neither; the cutover's check refuses
+        them before the source stops.
+    required: false
+    type: bool
+    default: false
   cloud:
     description:
       - Cloud resource from clouds.yml
@@ -96,6 +104,7 @@ def run_module():
     argument_spec = os_auth.openstack_full_argument_spec(
         data=dict(type="dict", required=True),
         dst_filters=dict(type="dict", required=False, default={}),
+        network_as_warnings=dict(type="bool", required=False, default=False),
     )
 
     result = dict(
@@ -111,7 +120,15 @@ def run_module():
 
     conn = os_auth.get_connection(module)
     ser_server = server.Server.from_data(module.params["data"])
-    errors = ser_server.dst_prerequisites_errors(conn, module.params["dst_filters"])
+    warn_network = module.params["network_as_warnings"]
+    errors = ser_server.dst_prerequisites_errors(
+        conn, module.params["dst_filters"], network=not warn_network
+    )
+    if warn_network:
+        # a warm pass makes no port or floating IP: the cutover's check refuses their
+        # problems before the source stops (SDD 6.6)
+        for problem in ser_server.dst_network_errors(conn):
+            module.warn("The cutover will refuse this before the source stops: " + problem)
 
     if errors:
         error_msg = " ".join(errors)

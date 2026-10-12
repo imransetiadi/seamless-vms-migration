@@ -42,6 +42,9 @@
             client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
             data: "{{ item }}"
             dst_filters: "{{ os_migrate_dst_filters }}"
+            # a pass makes no port or floating IP: the cutover's check refuses their
+            # problems before the source stops (SDD 6.6)
+            network_as_warnings: true
 
         - name: Snapshot the running workload
           os_migrate.os_migrate.import_workload_warm_snapshot:

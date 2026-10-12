@@ -602,9 +602,22 @@ def run_module(module, args, conn, shell_factory=None):
             payload = json.dumps({"ANSIBLE_MODULE_ARGS": module_args}).encode()
             return mock.patch.object(basic, "_ANSIBLE_ARGS", payload)
 
+    from ansible.module_utils.common import warnings as module_warnings
+
+    # a module process starts with no warnings: in-process runs share the registries
+    for registry in ("_global_warnings", "_global_deprecations"):
+        getattr(module_warnings, registry, {}).clear()
     connect = mock.Mock(return_value=conn)
     stdout = io.StringIO()
     with contextlib.ExitStack() as stack:
+        try:
+            from ansible.module_utils import _internal
+        except ImportError:  # ansible-core < 2.19
+            pass
+        else:
+            # never the controller, which ansible-core 2.19 and later mark once a test imported
+            # its code: a controller's module.warn() displays instead of returning the warning
+            stack.enter_context(mock.patch.object(_internal, "is_controller", False))
         stack.enter_context(patch_module_args(args))
         stack.enter_context(mock.patch.object(os_auth, "get_connection", connect))
         if shell_factory is not None:
