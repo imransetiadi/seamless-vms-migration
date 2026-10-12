@@ -965,9 +965,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   * the network is the RHOSO network the port group resolves to: the plan's mapping of it, else the same
     name, by the rule of §7.3 step 0 against the destination's networks read for that run. The kit looks
     a value up by its ID first;
-  * the subnet is the network's subnet that holds the NIC's IPv4 addresses, or any of its subnets (an
-    IPv4 one first) when the NIC has none; a network without a subnet gets its id alone, which the kit
-    takes for a NIC with no IPv4 address (its port then gets none).
+  * the subnet is the network's subnet that holds the NIC's IPv4 addresses. A NIC with none needs no
+    particular subnet: it takes the one another NIC of its key needs, since the kit gives both one value,
+    else any of the network's subnets (an IPv4 one first). A network without a subnet gets its id alone,
+    which the kit takes for a NIC with no IPv4 address (its port then gets none).
 
   The run stops before the kit, which powers the VM off at the cutover, with a permanent failure naming
   the NIC when the network does not resolve, when the credential may not put a port there (§6.6's rule,
