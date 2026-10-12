@@ -1159,7 +1159,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
             </div>
           </details>
 
-          {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} />}
+          {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} reveal />}
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">

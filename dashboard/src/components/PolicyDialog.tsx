@@ -331,7 +331,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
             onChange={(on) => set('requireDistinctApprover', on)}
           />
 
-          {save.error && <ErrorBanner error={save.error} title={policy ? 'The policy was not saved' : 'The policy was not created'} />}
+          {save.error && <ErrorBanner error={save.error} title={policy ? 'The policy was not saved' : 'The policy was not created'} reveal />}
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">

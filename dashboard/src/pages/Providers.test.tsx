@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Providers from './Providers';
 
 // a key-shaped string without key material (write-only upload fixture)
@@ -424,6 +424,33 @@ describe('Providers page', () => {
     await waitFor(() => expect(added()[0]?.credentials_updated_at).not.toBeNull());
     expect(added()).toHaveLength(1);
     expect(JSON.stringify(server.providers)).not.toContain('Hunter2-secret');
+  });
+
+  it('scrolls a failed save into view: the long form would keep it out of sight (SDD §16)', async () => {
+    const recorder = recordScrolls();
+    try {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      // the credentials step fails (e.g. the secret store cannot be written)
+      const target = server as unknown as { setCredentials: (...args: unknown[]) => unknown };
+      target.setCredentials = () => {
+        throw new Error('secret store unavailable');
+      };
+      renderPage('admin', server);
+      const dialog = await openAdd(user);
+      await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab D');
+      await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-d.example.com:5000/v3');
+      await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+      await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+      await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+      await user.click(within(dialog).getByRole('button', { name: /^add and test connection$/i }));
+      const alert = await within(dialog).findByRole('alert');
+      expect(alert).toHaveTextContent(/not all changes were saved/i);
+      expect(recorder.scrolls.map((s) => s.element)).toContain(alert);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('after a connection test that did not pass, Edit again fixes the added provider instead of adding it again (SDD §16)', async () => {

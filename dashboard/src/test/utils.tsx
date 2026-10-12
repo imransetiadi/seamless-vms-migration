@@ -14,6 +14,23 @@ import { ThemeProvider } from '../theme/ThemeProvider';
 /** Fixed clock for deterministic fixtures. */
 export const TEST_NOW = Date.parse('2026-10-08T12:00:00Z');
 
+/** What scrollIntoView was called on, and how: jsdom has no scrollIntoView of its own (SDD §16). */
+export function recordScrolls(): { scrolls: Array<{ element: Element; options: unknown }>; restore: () => void } {
+  const proto = Element.prototype as unknown as Record<string, unknown>;
+  const own = Object.getOwnPropertyDescriptor(proto, 'scrollIntoView');
+  const scrolls: Array<{ element: Element; options: unknown }> = [];
+  proto.scrollIntoView = function (this: Element, options?: unknown) {
+    scrolls.push({ element: this, options });
+  };
+  return {
+    scrolls,
+    restore: () => {
+      if (own) Object.defineProperty(proto, 'scrollIntoView', own);
+      else delete proto.scrollIntoView;
+    },
+  };
+}
+
 export interface RenderOptions {
   /** Mock token selecting the role (`viewer`, `operator`, `approver`, `admin`). */
   token?: string | null;

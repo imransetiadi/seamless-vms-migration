@@ -941,7 +941,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
             )}
           </Section>
 
-          {failureText && <ErrorBanner error={failure} title={editing ? 'Not all changes were saved' : 'The provider could not be saved'} />}
+          {failureText && <ErrorBanner error={failure} title={editing ? 'Not all changes were saved' : 'The provider could not be saved'} reveal />}
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">

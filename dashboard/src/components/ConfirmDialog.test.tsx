@@ -2,6 +2,7 @@ import { render, screen, within } from '@testing-library/react';
 import { Trash2 } from 'lucide-react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
+import { recordScrolls } from '../test/utils';
 import { ConfirmDialog } from './ConfirmDialog';
 
 describe('ConfirmDialog', () => {
@@ -43,6 +44,21 @@ describe('ConfirmDialog', () => {
     expect(confirm).toHaveAccessibleDescription('Enter a reason first.');
     await user.click(confirm);
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it('scrolls its request failure into view, and the next one again (SDD §16)', () => {
+    const recorder = recordScrolls();
+    try {
+      const props = { open: true, tone: 'danger' as const, title: 'Delete RHOSO 18.0?', confirmLabel: 'Delete provider', onConfirm: vi.fn(), onCancel: vi.fn() };
+      const { rerender } = render(<ConfirmDialog {...props} error={new Error('a plan still uses it')} />);
+      const alert = screen.getByRole('alert');
+      expect(alert).toHaveTextContent('Delete provider failed');
+      expect(recorder.scrolls.map((s) => s.element)).toEqual([alert]);
+      rerender(<ConfirmDialog {...props} error={new Error('a plan still uses it')} />);
+      expect(recorder.scrolls).toHaveLength(2);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('keeps Cancel focusable while its request runs, saying why (SDD §16)', async () => {

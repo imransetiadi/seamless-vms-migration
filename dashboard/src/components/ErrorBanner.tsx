@@ -9,13 +9,15 @@ export interface ErrorBannerProps {
   title?: string;
   onRetry?: () => void;
   className?: string;
+  /** A dialog's request failure, at the end of its scrolling body: scrolled into view when it appears or changes. */
+  reveal?: boolean;
 }
 
 /** How long Retry stays busy without an answer before it can be pressed again. */
 const RETRY_BUSY_MAX_MS = 30_000;
 
 /** Announced error with its cause and a recovery path (retry). */
-export function ErrorBanner({ error, title = 'Something went wrong', onRetry, className }: ErrorBannerProps) {
+export function ErrorBanner({ error, title = 'Something went wrong', onRetry, className, reveal = false }: ErrorBannerProps) {
   const code = error instanceof ApiError && error.code ? error.code : null;
   // Retry is busy until an answer comes: another failure ends it, a success removes the banner (SDD §16)
   const [retrying, setRetrying] = useState(false);
@@ -36,6 +38,11 @@ export function ErrorBanner({ error, title = 'Something went wrong', onRetry, cl
       });
     };
   }, []);
+  // seen as well as heard (SDD §16); an error a page shows while loading is never scrolled to, so a refetch in the
+  // background never moves the page
+  useEffect(() => {
+    if (reveal) root.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [reveal, error]);
   // never stuck busy: a retry that gets no answer at all frees Retry after the API's own bound
   useEffect(() => {
     if (!retrying) return;

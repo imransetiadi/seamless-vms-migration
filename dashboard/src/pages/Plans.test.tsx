@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
 
 describe('Plans page', () => {
@@ -171,6 +171,33 @@ describe('Plans page', () => {
     expect(created?.downtime_slo_s).toBe(600);
     expect(created?.estimator_overrides).toEqual({});
     expect(created?.status).toBe('draft');
+  });
+
+  it('scrolls a plan that was not created into view (SDD §16)', async () => {
+    const recorder = recordScrolls();
+    try {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      const handle = server.handle.bind(server);
+      server.handle = (method, path, query, body, token) =>
+        method === 'POST' && path === '/plans'
+          ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+          : handle(method, path, query, body, token);
+      renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+      await user.click(await screen.findByRole('button', { name: /new plan/i }));
+      const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Not created');
+      await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+      await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+      await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+      await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+      const alert = await within(dialog).findByText('The plan was not created');
+      const banner = alert.closest('[role="alert"]');
+      expect(banner).not.toBeNull();
+      expect(recorder.scrolls.map((s) => s.element)).toContain(banner);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('sets the guest write rate and the aggregate scan cap of a new plan (SDD §16)', async () => {
