@@ -1,3 +1,4 @@
+<!-- Modified by the Seamless Migrate project, 2026. -->
 The role conversion_host
 deploys all the resources required to do a
 workload migration. This includes the conversion

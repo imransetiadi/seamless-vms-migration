@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: change item in file for update test
   ansible.builtin.replace:
     path: "{{ os_migrate_data_dir }}/networks.yml"

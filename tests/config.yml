@@ -1,4 +1,5 @@
 ---
+# Modified by the Seamless Migrate project, 2026.
 # Minimum Python version required for this collection
 python:
   minimum: "3.10"

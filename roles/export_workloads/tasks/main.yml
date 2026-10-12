@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Scan instances for workloads to export
   os_migrate.os_migrate.server_info:
     filters: "{{ os_migrate_src_filters }}"

@@ -6,6 +6,11 @@
 Red Hat OpenStack Services on OpenShift (RHOSO) 18.0 — with minutes of downtime, predictable before it
 starts, approved by the right people, and reversible until you finalize.**
 
+> **Independent project.** Seamless Migrate is not affiliated with, sponsored by, or endorsed by
+> Red Hat, Inc., the Open Infrastructure Foundation (OpenStack), or Broadcom Inc. (VMware).
+> Product names are used only to describe compatibility. See
+> [Trademarks and affiliation](#trademarks-and-affiliation).
+
 Seamless Migrate 0.1.0 extends the [os-migrate](#collection-reference-os-migrate) Ansible collection (this
 repository's root, which stays the *data mover*) with a warm migration path, a control plane with a REST/SSE
 API and CLI, a dashboard, and optional AI assistance (Jev for bounded judgments, agentmemory for lessons
@@ -223,9 +228,50 @@ an API response); AI payloads redacted and guest console
 output screened as untrusted; non-root, read-only-root-filesystem containers with default-deny network
 policies. Report vulnerabilities privately — see [docs/Security.md](docs/Security.md) §14.
 
+## Trademarks and affiliation
+
+Seamless Migrate is an independent open source project. It is not affiliated with, sponsored by,
+or endorsed by Red Hat, Inc., IBM, the OpenStack Foundation d/b/a Open Infrastructure Foundation
+("OpenInfra"), Broadcom Inc., or the upstream os-migrate project. Product and project names appear
+in this repository only to describe what Seamless Migrate works with.
+
+- Red Hat, Red Hat Enterprise Linux, OpenShift and Ansible are trademarks or registered trademarks
+  of Red Hat, Inc. or its subsidiaries in the United States and other countries.
+- The OpenStack word mark is a trademark of the OpenStack Foundation d/b/a Open Infrastructure
+  Foundation.
+- VMware, vSphere and vCenter are trademarks or registered trademarks of Broadcom Inc. and/or its
+  subsidiaries.
+- Kubernetes is a registered trademark of The Linux Foundation.
+- All other trademarks are the property of their respective owners.
+
+## Upstream attribution
+
+Seamless Migrate builds on [os-migrate](https://github.com/os-migrate/os-migrate), licensed under
+the Apache License 2.0. Upstream copyright and license notices are retained, and files modified by
+this project carry a notice stating that they were changed. Seamless Migrate is distributed under
+the same license; see [LICENSE](LICENSE).
+
+## Support
+
+Seamless Migrate is not a Red Hat product and is not covered by any Red Hat subscription or support
+agreement. Please do not open Red Hat support cases for it. Report bugs in
+[GitHub Issues](https://github.com/imransetiadi/seamless-vms-migration/issues) and vulnerabilities
+as described in [docs/Security.md](docs/Security.md).
+
+Where this README calls a guest OS "supported", it refers to Red Hat's virt-v2v support matrix for
+the conversion step, not to support for Seamless Migrate itself.
+
+The software is provided "AS IS", without warranties or conditions of any kind (Apache License 2.0,
+sections 7 and 8). A migration can stop or change production workloads: rehearse it outside
+production and keep verified backups before you finalize.
+
 ---
 
 ## Collection reference (os-migrate)
+
+> **Note:** This section reproduces the upstream os-migrate README for reference only. Statements
+> about Red Hat support, Red Hat Automation Hub and certified content apply to the upstream
+> `os_migrate.os_migrate` collection published by the os-migrate project, not to Seamless Migrate.
 
 The remainder of this file is the upstream **os-migrate 1.0.5** collection README, kept for reference. The
 collection is the data mover underneath Seamless Migrate and can still be used on its own.

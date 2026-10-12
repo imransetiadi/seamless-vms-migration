@@ -13,6 +13,7 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+# Modified by the Seamless Migrate project, 2026.
 
 - name: Get the current openstacksdk version
   ansible.builtin.command: python3 -c "import importlib.metadata; print(importlib.metadata.version('openstacksdk'))"

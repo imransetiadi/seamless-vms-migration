@@ -1,0 +1,18 @@
+Seamless Migrate
+Copyright 2026 The Seamless Migrate Authors
+
+This product builds on os-migrate (https://github.com/os-migrate/os-migrate),
+licensed under the Apache License, Version 2.0. Seamless Migrate is distributed
+under the same license; see LICENSE.
+
+Files from os-migrate 1.0.5 that this project modified carry the comment
+"Modified by the Seamless Migrate project, 2026." The following modified files
+cannot carry that comment; this notice states that they were changed:
+
+  README.md
+      Its changes are limited to the project's own sections.
+  tests/sanity/ignore-2.15.txt
+  tests/sanity/ignore-2.16.txt
+  tests/sanity/ignore-2.17.txt
+  tests/sanity/ignore-2.18.txt
+      ansible-test sanity ignore files do not allow comment-only lines.
