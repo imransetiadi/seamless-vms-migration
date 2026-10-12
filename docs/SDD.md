@@ -163,7 +163,8 @@ Nic   { network: str, mac: str|null, fixed_ips: list[str] = [], vnic_type: str =
         mtu: int|null,
         network_key: str|null = null }  # VMware: what the migration kit maps the NIC by (§7.2): its
                                         # distributed port group's key, else its device summary
-                                        # (a standard port group's name); null for OpenStack
+                                        # (a standard port group's name); null for OpenStack,
+                                        # and on a VM validated before it was recorded
 
 VMRef { source_id: str, name: str, project: str|null, flavor: str|null, vcpus: int, ram_mb: int,
         disks: list[Disk], nics: list[Nic],
@@ -964,7 +965,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `use_fixed_ips` it gives the NIC's IPv4 guest addresses the subnet named in the NIC's map value; otherwise
   the network's first subnet, and a value without one becomes the `omit` placeholder string. So before
   every kit run (pre-copy, sync, cutover) the executor writes, for each NIC of the VM,
-  `network_map[network_key, else the NIC's network] = "{network id},{subnet id}"`:
+  `network_map[network_key] = "{network id},{subnet id}"`:
   * the network is the RHOSO network the port group resolves to: the plan's mapping of it, else the same
     name, by the rule of §7.3 step 0 against the destination's networks read for that run. The kit looks
     a value up by its ID first;
@@ -973,10 +974,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     else any of the network's subnets (an IPv4 one first). A network without a subnet gets its id alone,
     which the kit takes for a NIC with no IPv4 address (its port then gets none).
 
-  The run stops before the kit, which powers the VM off at the cutover, with a permanent failure naming
-  the NIC when the network does not resolve, when the credential may not put a port there (§6.6's rule,
-  with the roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host
-  addresses of one subnet of that network, or when two NICs share a key but need different values.
+  The run stops before the kit, which powers the VM off at the cutover, with a permanent failure naming the NIC when
+  its record has no `network_key` (a VM validated before the key was recorded: the kit would look a NIC on a
+  distributed port group up by its key and drop it, so the plan is validated again, after a retry if the migration
+  failed), when the network does not resolve, when the credential may not put a port there (§6.6's rule, with the
+  roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host addresses of one subnet of
+  that network, or when two NICs share a key but need different values.
   Destination networks that cannot be read are a transient failure.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
