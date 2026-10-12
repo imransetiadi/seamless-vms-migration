@@ -517,9 +517,12 @@ the force goes with the cutover request (a retry, a new assessment), and the nex
 Approvals, `cutover_requested` (with its requester) and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
-`blocked` and `ready`, and one that an interrupted validation left in `validating` (a write that failed
-between its two transitions — a database error, a restart): a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. A VM whose migration is `cancelled` (terminal) cannot be
+`blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
+its lock, so no other validation is still at work on it. A validation writes each migration once — a new one is
+created already assessed, its history running from `pending` through `validating` to `ready` or `blocked`, and an
+existing one takes both transitions in one write — and then emits the same events: `migration.created` for a new
+one and one `migration.phase` per transition. Only an earlier version wrote the two transitions apart, so that a
+database error or a restart between them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
@@ -1617,7 +1620,10 @@ Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `adv
 `advisor_policy` (§14.6).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
-`ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
+`ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
+exists already is a `ConflictError`, and an `UPDATE … WHERE version = n` for `n > 0`, where no row updated is a
+`ConflictError` saying whether the document is missing or at which version it is — and only an unconditional write
+reads the version first), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
 top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
 pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
 other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
