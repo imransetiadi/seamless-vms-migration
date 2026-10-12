@@ -102,6 +102,14 @@ SCRIPT = textwrap.dedent(
                 port["params"]["security_group_refs"] = [{{"name": "default",
                     "project_name": "finance", "domain_name": "Default"}}]
                 port["params"]["is_port_security_enabled"] = True
+        floating = os.environ.get("ANSIBLE_FAKE_FLOATING")
+        if floating:
+            # "{{address}}@{{network}}": a floating IP on the port's 10.0.0.5
+            address, network = floating.split("@", 1)
+            doc["resources"][0]["params"]["floating_ips"] = [{{"params": {{
+                "fixed_ip_address": "10.0.0.5", "floating_ip_address": address,
+                "floating_network_ref": {{"name": network, "project_name": "admin",
+                                         "domain_name": "Default"}}}}}}]
         twin = os.environ.get("ANSIBLE_FAKE_TWIN_ID")
         if twin:
             # os-migrate exports by name: another server of the project with the same name

@@ -1749,7 +1749,7 @@ def test_resolve_network_refs_points_each_port_at_the_network_the_cutover_finds(
 
 def test_resolve_network_refs_refuses_a_name_it_cannot_resolve():
     """SDD §7.2: a port network the rule cannot resolve stops the cutover before the source stops,
-    naming the port; so does a floating IP's."""
+    naming the port."""
     two = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso-2")]
     two[1]["own"] = True
     doc = server_doc(("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"))
@@ -1759,11 +1759,48 @@ def test_resolve_network_refs_refuses_a_name_it_cannot_resolve():
         resolve_network_refs(doc, two)
     with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:01.*no network named 'rhoso-app'"):
         resolve_network_refs(doc, [dst_net("other")])
-    floating = server_doc(
-        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"), floating=[("203.0.113.10", "gone")]
+
+
+def test_resolve_network_refs_keeps_a_floating_network_it_cannot_resolve():
+    """SDD §7.2, review NC-10: a floating IP's network that does not resolve keeps its reference
+    as exported - in auto mode a detached floating IP with the address needs no network, and the
+    destination check refuses a network the import needs before the stop - while the port's is
+    resolved as always."""
+    doc = server_doc(
+        ("fa:16:3e:00:00:01", "rhoso-app", "10.0.0.5"),
+        floating=[("203.0.113.10", "gone"), ("203.0.113.11", "twice")],
     )
-    with pytest.raises(PermanentStepError, match="203.0.113.10.*no network named 'gone'"):
-        resolve_network_refs(floating, [dst_net("rhoso-app")])
+    networks = [dst_net("rhoso-app"), dst_net("twice"), {**dst_net("twice"), "id": "net-twice-2"}]
+    out = resolve_network_refs(doc, networks)
+    fips = out["resources"][0]["params"]["floating_ips"]
+    assert [f["params"]["floating_network_ref"] for f in fips] == [
+        {"name": "gone", "project_name": "admin", "domain_name": "Default"},
+        {"name": "twice", "project_name": "admin", "domain_name": "Default"},
+    ]
+    port = out["resources"][0]["params"]["ports"][0]["params"]
+    assert port["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+async def test_a_cutover_keeps_a_floating_network_it_cannot_resolve(env, monkeypatch):
+    """SDD §7.2, review NC-10: RHOSO has no network named like the floating IP's - the cutover
+    runs with the reference as exported, for the destination check to judge by the mode."""
+    monkeypatch.setenv("ANSIBLE_FAKE_FLOATING", "203.0.113.7@public")
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, cold)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    [fip] = exported_server(env)["params"]["floating_ips"]
+    assert fip["params"]["floating_network_ref"] == {
+        "name": "public",
+        "project_name": "admin",
+        "domain_name": "Default",
+    }
 
 
 async def test_a_cutover_resolves_the_network_references_before_the_import(env):

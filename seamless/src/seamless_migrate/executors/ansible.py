@@ -257,6 +257,13 @@ def _overridden_ports(doc: dict[str, Any]) -> bool:
     )
 
 
+def _scoped_ref(ref: dict[str, Any], network: dict[str, Any]) -> dict:
+    # os-migrate searches the credential's own project for %auth%, and every network it sees
+    # for a reference without a project (SDD §7.2)
+    scope = "%auth%" if network.get("own") else None
+    return {**ref, "project_name": scope, "domain_name": scope}
+
+
 def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what: str) -> dict:
     name = ref.get("name")
     network, why = resolve_network(networks, str(name))
@@ -265,10 +272,7 @@ def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what:
             f"{what} cannot go to RHOSO network {name!r}: "
             + (why or f"there is no network named {name!r}")
         )
-    # os-migrate searches the credential's own project for %auth%, and every network it sees
-    # for a reference without a project (SDD §7.2)
-    scope = "%auth%" if network.get("own") else None
-    return {**ref, "project_name": scope, "domain_name": scope}
+    return _scoped_ref(ref, network)
 
 
 def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -276,8 +280,10 @@ def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]
     RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
     keeps ``%auth%`` as the reference's project and domain, another project's - the only one of
     its name - neither; every fixed IP reference becomes address-only, so Neutron finds the
-    address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port or a
-    floating IP whose network does not resolve: raised before the import stops the source."""
+    address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port whose
+    network does not resolve: raised before the import stops the source. A floating IP's that does
+    not resolve keeps its reference: in auto mode a detached floating IP with the address needs
+    no network, and the destination check judges it before the stop."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -294,13 +300,10 @@ def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]
             ]
         for fip in server.get("floating_ips") or []:
             params = fip.get("params") or {}
-            if params.get("floating_network_ref"):
-                what = (
-                    f"the floating IP {params.get('floating_ip_address')} of {server.get('name')}"
-                )
-                params["floating_network_ref"] = _resolved_ref(
-                    params["floating_network_ref"], networks, what
-                )
+            ref = params.get("floating_network_ref")
+            network = resolve_network(networks, str(ref.get("name")))[0] if ref else None
+            if network is not None:
+                params["floating_network_ref"] = _scoped_ref(ref, network)
     return out
 
 
