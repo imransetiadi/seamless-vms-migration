@@ -1,7 +1,7 @@
 import { CircleAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
+import { useCreatePlan, useInventory, useMigrationSummaries, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
 import { heldElsewhere } from '../lib/holds';
@@ -289,7 +289,8 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing - read only while
   // the form is open: the page behind it reads no migration (SDD §16)
   const plans = usePlans();
-  const migrations = useMigrations({}, { enabled: open });
+  // which VMs another plan holds: the migrations as summaries, read while open (SDD §5.4, §16)
+  const migrations = useMigrationSummaries({}, { enabled: open });
 
   useEffect(() => {
     if (!open) return;

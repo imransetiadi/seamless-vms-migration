@@ -94,6 +94,24 @@ describe('Plans page', () => {
     expect(read.filter((path) => path.startsWith('/migrations'))).toEqual([]);
   });
 
+  it("names the VMs another plan holds from the migration summaries it reads while open (SDD §5.4, §16, perf audit PF-02)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const reads: string[] = [];
+    renderWithApp(<Plans />, {
+      route: '/plans',
+      path: '/plans',
+      token: 'operator',
+      wrapFetch: (mock) => (input, init) => {
+        if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+        return mock(input, init);
+      },
+    });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    await screen.findByRole('dialog', { name: /new migration plan/i });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
+  });
+
   it('summarises validation errors and moves focus to the summary', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator' });

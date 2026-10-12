@@ -601,6 +601,26 @@ describe('MigrationDetail', () => {
     await waitFor(() => expect(m.vm.source_id in plan.probe_overrides).toBe(false));
   });
 
+  it("decides whether its plan can be edited from the plan's migration summaries, not the whole list (SDD §16, perf audit PF-02)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const reads: string[] = [];
+    renderWithApp(<MigrationDetail />, {
+      route: `/migrations/${m.id}`,
+      path: '/migrations/:migrationId',
+      token: 'operator',
+      server,
+      wrapFetch: (mock) => (input, init) => {
+        if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+        return mock(input, init);
+      },
+    });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await within(panel).findByRole('button', { name: 'Edit network' });
+    await waitFor(() => expect(reads.filter((r) => r.startsWith('/migrations?'))).not.toEqual([]));
+    expect(new Set(reads.filter((r) => r.startsWith('/migrations?')))).toEqual(new Set([`/migrations?plan_id=${m.plan_id}&view=summary`]));
+  });
+
   it("shows where each NIC goes and lets an operator send it to another network with other addresses (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();

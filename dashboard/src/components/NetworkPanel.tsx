@@ -1,6 +1,6 @@
 import { Info, Pencil, Trash2, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import { useInventory, useMigrations, usePatchPlan, useProviders } from '../api/hooks';
+import { useInventory, useMigrationSummaries, usePatchPlan, useProviders } from '../api/hooks';
 import type { Migration, Plan, Role } from '../api/types';
 import { capabilityRoles, portRefusal, resolveNetwork } from '../lib/networks';
 import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
@@ -17,7 +17,8 @@ import { Modal } from './Modal';
 export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration: Migration; plan: Plan | null | undefined; role: Role | undefined; onSaved: (text: string) => void }) {
   // the plan's edit rules (SDD §12), as for the probes: only a draft or validated plan is editable
   const editable = plan?.status === 'draft' || plan?.status === 'validated';
-  const siblings = useMigrations({ plan_id: m.plan_id }, { enabled: editable });
+  // whether the plan can be edited: its migrations as summaries (SDD §16, perf audit PF-02)
+  const siblings = useMigrationSummaries({ plan_id: m.plan_id }, { enabled: editable });
   const providers = useProviders();
   const inventory = useInventory(plan?.destination_provider_id);
   const patch = usePatchPlan(plan?.id ?? '');

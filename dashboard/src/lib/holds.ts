@@ -13,7 +13,7 @@ export function heldElsewhere(
   sourceId: string,
   planId: string | undefined,
   plans: readonly Plan[],
-  migrations: readonly Migration[],
+  migrations: readonly (Pick<Migration, 'plan_id' | 'phase'> & { vm: Pick<Migration['vm'], 'source_id' | 'name'> })[],
 ): Map<string, string[]> {
   const wanted = new Set(vmIds);
   const others = new Map(plans.filter((p) => p.id !== planId && p.source_provider_id === sourceId).map((p) => [p.id, p]));
