@@ -2497,6 +2497,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
   event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
+  A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
+  cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
+  as it is, so what reads only such lists does not draw again on every progress event.
   Persisted events refresh the queries they affect in one batch per 400 ms. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
