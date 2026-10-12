@@ -370,6 +370,8 @@ export interface Plan {
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
   derived_status: DerivedPlanStatus;
+  /** Read-only: how many of the plan's migrations are in each phase that has any; {} before the first validation (SDD §4, §8.1). */
+  migration_counts: Partial<Record<Phase, number>>;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -849,7 +851,7 @@ export interface Me {
 }
 
 
-type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'created_at' | 'updated_at';
+type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'migration_counts' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';
 
 /** Plan fields minus id/waves/status/created_at/updated_at; name, providers and vm_ids required. */

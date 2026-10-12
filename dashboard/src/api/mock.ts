@@ -271,7 +271,7 @@ function probeProblemsOf(where: string, value: unknown): string[] {
 
 /** The API's `PLAN_EDITABLE_FIELDS` (SDD §12): what a `PlanCreate` and a PATCH may carry. */
 export const PLAN_EDITABLE_FIELDS: ReadonlySet<string> = new Set([
-  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'created_at', 'updated_at'].includes(key)),
+  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'migration_counts', 'created_at', 'updated_at'].includes(key)),
   'name',
   'source_provider_id',
   'destination_provider_id',
@@ -1715,9 +1715,13 @@ export class MockServer {
     return null;
   }
 
-  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19). */
+  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19) and its migrations counted by phase (§4). */
   private withDerivedStatus(res: MockResponse): MockResponse {
-    const out = (plan: Plan): Plan => ({ ...plan, derived_status: derivePlanStatus(plan, this.migrations) });
+    const out = (plan: Plan): Plan => {
+      const counts: Plan['migration_counts'] = {};
+      for (const m of this.migrations) if (m.plan_id === plan.id) counts[m.phase] = (counts[m.phase] ?? 0) + 1;
+      return { ...plan, derived_status: derivePlanStatus(plan, this.migrations), migration_counts: counts };
+    };
     const isPlan = (value: unknown): value is Plan => typeof value === 'object' && value !== null && 'vm_ids' in value && 'waves' in value;
     if (Array.isArray(res.body)) return { ...res, body: res.body.map((item: unknown) => (isPlan(item) ? out(item) : item)) };
     return isPlan(res.body) ? { ...res, body: out(res.body) } : res;

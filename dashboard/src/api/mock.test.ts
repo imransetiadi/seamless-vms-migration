@@ -1960,6 +1960,25 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect((await viewer.get<Plan[]>('/plans')).find((p) => p.id === pilot.id)!.derived_status).toBe('finalized');
   });
 
+  it('returns every plan with its migrations counted by phase, which a client cannot set (SDD §4, §8.1, PF-02)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const counted = (planId: string) => {
+      const counts: Record<string, number> = {};
+      for (const m of server.migrations.filter((x) => x.plan_id === planId)) counts[m.phase] = (counts[m.phase] ?? 0) + 1;
+      return counts;
+    };
+    const viewer = as(server, 'viewer');
+    const all = await viewer.get<Plan[]>('/plans');
+    for (const plan of all) expect(plan.migration_counts).toEqual(counted(plan.id));
+    expect(all.some((p) => Object.keys(p.migration_counts).length > 1)).toBe(true);
+    // derived on every answer: a migration that moves moves its count
+    byName(server, 'web-cache-01').phase = 'finalized';
+    const pilot = await viewer.get<Plan>('/plans/plan-2d5c8b93');
+    expect(pilot.migration_counts).toEqual(counted('plan-2d5c8b93'));
+    // the API's: a PATCH may not carry it
+    await expect(as(server, 'operator').patch(`/plans/${pilot.id}`, { migration_counts: { completed: 9 } })).rejects.toMatchObject({ status: 422 });
+  });
+
   it('splits completed into awaiting finalize and finalized', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const stats = await as(server, 'viewer').get<Stats>('/stats?plan_id=plan-2d5c8b93');

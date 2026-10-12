@@ -1,9 +1,9 @@
 import { ClipboardList, Plus, SearchX } from 'lucide-react';
 import { useEffect, useId, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { useMigrations, usePlans, useProviders } from '../api/hooks';
+import { usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import { DERIVED_PLAN_STATUSES, type DerivedPlanStatus } from '../api/types';
+import { DERIVED_PLAN_STATUSES, type DerivedPlanStatus, type Plan } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -27,11 +27,19 @@ export interface NewPlanState {
   newPlan?: { sourceId: string; vmIds: string[] };
 }
 
+/** A plan's migrations done, from the counts it carries: the list reads no migration (SDD §16, §8.1). */
+function planProgress(plan: Plan): { total: number; done: number } {
+  const counts = plan.migration_counts ?? {};
+  const total = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
+  // before the first validation: its VMs, none done
+  if (!total) return { total: plan.vm_ids.length, done: 0 };
+  return { total, done: (counts.completed ?? 0) + (counts.finalized ?? 0) };
+}
+
 export default function Plans() {
   usePageTitle('Plans');
   const searchId = useId();
   const plans = usePlans();
-  const migrations = useMigrations();
   const providers = useProviders();
   const role = useRole();
   const location = useLocation();
@@ -53,16 +61,6 @@ export default function Plans() {
   }, [location.state, location.pathname, navigate, canCreate]);
 
   const providerName = useMemo(() => new Map((providers.data ?? []).map((p) => [p.id, p.name])), [providers.data]);
-  const progress = useMemo(() => {
-    const map = new Map<string, { total: number; done: number }>();
-    for (const m of migrations.data ?? []) {
-      const entry = map.get(m.plan_id) ?? { total: 0, done: 0 };
-      entry.total += 1;
-      if (m.phase === 'completed' || m.phase === 'finalized') entry.done += 1;
-      map.set(m.plan_id, entry);
-    }
-    return map;
-  }, [migrations.data]);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -78,8 +76,8 @@ export default function Plans() {
         case 'vms':
           return p.vm_ids.length;
         case 'done': {
-          const pr = progress.get(p.id);
-          return pr && pr.total ? pr.done / pr.total : 0;
+          const pr = planProgress(p);
+          return pr.total ? pr.done / pr.total : 0;
         }
         case 'slo':
           return p.downtime_slo_s;
@@ -87,7 +85,7 @@ export default function Plans() {
           return Date.parse(p.updated_at);
       }
     });
-  }, [plans.data, query, status, sort, progress]);
+  }, [plans.data, query, status, sort]);
 
   const onSort = (key: SortKey) => setSort(nextSort(sort, key));
 
@@ -131,9 +129,6 @@ export default function Plans() {
       </p>
       {plans.isPending && <LoadingBlock label="Loading plans…" rows={5} />}
       {plans.error && <ErrorBanner error={plans.error} title="Plans are unavailable" onRetry={() => void plans.refetch()} />}
-      {migrations.error && (
-        <ErrorBanner error={migrations.error} title="Migration progress is unavailable" onRetry={() => void migrations.refetch()} />
-      )}
       {/* without the providers each plan shows its provider ids, not their names (SDD §16) */}
       {providers.error && (
         <ErrorBanner error={providers.error} title="Providers are unavailable: the plans show provider ids" onRetry={() => void providers.refetch()} />
@@ -172,7 +167,7 @@ export default function Plans() {
             </thead>
             <tbody>
               {rows.map((p) => {
-                const pr = progress.get(p.id) ?? { total: p.vm_ids.length, done: 0 };
+                const pr = planProgress(p);
                 return (
                   <tr key={p.id}>
                     <th scope="row" className="sm:min-w-48">
@@ -182,23 +177,17 @@ export default function Plans() {
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>
                       {/* on a phone the Done and clouds columns are hidden: their facts stand under the name (SDD §16) */}
                       <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal sm:hidden">
-                        {migrations.error ? (
-                          <span className="text-xs text-muted-foreground">progress unknown</span>
-                        ) : (
-                          <>
-                            {/* never a dot on a 320 px screen: the count wraps under the bar instead */}
-                            <ProgressBar
-                              value={pr.total ? (pr.done / pr.total) * 100 : 0}
-                              label={`${p.name}: migrations done`}
-                              tone="success"
-                              size="sm"
-                              className="min-w-16 flex-1"
-                            />
-                            <span className="num shrink-0 text-xs">
-                              {pr.done}/{pr.total} done
-                            </span>
-                          </>
-                        )}
+                        {/* never a dot on a 320 px screen: the count wraps under the bar instead */}
+                        <ProgressBar
+                          value={pr.total ? (pr.done / pr.total) * 100 : 0}
+                          label={`${p.name}: migrations done`}
+                          tone="success"
+                          size="sm"
+                          className="min-w-16 flex-1"
+                        />
+                        <span className="num shrink-0 text-xs">
+                          {pr.done}/{pr.total} done
+                        </span>
                       </span>
                       <span className="mt-0.5 block text-xs font-normal text-muted-foreground sm:hidden">
                         {providerName.get(p.source_provider_id) ?? p.source_provider_id} → {providerName.get(p.destination_provider_id) ?? p.destination_provider_id}
@@ -214,17 +203,12 @@ export default function Plans() {
                     </td>
                     <td className="num text-right">{p.vm_ids.length}</td>
                     <td className="hidden w-40 sm:table-cell">
-                      {migrations.error ? (
-                        // progress cannot be read: say so rather than show 0 done (the banner above explains)
-                        <span className="text-xs text-muted-foreground">unknown</span>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
-                          <span className="num shrink-0 text-xs">
-                            {pr.done}/{pr.total}
-                          </span>
-                        </div>
-                      )}
+                      <div className="flex items-center gap-2">
+                        <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
+                        <span className="num shrink-0 text-xs">
+                          {pr.done}/{pr.total}
+                        </span>
+                      </div>
                     </td>
                     <td className="num hidden whitespace-nowrap text-right lg:table-cell">{formatDuration(p.downtime_slo_s)}</td>
                     <td className="hidden whitespace-nowrap text-muted-foreground lg:table-cell">

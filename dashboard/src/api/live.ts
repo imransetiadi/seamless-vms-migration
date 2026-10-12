@@ -299,7 +299,8 @@ export function applyEventToCache(
       if (event.migration_id) invalidate(['migration', event.migration_id]);
     }
     invalidate(['stats']);
-    if (event.plan_id && (kind === 'migration.phase' || kind === 'migration.created')) invalidate(['plans', event.plan_id]);
+    // the plan list with its plan: their status and migration counts follow the phases (SDD §16)
+    if (kind === 'migration.phase' || kind === 'migration.created') invalidate(['plans']);
     return;
   }
   if (kind.startsWith('plan.') || kind.startsWith('wave.')) {

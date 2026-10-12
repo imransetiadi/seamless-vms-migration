@@ -1085,6 +1085,7 @@ export function defaultPlanFields(now: number) {
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,
+    migration_counts: {} as Plan['migration_counts'],
     created_at: iso(now),
     updated_at: iso(now),
   };

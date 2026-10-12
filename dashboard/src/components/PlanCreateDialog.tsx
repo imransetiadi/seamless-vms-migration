@@ -286,9 +286,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const inventory = useInventory(form.sourceId || undefined);
-  // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing
+  // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing - read only while
+  // the form is open: the page behind it reads no migration (SDD §16)
   const plans = usePlans();
-  const migrations = useMigrations();
+  const migrations = useMigrations({}, { enabled: open });
 
   useEffect(() => {
     if (!open) return;

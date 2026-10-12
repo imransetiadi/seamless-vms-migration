@@ -70,22 +70,29 @@ describe('Plans page', () => {
     await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Plans' })).toHaveFocus());
   });
 
-  it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
+  it("shows each plan's done count from its migration counts and reads no migration (SDD §16, PF-02)", async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
-    server.handle = (method, path, query, body, token) =>
-      method === 'GET' && path === '/migrations'
-        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
-        : handle(method, path, query, body, token);
+    const read: string[] = [];
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET') read.push(path);
+      return handle(method, path, query, body, token);
+    };
+    const plan = server.plans.find((p) => p.name === 'DC1 → RHOSO production rollout')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    // completed and finalized both count as done
+    ofPlan[0]!.phase = 'completed';
+    ofPlan[1]!.phase = 'finalized';
+    const done = ofPlan.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length;
+    // a plan before its first validation counts its VMs, none done
+    server.plans.push({ ...plan, id: 'plan-0d0d0d0d', name: 'Not validated yet', vm_ids: ['vm-a', 'vm-b', 'vm-c'], waves: [], status: 'draft' });
     renderWithApp(<Plans />, { server });
-
-    // a 5xx is retried twice with backoff before the query reports the error
-    expect(await screen.findByText(/migration progress is unavailable/i, {}, { timeout: 8000 })).toBeInTheDocument();
-    // the Done column says it does not know, rather than showing every plan at 0 done
-    const table = screen.getByRole('table');
-    expect(within(table).queryByText(/^0\/\d+$/)).not.toBeInTheDocument();
-    expect(within(table).getAllByText('unknown').length).toBeGreaterThan(0);
-  }, 15_000); // the 5xx retries take about 3 s
+    const link = await screen.findByRole('link', { name: 'DC1 → RHOSO production rollout' });
+    expect(within(link.closest('th')!).getByText(`${done}/${ofPlan.length} done`)).toBeInTheDocument();
+    expect(within(screen.getByRole('link', { name: 'Not validated yet' }).closest('th')!).getByText('0/3 done')).toBeInTheDocument();
+    expect(read).toContain('/plans');
+    expect(read.filter((path) => path.startsWith('/migrations'))).toEqual([]);
+  });
 
   it('summarises validation errors and moves focus to the summary', async () => {
     const user = userEvent.setup({ delay: null });
@@ -342,7 +349,8 @@ describe('Plans page', () => {
   });
 
   it.each([
-    ['/migrations', /migration progress is unavailable/i],
+    // the list reads no migration, so no page banner names a failed /migrations: only the form does (SDD §16)
+    ['/migrations', null],
     ['/plans', /plans are unavailable/i],
   ])('says it cannot check whether another plan holds a selected VM when %s cannot be loaded (SDD §5.4, §16)', async (failing, pageBanner) => {
     const server = createTestServer();
@@ -359,8 +367,8 @@ describe('Plans page', () => {
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
-    // the load has failed (the page behind names it), but with no VM selected there is nothing to check
-    await screen.findByText(pageBanner);
+    // the load has failed (the page behind names a failed plan list), but with no VM selected there is nothing to check
+    if (pageBanner) await screen.findByText(pageBanner);
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
     await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
 

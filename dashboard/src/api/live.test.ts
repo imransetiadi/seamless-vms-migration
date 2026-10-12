@@ -170,7 +170,8 @@ describe('applyEventToCache', () => {
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 42, kind: 'migration.phase' }, invalidate);
     expect(invalidate).toHaveBeenCalledWith(['migrations']);
     expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
-    expect(invalidate).toHaveBeenCalledWith(['plans', migration.plan_id]);
+    // the plan list with its plan: their status and migration counts follow the phases (SDD §16)
+    expect(invalidate).toHaveBeenCalledWith(['plans']);
     expect(invalidate).toHaveBeenCalledWith(['stats']);
 
     invalidate.mockClear();
