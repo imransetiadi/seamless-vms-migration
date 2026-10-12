@@ -24,7 +24,7 @@ from typing import Any, TypeVar
 from ..ai.redaction import redact_cut
 from ..config import Settings
 from ..domain.enums import Strategy
-from ..domain.models import Plan, Provider, utcnow
+from ..domain.models import Mappings, Plan, Provider, utcnow
 from ..planning.ipam import address_refusal, requested_ips
 from ..planning.networks import port_refusal
 from ..storage import (
@@ -34,7 +34,7 @@ from ..storage import (
     split_host,
     storage_family,
 )
-from .ansible import classify_failure, run_dir
+from .ansible import classify_failure, effective_mappings, run_dir
 from .base import PermanentStepError, StepContext, StepName, StepResult
 
 log = logging.getLogger(__name__)
@@ -407,9 +407,11 @@ class HandoverExecutor:
         server_id: str,
         backend_map: dict[str, str],
         plan: Plan | None = None,
+        mappings: Mappings | None = None,
     ) -> dict[str, Any]:
         """Step 0 as a read-only report: what each volume would become, and every problem; with the
-        plan, also what would make step 8 fail on a port or a security group."""
+        plan, also what would make step 6 or 8 fail on a port, a security group, the flavor or a
+        volume type - ``mappings`` as those steps apply them, the plan's by default."""
         mode = plan.port_creation_mode if plan is not None else "nova"
         definition = self._capture_definition(src, server_id, mode)
         attachments = definition["attachments"]
@@ -417,6 +419,7 @@ class HandoverExecutor:
         if plan is not None:
             problems.extend(self._port_problems(dst, definition["networks"], plan, server_id))
             problems.extend(self._group_problems(dst, definition))
+            problems.extend(self._lookup_problems(dst, definition, mappings or plan.mappings))
         if attachments and not any(a["boot"] for a in attachments):
             # the destination server could not be created, nor the source again on rollback
             problems.append(
@@ -484,6 +487,7 @@ class HandoverExecutor:
         server_id: str,
         backend_map: dict[str, str],
         plan: Plan | None = None,
+        mappings: Mappings | None = None,
     ) -> dict[str, Any]:
         """Read-only handover check of one server (SDD §7.3 step 0): per volume its driver
         family, source pool, destination host and manage reference, and every problem that would
@@ -492,7 +496,7 @@ class HandoverExecutor:
         dst = await self._conn(destination)
         return await self._call(
             "check the handover readiness",
-            lambda: self._readiness(src, dst, server_id, backend_map, plan),
+            lambda: self._readiness(src, dst, server_id, backend_map, plan, mappings),
         )
 
     @staticmethod
@@ -594,6 +598,27 @@ class HandoverExecutor:
                 problems.append(
                     f"{', '.join(who)}: RHOSO has {many} named {name!r} in the credential's project"
                 )
+        return problems
+
+    @staticmethod
+    def _lookup_problems(dst: Any, definition: dict[str, Any], mappings: Mappings) -> list[str]:
+        """The flavor step 8 and the volume types step 6 would ask RHOSO for and it lacks, found
+        while the VM still runs (§7.3 step 0): both steps run after the source server was deleted.
+        Each is chosen as those steps choose it - the mapping, else the source's own name."""
+        problems: list[str] = []
+        source = definition["flavor"]
+        flavor = mappings.flavors.get(source, source)
+        if flavor and dst.compute.find_flavor(flavor, ignore_missing=True) is None:
+            problems.append(f"the server's flavor {source!r}: RHOSO has no flavor named {flavor!r}")
+        known = {str(_attr(t, "name")) for t in dst.block_storage.types()}
+        missing: dict[str, list[str]] = {}
+        for att in definition["attachments"]:
+            vtype = mappings.volume_types.get(att["volume_type"] or "", att["volume_type"])
+            if vtype and vtype not in known:
+                missing.setdefault(vtype, []).append(str(att["volume_id"]))
+        for vtype, volumes in missing.items():
+            which = f"volume {volumes[0]}" if len(volumes) == 1 else f"volumes {', '.join(volumes)}"
+            problems.append(f"{which}: RHOSO has no volume type named {vtype!r}")
         return problems
 
     @staticmethod
@@ -930,14 +955,16 @@ class HandoverExecutor:
         journal = await asyncio.to_thread(_Journal, rdir / JOURNAL_FILE)
         src = await self._conn(ctx.source)
         dst = await self._conn(ctx.destination)
-        mappings = ctx.plan.mappings
+        # the plan's mappings overlaid with the flavor preflight matched: what steps 6 and 8 apply
+        # (SDD §7.2)
+        mappings = effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings)
         backend_map = ctx.plan.handover.backend_map
         server_id = ctx.migration.vm.source_id
 
         if not journal.data["order"]:
             # step 0: everything that can be checked while the VM still runs (§7.3, §7.3.1)
             report = await self.readiness(
-                ctx.source, ctx.destination, server_id, backend_map, ctx.plan
+                ctx.source, ctx.destination, server_id, backend_map, ctx.plan, mappings
             )
             if report["problems"]:
                 raise PermanentStepError(

@@ -153,6 +153,11 @@ class FakeCompute:
         return res
 
     def find_flavor(self, name, ignore_missing=True):
+        # by default every flavor exists
+        if self.c.flavor_names is not None and name not in self.c.flavor_names:
+            if ignore_missing:
+                return None
+            raise NotFoundException(f"No Flavor found for {name}")
         return NS(id=f"flavor-{name}", name=name)
 
     def create_server(self, **params):
@@ -204,6 +209,9 @@ class FakeBlockStorage:
             self.c.crash_wait = None
             raise Crash("wait_for_delete")
         return res
+
+    def types(self):
+        return [NS(id=f"type-{name}", name=name) for name in self.c.type_names]
 
     def backend_pools(self):
         if self.c.pools is None:
@@ -393,6 +401,9 @@ class FakeCloud:
         self.security_groups = {}
         self.group_lookups = []
         self.group_list = None
+        # Nova's flavors (None: every name), and Cinder's types: the source's and the mapped one
+        self.flavor_names = None
+        self.type_names = ("ceph-ssd", "ceph-hdd", "rbd-hdd")
         self.current_project_id = f"{name}-project"
         # keystoneauth: the role names of the token (the handover's admin credential)
         self.roles = ["admin", "member", "reader"]
@@ -1806,6 +1817,47 @@ async def test_handover_step_0_refuses_a_security_group_step_8_could_not_find(tm
     clouds["dst"].group_list = twice
     await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
     assert clouds["dst"].created
+
+
+async def test_handover_creates_the_server_with_the_flavor_preflight_matched(tmp_path):
+    """SDD §7.3 step 8, review RT-01: with no flavor mapped, the flavor preflight matched for the
+    migration (its resolved mappings, §7.2) is the server's; a plan mapping still wins."""
+    matched = Mappings(flavors={"m1.small": "rhoso.medium"})
+    for name, flavors, expected in (
+        ("matched", {}, "flavor-rhoso.medium"),
+        ("mapped", {"m1.small": "rhoso.small"}, "flavor-rhoso.small"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        # RHOSO has no flavor of the source's name: step 0 checks the one step 8 uses
+        clouds["dst"].flavor_names = {"rhoso.medium", "rhoso.small"}
+        mappings = plan.mappings.model_copy(update={"flavors": flavors})
+        plan = plan.model_copy(update={"mappings": mappings})
+        mig = mig.model_copy(update={"resolved_mappings": matched})
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+        assert clouds["dst"].created[0]["flavor_id"] == expected, name
+
+
+async def test_handover_step_0_refuses_a_flavor_or_a_volume_type_rhoso_lacks(tmp_path):
+    """SDD §7.3 step 0, review RT-01/RT-02: steps 6 and 8 run after step 4 deleted the source
+    server; a flavor or a volume type they would ask RHOSO for and it lacks refuses before the
+    stop."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "flavor")
+    clouds["dst"].flavor_names = {"rhoso.large"}
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "the server's flavor 'm1.small': RHOSO has no flavor named 'rhoso.small'" in (
+        str(refused.value)
+    )
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
+    # ceph-ssd is unmapped and RHOSO lacks a type of that name; ceph-hdd maps to rbd-hdd, it has
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "type")
+    clouds["dst"].type_names = ("rbd-hdd",)
+    with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert "volume vol-root: RHOSO has no volume type named 'ceph-ssd'" in str(refused.value)
+    # vol-data is checked under its mapped type, which RHOSO has
+    assert "vol-data" not in str(refused.value)
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == []
 
 
 async def test_handover_step_8_uses_the_network_step_0_resolved(tmp_path):
