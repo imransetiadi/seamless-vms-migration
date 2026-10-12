@@ -1158,6 +1158,14 @@ with Retry first, and how both clear (the API is read only to wait for a pass or
 `dashboard/dist`. `SHOT_DIR=` keeps a screenshot of the page when a check fails. CI's `dashboard-e2e` job runs it
 after its mock-mode smoke: it builds the dashboard, installs the control plane into the runner's Python
 (`SEAMLESS=seamless`) and uploads the screenshots of a failed run with the Playwright report.
+[`tests/e2e/demo-approval-browser.mjs`](../tests/e2e/demo-approval-browser.mjs) drives maker-checker (SDD §5.4, ADV-17)
+the same way, with authentication on: it creates two throwaway tokens in its own data directory (`seamless token
+create`, never printed) — a requester and an approver — and, in two browser sessions, plans the free finance VMs
+`report-01` and `batch-01` through New plan with the dialog's approval defaults, requests each cutover (the dialog
+asks to request it, not to start it), checks that the requester cannot approve it and is told why, approves as
+the other user — each cutover runs and verifies on TCP 22 — finalizes `report-01` typing its name and rolls back
+`batch-01` with the reason it asks for (10 checks, about 25 s). CI's `dashboard-e2e` job runs it after the DEMO-07
+journey.
 
 The committed scripts pass `shellcheck`.
 

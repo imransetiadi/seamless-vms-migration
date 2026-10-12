@@ -420,6 +420,20 @@ def test_ci_runs_the_demo07_browser_journey_against_a_built_dashboard():
     assert re.search(r"pip install -e \.", before), before
 
 
+def test_ci_runs_the_maker_checker_browser_journey_after_the_demo07_one():
+    """The maker-checker journey (QASuite §14.7, SDD §5.4) runs in the same dashboard-e2e job,
+    after the DEMO-07 journey's build and install, with the runner's ``seamless`` and a time
+    bound of its own."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["dashboard-e2e"]["steps"]
+    runs = [step.get("run", "") for step in steps]
+    at = next((i for i, run in enumerate(runs) if "demo-approval-browser.mjs" in run), None)
+    assert at is not None, [step.get("name") or step.get("uses") for step in steps]
+    demo07 = next(i for i, run in enumerate(runs) if "demo-cutover-refusal-browser.mjs" in run)
+    assert at > demo07 and "SEAMLESS=seamless" in runs[at]
+    assert 0 < steps[at].get("timeout-minutes", 0) <= 5
+
+
 def test_no_test_id_carries_a_secret():
     """A parametrized case's id comes from its arguments, and ids reach pytest's cache - which the
     working-tree scan of ``make seamless-check`` reads (S-17) - ``-v`` output and CI logs. So no id
