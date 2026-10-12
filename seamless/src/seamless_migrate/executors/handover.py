@@ -977,6 +977,8 @@ class HandoverExecutor:
                 server = src.compute.get_server(server_id)
                 if str(_attr(server, "status", "")).upper() != "SHUTOFF":
                     src.compute.stop_server(server)
+                    # Nova accepted it: should the wait fail, a rollback starts the source (§7.3)
+                    journal.mark("sent:stop_source")
                 src.compute.wait_for_server(
                     server, status="SHUTOFF", interval=self.poll_s, wait=self.wait_s
                 )

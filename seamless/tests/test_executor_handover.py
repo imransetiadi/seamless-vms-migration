@@ -733,6 +733,39 @@ async def test_handover_rollback_with_empty_journal_is_a_noop(tmp_path):
     }
 
 
+async def test_handover_rollback_starts_a_source_whose_stop_was_sent(tmp_path):
+    """SDD §7.3 step 1, review RT-10: Nova accepted the stop, then the wait for SHUTOFF failed;
+    the stop is journaled as sent, so the rollback starts the source again instead of reading an
+    empty journal as nothing to roll back."""
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path)
+    clouds["src"].crash_wait = "server"  # the wait for SHUTOFF dies after the stop was sent
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert clouds["src"].servers["srv-1"].status == "SHUTOFF"
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [("src", "start_server", "srv-1")]
+    assert result.details == {"source_running": True}
+    # a retry instead of the rollback: the stop step runs again (it is not done until the wait
+    # succeeds), sends no second stop to the stopped source, and the handover completes
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "retry")
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    retried = await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert retried.destination_server_id
+    assert [op for op in ops(calls) if op[1] == "stop_server"] == [("src", "stop_server", "srv-1")]
+    # a source already stopped before the handover: no stop was sent, nothing to start again
+    executor, calls, clouds, plan, mig, settings = setup(tmp_path / "stopped")
+    clouds["src"].servers["srv-1"].status = "SHUTOFF"
+    clouds["src"].crash_wait = "server"
+    with pytest.raises(PermanentStepError, match="stop source server"):
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, DST, settings)[0])
+    calls.clear()
+    result = await executor.run(StepName.ROLLBACK, make_ctx(plan, mig, SRC, DST, settings)[0])
+    assert ops(calls) == [] and result.details["note"] == "nothing to roll back"
+
+
 async def test_handover_rollback_before_the_source_is_deleted_restores_and_starts(tmp_path):
     """Crash before the server was deleted: the volumes are still attached and managed; the
     rollback sets the journaled delete_on_termination back and starts the source."""
