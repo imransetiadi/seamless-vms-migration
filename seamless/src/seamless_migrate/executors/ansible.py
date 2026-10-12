@@ -284,15 +284,19 @@ def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what:
     return _scoped_ref(ref, network)
 
 
-def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def resolve_network_refs(
+    doc: dict[str, Any], networks: Sequence[dict[str, Any]], deferred: list[str] | None = None
+) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
     RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
     keeps ``%auth%`` as the reference's project and domain, another project's - the only one of
     its name - neither; every fixed IP reference becomes address-only, so Neutron finds the
     address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port whose
-    network does not resolve: raised before the import stops the source. A floating IP's that does
-    not resolve keeps its reference: in auto mode a detached floating IP with the address needs
-    no network, and the destination check judges it before the stop."""
+    network does not resolve: raised before the import stops the source. Given ``deferred`` (a
+    warm pre-copy or sync run, which makes no port), the failure is added there instead and the
+    port keeps its references as exported. A floating IP's network that does not resolve keeps
+    its reference: in auto mode a detached floating IP with the address needs no network, and
+    the destination check judges it before the stop."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -301,7 +305,15 @@ def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]
         for port in server.get("ports") or []:
             params = port.get("params") or {}
             what = f"the port {params.get('mac_address')} of {server.get('name')}"
-            params["network_ref"] = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            try:
+                ref = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            except PermanentStepError as exc:
+                if deferred is None:
+                    raise
+                # the cutover resolves it again and stops there, before the source stops
+                deferred.append(str(exc))
+                continue
+            params["network_ref"] = ref
             params["fixed_ips_refs"] = [
                 {"ip_address": ref["ip_address"]}
                 for ref in params.get("fixed_ips_refs") or []
@@ -348,10 +360,12 @@ def _apply_port_mode(
     networks: Sequence[dict[str, Any]] | None = None,
     record: dict[str, Any] | None = None,
     exports: bool = False,
+    deferred: list[str] | None = None,
 ) -> bool:
     """Write the plan's port_creation_mode into an existing export before a run, and resolve its
     network references again with the destination's ``networks`` when given, unless the run
     replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
+    A warm pass passes ``deferred``, where a port network that does not resolve is added.
 
     True when the run must export the workload again: a cutover in "neutron" mode whose ports were
     exported without their security groups, or of a VM with NIC overrides, or that had some at the
@@ -374,7 +388,7 @@ def _apply_port_mode(
     doc = set_port_creation_mode(doc, mode)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
-        doc = resolve_network_refs(doc, networks)
+        doc = resolve_network_refs(doc, networks, deferred)
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     return reexport
 
@@ -774,6 +788,9 @@ class AnsibleExecutor:
         osm = rdir / "osm"
         reexport = False
         networks: list[dict[str, Any]] | None = None
+        # a warm pre-copy or sync run makes no port: what only the cutover's ports would meet is
+        # logged, and the cutover refuses it before the source stops (SDD §7.2)
+        deferred: list[str] | None = [] if step in (StepName.PRECOPY, StepName.SYNC) else None
         if strategy in (Strategy.cold, Strategy.warm):
             vm_id = ctx.migration.vm.source_id
             nics = ctx.plan.nic_overrides.get(vm_id)
@@ -802,14 +819,19 @@ class AnsibleExecutor:
                 networks,
                 export_record(mappings, nics) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
+                deferred,
             )
+            await self._log_deferred(ctx, deferred)
         playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
         if not playbooks:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
         # the kit powers the VM off at the cutover: its networks are settled before it runs
-        network_map = await self._vmware_network_map(ctx) if strategy in VMWARE else None
+        network_map = None
+        if strategy in VMWARE:
+            network_map = await self._vmware_network_map(ctx, deferred)
+            await self._log_deferred(ctx, deferred)
         passes_before = 0
         if strategy == Strategy.warm:
             state_before = await asyncio.to_thread(
@@ -828,6 +850,7 @@ class AnsibleExecutor:
             ctx,
             effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
             networks,
+            deferred,
         )
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -958,7 +981,9 @@ class AnsibleExecutor:
         # none listed (an older provider): nothing to resolve against
         return list(getattr(inventory, "network_details", None) or [])
 
-    async def _vmware_network_map(self, ctx: StepContext) -> dict[str, str]:
+    async def _vmware_network_map(
+        self, ctx: StepContext, deferred: list[str] | None = None
+    ) -> dict[str, str]:
         """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
         "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
         mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
@@ -966,7 +991,10 @@ class AnsibleExecutor:
         resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
         take, two NICs one key would send to different values - a NIC with no IPv4 address takes
         any of its network's -, a MAC or address another port of the network holds; networks or
-        ports that cannot be read are a transient failure."""
+        ports that cannot be read are a transient failure. Given ``deferred`` (a pre-copy or sync
+        run, in which the kit makes no port), the network the credential may not use and the
+        held MAC or address are added there instead and the NIC is mapped, and ports that cannot
+        be read are logged."""
         dst = self.providers.get(ctx.destination)
         try:
             inventory = await dst.inventory()
@@ -1005,20 +1033,34 @@ class AnsibleExecutor:
                 continue
             refused = port_refusal(network, roles)
             if refused:
-                problems.append(
+                problem = (
                     f"{what} cannot go to RHOSO network {name!r} "
                     f"(project {network.get('project_id')}): {refused}"
                 )
-                continue
+                if deferred is None:
+                    problems.append(problem)
+                    continue
+                # the kit makes the port at the cutover only: the NIC is mapped meanwhile
+                deferred.append(problem)
             own = [s for s in subnets if s.get("network_id") == network.get("id")]
             subnet, why = kit_subnet(nic, own)
             if why:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
-            held = await self._held_by_another_port(dst, str(network["id"]), nic)
+            try:
+                held = await self._held_by_another_port(dst, str(network["id"]), nic)
+            except TransientStepError as exc:
+                if deferred is None:
+                    raise
+                await ctx.log(
+                    f"{what} on {name!r}: {exc}; the cutover reads them again before the power-off"
+                )
+                held = None
             if held:
-                problems.append(f"{what} on {name!r}: {held}")
-                continue
+                if deferred is None:
+                    problems.append(f"{what} on {name!r}: {held}")
+                    continue
+                deferred.append(f"{what} on {name!r}: {held}")
             key, value = kit_network_key(nic), kit_network_value(network, subnet)
             if key is None:
                 # the kit would drop a distributed port group's NIC that a name keys
@@ -1036,6 +1078,14 @@ class AnsibleExecutor:
         if problems:
             raise PermanentStepError("; ".join(problems))
         return out
+
+    @staticmethod
+    async def _log_deferred(ctx: StepContext, deferred: list[str] | None) -> None:
+        """Log, once each, what a warm pass did not refuse and the cutover will (SDD §7.2)."""
+        for problem in deferred or ():
+            await ctx.log(f"the cutover will refuse this before the source stops: {problem}")
+        if deferred:
+            deferred.clear()
 
     @staticmethod
     async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
@@ -1166,6 +1216,7 @@ class AnsibleExecutor:
         ctx: StepContext | None,
         mappings: Mappings | None,
         networks: Sequence[dict[str, Any]] | None = None,
+        deferred: list[str] | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped."""
         vars_path = workdir / "vars.yml"
@@ -1205,8 +1256,17 @@ class AnsibleExecutor:
                     mode = ctx.plan.port_creation_mode if ctx is not None else None
                     nics = ctx.plan.nic_overrides.get(planned or "") if ctx is not None else None
                     await asyncio.to_thread(
-                        self._rewrite_workloads, osm, mappings, planned, mode, nics, networks
+                        self._rewrite_workloads,
+                        osm,
+                        mappings,
+                        planned,
+                        mode,
+                        nics,
+                        networks,
+                        deferred,
                     )
+                    if ctx is not None:
+                        await self._log_deferred(ctx, deferred)
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
@@ -1220,11 +1280,12 @@ class AnsibleExecutor:
         port_mode: str | None = None,
         nic_overrides: Mapping[str, NicOverride] | None = None,
         networks: Sequence[dict[str, Any]] | None = None,
+        deferred: list[str] | None = None,
     ) -> None:
         """Keep only the planned server of the export, apply the mappings, the VM's NIC
         overrides and the plan's port_creation_mode, and resolve the network references against
-        the destination's ``networks``; once all of it succeeded, write the export record (SDD
-        §7.2)."""
+        the destination's ``networks`` - a warm pass adds a port network that does not resolve
+        to ``deferred`` -; once all of it succeeded, write the export record (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -1258,7 +1319,7 @@ class AnsibleExecutor:
             doc = apply_nic_overrides(doc, nic_overrides)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if networks:
-            doc = resolve_network_refs(doc, networks)
+            doc = resolve_network_refs(doc, networks, deferred)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:

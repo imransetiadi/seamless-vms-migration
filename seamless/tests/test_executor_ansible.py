@@ -1161,6 +1161,106 @@ async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(
     }
 
 
+async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
+    """SDD §7.2: the kit makes the ports only at the cutover, after the power-off. A vmware_warm
+    pre-copy or sync run maps a NIC whose network the credential may not use, or whose MAC or
+    address another port holds, as usual and logs the problem, as it logs ports that cannot be
+    read; the cutover refuses it. A NIC the map cannot take still stops every run (review
+    NC-07)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_warm, "source": VCENTER, "mappings": Mappings()}
+    later = "the cutover will refuse this before the source stops: "
+    env.registry.ports.append(
+        {
+            "id": "port-old",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": net["id"],
+            "device_id": "",
+            "mac_address": "00:50:56:00:00:01",
+            "fixed_ips": ["10.0.0.9"],
+        }
+    )
+    held = (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, rec = ctx_for(env, nics=[nic], **kit)
+        await env.executor.run(step, ctx)
+        assert read_log(env.log)[-1]["vars"]["network_map"] == {
+            "app-net": f"{net['id']},sub-{net['id']}"
+        }
+        assert rec.logs.count(later + held) == 1
+        # logged before the kit ran
+        assert rec.logs.index(later + held) < rec.logs.index(f"running {KIT_PLAYBOOK}")
+
+    # the cutover refuses it before the power-off
+    ran = len(read_log(env.log))
+    ctx, rec = ctx_for(env, nics=[nic], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == held
+    assert len(read_log(env.log)) == ran and rec.downtime_marks == 0
+
+    # ports that cannot be read: logged in a pass, transient at the cutover
+    env.registry.ports_error = True
+    ctx, rec = ctx_for(env, nics=[nic], **kit)
+    await env.executor.run(StepName.SYNC, ctx)
+    assert (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the destination's "
+        "ports: ports: HTTP 503; the cutover reads them again before the power-off"
+    ) in rec.logs
+    assert not any(ln.startswith(later) for ln in rec.logs)
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    with pytest.raises(TransientStepError, match="could not read the destination's ports"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    env.registry.ports_error = False
+
+    # another project's shared network, from a member's token: mapped and logged in a pass
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    member = DST.model_copy(update={"capabilities": {"roles": ["member", "reader"]}})
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    ctx, rec = make_ctx(plan, mig, VCENTER, member, env.settings)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-9": "net-shared-net-theirs,sub-net-shared-net-theirs"
+    }
+    [refused] = [ln for ln in rec.logs if ln.startswith(later)]
+    assert refused.startswith(
+        later + "the NIC 00:50:56:00:00:04 of web-01 cannot go to RHOSO network 'shared-net' "
+        "(project admin): "
+    )
+    assert "Neutron lets only the admin or advsvc role" in refused
+    ctx, _ = make_ctx(plan, mig, VCENTER, member, env.settings)
+    with pytest.raises(PermanentStepError, match="Neutron lets only the admin or advsvc role"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+
+    # a NIC the map cannot take still stops a pass, before the kit
+    ran = len(read_log(env.log))
+    gone = Nic(
+        network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"], network_key="gone-net"
+    )
+    ctx, _ = ctx_for(env, nics=[nic, gone], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.PRECOPY, ctx)
+    assert str(exc.value) == (
+        "the NIC 00:50:56:00:00:09 of web-01 cannot go to RHOSO network 'gone-net': there is no "
+        "network named 'gone-net'"
+    )
+    assert len(read_log(env.log)) == ran
+
+
 async def test_progress_tail_reports_pct(env, monkeypatch):
     monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.5")
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
@@ -2082,6 +2182,84 @@ async def test_a_warm_cutover_resolves_its_export_again_without_exporting(env):
     assert (
         exported_server(env)["params"]["ports"][0]["params"]["network_ref"]["project_name"] is None
     )
+
+
+async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover_refuses_it(env):
+    """SDD §7.2: a warm pre-copy or sync run makes no port. A port's network name that does not
+    resolve is logged, and the port keeps its references as exported; the cutover resolves them
+    again and stops there, before the source stops (review NC-07)."""
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso")]
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    problem = (
+        "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
+        "web-01 cannot go to RHOSO network 'rhoso-app': "
+    )
+    precopy, rec = ctx_for(env)
+    result = await env.executor.run(StepName.PRECOPY, precopy)
+    assert result.sync_pass is not None
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    [line] = [ln for ln in rec.logs if ln.startswith(problem)]
+    assert "2 networks of the credential's project" in line
+    # logged before the pass ran
+    assert rec.logs.index(line) < rec.logs.index("running import_workloads_precopy.yml")
+    # kept as exported, the mapping applied: the destination check (SDD §6.6) warns about it
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "finance-rhoso",
+        "domain_name": "Default",
+    }
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    # the rewrite finished: the next run does not export again
+    assert (run_dir(env) / "osm" / "rewrite.json").exists()
+
+    sync, rec = ctx_for(env)
+    await env.executor.run(StepName.SYNC, sync)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == ["import_workloads_precopy.yml"]
+    assert sum(ln.startswith(problem) for ln in rec.logs) == 1
+
+    cutover, rec = ctx_for(env)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == []
+    assert rec.downtime_marks == 0
+    assert not any(ln.startswith(problem) for ln in rec.logs)
+
+    # the operator maps the network to one that resolves: the retry exports again, resolved
+    retry, rec = ctx_for(env, mappings=_edited(networks={"app-net": "rhoso-dmz"}))
+    env.registry.networks.append(dst_net("rhoso-dmz"))
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+async def test_a_pass_logs_each_problem_it_defers_once():
+    """SDD §7.2: what a warm pass does not refuse is logged once, however many places look."""
+    logged: list[str] = []
+
+    async def log(line):
+        logged.append(line)
+
+    ctx = SimpleNamespace(log=log)
+    deferred = ["the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"]
+    await AnsibleExecutor._log_deferred(ctx, deferred)
+    await AnsibleExecutor._log_deferred(ctx, deferred)
+    # a cutover defers nothing
+    await AnsibleExecutor._log_deferred(ctx, None)
+    assert logged == [
+        "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
+        "web-01 cannot go to RHOSO network 'gone'"
+    ]
 
 
 async def test_an_unreadable_destination_keeps_the_exported_network_references(env):
