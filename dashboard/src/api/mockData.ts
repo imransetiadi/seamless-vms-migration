@@ -33,6 +33,7 @@ import type {
   VMRef,
 } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
+import { pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
@@ -855,7 +856,7 @@ function nicOverrideFindings(
     const { network, addresses } = nicTarget(plan, vm.source_id, nic);
     if (!(network in destinationNetworks)) {
       problems.push(
-        `${mac}: RHOSO has no network '${network}'` +
+        `${mac}: RHOSO has no network ${pyRepr(network)}` +
           (entries[mac]?.network ? '' : ' yet: pre-staging would create it, but its subnets cannot be checked before; name an existing RHOSO network'),
       );
       continue;
@@ -866,7 +867,7 @@ function nicOverrideFindings(
     const subnets = subnetsOf(context.subnets ?? [], resolved);
     const cidrs = subnets.map((s) => s.cidr);
     const outside = addresses.filter((a) => !cidrs.some((c) => ipInCidr(a, c)));
-    if (outside.length) problems.push(`${mac}: ${outside.join(', ')} ${outside.length === 1 ? 'lies' : 'lie'} in no subnet of '${network}'`);
+    if (outside.length) problems.push(`${mac}: ${outside.join(', ')} ${outside.length === 1 ? 'lies' : 'lie'} in no subnet of ${pyRepr(network)}`);
     const neutron = plan.port_creation_mode === 'neutron';
     for (const a of addresses) {
       const reserved = noHostAddress(a, cidrs);
@@ -927,7 +928,7 @@ export function preflight(
   for (const nic of vm.nics) {
     const network = resolved.get(nic);
     const why = network ? portRefusal(network, context.roles) : null;
-    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}' (project ${network.project_id}): ${why}`);
+    if (network && why) denied.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)} (project ${network.project_id ?? 'None'}): ${why}`);
   }
   if (denied.length)
     add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
@@ -960,7 +961,7 @@ export function preflight(
       const subnets = subnetsOf(context.subnets, network);
       for (const address of neutron ? nic.fixed_ips : nic.fixed_ips.slice(0, 1)) {
         const why = addressRefusal(address, subnets, { neutron, mac: nic.mac });
-        if (why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}': ${address} ${why}`);
+        if (why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${address} ${why}`);
       }
     }
     if (refused.length)
@@ -972,7 +973,7 @@ export function preflight(
     for (const nic of vm.nics) {
       const network = resolved.get(nic);
       const why = network ? kitSubnet(nic, subnetsOf(context.subnets, network)).why : null;
-      if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on '${network.name}': ${why}`);
+      if (network && why) refused.push(`${(nic.mac ?? '?').toLowerCase()} on ${pyRepr(network.name)}: ${why}`);
     }
     if (refused.length)
       add('NET_ADDRESS_REFUSED', 'blocker', `Neutron would refuse these addresses on their RHOSO network: ${refused.join('; ')}.`, NETWORK_REMEDIATION.NET_ADDRESS_REFUSED);

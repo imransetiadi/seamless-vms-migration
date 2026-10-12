@@ -53,11 +53,15 @@ export function isIpAddress(value: string): boolean {
 
 /**
  * An address as the API's `ipaddress` writes it ("FD00:0::0005" is "fd00::5", SDD §4.2); anything else as given. The
- * URL standard writes IPv6 as RFC 5952 does, as Python does; an address with an embedded IPv4 part stays as given.
+ * URL standard writes IPv6 as RFC 5952 does, as Python does; Python 3.13 writes an IPv4-mapped address with its IPv4
+ * part dotted ("::ffff:192.0.2.1") and any other embedded IPv4 part in hex ("64:ff9b::c000:201").
  */
 export function canonicalIp(address: string): string {
-  if (IPV4.test(address) || !isIpAddress(address) || address.includes('.')) return address;
-  return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  if (IPV4.test(address) || !isIpAddress(address)) return address;
+  const ip = toBits(address);
+  if (!ip) return address;
+  if (ip.value >> 32n === 0xffffn) return `::ffff:${fromBits(ip.value & 0xffffffffn, 32)}`;
+  return new URL(`http://[${withHexTail(address)}]/`).hostname.slice(1, -1);
 }
 
 /**
@@ -87,11 +91,14 @@ function toBits(address: string): { value: bigint; bits: 32 | 128 } | null {
   if (IPV4.test(address)) {
     return { value: address.split('.').reduce((n, part) => (n << 8n) + BigInt(Number(part)), 0n), bits: 32 };
   }
-  if (!isIpAddress(address) || address.includes('.')) return null;
-  const [head, tail = ''] = address.split('::');
+  if (!isIpAddress(address)) return null;
+  // an embedded IPv4 part ("64:ff9b::192.0.2.1") as its two hex groups, as Python's ipaddress reads it
+  const hex = withHexTail(address);
+  if (hex.includes('.')) return null;
+  const [head, tail = ''] = hex.split('::');
   const left = head ? head.split(':') : [];
-  const right = address.includes('::') ? (tail ? tail.split(':') : []) : [];
-  const groups = address.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
+  const right = hex.includes('::') ? (tail ? tail.split(':') : []) : [];
+  const groups = hex.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
   if (groups.length !== 8) return null;
   return { value: groups.reduce((n, g) => (n << 16n) + BigInt(parseInt(g, 16)), 0n), bits: 128 };
 }

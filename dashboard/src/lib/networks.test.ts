@@ -27,6 +27,16 @@ describe('resolveNetwork (SDD §7.3 step 0, §9.3)', () => {
     });
     expect(resolveNetwork([net('a', 'tenant-web', true)], 'gone')).toEqual({ network: null, why: null });
   });
+
+  it("writes the name and a missing project as the API does (review NC-11)", () => {
+    expect(resolveNetwork([net('a', "bob's-net", true), net('b', "bob's-net", true)], "bob's-net").why).toBe(
+      '2 networks of the credential\'s project are named "bob\'s-net"',
+    );
+    const unowned = { ...net('a', 'x', false), project_id: null };
+    expect(resolveNetwork([unowned, net('b', 'x', false, 'p2')], 'x').why).toBe(
+      "2 networks of other projects are named 'x' (None, p2), none of the credential's project",
+    );
+  });
 });
 
 describe('portRefusal (SDD §6.6, §9.3)', () => {

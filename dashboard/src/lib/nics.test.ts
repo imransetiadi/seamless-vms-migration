@@ -80,6 +80,22 @@ describe('canonicalIp', () => {
     expect(canonicalIp('10.20.1.300')).toBe('10.20.1.300');
     expect(canonicalIp('host')).toBe('host');
   });
+
+  it('writes an embedded IPv4 part as Python 3.13 does: dotted when IPv4-mapped, else in hex (review NC-11)', () => {
+    expect(canonicalIp('64:ff9b::192.0.2.1')).toBe('64:ff9b::c000:201');
+    expect(canonicalIp('::192.0.2.1')).toBe('::c000:201');
+    expect(canonicalIp('::FFFF:192.0.2.1')).toBe('::ffff:192.0.2.1');
+    expect(canonicalIp('0:0:0:0:0:ffff:c000:201')).toBe('::ffff:192.0.2.1');
+    expect(canonicalIp('::ffff:0:0')).toBe('::ffff:0.0.0.0');
+  });
+
+  it('places an address written with an embedded IPv4 part as the API does', async () => {
+    const { ipInCidr } = await import('./nics');
+    const nat64 = [{ cidr: '64:ff9b::/96', ipv6_address_mode: null, ipv6_ra_mode: null }];
+    expect(ipInCidr('64:ff9b::192.0.2.1', '64:ff9b::/96')).toBe(true);
+    expect(addressRefusal('64:ff9b::192.0.2.1', nat64, { neutron: true, mac: null })).toBeNull();
+    expect(addressRefusal('64:ff9b:1::192.0.2.1', nat64, { neutron: true, mac: null })).toBe("is no host address of any subnet of the port's network");
+  });
 });
 
 describe('noHostAddress', () => {

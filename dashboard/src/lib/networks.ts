@@ -1,4 +1,5 @@
 import type { DestinationInventory, DestinationNetwork, DestinationSubnet, Nic } from '../api/types';
+import { pyRepr } from './format';
 import { addressRefusal, kitIpv4 } from './nics';
 
 /**
@@ -9,12 +10,13 @@ import { addressRefusal, kitIpv4 } from './nics';
 export function resolveNetwork(networks: DestinationNetwork[], name: string): { network: DestinationNetwork | null; why: string | null } {
   const own = networks.filter((n) => n.name === name && n.own);
   if (own.length === 1) return { network: own[0]!, why: null };
-  if (own.length) return { network: null, why: `${own.length} networks of the credential's project are named '${name}'` };
+  if (own.length) return { network: null, why: `${own.length} networks of the credential's project are named ${pyRepr(name)}` };
   const seen = networks.filter((n) => n.name === name);
   if (seen.length === 1) return { network: seen[0]!, why: null };
   if (!seen.length) return { network: null, why: null };
-  const projects = [...new Set(seen.map((n) => String(n.project_id)))].sort().join(', ');
-  return { network: null, why: `${seen.length} networks of other projects are named '${name}' (${projects}), none of the credential's project` };
+  // a network without an owner: the API writes Python's None
+  const projects = [...new Set(seen.map((n) => String(n.project_id ?? 'None')))].sort().join(', ');
+  return { network: null, why: `${seen.length} networks of other projects are named ${pyRepr(name)} (${projects}), none of the credential's project` };
 }
 
 /** The networks an inventory lists with their owners; one from before `network_details` lists each name once, as the credential's own (SDD §10). */

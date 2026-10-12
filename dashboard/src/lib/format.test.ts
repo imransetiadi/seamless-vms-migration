@@ -8,7 +8,19 @@ import {
   formatPct,
   formatRate,
   formatRelative,
+  pyRepr,
 } from './format';
+
+describe('pyRepr', () => {
+  it("quotes a name as the API's messages do (Python's repr of a str)", () => {
+    expect(pyRepr('tenant-web')).toBe("'tenant-web'");
+    expect(pyRepr("bob's-net")).toBe('"bob\'s-net"');
+    expect(pyRepr('say "hi"')).toBe('\'say "hi"\'');
+    expect(pyRepr('both \' and "')).toBe("'both \\' and \"'");
+    expect(pyRepr('back\\slash')).toBe("'back\\\\slash'");
+    expect(pyRepr('tab\there')).toBe("'tab\\there'");
+  });
+});
 
 describe('formatBytes (IEC units)', () => {
   it('renders an em dash for missing or non-finite values', () => {

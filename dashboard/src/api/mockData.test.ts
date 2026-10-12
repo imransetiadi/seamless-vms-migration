@@ -145,6 +145,21 @@ describe('mock preflight checks NIC overrides like the API (SDD §9.3)', () => {
     );
   });
 
+  it("writes the target network's name as the API's messages do (review NC-11)", () => {
+    const quoted = "bob's-web";
+    const missing = preflight(vm, 'openstack', plan({ network: quoted }), nets, [vm.name], { subnets, selected: [vm] });
+    expect(missing.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
+      'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: RHOSO has no network "bob\'s-web".',
+    );
+    const outside = preflight(vm, 'openstack', plan({ network: quoted }), { ...nets, [quoted]: 1442 }, [vm.name], {
+      subnets: [...subnets, { name: 'q', network: quoted, cidr: '10.40.0.0/16' }],
+      selected: [vm],
+    });
+    expect(outside.find((f) => f.code === 'MAP_NIC_OVERRIDE_INVALID')?.message).toBe(
+      'NIC override(s) of nic-01 cannot be applied: fa:16:3e:00:00:01: 10.20.1.5 lies in no subnet of "bob\'s-web".',
+    );
+  });
+
   it('finds an address another NIC gets whatever way it is written', () => {
     const v6 = makeVm({ id: 'os-o2', name: 'nic-02', disks: [{ size_gb: 20 }], nics: [{ network: 'tenant-app', mac: 'fa:16:3e:00:00:02', fixed_ips: ['FD00:0::0005'] }] });
     const found = preflight(vm, 'openstack', plan({ fixed_ips: ['fd00::5'] }), nets, [vm.name], { subnets: [...subnets, { name: 'app-v6', network: 'tenant-app', cidr: 'fd00::/64' }], selected: [vm, v6] });
@@ -230,6 +245,20 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     for (const roles of [['admin', 'member', 'reader'], ['advsvc'], undefined]) expect(codes(run(shared, roles))).not.toContain('NET_PORT_NOT_PERMITTED');
     // a VMware NIC too: the migration kit creates every port with the NIC's MAC (SDD §7.2)
     expect(codes(run(shared, member, 'vmware'))).toContain('NET_PORT_NOT_PERMITTED');
+  });
+
+  it("writes a network's name and a missing project as the API's messages do (review NC-11)", () => {
+    const quoted = "bob's-web";
+    const plan = { ...base, mappings: { ...base.mappings, networks: { 'tenant-app': quoted } } };
+    const unowned = { ...net('q', quoted, false, 'x'), project_id: null, shared: false };
+    const subnets = [{ name: 's', network: quoted, network_id: 'q', cidr: '10.30.0.0/16', ipv6_address_mode: null, ipv6_ra_mode: null }];
+    const found = preflight(vm, 'openstack', plan, { [quoted]: 1442 }, [vm.name], { selected: [vm], networkDetails: [unowned], subnets, roles: ['member'] });
+    expect(found.find((f) => f.code === 'NET_PORT_NOT_PERMITTED')?.message).toBe(
+      'The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "bob\'s-web" (project None): it is neither shared with the credential\'s project nor external.',
+    );
+    expect(found.find((f) => f.code === 'NET_ADDRESS_REFUSED')?.message).toBe(
+      'Neutron would refuse these addresses on their RHOSO network: fa:16:3e:00:00:01 on "bob\'s-web": 10.20.1.5 is no host address of any subnet of the port\'s network.',
+    );
   });
 
   it("checks a VMware NIC's IPv4 guest addresses by the migration kit's rule, with the API's message (SDD §9.3, §7.2)", () => {
