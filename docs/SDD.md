@@ -332,7 +332,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             created_at: datetime, updated_at: datetime }
 
 MigrationSummary { id, plan_id, wave_id, vm: { source_id, name }, strategy, phase,
-                   phase_since: datetime,   # the last PhaseChange's `at`: when the phase it is in began
+                   phase_since: datetime,   # the last PhaseChange's `at`, when the phase it is in began; created_at without one
                    progress_pct, downtime_started_at, downtime_ended_at, approvals, cutover_requested,
                    cutover_requested_by, force_cutover, force_window, advisor_hold, review_required,
                    review_reason, error, source_running_at, findings, created_at, updated_at }
