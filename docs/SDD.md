@@ -2310,7 +2310,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   with every live event) and for the live event stream once it has been live — lost (reconnecting), back, stopped or
   signed out, said once for the page, not by each Live indicator, and not its first connection —, announced from a live
   region already on the page (a region inserted together with its text is not reliably read),
-  a form error announced when it appears (not only shown next to its field), focus that never drops to the
+  a form error announced when it appears (not only shown next to its field) — a dialog's request failure (the
+  Provider, Policy, Plan and Confirm dialogs show it at the end of their scrolling body) also scrolled into view when
+  it appears or changes, so it is seen as well as heard; an error a page shows while loading is never scrolled to, so
+  a refetch in the background never moves the page —, focus that never drops to the
   page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
   heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
