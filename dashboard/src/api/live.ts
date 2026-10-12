@@ -334,8 +334,11 @@ export function applyEventToCache(
   // not memory.lesson_saved: a lesson changes no migration, list or figure, and the Events page and the timeline take
   // it from the stream (SDD §16)
   if (kind.startsWith('migration.') || kind.startsWith('advisor.')) {
-    // advisor.strategy announces a recorded recommendation (SDD §14.4)
-    if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);
+    // advisor.strategy announces a recorded recommendation (SDD §14.4); a note is the Advisor page's too (§16)
+    if (kind.startsWith('advisor.')) {
+      invalidate(['advisor', 'recommendations']);
+      invalidate(['advisor', 'notes']);
+    }
     // one migration that exists already: read it alone and put it into the lists (SDD §16)
     const one = kind !== 'migration.created' ? event.migration_id : null;
     if (one && refreshMigration) refreshMigration(one);

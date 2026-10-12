@@ -1058,6 +1058,22 @@ export interface RecommendationPage {
   limit: number;
 }
 
+/** Bounds and default of the `limit` `GET /advisor/notes` accepts (SDD §12). */
+export const ADVISOR_NOTES_LIMIT_MAX = 200;
+export const ADVISOR_NOTES_LIMIT_DEFAULT = 20;
+
+/** An advisor note with the migration it belongs to (SDD §12 `GET /advisor/notes`). */
+export interface AdvisorNoteEntry extends AdvisorNote {
+  migration_id: string;
+  plan_id: string;
+  vm_name: string;
+}
+
+/** `GET /advisor/notes`: every migration's notes but strategy notes, newest first (SDD §12). */
+export interface AdvisorNoteList {
+  items: AdvisorNoteEntry[];
+}
+
 /** Migration actions exposed as `POST /migrations/{id}/<action>` (SDD §12). */
 export const MIGRATION_ACTIONS = ['approve', 'cutover', 'force-cutover', 'sync', 'rollback', 'retry', 'cancel', 'finalize'] as const;
 export type MigrationAction = (typeof MIGRATION_ACTIONS)[number];

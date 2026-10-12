@@ -13,6 +13,8 @@ import {
   PROVIDER_STATUSES,
   SEVERITIES,
   STRATEGIES,
+  type AdvisorNote,
+  type AdvisorNoteList,
   type AdvisorPolicy,
   type AdvisorRecommendation,
   type AdvisorStatus,
@@ -1279,6 +1281,39 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
   it('asks for a token, like the API', async () => {
     const { client } = setup('nobody');
     await expect(list(client)).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe('mock advisor notes, like the API (SDD §12, perf audit PF-02)', () => {
+  const notes = (client: ApiClient, query: Record<string, string | number | undefined> = {}) => client.get<AdvisorNoteList>('/advisor/notes', { query });
+  const note = (kind: AdvisorNote['kind'], at: string, summary: string): AdvisorNote => ({ kind, source: 'rules', summary, confidence: null, data: {}, created_at: at });
+
+  it("lists every migration's notes but strategy notes, newest first; the same time keeps creation and note order", async () => {
+    const { server, client } = setup('viewer');
+    for (const m of server.migrations) m.advisor_notes = [];
+    const [first, second] = server.migrations as [Migration, Migration];
+    first.advisor_notes = [note('classification', '2026-10-08T09:00:00Z', 'tier'), note('strategy', '2026-10-08T11:00:00Z', 'legacy'), note('screen', '2026-10-08T08:00:00Z', 'screened')];
+    second.advisor_notes = [note('verification', '2026-10-08T10:00:00Z', 'boot'), note('similar_incidents', '2026-10-08T09:00:00Z', 'similar')];
+    const { items } = await notes(client);
+    expect(items.map((n) => [n.migration_id, n.kind])).toEqual([
+      [second.id, 'verification'],
+      [first.id, 'classification'],
+      [second.id, 'similar_incidents'],
+      [first.id, 'screen'],
+    ]);
+    expect(items[0]).toEqual({ ...second.advisor_notes[0], migration_id: second.id, plan_id: second.plan_id, vm_name: second.vm.name });
+    expect((await notes(client, { limit: 2 })).items.map((n) => n.kind)).toEqual(['verification', 'classification']);
+    // 20 unless asked otherwise, at most 200
+    second.advisor_notes.push(...Array.from({ length: 25 }, (_, i) => note('classification', new Date(Date.parse('2026-10-07T00:00:00Z') - i * 60_000).toISOString(), `tier ${i}`)));
+    expect((await notes(client)).items).toHaveLength(20);
+    expect((await notes(client, { limit: 200 })).items).toHaveLength(29);
+    for (const limit of [0, 201]) await expect(notes(client, { limit })).rejects.toMatchObject({ status: 422 });
+  });
+
+  it('needs a token, and any role', async () => {
+    // no token at all is auth turned off, as in the API: an anonymous admin
+    await expect(notes(setup('nonsense').client)).rejects.toMatchObject({ status: 401 });
+    expect((await notes(setup('viewer').client)).items.length).toBeGreaterThan(0);
   });
 });
 

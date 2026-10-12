@@ -12,6 +12,7 @@ import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
 import { useApiQuery } from './stickyQuery';
 import type {
+  AdvisorNoteList,
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
@@ -82,6 +83,7 @@ export const queryKeys = {
   /** Under `recommendations`, so a refresh of the list refreshes it too. */
   recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
   snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
+  advisorNotes: (limit: number) => ['advisor', 'notes', limit] as const,
   policies: ['advisor', 'policies'] as const,
 };
 
@@ -244,6 +246,16 @@ export function useRecommendations(query: RecommendationListQuery = {}, options:
       }),
     enabled: options.enabled ?? true,
     placeholderData: options.keepPrevious ? keepPreviousData : undefined,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/notes`: every migration's advisor notes but strategy notes, newest first (SDD §12). */
+export function useAdvisorNotes(limit: number) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.advisorNotes(limit),
+    queryFn: ({ signal }) => api.get<AdvisorNoteList>('/advisor/notes', { signal, query: { limit } }),
     retry: noRetryOnClientErrors,
   });
 }

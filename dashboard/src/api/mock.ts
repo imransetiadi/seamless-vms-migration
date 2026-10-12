@@ -51,6 +51,8 @@ import type {
   ProbeKind,
   ProbeResult,
   VerificationCheck,
+  AdvisorNoteEntry,
+  AdvisorNoteList,
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
@@ -81,6 +83,8 @@ import type {
 import {
   ACTION_TEXT_MAX,
   ADVISOR_LIMIT_MAX,
+  ADVISOR_NOTES_LIMIT_DEFAULT,
+  ADVISOR_NOTES_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
   DECISION_TYPES,
@@ -1392,6 +1396,10 @@ export class MockServer {
         this.require(token, 'viewer', path);
         return ok(sub === undefined ? this.listRecommendations(query) : this.recommendation(sub));
       }
+      if (id === 'notes' && sub === undefined && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok(this.listAdvisorNotes(query));
+      }
       if (id === 'similar-incidents' && method === 'POST') {
         this.require(token, 'operator', path);
         // like the API (SDD §12): a query of 1-2000 characters, 1-20 results
@@ -1558,6 +1566,19 @@ export class MockServer {
       (r) => (migrationId === null || r.migration_id === migrationId) && (planId === null || r.plan_id === planId) && (type === null || r.decision_type === type),
     );
     return { items: items.slice(offset, offset + limit), total: items.length, offset, limit };
+  }
+
+  /**
+   * Every migration's advisor notes but strategy notes - those read as legacy recommendations - newest first, like the
+   * API (SDD §12): a stable sort keeps notes of the same time in the migrations' creation order and each one's note order.
+   */
+  private listAdvisorNotes(query: URLSearchParams): AdvisorNoteList {
+    const limit = intParam(query, 'limit', ADVISOR_NOTES_LIMIT_DEFAULT, 1, ADVISOR_NOTES_LIMIT_MAX);
+    const items: AdvisorNoteEntry[] = this.migrations.flatMap((m) =>
+      m.advisor_notes.filter((n) => n.kind !== 'strategy').map((n) => ({ ...n, migration_id: m.id, plan_id: m.plan_id, vm_name: m.vm.name })),
+    );
+    items.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    return { items: items.slice(0, limit) };
   }
 
   private recommendation(id: string): AdvisorRecommendation {

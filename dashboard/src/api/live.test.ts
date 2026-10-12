@@ -220,6 +220,19 @@ describe('applyEventToCache', () => {
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 45, kind: 'migration.phase' }, invalidate);
     expect(invalidate).not.toHaveBeenCalledWith(['advisor', 'recommendations']);
   });
+
+  it('refreshes the advisor notes on an advisor event, and only then (SDD §16, perf audit PF-02)', () => {
+    for (const kind of ['advisor.classification', 'advisor.verification', 'advisor.similar_incidents', 'advisor.strategy']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 46, kind }, invalidate);
+      expect(invalidate.mock.calls.map(([key]) => key), kind).toContainEqual(['advisor', 'notes']);
+    }
+    const { queryClient, invalidate } = setup();
+    for (const kind of ['migration.phase', 'migration.error', 'decision.approved', 'recommendation.created', 'plan.updated']) {
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 47, kind }, invalidate);
+    }
+    expect(invalidate.mock.calls.map(([key]) => key)).not.toContainEqual(['advisor', 'notes']);
+  });
 });
 
 describe('applyEventToCache for providers', () => {
