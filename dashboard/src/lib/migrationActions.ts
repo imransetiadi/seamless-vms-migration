@@ -55,6 +55,19 @@ export function uncountedReason(m: Migration, actor: string): string {
   return m.force_cutover?.actor === actor ? 'forced the cutover' : 'requested the cutover';
 }
 
+/**
+ * A cutover request that is not a start (SDD §5.4, §16): maker-checker, and no approval counts but the requester's
+ * own - `me` is the requester when nobody has requested it yet. It waits for another approver.
+ */
+export function requestWaitsForApprover(
+  m: Pick<Migration, 'approvals' | 'cutover_requested_by' | 'force_cutover'>,
+  plan: Plan | null | undefined,
+  me: string | null | undefined,
+): boolean {
+  if (!fourEyes(plan)) return false;
+  return countedApprovals({ ...m, cutover_requested_by: m.cutover_requested_by ?? me ?? null }, plan).length === 0;
+}
+
 /** Maker-checker (ADV-17): the plan wants an approval, and not from the cutover's requester. */
 function fourEyes(plan: Plan | null | undefined): boolean {
   return Boolean(plan?.require_approval && plan.require_distinct_approver);

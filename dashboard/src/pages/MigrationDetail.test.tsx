@@ -411,6 +411,32 @@ describe('MigrationDetail', () => {
     expect(within(again).getByRole('button', { name: /^approve$/i })).not.toHaveAttribute('aria-disabled');
   });
 
+  it('asks to request, not to start, a cutover another approver must approve, and to start one already approved (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-5003, ready, in a plan with maker-checker
+    m.approvals = [];
+    const openDialog = async () => {
+      const group = await screen.findByRole('group', { name: /migration actions/i });
+      await waitFor(() => expect(within(group).getByRole('button', { name: /^cut over/i })).not.toHaveAttribute('aria-disabled'));
+      await user.click(within(group).getByRole('button', { name: /^cut over/i }));
+      return screen.findByRole('alertdialog');
+    };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const waits = await openDialog();
+    expect(waits).toHaveAccessibleName(`Request the cutover of ${m.vm.name}?`);
+    expect(waits).toHaveTextContent('The cutover is requested now and starts once another approver approves it. Then the source VM will be stopped');
+    expect(within(waits).getByRole('button', { name: 'Request cutover' })).toBeInTheDocument();
+    expect(within(waits).queryByRole('button', { name: 'Start cutover' })).toBeNull();
+    view.unmount();
+    // rina approved ahead: sari's request starts the cutover
+    m.approvals = [{ actor: 'rina', at: '2026-10-08T11:50:00Z', comment: null }];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const starts = await openDialog();
+    expect(starts).toHaveAccessibleName(`Cut over ${m.vm.name} now?`);
+    expect(within(starts).getByRole('button', { name: 'Start cutover' })).toBeInTheDocument();
+  });
+
   it("does not offer another strategy while the advisor's decision waits for approval, and says why (SDD §12, §14.6, §16)", async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-b2c4d6e871')!;

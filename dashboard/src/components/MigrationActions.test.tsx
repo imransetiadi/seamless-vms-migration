@@ -141,8 +141,9 @@ describe('MigrationActions', () => {
     renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
     const group = screen.getByRole('group', { name: /migration actions/i });
     await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`cut over ${migration.vm.name} once pre-copy converges`, 'i') });
-    expect(dialog).toHaveTextContent(/starts once pre-copy has converged/i);
+    // maker-checker with no other approval: a request, not a start (SDD §16)
+    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`request the cutover of ${migration.vm.name}`, 'i') });
+    expect(dialog).toHaveTextContent(/starts once another approver approves it and pre-copy has converged/i);
     await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
@@ -352,9 +353,10 @@ describe('MigrationActions', () => {
 
     expect(screen.getByText(/next:/i)).toHaveTextContent(/cut over|approve/i);
     await user.click(button(/^cut over/i));
-    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01/i });
+    // its plan wants another approver and none approved: the dialog asks to request it (SDD §16)
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
     expect(dialog).toHaveTextContent(/source VM will be stopped/i);
-    await user.click(within(dialog).getByRole('button', { name: /start cutover/i }));
+    await user.click(within(dialog).getByRole('button', { name: /request cutover/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
   });
 
@@ -368,10 +370,10 @@ describe('MigrationActions', () => {
     renderWithApp(<MigrationActions migration={migration} plan={plan} role={"approver" as Role} />, { server, token: 'approver' });
     const group = screen.getByRole('group', { name: /migration actions/i });
     await user.click(within(group).getByRole('button', { name: /^cut over/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01/i });
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
     const refusals = within(dialog).getByRole('note', { name: 'Cutover will refuse' });
     expect(refusals).toHaveTextContent(problem);
-    await user.click(within(dialog).getByRole('button', { name: /start cutover/i }));
+    await user.click(within(dialog).getByRole('button', { name: /request cutover/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
   });
 
@@ -388,11 +390,11 @@ describe('MigrationActions', () => {
     const group = screen.getByRole('group', { name: /migration actions/i });
 
     await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01 now/i });
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
     const ignore = within(dialog).getByRole('checkbox', { name: /ignore the cutover window/i });
     expect(ignore).not.toBeChecked();
     await user.click(ignore);
-    await user.click(within(dialog).getByRole('button', { name: /^start cutover$/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
     expect(server.migrations.find((m) => m.id === migration.id)?.force_window).toBe(true);
   });

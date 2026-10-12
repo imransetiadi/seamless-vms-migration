@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, uncountedReason, type MigrationActionKey } from './migrationActions';
+import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
 import { OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
@@ -236,6 +236,23 @@ describe('migrationActions rules', () => {
     const cold = migration('ready', { approvals: [], estimate: { ...base.estimate!, downtime_s: 300 } }, 'cold');
     expect(nextStep(cold, plan).text).toBe('Ready. Next: an approver requests the cutover and another approves it; the source VM stops for about 5 min.');
     expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
+  });
+
+  it('knows when a cutover request only waits for another approver (maker-checker, SDD §5.4, §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const at = '2026-10-08T11:00:00Z';
+    const ready = migration('ready', { approvals: [] }, 'cold');
+    expect(requestWaitsForApprover(ready, plan, 'sari')).toBe(true);
+    // another approver approved ahead: sari's request starts it
+    expect(requestWaitsForApprover({ ...ready, approvals: [{ actor: 'rina', at, comment: null }] }, plan, 'sari')).toBe(false);
+    // sari's own approval stops counting once she requests
+    expect(requestWaitsForApprover({ ...ready, approvals: [{ actor: 'sari', at, comment: null }] }, plan, 'sari')).toBe(true);
+    // the request already made by rina: sari's approval counts for it
+    const requested = { ...ready, cutover_requested: true, cutover_requested_by: 'rina', approvals: [{ actor: 'sari', at, comment: null }] };
+    expect(requestWaitsForApprover(requested, plan, 'sari')).toBe(false);
+    // without maker-checker the request is the approval, and without approval nothing waits
+    expect(requestWaitsForApprover(ready, { ...plan, require_distinct_approver: false }, 'sari')).toBe(false);
+    expect(requestWaitsForApprover(ready, { ...plan, require_approval: false }, 'sari')).toBe(false);
   });
 
   const REFUSAL = "the NIC 00:50:56:40:d5:b3 of dc2-portal-02 on 'dc2-prod': port demo-port-1 holds 10.2.0.32";
