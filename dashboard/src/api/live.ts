@@ -168,9 +168,12 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
     const batch: Batch = { refreshed: new Set(), relied: new Set(), at: Date.now() };
     const ids = [...migrations];
     migrations.clear();
+    // a page that caches neither a migration nor any migration list takes no read (SDD §16)
+    const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).length > 0;
     for (const id of ids) {
       // a read of it under way may have started before the event: it waits for the next batch
       if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
+      else if (!lists && queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true }) === undefined) continue;
       else if (fetchMigration) void splice(id, fetchMigration, batch);
     }
     const keys = [...pending.entries()];

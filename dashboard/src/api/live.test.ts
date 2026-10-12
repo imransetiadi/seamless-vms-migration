@@ -430,6 +430,34 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
     }
   });
 
+  it('reads nothing for a migration when neither its page nor any migration list is cached (SDD §16, perf PF-04)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMigration = vi.fn(async () => migration);
+      // a page that shows no migration (Providers, Inventory): nothing would take the read
+      const none = await flushed(fetchMigration, []);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      expect(none.invalidated).toEqual([]);
+      expect(none.queryClient.getQueryData(['migration', migration.id])).toBeUndefined();
+      // its own page cached, no list: read once, into the page
+      const page = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      page.setQueryData(['migration', migration.id], migration);
+      const fresh: Migration = { ...migration, progress_pct: 7 };
+      const read = vi.fn(async () => fresh);
+      const batch = createBatchedInvalidator(page, 400, read);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(page.getQueryData(['migration', migration.id])).toEqual(fresh);
+      batch.dispose();
+      // any migration list cached: read, and each list decides as before
+      await flushed(fetchMigration, [[{ plan_id: 'plan-00000000' }, []]]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reads a list again that should hold the migration but does not, and every list when the read fails', async () => {
     vi.useFakeTimers();
     try {
