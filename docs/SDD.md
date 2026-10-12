@@ -1011,7 +1011,11 @@ volumes with their server, so the order is:
      the server's groups, which step 8 passes to Nova (Nova looks each name up in the project, `default` aside, and
      refuses one it finds none or several of), and in `"neutron"` mode each port's groups, which step 8 looks up the
      same way for the port it creates. Step 8 runs after the source server was deleted (step 4): a missing group would
-     leave the VM on neither cloud until the rollback.
+     leave the VM on neither cloud until the rollback;
+   * the flavor step 8 creates the server with is not a RHOSO flavor (`find_flavor`, as step 8 looks it up);
+   * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
+     is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
+     deleted.
 1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
@@ -1031,7 +1035,9 @@ volumes with their server, so the order is:
 5. `POST /v3/{project}/volumes/{id}/action {"os-unmanage": null}` for each volume (source).
 6. `POST /v3/{project}/manageable_volumes` on RHOSO for each volume: `{"volume": {"host":
    <resolved destination host>, "ref": <reference for the family and destination pool, named
-   "volume-<source_volume_id>">, "name": …, "volume_type": mapped, "bootable": …}}`; wait
+   "volume-<source_volume_id>">, "name": …, "volume_type": <the source type's mapping — `plan.mappings.volume_types`
+   overlaid with the migration's resolved mappings, as §7.2 applies them — else its name; none for a volume without
+   a type>, "bootable": …}}`; wait
    `available`. Every supported driver renames the object to `volume-<new_id>` — journal the new
    id/name, it is the reference for a reverse manage.
 7. Restore each volume's boot properties: Cinder `manage` creates a new volume record without
@@ -1040,7 +1046,9 @@ volumes with their server, so the order is:
    on the managed volume with `POST /volumes/{id}/action {"os-set_image_metadata": {"metadata":
    …}}` (journaled per volume). Without it a UEFI or Windows guest would boot with defaults.
 8. Create the destination server from the managed volumes (BDM in journaled device order,
-   `delete_on_termination: false`). Each network is found with step 0's lookup. Its NICs: with
+   `delete_on_termination: false`), with the source flavor's mapping — `plan.mappings.flavors` overlaid with the
+   migration's resolved mappings, so the flavor preflight matched is used (§7.2) — else its name. Each network is found
+   with step 0's lookup. Its NICs: with
    `plan.port_creation_mode` `"nova"` each port's mapped network with the port's first fixed IP (Nova creates the port with a new MAC; §9.2 rules out a port with more than one
    address). With `"neutron"` each port is first created through Neutron on the mapped network with the journaled
    MAC, every fixed IP (by address: Neutron picks the subnet) except those on a SLAAC or DHCPv6-stateless subnet of
