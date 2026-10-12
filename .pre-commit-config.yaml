@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 # Local guard rails mirroring the CI jobs (QASuite §13, Security.md §12).
 #   pipx install pre-commit   (or: uv tool install pre-commit)
 #   pre-commit install

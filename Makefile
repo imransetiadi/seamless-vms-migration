@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 # Let's use bash!
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c

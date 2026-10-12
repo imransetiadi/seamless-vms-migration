@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Add conversion hosts to inventory
   ansible.builtin.include_tasks: conv_host_inventory.yml
   vars:

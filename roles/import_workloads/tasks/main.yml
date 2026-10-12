@@ -1,3 +1,4 @@
+# Modified by the Seamless Migrate project, 2026.
 - name: Read workloads resource file
   os_migrate.os_migrate.read_resources:
     path: "{{ os_migrate_data_dir }}/workloads.yml"
