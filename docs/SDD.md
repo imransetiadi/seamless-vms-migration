@@ -897,8 +897,12 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     project's network that is neither shared with the credential's project nor external, and any network of
     another project when the credential's token carries neither the `admin` nor the `advsvc` role.
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
-  network's subnets whatever their names. A name that does not resolve stops the cutover there, before the
-  source stops: a permanent failure naming the port. When the destination's networks cannot be read, the run logs
+  network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
+  before the source stops: a permanent failure naming the port. A floating IP's network name that does not resolve
+  keeps its reference as exported. In `floating_ip_mode` `auto` (the collection's default, which the control plane
+  keeps) the import attaches a detached RHOSO floating IP with the address and needs no network. Only an admin can
+  create a floating IP with a chosen address. A network the import does need is refused by the destination check
+  (§6.6) before the source stops. When the destination's networks cannot be read, the run logs
   it and keeps the references as exported; the destination check (§6.6) still looks them up before the source
   stops. A run that exports again — the cold cutover always, a warm run by the rules here — never resolves the
   export it is about to replace: a name that no longer resolves there (a mapping fixed since) must not hold up
