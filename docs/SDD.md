@@ -322,6 +322,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
+            cutover_refusals: list[str] = [],   # what the last warm pass met that the cutover refuses before the source stops (§7.2): each pass replaces it, a successful cutover empties it
             downtime_model_s: float|null,   # demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (§5.2)
             verification: VerificationRecord|null,   # the last verification: checks and probe results (§7.5, ADV-18)
             suggested_probes: list[AppProbe] = [],   # the rules' suggestion at validation; inactive until added to the plan (§9.6)
@@ -338,7 +339,7 @@ MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strat
                    progress_pct, estimate, actual_downtime_s, downtime_started_at, downtime_ended_at, approvals,
                    cutover_requested, cutover_requested_by, force_cutover, force_window, advisor_hold,
                    review_required, review_reason, error, source_running_at, findings, suggested_probes,
-                   created_at, updated_at }
+                   cutover_refusals, created_at, updated_at }
                    # GET /migrations?view=summary (§12): a migration's fields as the Migration has them, those
                    # the Overview's and the plan page's lists read (§16), without the passes, all the estimates,
                    # notes, history or VM details
@@ -810,7 +811,9 @@ cutover fails while the source still runs. A pre-copy or sync pass creates and f
 no port or floating IP, so its check passes `network_as_warnings: true` (default `false`): the problems of the ports
 and floating IPs above become module warnings, which the pass's log shows, and only the server's own prerequisites
 (its flavor, image, security group and key pair references) fail the pass. Copying a large disk takes hours, and a
-network problem can be fixed meanwhile; the cutover's check refuses it before the source stops.
+network problem can be fixed meanwhile; the cutover's check refuses it before the source stops. The module also
+returns those problems as `cutover_refusals`, which the warm role writes beside the warm state
+(`osm/workload_warm/<server id>.refusals.json`) for the migration's `cutover_refusals` (§7.2).
 
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
@@ -930,7 +933,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
   before the source stops: a permanent failure naming the port. A warm pre-copy or sync run, which makes no port,
-  logs that failure instead and keeps the port's references as exported; the cutover resolves them again, or exports
+  logs that failure instead, records it in the migration's `cutover_refusals`, and keeps the port's references as exported; the cutover resolves them again, or exports
   again when the plan's mappings changed, and stops there. A floating IP's network name that does not resolve
   keeps its reference as exported. In `floating_ip_mode` `auto` (the collection's default, which the control plane
   keeps) the import attaches a detached RHOSO floating IP with the address and needs no network. Only an admin can
@@ -1007,8 +1010,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
   Destination networks or ports that cannot be read are a transient failure. A `vmware_warm` pre-copy or sync run, in
   which the kit makes no port, maps the NIC as usual when its problem is a network the credential may not use or a MAC
-  or address another port holds, and logs the problem instead, as it logs ports that cannot be read; the cutover
-  refuses it before the power-off. The other problems leave the NIC no correct value in the map, which the kit reads in
+  or address another port holds, and logs the problem and records it in the migration's `cutover_refusals` instead
+  (ports that cannot be read it only logs); the cutover refuses it before the power-off. Each pre-copy or sync pass
+  replaces `cutover_refusals` with what it met - what the executor defers here and what the destination check
+  returns (§6.6), once each - so the list empties once a pass meets the problems fixed, and a successful cutover
+  empties it. The other problems leave the NIC no correct value in the map, which the kit reads in
   every run, and stop every run.
 
   The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
@@ -2461,7 +2467,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
-  cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
+  cuts over once it converges); while the migration's `cutover_refusals` is not empty the page shows them above its actions as a warning,
+  "The cutover will refuse this before the source stops - fix it first" with each problem, and the Cut over
+  dialog repeats them (requesting stays possible: the cutover's own check refuses before the source stops); the
+  plan page's migration list marks such a migration with a warning naming how many problems the cutover will
+  refuse; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
   (`force_window`, §4.2); until the migration's plan is
