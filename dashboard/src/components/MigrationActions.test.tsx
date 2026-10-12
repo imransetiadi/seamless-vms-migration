@@ -347,6 +347,24 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('rolling_back'));
   });
 
+  it("leads an advisor-held migration's next step with its recommendation, ahead of its own actions (SDD §16)", async () => {
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!;
+    expect(migration.advisor_hold).toBeTruthy();
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={'approver' as Role} />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const link = within(group).getByRole('link', { name: 'See the recommendation' });
+    expect(link).toHaveAttribute('href', `/advisor/recommendations/${migration.advisor_hold}`);
+    expect(group.firstElementChild).toBe(link);
+  });
+
+  it('offers no recommendation link where no advisor decision waits', () => {
+    setup('app-billing-01', 'approver');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    expect(within(group).queryByRole('link', { name: 'See the recommendation' })).toBeNull();
+  });
+
   it('lets an approver request the cutover of a converged warm migration', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('app-billing-01', 'approver');

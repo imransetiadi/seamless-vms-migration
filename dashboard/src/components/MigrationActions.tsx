@@ -12,8 +12,11 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
+import { waitingDecision } from '../lib/advisor';
+import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
@@ -97,6 +100,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   // maker-checker with no other approval: the request waits for another approver, it starts nothing (SDD §16)
   const waitsForApprover = requestWaitsForApprover(m, plan, me);
   const step = nextStep(m, plan);
+  // the advisor's decision that holds the migration, when one does (SDD §14.6)
+  const waiting = waitingDecision(m);
   const action = useMigrationAction(m.id);
   const [open, setOpen] = useState<MigrationActionKey | null>(null);
   const [comment, setComment] = useState('');
@@ -184,6 +189,12 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         {step.text}
       </p>
       <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
+        {waiting && (
+          // SDD §16: the decision the next step asks for comes first, ahead of the migration's own actions
+          <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className={buttonClassName('primary', 'lg')}>
+            See the recommendation
+          </Link>
+        )}
         {available.map((key) => {
           const primary = key === step.action;
           const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
