@@ -1180,7 +1180,13 @@ guest answers its suggested probes (§9.6) and SSH (RDP on Windows), with HTTP s
 other port; a VM tagged `demo-fault: app-down` runs none of its application services, so its probes fail and
 its plan's automatic rollback rolls it back (ADV-18). The demo's finance plan probes its three databases (their
 suggested probes as `probe_overrides`; `billing-db-01` carries the fault), the VMware plan probes nothing, so its
-validation warns about its database VMs (`APP_PROBE_MISSING`, §9.3).
+validation warns about its database VMs (`APP_PROBE_MISSING`, §9.3). A VM tagged `demo-fault: cutover-refusal`
+migrated warm meets, on its first two pre-copy or sync passes, a problem the cutover refuses before the source stops
+- another port holds its NIC's address, reported as `cutover_refusals` (§7.2) in the executor's words - and none
+from its third pass on, as if fixed meanwhile; until that third pass ran its cutover refuses before the source
+stops, as the destination check does (§6.6). The demo's VMware inventory holds one such VM, `dc2-portal-02`, which
+no seeded plan holds: planned warm from the dashboard, it shows the migration page's warning, the Cut over dialog's
+note and the plan list's marker (§16), and how they clear.
 
 ### 7.5 Verification (`seamless_migrate.verification`)
 
