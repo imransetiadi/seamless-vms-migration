@@ -879,10 +879,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 * `nic_overrides`: after the mappings, each port of the planned server whose `mac_address` (lower case) has an entry
   in `plan.nic_overrides[vm.source_id]` gets the entry's `network` as its `network_ref` name. Its addresses — the
   entry's `fixed_ips`, else the port's own — become address-only fixed IP references (no `subnet_ref`, §6.6), so
-  Neutron finds them in that network's subnets. A floating IP on one of the port's former addresses moves to
-  the port's new address of the same IP version; os-migrate attaches it by that address, and fails after Nova
-  created the server when no port holds it. With no such address, or with several, the cutover stops after the
-  export: a permanent failure naming the port, before the source stops. An entry whose MAC no exported port has
+  Neutron finds them in that network's subnets. A floating IP on one of the port's former addresses stays on it
+  when the port keeps that address (a network-only entry, or one whose `fixed_ips` list it); otherwise it moves to
+  the port's new address of the same IP version. os-migrate attaches it by that address, and fails after Nova
+  created the server when no port holds it. A floating IP that must move and finds no such address, or several,
+  stops the cutover after the export: a permanent failure naming the port, before the source stops. An entry whose MAC no exported port has
   stops it the same way (the VM's NICs changed since validation). The port is marked
   `_migration_params.nic_override: true`. A warm cutover exports the workload again first when the VM has an entry,
   or when its `workloads.yml` holds a port so marked (an entry removed since the export).
