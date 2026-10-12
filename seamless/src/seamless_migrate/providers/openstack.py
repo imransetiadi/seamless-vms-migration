@@ -238,7 +238,7 @@ class OpenStackProvider:
         visible = list(conn.network.networks())
         networks = {str(_attr(n, "name")): _attr(n, "mtu") for n in visible}
         project = self._project_name(conn)
-        # the credential's own keypairs: what it can export, or owns as the creator (SDD §11)
+        # the credential's own keypairs: what it can export, or owns as the creator (SDD §10)
         keypairs = sorted(str(_attr(k, "name")) for k in conn.compute.keypairs())
         if self.provider.role == ProviderRole.source:
             return SourceInventory(

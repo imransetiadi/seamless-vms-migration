@@ -21,7 +21,7 @@ class SourceInventory:
     #: network name -> MTU (None when unknown)
     networks: dict[str, int | None] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
-    #: the source credential's own keypairs: what export_keypairs.yml can export (SDD §11)
+    #: the source credential's own keypairs: what export_keypairs.yml can export (SDD §10)
     keypairs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,13 +37,13 @@ class DestinationInventory:
     #: project -> free {cores, ram_mb, instances, volumes, gigabytes}; None/-1 = unlimited
     quotas: dict[str, dict[str, int | None]] = field(default_factory=dict)
     projects: list[str] = field(default_factory=list)
-    #: the destination credential's own keypairs: the server is created as that user (SDD §11)
+    #: the destination credential's own keypairs: the server is created as that user (SDD §10)
     keypairs: list[str] = field(default_factory=list)
-    #: [{name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}]: where a NIC's
-    #: addresses must lie (SDD §11, §9.3)
+    #: [{id, name, network, network_id, cidr, ipv6_address_mode, ipv6_ra_mode}]: where a NIC's
+    #: addresses must lie (SDD §10, §9.3)
     subnets: list[dict[str, Any]] = field(default_factory=list)
-    #: [{id, name, mtu, project_id, own, shared}]: every network the credential sees, what a NIC's
-    #: network name resolves to (SDD §11, §7.3 step 0)
+    #: [{id, name, mtu, project_id, own, shared, external}]: every network the credential sees, what
+    #: a NIC's network name resolves to (SDD §10, §7.3 step 0)
     network_details: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -469,7 +469,7 @@ def _in_subnets(address: str, cidrs: Sequence[str]) -> bool:
 
 
 def _network_list(dst_inv: DestinationInventory) -> list[dict[str, Any]]:
-    """The networks the destination credential sees (SDD §11); an inventory from before
+    """The networks the destination credential sees (SDD §10); an inventory from before
     network_details lists each name once, as the credential's own network."""
     if dst_inv.network_details:
         return dst_inv.network_details
