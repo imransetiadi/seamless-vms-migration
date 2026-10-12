@@ -1845,7 +1845,10 @@ written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
-  `seamless-secrets` volume there). The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
+  `seamless-secrets` volume there). When it is not — the default on a host run, where a user cannot write
+  `/var/run/secrets/seamless` — the credential routes answer 503 `unavailable` with "secret store: cannot write
+  the secret store at {directory}: {reason}; set SEAMLESS_SECRETS_DIR to a directory this process can write",
+  which the dashboard shows as is. The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
   an existing one it owns to 0700 when it writes, so other local users cannot list the secret names; one
   it does not own (a mount) keeps its mode.
 * `kubernetes` (OpenShift): a `Secret` named `seamless-{name}` in `SEAMLESS_K8S_NAMESPACE` (default:
