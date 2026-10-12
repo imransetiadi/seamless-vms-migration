@@ -196,6 +196,7 @@ ROUTES = [
     ("GET", "/api/v1/events", Role.viewer, None),
     ("GET", "/api/v1/stats", Role.viewer, None),
     ("GET", "/api/v1/advisor/status", Role.viewer, None),
+    ("GET", "/api/v1/advisor/notes", Role.viewer, None),
     ("POST", "/api/v1/advisor/similar-incidents", Role.operator, {"query": "timeout"}),
     ("GET", "/api/v1/metrics", Role.viewer, None),
 ]

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.enums import DecisionType, DerivedPlanStatus, Phase, Role, Strategy
 from ..domain.models import (
+    AdvisorNote,
     AdvisorPolicy,
     AdvisorRecommendation,
     Plan,
@@ -145,6 +146,18 @@ class RecommendationPage(BaseModel):
     total: int
     offset: int
     limit: int
+
+
+class AdvisorNoteEntry(AdvisorNote):
+    """An advisor note with the migration it belongs to (SDD §12 ``GET /advisor/notes``)."""
+
+    migration_id: str
+    plan_id: str
+    vm_name: str
+
+
+class AdvisorNoteList(BaseModel):
+    items: list[AdvisorNoteEntry]
 
 
 class OrchestratorHealth(BaseModel):

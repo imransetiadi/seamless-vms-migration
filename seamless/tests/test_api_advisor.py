@@ -192,3 +192,92 @@ def test_gets_a_recommendation_by_id_stored_or_legacy(api):
 def test_recommendations_need_a_token_and_any_role(api):
     assert api.get("/api/v1/advisor/recommendations", role=None).status_code == 401
     assert api.get("/api/v1/advisor/recommendations", role=Role.viewer).status_code == 200
+
+
+def test_lists_every_migrations_advisor_notes_but_strategy_notes_newest_first(api):
+    """SDD §12 GET /advisor/notes (perf audit PF-02): the Advisor page's notes without reading every
+    migration - newest first, notes of the same time in the migrations' creation order and each
+    migration's note order; strategy notes are listed as legacy recommendations instead."""
+    api.store.put(
+        "migration",
+        make_migration(
+            id="mig-c",
+            plan_id="plan-1",
+            vm=make_vm(name="app-03", source_id="src-mig-c"),
+            advisor_notes=[
+                AdvisorNote(
+                    kind="verification",
+                    source="jev",
+                    summary="Boot verified; no review needed",
+                    confidence=0.93,
+                    data={"verdict": "verified"},
+                    created_at=T0 + timedelta(hours=3),
+                ),
+                AdvisorNote(
+                    kind="strategy",
+                    source="jev",
+                    summary="legacy",
+                    created_at=T0 + timedelta(hours=4),
+                ),
+                AdvisorNote(
+                    kind="similar_incidents",
+                    source="memory",
+                    summary="2 similar incidents",
+                    created_at=T0 + timedelta(hours=1),
+                ),
+                AdvisorNote(kind="screen", source="jev", summary="screened", created_at=T0),
+            ],
+        ),
+    )
+    page = api.get("/api/v1/advisor/notes")
+    assert page.status_code == 200, page.text
+    items = page.json()["items"]
+    assert [(i["migration_id"], i["kind"]) for i in items] == [
+        ("mig-c", "verification"),
+        ("mig-c", "similar_incidents"),
+        # the same time: the migrations' creation order, then each migration's note order
+        ("mig-a", "classification"),
+        ("mig-b", "classification"),
+        ("mig-c", "screen"),
+    ]
+    assert items[0] == {
+        "kind": "verification",
+        "source": "jev",
+        "summary": "Boot verified; no review needed",
+        "confidence": 0.93,
+        "data": {"verdict": "verified"},
+        "created_at": items[0]["created_at"],
+        "migration_id": "mig-c",
+        "plan_id": "plan-1",
+        "vm_name": "app-03",
+    }
+    assert items[0]["created_at"].startswith("2026-10-09T11:00:00")
+    limited = api.get("/api/v1/advisor/notes", params={"limit": 2}).json()["items"]
+    assert [i["kind"] for i in limited] == ["verification", "similar_incidents"]
+    for bad in ({"limit": 0}, {"limit": 201}):
+        assert api.get("/api/v1/advisor/notes", params=bad).status_code == 422, bad
+    # 20 unless asked otherwise
+    api.store.put(
+        "migration",
+        make_migration(
+            id="mig-d",
+            plan_id="plan-2",
+            vm=make_vm(name="batch-04", source_id="src-mig-d"),
+            advisor_notes=[
+                AdvisorNote(
+                    kind="classification",
+                    source="rules",
+                    summary=f"tier {n}",
+                    created_at=T0 - timedelta(minutes=n),
+                )
+                for n in range(1, 25)
+            ],
+        ),
+    )
+    assert len(api.get("/api/v1/advisor/notes").json()["items"]) == 20
+    assert len(api.get("/api/v1/advisor/notes", params={"limit": 200}).json()["items"]) == 29
+
+
+def test_advisor_notes_need_a_token_and_any_role(api):
+    assert api.get("/api/v1/advisor/notes", role=None).status_code == 401
+    assert api.get("/api/v1/advisor/notes", role=Role.viewer).status_code == 200
