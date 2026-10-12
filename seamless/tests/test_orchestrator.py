@@ -38,7 +38,7 @@ from seamless_migrate.domain.models import (
     next_pass_number,
     utcnow,
 )
-from seamless_migrate.events import AUDIT_KINDS, EventBus
+from seamless_migrate.events import AUDIT_KINDS, EventBus, emit
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -3728,6 +3728,24 @@ async def _fail_with_memory(tmp_path, store, seen: list[str], results: list[dict
     store.put("plan", plan)
     await run_plan(h, plan)
     return h, plan
+
+
+async def test_each_tick_has_the_streams_send_what_another_process_wrote(tmp_path, store):
+    """SDD §12: the CLI beside the running server writes an event to the store - no event of the
+    server's own follows it, yet within about a tick it reaches the open streams."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    await h.orch.start()
+    agen = h.bus.subscribe(since=store.max_seq())
+    waiting = asyncio.ensure_future(agen.__anext__())
+    await asyncio.sleep(0.05)  # the stream has read the store and waits for live events
+    try:
+        cli = await emit(store, EventBus(store), "plan.updated", "from the CLI", actor="cli")
+        got = await asyncio.wait_for(waiting, 2)
+        assert (got.seq, got.message, got.actor) == (cli.seq, "from the CLI", "cli")
+    finally:
+        waiting.cancel()
+        await agen.aclose()
+        await h.orch.stop()
 
 
 async def test_similar_incidents_attached_on_failure(tmp_path, store):

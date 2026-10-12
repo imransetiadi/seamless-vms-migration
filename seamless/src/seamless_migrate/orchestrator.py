@@ -1984,6 +1984,8 @@ class Orchestrator:
             self._last_tick_at = started  # heartbeat: the loop is alive even during a long tick
             try:
                 await self.tick()
+                # SDD §12: the streams send what another process (the CLI) wrote to the store
+                await self.bus.catch_up()
                 self._tick_errors = 0
             except asyncio.CancelledError:
                 raise

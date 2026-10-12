@@ -1,10 +1,14 @@
 import asyncio
+from datetime import timedelta
 
 import pytest
+import sqlalchemy as sa
 
-from seamless_migrate.domain.models import Event
+from seamless_migrate import events as events_module
+from seamless_migrate.domain.models import Event, utcnow
 from seamless_migrate.events import EPHEMERAL_KINDS, PERSISTED_KINDS, EventBus, emit
 from seamless_migrate.store import Store
+from seamless_migrate.store import events as events_table
 
 
 async def _take(agen, n: int, wait_s: float = 2.0) -> list[Event]:
@@ -158,6 +162,286 @@ async def test_slow_subscriber_recovers_persisted_events(store: Store):
     assert [e.message for e in rest] == [f"burst-{i}" for i in range(5)]
     await agen.aclose()
     assert bus.subscriber_count == 0
+
+
+async def _from_another_process(store: Store, message: str) -> Event:
+    """An event the CLI beside the server writes: to the same store, through its own bus."""
+    return await emit(store, EventBus(store), "plan.updated", message, plan_id="p", actor="cli")
+
+
+async def test_a_stream_sends_what_another_process_wrote_before_the_next_event(store: Store):
+    """SDD §12: an event whose seq skips some comes after the skipped ones, read from the store."""
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 3))
+    await asyncio.sleep(0.05)
+    first = await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    cli = await _from_another_process(store, "cli")
+    second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    got = await task
+    assert [e.message for e in got] == ["server-1", "cli", "server-2"]
+    assert [e.seq for e in got] == [first.seq, cli.seq, second.seq]
+    # once each: the live copy of server-2 the replay already sent is dropped
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agen.__anext__(), 0.2)
+    await agen.aclose()
+
+
+async def test_a_stream_sends_what_another_process_wrote_while_the_server_emits_nothing(
+    store: Store,
+):
+    """SDD §12: each tick the bus compares the store's newest seq with the newest it published
+    and has every stream read what it lacks - and when the store is not ahead no stream reads it."""
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    await emit(store, bus, "plan.updated", "server", plan_id="p")
+    assert [e.message for e in await _take(agen, 1)] == ["server"]
+    reads: list[int] = []
+    events = store.events
+
+    def counted(*args, **kwargs):
+        reads.append(1)
+        return events(*args, **kwargs)
+
+    store.events = counted  # type: ignore[method-assign]
+    await bus.catch_up()  # nothing new: no stream reads the store
+    await asyncio.sleep(0.05)
+    assert reads == []
+    cli = [await _from_another_process(store, f"cli-{i}") for i in range(2)]
+    await bus.catch_up()
+    got = await _take(agen, 2)
+    assert [e.seq for e in got] == [e.seq for e in cli]
+    assert len(reads) == 1
+    await bus.catch_up()  # sent already: nothing to read again
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agen.__anext__(), 0.2)
+    assert len(reads) == 1
+    live = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    assert [e.seq for e in await _take(agen, 1)] == [live.seq]
+    assert len(reads) == 1, "the server's own next event comes live, without a read"
+    await agen.aclose()
+
+
+async def test_no_stream_no_look_at_the_store(store: Store):
+    """SDD §12: with no stream open the tick does not read the store's newest seq."""
+    bus = EventBus(store)
+    looked: list[int] = []
+    newest = store.max_seq
+
+    def counted() -> int:
+        looked.append(1)
+        return newest()
+
+    store.max_seq = counted  # type: ignore[method-assign]
+    await _from_another_process(store, "cli")
+    await bus.catch_up()
+    assert looked == []
+
+
+def _uncommitted(
+    store: Store,
+    seqs: set[int],
+    reads: int | None = None,
+    aged: set[int] = frozenset(),
+    ahead: set[int] = frozenset(),
+):
+    """store.events as another process's insert not committed yet shows it (PostgreSQL): ``seqs``
+    are missing for the first ``reads`` reads, or for good; ``aged`` events look a minute old, and
+    ``ahead`` ones a minute in the future (a writer whose clock is ahead)."""
+    events = store.events
+    calls = {"n": 0}
+
+    def shifted(e: Event) -> Event:
+        if e.seq in aged:
+            return e.model_copy(update={"ts": e.ts - timedelta(minutes=1)})
+        if e.seq in ahead:
+            return e.model_copy(update={"ts": e.ts + timedelta(minutes=1)})
+        return e
+
+    def read(*args, **kwargs):
+        calls["n"] += 1
+        got = events(*args, **kwargs)
+        if reads is None or calls["n"] <= reads:
+            got = [e for e in got if e.seq not in seqs]
+        return [shifted(e) for e in got]
+
+    store.events = read  # type: ignore[method-assign]
+    return calls
+
+
+async def test_a_stream_holds_what_follows_an_insert_not_committed_yet(store: Store):
+    """SDD §12: PostgreSQL may commit another process's insert after a later one - the stream holds
+    the later event until the earlier one appears, so both come once and in seq order."""
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    first = await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    assert [e.seq for e in await _take(agen, 1)] == [first.seq]
+    cli = await _from_another_process(store, "cli")
+    calls = _uncommitted(store, {cli.seq}, reads=2)
+    second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    got = await _take(agen, 2)
+    assert [e.seq for e in got] == [cli.seq, second.seq]
+    assert calls["n"] == 3  # two reads without it, a moment apart, then the one with it
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agen.__anext__(), 0.2)
+    await agen.aclose()
+
+
+async def test_a_seq_that_never_comes_holds_the_stream_back_only_a_while(store: Store, monkeypatch):
+    """SDD §12: a rolled-back insert's seq never appears - after one wait the stream goes on."""
+    monkeypatch.setattr(events_module, "HOLE_WAIT_S", 0.3)
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    await _take(agen, 1)
+    lost = await _from_another_process(store, "rolled back")
+    calls = _uncommitted(store, {lost.seq})
+    loop = asyncio.get_running_loop()
+    second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    started = loop.time()
+    got = await _take(agen, 1)
+    assert [e.seq for e in got] == [second.seq]
+    assert 0.25 <= loop.time() - started < 1.5
+    assert calls["n"] <= 0.3 / events_module.HOLE_POLL_S + 3, "it reads again a moment apart"
+    third = await emit(store, bus, "plan.updated", "server-3", plan_id="p")
+    started = loop.time()
+    assert [e.seq for e in await _take(agen, 1)] == [third.seq]
+    assert loop.time() - started < 0.2, "one wait per gap, not for each event after it"
+    await agen.aclose()
+
+
+async def test_a_hold_ends_after_its_wait_even_when_the_writer_s_clock_is_ahead(
+    store: Store, monkeypatch
+):
+    """SDD §12: the wait is counted from when the stream began holding, so an event stamped by a
+    clock that runs ahead - it looks recent for a minute - holds the stream only that long."""
+    monkeypatch.setattr(events_module, "HOLE_WAIT_S", 0.3)
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    await _take(agen, 1)
+    lost = await _from_another_process(store, "rolled back")
+    second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    _uncommitted(store, {lost.seq}, ahead={second.seq})
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert [e.seq for e in await _take(agen, 1)] == [second.seq]
+    assert 0.25 <= loop.time() - started < 1.5
+    await agen.aclose()
+
+
+async def test_each_gap_is_held_for_on_its_own(store: Store, monkeypatch):
+    """SDD §12: a gap waited out does not use up the wait of the next one."""
+    monkeypatch.setattr(events_module, "HOLE_WAIT_S", 0.3)
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    await _take(agen, 1)
+    lost = await _from_another_process(store, "rolled back")
+    _uncommitted(store, {lost.seq})
+    second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+    assert [e.seq for e in await _take(agen, 1)] == [second.seq]
+    late = await _from_another_process(store, "late")
+    _uncommitted(store, {late.seq}, reads=2)
+    third = await emit(store, bus, "plan.updated", "server-3", plan_id="p")
+    assert [e.seq for e in await _take(agen, 2)] == [late.seq, third.seq]
+    await agen.aclose()
+
+
+async def test_what_comes_before_a_gap_is_sent_at_once(store: Store, monkeypatch):
+    """SDD §12: the stream holds only what follows the gap - what was read before it goes out."""
+    monkeypatch.setattr(events_module, "HOLE_WAIT_S", 0.5)
+    bus = EventBus(store)
+    since = store.max_seq()
+    before = [await emit(store, bus, "plan.updated", f"b{i}", plan_id="p") for i in range(2)]
+    lost = await _from_another_process(store, "rolled back")
+    after = await emit(store, bus, "plan.updated", "after", plan_id="p")
+    _uncommitted(store, {lost.seq})
+    agen = bus.subscribe(since=since)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert [e.seq for e in await _take(agen, 2)] == [e.seq for e in before]
+    assert loop.time() - started < 0.2
+    assert [e.seq for e in await _take(agen, 1)] == [after.seq]
+    assert loop.time() - started >= 0.45
+    await agen.aclose()
+
+
+async def test_no_hold_for_a_gap_right_after_seq_0(any_store):
+    """SDD §12: a store whose events were all deleted goes on numbering from where they ended - a
+    stream that starts from seq 0 sends its first event at once."""
+    store = any_store
+    bus = EventBus(store)
+    for i in range(3):
+        await emit(store, bus, "plan.updated", f"old-{i}", plan_id="p")
+    assert store.delete_events_before(utcnow() + timedelta(seconds=1)) == 3
+    assert store.max_seq() == 0
+    agen = bus.subscribe(since=store.max_seq())
+    task = asyncio.ensure_future(_take(agen, 1))
+    await asyncio.sleep(0.05)
+    loop = asyncio.get_running_loop()
+    fresh = await emit(store, bus, "plan.updated", "new", plan_id="p")
+    started = loop.time()
+    assert [e.seq for e in await task] == [fresh.seq]
+    assert fresh.seq > 3 and loop.time() - started < 0.2
+    await agen.aclose()
+
+
+async def test_a_replay_without_gaps_is_one_read(store: Store):
+    """SDD §12: consecutive seqs are sent as they are read - no gap, nothing held, no read again."""
+    bus = EventBus(store)
+    since = store.max_seq()
+    sent = [await emit(store, bus, "plan.updated", f"e{i}", plan_id="p") for i in range(3)]
+    calls = _uncommitted(store, set())
+    agen = bus.subscribe(since=since)
+    assert [e.seq for e in await _take(agen, 3)] == [e.seq for e in sent]
+    assert calls["n"] == 1
+    await agen.aclose()
+
+
+async def test_a_gap_before_an_older_event_is_not_waited_for(store: Store):
+    """SDD §12: a resume's replay meets old gaps (pruned events) - they hold nothing back."""
+    bus = EventBus(store)
+    first = await emit(store, bus, "plan.updated", "a", plan_id="p")
+    gone = await _from_another_process(store, "pruned")
+    old = await emit(store, bus, "plan.updated", "b", plan_id="p")
+    _uncommitted(store, {gone.seq}, aged={old.seq})
+    agen = bus.subscribe(since=first.seq - 1)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    got = await _take(agen, 2)
+    assert [e.seq for e in got] == [first.seq, old.seq]
+    assert loop.time() - started < 0.2
+    await agen.aclose()
+
+
+async def test_a_stream_holds_an_event_behind_another_process_s_uncommitted_insert(any_store):
+    """SDD §12 on PostgreSQL: the CLI's insert takes its seq, the server commits a later event
+    first - the stream holds that event until the CLI's commits, and sends both in seq order."""
+    store = any_store
+    if store.engine.dialect.name != "postgresql":
+        pytest.skip("SQLite serializes writers: no insert stays uncommitted beside a commit")
+    bus = EventBus(store)
+    agen = bus.subscribe(since=store.max_seq())
+    first = await emit(store, bus, "plan.updated", "server-1", plan_id="p")
+    assert [e.seq for e in await _take(agen, 1)] == [first.seq]
+    other = sa.create_engine(store.engine.url)  # another process's own connection
+    try:
+        with other.connect() as conn:
+            tx = conn.begin()
+            row = {"ts": utcnow(), "kind": "plan.updated", "plan_id": "p", "actor": "cli"}
+            conn.execute(events_table.insert().values(**row, message="cli", data={}))
+            second = await emit(store, bus, "plan.updated", "server-2", plan_id="p")
+            task = asyncio.ensure_future(_take(agen, 2))
+            await asyncio.sleep(0.3)
+            assert not task.done(), "server-2 waits for the CLI's event"
+            tx.commit()
+        got = await task
+    finally:
+        other.dispose()
+    assert [e.message for e in got] == ["cli", "server-2"]
+    assert got[0].seq < got[1].seq == second.seq
+    await agen.aclose()
 
 
 def test_event_kinds_match_sdd_4_3_and_the_dashboard():
