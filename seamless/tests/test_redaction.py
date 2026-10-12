@@ -111,6 +111,8 @@ URL_WITH_PASSWORD = "postgresql://svc:Sup3rS3cretPw@db.example:5432/seamless"
         ("x" * 400 + " " + PEM_KEY + " tail", "KKKK"),  # the cut falls inside the key
         ("x" * 470 + " " + URL_WITH_PASSWORD + " tail", "Sup3r"),  # ... inside the password
     ],
+    # ids of their own: derived from the texts, they would carry the secrets into the cache and logs
+    ids=["the cut splits a PEM key", "the cut splits a URL password"],
 )
 def test_redact_cut_finds_a_secret_the_cut_splits(text, leak):
     """SDD §13.4: cutting first leaves a PEM block without its END line and a URL without the @

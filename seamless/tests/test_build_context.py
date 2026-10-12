@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import tomllib
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from seamless_migrate.ai.redaction import redact
 from seamless_migrate.config import find_repo_root
 
 ROOT = find_repo_root()
@@ -392,6 +394,41 @@ def test_strict_gitleaks_config_never_allowlists_a_secret_path():
         paths += [re.compile(p) for p in block.get("paths", [])]
     covered = [path for path in SECRET_PATHS if any(rx.search(path) for rx in paths)]
     assert covered == [], f".gitleaks.toml allowlists secret files: {covered}"
+
+
+def _ids_carrying_a_secret(nodeids: list[str]) -> list[str]:
+    """The tests among ``nodeids`` whose ids hold what the control plane redacts as a secret (SDD
+    §13.4), by test name only: their ids are never repeated."""
+    return sorted({nodeid.split("[")[0] for nodeid in nodeids if redact(nodeid) != nodeid})
+
+
+def test_no_test_id_carries_a_secret():
+    """A parametrized case's id comes from its arguments, and ids reach pytest's cache - which the
+    working-tree scan of ``make seamless-check`` reads (S-17) - ``-v`` output and CI logs. So no id
+    may hold a secret: such a case gets explicit ``ids``."""
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=ROOT / "seamless",
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    ids = [line for line in run.stdout.splitlines() if "::" in line]
+    assert ids, run.stdout[-1000:] + run.stderr[-1000:]
+    leaking = _ids_carrying_a_secret(ids)
+    assert leaking == [], f"test ids that carry a secret - give their cases ids=: {leaking}"
+
+
+def test_the_id_check_names_the_tests_whose_ids_carry_a_pem_key_or_a_url_password():
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 40 + "-----END RSA PRIVATE KEY-----"
+    url = "postgresql://svc:" + "pw" + "@db.example/seamless"
+    ids = [
+        f"tests/t.py::test_pem[x {pem} y]",
+        f"tests/t.py::test_url[{url}]",
+        "tests/t.py::test_plain[the cut splits a PEM key]",
+        "tests/t.py::test_unparametrized",
+    ]
+    assert _ids_carrying_a_secret(ids) == ["tests/t.py::test_pem", "tests/t.py::test_url"]
 
 
 def test_the_containers_stop_grace_leaves_room_for_the_orchestrator_to_stop():
