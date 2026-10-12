@@ -26,17 +26,25 @@ def port_refusal(network: dict[str, Any], roles: Collection[str] | None) -> str 
     """Why the destination credential may not put a port on ``network`` (a ``network_details``
     entry), or None (SDD §6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and only from a
-    token with one of ``PORT_ROLES``: every recreated port asks for its address or MAC. ``roles``
-    None (not reported) leaves that half unjudged."""
-    if network.get("own"):
-        return None
-    if not (network.get("shared") or network.get("external")):
-        return "it is neither shared with the credential's project nor external"
-    if roles is not None and not set(roles) & set(PORT_ROLES):
-        return (
-            "Neutron lets only the admin or advsvc role, or that project, choose a port's address "
-            "or MAC there, and the credential's token has neither"
-        )
+    token with one of ``PORT_ROLES``: every recreated port asks for its address or MAC. An
+    external network that is not shared, the credential's own included, also needs the admin
+    role: Nova attaches no other to a server. ``roles`` None (not reported) leaves the role
+    halves unjudged."""
+    if not network.get("own"):
+        if not (network.get("shared") or network.get("external")):
+            return "it is neither shared with the credential's project nor external"
+        if roles is not None and not set(roles) & set(PORT_ROLES):
+            return (
+                "Neutron lets only the admin or advsvc role, or that project, choose a port's "
+                "address or MAC there, and the credential's token has neither"
+            )
+    # Nova's network:attach_external_network, admin only by default (2023.1)
+    if network.get("external") and not network.get("shared"):
+        if roles is not None and "admin" not in roles:
+            return (
+                "it is external and not shared, and Nova lets only the admin role attach such a "
+                "network to a server; the credential's token lacks it"
+            )
     return None
 
 

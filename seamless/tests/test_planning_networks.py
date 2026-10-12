@@ -7,6 +7,7 @@ from seamless_migrate.planning.networks import (
     kit_network_key,
     kit_network_value,
     kit_subnet,
+    port_refusal,
 )
 
 NETWORK = {"id": "net-prod", "name": "dc2-prod", "own": True, "shared": False}
@@ -68,3 +69,29 @@ def test_kit_subnet_refuses_addresses_the_kits_port_cannot_take():
 def test_kit_network_value_names_the_network_and_the_subnet_by_id():
     assert kit_network_value(NETWORK, subnet("sub-a", "10.2.0.0/24")) == "net-prod,sub-a"
     assert kit_network_value(NETWORK, None) == "net-prod"
+
+
+def test_port_refusal_asks_the_admin_role_for_an_unshared_external_network():
+    """SDD §6.6, review RT-03: Nova (2023.1 network:attach_external_network, admin by default)
+    attaches an external network that is not shared only for the admin role - the credential's
+    own included, and advsvc does not count; Neutron's half is judged first for another
+    project's network, and no reported roles judge neither."""
+    member, advsvc, admin = ["member", "reader"], ["advsvc"], ["admin", "member"]
+    own_external = {"own": True, "shared": False, "external": True}
+    other_external = {"own": False, "shared": False, "external": True}
+    nova = (
+        "it is external and not shared, and Nova lets only the admin role attach such a network "
+        "to a server; the credential's token lacks it"
+    )
+    assert port_refusal(own_external, member) == nova
+    assert port_refusal(own_external, advsvc) == nova
+    assert port_refusal(own_external, admin) is None
+    assert port_refusal(other_external, advsvc) == nova
+    assert port_refusal(other_external, admin) is None
+    assert "Neutron lets only the admin or advsvc role" in (
+        port_refusal(other_external, member) or ""
+    )
+    assert port_refusal({**own_external, "shared": True}, member) is None
+    assert port_refusal({"own": True, "shared": False, "external": False}, member) is None
+    for network in (own_external, other_external):
+        assert port_refusal(network, None) is None

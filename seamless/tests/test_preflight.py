@@ -1050,12 +1050,16 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
         "project, choose a port's address or MAC there, and the credential's token has neither."
     )
     assert only(found(external, member), "NET_PORT_NOT_PERMITTED").message == f.message
-    # with the admin or advsvc role a shared or external network takes it
+    # with the admin or advsvc role a shared network takes it, an unshared external one only from
+    # the admin role: Nova attaches it for no other (review RT-03)
     for roles in (["admin", "member", "reader"], ["advsvc"]):
-        for network in (shared, external):
-            assert "NET_PORT_NOT_PERMITTED" not in [
-                x.code for x in found(network, {"roles": roles})
-            ]
+        assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, {"roles": roles})]
+    assert "NET_PORT_NOT_PERMITTED" not in [
+        x.code for x in found(external, {"roles": ["admin", "member", "reader"]})
+    ]
+    assert "Nova lets only the admin role attach such a network" in (
+        only(found(external, {"roles": ["advsvc"]}), "NET_PORT_NOT_PERMITTED").message
+    )
     # another project's private network never does: the admin sees it, the VM must not land there
     for caps in (member, {"admin": True, "roles": ["admin"]}, None, {}):
         f = only(found(private, caps), "NET_PORT_NOT_PERMITTED")
@@ -1067,9 +1071,20 @@ def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projec
     # no reported roles (a destination checked by another implementation): that half is not judged
     for caps in (None, {"admin": True}):
         assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(shared, caps)]
-    # the credential's own network, whatever the roles
+    # the credential's own network, whatever the roles - unless it is external and not shared
     own = net("o", "rhoso-net")
     assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own, member)]
+    own_external = net("x", "rhoso-net", project_id="project-me", shared=False, external=True)
+    assert only(found(own_external, member), "NET_PORT_NOT_PERMITTED").message == (
+        "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+        "'rhoso-net' (project project-me): it is external and not shared, and Nova lets only the "
+        "admin role attach such a network to a server; the credential's token lacks it."
+    )
+    assert "NET_PORT_NOT_PERMITTED" not in [
+        x.code for x in found(own_external, {"roles": ["admin"]})
+    ]
+    own_shared_external = {**own_external, "shared": True}
+    assert "NET_PORT_NOT_PERMITTED" not in [x.code for x in found(own_shared_external, member)]
     # a NIC override's network is judged the same way
     moved = make_plan(nic_overrides={"vm-1": {"fa:16:3e:00:00:01": {"network": "rhoso-net"}}})
     assert "NET_PORT_NOT_PERMITTED" in [x.code for x in found(shared, member, plan=moved)]
