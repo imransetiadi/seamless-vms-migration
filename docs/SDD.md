@@ -1700,6 +1700,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/advisor/data-sent` | viewer | — | `{"items": [{"decision_type": DecisionType, "tool": str, "fields": [{"key": str, "label": str}], "sent": bool, "note": str?}]}` — generated from the serializers' field specs (§13.4, ADV-06) |
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
+| GET | `/advisor/notes` | viewer | query `limit` (1–200, default 20) | `{"items": [AdvisorNoteEntry]}`: the advisor notes of every migration except strategy notes (those are listed as legacy recommendations, §14.4), newest first; notes of the same time keep the migrations' creation order and each migration's note order. An `AdvisorNoteEntry` is an `AdvisorNote` (§4) with `migration_id`, `plan_id` and `vm_name` |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
 | POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the decision's recorded `require_override_reason` — or, for a decision that recorded none, the policy in force — requires one (§14.6), 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
@@ -2461,7 +2462,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   operator archives to write-once storage (Security.md) — saying how many events it has read and stoppable meanwhile; its stream line counts the new events without announcing each, and Pause
   live updates stops everything that updates on its own — the list and that count — until Resume live updates, so only
   pausing and resuming are announced, the resume with the number of held events it adds: WCAG 2.2.2, 4.1.3),
-  `/advisor` (Jev/agentmemory status,
+  `/advisor` (Jev/agentmemory status, the 20 newest advisor notes of every migration, strategy notes aside, each
+  naming its VM with a link to its migration (`GET /advisor/notes?limit=20`),
   the recommendations feed — filtered by plan and by decision type, both kept in the address (`?plan=`, `?type=`) and
   sent as `GET /advisor/recommendations?plan_id=&decision_type=`, a change going back to its first page; each entry
   shows "Recommended: <option> · <confidence>% confidence" and "Decision:
@@ -2490,8 +2492,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   says so; "Similar past incidents", at most 3, each with its match; Jev's reasons by the item they name, ADV-02;
   tab "Details" with
   the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
-  its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`) offers
-  Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
+  its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`; on `/advisor`
+  a `pending_approval` entry whose migration still holds on it, §14.6 — the page reads that migration alone,
+  `GET /migrations/{id}`, and no migration list) offers Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
   when the policy requires a distinct approver (§14.6) — and Override opens a dialog: another eligible option and the
   reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
   "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
@@ -2529,7 +2532,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   its read starts after the batch's events, so it shows them; should that read fail while a migration waited on it,
   the list is read once more, and a list it already failed to read takes the migration as before. `memory.lesson_saved` refreshes nothing: a lesson
   changes no migration, list or figure, and the Events page and a migration's timeline take the event from the
-  stream. A refresh already under way is not
+  stream. An `advisor.*` event refreshes the recommendations feed and the advisor notes. A refresh already under
+  way is not
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
