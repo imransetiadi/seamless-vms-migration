@@ -1020,9 +1020,9 @@ volumes with their server, so the order is:
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
      deleted.
-1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`. The stop is journaled as sent before it is
-   sent (`sent:stop_source`), so a step that fails while waiting for `SHUTOFF` leaves a journal the rollback starts
-   the source from.
+1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`. The stop is journaled as sent once Nova
+   accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
+   journal the rollback starts the source from; a stop call that itself fails leaves the journal empty.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
    (network, MAC, fixed IPs, port id, whether Nova created it, its security group ids and port-security flag; with
    `plan.port_creation_mode` `"neutron"` also its security groups by name), and the volume attachments in device
