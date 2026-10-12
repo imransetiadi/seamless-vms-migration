@@ -949,7 +949,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 |---|---|---|---|
 | `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
-| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, power on source |
+| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
@@ -979,8 +979,15 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   distributed port group up by its key and drop it, so the plan is validated again, after a retry if the migration
   failed), when the network does not resolve, when the credential may not put a port there (§6.6's rule, with the
   roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host addresses of one subnet of
-  that network, or when two NICs share a key but need different values.
-  Destination networks that cannot be read are a transient failure.
+  that network, when two NICs share a key but need different values, or when another port of that network holds
+  the NIC's MAC or one of its IPv4 addresses (`DestinationProvider.ports`): the kit asks Neutron for both, which
+  refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
+  Destination networks or ports that cannot be read are a transient failure.
+
+  The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
+  create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
+  refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
+  (`<VM name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -1528,6 +1535,11 @@ class DestinationProvider(Protocol):
     async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}]}
     async def console_log(self, server_id: str, lines: int = 200) -> str | None
     async def delete_server(self, server_id: str) -> None
+    async def ports(self, *, network_id: str | None = None, mac_address: str | None = None,
+                    ip_address: str | None = None) -> list[dict[str, Any]]
+        # the ports the credential sees that match every filter given:
+        # [{id, name, network_id, device_id, mac_address, fixed_ips: [address, …]}] (§7.2 VMware networks)
+    async def delete_port(self, port_id: str) -> None   # a port already gone is no error
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
