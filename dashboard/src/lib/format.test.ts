@@ -8,6 +8,7 @@ import {
   formatPct,
   formatRate,
   formatRelative,
+  pyNames,
   pyRepr,
 } from './format';
 
@@ -176,5 +177,15 @@ describe('formatDateTime / formatNumber', () => {
     } finally {
       Intl.NumberFormat = Original;
     }
+  });
+});
+
+describe('pyNames', () => {
+  it("lists names as Python's \", \".join(sorted(set(items))): once each, by code point", () => {
+    expect(pyNames(['lab-b', 'lab-a', 'lab-b'])).toBe('lab-a, lab-b');
+    expect(pyNames([])).toBe('');
+    // JavaScript's default sort puts U+1F600 (a surrogate pair) before U+E000; Python puts it after
+    expect(pyNames(['\u{1F600}', '\uE000'])).toBe('\uE000, \u{1F600}');
+    expect(pyNames(['B', 'a', '\u00e9'])).toBe('B, a, \u00e9');
   });
 });

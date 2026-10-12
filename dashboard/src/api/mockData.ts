@@ -33,7 +33,7 @@ import type {
   VMRef,
 } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
-import { pyRepr } from '../lib/format';
+import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
@@ -932,11 +932,36 @@ export function preflight(
   }
   if (denied.length)
     add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
+  // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
+  // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
+  // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
+  const has = (names: Record<string, unknown>, name: string) => Object.prototype.hasOwnProperty.call(names, name);
+  const mappedNics = vm.nics.filter((nic) => !nicOverride(plan, vm.source_id, nic.mac)?.network);
+  const missingNets = mappedNics
+    .filter((nic) => !has(plan.mappings.networks, nic.network) && !has(destinationNetworks, nic.network))
+    .map((nic) => nic.network);
+  const badNetTargets = mappedNics
+    .filter((nic) => has(plan.mappings.networks, nic.network) && !has(destinationNetworks, plan.mappings.networks[nic.network]!))
+    .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
+  const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
+  if (missingNets.length && prestaged)
+    add(
+      'MAP_NETWORK_PRESTAGED',
+      'info',
+      `Pre-staging creates same-named RHOSO network(s): ${pyNames(missingNets)}.`,
+      'Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.',
+    );
+  else if (missingNets.length)
+    add(
+      'MAP_NETWORK_MISSING',
+      'blocker',
+      `No mapping or same-named RHOSO network for: ${pyNames(missingNets)}.` +
+        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''),
+      'Add a network mapping or create a same-named network in RHOSO.',
+    );
+  if (badNetTargets.length)
+    add('MAP_NETWORK_MISSING', 'blocker', `Network mapping target(s) do not exist in RHOSO: ${pyNames(badNetTargets)}.`, 'Fix the mapping: the destination network must exist.');
   for (const nic of vm.nics) {
-    const mapped = plan.mappings.networks[nic.network] ?? nic.network;
-    // a NIC its override sends elsewhere is checked by MAP_NIC_OVERRIDE_INVALID (SDD §9.3)
-    if (sourceKind !== 'vmware' && !nicOverride(plan, vm.source_id, nic.mac)?.network && !(mapped in destinationNetworks))
-      add('MAP_NETWORK_MISSING', 'blocker', `Network ${nic.network} has no mapping and no same-named RHOSO network.`, 'Add a network mapping in the plan.');
     const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[nicTarget(plan, vm.source_id, nic).network];
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
       add('NET_MTU_SHRINK', 'warning', `Destination MTU ${dstMtu} is smaller than the source NIC MTU ${nic.mtu} on ${nic.network}.`, 'Lower the guest MTU or enable jumbo frames on the OVN underlay.');

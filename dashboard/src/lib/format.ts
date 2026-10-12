@@ -152,6 +152,19 @@ export function secondsBetween(
   return Math.max(0, (b - a) / 1000);
 }
 
+/** Python's order for str, by code point: JavaScript's default sort compares UTF-16 code units, which differs past U+FFFF. */
+function byCodePoint(a: string, b: string): number {
+  const x = Array.from(a, (c) => c.codePointAt(0)!);
+  const y = Array.from(b, (c) => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
+}
+
+/** Names listed as the API's messages list them: Python's `", ".join(sorted(set(items)))`. */
+export function pyNames(items: Iterable<string>): string {
+  return [...new Set(items)].sort(byCodePoint).join(', ');
+}
+
 /** Control characters as Python's repr escapes them. */
 const REPR_ESCAPES: Record<string, string> = { '\\': '\\\\', '\t': '\\t', '\n': '\\n', '\r': '\\r' };
 
