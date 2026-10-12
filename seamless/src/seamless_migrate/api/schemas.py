@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import DecisionType, DerivedPlanStatus, Role, Strategy
+from ..domain.enums import DecisionType, DerivedPlanStatus, Phase, Role, Strategy
 from ..domain.models import (
     AdvisorPolicy,
     AdvisorRecommendation,
@@ -93,9 +93,11 @@ class StrategyRequest(_Body):
 
 
 class PlanOut(Plan):
-    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle."""
+    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle,
+    and how many of its migrations are in each phase (§8.1, §11)."""
 
     derived_status: DerivedPlanStatus
+    migration_counts: dict[Phase, int] = Field(default_factory=dict)
 
 
 class PlanFinalizeRequest(_Body):

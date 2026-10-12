@@ -342,24 +342,24 @@ class Store:
                     out[row.id] = (int(row.version), model_cls.model_validate(row.data))
         return out
 
-    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
-        """Each plan's distinct migration phases (SDD §8.1, §11): one ``SELECT DISTINCT`` over the
-        indexed ``plan_id`` and ``phase`` expressions; no document is loaded or validated. A plan
-        without migrations is absent from the result."""
+    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
+        """Each plan's migration phases with how many of its migrations are in each (SDD §8.1,
+        §11): one ``SELECT ... GROUP BY`` over the indexed ``plan_id`` and ``phase`` expressions; no
+        document is loaded or validated. A plan without migrations is absent from the result."""
         wanted = list(plan_ids)
         if not wanted:
             return {}
         plan_col = documents.c.data["plan_id"].as_string()
         phase_col = documents.c.data["phase"].as_string()
         query = (
-            sa.select(plan_col, phase_col)
-            .distinct()
+            sa.select(plan_col, phase_col, sa.func.count())
             .where(documents.c.kind == "migration", plan_col.in_(wanted))
+            .group_by(plan_col, phase_col)
         )
-        out: dict[str, set[Phase]] = {}
+        out: dict[str, dict[Phase, int]] = {}
         with self.engine.connect() as conn:
-            for plan_id, phase in conn.execute(query):
-                out.setdefault(plan_id, set()).add(Phase(phase))
+            for plan_id, phase, count in conn.execute(query):
+                out.setdefault(plan_id, {})[Phase(phase)] = int(count)
         return out
 
     def delete(self, kind: str, id_: str) -> None:
@@ -578,7 +578,7 @@ class AsyncStore:
     ) -> dict[str, tuple[int, M]]:
         return await asyncio.to_thread(self.sync.get_many, kind, ids, model_cls)
 
-    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
         return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
 
     async def delete(self, kind: str, id_: str) -> None:

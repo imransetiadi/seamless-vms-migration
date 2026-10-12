@@ -100,14 +100,16 @@ async def _check_providers(request: Request, spec: PlanCreate) -> None:
 
 
 async def _out(request: Request, plans: list[Plan]) -> list[PlanOut]:
-    """The plans with their derived status (SDD §8.1), from one query for their phases (§11)."""
+    """The plans with their derived status (SDD §8.1) and their migrations counted by phase,
+    from one query for their phases (§11)."""
     if not plans:
         return []
-    phases = await services(request).db.plan_phases([p.id for p in plans])
+    counts = await services(request).db.plan_phases([p.id for p in plans])
     return [
         PlanOut(
             **p.model_dump(),
-            derived_status=derive_plan_status_from_phases(p, phases.get(p.id, set())),
+            derived_status=derive_plan_status_from_phases(p, counts.get(p.id, {}).keys()),
+            migration_counts=counts.get(p.id, {}),
         )
         for p in plans
     ]

@@ -404,6 +404,39 @@ def test_plan_routes_derive_the_status_without_loading_migrations(api, monkeypat
     assert "migration" not in listed_kinds
 
 
+def test_plans_carry_their_migration_counts_by_phase(api):
+    """SDD §4, §8.1, §11 (PF-02): every plan route returns how many of the plan's migrations are
+    in each phase, from the query that derives its status: {} before the first validation; a
+    client cannot set it."""
+    vm_ids = first_clean_vms(api, n=3)
+    spec = {"source_provider_id": "src-osp", "destination_provider_id": "dst-rhoso"}
+    created = api.post(
+        "/api/v1/plans", Role.operator, json={**spec, "name": "counts", "vm_ids": vm_ids[:2]}
+    )
+    plan = created.json()
+    assert plan["migration_counts"] == {}
+    # a plan never validated has no migration: its own counts, never another plan's
+    other = api.post(
+        "/api/v1/plans", Role.operator, json={**spec, "name": "draft", "vm_ids": vm_ids[2:]}
+    ).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = [x for x in api.store.list("migration", Migration) if x.plan_id == plan["id"]]
+    api.store.put("migration", first.model_copy(update={"phase": Phase.completed}))
+    api.store.put("migration", second.model_copy(update={"phase": Phase.finalized}))
+    one = api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()
+    many = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert one["migration_counts"] == many[plan["id"]]["migration_counts"]
+    assert one["migration_counts"] == {"completed": 1, "finalized": 1}
+    assert many[other["id"]]["migration_counts"] == {}
+    # the API's: a client cannot set it
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"migration_counts": {"completed": 9}},
+    )
+    assert patched.status_code == 422
+
+
 def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):
     """SDD §8.1, §12: POST /plans/{id}/finalize — 403 below approver, 400 for a wrong name,
     404 for an unknown wave, 409 when nothing in scope is completed."""

@@ -57,8 +57,9 @@ def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     assert any_store.change_stamp("plan") == (0, 0)  # per kind
 
 
-def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
-    """SDD §8.1, §11: the set of each plan's phases, in one query, without loading a document."""
+def test_plan_phases_counts_each_plans_migrations_by_phase(any_store: Store):
+    """SDD §8.1, §11: each plan's phases with how many of its migrations are in each, in one
+    query, without loading a document (PF-02: the plan routes' migration_counts)."""
     for plan_id, phase in (
         ("plan-a", Phase.ready),
         ("plan-a", Phase.blocked),
@@ -68,7 +69,7 @@ def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
     ):
         any_store.put("migration", make_migration(plan_id=plan_id, phase=phase))
     got = any_store.plan_phases(["plan-a", "plan-b", "plan-x"])
-    assert got == {"plan-a": {Phase.ready, Phase.blocked}, "plan-b": {Phase.completed}}
+    assert got == {"plan-a": {Phase.ready: 2, Phase.blocked: 1}, "plan-b": {Phase.completed: 1}}
     assert all(isinstance(p, Phase) for phases in got.values() for p in phases)
     assert any_store.plan_phases([]) == {}
 
