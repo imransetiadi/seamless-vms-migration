@@ -190,10 +190,11 @@ def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride])
     lower case) go to the entry's network, their addresses - the entry's, else their own - as
     address-only fixed IP references that Neutron places by subnet (SDD §7.2, §6.6).
 
-    A floating IP on a port's former address moves to its new address of the same IP version:
-    os-migrate attaches it by that address. ``PermanentStepError`` when there is no such address
-    or several, or when an entry's MAC is no exported port's (the VM's NICs changed since
-    validation): raised after the export, before the import stops the source.
+    A floating IP on a port's former address stays there when the port keeps the address, else
+    moves to its new address of the same IP version: os-migrate attaches it by that address.
+    ``PermanentStepError`` when one that must move finds no such address or several, or when an
+    entry's MAC is no exported port's (the VM's NICs changed since validation): raised after the
+    export, before the import stops the source.
     """
     out = copy.deepcopy(doc)
     applied: set[str] = set()
@@ -226,6 +227,10 @@ def apply_nic_overrides(doc: dict[str, Any], entries: Mapping[str, NicOverride])
             if address not in moved:
                 continue
             mac, addresses = moved[address]
+            if address in addresses:
+                # the port keeps it (NicOverride writes addresses canonically, as Neutron does):
+                # os-migrate attaches the floating IP there
+                continue
             version = _ip_version(address)
             same = [a for a in addresses if _ip_version(a) == version]
             if len(same) != 1:

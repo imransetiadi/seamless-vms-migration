@@ -546,6 +546,24 @@ def test_apply_nic_overrides_moves_the_floating_ip_to_the_new_address():
     )
 
 
+def test_apply_nic_overrides_leaves_a_floating_ip_on_an_address_the_port_keeps():
+    """SDD §7.2, review NC-06: a floating IP stays on its address when the override keeps it, also
+    beside other addresses of its version - os-migrate attaches it by that address; only one that
+    must move needs exactly one new address of its version."""
+    from seamless_migrate.domain.models import NicOverride
+    from seamless_migrate.executors.ansible import apply_nic_overrides
+
+    for doc, entry in (
+        # a network-only entry on a port with two IPv4 addresses
+        (fip_doc(("10.0.0.5", "10.0.1.5")), NicOverride(network="rhoso-dmz")),
+        # an entry whose addresses list the floating IP's among another
+        (fip_doc(), NicOverride(fixed_ips=["10.0.1.5", "10.0.0.5"])),
+    ):
+        out = apply_nic_overrides(doc, {"fa:16:3e:00:00:01": entry})
+        [fip] = out["resources"][0]["params"]["floating_ips"]
+        assert fip["params"]["fixed_ip_address"] == "10.0.0.5"
+
+
 def test_apply_nic_overrides_refuses_what_it_cannot_place_before_the_stop():
     """With no new address of the floating IP's version, with several, or with an entry whose MAC
     no exported port has, the cutover stops after the export, before the source stops."""
