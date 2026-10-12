@@ -98,6 +98,22 @@ class FakeImpl:
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
 
+    async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
+        """The destination's ports matching every filter given (SDD §10)."""
+        if self.registry.ports_error:
+            raise ProviderError("ports: HTTP 503")
+        return [
+            dict(p)
+            for p in self.registry.ports
+            if (network_id is None or p["network_id"] == network_id)
+            and (mac_address is None or p["mac_address"] == mac_address)
+            and (ip_address is None or ip_address in p["fixed_ips"])
+        ]
+
+    async def delete_port(self, port_id):
+        self.calls.append(("delete_port", port_id))
+        self.registry.ports = [p for p in self.registry.ports if p["id"] != port_id]
+
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2)."""
         self.calls.append(("inventory",))
@@ -142,6 +158,9 @@ class FakeRegistry:
         # more subnets, after each network's one
         self.subnets: list[dict] = []
         self.inventory_error = False
+        # the destination's ports (SDD §10 DestinationProvider.ports)
+        self.ports: list[dict] = []
+        self.ports_error = False
 
     def get(self, provider):
         return FakeImpl(self)
@@ -1046,6 +1065,102 @@ async def test_vmware_rollback_deletes_destination_and_powers_on_source(env):
     assert read_log(env.log) == []
 
 
+async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
+    """SDD §7.2: the kit creates each port and gives Nova its id, and Nova only unbinds such a port
+    when it deletes the server - it would keep the NIC's MAC and addresses and refuse the next
+    attempt. The rollback deletes, after the server, the unbound ports with one of the VM's NIC
+    MACs and the kit's name form; any other port is kept (review RT-11)."""
+    mac = "00:50:56:00:00:01"
+    nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
+
+    def port(port_id, name, mac=mac, device_id=""):
+        return {
+            "id": port_id,
+            "name": name,
+            "network_id": "net-app-net-mine",
+            "device_id": device_id,
+            "mac_address": mac,
+            "fixed_ips": ["10.0.0.5"],
+        }
+
+    env.registry.ports = [
+        port("kit", "web-01-NIC-0-VLAN-app-net"),
+        port("bound", "web-01-NIC-0-VLAN-app-net", device_id="srv-other"),
+        port("named-otherwise", "my-port"),
+        port("other-mac", "web-01-NIC-1-VLAN-app-net", mac="00:50:56:00:00:99"),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        ("delete_port", "kit"),
+        ("power_on", "srv-1"),
+    ]
+    assert result.details["deleted_ports"] == ["kit"]
+    assert [p["id"] for p in env.registry.ports] == ["bound", "named-otherwise", "other-mac"]
+    # ports that cannot be read: the rollback is retried, the source not yet started
+    env.registry.calls.clear()
+    env.registry.ports_error = True
+    with pytest.raises(TransientStepError, match="rollback: ports: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("power_on", "srv-1") not in env.registry.calls
+
+
+async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(env):
+    """SDD §7.2: the kit asks Neutron for each NIC's MAC and IPv4 addresses after it powered the VM
+    off; another port of the NIC's network holding either is refused before the kit, naming the
+    port (review RT-11)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+
+    async def refused(error=PermanentStepError):
+        ran = len(read_log(env.log))
+        ctx, rec = ctx_for(env, nics=[nic], **kit)
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, ctx)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and rec.downtime_marks == 0
+        return str(exc.value)
+
+    held = {
+        "id": "port-old",
+        "name": "web-01-NIC-0-VLAN-app-net",
+        "network_id": net["id"],
+        "device_id": "",
+        "mac_address": "00:50:56:00:00:01",
+        "fixed_ips": ["10.0.0.9"],
+    }
+    env.registry.ports.append(held)
+    assert await refused() == (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    held.update(mac_address="fa:16:3e:00:00:09", fixed_ips=["10.0.0.5"])
+    assert await refused() == (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds 10.0.0.5"
+    )
+    # ports that cannot be read: transient, before the kit
+    env.registry.ports_error = True
+    assert "could not read the destination's ports" in await refused(TransientStepError)
+    env.registry.ports_error = False
+    # a port of another network holds nothing the kit asks this network for
+    held.update(network_id="net-elsewhere", mac_address="00:50:56:00:00:01")
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "app-net": f"{net['id']},sub-{net['id']}"
+    }
+
+
 async def test_progress_tail_reports_pct(env, monkeypatch):
     monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.5")
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
@@ -1446,6 +1561,12 @@ class FailingImpl:
 
     async def inventory(self):
         raise ProviderError("inventory: connection refused")
+
+    async def ports(self, **filters):
+        raise ProviderError("ports: connection refused")
+
+    async def delete_port(self, port_id):
+        raise ProviderError(f"delete port {port_id}: HTTP 503")
 
 
 class FailingRegistry(FakeRegistry):

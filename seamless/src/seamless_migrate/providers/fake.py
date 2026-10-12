@@ -479,3 +479,16 @@ class FakeDestinationProvider:
 
     async def find_server(self, name: str) -> str | None:
         return _stable_id("dst", name)
+
+    async def ports(
+        self,
+        *,
+        network_id: str | None = None,
+        mac_address: str | None = None,
+        ip_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        # the demo runs the simulated executor: no port of another migration holds anything
+        return []
+
+    async def delete_port(self, port_id: str) -> None:
+        return None

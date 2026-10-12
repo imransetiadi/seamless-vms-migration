@@ -41,6 +41,21 @@ class DestinationProvider(Protocol):
         """Id of the destination server called ``name`` (extension used by executors)."""
         ...
 
+    async def ports(
+        self,
+        *,
+        network_id: str | None = None,
+        mac_address: str | None = None,
+        ip_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The ports the credential sees that match every filter given:
+        ``[{id, name, network_id, device_id, mac_address, fixed_ips: [address, ...]}]``."""
+        ...
+
+    async def delete_port(self, port_id: str) -> None:
+        """Delete a port; one already gone is no error."""
+        ...
+
 
 def provider_caps(provider: Provider) -> dict[str, Any]:
     """Capabilities used by the selector: stored capabilities plus ``conversion_host``."""

@@ -77,6 +77,9 @@ async def test_fake_destination_inventory_and_servers():
     await dst.delete_server("srv-1")
     assert "srv-1" in dst.deleted
     assert await dst.find_server("web-01") is not None
+    # the demo destination holds no port another migration could collide with (SDD §10)
+    assert await dst.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == []
+    await dst.delete_port("port-gone")
 
 
 def test_registry_returns_fake_in_demo():
@@ -1206,6 +1209,63 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
         osp.connect(make_provider(cloud=None), settings())
     assert osp._truthy("Yes") and osp._truthy(" true ") and not osp._truthy("no")
     assert osp._truthy(1) and not osp._truthy(0)
+
+
+async def test_openstack_destination_ports_match_every_filter_and_delete_is_idempotent():
+    """SDD §10 (§7.2 VMware networks, review RT-11): ports() returns the ports matching every
+    filter given, checked again here in case the server ignores one, with the MAC compared in
+    lower case and an address in its canonical form; delete_port takes a port already gone as
+    deleted."""
+    queries, deleted = [], []
+
+    def port(port_id, mac, ips, network="net-1", device="", name=""):
+        return NS(
+            id=port_id,
+            name=name,
+            network_id=network,
+            device_id=device,
+            mac_address=mac,
+            fixed_ips=[{"subnet_id": "sub-1", "ip_address": ip} for ip in ips],
+        )
+
+    everything = [
+        port("p1", "00:50:56:00:00:01", ["10.0.0.5"], name="web-01-NIC-0-VLAN-app-net"),
+        port("p2", "fa:16:3e:00:00:02", ["10.0.0.6", "fd00::6"], device="srv-1"),
+        port("p3", "00:50:56:00:00:01", ["192.0.2.5"], network="net-2"),
+    ]
+
+    class Network:
+        def ports(self, **query):
+            queries.append(query)
+            return list(everything)  # a server that ignores every filter
+
+        def delete_port(self, port_id, ignore_missing=True):
+            deleted.append((port_id, ignore_missing))
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    assert await provider.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == [
+        {
+            "id": "p1",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": "net-1",
+            "device_id": "",
+            "mac_address": "00:50:56:00:00:01",
+            "fixed_ips": ["10.0.0.5"],
+        }
+    ]
+    assert queries[-1] == {"network_id": "net-1", "mac_address": "00:50:56:00:00:01"}
+    assert [p["id"] for p in await provider.ports(mac_address="00:50:56:00:00:01")] == ["p1", "p3"]
+    # Neutron keeps a MAC in lower case: one asked for in upper case is the same MAC
+    assert [p["id"] for p in await provider.ports(mac_address="FA:16:3E:00:00:02")] == ["p2"]
+    assert queries[-1] == {"mac_address": "fa:16:3e:00:00:02"}
+    assert [p["id"] for p in await provider.ports(ip_address="fd00:0::6")] == ["p2"]
+    assert queries[-1] == {"fixed_ips": ["ip_address=fd00::6"]}
+    assert [p["id"] for p in await provider.ports()] == ["p1", "p2", "p3"]
+    await provider.delete_port("p1")
+    assert deleted == [("p1", True)]
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):

@@ -32,6 +32,7 @@ from ..domain.enums import ProviderKind, Strategy, SyncPassKind
 from ..domain.models import (
     Mappings,
     Migration,
+    Nic,
     NicOverride,
     Plan,
     Provider,
@@ -62,6 +63,8 @@ from .base import PermanentStepError, StepContext, StepName, StepResult, Transie
 log = logging.getLogger(__name__)
 
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
+#: the name the migration kit gives the port it creates for a NIC: "{vm}-NIC-{n}-VLAN-{network}"
+KIT_PORT_NAME = re.compile(r"-NIC-\d+-VLAN-")
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -962,9 +965,11 @@ class AnsibleExecutor:
         holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
         resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
         take, two NICs one key would send to different values - a NIC with no IPv4 address takes
-        any of its network's; networks that cannot be read are a transient failure."""
+        any of its network's -, a MAC or address another port of the network holds; networks or
+        ports that cannot be read are a transient failure."""
+        dst = self.providers.get(ctx.destination)
         try:
-            inventory = await self.providers.get(ctx.destination).inventory()
+            inventory = await dst.inventory()
         except ProviderError as exc:
             raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
         networks = list(getattr(inventory, "network_details", None) or [])
@@ -1010,6 +1015,10 @@ class AnsibleExecutor:
             if why:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
+            held = await self._held_by_another_port(dst, str(network["id"]), nic)
+            if held:
+                problems.append(f"{what} on {name!r}: {held}")
+                continue
             key, value = kit_network_key(nic), kit_network_value(network, subnet)
             if key is None:
                 # the kit would drop a distributed port group's NIC that a name keys
@@ -1027,6 +1036,36 @@ class AnsibleExecutor:
         if problems:
             raise PermanentStepError("; ".join(problems))
         return out
+
+    @staticmethod
+    async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
+        """What another port of the network holds of what the kit asks Neutron for after the
+        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2)."""
+        try:
+            if nic.mac:
+                for port in await dst.ports(network_id=network_id, mac_address=nic.mac.lower()):
+                    return f"port {port['id']} holds its MAC {nic.mac}"
+            for address in kit_ipv4(nic.fixed_ips):
+                for port in await dst.ports(network_id=network_id, ip_address=address):
+                    return f"port {port['id']} holds {address}"
+        except ProviderError as exc:
+            raise TransientStepError(f"could not read the destination's ports: {exc}") from exc
+        return None
+
+    @staticmethod
+    async def _delete_kit_ports(dst: Any, nics: list[Nic]) -> list[str]:
+        """Delete the migration kit's ports of the VM (SDD §7.2): Nova only unbinds a port it did
+        not create when it deletes the server, and the port would keep the NIC's MAC and addresses.
+        They are the unbound ports with one of the NICs' MACs and the kit's name form; a port bound
+        to a server is never deleted."""
+        deleted: list[str] = []
+        for mac in sorted({nic.mac.lower() for nic in nics if nic.mac}):
+            for port in await dst.ports(mac_address=mac):
+                if port.get("device_id") or not KIT_PORT_NAME.search(str(port.get("name") or "")):
+                    continue
+                await dst.delete_port(port["id"])
+                deleted.append(str(port["id"]))
+        return deleted
 
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         try:
@@ -1048,10 +1087,17 @@ class AnsibleExecutor:
                 server_id = await dst.find_server(vm.name)
             if server_id:
                 await dst.delete_server(server_id)
+            deleted_ports = await self._delete_kit_ports(dst, vm.nics)
             await self.providers.get(ctx.source).power_on(vm.source_id)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
-        return StepResult(details={"source_running": True, "deleted_server": server_id})
+        return StepResult(
+            details={
+                "source_running": True,
+                "deleted_server": server_id,
+                "deleted_ports": deleted_ports,
+            }
+        )
 
     async def _finalize(self, ctx: StepContext) -> StepResult:
         if not ctx.options.get("delete_source"):
