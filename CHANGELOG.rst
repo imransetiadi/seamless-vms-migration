@@ -178,3 +178,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   attaches such a network to a server, as a requested network or through a
   port, only for admins (2023.1 ``network:attach_external_network``), and
   ``advsvc`` does not count; the import failed after the source had stopped.
+- With ``port_creation_mode: neutron``, a re-run uses again an earlier
+  attempt's unbound port only when it is in the credential's project. An admin
+  credential sees every project's ports, and Nova attaches no port of another
+  project to a server (``PortNotUsable``). Such a port with the MAC is now
+  refused, by ``import_workload_dst_check`` before the source stops and by
+  ``create_or_update`` before Nova is asked for the server. Before, the import
+  failed only after the source had stopped.

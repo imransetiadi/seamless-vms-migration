@@ -192,9 +192,10 @@ class ServerPort(osm_resource.Resource):
 
     @staticmethod
     def _earlier_port(conn, sdk_params):
-        """The unbound port an earlier attempt created with these addresses, or
-        None. Any other port with the MAC on the network is refused before Nova
-        is asked for the server."""
+        """The unbound port an earlier attempt created with these addresses, in the
+        credential's project, or None. Any other port with the MAC on the network is
+        refused before Nova is asked for the server - another project's too, which an
+        admin credential sees and Nova never attaches (PortNotUsable, SDD 6.6)."""
         mac = sdk_params.get("mac_address")
         if not mac:
             return None
@@ -214,6 +215,7 @@ class ServerPort(osm_resource.Resource):
                 sdk_port["description"] == sdk_params["description"]
                 and not sdk_port["device_id"]
                 and have == wanted
+                and sdk_port["project_id"] == conn.current_project_id
             ):
                 return sdk_port
             raise exc.InconsistentState(

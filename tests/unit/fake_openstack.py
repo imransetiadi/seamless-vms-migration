@@ -81,7 +81,7 @@ class FakeCloud:
         return self.servers[server_id]
 
     def add_port(self, port_id, mac, network_id="net-1", description="", device_id="",
-                 fixed_ips=None):
+                 fixed_ips=None, project_id=None):
         self.ports[port_id] = Obj(
             id=port_id,
             mac_address=mac,
@@ -89,6 +89,8 @@ class FakeCloud:
             description=description,
             device_id=device_id,
             fixed_ips=list(fixed_ips or []),
+            # Neutron's: the token's project unless an admin names another
+            project_id=project_id or self.current_project_id,
         )
         return self.ports[port_id]
 
@@ -379,6 +381,7 @@ class _FakeNetwork:
         self.cloud.record("create_port", **params)
         port = Obj(params, id=self.cloud.new_id("port"), device_id="")
         port.setdefault("description", "")
+        port.setdefault("project_id", self.cloud.current_project_id)
         port.setdefault("fixed_ips", [])
         self.cloud.ports[port.id] = port
         return port

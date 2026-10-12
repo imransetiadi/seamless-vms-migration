@@ -303,6 +303,13 @@ class TestServerPortNeutron(unittest.TestCase):
                 "description": MARKER,
                 "fixed_ips": [{"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.99"}],
             },
+            # an earlier attempt's port in every way but its project, which an admin credential
+            # sees: Nova attaches no port of another project (PortNotUsable, review RT-04)
+            "p-other-project": {
+                "description": MARKER,
+                "fixed_ips": [{"subnet_id": "uuid-test-subnet", "ip_address": "192.168.0.11"}],
+                "project_id": "project-elsewhere",
+            },
         }
         for port_id, extra in others.items():
             dst = fake.FakeCloud("dst")

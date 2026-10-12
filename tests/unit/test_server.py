@@ -803,7 +803,7 @@ class TestServerDstNetworkCheck(unittest.TestCase):
                 {"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"},
                 {"ip_address": "fd00:50::f816:3eff:fe00:1", "subnet_id": "sub-app-slaac"},
             ],
-            device_id="", description="os-migrate:p1",
+            device_id="", description="os-migrate:p1", project_id=self.dst.current_project_id,
         )
         self.assertEqual(self.errors([network_port("p1", "app", app)], mode="neutron"), [])
         del self.dst.ports["mine"], self.dst.subnets["sub-app-slaac"]
@@ -811,10 +811,21 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.dst.ports["mine"] = fake.Obj(
             id="mine", network_id="net-app", mac_address="fa:16:3e:00:00:01",
             fixed_ips=[{"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"}],
-            device_id="", description="os-migrate:p1",
+            device_id="", description="os-migrate:p1", project_id=self.dst.current_project_id,
         )
         self.assertEqual(self.errors([network_port("p1", "app", app)], mode="neutron"), [])
         del self.dst.ports["mine"]
+        # the same port in another project, which an admin credential sees: Nova attaches no
+        # port of another project (PortNotUsable), so it holds the MAC (review RT-04)
+        self.dst.ports["theirs"] = fake.Obj(
+            id="theirs", network_id="net-app", mac_address="fa:16:3e:00:00:01",
+            fixed_ips=[{"ip_address": "10.0.0.5", "subnet_id": "sub-app-v4"}],
+            device_id="", description="os-migrate:p1", project_id="project-elsewhere",
+        )
+        errors = self.errors([network_port("p1", "app", app)], mode="neutron")
+        self.assertTrue(any("already has MAC fa:16:3e:00:00:01" in e for e in errors), errors)
+        self.assertTrue(any("10.0.0.5 is held by port theirs" in e for e in errors), errors)
+        del self.dst.ports["theirs"]
         # another port with the MAC: Neutron refuses the MAC when it is kept, Nova gives a new one
         self.dst.ports["same-mac"] = fake.Obj(
             id="same-mac", network_id="net-app", mac_address="fa:16:3e:00:00:01",
