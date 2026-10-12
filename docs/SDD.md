@@ -2514,7 +2514,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
   (`force_window`, §4.2); a request that waits for another approver — maker-checker, and no approval counts but
   the requester's own — is not a start, so its Cut over dialog asks "Request the cutover of {vm}?" with Request
-  cutover and says the source stops once another approver approves it; until the migration's plan is
+  cutover and says the source stops once another approver approves it; the Cut over and Force cutover dialogs say
+  the request also records the user's approval only when the plan requires no distinct approver, as only then does
+  it (§5.4), under maker-checker that the request is not an approval, and otherwise — no approval required, the
+  distinct approver kept, as a plan made without approval keeps it — nothing about an approval; until the migration's plan is
   loaded Cutover stays unavailable — its window and approval policy are unknown, and the dialog would promise an
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
