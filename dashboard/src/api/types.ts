@@ -670,6 +670,44 @@ export interface Migration {
   updated_at: Timestamp;
 }
 
+/** The fields of a migration a {@link MigrationSummary} keeps, as the migration has them (SDD §4). */
+export const MIGRATION_SUMMARY_FIELDS = [
+  'id',
+  'plan_id',
+  'wave_id',
+  'vm',
+  'strategy',
+  'phase',
+  'phase_since',
+  'progress_pct',
+  'downtime_started_at',
+  'downtime_ended_at',
+  'approvals',
+  'cutover_requested',
+  'cutover_requested_by',
+  'force_cutover',
+  'force_window',
+  'advisor_hold',
+  'review_required',
+  'review_reason',
+  'error',
+  'source_running_at',
+  'findings',
+  'created_at',
+  'updated_at',
+] as const;
+
+/**
+ * `GET /migrations?view=summary` (SDD §4, §12): the fields of a migration the Overview's lists read - no passes,
+ * estimates, notes, history or VM details. `phase_since` is the last phase change's time, when the phase it is in
+ * began, else the creation time.
+ */
+export interface MigrationSummary
+  extends Pick<Migration, Exclude<(typeof MIGRATION_SUMMARY_FIELDS)[number], 'vm' | 'phase_since'>> {
+  vm: Pick<VMRef, 'source_id' | 'name'>;
+  phase_since: Timestamp;
+}
+
 // ---------------------------------------------------------------------------------------------
 // §4.3 Event kinds
 // ---------------------------------------------------------------------------------------------
@@ -886,6 +924,8 @@ export interface MigrationListQuery {
   /** Page large plans: 1…5000 (default: every migration), creation order. */
   limit?: number;
   offset?: number;
+  /** `summary`: each migration as its {@link MigrationSummary} (SDD §12); not a filter. */
+  view?: 'full' | 'summary';
 }
 
 /** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4). */

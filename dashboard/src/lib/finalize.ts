@@ -1,14 +1,19 @@
-import type { Migration, Plan, PlanFinalizeResult, Wave } from '../api/types';
+import type { Migration, MigrationSummary, Plan, PlanFinalizeResult, Wave } from '../api/types';
+
+/** A migration, or its summary: what tells when it last entered Completed (SDD §4, §8.1). */
+export type Completable = Pick<Migration, 'phase'> & ({ phase_history: Migration['phase_history'] } | Pick<MigrationSummary, 'phase_since'>);
 
 /** When a migration last entered Completed (SDD §8.1): the start of its time in the finalize queue. */
-export function completedSince(m: Migration): string | null {
+export function completedSince(m: Completable): string | null {
   if (m.phase !== 'completed') return null;
+  // a summary's phase began when it last entered Completed (SDD §4)
+  if ('phase_since' in m) return m.phase_since;
   const entry = [...m.phase_history].reverse().find((c) => c.to_phase === 'completed');
   return entry?.at ?? null;
 }
 
 /** Waited in Completed longer than the plan's `finalize_warning_h` (SDD §8.1, ADV-19). */
-export function isOverdue(m: Migration, warningH: number, now: number = Date.now()): boolean {
+export function isOverdue(m: Completable, warningH: number, now: number = Date.now()): boolean {
   const since = completedSince(m);
   return since !== null && now - Date.parse(since) > warningH * 3_600_000;
 }

@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
 import { applyEventToCache, createBatchedInvalidator, documentVisibility, refetchAfterReconnect } from './live';
 import { buildFixtures } from './mockData';
-import type { Event, Migration } from './types';
+import { summaryOf } from '../lib/summary';
+import type { Event, Migration, MigrationSummary } from './types';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const migration = fx.migrations.find((m) => m.phase === 'precopy') as Migration;
@@ -219,6 +220,22 @@ describe('applyEventToCache', () => {
     invalidate.mockClear();
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 45, kind: 'migration.phase' }, invalidate);
     expect(invalidate).not.toHaveBeenCalledWith(['advisor', 'recommendations']);
+  });
+
+  it('patches a summary list with the percentage alone, and leaves it out of a pass (SDD §16, perf audit PF-02)', () => {
+    const { queryClient, invalidate } = setup();
+    const key = ['migrations', { view: 'summary' }];
+    queryClient.setQueryData(key, [summaryOf(migration)]);
+    applyEventToCache(queryClient, progressEvent({ pct: 41, bytes_done: MiB }), invalidate);
+    expect(queryClient.getQueryData<MigrationSummary[]>(key)).toEqual([{ ...summaryOf(migration), progress_pct: 41 }]);
+    // the full list takes the bytes too
+    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.progress_pct).toBe(41);
+    const before = queryClient.getQueryData(key);
+    const ended = { number: 9, kind: 'delta', started_at: '2026-10-08T12:00:00Z', ended_at: '2026-10-08T12:00:04Z', bytes_scanned: 0, bytes_changed: 0, bytes_transferred: MiB, duration_s: 4 };
+    applyEventToCache(queryClient, { ...progressEvent(ended), seq: 60, kind: 'migration.sync_pass' }, invalidate);
+    // a summary holds no passes: the next read brings what the pass changed
+    expect(queryClient.getQueryData(key)).toBe(before);
+    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.sync_passes.some((p) => p.number === 9)).toBe(true);
   });
 
   it('refreshes the advisor notes on an advisor event, and only then (SDD §16, perf audit PF-02)', () => {
@@ -439,6 +456,28 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       expect(invalidated).not.toContainEqual(['migrations', { plan_id: 'plan-00000000' }]);
       expect(invalidated).not.toContainEqual(['migrations', {}]);
       expect(invalidated).not.toContainEqual(['migrations']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('puts the summary of a migration read alone into a summary list (SDD §16, perf audit PF-02)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing', progress_pct: 3 };
+      const fetchMigration = vi.fn(async () => fresh);
+      const summaries = (list: Migration[]) => list.map(summaryOf) as unknown as Migration[];
+      const { queryClient, invalidated } = await flushed(fetchMigration, [
+        [{ view: 'summary' }, summaries([other, migration])],
+        [{ plan_id: migration.plan_id, view: 'summary' }, summaries([migration])],
+        [{ plan_id: migration.plan_id }, [migration]],
+      ]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      expect(queryClient.getQueryData(['migrations', { view: 'summary' }])).toEqual([summaryOf(other), summaryOf(fresh)]);
+      expect(queryClient.getQueryData(['migrations', { plan_id: migration.plan_id, view: 'summary' }])).toEqual([summaryOf(fresh)]);
+      expect(queryClient.getQueryData(['migrations', { plan_id: migration.plan_id }])).toEqual([fresh]);
+      expect(invalidated).not.toContainEqual(['migrations', { view: 'summary' }]);
+      expect(invalidated).not.toContainEqual(['migrations', { plan_id: migration.plan_id, view: 'summary' }]);
     } finally {
       vi.useRealTimers();
     }

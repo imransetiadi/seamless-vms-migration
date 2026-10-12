@@ -3,6 +3,7 @@ import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
+import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
   ADVISOR_NOTE_KINDS,
@@ -15,6 +16,7 @@ import {
   STRATEGIES,
   type AdvisorNote,
   type AdvisorNoteList,
+  type MigrationSummary,
   type AdvisorPolicy,
   type AdvisorRecommendation,
   type AdvisorStatus,
@@ -1281,6 +1283,19 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
   it('asks for a token, like the API', async () => {
     const { client } = setup('nobody');
     await expect(list(client)).rejects.toMatchObject({ status: 401 });
+  });
+});
+
+describe('mock migration summaries, like the API (SDD §4, §12, perf audit PF-02)', () => {
+  it('lists each migration as its summary, in the same order, filtered and paged alike; another view is 422', async () => {
+    const { client } = setup('viewer');
+    const full = await client.get<Migration[]>('/migrations');
+    expect(await client.get<MigrationSummary[]>('/migrations', { query: { view: 'summary' } })).toEqual(full.map(summaryOf));
+    const planId = full[0]!.plan_id;
+    const page = { plan_id: planId, limit: 2, offset: 1 };
+    expect(await client.get('/migrations', { query: { ...page, view: 'summary' } })).toEqual((await client.get<Migration[]>('/migrations', { query: page })).map(summaryOf));
+    expect(await client.get('/migrations', { query: { view: 'full' } })).toEqual(full);
+    await expect(client.get('/migrations', { query: { view: 'everything' } })).rejects.toMatchObject({ status: 422 });
   });
 });
 

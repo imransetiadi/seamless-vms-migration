@@ -32,6 +32,7 @@ import type {
   Migration,
   MigrationAction,
   MigrationListQuery,
+  MigrationSummary,
   Plan,
   PlanCreate,
   PlanFinalizeRequest,
@@ -180,6 +181,29 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
           wave_id: query.wave_id,
           limit: query.limit,
           offset: query.offset,
+        },
+      }),
+    enabled: options.enabled ?? true,
+    placeholderData: options.keepPrevious ? keepPreviousData : undefined,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /migrations?view=summary`: each migration as its summary, the fields list pages read (SDD §4, §12). */
+export function useMigrationSummaries(query: Omit<MigrationListQuery, 'view'> = {}, options: ListOptions = {}) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.migrations({ ...query, view: 'summary' }),
+    queryFn: ({ signal }) =>
+      api.get<MigrationSummary[]>('/migrations', {
+        signal,
+        query: {
+          plan_id: query.plan_id,
+          phase: query.phase,
+          wave_id: query.wave_id,
+          limit: query.limit,
+          offset: query.offset,
+          view: 'summary',
         },
       }),
     enabled: options.enabled ?? true,

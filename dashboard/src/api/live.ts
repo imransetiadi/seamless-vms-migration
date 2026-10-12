@@ -3,11 +3,12 @@
  * TanStack Query cache fresh: progress events patch cached migrations in place; persisted events
  * invalidate the affected queries in small batches (NFR-08: live updates ≤ 2 s).
  */
-import type { QueryClient, QueryKey } from '@tanstack/react-query';
+import type { Query, QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
+import { isSummaryList, summaryOf } from '../lib/summary';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration, MigrationListQuery, SyncPass } from './types';
+import type { Event, Migration, MigrationListQuery, MigrationSummary, SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -192,9 +193,11 @@ export function createBatchedInvalidator(
       const index = list.findIndex((m) => m.id === id);
       const narrowed = filter.phase !== undefined || filter.wave_id !== undefined || filter.limit !== undefined || filter.offset !== undefined;
       if (!narrowed && index < 0 && filter.plan_id !== undefined && filter.plan_id !== fresh.plan_id) continue;
+      // a summary list takes the migration's summary, as the API builds it (SDD §16)
+      const entry = isSummaryList(query.queryKey) ? summaryOf(fresh) : fresh;
       // filtered by phase, wave or page it may gain, lose or shift; a missing member, or a read under way, is read again
       if (narrowed || index < 0 || query.state.fetchStatus === 'fetching') invalidate(query.queryKey);
-      else queryClient.setQueryData<Migration[]>(query.queryKey, list.map((m, i) => (i === index ? fresh : m)));
+      else queryClient.setQueryData<(Migration | MigrationSummary)[]>(query.queryKey, list.map((m, i) => (i === index ? entry : m)));
     }
   };
   const flush = () => {
@@ -259,13 +262,18 @@ export function createBatchedInvalidator(
   };
 }
 
+/** A cached list of whole migrations, not of summaries (SDD §16). */
+function fullList(query: Query): boolean {
+  return !isSummaryList(query.queryKey);
+}
+
 /**
  * An updater for the cached migration lists that patches the one migration in a list that holds it. A list that does
  * not hold it gets `undefined`, which TanStack Query takes as "no update": its data, `dataUpdatedAt` and observers are
  * left alone, so nothing reading it draws again on every progress event (SDD §16).
  */
-function holding(id: string, patch: (m: Migration) => Migration) {
-  return (old: Migration[] | undefined): Migration[] | undefined => (old?.some((m) => m.id === id) ? old.map(patch) : undefined);
+function holding<M extends { id: string }>(id: string, patch: (m: M) => M) {
+  return (old: M[] | undefined): M[] | undefined => (old?.some((m) => m.id === id) ? old.map(patch) : undefined);
 }
 
 /** Applies one streamed event to the query cache. */
@@ -293,7 +301,12 @@ export function applyEventToCache(
     const patch = (m: Migration): Migration =>
       m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done === null ? m.bytes_transferred : endedPassBytes(m) + done } : m;
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, holding(id, patch));
+    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'], predicate: fullList }, holding(id, patch));
+    // a summary holds neither the passes nor the bytes: it takes the percentage alone (SDD §16)
+    queryClient.setQueriesData<MigrationSummary[]>(
+      { queryKey: ['migrations'], predicate: (query) => isSummaryList(query.queryKey) },
+      holding(id, (m) => (m.id === id ? { ...m, progress_pct: pct } : m)),
+    );
     return;
   }
 
@@ -309,7 +322,8 @@ export function applyEventToCache(
         return { ...m, sync_passes: passes, bytes_transferred: endedPassBytes({ ...m, sync_passes: passes }) };
       };
       queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, holding(id, patch));
+      // a summary list has no passes: the read the event asks for brings what the pass changed
+      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'], predicate: fullList }, holding(id, patch));
     }
   }
 

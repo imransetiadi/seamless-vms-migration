@@ -1,9 +1,15 @@
-import type { DecisionType, Migration, Plan } from '../api/types';
+import type { DecisionType, Migration, Plan, VMRef } from '../api/types';
 import { DECISION_TYPE_LABELS, waitingDecision } from './advisor';
 import { countedApprovals } from './migrationActions';
 import { isWarmStrategy } from './phase';
 import { PERMISSIONS } from './roles';
 import { isWaveActive } from './waves';
+
+/** What Pending approvals reads of a migration, or of its summary (SDD §4, §16). */
+export type ApprovalMigration = Pick<
+  Migration,
+  'id' | 'plan_id' | 'wave_id' | 'strategy' | 'phase' | 'approvals' | 'cutover_requested' | 'cutover_requested_by' | 'force_cutover' | 'advisor_hold'
+> & { vm: Pick<VMRef, 'source_id' | 'name'> };
 
 /** The two kinds of approval (SDD §16, ADV-20): the plan's cutover approval and an advisor decision (§14.6). */
 export type ApprovalKind = 'cutover' | 'advisor_decision';
@@ -18,7 +24,7 @@ export const APPROVAL_KIND_LABELS: Record<ApprovalKind, string> = {
 
 export interface PendingApproval {
   kind: ApprovalKind;
-  migration: Migration;
+  migration: ApprovalMigration;
   /** Undefined while the plans could not be loaded. */
   plan: Plan | undefined;
   /** An advisor decision's type; null for a cutover approval. */
@@ -36,13 +42,13 @@ export function approvalKindLabel(item: Pick<PendingApproval, 'kind' | 'decision
 }
 
 /** At the cutover gate (SDD §5.4): converged, a single-shot strategy in ready whose wave runs, or a forced cutover. */
-function atGate(m: Migration, plan: Plan, migrations: Migration[]): boolean {
+function atGate(m: ApprovalMigration, plan: Plan, migrations: readonly ApprovalMigration[]): boolean {
   if (m.phase === 'awaiting_cutover') return true;
   if (m.phase === 'ready') return !isWarmStrategy(m.strategy) && plan.status === 'running' && isWaveActive(plan, m.wave_id, migrations);
   return (m.phase === 'precopy' || m.phase === 'syncing') && m.force_cutover !== null;
 }
 
-function cutoverWait(m: Migration, plan: Plan): string {
+function cutoverWait(m: ApprovalMigration, plan: Plan): string {
   // maker-checker: the requester's own approval does not count (SDD §5.4, ADV-17)
   if (plan.require_distinct_approver && m.force_cutover) return `Cutover forced by ${m.force_cutover.actor}: another approver approves it.`;
   if (plan.require_distinct_approver && m.cutover_requested && m.cutover_requested_by) return `Requested by ${m.cutover_requested_by}: another approver approves it.`;
@@ -57,7 +63,7 @@ function cutoverWait(m: Migration, plan: Plan): string {
  * unknown (`cutoverUnknown`); the advisor decisions still show.
  */
 export function pendingApprovals(
-  migrations: Migration[],
+  migrations: readonly ApprovalMigration[],
   plans: ReadonlyMap<string, Plan>,
   { plansUnknown = false }: { plansUnknown?: boolean } = {},
 ): { items: PendingApproval[]; cutoverUnknown: boolean } {

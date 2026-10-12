@@ -23,6 +23,7 @@ import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
+import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import {
   buildFixtures,
@@ -1312,7 +1313,11 @@ export class MockServer {
         // the API's bounds (SDD §12): limit 1…5000, default all; offset from 0
         const limit = intParam(query, 'limit', rows.length, 1, 5000);
         const offset = intParam(query, 'offset', 0, 0);
-        return ok(rows.slice(offset, offset + limit));
+        // each as its summary, as the API builds it (SDD §4, §12)
+        const view = query.get('view') ?? 'full';
+        if (view !== 'full' && view !== 'summary') throw new HttpError(422, 'validation_error', "query.view: Input should be 'full' or 'summary'");
+        const page = rows.slice(offset, offset + limit);
+        return ok(view === 'summary' ? page.map(summaryOf) : page);
       }
       if (id && !sub && method === 'GET') {
         this.require(token, 'viewer', path);

@@ -6,7 +6,34 @@ import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
+/** Every GET the page makes, as its path and query under /api/v1. */
+function recordingReads(reads: string[]) {
+  return (mock: typeof fetch): typeof fetch =>
+    (input, init) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+      return mock(input, init);
+    };
+}
+
 describe('Overview page (mock data)', () => {
+  it('reads the migrations as summaries, never every migration whole (SDD §16, perf audit PF-02)', async () => {
+    const reads: string[] = [];
+    renderWithApp(<Overview />, { wrapFetch: recordingReads(reads) });
+    await screen.findByRole('region', { name: 'Needs attention' });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    await screen.findAllByRole('link', { name: /^[a-z0-9-]+$/ });
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
+  });
+
+  it('reads the summaries of the plan in its address alone (SDD §16, perf audit PF-02)', async () => {
+    const reads: string[] = [];
+    const server = createTestServer();
+    const plan = server.plans[0]!;
+    renderWithApp(<Overview />, { server, route: `/?plan=${plan.id}`, wrapFetch: recordingReads(reads) });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual([`/migrations?plan_id=${plan.id}&view=summary`]);
+  });
+
   it("keeps the figures readable while another plan's statistics load: greyed and busy, never faded (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     let hold = false;

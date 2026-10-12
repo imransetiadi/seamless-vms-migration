@@ -10,8 +10,8 @@ import {
 } from 'lucide-react';
 import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useDemoSpeed, useMigrations, usePlans, useStats } from '../api/hooks';
-import type { Migration, Phase, Plan } from '../api/types';
+import { useDemoSpeed, useMigrationSummaries, usePlans, useStats } from '../api/hooks';
+import type { MigrationSummary, Phase, Plan } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -52,7 +52,7 @@ const BAR_CLASSES: Record<'success' | 'warning' | 'danger', string> = {
  * Down right now: in the cutover window (the stop may not be reported yet) or with an open downtime
  * clock — a failed cutover or a rollback keeps the source stopped until it runs again (SDD §5.2).
  */
-function isDown(m: Migration): boolean {
+function isDown(m: MigrationSummary): boolean {
   return m.phase === 'cutover' || m.phase === 'verifying' || (Boolean(m.downtime_started_at) && !m.downtime_ended_at);
 }
 
@@ -67,7 +67,7 @@ const DOWN_DETAIL: Partial<Record<Phase, string>> = {
  * The page's centre: every VM whose source is stopped right now, with its downtime clock and how
  * much of the plan's downtime SLO it has used (SDD §7.2 downtime clock, §5.4).
  */
-function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
+function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: MigrationSummary[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
   const active = migrations
     .filter(isDown)
     .sort((a, b) => Date.parse(a.downtime_started_at ?? a.updated_at) - Date.parse(b.downtime_started_at ?? b.updated_at));
@@ -174,7 +174,7 @@ function DowntimeNow({ migrations, plans, plansUnknown }: { migrations: Migratio
   );
 }
 
-function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migration[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
+function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: MigrationSummary[]; plans: ReadonlyMap<string, Plan>; plansUnknown: boolean }) {
   const items = attentionItems(migrations, plans, Date.now(), { plansUnknown });
   const shown = items.slice(0, 8);
   return (
@@ -220,7 +220,7 @@ function NeedsAttention({ migrations, plans, plansUnknown }: { migrations: Migra
 }
 
 /** Completion per plan; `migrations` is null when they could not be loaded (progress unknown, SDD §16). */
-function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migration[] | null }) {
+function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: MigrationSummary[] | null }) {
   if (plans.length === 0) {
     return <EmptyState icon={ClipboardList} title="No plans yet" description="Create a plan to start migrating." />;
   }
@@ -258,7 +258,8 @@ export default function Overview() {
   const planId = params.get('plan') ?? '';
   const plansQuery = usePlans();
   const stats = useStats(planId || null);
-  const migrationsQuery = useMigrations(planId ? { plan_id: planId } : {}, { keepPrevious: true });
+  // summaries: what the page's rules read, not every migration whole (SDD §16, perf audit PF-02)
+  const migrationsQuery = useMigrationSummaries(planId ? { plan_id: planId } : {}, { keepPrevious: true });
 
   const plans = useMemo(() => plansQuery.data ?? [], [plansQuery.data]);
   const plansById = useMemo(() => new Map(plans.map((p) => [p.id, p])), [plans]);

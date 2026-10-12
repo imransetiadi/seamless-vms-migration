@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration, PhaseChange, Plan, Wave } from '../api/types';
 import { completedSince, finalizedText, finalizeQueue, inScope, isOverdue, queueByWave, skippedVms } from './finalize';
+import { summaryOf } from './summary';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations[0]!;
@@ -26,6 +27,14 @@ describe('the finalize queue (SDD §8.1, ADV-19)', () => {
     const m = completedAt('mig-1', '2026-10-07T11:00:00Z'); // 73 h before NOW
     expect(isOverdue(m, 72, NOW)).toBe(true);
     expect(isOverdue(m, 74, NOW)).toBe(false);
+  });
+
+  it("takes a summary's phase start as its completion time, as the migration's history gives it (SDD §4, perf audit PF-02)", () => {
+    const m = completedAt('mig-1', '2026-10-07T11:00:00Z');
+    expect(completedSince(summaryOf(m))).toBe('2026-10-07T11:00:00Z');
+    expect(isOverdue(summaryOf(m), 72, NOW)).toBe(true);
+    expect(isOverdue(summaryOf(m), 74, NOW)).toBe(false);
+    expect(completedSince(summaryOf({ ...m, phase: 'rolling_back' }))).toBeNull();
   });
 
   it('scopes a wave by its VMs, as the API does, and the plan by its own migrations', () => {

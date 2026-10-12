@@ -43,7 +43,7 @@ function isSingleShot(m: Migration): boolean {
  * The approvals the cutover gate counts (SDD §5.4 rule 1): all but, when the plan requires a distinct
  * approver, the requester's and the forcer's.
  */
-export function countedApprovals(m: Migration, plan: Plan | null | undefined): Approval[] {
+export function countedApprovals(m: Pick<Migration, 'approvals' | 'cutover_requested_by' | 'force_cutover'>, plan: Plan | null | undefined): Approval[] {
   // while the plan loads, the API's default holds: a distinct approver
   if (plan?.require_distinct_approver === false) return m.approvals;
   const own = new Set([m.cutover_requested_by, m.force_cutover?.actor].filter(Boolean));
