@@ -51,6 +51,45 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(within(row).getByRole('link', { name: warm.vm.name })).toHaveAttribute('href', `/migrations/${warm.id}`);
   });
 
+  it('lists under a policy change the settings it changed, so a weakened approval gate shows on the page (SDD §14.5)', async () => {
+    const server = createTestServer();
+    const plan = server.plans[0]!;
+    const weakened = {
+      name: 'Finance — approval required',
+      scope: { provider_ids: [], plan_ids: [plan.id] },
+      decision_types: ['migration_strategy'],
+      mode: 'auto_apply_above_threshold',
+      threshold: 0.8,
+      min_evidence_for_auto_apply: 0,
+      require_override_reason: true,
+      require_distinct_approver: false,
+    };
+    const put = () => server.handle('PUT', '/advisor/policies/pol-finance', new URLSearchParams(), weakened, 'admin').status;
+    expect(put()).toBe(200);
+    // saved again as it was
+    expect(put()).toBe(200);
+    // an event that holds no policy lists nothing
+    server.emit({ kind: 'policy.updated', plan_id: null, migration_id: null, actor: 'user:rina', message: 'advisor policy pol-bare updated', data: { target_id: 'pol-bare' } });
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await auditTable();
+    const [bare, again, changed] = within(table)
+      .getAllByRole('row')
+      .filter((r) => within(r).queryByText('Policy changed'));
+    await waitFor(() =>
+      expect(within(changed!).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+        'When the advisor decides: Always asks for approval → Applies above the threshold',
+        `Applies to: Plans from RHOSP 17.1 — DC1 → Plan ${plan.name}`,
+        'Threshold: 60% → 80%',
+        'Distinct approver: Required → Not required',
+      ]),
+    );
+    expect(within(changed!).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies');
+    expect(again).toHaveTextContent('No setting changed');
+    expect(within(again!).queryByRole('listitem')).not.toBeInTheDocument();
+    expect(bare).not.toHaveTextContent('No setting changed');
+    expect(within(bare!).queryByRole('listitem')).not.toBeInTheDocument();
+  });
+
   it('says how many audit events its filters show from a live region already on the page, also when none match (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });

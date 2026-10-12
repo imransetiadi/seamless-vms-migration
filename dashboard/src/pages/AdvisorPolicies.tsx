@@ -11,9 +11,9 @@ import { PageHeader } from '../components/PageHeader';
 import { PolicyDialog } from '../components/PolicyDialog';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
-import { DECISION_TYPE_LABELS, formatThreshold } from '../lib/advisor';
+import { formatThreshold } from '../lib/advisor';
 import { formatDateTime, formatRelative } from '../lib/format';
-import { POLICY_MODE_LABELS } from '../lib/policies';
+import { distinctApproverText, overrideReasonText, POLICY_MODE_LABELS, policyDecisionsText, policyScopeText } from '../lib/policies';
 import { can } from '../lib/roles';
 import { useHashLanding } from '../lib/useHashLanding';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -49,15 +49,8 @@ function PolicyCard({
   onDelete?: () => void;
 }) {
   const headingId = useId();
-  const { provider_ids, plan_ids } = policy.scope;
-  const listed = (ids: string[]) => ids.map((id) => names.get(id) ?? id).join(', ');
-  const scope = builtIn
-    ? 'Plans no other policy covers'
-    : plan_ids.length
-      ? `${plan_ids.length === 1 ? 'Plan' : 'Plans'} ${listed(plan_ids)}`
-      : provider_ids.length
-        ? `Plans from ${listed(provider_ids)}`
-        : 'Every plan';
+  // worded as the audit trail lists a policy change (SDD §14.5)
+  const scope = builtIn ? 'Plans no other policy covers' : policyScopeText(policy.scope, names);
   return (
     <li>
       {/* addressable as #policy-{id}: the plan settings link to the policy in force (SDD §16, ADV-20) */}
@@ -82,15 +75,15 @@ function PolicyCard({
           <dt className="text-muted-foreground">Applies to</dt>
           <dd className="min-w-0 wrap-break-word">{scope}</dd>
           <dt className="text-muted-foreground">Decisions</dt>
-          <dd className="min-w-0">{policy.decision_types.length ? policy.decision_types.map((t) => DECISION_TYPE_LABELS[t]).join(', ') : 'Every kind'}</dd>
+          <dd className="min-w-0">{policyDecisionsText(policy.decision_types)}</dd>
           <dt className="text-muted-foreground">Threshold</dt>
           <dd className="num">{formatThreshold(policy.threshold)}</dd>
           <dt className="text-muted-foreground">Minimum evidence</dt>
           <dd className="num">{policy.min_evidence_for_auto_apply}</dd>
           <dt className="text-muted-foreground">Override reason</dt>
-          <dd>{policy.require_override_reason ? 'Required' : 'Optional'}</dd>
+          <dd>{overrideReasonText(policy.require_override_reason)}</dd>
           <dt className="text-muted-foreground">Distinct approver</dt>
-          <dd>{policy.require_distinct_approver ? 'Required' : 'Not required'}</dd>
+          <dd>{distinctApproverText(policy.require_distinct_approver)}</dd>
           {!builtIn && (
             <>
               <dt className="text-muted-foreground">Changed</dt>

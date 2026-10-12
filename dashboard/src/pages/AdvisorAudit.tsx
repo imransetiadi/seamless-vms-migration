@@ -1,7 +1,7 @@
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { fetchEventTail, useApi, useEventTail } from '../api/hooks';
+import { fetchEventTail, useApi, useEventTail, usePlans, useProviders } from '../api/hooks';
 import type { Event } from '../api/types';
 import { AUDIT_EVENT_KINDS } from '../api/types';
 import { Button } from '../components/Button';
@@ -13,6 +13,7 @@ import { Panel } from '../components/Panel';
 import { LoadingBlock } from '../components/Skeleton';
 import { auditActionLabel, auditCsv } from '../lib/audit';
 import { formatDateTime, formatNumber } from '../lib/format';
+import { policyChanges } from '../lib/policies';
 import { usePageTitle } from '../lib/usePageTitle';
 
 /** The newest audit events one request returns (SDD §12). */
@@ -83,6 +84,13 @@ export default function AdvisorAudit() {
           .map((e) => [text(e.data.target_id), text((e.data.subject as { name?: unknown } | undefined)?.name)]),
       ),
     [events],
+  );
+  // the plans and providers a policy change names, by name (SDD §14.5)
+  const plans = usePlans();
+  const providers = useProviders();
+  const scopeNames = useMemo(
+    () => new Map([...(providers.data ?? []), ...(plans.data ?? [])].map((x) => [x.id, x.name] as [string, string])),
+    [providers.data, plans.data],
   );
   const actors = useMemo(() => [...new Set(events.map((e) => e.actor))].sort(), [events]);
   const shown = useMemo(() => {
@@ -176,6 +184,8 @@ export default function AdvisorAudit() {
                   const forced = e.kind === 'migration.force_cutover';
                   // a policy change names the policy (SDD §14.5); the policies page lists it
                   const policyName = text((e.data.after as { name?: unknown } | null)?.name) || text((e.data.before as { name?: unknown } | null)?.name);
+                  // and lists the settings it changed: a weakened approval gate shows here, not only in the JSON (SDD §14.5)
+                  const changes = e.kind === 'policy.updated' ? policyChanges(e.data.before, e.data.after, scopeNames) : null;
                   return (
                     <tr key={e.seq}>
                       <td className="whitespace-nowrap">
@@ -185,6 +195,19 @@ export default function AdvisorAudit() {
                         {auditActionLabel(e.kind)}
                         {/* a Force cutover's reason goes with it (SDD §14.5, ADV-16) */}
                         {forced && text(e.data.reason) && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{text(e.data.reason)}</p>}
+                        {changes &&
+                          (changes.length ? (
+                            <ul className="mt-0.5 max-w-md text-xs text-muted-foreground">
+                              {changes.map((c) => (
+                                // a hanging indent: where one change ends shows when its line wraps
+                                <li key={c.setting} className="pl-3 -indent-3 wrap-break-word">
+                                  <span className="text-foreground">{c.setting}:</span> {c.before} → {c.after}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="mt-0.5 text-xs text-muted-foreground">No setting changed</p>
+                          ))}
                       </td>
                       <td className="font-mono text-xs">{e.actor}</td>
                       <td>
