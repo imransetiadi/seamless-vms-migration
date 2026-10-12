@@ -1175,9 +1175,10 @@ cutover its copy, conversion and create — a failed cutover up to its failure, 
 `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted (cancelled mid-copy,
 the cutover reported none), before it starts the source again. Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
-strategy. The fake destination simulates the guests' services for the application probes (§7.5): a
-guest answers its suggested probes (§9.6) and SSH (RDP on Windows), with HTTP status 200, and refuses every
-other port; a VM tagged `demo-fault: app-down` runs none of its application services, so its probes fail and
+strategy. The fake destination simulates the guests' services for the verification's TCP checks (`tcp_ports`,
+`windows_tcp_ports`) and its application probes (§7.5): a guest answers its suggested probes (§9.6) and SSH
+(RDP on Windows), with HTTP status 200, and refuses every other port - so a demo plan with the dashboard's
+default TCP ports (22, 3389 on Windows) verifies, where a real connection to a simulated address would time out; a VM tagged `demo-fault: app-down` runs none of its application services, so its probes fail and
 its plan's automatic rollback rolls it back (ADV-18). The demo's finance plan probes its three databases (their
 suggested probes as `probe_overrides`; `billing-db-01` carries the fault), the VMware plan probes nothing, so its
 validation warns about its database VMs (`APP_PROBE_MISSING`, §9.3). A VM tagged `demo-fault: cutover-refusal`
