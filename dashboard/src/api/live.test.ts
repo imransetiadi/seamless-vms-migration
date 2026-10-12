@@ -1,7 +1,7 @@
-import { QueryClient, QueryObserver } from '@tanstack/react-query';
+import { focusManager, QueryClient, QueryObserver, type QueryKey } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
-import { applyEventToCache, createBatchedInvalidator, documentVisibility, refetchAfterReconnect } from './live';
+import { applyEventToCache, createBatchedInvalidator, documentVisibility, keepStreamFresh, refetchAfterReconnect, type LiveStatus } from './live';
 import { buildFixtures } from './mockData';
 import { summaryOf } from '../lib/summary';
 import type { Event, Migration, MigrationSummary } from './types';
@@ -818,16 +818,18 @@ describe('a hidden page holds the live-event batch (SDD §16, perf audit PF-03)'
         },
       };
       const batch = createBatchedInvalidator(queryClient, 400, fetchMigration, visibility);
-      const timers = vi.spyOn(globalThis, 'setTimeout');
       batch.invalidate(['plans']);
       batch.invalidate(['stats']);
       batch.invalidate(['plans']);
       batch.refreshMigration(one.id);
+      // a background tab: no batch timer wakes it - counted on the fake clock: a spy on the global setTimeout, made
+      // while the fake timers are installed, would be restored to the fake before the next test (restoreMocks), and no
+      // later test's own timer would ever fire
+      expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(5000);
-      // a background tab: nothing is read again, and no batch timer wakes it
+      // nothing is read again
       expect(spy).not.toHaveBeenCalled();
       expect(fetchMigration).not.toHaveBeenCalled();
-      expect(timers.mock.calls.filter(([, ms]) => ms === 400)).toEqual([]);
       hidden = false;
       shown!();
       await vi.advanceTimersByTimeAsync(400);
@@ -931,6 +933,109 @@ describe('a batch with many migrations to read (SDD §16, perf audit PF-03)', ()
       expect(many.invalidated).toEqual(expect.arrayContaining([['migrations'], ['migration']]));
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe('the window regaining focus and the open stream (SDD §16, AUD-3)', () => {
+  /** A query a page shows, read once; how often its query function ran, and how to stop showing it. */
+  async function shown(queryClient: QueryClient, queryKey: QueryKey, fail = false) {
+    let reads = 0;
+    const observer = new QueryObserver(queryClient, {
+      queryKey,
+      queryFn: async () => {
+        reads += 1;
+        if (fail) throw new Error('down');
+        return [];
+      },
+    });
+    const stop = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(reads).toBe(1));
+    return { reads: () => reads, stop };
+  }
+
+  /** The window loses and regains focus once the queries are stale; what focus reads has started. */
+  async function refocus() {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  async function withClient(test: (queryClient: QueryClient, status: { now: LiveStatus }) => Promise<void>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10, refetchOnWindowFocus: true, retry: false } } });
+    queryClient.mount();
+    const status = { now: 'open' as LiveStatus };
+    const stop = keepStreamFresh(queryClient, () => status.now);
+    try {
+      await test(queryClient, status);
+    } finally {
+      stop();
+      queryClient.unmount();
+      focusManager.setFocused(undefined);
+    }
+  }
+
+  it('reads nothing the open stream keeps, and what it does not keep as before', async () => {
+    await withClient(async (queryClient) => {
+      const kept = await Promise.all(
+        [
+          ['migrations', { plan_id: 'p1', view: 'summary' }],
+          ['migration', 'm1'],
+          ['plans'],
+          ['plans', 'p1'],
+          ['stats', 'p1'],
+          ['providers'],
+          ['advisor', 'recommendations', {}],
+          ['advisor', 'notes', 20],
+          ['advisor', 'policies'],
+          ['events', 'tail', {}],
+        ].map((key) => shown(queryClient, key)),
+      );
+      const others = await Promise.all(
+        [['me'], ['health'], ['inventory', 'src-1'], ['advisor', 'status'], ['advisor', 'data-sent']].map((key) => shown(queryClient, key)),
+      );
+      await refocus();
+      expect(kept.map((q) => q.reads())).toEqual(kept.map(() => 1));
+      await vi.waitFor(() => expect(others.map((q) => q.reads())).toEqual(others.map(() => 2)));
+      for (const q of [...kept, ...others]) q.stop();
+    });
+  });
+
+  it('reads them all on focus while the stream is not open', async () => {
+    await withClient(async (queryClient, status) => {
+      const list = await shown(queryClient, ['migrations', {}]);
+      for (const now of ['connecting', 'reconnecting', 'closed', 'unauthorized', 'idle'] as LiveStatus[]) {
+        status.now = now;
+        const before = list.reads();
+        await refocus();
+        await vi.waitFor(() => expect(list.reads()).toBe(before + 1));
+      }
+      list.stop();
+    });
+  });
+
+  it('reads one whose last read failed on focus, the stream open or not', async () => {
+    await withClient(async (queryClient) => {
+      const failed = await shown(queryClient, ['stats', 'p1'], true);
+      await refocus();
+      await vi.waitFor(() => expect(failed.reads()).toBe(2));
+      failed.stop();
+    });
+  });
+
+  it('once stopped (signed out), focus reads them as before', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10, refetchOnWindowFocus: true, retry: false } } });
+    queryClient.mount();
+    try {
+      keepStreamFresh(queryClient, () => 'open')();
+      const list = await shown(queryClient, ['migrations', {}]);
+      await refocus();
+      await vi.waitFor(() => expect(list.reads()).toBe(2));
+      list.stop();
+    } finally {
+      queryClient.unmount();
+      focusManager.setFocused(undefined);
     }
   });
 });

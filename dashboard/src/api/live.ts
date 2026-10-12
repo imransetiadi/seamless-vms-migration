@@ -100,6 +100,35 @@ export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveSt
 }
 
 /**
+ * The queries the event stream keeps fresh: each of their changes comes as an event (SDD §16) - the migration lists and
+ * pages, the plans, the figures, the providers, the advisor's recommendations, notes and policies, the event lists.
+ */
+export const STREAM_KEPT: readonly QueryKey[] = [
+  ['migrations'],
+  ['migration'],
+  ['plans'],
+  ['stats'],
+  ['providers'],
+  ['advisor', 'recommendations'],
+  ['advisor', 'notes'],
+  ['advisor', 'policies'],
+  ['events', 'tail'],
+];
+
+/**
+ * While the stream is open, the window regaining focus reads nothing it keeps fresh (SDD §16): what the events held
+ * while the page was hidden ask for is read once, and a list whose changes they brought is not read again (NFR-03).
+ * One whose last read failed is still read on focus, as they all are while the stream is not open. Returns how to stop.
+ */
+export function keepStreamFresh(queryClient: QueryClient, status: () => LiveStatus): () => void {
+  const refetchOnWindowFocus = (query: Query) => status() !== 'open' || query.state.status === 'error';
+  for (const queryKey of STREAM_KEPT) queryClient.setQueryDefaults(queryKey, { refetchOnWindowFocus });
+  return () => {
+    for (const queryKey of STREAM_KEPT) queryClient.setQueryDefaults(queryKey, {});
+  };
+}
+
+/**
  * One flush: the queries it reads again (by hash), those a splice left to that read while it ran, and when it began.
  */
 interface Batch {
