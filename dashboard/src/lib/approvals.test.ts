@@ -88,4 +88,22 @@ describe('pending approvals, both kinds (SDD §16, ADV-20)', () => {
     expect(cutoverUnknown).toBe(true);
     expect(items.map((i) => [i.kind, i.migration.vm.name, i.plan])).toEqual([['advisor_decision', 'analytics-node-2', undefined]]);
   });
+
+  it('says what the cutover will refuse where the approval is given (SDD §16)', () => {
+    const { byName, find } = scenario();
+    const billing = byName('app-billing-01');
+    const refusal = "the NIC fa:16:3e:00:00:01 of app-billing-01 on 'finance-app': port p-1 holds 10.0.0.5";
+    billing.cutover_refusals = [refusal];
+    expect(find(billing)?.waitsFor).toBe(
+      'Converged: waiting for an approval; keep-warm syncs run meanwhile. The cutover will refuse 1 problem: fix it first.',
+    );
+    // whatever it waits for: a requested cutover, and two problems
+    billing.cutover_refusals = [refusal, refusal.replace('10.0.0.5', '10.0.0.6')];
+    billing.cutover_requested = true;
+    billing.cutover_requested_by = 'rina';
+    expect(find(billing)?.waitsFor).toBe('Requested by rina: another approver approves it. The cutover will refuse 2 problems: fix them first.');
+    // once a pass finds none, the row says only what it waits for
+    billing.cutover_refusals = [];
+    expect(find(billing)?.waitsFor).toBe('Requested by rina: another approver approves it.');
+  });
 });

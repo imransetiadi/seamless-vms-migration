@@ -8,7 +8,7 @@ import { isWaveActive } from './waves';
 /** What Pending approvals reads of a migration, or of its summary (SDD §4, §16). */
 export type ApprovalMigration = Pick<
   Migration,
-  'id' | 'plan_id' | 'wave_id' | 'strategy' | 'phase' | 'approvals' | 'cutover_requested' | 'cutover_requested_by' | 'force_cutover' | 'advisor_hold'
+  'id' | 'plan_id' | 'wave_id' | 'strategy' | 'phase' | 'approvals' | 'cutover_requested' | 'cutover_requested_by' | 'force_cutover' | 'advisor_hold' | 'cutover_refusals'
 > & { vm: Pick<VMRef, 'source_id' | 'name'> };
 
 /** The two kinds of approval (SDD §16, ADV-20): the plan's cutover approval and an advisor decision (§14.6). */
@@ -48,11 +48,19 @@ function atGate(m: ApprovalMigration, plan: Plan, migrations: readonly ApprovalM
   return (m.phase === 'precopy' || m.phase === 'syncing') && m.force_cutover !== null;
 }
 
-function cutoverWait(m: ApprovalMigration, plan: Plan): string {
+function gateWait(m: ApprovalMigration, plan: Plan): string {
   // maker-checker: the requester's own approval does not count (SDD §5.4, ADV-17)
   if (plan.require_distinct_approver && m.force_cutover) return `Cutover forced by ${m.force_cutover.actor}: another approver approves it.`;
   if (plan.require_distinct_approver && m.cutover_requested && m.cutover_requested_by) return `Requested by ${m.cutover_requested_by}: another approver approves it.`;
   return m.phase === 'awaiting_cutover' ? 'Converged: waiting for an approval; keep-warm syncs run meanwhile.' : 'Ready for cutover: waiting for an approval.';
+}
+
+/** What a cutover approval waits for, and what its cutover will refuse: the approver sees it where the approval
+ * is given (SDD §16). */
+function cutoverWait(m: ApprovalMigration, plan: Plan): string {
+  const n = m.cutover_refusals.length;
+  if (n === 0) return gateWait(m, plan);
+  return `${gateWait(m, plan)} The cutover will refuse ${n} problem${n === 1 ? '' : 's'}: fix ${n === 1 ? 'it' : 'them'} first.`;
 }
 
 /**
