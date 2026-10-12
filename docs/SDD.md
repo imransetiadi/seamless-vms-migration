@@ -237,6 +237,8 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
+       migration_counts: dict[Phase, int],  # read-only, never stored: how many of the plan's migrations are in each
+                                        # phase that has any (§8.1, §11); {} before the first validation
        created_at: datetime, updated_at: datetime }
 
 DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed
@@ -1266,7 +1268,7 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 `Plan.status` stays the lifecycle the orchestrator drives (above). What every view shows is
 `derive_plan_status(plan, migrations) -> DerivedPlanStatus`, returned as `Plan.derived_status` by every plan
 route and never stored (the rules read only the set of the plan's phases: the routes take it from `Store.plan_phases`,
-§11, and never load the migrations for it) — a re-validation of a finished plan stores `validated` although its migrations completed
+§11, and never load the migrations for it; `Plan.migration_counts` comes from the same query) — a re-validation of a finished plan stores `validated` although its migrations completed
 (seen on the demo after 10 October), and a stored status cannot tell a finished plan from a finalized one. Over the
 migrations that are not `cancelled`, in this order:
 
@@ -1614,9 +1616,9 @@ aggregate over the kind; moves on every insert, update or delete — `GET /stats
 moved reload only the documents that changed — sound because those kinds are never deleted: a delete, an insert and an
 update between two reads could leave count and sum as they were; a route that deletes them must first give the stamp
 a value that only grows), `versions(kind) -> [(id, version)]` (in creation order, no document read),
-`get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
-`SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
-`derived_status` from it, §8.1), `delete(kind, id)`,
+`get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
+`SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
+`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -2301,7 +2303,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
   the first eight rows of the chosen kind, as many as Needs attention shows, the rest behind "Show all ({n})" and
   folded back by "Show fewer" or by choosing another kind, so a plan of hundreds of VMs awaiting approval never stretches the Overview;
-  ADV-20), `/plans` (the list: each plan's status, VMs, migrations done, clouds, SLO and last change — on a phone the
+  ADV-20), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of all its
+  migrations, from `Plan.migration_counts`, or of its VMs before validation; the list reads no migration —, clouds,
+  SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
   scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
@@ -2500,7 +2504,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
   cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
   as it is, so what reads only such lists does not draw again on every progress event.
-  Persisted events refresh the queries they affect in one batch per 400 ms. An event about one migration that
+  Persisted events refresh the queries they affect in one batch per 400 ms. A `migration.phase` or
+  `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
   holds it and is filtered by plan at most, instead of reading those lists again — at 1,000 VMs a plan (NFR-03) a
