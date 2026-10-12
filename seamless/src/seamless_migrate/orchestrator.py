@@ -474,13 +474,24 @@ class Orchestrator:
         version: int,
         steps: list[tuple[Phase, str, dict[str, Any] | None]],
         actor: str = "system",
+        *,
+        created: dict[str, Any] | None = None,
     ) -> tuple[Migration, int]:
         """Several transitions in one write — a crash or a failed event write never splits them
-        (SDD §8) — then one ``migration.phase`` event each."""
+        (SDD §8) — then one ``migration.phase`` event each. Version 0 creates the migration, and
+        ``created`` is then the data of the ``migration.created`` event that comes first."""
         new = m
         for to, reason, _ in steps:
             new = fsm.transition(new, to, reason, actor, now=self._now())
         version = await self._save(new, version)
+        if created is not None:
+            await self._emit(
+                "migration.created",
+                f"migration of {new.vm.name} created",
+                migration=new,
+                actor=actor,
+                data=created,
+            )
         before = m.phase
         for to, reason, data in steps:
             await self._emit(
@@ -727,24 +738,37 @@ class Orchestrator:
                         f"advisor decision {decision.status}: {final} "
                         f"(confidence {advice.confidence:.2f})"
                     )
-            migration = existing.get(vm.source_id) or await self._create_migration(
-                plan, vm, strategy, actor, migration_id=migration_id
-            )
             # a decision that waits for approval holds the migration from the same write on
             # (SDD §5.4, §14.6); any other validation clears an earlier hold
             waiting = decision is not None and decision.status == DecisionStatus.pending_approval
-            migration = await self._apply_validation(
-                migration.id,
-                plan,
-                vm,
-                strategy,
-                why,
-                estimates,
-                findings,
-                actor,
-                resolved,
-                hold=rec_id if waiting else None,
-            )
+            hold = rec_id if waiting else None
+            # each migration is written once (SDD §5.4): a new one created already assessed
+            if current is None:
+                migration = await self._create_migration(
+                    plan,
+                    vm,
+                    strategy,
+                    actor,
+                    migration_id=migration_id,
+                    why=why,
+                    estimates=estimates,
+                    findings=findings,
+                    resolved=resolved,
+                    hold=hold,
+                )
+            else:
+                migration = await self._apply_validation(
+                    current.id,
+                    plan,
+                    vm,
+                    strategy,
+                    why,
+                    estimates,
+                    findings,
+                    actor,
+                    resolved,
+                    hold=hold,
+                )
             # recorded only when this validation took the choice (ready or blocked now): one that
             # went in flight meanwhile was left alone and runs what it ran
             validated = migration.phase in (P.ready, P.blocked)
@@ -828,13 +852,18 @@ class Orchestrator:
         actor: str,
         *,
         migration_id: str | None = None,
+        why: str,
+        estimates: list[Estimate],
+        findings: list[Finding],
+        resolved: Mappings | None = None,
+        hold: str | None = None,
     ) -> Migration:
+        """A new migration, created already assessed (SDD §5.4): its history from pending through
+        validating to ready or blocked in one write, then migration.created and the phase events."""
         now = self._now()
-        wave = plan.wave_of(vm.source_id)
         migration = Migration(
             id=migration_id or new_migration_id(),
             plan_id=plan.id,
-            wave_id=wave.id if wave else None,
             vm=vm,
             strategy=strategy,
             phase=P.pending,
@@ -847,19 +876,63 @@ class Orchestrator:
                     actor=actor,
                 )
             ],
-            bytes_total=vm.used_bytes,
             created_at=now,
             updated_at=now,
         )
-        await self.db.put("migration", migration, expected_version=0)
-        await self._emit(
-            "migration.created",
-            f"migration of {vm.name} created",
-            migration=migration,
-            actor=actor,
-            data={"vm": vm.name, "source_id": vm.source_id, "strategy": str(strategy)},
+        final = self._assess(
+            migration, plan, vm, strategy, why, estimates, findings, resolved, hold
+        )
+        migration, _ = await self._transitions(
+            migration,
+            0,
+            [(P.validating, "pre-flight validation", None), final],
+            actor,
+            created={"vm": vm.name, "source_id": vm.source_id, "strategy": str(strategy)},
         )
         return migration
+
+    @staticmethod
+    def _assess(
+        m: Migration,
+        plan: Plan,
+        vm: VMRef,
+        strategy: Strategy,
+        why: str,
+        estimates: list[Estimate],
+        findings: list[Finding],
+        resolved: Mappings | None,
+        hold: str | None,
+    ) -> tuple[Phase, str, dict[str, Any] | None]:
+        """Write a validation's assessment into ``m``; return its last transition: to ready, or
+        to blocked by a blocker or when no strategy is eligible (SDD §5.4, §9)."""
+        no_eligible = not any(e.eligible for e in estimates)
+        wave = plan.wave_of(vm.source_id)
+        m.vm = vm
+        m.strategy = strategy
+        m.estimates = estimates
+        m.estimate = next((e for e in estimates if e.strategy == strategy), None)
+        m.findings = findings
+        # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+        m.suggested_probes = suggest_probes(vm)
+        m.resolved_mappings = resolved or Mappings()
+        m.wave_id = wave.id if wave else None
+        m.bytes_total = vm.used_bytes
+        m.advisor_hold = hold
+        # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
+        # stay - strategy notes of earlier versions are listed as legacy recommendations
+        m.error = None
+        # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
+        # this validation carries over to the new strategy, findings and estimate
+        m.approvals = []
+        _clear_request(m)
+        if no_eligible:
+            details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
+            m.error = f"no eligible strategy ({details})"[:1000]
+        if has_blocker(findings) or no_eligible:
+            codes = [f.code for f in findings if f.severity == "blocker"]
+            reason = f"blocked by {', '.join(codes)}" if codes else "no eligible strategy"
+            return P.blocked, reason, {"findings": codes}
+        return P.ready, why, {"strategy": str(strategy)}
 
     async def _apply_validation(
         self,
@@ -875,48 +948,18 @@ class Orchestrator:
         *,
         hold: str | None = None,
     ) -> Migration:
-        no_eligible = not any(e.eligible for e in estimates)
-        blocked = has_blocker(findings) or no_eligible
         async with self._lock(mid):
             m, v = await self._load(mid)
             # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
             # (validations of a plan run one at a time under its lock: none is at work on it)
             if m.phase not in REVALIDATABLE and m.phase != P.validating:
                 return m  # already in flight or finished: leave it alone
+            steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
-                m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
-            wave = plan.wave_of(vm.source_id)
-            m.vm = vm
-            m.strategy = strategy
-            m.estimates = estimates
-            m.estimate = next((e for e in estimates if e.strategy == strategy), None)
-            m.findings = findings
-            # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
-            m.suggested_probes = suggest_probes(vm)
-            m.resolved_mappings = resolved or Mappings()
-            m.wave_id = wave.id if wave else None
-            m.bytes_total = vm.used_bytes
-            m.advisor_hold = hold
-            # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
-            # stay - strategy notes of earlier versions are listed as legacy recommendations
-            m.error = None
-            # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
-            # this validation carries over to the new strategy, findings and estimate
-            m.approvals = []
-            _clear_request(m)
-            if no_eligible:
-                details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
-                m.error = f"no eligible strategy ({details})"[:1000]
-            if blocked:
-                codes = [f.code for f in findings if f.severity == "blocker"]
-                reason = f"blocked by {', '.join(codes)}" if codes else "no eligible strategy"
-                m, v = await self._transition(
-                    m, v, P.blocked, reason, actor, data={"findings": codes}
-                )
-            else:
-                m, v = await self._transition(
-                    m, v, P.ready, why, actor, data={"strategy": str(strategy)}
-                )
+                steps.append((P.validating, "pre-flight validation", None))
+            final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
+            # both transitions in one write (SDD §5.4)
+            m, v = await self._transitions(m, v, [*steps, final], actor)
         return m
 
     async def _record_strategy_recommendation(

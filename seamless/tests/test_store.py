@@ -43,6 +43,39 @@ def test_optimistic_conflict_raises(any_store: Store):
         any_store.put("migration", make_migration(), expected_version=4)
 
 
+def test_a_versioned_put_is_one_statement(any_store: Store):
+    """SDD §11 (control-plane perf audit CP-P6): a write with an expected version is one statement -
+    an INSERT for a new document, an UPDATE ... WHERE version for an update; only a conflict reads
+    the version, to say what it found. An unconditional write still reads the version first."""
+    statements: list[str] = []
+
+    def count(conn, cursor, statement, params, context, executemany):
+        statements.append(statement.split()[0].upper())
+
+    mig = make_migration()
+    sa.event.listen(any_store.engine, "before_cursor_execute", count)
+    try:
+        assert any_store.put("migration", mig, expected_version=0) == 1
+        assert statements == ["INSERT"]
+        statements.clear()
+        mig.progress_pct = 10
+        assert any_store.put("migration", mig, expected_version=1) == 2
+        assert statements == ["UPDATE"]
+        with pytest.raises(ConflictError, match="is at version 2, expected 0"):
+            any_store.put("migration", mig, expected_version=0)
+        with pytest.raises(ConflictError, match="is at version 2, expected 1"):
+            any_store.put("migration", mig.model_copy(update={"progress_pct": 99.0}), 1)
+        with pytest.raises(ConflictError, match="does not exist"):
+            any_store.put("migration", make_migration(), expected_version=4)
+        statements.clear()
+        assert any_store.put("migration", mig) == 3
+        assert statements == ["SELECT", "UPDATE"]
+    finally:
+        sa.event.remove(any_store.engine, "before_cursor_execute", count)
+    # a refused write changed nothing
+    assert any_store.get("migration", mig.id, Migration).progress_pct == 10
+
+
 def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     assert any_store.change_stamp("migration") == (0, 0)
     m = make_migration()

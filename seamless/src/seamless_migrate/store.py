@@ -211,12 +211,38 @@ class Store:
     ) -> int:
         now = _now()
         key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        # a versioned write is one statement; only a refused one reads what it found (SDD §11)
+        if expected_version == 0:
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        documents.insert().values(
+                            kind=kind,
+                            id=doc_id,
+                            version=1,
+                            data=data,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            except IntegrityError:
+                raise self._refused(kind, doc_id, expected_version) from None
+            return 1
+        if expected_version is not None:
+            with self.engine.begin() as conn:
+                result = conn.execute(
+                    documents.update()
+                    .where(key & (documents.c.version == expected_version))
+                    .values(version=expected_version + 1, data=data, updated_at=now)
+                )
+            if result.rowcount != 1:
+                raise self._refused(kind, doc_id, expected_version)
+            return expected_version + 1
+        # unconditional: the next version of whatever is stored (put() retries a race)
         try:
             with self.engine.begin() as conn:
                 row = conn.execute(sa.select(documents.c.version).where(key)).first()
                 if row is None:
-                    if expected_version not in (None, 0):
-                        raise ConflictError(f"{kind} {doc_id!r} does not exist")
                     conn.execute(
                         documents.insert().values(
                             kind=kind,
@@ -229,10 +255,6 @@ class Store:
                     )
                     return 1
                 current = int(row.version)
-                if expected_version is not None and current != expected_version:
-                    raise ConflictError(
-                        f"{kind} {doc_id!r} is at version {current}, expected {expected_version}"
-                    )
                 result = conn.execute(
                     documents.update()
                     .where(key & (documents.c.version == current))
@@ -243,6 +265,18 @@ class Store:
                 return current + 1
         except IntegrityError as exc:
             raise ConflictError(f"{kind} {doc_id!r} already exists") from exc
+
+    def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
+        """Why a versioned write found no row to write: the document is missing, or at another
+        version (SDD §11)."""
+        key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.select(documents.c.version).where(key)).first()
+        if row is None:
+            return ConflictError(f"{kind} {doc_id!r} does not exist")
+        return ConflictError(
+            f"{kind} {doc_id!r} is at version {int(row.version)}, expected {expected_version}"
+        )
 
     def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
         with self.engine.connect() as conn:

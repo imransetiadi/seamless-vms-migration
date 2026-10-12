@@ -461,52 +461,146 @@ async def test_a_validation_leaves_a_removed_vms_migration_that_moved_meanwhile_
     assert kept["vm"] == "web-02" and kept["phase"] in ("rolling_back", "rolled_back")
 
 
+async def _left_validating(tmp_path, store):
+    """A plan of two VMs that an earlier version's validation left as it was when it failed
+    between vm-2's two writes (a database error, a restart): vm-2 in validating, the plan not
+    validated (SDD §5.4). Validation now writes each migration once, so the state is seeded."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    stuck = await h.by_vm(plan.id, "vm-2")
+    stuck.phase = P.validating
+    stuck.phase_history = stuck.phase_history[:2]
+    store.put("migration", stuck)
+    left = await h.plan(plan.id)
+    left.status = PlanStatus.draft
+    store.put("plan", left)
+    assert h.history(await h.migration(stuck.id)) == [P.pending, P.validating]
+    return h, plan, stuck
+
+
 async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_validating(
     tmp_path, store
 ):
-    """SDD §5.4: a validation whose second write failed (a database error, a restart) left a
-    migration in validating; the next validation of the plan re-assesses it like a ready one, so
-    the plan can start and the VM is not held for good."""
-    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    transition = h.orch._transition
-    failed: list[str] = []
-
-    async def failing_transition(m, version, to, reason, actor="system", data=None):
-        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
-            failed.append(m.id)
-            raise ConnectionError("database connection lost")
-        return await transition(m, version, to, reason, actor, data)
-
-    h.orch._transition = failing_transition
-    with pytest.raises(ConnectionError):
-        await h.orch.validate_plan(plan.id, "alice")
-    stuck = await h.by_vm(plan.id, "vm-2")
-    assert stuck.phase == P.validating
-
+    """SDD §5.4: an earlier version's validation whose second write failed (a database error, a
+    restart) left a migration in validating; the next validation of the plan re-assesses it like a
+    ready one, so the plan can start and the VM is not held for good."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
     report = await h.orch.validate_plan(plan.id, "alice")
     assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
-    assert (await h.migration(stuck.id)).phase == P.ready
+    taken = await h.migration(stuck.id)
+    assert taken.phase == P.ready
+    # taken over as it was: one transition, written once
+    assert h.history(taken) == [P.pending, P.validating, P.ready]
     assert (await h.plan(plan.id)).status == PlanStatus.validated
 
 
-async def _left_validating(tmp_path, store):
-    """A plan of two VMs whose first validation failed between vm-2's two writes (SDD §5.4)."""
+async def test_a_validation_writes_each_migration_once_with_the_same_events(tmp_path, store):
+    """SDD §5.4 (control-plane perf audit CP-P6): a new migration is created already assessed - its
+    history pending -> validating -> ready or blocked, in one write - and an existing one takes
+    both transitions in one write; the events stay migration.created for a new one and one
+    migration.phase per transition, in that order."""
+    gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
+    h, plan = await setup(tmp_path, store, [vm(1), gpu])
+
+    def phase_events(m):
+        return [
+            (e.kind, e.data.get("from"), e.data.get("to"))
+            for e in store.events(migration_id=m.id, limit=1000)
+        ]
+
+    await h.orch.validate_plan(plan.id, "alice")
+    expected = {"vm-1": P.ready, "vm-3": P.blocked}
+    for vm_id, last in expected.items():
+        m = await h.by_vm(plan.id, vm_id)
+        assert store.get_versioned("migration", m.id, Migration)[1] == 1, vm_id
+        assert h.history(m) == [P.pending, P.validating, last]
+        assert phase_events(m) == [
+            ("migration.created", None, None),
+            ("migration.phase", "pending", "validating"),
+            ("migration.phase", "validating", str(last)),
+        ]
+        created, validating, assessed = store.events(migration_id=m.id, limit=1000)
+        assert created.data == {"vm": m.vm.name, "source_id": vm_id, "strategy": str(m.strategy)}
+        assert created.message == f"migration of {m.vm.name} created"
+        assert validating.data == {
+            "from": "pending",
+            "to": "validating",
+            "reason": "pre-flight validation",
+        }
+        assert validating.message == f"{m.vm.name}: pending -> validating (pre-flight validation)"
+        reason = m.phase_history[-1].reason
+        extra = {"findings": ["VM_VGPU"]} if last == P.blocked else {"strategy": str(m.strategy)}
+        assert assessed.data == {"from": "validating", "to": str(last), "reason": reason, **extra}
+        assert assessed.message == f"{m.vm.name}: validating -> {last} ({reason})"
+        assert {e.actor for e in (created, validating, assessed)} == {"alice"}
+    await h.orch.validate_plan(plan.id, "alice")
+    for vm_id, last in expected.items():
+        m = await h.by_vm(plan.id, vm_id)
+        assert store.get_versioned("migration", m.id, Migration)[1] == 2, vm_id
+        assert h.history(m) == [P.pending, P.validating, last, P.validating, last]
+        assert phase_events(m)[3:] == [
+            ("migration.phase", str(last), "validating"),
+            ("migration.phase", "validating", str(last)),
+        ]
+
+
+async def test_a_validation_runs_four_statements_per_vm(tmp_path):
+    """SDD §5.4, §11 (CP-P6): per VM, a first validation inserts the migration and its three events,
+    and a validation again reads it, updates it and inserts its two events - four statements each,
+    where it was ten and seven. Each size gets its own store, so no other plan is read."""
+    import sqlalchemy as sa
+
+    seen: list[str] = []
+
+    def count(conn, cursor, statement, params, context, executemany):
+        seen.append(statement)
+
+    async def statements(n):
+        own = Store(f"sqlite:///{tmp_path / f'n{n}.db'}")
+        own.create_schema()
+        h, plan = await setup(tmp_path / f"n{n}", own, [vm(i) for i in range(1, n + 1)])
+        seen.clear()
+        sa.event.listen(own.engine, "before_cursor_execute", count)
+        try:
+            await h.orch.validate_plan(plan.id, "alice")
+            first = len(seen)
+            seen.clear()
+            await h.orch.validate_plan(plan.id, "alice")
+            again = len(seen)
+        finally:
+            sa.event.remove(own.engine, "before_cursor_execute", count)
+            own.dispose()
+        return first, again
+
+    (first4, again4), (first8, again8) = await statements(4), await statements(8)
+    assert ((first8 - first4) / 4, (again8 - again4) / 4) == (4, 4)
+
+
+async def test_a_failed_validation_write_leaves_no_migration_in_validating(tmp_path, store):
+    """SDD §5.4: the one write lands or not - a database error leaves a new VM without a migration
+    and an existing migration as it was, never in validating."""
     h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    transition = h.orch._transition
-    failed: list[str] = []
+    put = h.orch.db.put
 
-    async def failing_transition(m, version, to, reason, actor="system", data=None):
-        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
-            failed.append(m.id)
+    async def failing_put(kind, model, expected_version=None):
+        # the write that lands the assessment (an earlier version wrote validating before it)
+        if kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating:
             raise ConnectionError("database connection lost")
-        return await transition(m, version, to, reason, actor, data)
+        return await put(kind, model, expected_version)
 
-    h.orch._transition = failing_transition
+    h.orch.db.put = failing_put
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
-    stuck = await h.by_vm(plan.id, "vm-2")
-    assert stuck.phase == P.validating
-    return h, plan, stuck
+    assert [m.vm.source_id for m in await h.migrations(plan.id)] == ["vm-1"]
+    h.orch.db.put = put
+    await h.orch.validate_plan(plan.id, "alice")
+    ready = await h.by_vm(plan.id, "vm-2")
+    _, version = store.get_versioned("migration", ready.id, Migration)
+    h.orch.db.put = failing_put
+    with pytest.raises(ConnectionError):
+        await h.orch.validate_plan(plan.id, "alice")
+    kept, same = store.get_versioned("migration", ready.id, Migration)
+    assert (kept.phase, same, h.history(kept)) == (P.ready, version, h.history(ready))
 
 
 async def test_validation_cancels_a_removed_vms_leftover_in_validating(tmp_path, store):
