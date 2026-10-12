@@ -58,6 +58,11 @@ jobs:
         env:
           SEAMLESS_TEST_PG_URL: postgresql+psycopg://seamless:ci-only@127.0.0.1:5432/seamless_test
         run: pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
+      - name: DEMO-07 on a throwaway demo server (QASuite §6.6, §14.7)
+        # about 15 s: a hang fails this step, not the job's whole time budget
+        timeout-minutes: 5
+        # the runner's Python holds the control plane, not a venv: its seamless is on PATH
+        run: SEAMLESS=seamless ../tests/e2e/demo-cutover-refusal.sh
       - name: Dependency audit (S-18)
         run: pip-audit --progress-spinner off
 

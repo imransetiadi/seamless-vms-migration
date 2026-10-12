@@ -1146,7 +1146,9 @@ something already answers on is refused) with its own data directory and a clean
 runs without authentication — so a shared demo keeps `dc2-portal-02` free. It plans the VM `vmware_warm` with the
 cutover on request and checks the refusal through the first pass, the migration summaries, the cutover that fails
 before the source stops, the retry's pass and a requested sync pass, then the cutover that completes (12 checks,
-about 15 s; `SEAMLESS=` names another `seamless`, and `PYTHONPATH` runs another tree's code).
+about 15 s; `SEAMLESS=` names another `seamless`, and `PYTHONPATH` runs another tree's code). CI's control-plane
+job runs it on both Python versions (with `SEAMLESS=seamless`: CI installs into the runner's Python, not a
+venv), and so does `make seamless-check`.
 
 The committed scripts pass `shellcheck`.
 

@@ -319,6 +319,22 @@ def test_seamless_check_runs_the_ci_checks_that_run_locally():
     assert any(req.startswith("pytest-cov") for req in extras["optional-dependencies"]["dev"])
 
 
+def test_ci_and_seamless_check_run_the_demo07_script():
+    """DEMO-07 (QASuite §6.6, §14.7) runs where the control plane is tested - CI's control-plane
+    job and ``make seamless-check`` - since the script needs only the installed control plane. CI
+    installs into the runner's Python, not a venv, so it names the ``seamless`` on its PATH."""
+    script = "tests/e2e/demo-cutover-refusal.sh"
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["control-plane"]["steps"]
+    step = next((s for s in steps if s.get("name", "").startswith("DEMO-07")), None)
+    assert step is not None, [s.get("name") for s in steps]
+    ci = _ci_step_run("DEMO-07")
+    assert script in ci and "SEAMLESS=seamless" in ci
+    # its run takes about 15 s: a hang fails the step, not the job's whole time budget
+    assert 0 < step.get("timeout-minutes", 0) <= 5
+    assert script in _makefile_target_recipe("seamless-check")
+
+
 def test_seamless_check_fails_when_any_playbook_syntax_check_fails(tmp_path):
     """A failing syntax check fails ``make seamless-check`` even when a later playbook passes: bash
     ignores errexit for a loop inside an && list, so the loop has to stop on the first failure."""
