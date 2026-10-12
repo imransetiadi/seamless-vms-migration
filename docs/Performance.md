@@ -603,7 +603,10 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
   226 → 39 ms and 153 → 32 ms CPU. The same query, grouped and counted since 282a81b, gives each plan its
   `migration_counts`, so the dashboard's Plans list reads no migration (a4e40b0; before, it read every
-  migration of every plan to show "migrations done"), and the plan form reads them only while open. Prefer SSE-triggered
+  migration of every plan to show "migrations done"), and the plan form reads them only while open. The Advisor
+  page reads no migration either: its notes come from `GET /advisor/notes` (33ca02a, 20 notes out of the API's
+  document cache) and a waiting decision reads its migration alone (f1b52e7); at 1,000 VMs every migration was
+  4,127.7 KiB of its 4,230 KiB load. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling; an event about one existing migration
   re-reads that migration alone and splices it into the cached lists (SDD §16, 376eec7): at 1,000 VMs a plan a
   full list is ≈ 4.5 MB (≈ 0.5 MB gzipped) per page and event, one migration ≈ 4.5 KB.
