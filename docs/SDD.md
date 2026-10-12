@@ -2700,7 +2700,7 @@ against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that ne
 dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
 scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
 name what it leaves out — the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency
-audits, the manifest and image jobs — and how to run each).
+audits, trivy's configuration scan, the manifest and image jobs — and how to run each).
 
 Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host — on a Linux machine's own
 Docker Engine, which defines no `host.docker.internal`, the targets add `deploy/compose/compose.linux-host.yaml`,
