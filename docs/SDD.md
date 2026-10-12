@@ -753,7 +753,10 @@ the import will after the stop:
   another project owns is not found, and a name that two of the project's networks carry is ambiguous.
 * With `port_creation_mode: neutron`, each of the port's security group references (`reference.security_group_id`):
   `create_or_update` looks them up for the port it creates, and one that matches no group or several would fail it
-  after the stop. (The server's own security group references are looked up with the server's other references.)
+  after the stop. A port exported without `security_group_refs` (an export from before that rule), which
+  `create_or_update` refuses, is refused here too; the control plane exports such a workload again (§7.2), a
+  playbook run by hand does not. (The server's own security group references are looked up with the server's other
+  references.)
 * Whether the credential may put the port on that network. A network of the credential's own project: always.
   Another project's network only when it is shared with the credential's project or is external (Neutron's `shared`
   and `router:external`, as the credential sees them). An admin credential sees every project's networks, and a port
