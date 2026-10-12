@@ -30,6 +30,12 @@ function setup(m: Migration = migration) {
   return { queryClient, invalidate };
 }
 
+/** Holds `queryKey` with an enabled observer, as a page that shows it does; its data stays as it is (SDD §16). */
+function heldByPage(queryClient: QueryClient, queryKey: readonly unknown[]): () => void {
+  const observer = new QueryObserver(queryClient, { queryKey, queryFn: async () => queryClient.getQueryData(queryKey) ?? null, staleTime: Infinity });
+  return observer.subscribe(() => {});
+}
+
 const MiB = 2 ** 20;
 const GiB = 2 ** 30;
 
@@ -419,7 +425,10 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
 
   async function flushed(fetchMigration: (id: string) => Promise<Migration>, lists: Array<[object, Migration[]]>) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    for (const [query, list] of lists) queryClient.setQueryData(['migrations', query], list);
+    for (const [query, list] of lists) {
+      queryClient.setQueryData(['migrations', query], list);
+      heldByPage(queryClient, ['migrations', query]);
+    }
     const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
     const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
     batch.refreshMigration(migration.id);
@@ -495,6 +504,7 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       // its own page cached, no list: read once, into the page
       const page = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       page.setQueryData(['migration', migration.id], migration);
+      heldByPage(page, ['migration', migration.id]);
       const fresh: Migration = { ...migration, progress_pct: 7 };
       const read = vi.fn(async () => fresh);
       const batch = createBatchedInvalidator(page, 400, read);
@@ -506,6 +516,37 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       // any migration list cached: read, and each list decides as before
       await flushed(fetchMigration, [[{ plan_id: 'plan-00000000' }, []]]);
       expect(fetchMigration).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads nothing for a migration no page shows: a disabled list or one kept after its page closed is not shown (SDD §16, audit AUD-1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMigration = vi.fn(async () => migration);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      // the plan form's summary list while the form is closed, and a panel's while its plan cannot be edited
+      const closed = new QueryObserver(queryClient, { queryKey: ['migrations', { view: 'summary' }], queryFn: async () => [], enabled: false });
+      const unsubscribe = closed.subscribe(() => {});
+      const panel = new QueryObserver(queryClient, { queryKey: ['migrations', { plan_id: migration.plan_id, view: 'summary' }], queryFn: async () => [], enabled: false });
+      const unsubscribePanel = panel.subscribe(() => {});
+      // a list and a migration page kept in the cache after their page closed
+      queryClient.setQueryData(['migrations', { plan_id: migration.plan_id }], [migration]);
+      queryClient.setQueryData(['migration', migration.id], migration);
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+      for (let i = 0; i < 5; i++) batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      // once a page shows one of them, the event reads the migration again
+      const stop = heldByPage(queryClient, ['migrations', { plan_id: migration.plan_id }]);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      stop();
+      unsubscribe();
+      unsubscribePanel();
+      batch.dispose();
     } finally {
       vi.useRealTimers();
     }
@@ -641,6 +682,9 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       const key = ['migrations', { plan_id: migration.plan_id }];
       const other: Migration = { ...migration, id: 'mig-other', phase: 'cutover' };
       client.setQueryData(key, [migration, other]);
+      // a page shows another list, so the reads happen (SDD §16)
+      client.setQueryData(['migrations', {}], [migration, other]);
+      heldByPage(client, ['migrations', {}]);
       const batch = createBatchedInvalidator(client, 400, async (id) => ({ ...(id === other.id ? other : migration), phase: 'completed' }));
       applyEventToCache(client, { ...progressEvent({}), seq: 88, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
       applyEventToCache(client, { ...progressEvent({}), seq: 89, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
@@ -760,6 +804,7 @@ describe('a hidden page holds the live-event batch (SDD §16, perf audit PF-03)'
       const one = fx2.migrations.find((m) => m.phase === 'precopy') as Migration;
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       queryClient.setQueryData(['migrations', {}], [one]);
+      heldByPage(queryClient, ['migrations', {}]);
       const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
       const fetchMigration = vi.fn(async () => one);
       let hidden = true;
@@ -804,8 +849,9 @@ describe('a hidden page holds the live-event batch (SDD §16, perf audit PF-03)'
     try {
       const queryClient = new QueryClient();
       const page = { ...(buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration), id: 'mig-0000000001' };
-      // its page is cached, so the read is wanted (PF-04)
+      // its page shows it, so the read is wanted (PF-04)
       queryClient.setQueryData(['migration', page.id], page);
+      heldByPage(queryClient, ['migration', page.id]);
       const fetchMigration = vi.fn(async () => page);
       let hidden = true;
       let shown: (() => void) | null = null;
@@ -862,8 +908,9 @@ describe('a batch with many migrations to read (SDD §16, perf audit PF-03)', ()
   async function batchOf(count: number) {
     const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    // a cached list, so the reads are wanted (PF-04)
+    // a list a page shows, so the reads are wanted (PF-04)
     queryClient.setQueryData(['migrations', {}], [base]);
+    heldByPage(queryClient, ['migrations', {}]);
     const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
     const fetchMigration = vi.fn(async (id: string) => ({ ...base, id }));
     const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);

@@ -215,12 +215,14 @@ export function createBatchedInvalidator(
       pending.set(JSON.stringify(['migration']), ['migration']);
       ids = [];
     }
-    // a page that caches neither a migration nor any migration list takes no read (SDD §16)
-    const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).length > 0;
+    // a page that shows neither a migration nor any migration list takes no read (SDD §16): a query is shown while an
+    // enabled observer holds it - a disabled one (a closed form, a panel whose plan cannot be edited) or one kept in
+    // the cache after its page closed shows nothing
+    const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).some((query) => query.isActive());
     for (const id of ids) {
       // a read of it under way may have started before the event: it waits for the next batch
       if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
-      else if (!lists && queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true }) === undefined) continue;
+      else if (!lists && !queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true })?.isActive()) continue;
       else if (fetchMigration) void splice(id, fetchMigration, batch);
     }
     const keys = [...pending.entries()];

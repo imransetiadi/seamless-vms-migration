@@ -70,6 +70,32 @@ describe('Plans page', () => {
     await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Plans' })).toHaveFocus());
   });
 
+  it('reads no migration on a live event while the plan form is closed (SDD §16, audit AUD-1)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    const read: string[] = [];
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET') read.push(path);
+      return handle(method, path, query, body, token);
+    };
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server, live: true });
+    await screen.findByRole('table', { name: /migration plans/i });
+    const m = server.migrations[0]!;
+    const phase = (seq: number) =>
+      server.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message: `phase ${seq}`, data: {} });
+    // the closed form's summary query is disabled: no page shows a migration, so no event reads one
+    for (const seq of [1, 2, 3]) phase(seq);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(read.filter((path) => path.startsWith('/migrations'))).toEqual([]);
+    // the open form shows the summaries: the next event reads that migration, once
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    await screen.findByRole('dialog', { name: /new migration plan/i });
+    await waitFor(() => expect(read).toContain('/migrations'));
+    phase(4);
+    await waitFor(() => expect(read).toContain(`/migrations/${m.id}`), { timeout: 3000 });
+  });
+
   it("shows each plan's done count from its migration counts and reads no migration (SDD §16, PF-02)", async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
