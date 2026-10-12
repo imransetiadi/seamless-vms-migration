@@ -1,8 +1,9 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { strategyRecommendation } from '../api/mockData';
 import type { Migration, Strategy } from '../api/types';
+import { AUTH_OFF_HINT, OWN_DECISION } from '../lib/roles';
 import { summaryOf } from '../lib/summary';
 import { createTestServer, renderWithApp } from '../test/utils';
 import { RecommendationActions, type ActionMigration } from './RecommendationActions';
@@ -51,6 +52,17 @@ async function offered(migration: ActionMigration, rec: ReturnType<typeof setup>
 }
 
 describe('RecommendationActions (SDD §14.6)', () => {
+  it('says, with authentication off, how to get past a decision only another person may make (SDD §13, §16)', async () => {
+    const { server, migration, rec } = setup(['cold', 'warm']);
+    // no token: the anonymous admin of a loopback demo, who asked for this decision
+    renderWithApp(<RecommendationActions rec={{ ...rec, requested_by: 'anonymous' }} migration={migration} />, { token: null, server });
+    const group = await screen.findByRole('group', { name: /^Decide on the recommendation for/ });
+    const approve = within(group).getByRole('button', { name: 'Approve' });
+    await waitFor(() => expect(approve).toHaveAttribute('aria-disabled', 'true'));
+    expect(approve).toHaveAccessibleDescription(`${OWN_DECISION} ${AUTH_OFF_HINT}`);
+    expect(within(group).getByRole('button', { name: 'Override' })).toHaveAccessibleDescription(`${OWN_DECISION} ${AUTH_OFF_HINT}`);
+  });
+
   it("offers the same from a migration's summary as from the whole migration: the eligible strategies (SDD §4, perf audit PF-02)", async () => {
     const { server, migration, rec } = setup(['cold', 'warm']);
     const whole = await offered(migration, rec, server);

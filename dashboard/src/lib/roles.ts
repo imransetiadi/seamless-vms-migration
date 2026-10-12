@@ -25,6 +25,15 @@ export const OWN_CUTOVER = 'You requested this cutover. Another approver must ap
 /** The API's answer to the approver who forced a cutover approving it (SDD §5.4). */
 export const OWN_FORCE = 'You forced this cutover. Another approver must approve it.';
 export const OWN_DECISION = 'You requested this decision. Another approver must decide it.';
+/** Every request's principal while authentication is off (SDD §13): a reserved token name, so nobody else's. */
+export const ANONYMOUS = 'anonymous';
+/** What a maker-checker refusal adds while authentication is off: nobody else exists to approve (SDD §13, §16). */
+export const AUTH_OFF_HINT = 'With authentication off everyone is anonymous: give each person a token (seamless token create) and turn authentication on.';
+
+/** A maker-checker refusal for `user`, with the way past it while authentication is off; the control stays. */
+export function ownReason(reason: string, user: string | null | undefined): string {
+  return user === ANONYMOUS ? `${reason} ${AUTH_OFF_HINT}` : reason;
+}
 
 export const ROLE_LABELS: Record<Role, string> = {
   viewer: 'Viewer',

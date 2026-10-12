@@ -4,7 +4,7 @@ import { formatRelative } from './format';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
-import { hasRole, OWN_CUTOVER, OWN_FORCE, PERMISSIONS } from './roles';
+import { hasRole, OWN_CUTOVER, OWN_FORCE, ownReason, PERMISSIONS } from './roles';
 
 export type MigrationActionKey = 'approve' | 'cutover' | 'force-cutover' | 'sync' | 'rollback' | 'retry' | 'cancel' | 'finalize';
 
@@ -87,8 +87,8 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
     case 'approve':
       if (APPROVAL_LASTS.has(m.phase)) {
         // maker-checker (SDD §5.4): the API refuses the requester's approval, and the forcer's
-        if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(OWN_CUTOVER);
-        if (user && m.force_cutover?.actor === user && plan?.require_distinct_approver !== false) return no(OWN_FORCE);
+        if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(ownReason(OWN_CUTOVER, user));
+        if (user && m.force_cutover?.actor === user && plan?.require_distinct_approver !== false) return no(ownReason(OWN_FORCE, user));
         return ok;
       }
       if (BEFORE_VALIDATION.has(m.phase)) return no('Validate the plan first: validation clears approvals, so approve its new assessment.');

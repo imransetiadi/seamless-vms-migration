@@ -4,7 +4,7 @@ import { useDecideRecommendation, useMe, usePlan, usePolicies } from '../api/hoo
 import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type MigrationSummary, type Strategy, type VMRef } from '../api/types';
 import { optionLabel } from '../lib/advisor';
 import { resolvePolicy } from '../lib/policies';
-import { OWN_DECISION } from '../lib/roles';
+import { OWN_DECISION, ownReason } from '../lib/roles';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { SelectField, TextAreaField } from './Field';
@@ -68,9 +68,9 @@ export function RecommendationActions({
   const pinned = usePlan(migration.plan_id).data?.strategy_overrides[migration.vm.source_id];
   const pinnedReason = pinned ? `The plan sets the strategy of ${name} (${optionLabel(pinned)}): change it in the plan.` : null;
   const approveReason = own
-    ? OWN_DECISION
+    ? ownReason(OWN_DECISION, me)
     : (pinnedReason ?? (rec.decision.status === 'approved' ? 'The decision is already approved.' : canApprove ? null : 'The recommended option is not eligible for this VM now.'));
-  const overrideReason = own ? OWN_DECISION : (pinnedReason ?? (alternatives.length ? null : 'No other option is eligible for this VM.'));
+  const overrideReason = own ? ownReason(OWN_DECISION, me) : (pinnedReason ?? (alternatives.length ? null : 'No other option is eligible for this VM.'));
   return (
     <>
       <div role="group" aria-label={`Decide on the recommendation for ${name}`} className="mt-2 flex flex-wrap gap-2">

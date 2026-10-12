@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
 import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
-import { OWN_CUTOVER, OWN_FORCE } from './roles';
+import { AUTH_OFF_HINT, OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -189,6 +189,18 @@ describe('migrationActions rules', () => {
     expect(migrationActions(requested, 'approver', { ...plan, require_distinct_approver: false }, now, 'sari').approve.enabled).toBe(true);
     // while the plan is loading, the API's default holds: a distinct approver
     expect(migrationActions(requested, 'approver', undefined, now, 'sari').approve.enabled).toBe(false);
+  });
+
+  it('says, with authentication off, how to get past a maker-checker refusal (SDD §13, §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_distinct_approver: true };
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    // every request is anonymous with authentication off: nobody else exists to approve
+    const requested = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'anonymous', approvals: [] });
+    expect(migrationActions(requested, 'admin', plan, now, 'anonymous').approve).toEqual({ enabled: false, reason: `${OWN_CUTOVER} ${AUTH_OFF_HINT}` });
+    const forced = migration('syncing', { force_cutover: { ...FORCED, actor: 'anonymous' }, approvals: [] });
+    expect(migrationActions(forced, 'admin', plan, now, 'anonymous').approve).toEqual({ enabled: false, reason: `${OWN_FORCE} ${AUTH_OFF_HINT}` });
+    // a named user gets the API's words alone
+    expect(migrationActions({ ...requested, cutover_requested_by: 'sari' }, 'approver', plan, now, 'sari').approve.reason).toBe(OWN_CUTOVER);
   });
 
   it('counts the approvals the gate counts: all but the requester\'s under a distinct approver (SDD §5.4)', () => {
