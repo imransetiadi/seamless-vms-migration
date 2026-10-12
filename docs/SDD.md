@@ -749,8 +749,8 @@ override (§7.2). `ServerPort` then gives Nova the address as `fixed_ip` and Neu
 picks the subnet of the port's network that holds it.
 
 `Server.dst_prerequisites_errors` runs in `import_workload_dst_check`, before the cold import or the warm cutover
-stops the source and before a warm pre-copy's first pass. It looks up what each port of the workload needs, the way
-the import will after the stop:
+stops the source and before each warm pre-copy or sync pass. It looks up what each port of the workload needs, the
+way the import will after the stop:
 * The port's network reference and every fixed IP's subnet reference (`reference.network_id`,
   `reference.subnet_id`). A `%auth%` reference searches only the credential's own project, so a shared network that
   another project owns is not found, and a name that two of the project's networks carry is ambiguous.
@@ -791,7 +791,11 @@ the import will after the stop:
   id}`, the MAC and the same addresses (those on a SLAAC or DHCPv6-stateless subnet aside).
 
 Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
-cutover fails while the source still runs.
+cutover fails while the source still runs. A pre-copy or sync pass creates and fills the destination volumes and makes
+no port or floating IP, so its check passes `network_as_warnings: true` (default `false`): the problems of the ports
+and floating IPs above become module warnings, which the pass's log shows, and only the server's own prerequisites
+(its flavor, image, security group and key pair references) fail the pass. Copying a large disk takes hours, and a
+network problem can be fixed meanwhile; the cutover's check refuses it before the source stops.
 
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
@@ -910,7 +914,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     another project when the credential's token carries neither the `admin` nor the `advsvc` role.
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
-  before the source stops: a permanent failure naming the port. A floating IP's network name that does not resolve
+  before the source stops: a permanent failure naming the port. A warm pre-copy or sync run, which makes no port,
+  logs that failure instead and keeps the port's references as exported; the cutover resolves them again, or exports
+  again when the plan's mappings changed, and stops there. A floating IP's network name that does not resolve
   keeps its reference as exported. In `floating_ip_mode` `auto` (the collection's default, which the control plane
   keeps) the import attaches a detached RHOSO floating IP with the address and needs no network. Only an admin can
   create a floating IP with a chosen address. A network the import does need is refused by the destination check
@@ -984,7 +990,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   that network, when two NICs share a key but need different values, or when another port of that network holds
   the NIC's MAC or one of its IPv4 addresses (`DestinationProvider.ports`): the kit asks Neutron for both, which
   refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
-  Destination networks or ports that cannot be read are a transient failure.
+  Destination networks or ports that cannot be read are a transient failure. A `vmware_warm` pre-copy or sync run, in
+  which the kit makes no port, maps the NIC as usual when its problem is a network the credential may not use or a MAC
+  or address another port holds, and logs the problem instead, as it logs ports that cannot be read; the cutover
+  refuses it before the power-off. The other problems leave the NIC no correct value in the map, which the kit reads in
+  every run, and stop every run.
 
   The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
   create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
