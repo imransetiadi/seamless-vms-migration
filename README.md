@@ -104,9 +104,18 @@ make seamless-demo               # build + start postgres, jev (if enabled) and 
 open http://127.0.0.1:8080/      # sign in at /login with the admin token (127.0.0.1: localhost may be another program)
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
-make seamless-check              # every CI check that runs locally: tests with the 85 % coverage gate, ruff,
-                                 # collection tests, playbook syntax, ansible-lint, scans, dashboard
-cd dashboard && npx playwright install chromium && npm run test:e2e   # browser smoke of the built dashboard (mock mode)
+make seamless-check              # CI's checks that need only the venv and node_modules: tests with the 85 % coverage
+                                 # gate, ruff, DEMO-07, collection tests, playbook syntax, ansible-lint, installed scanners,
+                                 # dashboard unit tests and build. The rest of CI, each on its own:
+(cd dashboard && npx playwright install chromium && npm run test:e2e)   # browser smoke of the built dashboard (mock mode)
+npm --prefix dashboard run build && node tests/e2e/demo-cutover-refusal-browser.mjs && node tests/e2e/demo-approval-browser.mjs
+                                 # the browser journeys: DEMO-07 and maker-checker from the dashboard
+SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db>' make seamless-test   # PostgreSQL store tests
+seamless/.venv/bin/pip install pip-audit && seamless/.venv/bin/pip-audit && npm --prefix dashboard audit --omit=dev --audit-level=high
+                                 # the dependency audits, as CI runs them (pip-audit; npm audit)
+trivy config --severity HIGH,CRITICAL --exit-code 1 deploy   # trivy's configuration scan of the manifests (needs trivy)
+make deploy-runtime-check        # PostgreSQL and the built image under the manifests' security context; kubeconform,
+                                 # trivy's image scan and the SBOM need those tools (see .github/workflows/ci.yml)
 pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
 

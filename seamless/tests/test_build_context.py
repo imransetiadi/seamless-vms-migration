@@ -299,9 +299,9 @@ def test_seamless_up_and_demo_check_localhost_once_healthy(target):
 
 
 def test_seamless_check_runs_the_ci_checks_that_run_locally():
-    """``make seamless-check`` is "everything CI runs that can run locally" (QASuite §13): the
-    control-plane coverage gate (NFR-11), the playbook syntax checks and ansible-lint, with CI's
-    threshold, playbooks and lint targets."""
+    """``make seamless-check`` runs CI's checks that need only the venv and the dashboard's
+    node_modules (SDD §17.1, QASuite §13): the control-plane coverage gate (NFR-11), the playbook
+    syntax checks and ansible-lint, with CI's threshold, playbooks and lint targets."""
     recipe = _makefile_target_recipe("seamless-check")
     gate = re.search(r"--cov-fail-under=(\d+)", _ci_step_run("Unit and integration tests"))
     assert gate and "--cov=seamless_migrate" in recipe
@@ -319,6 +319,59 @@ def test_seamless_check_runs_the_ci_checks_that_run_locally():
     # the venv the target runs in has what the gate needs
     extras = tomllib.loads((ROOT / "seamless" / "pyproject.toml").read_text())["project"]
     assert any(req.startswith("pytest-cov") for req in extras["optional-dependencies"]["dev"])
+
+
+def test_seamless_check_says_which_ci_checks_it_leaves_out():
+    """SDD §17.1: ``make seamless-check`` is not all of CI. Its comment, ``make seamless-help``
+    and the README name what it leaves out - each a CI check the recipe does not run - and the
+    README says how to run each, so a contributor who passed it knows what CI still runs."""
+    recipe = _makefile_target_recipe("seamless-check")
+    makefile = (ROOT / "Makefile").read_text()
+    lines = makefile.splitlines()
+    start = lines.index("seamless-check:")
+    comment = []
+    for line in reversed(lines[:start]):
+        if not line.startswith("#"):
+            break
+        comment.insert(0, line)
+    comment_text = "\n".join(comment)
+    help_line = next(line for line in lines if line.strip().startswith('@echo "  seamless-check '))
+    readme = (ROOT / "README.md").read_text()
+    # the block a contributor reads under ``make seamless-check``, to the end of its code fence
+    start_check = readme.index("make seamless-check")
+    readme_block = readme[start_check : readme.index("```", start_check)]
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for where, text in (
+        ("the Makefile comment", comment_text),
+        ("make seamless-help", help_line),
+        ("the README", readme),
+    ):
+        claims = [phrase for phrase in ("every CI check", "Everything CI runs") if phrase in text]
+        assert not claims, f"{where} claims all of CI: {claims}"
+    # each a CI check the recipe leaves out, with how to run it in the README
+    for command in (
+        "npm run test:e2e",
+        "demo-cutover-refusal-browser.mjs",
+        "demo-approval-browser.mjs",
+        "SEAMLESS_TEST_PG_URL",
+        "pip-audit",
+        "npm audit",
+        "trivy config",
+    ):
+        assert command in ci, command
+        assert command not in recipe, command
+        assert command in readme_block, command
+    for left_out in (
+        "Playwright",
+        "browser journeys",
+        "PostgreSQL",
+        "audits",
+        "trivy",
+        "manifest",
+        "image",
+    ):
+        assert left_out in comment_text, left_out
+        assert left_out in help_line, left_out
 
 
 def test_ci_and_seamless_check_run_the_demo07_script():

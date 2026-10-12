@@ -471,7 +471,7 @@ seamless-help:
 	@echo "  seamless-test       - run the control-plane test suite (cd seamless && .venv/bin/pytest -q)"
 	@echo "  lab-handover        - storage handover against the lab clouds (SEAMLESS_LAB_*; read-only unless SEAMLESS_LAB_DESTRUCTIVE=1)"
 	@echo "  dashboard-build     - build the dashboard (cd dashboard && npm ci && npm run build)"
-	@echo "  seamless-check      - every CI check that runs locally: tests with the coverage gate, ruff, DEMO-07, collection tests, playbook syntax, ansible-lint, scans, dashboard"
+	@echo "  seamless-check      - CI's checks that need only the venv and node_modules: tests with the coverage gate, ruff, DEMO-07, collection tests, playbook syntax, ansible-lint, installed scanners, dashboard; not the Playwright suite, the browser journeys, PostgreSQL, the audits, trivy, the manifest or image jobs (see the README)"
 	@echo "  deploy-runtime-check - run PostgreSQL (and the control-plane image, when built) the way the cluster manifests do: read-only, arbitrary UID"
 
 # Start (or create) the dedicated Colima profile; idempotent. Colima activates the context of the profile it
@@ -558,10 +558,13 @@ seamless-test:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -q
 
-# Everything CI runs that can run locally (QASuite §13, .github/workflows/ci.yml), in one go: the
-# control-plane tests with CI's coverage gate (NFR-11), ruff, DEMO-07 (tests/e2e/demo-cutover-refusal.sh),
-# the collection's unit tests, playbook syntax checks and ansible-lint (the venv's 'collection' extra),
-# the scanners and the dashboard.
+# The CI checks that need only the venv and the dashboard's node_modules (SDD §17.1, QASuite §13,
+# .github/workflows/ci.yml), in one go: the control-plane tests with CI's coverage gate (NFR-11), ruff,
+# DEMO-07 (tests/e2e/demo-cutover-refusal.sh), the collection's unit tests, playbook syntax checks and
+# ansible-lint (the venv's 'collection' extra), the scanners that are installed and the dashboard's unit
+# tests and build. Not all of CI: it leaves out the Playwright suite and the browser journeys, the PostgreSQL
+# store tests, the dependency audits, trivy's configuration scan and the manifest and image jobs; the README
+# says how to run each.
 seamless-check:
 	@[ -x seamless/.venv/bin/pytest ] || { echo "Create the venv first: cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'"; exit 1; }
 	cd seamless && .venv/bin/pytest -q --cov=seamless_migrate --cov-report=term --cov-fail-under=85
