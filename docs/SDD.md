@@ -1761,6 +1761,11 @@ Stats { total: int, by_phase: dict[Phase,int], completed: int, failed: int, in_p
 **SSE format**: each event is `id: <seq or 0 for ephemeral>\nevent: <kind>\ndata: <Event JSON>\n\n`;
 a `: heartbeat` comment every 15 s. Clients authenticate with the Authorization header (the
 dashboard uses `fetch` streaming, not `EventSource`), and resume with `?since=<last seq>`.
+A stream sends each persisted event once, in `seq` order, also those another process wrote to the store (the
+CLI beside a running server, §15): a stream given an event whose `seq` skips some first reads the store from the
+last `seq` it sent, so what was written in between comes before it, and each tick (`tick_s`, §8) the server
+compares the store's newest `seq` with the newest it published and has every stream read what it lacks - another
+process's events reach an open page within about a tick, also while the server itself emits nothing.
 
 The dashboard build (`SEAMLESS_DASHBOARD_DIR`, default `<repo>/dashboard/dist` when present) is
 served at `/` with SPA fallback for non-`/api` paths.
@@ -2168,7 +2173,8 @@ seamless version
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
 refuse. Commands operating on the store use the same
-settings as `serve` (they open the DB directly; a running server sees changes on its next tick). An
+settings as `serve` (they open the DB directly; a running server sees changes on its next tick, and its event
+stream sends their events, §12). An
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
 the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
 only if the plan did not change since it was read (a server that started or validated it meanwhile), and
