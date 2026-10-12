@@ -2108,7 +2108,13 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
   decision) and `after` are `{status, final_option, reason_code, policy_id, threshold_used}`.
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
-  (the policy, null where there is none).
+  (the policy, null where there is none). The audit page lists with a `policy.updated` the settings it changed, one
+  line each, "{setting}: {before} → {after}", worded as the policies page shows them (§16) and in its order: Name,
+  When the advisor decides, Applies to (plans and providers by name, by id when the page does not know it), Decisions,
+  Threshold, Minimum evidence, Override reason, Distinct approver. A list of plans, providers or decision types whose
+  order alone changed did not change; a setting either side lacks is not compared; "No setting changed" when none
+  did, and nothing when `before` or `after` is not a policy. A change that weakens an approval gate so shows on the
+  page, not only in the JSON download.
 * `migration.force_cutover` — a cutover before convergence (§5.4): actor the approver who forced it; data
   `{target_id, vm, reason, delta_bytes, estimated_downtime_s}`, `target_id` the migration id and `vm` its VM's name.
   The audit page shows the reason with the action and links the target to the migration.
