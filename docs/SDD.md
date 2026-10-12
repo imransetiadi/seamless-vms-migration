@@ -2303,7 +2303,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (Delete provider) with its icon. Initial focus, Escape, busy and unavailable states are as for every dialog.
 * Accessibility: WCAG 2.2 AA contrast — figures shown while newer ones load too: the Overview greys them to the muted
   foreground and marks them `aria-busy`, never fades them with opacity —, visible focus rings, keyboard reachable
-  actions, `aria-live`
+  actions, a control repeated on each card of a list naming its card's object to assistive technology after its
+  visible label, the rest visually hidden as the card's heading shows it (a policy card's Edit {policy} and Delete
+  {policy}; a provider card's Check {provider}, Inventory of {provider}, Edit {provider} and Delete {provider}), so a
+  list of the page's controls never reads "Edit" three times, `aria-live`
   for progress, for the outcome of an action (a plan started, resumed, paused, saved or validated — with
   the report's counts — or its waves planned; a migration's action or strategy change) and for what a list's
   filters show ("Showing 3 of 12 plans", also when none match; on Events only that none match, as its count moves
