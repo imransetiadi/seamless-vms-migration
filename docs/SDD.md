@@ -2505,7 +2505,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
   as it is, so what reads only such lists does not draw again on every progress event.
   Persisted events refresh the queries they affect in one batch per 400 ms. A `migration.phase` or
-  `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases. An event about one migration that
+  `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases.
+  While the page is hidden (`document.visibilityState` `hidden`, a background tab) the batch waits: what its events
+  would refresh or read again is refreshed once, as one batch, when the page is shown again; progress still patches
+  the cached figures in place. A batch that would read more than 50 migrations one by one - a long-hidden page in a
+  busy wave - refreshes the cached migration lists and pages instead: one read per list costs less than so many. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
   holds it and is filtered by plan at most, instead of reading those lists again — at 1,000 VMs a plan (NFR-03) a
