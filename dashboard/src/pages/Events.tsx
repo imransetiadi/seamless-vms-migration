@@ -40,6 +40,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatNumber, formatTime } from '../lib/format';
 import type { Tone } from '../lib/phase';
+import { createSeenSeqs } from '../lib/seen';
 import { TONE_CLASSES } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 
@@ -199,14 +200,15 @@ export default function Events() {
   const historyMaxSeq = useMemo(() => (history.data ?? []).reduce((max, e) => Math.max(max, e.seq), 0), [history.data]);
   const historyMaxRef = useRef(historyMaxSeq);
   historyMaxRef.current = historyMaxSeq;
-  const seenLive = useRef(new Set<number>());
+  // the persisted live events shown, by sequence, so a replay is shown once - bounded: an open page keeps no more
+  // numbers than four times the live list it shows (perf audit PF-07)
+  const seenLive = useRef(createSeenSeqs(4 * MAX_LIVE));
 
   useLiveEvents((event) => {
     if (event.kind === 'heartbeat') return;
     if (event.seq === 0 && !progressRef.current) return;
     if (event.seq > 0) {
-      if (event.seq <= historyMaxRef.current || seenLive.current.has(event.seq)) return;
-      seenLive.current.add(event.seq);
+      if (event.seq <= historyMaxRef.current || !seenLive.current.add(event.seq)) return;
     }
     counter.current += 1;
     const item = itemOf(event.seq > 0 ? `seq-${event.seq}` : `live-${counter.current}`, event);

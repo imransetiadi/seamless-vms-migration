@@ -103,6 +103,27 @@ describe('Events page', () => {
     expect(screen.getByText('Live · waiting for new events')).toBeInTheDocument();
   });
 
+  it('shows a new event the stream delivers twice once (SDD §16, perf audit PF-07)', async () => {
+    const hub = new LiveEventHub();
+    const { server } = renderWithApp(
+      <LiveContext.Provider value={hub}>
+        <Events />
+      </LiveContext.Provider>,
+      { route: '/events', token: 'viewer' },
+    );
+    const list = await screen.findByRole('list', { name: /events, newest first/i });
+    await within(list).findByText(/paused: vCenter degraded/i);
+    const last = server.events[server.events.length - 1];
+    if (!last) throw new Error('no fixture events');
+    // newer than the history: only the page's own record of what it showed tells a second delivery
+    const fresh = { ...last, seq: last.seq + 1, message: 'zz delivered twice' };
+    act(() => hub.publish({ ...fresh }));
+    act(() => hub.publish({ ...fresh }));
+    expect(await within(list).findAllByText('zz delivered twice')).toHaveLength(1);
+    // and counted once on the stream line
+    expect(screen.getByText('Live · 1 new event since you opened this page')).toBeInTheDocument();
+  });
+
   it('never says no events match when the history cannot be loaded (SDD §16)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
