@@ -910,6 +910,10 @@ class TestServerDstNetworkCheck(unittest.TestCase):
             "Destination prerequisites not met: "
         )
         self.assertTrue(all(w.startswith(prefix) for w in warned), warned)
+        # SDD 6.6: the pass returns them too, for the migration's cutover_refusals (SDD 7.2)
+        lead = "The cutover will refuse this before the source stops: "
+        self.assertEqual(passing["cutover_refusals"], [w[len(lead):] for w in warned])
+        self.assertNotIn("cutover_refusals", cutover)
         self.assertTrue(any("port lost on network 'gone'" in w for w in warned), warned)
         self.assertTrue(
             any("floating IP 172.20.9.135 on network 'gone'" in w for w in warned), warned

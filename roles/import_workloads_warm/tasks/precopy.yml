@@ -45,6 +45,15 @@
             # a pass makes no port or floating IP: the cutover's check refuses their
             # problems before the source stops (SDD 6.6)
             network_as_warnings: true
+          register: import_workloads_warm_dst_check
+
+        - name: Record what the cutover will refuse
+          ansible.builtin.copy:
+            # beside the warm state, for the migration's cutover_refusals (SDD 6.6, 7.2):
+            # each pass replaces it, an empty list once the problems are fixed
+            dest: "{{ os_migrate_warm_state_dir }}/{{ item['_info']['id'] }}.refusals.json"
+            content: "{{ import_workloads_warm_dst_check.cutover_refusals | default([]) | to_json }}"
+            mode: "0600"
 
         - name: Snapshot the running workload
           os_migrate.os_migrate.import_workload_warm_snapshot:

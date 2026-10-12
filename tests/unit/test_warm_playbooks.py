@@ -94,6 +94,9 @@ elif NAME == "import_workload_prelim":
         result = {"changed": True, "server_name": name,
                   "log_file": os.path.join(args["log_dir"], name + ".log"),
                   "state_file": os.path.join(args["log_dir"], name + ".state")}
+elif NAME == "import_workload_dst_check" and args.get("network_as_warnings"):
+    result = {"changed": False,
+              "cutover_refusals": world.get("refusals", {}).get(name, [])}
 elif NAME == "os_conversion_host_info":
     result = {"changed": False, "openstack_conversion_host": {
         "id": "src-conv", "address": "10.0.0.10", "status": "ACTIVE", "name": args["server"]}}
@@ -312,6 +315,26 @@ PRECOPY = [
     "import_workload_warm_sync",
     "import_workload_warm_snapshot:absent",
 ]
+
+
+def test_a_pass_records_what_the_cutover_will_refuse(env):
+    """SDD 6.6, 7.2: each pre-copy pass writes, beside the workload's warm state, what its
+    destination check found that the cutover will refuse - and a later pass replaces it."""
+
+    def refusals(server_id):
+        with open(os.path.join(env.state_dir, server_id + ".refusals.json")) as f:
+            return json.load(f)
+
+    problem = "Destination prerequisites not met: port p2 on network 'gone' does not resolve"
+    env.world["refusals"] = {"vm1": [problem]}
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+    assert refusals("srv-1") == [problem]
+    assert refusals("srv-2") == []
+    env.world["refusals"] = {}  # fixed meanwhile
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+    assert refusals("srv-1") == []
 
 
 def test_warm_playbooks_story(env):

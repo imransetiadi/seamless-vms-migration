@@ -93,6 +93,13 @@ EXAMPLES = r"""
 """
 
 RETURN = r"""
+cutover_refusals:
+  description:
+    - With network_as_warnings, the problems of the workload's ports and floating IPs that
+      the cutover's check will refuse before the source stops, one message each.
+  returned: when network_as_warnings is true
+  type: list
+  elements: str
 """
 
 from ansible.module_utils.basic import AnsibleModule
@@ -128,8 +135,11 @@ def run_module():
     if warn_network:
         # a warm pass makes no port or floating IP: the cutover's check refuses their
         # problems before the source stops (SDD 6.6)
-        for problem in ser_server.dst_network_errors(conn):
+        refusals = ser_server.dst_network_errors(conn)
+        for problem in refusals:
             module.warn("The cutover will refuse this before the source stops: " + problem)
+        # returned too, for the migration's cutover_refusals (SDD 7.2)
+        result["cutover_refusals"] = refusals
 
     if errors:
         error_msg = " ".join(errors)
