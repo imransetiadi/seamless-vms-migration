@@ -2354,7 +2354,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   found what its cutover will refuse (`cutover_refusals`, in `precopy`, `syncing` or `awaiting_cutover`) is listed
   there ahead of what it waits for, as the plan list marks it — "Cutover will refuse {n} problem(s)" — with "fix
   it, then Sync now" once it waits for its cutover and "fix it before it converges" while its passes run (the next
-  pass looks again); an approval it still needs stays in Pending approvals.
+  pass looks again); an approval it still needs stays in Pending approvals, whose row then adds to what it waits
+  for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
