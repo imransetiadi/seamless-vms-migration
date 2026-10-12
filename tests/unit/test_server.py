@@ -634,6 +634,35 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.assertEqual(self.errors([network_port("p1", "app", two)], mode="neutron"), [])
         self.assertEqual(self.errors([network_port("p2", "app", [])], mode="neutron"), [])
 
+    def test_looks_up_a_neutron_ports_security_groups_before_the_stop(self):
+        """SDD 6.6: create_or_update looks the port's groups up for the port it creates, after
+        the stop; the check looks them up before it. Through Nova the port's own groups are
+        never looked up."""
+        def security_group_id(conn, ref, required=True):
+            if ref["name"] == "gone":
+                raise openstack.exceptions.ResourceNotFound("No SecurityGroup found for gone")
+            if ref["name"] == "twice":
+                raise openstack.exceptions.DuplicateResource(
+                    "More than one SecurityGroup exists with the name 'twice'."
+                )
+            return "sg-" + ref["name"]
+
+        def port(*names):
+            data = network_port("p1", "app", [{"ip_address": "10.0.0.5"}])
+            data["params"]["security_group_refs"] = [
+                {"name": name, "project_name": "%auth%", "domain_name": "%auth%"} for name in names
+            ]
+            return data
+
+        with mock.patch.object(reference, "security_group_id", side_effect=security_group_id):
+            self.assertEqual(self.errors([port("web", "default")], mode="neutron"), [])
+            [gone] = self.errors([port("web", "gone")], mode="neutron")
+            self.assertIn("Destination prerequisites not met: port p1 on network 'app'", gone)
+            self.assertIn("No SecurityGroup found for gone", gone)
+            [twice] = self.errors([port("twice")], mode="neutron")
+            self.assertIn("More than one SecurityGroup exists with the name 'twice'", twice)
+            self.assertEqual(self.errors([port("gone")], mode="nova"), [])
+
     def test_follows_neutron_on_slaac_and_dhcpv6_stateless_subnets(self):
         def check(address, mode, mac="fa:16:3e:00:00:01"):
             port = network_port("p1", "slaac", [{"ip_address": address}], mac=mac)

@@ -258,6 +258,17 @@ class ServerPort(osm_resource.Resource):
         # Nova creates its ports with a new MAC; a port created through Neutron keeps the
         # source MAC
         neutron = port_creation_mode == "neutron"
+        if neutron:
+            # create_or_update looks the port's groups up for the port it creates (SDD 6.6)
+            for ref in params.get("security_group_refs") or []:
+                try:
+                    reference.security_group_id(conn, ref)
+                except (
+                    osm_resource.OPENSTACK_EXC.ResourceFailure,
+                    osm_resource.OPENSTACK_EXC.ResourceNotFound,
+                    osm_resource.OPENSTACK_EXC.DuplicateResource,
+                ) as e:
+                    errors.append(f"Destination prerequisites not met: {where}: {e}")
         if not neutron and len(refs["fixed_ips"]) != 1:
             # nova_sdk_params refuses any other count, after the stop (SDD 6.6)
             addresses = ", ".join(fixed_ip["ip_address"] for fixed_ip in refs["fixed_ips"])

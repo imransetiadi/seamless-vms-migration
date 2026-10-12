@@ -169,3 +169,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Nova creates each port with one address, and the import refused any other
   count only after the source had stopped. A port whose addresses changed
   after validation is now refused while the source still runs.
+- ``import_workload_dst_check`` looks up a port's own security groups when the
+  ports are recreated through Neutron (``port_creation_mode: neutron``), as
+  ``create_or_update`` will. A group the destination lacks, or has several
+  of, used to fail the import only after the source had stopped.
