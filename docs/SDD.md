@@ -2481,7 +2481,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   each entry names its kind: "Cutover approval" for the request and each approval,
   "Advisor decision · {decision type}" for the migration's advisor decision while it waits for approval and once a
   person approved or overrode it, with who and when (ADV-20); Approve is unavailable to the cutover's requester when the plan requires a distinct
-  approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
+  approver, with the reason "You requested this cutover. Another approver must approve it." — and while authentication
+  is off, when every request is `anonymous` (§13) and nobody else exists to approve, every such maker-checker reason
+  (a requested or forced cutover, a requested advisor decision) adds "With authentication off everyone is anonymous:
+  give each person a token (seamless token create) and turn authentication on.", the control staying; Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
   cuts over once it converges); while the migration's `cutover_refusals` is not empty the page shows them above its actions as a warning,
