@@ -2551,7 +2551,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   reading those lists again — at 1,000 VMs a plan (NFR-03) a
   list is megabytes; a list filtered otherwise, one that does not hold the migration and one being read are
   refreshed as before, and every list is when that read fails. With neither that migration nor any migration list
-  cached (a page that shows none), the event reads nothing. A list that the same batch refreshes is left alone:
+  shown (a page that shows none), the event reads nothing: a query counts as shown while an enabled observer holds it,
+  not when it is only disabled - the plan form's while closed, a panel's while its plan cannot be edited - or kept in
+  the cache after its page closed. A list that the same batch refreshes is left alone:
   its read starts after the batch's events, so it shows them; should that read fail while a migration waited on it,
   the list is read once more, and a list it already failed to read takes the migration as before. `memory.lesson_saved` refreshes nothing: a lesson
   changes no migration, list or figure, and the Events page and a migration's timeline take the event from the
