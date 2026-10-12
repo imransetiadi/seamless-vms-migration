@@ -1769,7 +1769,8 @@ process's events reach an open page within about a tick, also while the server i
 `seq` the store does not hold yet, before an event created less than 2 s earlier, may be another process's insert
 not committed yet (PostgreSQL need not commit in `seq` order): the stream sends what comes before it and holds the
 rest, reading the store again every 50 ms, until it appears or 2 s have passed - a `seq` that never comes (a
-rolled-back insert) holds the stream back that once, and an older gap (pruned events) not at all.
+rolled-back insert) holds the stream back that once, and an older gap (pruned events) not at all, nor one right after
+`seq` 0: a store whose events were all deleted goes on numbering from where they ended.
 
 The dashboard build (`SEAMLESS_DASHBOARD_DIR`, default `<repo>/dashboard/dist` when present) is
 served at `/` with SPA fallback for non-`/api` paths.
