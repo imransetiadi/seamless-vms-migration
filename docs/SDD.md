@@ -2501,7 +2501,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
   request, and is unavailable, saying why, while the migration's advisor decision waits for approval (`advisor_hold`,
-  §14.6) — the API refuses it then (§12)), `/providers` (status cards + Check,
+  §14.6) — the API refuses it then (§12); while that decision waits, the Next step leads with a primary "See the
+  recommendation" link to it, ahead of the migration's own actions, so its first control is the decision its text
+  asks for, not the cutover's Approve), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
