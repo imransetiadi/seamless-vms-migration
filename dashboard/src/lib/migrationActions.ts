@@ -285,6 +285,11 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'verifying':
       return { text: 'Verifying the destination VM: server state, ports, TCP probes and console.', action: null };
     case 'completed': {
+      // its finalize began deleting the source and a rollback is refused: finalizing again is the way out, also while the
+      // source runs again (SDD §8.1)
+      if (m.checkpoint === 'finalizing') {
+        return { text: 'The finalize began deleting the source VM. Next: finalize it again (approver); it can no longer be rolled back.', action: 'finalize' };
+      }
       if (m.source_running_at) {
         // the source watch saw it running (SDD §8.1): finalizing now would keep a diverged source
         return {

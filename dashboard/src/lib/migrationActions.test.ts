@@ -372,6 +372,12 @@ describe('migrationActions rules', () => {
     expect(nextStep(migration('completed', { phase_history: [] }), plan, now).text).toBe(
       'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.',
     );
+    // its finalize began deleting the source: finalizing again is the way out, never a rollback - also while the source
+    // runs again (SDD §8.1)
+    const again = { text: 'The finalize began deleting the source VM. Next: finalize it again (approver); it can no longer be rolled back.', action: 'finalize' };
+    for (const m of [{ ...completed(10), checkpoint: 'finalizing' }, { ...completed(80), checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' }]) {
+      expect(nextStep(m, plan, now)).toEqual(again);
+    }
   });
 
   it('names the next step', () => {
