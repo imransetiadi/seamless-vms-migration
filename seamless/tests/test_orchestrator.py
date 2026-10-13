@@ -1190,6 +1190,8 @@ async def test_warm_flow_reaches_completed_with_downtime(tmp_path, store):
     m = await h.by_vm(plan.id, "vm-1")
     done = await h.wait_phase(m.id, P.completed)
     await h.wait_plan(plan.id, PlanStatus.completed)
+    # plan.completed is written after the plan's status: stopping now would cancel it
+    await h.wait_kind("plan.completed")
     await h.orch.stop()
     assert h.history(done) == [
         P.pending,
@@ -3095,6 +3097,8 @@ async def test_resume_mid_cutover_is_idempotent(tmp_path, store):
         await asyncio.sleep(0.01)
     first = await h.migration(mid)
     assert first.phase == P.cutover and first.downtime_started_at is not None
+    # its event follows the clock: crash once both are in, so only a second one counts
+    await h.wait_kind("migration.downtime_started")
     await h.orch.stop()  # crash
 
     crash_point.set()
