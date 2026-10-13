@@ -354,6 +354,7 @@ def test_seamless_check_says_which_ci_checks_it_leaves_out():
         "demo-cutover-refusal-browser.mjs",
         "demo-approval-browser.mjs",
         "demo-signin-browser.mjs",
+        "demo-keyboard-browser.mjs",
         "SEAMLESS_TEST_PG_URL",
         "pip-audit",
         "npm audit",

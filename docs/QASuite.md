@@ -653,10 +653,10 @@ past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule find
 (WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
 320 and 1280 px, with the web fonts and with their font files aborted, the system font a browser shows until they arrive (WCAG 1.4.10, SDD §16 — in it an Overview plan name was 3 px too wide at 320 px until 068a64a); UI-27 the plan, policy and provider dialogs' error summaries pass axe's target-size rule (9514b10: their links were 17 px tall); UI-25 the sign-in page requests no chart code and the Overview still draws its charts (40ff6b7: Rolldown had put React inside `charts`, so every page preloaded Recharts); UI-26 the fonts come with the dashboard: no request leaves the page's origin and Fira Sans and Fira Code load (8e4aebd: they came from Google Fonts, render-blocking, unreachable in an air-gapped site); each was checked to fail when the behaviour it
 guards is broken; UI-19 timed out on a busy machine until its kind filters were matched by pattern — the mock's migrations move on and a second one can reach an advisor hold mid-test; UI-24's former flake was that Overview plan name, cut off whenever it measured before Fira Sans arrived — it waits for `document.fonts.ready` since 068a64a) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
-Chromium against the running demo stack through the real control plane); UI-01 sign in with a token and land on Overview and UI-08 a 401 returns to `/login` run in `tests/e2e/demo-signin-browser.mjs`, UI-04 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, in `smoke.spec.ts`) and UI-05 Finalize needs the typed VM name in `tests/e2e/demo-approval-browser.mjs` (§14.7). Cases still manual, to automate next: UI-02 KPI
-tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator;
+Chromium against the running demo stack through the real control plane); UI-01 sign in with a token and land on Overview and UI-08 a 401 returns to `/login` run in `tests/e2e/demo-signin-browser.mjs`, UI-04 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, in `smoke.spec.ts`) and UI-05 Finalize needs the typed VM name in `tests/e2e/demo-approval-browser.mjs`, UI-03 plan detail → Validate → Start as operator and UI-10 its keyboard-only run in `tests/e2e/demo-keyboard-browser.mjs` (§14.7). Cases still manual, to automate next: UI-02 KPI
+tiles and phase distribution render with demo data;
 UI-06 Events page appends live events; UI-07 theme toggle persists; UI-09 SSE
-reconnect after a dropped connection resumes without duplicates; UI-10 keyboard-only run of UI-03.
+reconnect after a dropped connection resumes without duplicates.
 
 ```bash
 cd dashboard && npm ci && npx playwright install --with-deps chromium
@@ -1176,6 +1176,15 @@ server without the admin's token revokes it — the server reads the tokens file
 session ended; restarted with authentication off, Sign in offers to continue without a token, back to the page that
 asked (14 checks, about 10 s). Against the dashboard and server of 2f02025a, before the two Sign in fixes, three of
 them fail. CI's `dashboard-e2e` job runs it after the maker-checker journey.
+
+[`tests/e2e/demo-keyboard-browser.mjs`](../tests/e2e/demo-keyboard-browser.mjs) plans and starts by keyboard alone
+(UI-03, UI-10; WCAG 2.1.1, 2.4.1, 2.4.3, 2.4.7), with an operator token of its own and a plan of `report-01` and
+`batch-01` made through the API: only Tab, Shift+Tab, Enter and Escape move or act. The operator signs in; the first Tab
+stop skips to the content; the rail leads to Plans; New plan's dialog takes the focus, keeps it over 120 Tabs and gives
+it back to New plan on Escape; the plan opens from the list; Validate runs, and Start's confirmation takes the focus
+before the plan's heading has it; and every stop is visible with a focus indicator (11 checks, about 15 s). Against a
+dashboard without the skip link, without the dialog's Tab wrap or without the focus ring, the check of that guarantee
+fails. CI's `dashboard-e2e` job runs it after the sign-in journey.
 
 The committed scripts pass `shellcheck`.
 

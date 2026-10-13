@@ -180,6 +180,12 @@ jobs:
         env:
           SHOT_DIR: ${{ runner.temp }}/demo07
         run: mkdir -p "$SHOT_DIR" && SEAMLESS=seamless node ../tests/e2e/demo-signin-browser.mjs
+      - name: Planning and starting by keyboard alone on a throwaway demo server (QASuite §14.7)
+        # about 15 s: the skip link, a dialog's focus trap, Validate and Start, and a visible focus at every stop
+        timeout-minutes: 5
+        env:
+          SHOT_DIR: ${{ runner.temp }}/demo07
+        run: mkdir -p "$SHOT_DIR" && SEAMLESS=seamless node ../tests/e2e/demo-keyboard-browser.mjs
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:
