@@ -1334,7 +1334,8 @@ fails, the migration stays `completed` with that checkpoint: the source may be g
 may still finish — so it stays in the queue to be finalized again (deleting a VM that is gone already succeeds)
 and can no longer be rolled back: `POST …/rollback` answers 409 ("the finalize began deleting the source VM:
 finalize it again"), since a rollback deletes the destination server and would find no source to start, and the
-dashboard keeps Rollback unavailable with that reason. A provider call is bounded (300 s); the provider's wait
+dashboard keeps Rollback unavailable with that reason, and the migration's next step is to finalize it again
+(approver), never a rollback — also while its source VM runs again. A provider call is bounded (300 s); the provider's wait
 for a deletion stays within that bound.
 
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
@@ -2488,7 +2489,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   the estimated downtime or the pass limit decides", ADV-16; it names the running pass the
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
   and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
-  `/health` `demo_speed`; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
+  `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
+  downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
   difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
