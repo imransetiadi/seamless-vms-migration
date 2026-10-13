@@ -30,9 +30,9 @@ from .schemas import ConversionKeyRequest, ProviderCredentialsRequest
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["providers"])
-#: plans that can release their providers: only a completed one, once none of its migrations
-#: holds its VM — a failed plan can be started again (SDD §8, §12)
-TERMINAL_PLAN_STATUSES = frozenset({PlanStatus.completed})
+#: plans that can release their providers: a completed one, once none of its migrations holds its
+#: VM, and a cancelled one — a failed plan can be started again (SDD §8, §12)
+TERMINAL_PLAN_STATUSES = frozenset({PlanStatus.completed, PlanStatus.cancelled})
 #: plans whose provider must not change under them (PATCH answers 409)
 ACTIVE_PLAN_STATUSES = frozenset({PlanStatus.running, PlanStatus.paused})
 #: PATCH /providers/{id} (SDD §12); id, kind, role and server-owned fields are immutable

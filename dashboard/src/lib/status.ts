@@ -1,6 +1,7 @@
 import type { LucideIcon } from 'lucide-react';
 import {
   BadgeCheck,
+  Ban,
   CircleAlert,
   CircleCheck,
   CircleHelp,
@@ -74,6 +75,8 @@ const PLAN_STATUS: Record<DerivedPlanStatus, StatusMeta> = {
   completed: { label: 'Completed', tone: 'success', icon: CircleCheck },
   finalized: { label: 'Finalized', tone: 'success', icon: BadgeCheck },
   failed: { label: 'Failed', tone: 'danger', icon: CircleX },
+  // retired before any migration started (SDD §12): nothing more happens to it
+  cancelled: { label: 'Cancelled', tone: 'neutral', icon: Ban },
 };
 
 const PROVIDER_STATUS: Record<ProviderStatus, StatusMeta> = {

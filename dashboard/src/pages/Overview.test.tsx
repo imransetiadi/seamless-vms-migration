@@ -25,6 +25,18 @@ describe('Overview page (mock data)', () => {
     expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
   });
 
+  it('leaves a cancelled plan out of the strictest SLO: it migrates nothing more (SDD §12)', async () => {
+    const server = createTestServer();
+    const cancelled = server.plans.find((p) => p.status === 'cancelled');
+    if (!cancelled) throw new Error('fixture without a cancelled plan');
+    cancelled.downtime_slo_s = 60;
+    const others = server.plans.filter((p) => p.status !== 'draft' && p.status !== 'cancelled').map((p) => p.downtime_slo_s);
+    expect(Math.min(...others)).toBeGreaterThan(60);
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const summaries = await screen.findAllByText(/the (Strictest )?SLO of /);
+    for (const summary of summaries) expect(summary).not.toHaveTextContent('1m 00s');
+  });
+
   it('reads the summaries of the plan in its address alone (SDD §16, perf audit PF-02)', async () => {
     const reads: string[] = [];
     const server = createTestServer();

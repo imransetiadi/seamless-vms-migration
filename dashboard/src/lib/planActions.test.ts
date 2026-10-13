@@ -9,15 +9,18 @@ const planWith = (status: PlanStatus): Plan => ({ ...base, status });
 const ready: Migration[] = fx.migrations.filter((m) => m.plan_id === base.id);
 
 // finalize needs a completed migration (and an approver): none of these has one
+// these migrations have not started: Cancel plan retires any plan that does not run (SDD §12)
 const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
-  draft: { validate: true, waves: true, start: false, pause: false, edit: true, finalize: false },
-  validated: { validate: true, waves: true, start: true, pause: false, edit: true, finalize: false },
-  running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false },
+  draft: { validate: true, waves: true, start: false, pause: false, edit: true, finalize: false, cancel: true },
+  validated: { validate: true, waves: true, start: true, pause: false, edit: true, finalize: false, cancel: true },
+  running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false, cancel: false },
   // the API plans waves on a paused plan too, returning it to draft (SDD §12)
-  paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false },
-  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false },
+  paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false, cancel: true },
+  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: true },
   // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
-  failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false },
+  failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false, cancel: true },
+  // terminal (SDD §12): nothing more is done with it
+  cancelled: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: false },
 };
 
 describe('planActions', () => {
@@ -27,6 +30,18 @@ describe('planActions', () => {
       expect(actions[key].enabled, `${key} in ${status}`).toBe(enabled);
       if (!enabled) expect(actions[key].reason, `${key} in ${status}`).toBeTruthy();
     }
+  });
+
+  it('cancels a plan only while it does not run and none of its migrations started, naming those that did, as the API does (SDD §12)', () => {
+    expect(planActions(planWith('running'), 'operator', ready).cancel.reason).toBe('Pause the plan before cancelling it.');
+    expect(planActions(planWith('cancelled'), 'operator', ready).cancel.reason).toBe('The plan is cancelled.');
+    const started = ready.map((m, i) => (i === 0 ? { ...m, phase: 'failed' as const } : i === 1 ? { ...m, phase: 'cancelled' as const } : m));
+    const cancel = planActions(planWith('validated'), 'operator', started).cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toBe(`Only a plan whose migrations have not started can be cancelled: ${started[0]!.vm.name} (failed). Cancel a failed or rolled-back migration on its own first.`);
+    // a cancelled migration never counts as started
+    expect(planActions(planWith('validated'), 'operator', ready.map((m) => ({ ...m, phase: 'cancelled' as const }))).cancel.enabled).toBe(true);
+    expect(planActions(planWith('validated'), 'viewer', ready).cancel.reason).toBe('Requires the operator role.');
   });
 
   it('asks to validate a draft before starting', () => {

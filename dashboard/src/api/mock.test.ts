@@ -1077,6 +1077,30 @@ describe('mock API', () => {
     expect(m.approvals.map((a) => a.actor)).toEqual(['ana']);
   });
 
+  it('cancels a plan like the API: its unstarted migrations cancelled, a running plan paused first, a started migration named (SDD §12)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (id: string, token = 'operator') => server.handle('POST', `/plans/${id}/cancel`, new URLSearchParams(), { reason: 'made by mistake' }, token);
+    expect(call('plan-c81d44a0', 'viewer').status).toBe(403);
+    expect(call('plan-4f2a9c1e')).toMatchObject({ status: 409, body: { error: { message: 'pause the plan before cancelling it' } } });
+    const started = call('plan-7b3e0d52');
+    expect(started.status).toBe(409);
+    expect((started.body as { error: { message: string } }).error.message).toMatch(/^only a plan whose migrations have not started can be cancelled: .+ \(syncing\)/);
+    const before = server.events.length;
+    const done = call('plan-c81d44a0');
+    expect(done.status).toBe(200);
+    expect(done.body).toMatchObject({ status: 'cancelled', derived_status: 'cancelled' });
+    expect(new Set(server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').map((m) => m.phase))).toEqual(new Set(['cancelled']));
+    const events = server.events.slice(before);
+    const n = server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').length;
+    const operator = (server.handle('GET', '/me', new URLSearchParams(), undefined, 'operator').body as { name: string }).name;
+    expect(events.filter((e) => e.kind === 'plan.cancelled')).toMatchObject([{ plan_id: 'plan-c81d44a0', actor: operator, data: { reason: 'made by mistake', migrations: n } }]);
+    // terminal: no validation, start or edit, and a second cancel answers the plan as it is
+    expect(server.handle('POST', '/plans/plan-c81d44a0/validate', new URLSearchParams(), {}, 'operator').status).toBe(409);
+    expect(server.handle('POST', '/plans/plan-c81d44a0/start', new URLSearchParams(), {}, 'operator').status).toBe(409);
+    expect(call('plan-c81d44a0')).toMatchObject({ status: 200, body: { status: 'cancelled' } });
+    expect(server.events.slice(before).filter((e) => e.kind === 'plan.cancelled')).toHaveLength(1);
+  });
+
   it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {
     const { server } = setup('operator');
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;

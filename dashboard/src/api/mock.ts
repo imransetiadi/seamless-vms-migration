@@ -1739,6 +1739,7 @@ export class MockServer {
     if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
     if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
     if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
     return null;
   }
@@ -1872,6 +1873,8 @@ export class MockServer {
       .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return plans.flatMap((p) => {
+      // a cancelled plan's migrations never started and are all cancelled (SDD §12)
+      if (p.status === 'cancelled') return [];
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
       const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
       return n ? [`${p.id} ("${p.name}", ${n} VM${n === 1 ? '' : 's'} not finalized)`] : [];
@@ -2016,6 +2019,7 @@ export class MockServer {
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
     if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    if (plan.status === 'cancelled') throw new HttpError(409, 'conflict', 'a cancelled plan cannot be validated');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
@@ -2098,6 +2102,32 @@ export class MockServer {
     plan.status = 'paused';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.paused', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" paused`, data: {} });
+    return ok(plan);
+  }
+
+  /** POST /plans/{id}/cancel, like the API (SDD §12): retires a plan none of whose migrations started; nothing is deleted. */
+  private cancelPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    if (plan.status === 'cancelled') return ok(plan);
+    if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before cancelling it');
+    const mine = this.migrations.filter((m) => m.plan_id === plan.id);
+    const started = mine.filter((m) => !['pending', 'blocked', 'ready', 'cancelled'].includes(m.phase));
+    if (started.length) {
+      const named = started.map((m) => `${m.vm.name} (${m.phase})`).sort();
+      const rest = named.length - 10;
+      throw new HttpError(
+        409,
+        'conflict',
+        `only a plan whose migrations have not started can be cancelled: ${named.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+          'cancel a failed or rolled-back migration on its own first, which cleans up what it copied',
+      );
+    }
+    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
+    const todo = mine.filter((m) => m.phase !== 'cancelled').sort((a, b) => (a.id < b.id ? -1 : 1));
+    // each one as POST /migrations/{id}/cancel does, with its own event
+    for (const m of todo) this.migrationAction(me, m, 'cancel', { reason: reason ? `plan cancelled: ${reason}` : 'plan cancelled' });
+    plan.status = 'cancelled';
+    plan.updated_at = new Date(this.now()).toISOString();
+    this.emit({ kind: 'plan.cancelled', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} cancelled`, data: { reason, migrations: todo.length } });
     return ok(plan);
   }
 

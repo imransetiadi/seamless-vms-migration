@@ -74,6 +74,8 @@ class PlanStatus(StrEnum):
     paused = "paused"
     completed = "completed"
     failed = "failed"
+    #: retired before any of its migrations started (SDD §12): terminal, nothing deleted (§11)
+    cancelled = "cancelled"
 
 
 class DerivedPlanStatus(StrEnum):
@@ -86,6 +88,7 @@ class DerivedPlanStatus(StrEnum):
     completed = "completed"
     finalized = "finalized"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class SyncPassKind(StrEnum):

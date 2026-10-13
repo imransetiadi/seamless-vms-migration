@@ -24,7 +24,13 @@ from ..plan_status import derive_plan_status_from_phases
 from ..security.auth import Principal
 from ..store import NotFound
 from .deps import ApiError, _audit_denied, require_role, services
-from .schemas import PlanFinalizeRequest, PlanFinalizeResult, PlanOut, WavesAutoRequest
+from .schemas import (
+    CancelRequest,
+    PlanFinalizeRequest,
+    PlanFinalizeResult,
+    PlanOut,
+    WavesAutoRequest,
+)
 
 router = APIRouter(tags=["plans"])
 
@@ -260,6 +266,19 @@ async def pause_plan(
     return await _one(
         request, await services(request).orchestrator.pause_plan(plan_id, principal.name)
     )
+
+
+@router.post("/plans/{plan_id}/cancel", response_model=PlanOut)
+async def cancel_plan(
+    plan_id: str,
+    request: Request,
+    body: CancelRequest | None = None,
+    principal: Principal = Depends(require_role(Role.operator)),
+) -> PlanOut:
+    """SDD §12: retire a plan none of whose migrations started; nothing is deleted (§11)."""
+    reason = body.reason if body else None
+    plan = await services(request).orchestrator.cancel_plan(plan_id, principal.name, reason)
+    return await _one(request, plan)
 
 
 @router.post("/plans/{plan_id}/finalize", response_model=PlanFinalizeResult)

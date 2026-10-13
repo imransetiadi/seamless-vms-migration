@@ -48,11 +48,12 @@ export type Severity = (typeof SEVERITIES)[number];
 export const ROLES = ['viewer', 'operator', 'approver', 'admin'] as const;
 export type Role = (typeof ROLES)[number];
 
-export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed'] as const;
+/** `cancelled` retires a plan none of whose migrations started (SDD §12): terminal, nothing deleted. */
+export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed', 'cancelled'] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
 /** The plan status every view shows (SDD §8.1, ADV-19): the lifecycle, told by the plan's migrations. */
-export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed'] as const;
+export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed', 'cancelled'] as const;
 export type DerivedPlanStatus = (typeof DERIVED_PLAN_STATUSES)[number];
 
 export const SYNC_PASS_KINDS = ['full', 'delta', 'final'] as const;
@@ -749,6 +750,7 @@ export const PERSISTED_EVENT_KINDS = [
   'migration.source_running',
   'migration.source_stopped',
   'plan.finalized',
+  'plan.cancelled',
   'migration.approved',
   'migration.action',
   'advisor.strategy',

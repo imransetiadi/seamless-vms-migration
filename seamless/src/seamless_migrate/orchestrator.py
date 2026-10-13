@@ -137,6 +137,8 @@ REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
 REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
 #: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
 RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
+#: a plan is cancelled only while none of its migrations started (SDD §12)
+UNSTARTED = frozenset({P.pending, P.blocked, P.ready})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
 #: it is taken after a plan lock and before a migration lock
 VM_CLAIMS = "vm-claims"
@@ -183,6 +185,18 @@ def failed_provider_change_refusal(failed: list[str]) -> str:
     return (
         f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before changing the "
         "plan's providers: its rollback acts on the clouds its attempt used"
+    )
+
+
+def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
+    """The 409 of a plan cancel while migrations of the plan have started (SDD §12): each VM with
+    its phase, at most ``limit`` and how many are left out."""
+    named = sorted(f"{m.vm.name} ({m.phase})" for m in started)
+    rest = len(named) - limit
+    listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
+    return (
+        f"only a plan whose migrations have not started can be cancelled: {listed}; cancel a "
+        "failed or rolled-back migration on its own first, which cleans up what it copied"
     )
 
 
@@ -584,8 +598,11 @@ class Orchestrator:
         async with self._lock(f"plan:{plan_id}"):
             # SDD §8: refused before waiting for the claims — another plan's validation may hold
             # them for minutes, and the tick starts a running plan's steps under this lock
-            if (await self._plan(plan_id)).status == PlanStatus.running:
+            status = (await self._plan(plan_id)).status
+            if status == PlanStatus.running:
                 raise NotAllowed("pause the plan before validating it again")
+            if status == PlanStatus.cancelled:
+                raise NotAllowed("a cancelled plan cannot be validated")  # terminal (SDD §12)
             async with self._claims():
                 return await self._validate_plan(plan_id, actor)
 
@@ -597,6 +614,8 @@ class Orchestrator:
         seen = plan.model_dump(mode="json", include=_VALIDATION_WATCHES)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
+        if plan.status == PlanStatus.cancelled:
+            raise NotAllowed("a cancelled plan cannot be validated")
         repeated = repeated_vm_ids(plan.vm_ids)
         if repeated:
             # SDD §5.4: two migrations of one VM would both cut it over
@@ -1145,6 +1164,40 @@ class Orchestrator:
 
         plan = await self._update_plan(plan.id, pause)
         await self._emit("plan.paused", f"{plan.name} paused", plan_id=plan.id, actor=actor)
+        return plan
+
+    async def cancel_plan(self, plan_id: str, actor: str, reason: str | None = None) -> Plan:
+        """Retire a plan none of whose migrations started (SDD §12): each is cancelled as
+        :meth:`cancel` does, then the plan becomes ``cancelled``. Nothing is deleted (§11): its
+        VMs are free for another plan and its providers for deletion; its history stays."""
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: no validation, start or step meanwhile
+            plan = await self._plan(plan_id)
+            if plan.status == PlanStatus.cancelled:
+                return plan
+            if plan.status == PlanStatus.running:
+                raise NotAllowed("pause the plan before cancelling it")
+            # SDD §5.4: a validation in another process claims VMs under this lock too
+            async with self._claims():
+                migrations = await self.db.list("migration", Migration, plan_id=plan_id)
+                started = [m for m in migrations if m.phase not in UNSTARTED | {P.cancelled}]
+                if started:
+                    raise NotAllowed(started_refusal(started))
+                todo = sorted((m for m in migrations if m.phase != P.cancelled), key=lambda m: m.id)
+                why = f"plan cancelled: {reason}" if reason else "plan cancelled"
+                for m in todo:
+                    await self.cancel(m.id, actor, why)
+
+                def retire(fresh: Plan) -> None:
+                    fresh.status = PlanStatus.cancelled
+
+                plan = await self._update_plan(plan_id, retire)
+        await self._emit(
+            "plan.cancelled",
+            f"{plan.name} cancelled",
+            plan_id=plan_id,
+            actor=actor,
+            data={"reason": reason, "migrations": len(todo)},
+        )
         return plan
 
     # ------------------------------------------------------------------------------------------

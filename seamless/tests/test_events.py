@@ -45,6 +45,7 @@ def test_kind_catalog_matches_sdd():
         "migration.source_running",
         "migration.source_stopped",
         "plan.finalized",
+        "plan.cancelled",
         "migration.approved",
         "migration.action",
         "advisor.strategy",

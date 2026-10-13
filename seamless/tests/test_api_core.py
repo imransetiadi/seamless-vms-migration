@@ -183,6 +183,7 @@ ROUTES = [
     ("POST", "/api/v1/plans/plan-00000000/validate", Role.operator, None),
     ("POST", "/api/v1/plans/plan-00000000/start", Role.operator, None),
     ("POST", "/api/v1/plans/plan-00000000/pause", Role.operator, None),
+    ("POST", "/api/v1/plans/plan-00000000/cancel", Role.operator, {}),
     ("GET", "/api/v1/migrations", Role.viewer, None),
     ("GET", "/api/v1/migrations/mig-0000000000", Role.viewer, None),
     ("POST", "/api/v1/migrations/mig-0000000000/approve", Role.approver, {"comment": "ok"}),

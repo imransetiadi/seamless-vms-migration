@@ -265,7 +265,8 @@ export default function Overview() {
   const plansById = useMemo(() => new Map(plans.map((p) => [p.id, p])), [plans]);
   const migrations = migrationsQuery.data ?? [];
   const scopedPlans = planId ? plans.filter((p) => p.id === planId) : plans;
-  const activePlans = scopedPlans.filter((p) => p.derived_status !== 'draft');
+  // a draft has not started and a cancelled plan never will (SDD §12): neither sets the SLO the chart reads
+  const activePlans = scopedPlans.filter((p) => p.derived_status !== 'draft' && p.derived_status !== 'cancelled');
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;

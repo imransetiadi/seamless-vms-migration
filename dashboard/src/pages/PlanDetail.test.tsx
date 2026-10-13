@@ -104,6 +104,42 @@ describe('PlanDetail', () => {
     expect(await actionButton(/auto-plan waves/i)).toHaveAttribute('aria-disabled', 'true');
   });
 
+  it('cancels a plan none of whose migrations started, once its name is typed, then offers no action (SDD §12, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { server } = renderPlan('plan-c81d44a0');
+    const name = 'Shared Ceph handover — analytics';
+    await user.click(await actionButton(/^cancel plan$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: `Cancel ${name}?` });
+    const unstarted = server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0' && m.phase !== 'cancelled').length;
+    expect(dialog).toHaveTextContent(`its ${unstarted} migrations that have not started are cancelled: its VMs can be planned again`);
+    expect(dialog).toHaveTextContent(/the plan and its history/i);
+    // the dialog's other button keeps the plan: never two buttons both named "Cancel"
+    expect(within(dialog).getByRole('button', { name: 'Keep plan' })).toBeInTheDocument();
+    const confirm = within(dialog).getByRole('button', { name: 'Cancel plan' });
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    await user.type(within(dialog).getByRole('textbox'), name);
+    await user.click(confirm);
+    await waitFor(() => expect(server.plans.find((x) => x.id === 'plan-c81d44a0')?.status).toBe('cancelled'));
+    expect(new Set(server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').map((m) => m.phase))).toEqual(new Set(['cancelled']));
+    // the plan shows Cancelled and offers no action; its button went, so the focus goes to the plan's heading
+    expect(await screen.findByText('Plan cancelled.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('group', { name: /plan actions/i })).not.toBeInTheDocument());
+    // the plan's own status, in its header (its migrations' table says Cancelled too)
+    const header = screen.getByRole('heading', { level: 1, name }).closest('header')!;
+    await waitFor(() => expect(header).toHaveTextContent('Cancelled'));
+    await waitFor(() => expect(screen.getByRole('heading', { level: 1, name })).toHaveFocus());
+  });
+
+  it('says why Cancel plan is unavailable: which VMs have started, or that a running plan is paused first (SDD §16)', async () => {
+    const view = renderPlan('plan-7b3e0d52');
+    const started = await actionButton(/^cancel plan$/i);
+    expect(started).toHaveAttribute('aria-disabled', 'true');
+    await waitFor(() => expect(started).toHaveAccessibleDescription(/^Only a plan whose migrations have not started can be cancelled: .+ \(syncing\)/));
+    view.unmount();
+    renderPlan('plan-4f2a9c1e');
+    expect(await actionButton(/^cancel plan$/i)).toHaveAccessibleDescription('Pause the plan before cancelling it.');
+  });
+
   it('validates a draft plan and then allows starting it', async () => {
     const user = userEvent.setup({ delay: null });
     renderPlan('plan-0e9f6a17');

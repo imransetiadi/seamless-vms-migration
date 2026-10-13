@@ -468,7 +468,8 @@ export type PlanActionRequest =
   | { action: 'validate' }
   | { action: 'start' }
   | { action: 'pause' }
-  | { action: 'waves'; body?: AutoWavesRequest };
+  | { action: 'waves'; body?: AutoWavesRequest }
+  | { action: 'cancel'; body?: CancelRequest };
 
 export function usePlanAction(planId: string) {
   const api = useApi();
@@ -485,6 +486,8 @@ export function usePlanAction(planId: string) {
           return api.post<Plan>(`${base}/pause`);
         case 'waves':
           return api.post<Plan>(`${base}/waves/auto`, request.body ?? {});
+        case 'cancel':
+          return api.post<Plan>(`${base}/cancel`, request.body ?? {});
       }
     },
     onSuccess: (result, request) => {

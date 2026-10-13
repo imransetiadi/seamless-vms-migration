@@ -1,6 +1,7 @@
 import {
   Activity,
   BadgeCheck,
+  Ban,
   CircleCheck,
   CircleX,
   ClipboardX,
@@ -52,7 +53,7 @@ import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { usePlanFindings } from '../lib/usePlanFindings';
 
-type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
+type Confirm = 'validate' | 'start' | 'pause' | 'waves' | 'cancel' | null;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -361,6 +362,13 @@ export default function PlanDetail() {
     afterActionRef.current = null;
     setConfirm('start');
   };
+  const askCancel = () => {
+    afterActionRef.current = null;
+    setConfirm('cancel');
+  };
+  // whether a migration started is unknown while the migrations cannot be loaded: the API checks anyway (SDD §12)
+  const cancelReason = migrationsUnknown ? 'The migrations could not be loaded: whether one has started is unknown.' : actions.cancel.reason;
+  const unstarted = list.filter((m) => m.phase !== 'cancelled').length;
   const askFinalize = (scope: FinalizeScope) => {
     afterActionRef.current = null;
     setFinalizing(scope);
@@ -382,6 +390,8 @@ export default function PlanDetail() {
           </>
         }
         actions={
+          // a cancelled plan offers no action but its history (SDD §12, §16)
+          p.status !== 'cancelled' && (
           <div role="group" aria-label="Plan actions" className="flex flex-wrap gap-2">
             <Button size="lg" icon={Pencil} disabledReason={actions.edit.reason} onClick={() => setEditing(true)}>
               Edit plan
@@ -415,7 +425,11 @@ export default function PlanDetail() {
                 Pause
               </Button>
             )}
+            <Button size="lg" variant="ghost" icon={Ban} disabledReason={cancelReason} onClick={askCancel}>
+              Cancel plan
+            </Button>
           </div>
+          )
         }
       />
 
@@ -580,6 +594,37 @@ export default function PlanDetail() {
         pending={pending('pause')}
         error={confirm === 'pause' ? action.error : null}
         onConfirm={() => run({ action: 'pause' }, () => setAnnouncement('Plan paused.'))}
+        onCancel={() => {
+          setConfirm(null);
+          action.reset();
+        }}
+      />
+      <ConfirmDialog
+        open={confirm === 'cancel'}
+        tone="danger"
+        icon={Ban}
+        title={`Cancel ${p.name}?`}
+        subject={`Plan ${p.id}`}
+        consequences={[
+          { kind: 'kept', text: 'the plan and its history, shown as Cancelled' },
+          {
+            kind: 'then',
+            text: `its ${unstarted} migration${unstarted === 1 ? ' that has' : 's that have'} not started ${unstarted === 1 ? 'is' : 'are'} cancelled: its VMs can be planned again, and its clouds deleted once no other plan uses them`,
+          },
+        ]}
+        confirmLabel="Cancel plan"
+        cancelLabel="Keep plan"
+        requireText={p.name}
+        pending={pending('cancel')}
+        error={confirm === 'cancel' ? action.error : null}
+        returnFocusRef={afterActionRef}
+        onConfirm={() =>
+          run({ action: 'cancel' }, () => {
+            // the plan's actions go with it: the focus goes to its heading, never the page (SDD §16)
+            afterActionRef.current = headingRef.current;
+            setAnnouncement('Plan cancelled.');
+          })
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();

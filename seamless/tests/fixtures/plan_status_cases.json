@@ -163,6 +163,15 @@
    ],
    "expected": "failed",
    "note": "pre-staging failed (SDD §8)"
+  },
+  {
+   "stored": "cancelled",
+   "phases": [
+    "cancelled",
+    "cancelled"
+   ],
+   "expected": "cancelled",
+   "note": "2. a cancelled plan (SDD §12): its migrations are all cancelled, so none counts; the stored status"
   }
  ]
 }

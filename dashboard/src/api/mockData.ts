@@ -1292,6 +1292,19 @@ const PLAN_SPECS: PlanSpec[] = [
     ],
   },
   {
+    // retired before any of its migrations started (SDD §12): its VMs went to "Community lab cleanup"
+    id: 'plan-6a1b2c3d',
+    name: 'Lab trial — k8s',
+    description: 'A first try at the lab cloud, made before its source failed; cancelled.',
+    source: 'community-lab',
+    destination: 'rhoso-prod',
+    status: 'cancelled',
+    createdAgo: 5 * D,
+    overrides: { require_approval: false },
+    waves: [],
+    migrations: [{ id: 'mig-c3d5e7f970', vm: 'lab-2b01', strategy: 'cold', phase: 'cancelled', enteredAgo: 4 * D }],
+  },
+  {
     id: 'plan-2d5c8b93',
     name: 'Pilot — static content',
     description: 'First production pilot: static web content and cache.',
