@@ -1344,7 +1344,11 @@ starts the watch, as a task of its own, one at a time, and never waits for it: a
 (`/ready`, §12); stopping the orchestrator cancels it. Seen `running`, the
 migration records `source_running_at` once — when the provider answered, not when the watch began: one call may take
 minutes — and emits `migration.source_running` (data `{"power_state"}`): the VM
-writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
+writes data RHOSO no longer receives — stop it, or roll back. While `source_running_at` is set, `POST …/finalize`
+answers 409 "the source VM runs again: stop it, or roll it back, before finalizing" (the owner's choice, 2026-10-13):
+a finalize would keep a source that diverged, or delete it with what it wrote since. A migration whose checkpoint is
+`finalizing` is the exception — its finalize began deleting the source, and a rollback is refused then, so finalizing
+again is its way out. Seen stopped again, `source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
 the timeline records it. Any other power state — `paused`, `transitioning` (a reboot or a resize), `error`, `unknown` —
 leaves `source_running_at` as it is: the VM was not seen stopped, and the alert keeps the time it was first seen. A rollback clears `source_running_at`: it starts the source on purpose, and a migration that
@@ -1357,8 +1361,8 @@ outside demo mode) sets a fake source VM's power state, so the alert shows on th
 (approver; `confirm` must equal the wave's name, or the plan's name without `wave_id`, 400 otherwise) finalizes every
 `completed` migration of the wave or the plan with one approval: each one as `POST …/finalize` does it (its
 `migration.phase` and `migration.action` events, with the approver as actor), and one `plan.finalized` event whose
-data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, or
-whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
+data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, one whose
+source VM runs again (the 409 of `POST …/finalize`), or one whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
 `completed` for a later finalize, and one VM's error never stops the others. It answers
 `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
 
@@ -1728,7 +1732,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
-| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
+| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
@@ -2486,7 +2490,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
   an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
-  roll back (§8.1) —, the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
+  roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
+  the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
   the alert can be shown,
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
