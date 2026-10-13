@@ -248,11 +248,21 @@ export function createBatchedInvalidator(
     // enabled observer holds it - a disabled one (a closed form, a panel whose plan cannot be edited) or one kept in
     // the cache after its page closed shows nothing
     const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).some((query) => query.isActive());
+    let unread = false;
     for (const id of ids) {
+      const page = queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true });
       // a read of it under way may have started before the event: it waits for the next batch
       if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
-      else if (!lists && !queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true })?.isActive()) continue;
-      else if (fetchMigration) void splice(id, fetchMigration, batch);
+      else if (!lists && !page?.isActive()) {
+        // read by nothing, but marked stale where it is cached: a page that shows it later, Back included, reads it
+        // again as it opens instead of showing it as it was before the event (SDD §16)
+        if (page) void queryClient.invalidateQueries({ queryKey: ['migration', id], exact: true, refetchType: 'none' });
+        unread = true;
+      } else if (fetchMigration) void splice(id, fetchMigration, batch);
+    }
+    // and so are the lists it may be in
+    if (unread && queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).length > 0) {
+      void queryClient.invalidateQueries({ queryKey: ['migrations'], refetchType: 'none' });
     }
     const keys = [...pending.entries()];
     pending.clear();

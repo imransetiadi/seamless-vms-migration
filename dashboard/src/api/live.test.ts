@@ -566,6 +566,41 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
     }
   });
 
+  it('marks what it does not read stale, so a page opened after the event - Back included - reads it again (SDD §16, review RR-05)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing' };
+      const fetchMigration = vi.fn(async () => fresh);
+      // the dashboard's default: a read stays fresh for 5 s (main.tsx)
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 5_000 } } });
+      const listKey = ['migrations', { plan_id: migration.plan_id }];
+      // a migration page and a list kept in the cache after their page closed, read just before the event
+      queryClient.setQueryData(['migration', migration.id], migration);
+      queryClient.setQueryData(['migration', other.id], other);
+      queryClient.setQueryData(listKey, [migration, other]);
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      // another migration's page is not marked: no event named it
+      expect(queryClient.getQueryState(['migration', other.id])?.isInvalidated).toBe(false);
+      // Back to the migration's page and to the list, within the 5 s: each reads again as it opens
+      const readPage = vi.fn(async () => fresh);
+      const stopPage = new QueryObserver(queryClient, { queryKey: ['migration', migration.id], queryFn: readPage }).subscribe(() => {});
+      const readList = vi.fn(async () => [fresh, other]);
+      const stopList = new QueryObserver(queryClient, { queryKey: listKey, queryFn: readList }).subscribe(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readPage).toHaveBeenCalledTimes(1);
+      expect(readList).toHaveBeenCalledTimes(1);
+      expect(queryClient.getQueryData(['migration', migration.id])).toEqual(fresh);
+      stopPage();
+      stopList();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reads a list again that should hold the migration but does not, and every list when the read fails', async () => {
     vi.useFakeTimers();
     try {
