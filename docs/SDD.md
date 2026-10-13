@@ -2556,7 +2556,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
   `SEAMLESS_SECRET_*` variables), which the dashboard then never writes; a provider added before a later step of
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
-  the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
+  the dialog goes on editing it, so Save retries the remaining steps instead of adding it again; Delete is unavailable
+  while a plan still needs the provider, naming each with why, as the API refuses it (§12) — a plan neither completed
+  nor cancelled, with its status, or a completed one with VMs not finalized, rolled back or cancelled, with their
+  number — so nobody types its id to learn that; the dialog's Then says what stays: finished plans keep its id),
   `/inventory/:providerId` — `/inventory` opens the first source provider's, or the first provider when there is no
   source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
