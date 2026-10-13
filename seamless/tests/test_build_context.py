@@ -353,6 +353,7 @@ def test_seamless_check_says_which_ci_checks_it_leaves_out():
         "npm run test:e2e",
         "demo-cutover-refusal-browser.mjs",
         "demo-approval-browser.mjs",
+        "demo-signin-browser.mjs",
         "SEAMLESS_TEST_PG_URL",
         "pip-audit",
         "npm audit",

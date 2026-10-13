@@ -653,10 +653,10 @@ past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule find
 (WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
 320 and 1280 px, with the web fonts and with their font files aborted, the system font a browser shows until they arrive (WCAG 1.4.10, SDD §16 — in it an Overview plan name was 3 px too wide at 320 px until 068a64a); UI-27 the plan, policy and provider dialogs' error summaries pass axe's target-size rule (9514b10: their links were 17 px tall); UI-25 the sign-in page requests no chart code and the Overview still draws its charts (40ff6b7: Rolldown had put React inside `charts`, so every page preloaded Recharts); UI-26 the fonts come with the dashboard: no request leaves the page's origin and Fira Sans and Fira Code load (8e4aebd: they came from Google Fonts, render-blocking, unreachable in an air-gapped site); each was checked to fail when the behaviour it
 guards is broken; UI-19 timed out on a busy machine until its kind filters were matched by pattern — the mock's migrations move on and a second one can reach an advisor hold mid-test; UI-24's former flake was that Overview plan name, cut off whenever it measured before Fira Sans arrived — it waits for `document.fonts.ready` since 068a64a) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
-Chromium against the running demo stack through the real control plane). Cases still manual, to automate next: UI-01 sign in with a token and land on Overview; UI-02 KPI
+Chromium against the running demo stack through the real control plane); UI-01 sign in with a token and land on Overview and UI-08 a 401 returns to `/login` run in `tests/e2e/demo-signin-browser.mjs` (§14.7). Cases still manual, to automate next: UI-02 KPI
 tiles and phase distribution render with demo data; UI-03 plan detail → Validate → Start as operator; UI-04
 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, are automated in `smoke.spec.ts`); UI-05 Finalize needs the typed VM name;
-UI-06 Events page appends live events; UI-07 theme toggle persists; UI-08 a 401 returns to `/login`; UI-09 SSE
+UI-06 Events page appends live events; UI-07 theme toggle persists; UI-09 SSE
 reconnect after a dropped connection resumes without duplicates; UI-10 keyboard-only run of UI-03.
 
 ```bash
@@ -1166,6 +1166,16 @@ asks to request it, not to start it), checks that the requester cannot approve i
 the other user — each cutover runs and verifies on TCP 22 — finalizes `report-01` typing its name and rolls back
 `batch-01` with the reason it asks for (10 checks, about 25 s). CI's `dashboard-e2e` job runs it after the DEMO-07
 journey.
+
+[`tests/e2e/demo-signin-browser.mjs`](../tests/e2e/demo-signin-browser.mjs) drives signing in and out (SDD §13.1, §16;
+UI-01, UI-08) the same way, with a viewer and an admin token of its own: a deep link while signed out asks to sign in,
+and with authentication on Sign in offers no way past it; an empty and a wrong token are refused with a reason, the
+token field keeping the focus; the viewer lands where the deep link pointed and finds Add provider unavailable, with
+the reason; signing out leaves no token in the tab; the admin opens the dashboard and lands on Overview. Restarting the
+server without the admin's token revokes it — the server reads the tokens file at startup — and the next page says the
+session ended; restarted with authentication off, Sign in offers to continue without a token, back to the page that
+asked (14 checks, about 10 s). Against the dashboard and server of 2f02025a, before the two Sign in fixes, three of
+them fail. CI's `dashboard-e2e` job runs it after the maker-checker journey.
 
 The committed scripts pass `shellcheck`.
 
