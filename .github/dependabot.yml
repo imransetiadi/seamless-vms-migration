@@ -1,6 +1,8 @@
 # Dependency updates (Security.md §12 "dependency and image scans run monthly and before releases").
 # Grouped, weekly, so a single PR per ecosystem carries the routine bumps; security updates are
-# opened immediately regardless of the schedule.
+# opened immediately regardless of the schedule. A group takes only minor and patch bumps: a major
+# (React 19, ESLint 10, TypeScript 7, ...) is a migration with its own PR, so one incompatible major
+# no longer turns the whole group's PR red (see the failed group PR #5).
 version: 2
 updates:
   - package-ecosystem: pip
@@ -11,6 +13,7 @@ updates:
     groups:
       control-plane:
         patterns: ["*"]
+        update-types: [minor, patch]
     labels: [dependencies, control-plane]
 
   - package-ecosystem: npm
@@ -19,8 +22,13 @@ updates:
       interval: weekly
       day: monday
     groups:
+      # react and its types move together: a react major without @types/react does not typecheck
+      react-major:
+        patterns: [react, react-dom, "@types/react", "@types/react-dom"]
+        update-types: [major]
       dashboard:
         patterns: ["*"]
+        update-types: [minor, patch]
     labels: [dependencies, dashboard]
 
   - package-ecosystem: github-actions
@@ -31,6 +39,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+        update-types: [minor, patch]
     labels: [dependencies, ci]
 
   - package-ecosystem: docker
