@@ -103,10 +103,15 @@ export class SseParser {
 
 export type StreamStatus = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'unauthorized';
 
+/** Silence - no event, no heartbeat - after which a stream counts as dropped: three of the server's 15 s heartbeats (SDD §12, §16). */
+export const STREAM_IDLE_MS = 3 * 15_000;
+
 export interface StreamOptions {
   client?: ApiClient;
   onStatus?: (status: StreamStatus) => void;
   onHeartbeat?: () => void;
+  /** Injected in tests: the silence after which a stream counts as dropped (default `STREAM_IDLE_MS`). */
+  idleTimeoutMs?: number;
   /** Delay before reconnect attempt `n` (0-based). */
   backoff?: (attempt: number) => number;
   /** Injected in tests; must resolve early when `signal` aborts. */
@@ -172,6 +177,7 @@ export async function streamEvents(
   const sleep = options.sleep ?? abortableSleep;
   const backoff = options.backoff ?? defaultBackoff;
   const setStatus = (status: StreamStatus) => options.onStatus?.(status);
+  const idleMs = options.idleTimeoutMs ?? STREAM_IDLE_MS;
 
   let cursorKnown = since !== null;
   let lastSeq = since ?? 0;
@@ -198,6 +204,14 @@ export async function streamEvents(
         reader.cancel().catch(() => undefined);
       };
       signal.addEventListener('abort', cancel, { once: true });
+      // nothing for three heartbeats: a half-open connection, where no error ever comes - end it and connect again
+      // with since=, never "open" on events that stopped (SDD §16)
+      let idle: ReturnType<typeof setTimeout> | undefined;
+      const watch = () => {
+        clearTimeout(idle);
+        idle = setTimeout(cancel, idleMs);
+      };
+      watch();
       const decoder = new TextDecoder();
       const parser = new SseParser((comment) => {
         if (comment === 'heartbeat') options.onHeartbeat?.();
@@ -207,6 +221,7 @@ export async function streamEvents(
         while (!signal.aborted) {
           const { done, value } = await reader.read();
           if (done) break;
+          watch();
           for (const message of parser.push(decoder.decode(value, { stream: true }))) {
             const event = toEvent(message);
             if (!event) continue;
@@ -224,6 +239,7 @@ export async function streamEvents(
           }
         }
       } finally {
+        clearTimeout(idle);
         signal.removeEventListener('abort', cancel);
       }
     } catch (error) {

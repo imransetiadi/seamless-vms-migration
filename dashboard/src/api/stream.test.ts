@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
-import { SseParser, streamEvents, type StreamStatus } from './stream';
+import { SseParser, STREAM_IDLE_MS, streamEvents, type StreamStatus } from './stream';
 import type { Event } from './types';
 
 function event(seq: number, kind = 'migration.phase', extra: Partial<Event> = {}): Event {
@@ -179,6 +179,72 @@ describe('streamEvents', () => {
 
     expect(received).toEqual([4]);
     expect(lastSeq).toBe(4);
+  });
+
+  it('drops a stream that delivers nothing for three heartbeats and resumes it with since= (SDD §16)', async () => {
+    const encoder = new TextEncoder();
+    // heartbeats every 10 ms keep it alive past the 40 ms limit; then event 5, and silence: a half-open connection
+    const silent = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (let i = 0; i < 8; i += 1) {
+          controller.enqueue(encoder.encode(': heartbeat\n\n'));
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        controller.enqueue(encoder.encode(frame(event(5))));
+      },
+    });
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(silent, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(sseResponse([frame(event(6))], { keepOpen: true }));
+    const client = new ApiClient({ baseUrl: '/api/v1', getToken: () => 'smg_tok', fetchImpl });
+    const controller = new AbortController();
+    const received: number[] = [];
+    const statuses: StreamStatus[] = [];
+
+    await streamEvents(
+      4,
+      (e) => {
+        received.push(e.seq);
+        if (e.seq === 6) controller.abort();
+      },
+      controller.signal,
+      { client, sleep: immediate, idleTimeoutMs: 40, onStatus: (s) => statuses.push(s) },
+    );
+
+    expect(received).toEqual([5, 6]);
+    // the heartbeats kept the first connection; its silence ended it, and the next one resumed after 5
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toBe('/api/v1/events/stream?since=5');
+    // each change once (a status is reported again when nothing changed)
+    expect(statuses.filter((st, i) => st !== statuses[i - 1])).toEqual(['connecting', 'open', 'reconnecting', 'open', 'closed']);
+  });
+
+  it('resumes live-only when a stream goes silent before its first persisted event (SDD §16)', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      // only ephemeral progress, then silence: no cursor yet
+      .mockResolvedValueOnce(sseResponse([frame(event(0, 'migration.progress'))], { keepOpen: true }))
+      .mockResolvedValueOnce(sseResponse([frame(event(9))], { keepOpen: true }));
+    const client = new ApiClient({ baseUrl: '/api/v1', getToken: () => 'smg_tok', fetchImpl });
+    const controller = new AbortController();
+
+    await streamEvents(
+      null,
+      (e) => {
+        if (e.seq === 9) controller.abort();
+      },
+      controller.signal,
+      { client, sleep: immediate, idleTimeoutMs: 20 },
+    );
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // the gap is never replayed: the second connection is live-only too
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toBe('/api/v1/events/stream');
+  });
+
+  it('counts a stream as dropped after three of the server\'s 15 s heartbeats by default (SDD §12, §16)', () => {
+    expect(STREAM_IDLE_MS).toBe(3 * 15_000);
   });
 
   it('backs off and reconnects after network errors', async () => {
