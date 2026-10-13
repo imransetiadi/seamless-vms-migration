@@ -2608,7 +2608,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   similar-incident search — the query field takes at most 2000 characters and the result count stays in
   1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`; when a request of a signed-in
   session is refused, 401, the token is dropped and Sign in says the session ended — the token is no longer accepted:
-  revoked, or the server's tokens changed — before asking for one again, which signing out never does).
+  revoked, or the server's tokens changed — before asking for one again, which signing out never does; it offers to
+  continue without a token only when the server answers `GET /me` without one, authentication being off — with it on,
+  that link would lead straight back to Sign in — and asks without the tab's token, so the question ends no session).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
