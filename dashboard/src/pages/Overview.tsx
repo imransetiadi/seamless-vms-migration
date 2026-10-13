@@ -33,7 +33,7 @@ import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
-import { phaseCounts, planDone } from '../lib/planDone';
+import { nothingMigrated, phaseCounts, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
 
@@ -239,7 +239,7 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
               <Link to={`/plans/${plan.id}`} className="min-w-0 wrap-break-word font-medium text-foreground underline-offset-4 hover:underline">
                 {plan.name}
               </Link>
-              <PlanStatusBadge status={plan.derived_status} />
+              <PlanStatusBadge status={plan.derived_status} nothingMigrated={nothingMigrated(plan)} />
             </div>
             {pr && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">

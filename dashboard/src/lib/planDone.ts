@@ -20,3 +20,17 @@ export function planDone(plan: Pick<Plan, 'status' | 'vm_ids'>, counts: PhaseCou
   if (!total) return { done: 0, total: plan.vm_ids.length };
   return { done: (counts.completed ?? 0) + (counts.finalized ?? 0), total };
 }
+
+/** Why a Completed plan that migrated nothing is no success, and what to do next (SDD §16). */
+export const NOTHING_MIGRATED = 'Nothing was migrated: every migration rolled back.';
+export const NOTHING_MIGRATED_NEXT =
+  'Nothing was migrated: every migration rolled back and its source VM runs again. Retry each one from its page once the cause is fixed, or cancel it.';
+
+/**
+ * A Completed plan that migrated nothing: every migration it did not cancel rolled back (SDD §8.1 rule 6, §16). It
+ * never reads as a success.
+ */
+export function nothingMigrated(plan: Pick<Plan, 'derived_status' | 'migration_counts'>): boolean {
+  const counts = plan.migration_counts;
+  return plan.derived_status === 'completed' && !counts.completed && !counts.finalized && (counts.rolled_back ?? 0) > 0;
+}

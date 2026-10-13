@@ -53,6 +53,15 @@ describe('Overview page (mock data)', () => {
     expect(gone).toHaveTextContent('Nothing left to do');
   });
 
+  it('marks a Completed plan where nothing was migrated, as every view does (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) m.phase = 'rolled_back';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    expect(within(item).getByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+  });
+
   it('counts a plan before its first validation by its VMs, as the plans list does (SDD §16)', async () => {
     const server = createTestServer();
     const template = server.plans.find((p) => p.name === 'Pilot — static content')!;

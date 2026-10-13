@@ -12,6 +12,12 @@ export function waveMigrations<M extends WaveMember>(wave: Wave, migrations: rea
   return migrations.filter((m) => m.plan_id === planId && (m.wave_id === wave.id || (!m.wave_id && wave.vm_ids.includes(m.vm.source_id))));
 }
 
+/** Every migration of the wave it did not cancel rolled back: the wave ended and migrated nothing (SDD §16). */
+export function waveRolledBack(members: ReadonlyArray<Pick<Migration, 'phase'>>): boolean {
+  const kept = members.filter((m) => m.phase !== 'cancelled');
+  return kept.length > 0 && kept.every((m) => m.phase === 'rolled_back');
+}
+
 export function isWaveComplete(plan: Plan, waveId: string, migrations: readonly WaveMember[]): boolean {
   const wave = plan.waves.find((w) => w.id === waveId);
   if (!wave) return true;

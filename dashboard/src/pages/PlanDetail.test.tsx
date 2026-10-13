@@ -1293,6 +1293,25 @@ describe('PlanDetail', () => {
     expect(screen.queryByRole('region', { name: 'Waiting for advisor approval' })).not.toBeInTheDocument();
   });
 
+  it('never reads a plan where nothing was migrated as a success: neutral badge, the next step, no Finalize all, a rolled-back wave (SDD §16)', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations.filter((x) => x.plan_id === 'plan-2d5c8b93')) m.phase = 'rolled_back';
+    renderWithApp(<PlanDetail />, { route: '/plans/plan-2d5c8b93', path: '/plans/:planId', token: 'approver', server });
+    // the derived status stays Completed (SDD §8.1 rule 6), and says why it is no success
+    expect(await screen.findByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+    expect(
+      screen.getByText('Nothing was migrated: every migration rolled back and its source VM runs again. Retry each one from its page once the cause is fixed, or cancel it.'),
+    ).toBeInTheDocument();
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    expect(within(actions).queryByRole('button', { name: 'Finalize all' })).not.toBeInTheDocument();
+    expect(within(actions).queryByRole('button', { name: /^Start/ })).not.toBeInTheDocument();
+    // the wave ended, so the next would start, but it migrated nothing
+    const waves = screen.getByRole('region', { name: /^Waves/ });
+    const card = within(waves).getByRole('heading', { name: 'Pilot' }).closest('li')!;
+    await waitFor(() => expect(within(card).queryByText('Complete')).not.toBeInTheDocument());
+    expect(within(card).getAllByText('Rolled back')).toHaveLength(3); // the wave and its two VMs
+  });
+
   it('lists the migrations waiting for advisor approval and keeps the panel, focused, after the last decision (SDD §14.6, §16, ADV-04)', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPlan('plan-c81d44a0', 'admin');

@@ -39,6 +39,16 @@ describe('Plans page', () => {
     expect(screen.queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
   });
 
+  it('marks a Completed plan where nothing was migrated, and only that one (SDD §16)', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations.filter((x) => x.plan_id === 'plan-2d5c8b93')) m.phase = 'rolled_back';
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('link', { name: 'Pilot — static content' })).closest('tr')!;
+    expect(within(row).getByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+    // a plan that migrated its VMs keeps the plain badge
+    expect(screen.queryAllByRole('button', { name: 'Completed' })).toHaveLength(1);
+  });
+
   it('says the providers are unavailable when the list shows provider ids instead of names (SDD §16)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);

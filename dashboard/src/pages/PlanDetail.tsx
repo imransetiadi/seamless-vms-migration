@@ -6,6 +6,7 @@ import {
   CircleX,
   ClipboardX,
   Gauge,
+  History,
   Hourglass,
   Layers,
   ListChecks,
@@ -48,6 +49,7 @@ import { clearedByValidation } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
+import { NOTHING_MIGRATED_NEXT, nothingMigrated } from '../lib/planDone';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
@@ -354,6 +356,8 @@ export default function PlanDetail() {
   // the primary action follows the derived status (SDD §8.1, ADV-19): Start is hidden once it has nothing to
   // start — while the plan runs (Pause is its action) and once its migrations ended; a Completed plan finalizes
   const ended = p.derived_status === 'completed' || p.derived_status === 'finalized';
+  // every migration it did not cancel rolled back: Completed, and no success (SDD §8.1 rule 6, §16)
+  const migratedNothing = nothingMigrated(p);
   // the advisor policy in force for the plan's strategy decisions (SDD §14.6, §16, ADV-20)
   const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
   const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
@@ -384,7 +388,7 @@ export default function PlanDetail() {
         description={p.description ?? undefined}
         meta={
           <>
-            <PlanStatusBadge status={p.derived_status} size="md" />
+            <PlanStatusBadge status={p.derived_status} size="md" nothingMigrated={migratedNothing} />
             <code className="text-xs text-muted-foreground">{p.id}</code>
             <span className="text-xs text-muted-foreground">updated {formatRelative(p.updated_at)}</span>
           </>
@@ -410,9 +414,12 @@ export default function PlanDetail() {
               Auto-plan waves
             </Button>
             {p.derived_status === 'completed' ? (
-              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
-                Finalize all
-              </Button>
+              // nothing awaits finalize where nothing was migrated: the next step is each VM's own (SDD §16)
+              !migratedNothing && (
+                <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
+                  Finalize all
+                </Button>
+              )
             ) : (
               startShown && (
                 <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={askStart}>
@@ -452,6 +459,13 @@ export default function PlanDetail() {
       )}
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
+      {migratedNothing && (
+        // a Completed plan that migrated nothing says so, with the next step (SDD §16)
+        <div role="note" aria-label="Nothing was migrated" className="mb-4 flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <History aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <p className="text-foreground">{NOTHING_MIGRATED_NEXT}</p>
+        </div>
+      )}
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
       <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />

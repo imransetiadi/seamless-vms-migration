@@ -18,7 +18,7 @@ import { formatDateTime, formatDuration, formatNumber, formatRelative } from '..
 import { hasRole } from '../lib/roles';
 import { nextSort, sortBy, type SortState } from '../lib/sort';
 import { planStatusMeta } from '../lib/status';
-import { planDone } from '../lib/planDone';
+import { nothingMigrated, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 
 type SortKey = 'name' | 'status' | 'vms' | 'done' | 'slo' | 'updated';
@@ -205,7 +205,7 @@ export default function Plans() {
                       </span>
                     </th>
                     <td>
-                      <PlanStatusBadge status={p.derived_status} />
+                      <PlanStatusBadge status={p.derived_status} nothingMigrated={nothingMigrated(p)} />
                     </td>
                     <td className="hidden text-sm md:table-cell">
                       {providerName.get(p.source_provider_id) ?? p.source_provider_id}

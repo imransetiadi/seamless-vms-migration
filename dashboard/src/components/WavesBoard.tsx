@@ -1,17 +1,19 @@
-import { CircleCheck, CircleHelp, Clock, Pause, Play, Rows3, type LucideIcon } from 'lucide-react';
+import { CircleCheck, CircleHelp, Clock, History, Pause, Play, Rows3, type LucideIcon } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { Plan, MigrationLike } from '../api/types';
 import type { Tone } from '../lib/phase';
-import { WAVE_COMPLETE_PHASES, waveMigrations, waveState } from '../lib/waves';
+import { WAVE_COMPLETE_PHASES, waveMigrations, waveRolledBack, waveState } from '../lib/waves';
 import { EmptyState } from './EmptyState';
 import { ProgressBar } from './ProgressBar';
 import { PhaseBadge, StatusBadge } from './StatusBadge';
 
-type BoardState = 'complete' | 'active' | 'waiting' | 'paused' | 'planned' | 'unknown';
+type BoardState = 'complete' | 'rolled_back' | 'active' | 'waiting' | 'paused' | 'planned' | 'unknown';
 
 const STATE_META: Record<BoardState, { label: string; tone: Tone; icon: LucideIcon }> = {
   complete: { label: 'Complete', tone: 'success', icon: CircleCheck },
+  // ended, so the next wave starts, but migrated nothing: no success (SDD §16)
+  rolled_back: { label: 'Rolled back', tone: 'warning', icon: History },
   active: { label: 'Active', tone: 'progress', icon: Play },
   waiting: { label: 'Waiting', tone: 'neutral', icon: Clock },
   paused: { label: 'Paused', tone: 'warning', icon: Pause },
@@ -48,7 +50,9 @@ export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migr
         const state: BoardState = !computed
           ? 'unknown'
           : computed === 'complete'
-            ? 'complete'
+            ? waveRolledBack(members)
+              ? 'rolled_back'
+              : 'complete'
             : plan.status === 'running'
               ? computed
               : plan.status === 'paused' && computed === 'active'
@@ -72,7 +76,12 @@ export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migr
             </p>
             {migrations ? (
               <div className="flex items-center gap-2">
-                <ProgressBar value={members.length ? (done / members.length) * 100 : 0} label={`${wave.name}: VMs done`} tone="success" size="sm" />
+                <ProgressBar
+                  value={members.length ? (done / members.length) * 100 : 0}
+                  label={`${wave.name}: VMs done`}
+                  tone={state === 'rolled_back' ? 'warning' : 'success'}
+                  size="sm"
+                />
                 <span className="num shrink-0 text-xs text-muted-foreground">
                   {done}/{members.length}
                 </span>
