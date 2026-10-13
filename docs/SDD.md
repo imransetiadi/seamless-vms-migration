@@ -551,7 +551,8 @@ failed one would hold its VM and keep the plan from completing, and one an inter
 changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1) or whose failed
 migration stopped it (a cancel is refused then, §5.1): such a VM stays in the plan until it is cut
 over or rolled back. A removed VM's migration that an operator moved meanwhile — rolled back while the
-validation re-assessed the plan's VMs — can no longer be cancelled: the validation leaves it as it is (a
+validation re-assessed the plan's VMs — is no longer the validation's to cancel, even once `rolled_back`, which an
+operator may cancel (§5.1): the validation cancels one only while it is still in a phase listed above, and leaves it as it is (a
 `rolled_back` one releases its VM), cancels the others and still finishes, its `plan.validated` event naming it
 (data `kept`: `[{"vm", "phase"}]`). One VM, one migration holds across plans too: a migration
 *holds* its VM in every phase but `cancelled`, `finalized` and `rolled_back`, and `validate_plan` refuses
