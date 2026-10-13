@@ -399,7 +399,7 @@ migration's totals.
 | `completed` | `finalized`, `rolling_back` |
 | `failed` | `rolling_back`, `ready`, `cancelled` |
 | `rolling_back` | `rolled_back`, `failed` |
-| `rolled_back` | `ready` |
+| `rolled_back` | `ready`, `cancelled` |
 | `finalized`, `cancelled` | — (terminal) |
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
@@ -409,7 +409,11 @@ refuses a migration in `validating` — a validation may be moving it — and sa
 `downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
 while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at` null): the source
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
-it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
+it stopped with nothing left to restart it. `rolled_back → cancelled` ends a migration for good once its
+rollback ran, for a VM that is not to be migrated again: its source runs again (the rollback closed the clock) and its
+VM is already free (§5.4), but the rollback deleted only the destination server and kept the warm data path for a
+retry (destination volumes and the warm state, §6.5), so a cancel cleans that up as one from `failed` does (below);
+Needs attention offers it, and Cancel plan's refusal asks for it first (§12, §16). `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
 granted with it (`cutover_requested` with its requester, `force_window`, `force_cutover`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change); and it clears what the
@@ -426,7 +430,7 @@ migration whose cutover stopped its source could then be neither rolled back, re
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
 no further attempt starts. Whenever the migration has a data path — it was cancelled in `precopy` or
 `syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it recorded
-`sync_passes` (a warm migration cancelled in `awaiting_cutover`, after a retry or a failed pass) — the
+`sync_passes` (a warm migration cancelled in `awaiting_cutover`, after a retry, a failed pass or its rollback) — the
 cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
