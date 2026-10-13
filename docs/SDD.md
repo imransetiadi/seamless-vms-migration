@@ -2570,9 +2570,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   sent as `GET /advisor/recommendations?plan_id=&decision_type=`, a change going back to its first page; each entry
   shows "Recommended: <option> · <confidence>% confidence" and "Decision:
   <final option> — <why>" (applied automatically by policy <policy>; below threshold, default kept; advisor
-  unavailable, decided by rules; no usable recommendation, decided by rules; policy <policy> requires approval by an
-  admin — the role that holds `advisor.approve`, §13.2, so whoever reads a waiting decision learns who decides it,
-  also without the controls; …), never the word "Selected". A
+  unavailable, decided by rules; no usable recommendation, decided by rules; policy <policy> requires approval; …),
+  never the word "Selected"; a decision that waits reads "Waiting for approval by an admin — <why>", naming the role
+  that holds `advisor.approve` (§13.2), so whoever reads it learns who decides it, also without the controls. A
   decision taken against the threshold ends its why with that comparison — "below threshold (57% < 60%), default
   kept", "applied automatically by policy global-default (83% ≥ 60%)", "too little evidence to apply it
   automatically (83% ≥ 60%)" (the owner's review of 10 October 2026) — its sign taken from the decision's reason
