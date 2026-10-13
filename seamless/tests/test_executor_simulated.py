@@ -179,19 +179,23 @@ async def test_simulated_failure_rate_seeded():
 
 
 async def test_a_simulated_step_reports_the_model_seconds_it_kept_the_source_stopped():
-    """SDD §5.2/§7.4: a failed cutover reports its model seconds up to the failure, in its
-    PermanentStepError's details; the rollback reports its own 90 s."""
+    """SDD §5.2/§7.4: a cutover's clock starts when it stops the source, so it reports the
+    shutdown, the copy and the create - the parts its estimate has; a failed cutover reports its
+    model seconds up to the failure, in its PermanentStepError's details; the rollback reports
+    its own 90 s."""
     never = Settings(demo=True, demo_speed=1e9, demo_failure_rate=0.0)
     always = Settings(demo=True, demo_speed=1e9, demo_failure_rate=1.0)
+    p = params_for_plan(make_plan())
     ctx, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
-    whole = (await SimulatedExecutor(never).run(StepName.CUTOVER, ctx)).details
-    copy = whole["downtime_model_s"] - params_for_plan(make_plan()).create_s
+    whole = await SimulatedExecutor(never).run(StepName.CUTOVER, ctx)
+    copy = whole.sync_pass.duration_s
+    assert whole.details["downtime_model_s"] == pytest.approx(p.shutdown_s + copy + p.create_s)
     ctx, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, always)
     failing = SimulatedExecutor(always)
     with pytest.raises(PermanentStepError) as failed:
         await failing.run(StepName.CUTOVER, ctx)
     # the same seeded copy, failed half-way through and before the create
-    assert failed.value.details == {"downtime_model_s": pytest.approx(copy / 2)}
+    assert failed.value.details == {"downtime_model_s": pytest.approx(p.shutdown_s + copy / 2)}
     # the failure reported them: the rollback after it counts only its own 90 s
     rb, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, always)
     assert (await failing.run(StepName.ROLLBACK, rb)).details["downtime_model_s"] == 90.0
@@ -203,6 +207,22 @@ async def test_a_simulated_step_reports_the_model_seconds_it_kept_the_source_sto
     assert PermanentStepError("no details").details == {}
 
 
+async def test_a_simulated_cutover_starts_its_clock_before_the_shutdown():
+    """SDD §5.2, §7.4: the clock starts when the cutover stops the source - before the shutdown
+    elapses, as an Ansible-driven cutover's starts with the source-stop task (§7.2) - so the
+    running clock and the model seconds count the same downtime."""
+    never = Settings(demo=True, demo_speed=1e9, demo_failure_rate=0.0)
+    ctx, rec = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
+    marks_at_each_sleep: list[int] = []
+
+    async def sleep(seconds: float) -> None:
+        marks_at_each_sleep.append(rec.downtime_marks)
+
+    await SimulatedExecutor(never, sleep=sleep).run(StepName.CUTOVER, ctx)
+    # the first sleep is the shutdown's
+    assert marks_at_each_sleep[0] == 1, marks_at_each_sleep
+
+
 async def test_a_rollback_reports_the_model_seconds_of_the_cutover_it_interrupted():
     """SDD §5.2/§7.4 (ADV-16..20 audit, F8): a rollback cancels the running cutover, which then
     reports nothing; the rollback reports the model seconds that cutover kept the source stopped,
@@ -210,8 +230,8 @@ async def test_a_rollback_reports_the_model_seconds_of_the_cutover_it_interrupte
     never = Settings(demo=True, demo_speed=1e9, demo_failure_rate=0.0)
     ctx, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
     full = SimulatedExecutor(never)
-    whole = (await full.run(StepName.CUTOVER, ctx)).details
-    copy = whole["downtime_model_s"] - params_for_plan(make_plan()).create_s
+    copy = (await full.run(StepName.CUTOVER, ctx)).sync_pass.duration_s
+    shutdown = params_for_plan(make_plan()).shutdown_s
     # a cutover that ran to its end reported its own: a later rollback counts only its 90 s
     rb, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
     assert (await full.run(StepName.ROLLBACK, rb)).details["downtime_model_s"] == 90.0
@@ -233,8 +253,9 @@ async def test_a_rollback_reports_the_model_seconds_of_the_cutover_it_interrupte
     with pytest.raises(asyncio.CancelledError):
         await cutover
     rb, _ = make_ctx(make_plan(), mig(Strategy.cold), SRC, DST, never)
+    # the cutover kept the source stopped through its shutdown and its copy
     assert (await ex.run(StepName.ROLLBACK, rb)).details["downtime_model_s"] == pytest.approx(
-        copy + 90.0
+        shutdown + copy + 90.0
     )
     # reported once: another rollback of the migration counts only its own
     assert (await ex.run(StepName.ROLLBACK, rb)).details["downtime_model_s"] == 90.0

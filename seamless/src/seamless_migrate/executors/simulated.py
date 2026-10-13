@@ -188,10 +188,12 @@ class SimulatedExecutor:
             # the problem lasts - the third pass finds it fixed
             raise PermanentStepError(refusal)
         await ctx.log("simulated cutover: stopping the source VM")
-        await self._elapse(ctx, p.shutdown_s, 0)
-        await self._source_power(ctx, on=False)
+        # the clock starts at the stop, as an Ansible-driven cutover's does: the shutdown counts, as
+        # it does in the estimate's parts (SDD §5.2, §7.2, §7.4)
         await ctx.mark_downtime_start()
         self._stopped[m.id] = 0.0  # counted from the stop; the cutover's result reports them
+        await self._elapse(ctx, p.shutdown_s, 0, stopped=True)
+        await self._source_power(ctx, on=False)
         # the final sync (or the copy) runs once the source is stopped (SDD §7.4, ADV-16)
         started = utcnow()
 
@@ -226,7 +228,7 @@ class SimulatedExecutor:
             raise PermanentStepError(
                 "simulated cutover failure: destination volume attach timed out on the "
                 "conversion host",
-                details={"downtime_model_s": copied_s},
+                details={"downtime_model_s": p.shutdown_s + copied_s},
             )
         if kind is not None:
             sync_pass = SyncPass(
@@ -245,5 +247,5 @@ class SimulatedExecutor:
         return StepResult(
             sync_pass=sync_pass,
             destination_server_id=f"sim-{m.id}",
-            details={"downtime_model_s": copy_s + p.create_s},
+            details={"downtime_model_s": p.shutdown_s + copy_s + p.create_s},
         )

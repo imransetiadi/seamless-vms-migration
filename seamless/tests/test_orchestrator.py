@@ -4911,8 +4911,15 @@ async def test_a_simulated_downtime_counts_model_seconds(tmp_path, store):
     await h.orch.stop()
     params = params_for_plan(plan)
     copy = done.sync_passes[-1].duration_s
-    assert done.downtime_model_s == pytest.approx(copy + params.create_s)
-    assert done.actual_downtime_s == pytest.approx(copy + params.create_s + params.boot_s)
+    # its clock starts at the stop: the shutdown counts, as the estimate's parts do (SDD §5.2, §7.4)
+    assert done.downtime_model_s == pytest.approx(params.shutdown_s + copy + params.create_s)
+    assert done.actual_downtime_s == pytest.approx(
+        params.shutdown_s + copy + params.create_s + params.boot_s
+    )
+    parts = done.estimate.downtime_parts
+    assert done.actual_downtime_s - copy == pytest.approx(
+        sum(seconds for part, seconds in parts.items() if part != "copy_s")
+    )
     wall = (done.downtime_ended_at - done.downtime_started_at).total_seconds()
     assert done.actual_downtime_s > wall, "the simulator compresses wall time"
 
@@ -4967,7 +4974,8 @@ async def test_a_rollback_that_interrupts_a_simulated_cutover_counts_its_model_s
     await run_plan(h, plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
     await asyncio.wait_for(blocked.wait(), 10)
-    # the same seeded copy, run to its end by another simulator: its model seconds without create
+    # the same seeded copy, run to its end by another simulator: its model seconds without the
+    # create - the shutdown and the copy
     ctx, _ = make_ctx(plan, await h.migration(mid), SRC_PROVIDER, DST_PROVIDER, settings)
     whole = (await SimulatedExecutor(settings).run(StepName.CUTOVER, ctx)).details
     copy = whole["downtime_model_s"] - params_for_plan(plan).create_s
