@@ -2378,7 +2378,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   a region already on the page, never the clock's every tick.
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
   Finalized, Failed, Cancelled — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
-  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19). A plan Completed with nothing migrated — every
+  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19), and Rolled back beside Failed
+  (`Stats.by_phase.rolled_back`, in the warning tone while there is one): a rolled-back migration's source VM runs
+  again and it waits for a person to fix the cause and retry it, or cancel it, so the tiles never read as all clear
+  while one waits. A plan Completed with nothing migrated — every
   migration it did not cancel rolled back (§8.1 rule 6: `migration_counts` holds `rolled_back` and no `completed` or
   `finalized`) — never reads as a success: its badge takes the neutral tone and explains "Nothing was migrated: every
   migration rolled back."; its page says so with the next step — "Nothing was migrated: every migration rolled back and
