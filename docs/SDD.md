@@ -1679,8 +1679,12 @@ events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, mes
 
 `ix_events_kind_seq` serves the `kinds` filter (`GET /events?audit=true`, its `before` pages): audit events are
 sparse, and without it the newest of them were found by reading the table backwards — 1,000,000 events took
-~0.3 s per page on SQLite, ~1 ms with it. `create_schema()` adds the events indexes to an existing table with
-`CREATE INDEX IF NOT EXISTS`, as it does the document indexes.
+~0.3 s per page on SQLite, ~1 ms with it. `create_schema()` adds an index an existing table lacks — the events
+indexes, as the document indexes — with `CREATE INDEX IF NOT EXISTS`, and only that one: it reads the index names
+the database has (`pg_indexes` of the current schema, `sqlite_master`), so a complete schema takes no DDL at all.
+PostgreSQL lets only a table's owner run `CREATE INDEX`, even for an index that exists, so this is what lets a role
+that does not own the tables start the control plane — the application role of Security.md §9.4, for which
+`events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
 `advisor_policy` (§14.6).
