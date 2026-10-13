@@ -71,6 +71,21 @@ describe('Login', () => {
     expect(screen.getByRole('button', { name: /show token/i })).toHaveAttribute('aria-pressed', 'false');
   });
 
+  it('never says the session ended after a rejected sign-in: it was no session, and signing out never says so (SDD §16, review RR-06)', async () => {
+    const user = userEvent.setup({ delay: null });
+    // the app's 401 handler (main.tsx): a refused request drops the stored token and marks the session ended
+    const view = renderLogin({ onUnauthorized: () => void endSession() });
+    await user.type(await screen.findByLabelText('API token'), 'not-a-valid-token');
+    await user.click(screen.getByRole('button', { name: /^sign in/i }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/token was rejected/i);
+    view.unmount();
+    // the next time Sign in shows - after a good token and a sign-out, say - it is an ordinary sign-in
+    renderLogin();
+    await screen.findByLabelText('API token');
+    expect(screen.queryByRole('status', { name: /session ended/i })).not.toBeInTheDocument();
+    clearSessionEnded();
+  });
+
   it('keeps the user on the page with a clear error when the token is rejected', async () => {
     const user = userEvent.setup({ delay: null });
     renderLogin();

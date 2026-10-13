@@ -227,6 +227,8 @@ try {
     await signInPage();
     const stored = await page.evaluate(() => sessionStorage.getItem('seamless.token'));
     if (new URL(page.url()).pathname !== '/login' || stored !== null) throw new Error(`it shows ${page.url()} and the tab ${stored === null ? 'holds no token' : 'still holds the token'}`);
+    // in the same page load: the wrong token refused before the viewer signed in was no session either (review RR-06)
+    if (await page.getByRole('status', { name: 'Session ended' }).count()) throw new Error('Sign in after signing out says the session ended');
     await page.goto(`${base}/plans`);
     await signInPage();
     if (await page.getByRole('status', { name: 'Session ended' }).count()) throw new Error('signing out is reported as a session the server ended');

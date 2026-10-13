@@ -43,6 +43,8 @@ export interface RenderOptions {
   storedToken?: boolean;
   /** Wraps the mock fetch, e.g. to hold one request pending and see a loading state. */
   wrapFetch?: (fetchImpl: typeof fetch) => typeof fetch;
+  /** Called on every 401, as the app's client calls its handler (main.tsx). */
+  onUnauthorized?: () => void;
 }
 
 export function createTestServer(): MockServer {
@@ -54,13 +56,20 @@ export function createTestClient(
   token: string | null = 'admin',
   storedToken = false,
   wrapFetch: (fetchImpl: typeof fetch) => typeof fetch = (fetchImpl) => fetchImpl,
+  onUnauthorized?: () => void,
 ): ApiClient {
-  return new ApiClient({ getToken: storedToken ? getStoredToken : () => token, fetchImpl: wrapFetch(createMockFetch(server)) });
+  return new ApiClient({ getToken: storedToken ? getStoredToken : () => token, fetchImpl: wrapFetch(createMockFetch(server)), onUnauthorized });
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}): RenderResult & { server: MockServer; queryClient: QueryClient } {
   const server = options.server ?? createTestServer();
-  const client = createTestClient(server, options.token === undefined ? 'admin' : options.token, options.storedToken, options.wrapFetch);
+  const client = createTestClient(
+    server,
+    options.token === undefined ? 'admin' : options.token,
+    options.storedToken,
+    options.wrapFetch,
+    options.onUnauthorized,
+  );
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnWindowFocus: false }, mutations: { retry: false } },
   });
