@@ -456,7 +456,8 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
   with its estimate and with the clock that ran before it (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED`
   would multiply the control plane's own overhead too): each simulated step reports the model seconds it kept the
-  source stopped — the cutover its copy or final sync, conversion and create (up to the failure when it fails), a
+  source stopped — the cutover its shutdown (its clock starts when it stops the source, as an Ansible-driven
+  cutover's does, §7.2), its copy or final sync, conversion and create (up to the failure when it fails), a
   rollback its own work, and those of a cutover it interrupted — and `Migration.downtime_model_s` adds them up while
   the clock is open. A verified
   migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
@@ -1069,7 +1070,9 @@ volumes with their server, so the order is:
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
      deleted.
-1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`. The stop is journaled as sent once Nova
+1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()` — after the shutdown, which the estimate's parts
+   count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
+   starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
    journal the rollback starts the source from; a stop call that itself fails leaves the journal empty.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
@@ -1172,9 +1175,10 @@ Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
 source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
-cutover its copy, conversion and create — a failed cutover up to its failure, in its `PermanentStepError`'s
-`details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted (cancelled mid-copy,
-the cutover reported none), before it starts the source again. Cutover fails with
+cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
+downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
+`PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
+(cancelled mid-copy, the cutover reported none), before it starts the source again. Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
 strategy. The fake destination simulates the guests' services for the verification's TCP checks (`tcp_ports`,
 `windows_tcp_ports`) and its application probes (§7.5): a guest answers its suggested probes (§9.6) and SSH
