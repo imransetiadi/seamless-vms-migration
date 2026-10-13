@@ -33,6 +33,7 @@ import { SLO_ICONS, sloTone } from '../lib/slo';
 import { DASH, formatBytes, formatClock, formatDuration, formatNumber, formatPct, secondsBetween } from '../lib/format';
 import { demoTimeText, leftOutText, speedOf } from '../lib/stats';
 import { strategyLabel, TONE_CLASSES } from '../lib/status';
+import { phaseCounts, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 import { useNow } from '../lib/useNow';
 
@@ -229,9 +230,9 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
     <div className="-my-2 overflow-hidden">
     <ul className="-mt-px grid gap-x-8 md:grid-cols-2 2xl:grid-cols-3">
       {plans.map((plan) => {
-        const mine = migrations?.filter((m) => m.plan_id === plan.id) ?? [];
-        const done = mine.filter((m) => ['completed', 'finalized'].includes(m.phase)).length;
-        const pct = mine.length ? (done / mine.length) * 100 : 0;
+        // counted as the plans list counts it (SDD §16): a cancelled migration is never done, a cancelled plan has nothing left
+        const pr = migrations ? planDone(plan, phaseCounts(migrations.filter((m) => m.plan_id === plan.id))) : undefined;
+        const pct = pr?.total ? (pr.done / pr.total) * 100 : 0;
         return (
           <li key={plan.id} className="flex min-w-0 flex-col gap-1.5 border-t border-border py-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -240,9 +241,19 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
               </Link>
               <PlanStatusBadge status={plan.derived_status} />
             </div>
-            {migrations && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
+            {pr && <ProgressBar value={pct} label={`${plan.name}: migrations done`} tone="success" size="sm" />}
             <p className="num text-xs text-muted-foreground">
-              {migrations ? `${done} of ${mine.length} done` : 'Progress unknown'}, downtime SLO {formatDuration(plan.downtime_slo_s)}
+              {pr === undefined ? (
+                'Progress unknown'
+              ) : pr === null ? (
+                <>
+                  <span aria-hidden>—</span>
+                  <span className="sr-only">Nothing left to do</span>
+                </>
+              ) : (
+                `${pr.done} of ${pr.total} done`
+              )}
+              , downtime SLO {formatDuration(plan.downtime_slo_s)}
             </p>
           </li>
         );

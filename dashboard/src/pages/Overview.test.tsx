@@ -37,6 +37,31 @@ describe('Overview page (mock data)', () => {
     for (const summary of summaries) expect(summary).not.toHaveTextContent('1m 00s');
   });
 
+  it('counts plan progress over the migrations that are not cancelled, and a cancelled plan shows none (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    const n = ofPlan.length - 1;
+    await waitFor(() => expect(item).toHaveTextContent(`${n} of ${n} done`));
+    const cancelled = server.plans.find((p) => p.status === 'cancelled')!;
+    const gone = screen.getByRole('link', { name: cancelled.name }).closest('li')!;
+    expect(gone).not.toHaveTextContent(/of \d+ done/);
+    expect(gone).toHaveTextContent('Nothing left to do');
+  });
+
+  it('counts a plan before its first validation by its VMs, as the plans list does (SDD §16)', async () => {
+    const server = createTestServer();
+    const template = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    server.plans.push({ ...template, id: 'plan-0d0d0d0d', name: 'Not validated yet', vm_ids: ['vm-a', 'vm-b', 'vm-c'], waves: [], status: 'draft' });
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: 'Not validated yet' })).closest('li')!;
+    await waitFor(() => expect(item).toHaveTextContent('0 of 3 done'));
+  });
+
   it('reads the summaries of the plan in its address alone (SDD §16, perf audit PF-02)', async () => {
     const reads: string[] = [];
     const server = createTestServer();

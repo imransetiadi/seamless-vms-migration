@@ -96,6 +96,23 @@ describe('Plans page', () => {
     await waitFor(() => expect(read).toContain(`/migrations/${m.id}`), { timeout: 3000 });
   });
 
+  it('counts a plan done over its migrations that are not cancelled, and a cancelled plan shows no count (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'DC1 → RHOSO production rollout')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    // a VM taken out of the plan left a cancelled migration: never done, so out of the count
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Plans />, { server });
+    const link = await screen.findByRole('link', { name: plan.name });
+    const n = ofPlan.length - 1;
+    expect(within(link.closest('th')!).getByText(`${n}/${n} done`)).toBeInTheDocument();
+    const cancelled = server.plans.find((p) => p.status === 'cancelled')!;
+    const row = screen.getByRole('link', { name: cancelled.name }).closest('tr')!;
+    expect(within(row).queryByText(/\d+\/\d+/)).not.toBeInTheDocument();
+    expect(within(row).getAllByText('Nothing left to do').length).toBeGreaterThan(0);
+  });
+
   it("shows each plan's done count from its migration counts and reads no migration (SDD §16, PF-02)", async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);

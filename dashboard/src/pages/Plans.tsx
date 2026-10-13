@@ -18,6 +18,7 @@ import { formatDateTime, formatDuration, formatNumber, formatRelative } from '..
 import { hasRole } from '../lib/roles';
 import { nextSort, sortBy, type SortState } from '../lib/sort';
 import { planStatusMeta } from '../lib/status';
+import { planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 
 type SortKey = 'name' | 'status' | 'vms' | 'done' | 'slo' | 'updated';
@@ -28,12 +29,16 @@ export interface NewPlanState {
 }
 
 /** A plan's migrations done, from the counts it carries: the list reads no migration (SDD §16, §8.1). */
-function planProgress(plan: Plan): { total: number; done: number } {
-  const counts = plan.migration_counts ?? {};
-  const total = Object.values(counts).reduce((sum, n) => sum + (n ?? 0), 0);
-  // before the first validation: its VMs, none done
-  if (!total) return { total: plan.vm_ids.length, done: 0 };
-  return { total, done: (counts.completed ?? 0) + (counts.finalized ?? 0) };
+const planProgress = (plan: Plan) => planDone(plan, plan.migration_counts ?? {});
+
+/** What a cancelled plan shows where the others show their progress: it has nothing left to do (SDD §16). */
+function NothingLeft() {
+  return (
+    <span className="num shrink-0 text-xs text-muted-foreground">
+      <span aria-hidden>—</span>
+      <span className="sr-only">Nothing left to do</span>
+    </span>
+  );
 }
 
 export default function Plans() {
@@ -77,7 +82,7 @@ export default function Plans() {
           return p.vm_ids.length;
         case 'done': {
           const pr = planProgress(p);
-          return pr.total ? pr.done / pr.total : 0;
+          return pr?.total ? pr.done / pr.total : 0;
         }
         case 'slo':
           return p.downtime_slo_s;
@@ -177,17 +182,23 @@ export default function Plans() {
                       <span className="block font-mono text-xs font-normal text-muted-foreground">{p.id}</span>
                       {/* on a phone the Done and clouds columns are hidden: their facts stand under the name (SDD §16) */}
                       <span className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 font-normal sm:hidden">
-                        {/* never a dot on a 320 px screen: the count wraps under the bar instead */}
-                        <ProgressBar
-                          value={pr.total ? (pr.done / pr.total) * 100 : 0}
-                          label={`${p.name}: migrations done`}
-                          tone="success"
-                          size="sm"
-                          className="min-w-16 flex-1"
-                        />
-                        <span className="num shrink-0 text-xs">
-                          {pr.done}/{pr.total} done
-                        </span>
+                        {pr === null ? (
+                          <NothingLeft />
+                        ) : (
+                          <>
+                            {/* never a dot on a 320 px screen: the count wraps under the bar instead */}
+                            <ProgressBar
+                              value={pr.total ? (pr.done / pr.total) * 100 : 0}
+                              label={`${p.name}: migrations done`}
+                              tone="success"
+                              size="sm"
+                              className="min-w-16 flex-1"
+                            />
+                            <span className="num shrink-0 text-xs">
+                              {pr.done}/{pr.total} done
+                            </span>
+                          </>
+                        )}
                       </span>
                       <span className="mt-0.5 block text-xs font-normal text-muted-foreground sm:hidden">
                         {providerName.get(p.source_provider_id) ?? p.source_provider_id} → {providerName.get(p.destination_provider_id) ?? p.destination_provider_id}
@@ -203,12 +214,16 @@ export default function Plans() {
                     </td>
                     <td className="num text-right">{p.vm_ids.length}</td>
                     <td className="hidden w-40 sm:table-cell">
-                      <div className="flex items-center gap-2">
-                        <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
-                        <span className="num shrink-0 text-xs">
-                          {pr.done}/{pr.total}
-                        </span>
-                      </div>
+                      {pr === null ? (
+                        <NothingLeft />
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
+                          <span className="num shrink-0 text-xs">
+                            {pr.done}/{pr.total}
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td className="num hidden whitespace-nowrap text-right lg:table-cell">{formatDuration(p.downtime_slo_s)}</td>
                     <td className="hidden whitespace-nowrap text-muted-foreground lg:table-cell">
