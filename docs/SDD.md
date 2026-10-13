@@ -2119,7 +2119,9 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
   Threshold, Minimum evidence, Override reason, Distinct approver. A list of plans, providers or decision types whose
   order alone changed did not change; a setting either side lacks is not compared; "No setting changed" when none
   did, and nothing when `before` or `after` is not a policy. A change that weakens an approval gate so shows on the
-  page, not only in the JSON download.
+  page, not only in the JSON download. A policy event names the policy and links to its card,
+  `/advisor/policies#policy-{id}` (ADV-20), while the policy exists; a deleted policy's name is plain text marked
+  "(deleted)", as no page shows it any more; while the policies cannot be read it links to `/advisor/policies`.
 * `migration.force_cutover` — a cutover before convergence (§5.4): actor the approver who forced it; data
   `{target_id, vm, reason, delta_bytes, estimated_downtime_s}`, `target_id` the migration id and `vm` its VM's name.
   The audit page shows the reason with the action and links the target to the migration.
