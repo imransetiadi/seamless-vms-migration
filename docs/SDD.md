@@ -2420,7 +2420,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   every migration whole), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of its
   migrations that are not `cancelled`, which are never done (a VM taken out of the plan, §5.4, or a migration cancelled
   while its VM stays in `vm_ids`), from `Plan.migration_counts`, naming the cancelled ones it leaves out ("11/21 done,
-  1 cancelled") so a plan's VMs and its done total never differ without a word,
+  1 cancelled", the cancelled count on a line of its own under the done count and its bar, as beside them it squeezed
+  the bar to a dot) so a plan's VMs and its done total never differ without a word,
   or of its VMs before validation, and none for a `cancelled` plan, which shows — instead; the Overview's plan progress
   counts the same way; the list reads no migration —, clouds,
   SLO and last change — on a phone the
