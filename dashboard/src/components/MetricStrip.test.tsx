@@ -13,6 +13,14 @@ describe('MetricStrip', () => {
     for (const cell of cells.slice(0, 6)) expect(cell.className).not.toContain('col-span');
   });
 
+  it('lays eight figures out in full rows of 2 on a phone and of 4 from sm, never one row too narrow for their labels', () => {
+    render(<MetricStrip label="Key metrics" metrics={metrics(8)} />);
+    const classes = screen.getByRole('region', { name: 'Key metrics' }).className.split(' ');
+    expect(classes).toEqual(expect.arrayContaining(['grid-cols-2', 'sm:grid-cols-4']));
+    expect(classes.filter((c) => c.startsWith('2xl:') || c.startsWith('xl:') || c.startsWith('lg:'))).toEqual([]);
+    for (const cell of screen.getAllByRole('group')) expect(cell.className).not.toContain('col-span');
+  });
+
   it('spans nothing when the figures fill their rows', () => {
     render(<MetricStrip label="Key metrics" metrics={metrics(6)} />);
     for (const cell of screen.getAllByRole('group')) expect(cell.className).not.toContain('col-span');

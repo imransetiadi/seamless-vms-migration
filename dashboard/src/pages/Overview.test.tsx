@@ -123,6 +123,29 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
   });
 
+  it('shows the rolled-back migrations beside Failed, in the warning tone, so the tiles never read as all clear (SDD §16)', async () => {
+    const { server } = renderWithApp(<Overview />);
+    const rolled = server.migrations.filter((m) => m.phase === 'rolled_back').length;
+    expect(rolled).toBeGreaterThan(0);
+    const tile = await screen.findByRole('group', { name: 'Rolled back' });
+    expect(tile).toHaveTextContent(String(rolled));
+    expect(tile).toHaveTextContent('the source VM runs again: retry or cancel');
+    expect(within(tile).getByText(String(rolled))).toHaveClass(TONE_CLASSES.warning.text);
+    // beside Failed, in the strip's order
+    const names = within(screen.getByRole('region', { name: 'Key metrics' })).getAllByRole('group').map((g) => g.getAttribute('aria-label'));
+    expect(names.slice(names.indexOf('Failed'), names.indexOf('Failed') + 2)).toEqual(['Failed', 'Rolled back']);
+  });
+
+  it('reads Rolled back as none, in the plain tone, when no migration rolled back', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations) if (m.phase === 'rolled_back') m.phase = 'ready';
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Rolled back' });
+    expect(tile).toHaveTextContent('0');
+    expect(tile).toHaveTextContent('none');
+    expect(within(tile).getByText('0')).not.toHaveClass(TONE_CLASSES.warning.text);
+  });
+
   it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
     const { server } = renderWithApp(<Overview />);
     const awaiting = await screen.findByRole('group', { name: 'Awaiting finalize' });
@@ -346,6 +369,7 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /key metrics/i });
     expect(within(metrics).getByRole('group', { name: 'Failed' })).toHaveTextContent('Failed—');
+    expect(within(metrics).getByRole('group', { name: 'Rolled back' })).toHaveTextContent('Rolled back—');
   });
 
   it('never reads a failed plans load as all clear while the migrations load (SDD §16)', async () => {

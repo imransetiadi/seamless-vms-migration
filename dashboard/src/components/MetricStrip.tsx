@@ -11,10 +11,13 @@ export interface Metric {
   tone?: Tone;
 }
 
-/** Columns per breakpoint by the number of metrics: one row on wide screens. */
+/** Columns per breakpoint by the number of metrics: one row on wide screens, up to seven. */
 const COLUMNS: Record<number, string> = {
   6: 'grid-cols-2 sm:grid-cols-3 2xl:grid-cols-6',
   7: 'grid-cols-2 sm:grid-cols-4 2xl:grid-cols-7',
+  // eight fill every row: 4 rows of 2 on a phone, 2 of 4 from sm; one row of 8 would leave a wide screen's cells too
+  // narrow for their labels, a wrapped one setting its figure below the others
+  8: 'grid-cols-2 sm:grid-cols-4',
 };
 
 /**

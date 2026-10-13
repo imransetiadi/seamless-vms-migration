@@ -348,7 +348,7 @@ export default function Overview() {
         statsUnknown ? (
           <MetricStrip
             label="Key metrics"
-            metrics={['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
+            metrics={['Migrations', 'In progress', 'Awaiting finalize', 'Finalized', 'Failed', 'Rolled back', 'Average downtime', 'SLO compliance'].map((label) => ({ label, value: DASH }))}
           />
         ) : (
           <Skeleton className="h-[86px]" />
@@ -364,6 +364,13 @@ export default function Overview() {
             { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; the source VM is kept' },
             { label: 'Finalized', value: formatNumber(s.finalized), hint: s.total ? `${formatPct((s.finalized / s.total) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
+            // its source VM runs again and a person retries or cancels it: never all clear while one waits (SDD §16)
+            {
+              label: 'Rolled back',
+              value: formatNumber(s.by_phase.rolled_back ?? 0),
+              tone: (s.by_phase.rolled_back ?? 0) > 0 ? 'warning' : undefined,
+              hint: (s.by_phase.rolled_back ?? 0) > 0 ? 'the source VM runs again: retry or cancel' : 'none',
+            },
             {
               label: 'Average downtime',
               value: formatDuration(s.avg_downtime_s),
