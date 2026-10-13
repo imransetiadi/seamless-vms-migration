@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useCreatePlan, useInventory, useMigrationSummaries, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
-import { heldElsewhere } from '../lib/holds';
+import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
@@ -346,6 +346,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // the check needs every plan and migration: without them it is unknown, not "none held" (SDD §16)
   const plansUnknown = Boolean(plans.error) && !plans.data;
   const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
+  // the plan that holds each VM, named in the VM table before any is picked (SDD §16): the plan being edited never
+  // holds its own; unknown, not free, while the plans or migrations fail
+  const holders =
+    plansUnknown || migrationsUnknown ? null : plans.data && migrations.data ? holdersOf(form.sourceId, plans.data, migrations.data, plan?.id) : undefined;
   const sourceStorage = source ? storageBackends(source.capabilities) : [];
   const destinationStorage = destination ? storageBackends(destination.capabilities) : [];
   const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
@@ -672,6 +676,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 onSelectedChange={(next) => set('vmIds', next)}
                 caption={`VMs on ${source.name}`}
                 pageSize={25}
+                holders={holders}
               />
             )}
             {form.vmIds.size > 0 && (plansUnknown || migrationsUnknown) && (

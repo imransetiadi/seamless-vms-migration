@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
+import { phaseMeta } from '../lib/phase';
 import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
 
@@ -404,6 +405,38 @@ describe('Plans page', () => {
 
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
     expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
+  });
+
+  it('names in the VM picker the plan that holds each VM before any is selected, with the Plan filter (SDD §16)', async () => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    const row = (await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` })).closest('tr')!;
+    await waitFor(() => expect(within(row).getByRole('link', { name: holder.name })).toHaveAttribute('href', `/plans/${holder.id}`));
+    expect(row).toHaveTextContent(`In plan ${holder.name}, phase ${phaseMeta(held.phase).label}`);
+    await user.selectOptions(within(dialog).getByLabelText('Plan'), 'Not in a plan');
+    expect(within(dialog).queryByRole('checkbox', { name: `Select ${held.vm.name}` })).not.toBeInTheDocument();
+  });
+
+  it('says in the VM picker that it does not know which plans hold the VMs while the migrations cannot be loaded (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, {
+      route: '/plans',
+      path: '/plans',
+      token: 'operator',
+      wrapFetch: (mock) => (input, init) =>
+        String(input).split('?')[0]!.endsWith('/api/v1/migrations') ? Promise.resolve(new Response('{}', { status: 503 })) : mock(input, init),
+    });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    expect(await within(dialog).findByText('Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Plan')).not.toBeInTheDocument();
   });
 
   it('announces a VM another plan holds from a live region already in the form (SDD §16)', async () => {

@@ -49,6 +49,21 @@ describe('PlanDetail', () => {
     expect(within(table).getAllByRole('row')).toHaveLength(11);
   });
 
+  it('never names the plan being edited as holding its own VMs in the VM picker (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
+    const own = server.migrations.filter((m) => m.plan_id === plan.id && !['cancelled', 'finalized', 'rolled_back'].includes(m.phase));
+    expect(own.length).toBeGreaterThan(0);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await user.click(await actionButton(/^edit plan$/i));
+    const dialog = await screen.findByRole('dialog', { name: /edit plan/i });
+    await within(dialog).findByRole('checkbox', { name: `Select ${own[0]!.vm.name}` });
+    // the holders are known (the Plan filter is offered), and none of them is the plan itself
+    await waitFor(() => expect(within(dialog).getByLabelText('Plan')).toBeInTheDocument());
+    expect(within(dialog).queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
+  });
+
   it('names kept ports in the settings summary, and the edit form sends only that change (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
