@@ -638,7 +638,10 @@ Two layers exist: `dashboard/e2e/` (`npm run test:e2e`, Chromium against the moc
 `dashboard-e2e`) — `smoke.spec.ts` (design tokens and themes, the main journey, viewer soft-disabled actions, adding
 a provider; UI-07 the theme chosen stays after a reload, light and dark — red when the choice is not stored or not
 read; UI-15 no page scrolls sideways on a 320 px wide screen — NFR-08, WCAG 2.2 reflow — it failed on the
-migration page while visually hidden text in the strategy table escaped its scroller) and `journeys.spec.ts`
+migration page while visually hidden text in the strategy table escaped its scroller; UI-28 at 320, 768 and 1280 px
+the plans list names a plan's cancelled migrations on a line of their own under its done count, the bar keeping its
+width and no cell of the row spilling — SDD §16; beside the count, ", 1 cancelled" squeezed the bar to 13 px at
+1280 px, scrolled the list sideways at 768 px and ran into the status badge at 320 px) and `journeys.spec.ts`
 (UI-11 editing a validated plan saves the change and returns it to draft; UI-12
 the shown audit events download as JSON lines in sequence order; UI-13 the guest OS filter and Clear filters;
 UI-14 a NetApp NFS handover names the RHOSO pool per volume type; UI-16 a keyboard user keeps focus on Validate
