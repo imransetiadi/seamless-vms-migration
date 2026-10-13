@@ -142,6 +142,25 @@ def test_a_plan_whose_migration_started_is_not_cancelled_and_names_it(api):
     assert phases == {started.id: Phase.failed, waiting.id: waiting.phase}
 
 
+def test_a_plan_whose_unstarted_migration_has_its_source_stopped_is_not_cancelled(api):
+    """SDD §12 (RR-01): a ready migration can still have its source stopped - a retry after a
+    failed cutover keeps the open clock (§5.2) - and a cancel cannot restart it (§5.1). The plan
+    cancel names it and refuses before cancelling any migration, though another sorts before it."""
+    plan_id = validated_plan(api, "stopped source", clean_vms(api, 2))
+    first, last = sorted(migrations(api, plan_id), key=lambda m: m.id)
+    update = {"phase": Phase.ready, "downtime_started_at": utcnow(), "downtime_ended_at": None}
+    api.store.put("migration", last.model_copy(update=update))
+    res = cancel(api, plan_id)
+    assert res.status_code == 409
+    message = res.json()["error"]["message"]
+    assert last.vm.name in message and "stopped" in message and "cut it over" in message
+    assert first.vm.name not in message
+    # nothing changed: the plan and the migration sorted first are as they were
+    assert api.get(f"/api/v1/plans/{plan_id}").json()["status"] == "validated"
+    phases = {m.id: m.phase for m in migrations(api, plan_id)}
+    assert phases == {first.id: first.phase, last.id: Phase.ready}
+
+
 def test_a_cancelled_plan_is_terminal(api):
     plan_id = validated_plan(api, "done with", clean_vms(api, 1))
     first = cancel(api, plan_id)

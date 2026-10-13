@@ -67,6 +67,23 @@ def test_failed_to_cancelled_requires_no_downtime():
         fsm.transition(stopped, Phase.cancelled, "source was stopped")
 
 
+@pytest.mark.parametrize("phase", [P.pending, P.blocked, P.ready])
+@pytest.mark.parametrize(("started", "ended"), [(False, False), (True, False), (True, True)])
+def test_an_unstarted_migration_is_refused_a_cancel_only_while_its_source_is_stopped(
+    phase, started, ended
+):
+    """SDD §12: Cancel plan checks fsm.source_stopped on every migration it would cancel - pending,
+    blocked or ready - before cancelling any; that covers every refusal of the move to cancelled
+    from those phases, so no cancel refuses midway (and a new rule must keep this so)."""
+    at = datetime(2026, 10, 8, tzinfo=UTC)
+    m = make_migration(
+        phase=phase,
+        downtime_started_at=at if started else None,
+        downtime_ended_at=at + timedelta(minutes=5) if ended else None,
+    )
+    assert (fsm.refusal(m, P.cancelled) is not None) == fsm.source_stopped(m)
+
+
 def test_no_cancel_while_the_source_vm_is_stopped():
     """SDD §5.1: with the downtime clock open the source VM is stopped, and a cancel would leave it
     stopped with nothing left to restart it; once the clock closed, a cancel is fine again."""

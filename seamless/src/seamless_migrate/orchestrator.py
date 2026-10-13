@@ -200,6 +200,19 @@ def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
     )
 
 
+def stopped_refusal(stopped: Iterable[Migration], limit: int = 10) -> str:
+    """The 409 of a plan cancel while a migration that has not started has its source stopped
+    (SDD §12): an open downtime clock a retry kept (§5.2) - a cancel cannot restart the source
+    (§5.1), so it is cut over first. At most ``limit`` VMs and how many are left out."""
+    named = sorted(m.vm.name for m in stopped)
+    rest = len(named) - limit
+    listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
+    return (
+        f"the source VM is stopped after a failed cutover: {listed}; cut it over before "
+        "cancelling the plan - a cancel cannot restart it"
+    )
+
+
 def in_flight_refusal(busy: Iterable[Migration], before: str, limit: int = 10) -> str:
     """The 409 of an edit or re-wave while ``busy`` are in flight (SDD §12): each VM, at most
     ``limit`` per kind and how many are left out, with what releases it."""
@@ -1185,6 +1198,11 @@ class Orchestrator:
                 if started:
                     raise NotAllowed(started_refusal(started))
                 todo = sorted((m for m in migrations if m.phase != P.cancelled), key=lambda m: m.id)
+                # SDD §12: refused before any migration is cancelled - one cancel() would refuse
+                # midway, after the ones sorted before it were cancelled for good
+                stopped = [m for m in todo if fsm.source_stopped(m)]
+                if stopped:
+                    raise NotAllowed(stopped_refusal(stopped))
                 why = f"plan cancelled: {reason}" if reason else "plan cancelled"
                 for m in todo:
                     await self.cancel(m.id, actor, why)
