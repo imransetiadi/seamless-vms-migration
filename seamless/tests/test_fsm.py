@@ -22,7 +22,8 @@ ALLOWED = {
     P.completed: {P.finalized, P.rolling_back},
     P.failed: {P.rolling_back, P.ready, P.cancelled},
     P.rolling_back: {P.rolled_back, P.failed},
-    P.rolled_back: {P.ready},
+    # cancelled: a rolled-back VM dropped for good, its kept data path cleaned up (SDD §5.1)
+    P.rolled_back: {P.ready, P.cancelled},
     P.finalized: set(),
     P.cancelled: set(),
 }

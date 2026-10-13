@@ -461,6 +461,41 @@ async def test_a_validation_leaves_a_removed_vms_migration_that_moved_meanwhile_
     assert kept["vm"] == "web-02" and kept["phase"] in ("rolling_back", "rolled_back")
 
 
+async def test_a_validation_leaves_a_removed_vms_migration_rolled_back_meanwhile(tmp_path, store):
+    """SDD §5.4: an operator may cancel a rolled-back migration (§5.1), but the validation does not:
+    a removed VM's migration whose rollback finished while the validation re-assessed the plan stays
+    rolled back - the operator's move stands - and is named in kept."""
+    from seamless_migrate.domain.models import Migration, Plan
+
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    await h.orch.validate_plan(plan.id, "alice")
+    moved = await h.by_vm(plan.id, "vm-2")
+    moved.phase = P.failed  # a pre-copy failed; the source VM kept running
+    store.put("migration", moved)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    apply_validation = h.orch._apply_validation
+
+    async def slow_apply_validation(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+        return await apply_validation(*args, **kwargs)
+
+    h.orch._apply_validation = slow_apply_validation
+    validation = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+    await asyncio.wait_for(entered.wait(), 5)
+    await h.orch.rollback(moved.id, "bayu", "keep the source running")
+    await h.wait_phase(moved.id, P.rolled_back)  # the rollback finished before the cancel
+    gate.set()
+    await validation
+    await h.orch.stop()
+    assert store.get("migration", moved.id, Migration).phase == P.rolled_back
+    validated = [e for e in store.events(since_seq=0, limit=100000) if e.kind == "plan.validated"]
+    assert validated[-1].data["kept"] == [{"vm": "web-02", "phase": "rolled_back"}]
+
+
 async def _left_validating(tmp_path, store):
     """A plan of two VMs that an earlier version's validation left as it was when it failed
     between vm-2's two writes (a database error, a restart): vm-2 in validating, the plan not
@@ -2028,6 +2063,87 @@ async def test_cancel_with_recorded_passes_cleans_up_the_warm_data_path(tmp_path
     assert cancelled.phase == P.cancelled
     assert await _settled(h, m.id) == ["cancel", "cleanup"]
     assert rollbacks == [{"delete_dest_volumes": True}]
+    await h.orch.stop()
+
+
+async def test_a_rolled_back_migration_is_cancelled_and_its_kept_data_path_cleaned_up(
+    tmp_path, store
+):
+    """SDD §5.1 (RR-03): a rollback deletes the destination server but keeps the warm data path for
+    a retry - it passes no delete_dest_volumes. Cancelling the rolled-back migration ends it for
+    good, so the cancel runs the rollback step once more, with delete_dest_volumes."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    async def quota(ctx):
+        raise PermanentStepError("snapshot quota exceeded")
+
+    hooks = {
+        StepName.ROLLBACK: rollback,
+        # a first pass that does not converge, then a delta pass that fails for good
+        StepName.PRECOPY: scripted_pass(recent_base(), 0, 100.0, 10 * 2**30, "full"),
+        StepName.SYNC: quota,
+    }
+    executor = ScriptedExecutor(settings, hooks=hooks)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300, "require_approval": True},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    await h.orch.rollback(m.id, "rina", "the snapshot quota is not ours to raise")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    assert m.sync_passes and rollbacks == [{}], "the rollback kept the data path for a retry"
+
+    cancelled = await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert cancelled.phase == P.cancelled
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    assert rollbacks == [{}, {"delete_dest_volumes": True}]
+    await h.orch.stop()
+
+
+async def test_a_rolled_back_migration_without_passes_is_cancelled_and_then_its_plan(
+    tmp_path, store
+):
+    """SDD §5.1, §12 (RR-03): a rolled-back migration that recorded no pass - as a storage
+    handover, which copies nothing - leaves no data path, so its cancel cleans nothing up; and
+    with it cancelled, Cancel plan, which refuses while it is rolled back and says to cancel it
+    on its own first, retires the plan."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    assert rollbacks == [{}]
+    m.sync_passes = []  # nothing copied
+    store.put("migration", m)
+    with pytest.raises(NotAllowed, match="on its own first"):
+        await h.orch.cancel_plan(plan.id, "rina", "retired")
+
+    assert (await h.orch.cancel(m.id, "rina", "not migrated after all")).phase == P.cancelled
+    assert "cleanup" not in await _settled(h, m.id)
+    assert rollbacks == [{}]
+    assert (await h.orch.cancel_plan(plan.id, "rina", "retired")).status == PlanStatus.cancelled
     await h.orch.stop()
 
 

@@ -1480,6 +1480,10 @@ class Orchestrator:
                     f"{m.vm.name} is being validated and cannot be cancelled; validate the plan "
                     "again - it finishes the migration, or cancels it once its VM left vm_ids"
                 )
+            if by_validation and m.phase not in REMOVABLE:
+                # SDD §5.4: an operator moved it meanwhile (a rollback, even a finished one an
+                # operator may cancel): the operator's move stands
+                raise NotAllowed(f"{m.vm.name} moved to {m.phase} meanwhile")
             why = fsm.refusal(m, P.cancelled)
             if why is not None:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
