@@ -3944,6 +3944,8 @@ async def test_prestage_failure_fails_the_plan(tmp_path, store):
     )  # fmt: skip
     await run_plan(h, plan)
     failed = await h.wait_plan(plan.id, PlanStatus.failed)
+    # the failure is announced after the plan is saved failed: stopping now would cancel it
+    await h.wait_kind("plan.updated")
     await h.orch.stop()
     assert failed.status == PlanStatus.failed
     assert (await h.by_vm(plan.id, "vm-1")).phase == P.ready, "no migration started"
