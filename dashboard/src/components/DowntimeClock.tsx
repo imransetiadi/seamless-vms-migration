@@ -73,6 +73,8 @@ export function DowntimeClock({
     : endedAt
       ? (actualS ?? (secondsBetween(startedAt, endedAt) ?? 0) * speed)
       : (secondsBetween(startedAt, now) ?? 0) * speed;
+  // a running clock counts whole seconds; an ended one shows the actual downtime as every view rounds it (SDD §16)
+  const shown = running ? elapsed : Math.round(elapsed);
   const id = useId();
   const shownParts = DOWNTIME_PARTS.filter((part) => (parts[part] ?? 0) > 0);
   const demoNote = startedAt ? demoTimeText(speed) : null;
@@ -119,7 +121,7 @@ export function DowntimeClock({
             slo?.tone === 'danger' ? 'text-status-danger' : startedAt ? 'text-foreground' : 'text-muted-foreground',
           )}
         >
-          {formatClock(elapsed)}
+          {formatClock(shown)}
         </span>
         <span className={cn('inline-flex items-center gap-1 text-sm', TONE_CLASSES[state.tone].text)}>
           <state.icon aria-hidden className={cn('size-4 shrink-0', running && 'motion-safe:animate-pulse')} />
@@ -131,7 +133,7 @@ export function DowntimeClock({
           <ProgressBar
             value={pct}
             label="Downtime against the SLO"
-            valueText={`${formatClock(elapsed)} of ${formatClock(sloS)}`}
+            valueText={`${formatClock(shown)} of ${formatClock(sloS)}`}
             tone={slo?.tone === 'danger' ? 'danger' : slo?.tone === 'warning' ? 'warning' : startedAt ? 'success' : 'neutral'}
             size="sm"
           />
