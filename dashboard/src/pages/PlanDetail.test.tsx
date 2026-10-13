@@ -1298,7 +1298,7 @@ describe('PlanDetail', () => {
     const { server } = renderPlan('plan-c81d44a0', 'admin');
     const panel = await screen.findByRole('region', { name: 'Waiting for advisor approval' });
     expect(await within(panel).findByRole('link', { name: 'analytics-node-2' })).toHaveAttribute('href', '/migrations/mig-b2c4d6e871');
-    expect(await within(panel).findByText('Decision: Waiting for approval — policy pol-finance requires approval')).toBeInTheDocument();
+    expect(await within(panel).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval')).toBeInTheDocument();
     expect(panel).toHaveTextContent('Recommended: Storage handover · 86% confidence (threshold 60%)');
     await user.click(within(panel).getByRole('button', { name: 'Approve' }));
     await user.click(within(await screen.findByRole('alertdialog', { name: 'Approve Storage handover for analytics-node-2?' })).getByRole('button', { name: 'Approve' }));
@@ -1311,7 +1311,8 @@ describe('PlanDetail', () => {
   it('shows the waiting migrations without the actions below advisor.approve, and no panel when nothing waits', async () => {
     const { unmount } = renderPlan('plan-c81d44a0', 'operator');
     const panel = await screen.findByRole('region', { name: 'Waiting for advisor approval' });
-    await within(panel).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    // without the controls, the line says who decides (SDD §16)
+    await within(panel).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     expect(within(panel).queryByRole('button', { name: /approve|override/i })).not.toBeInTheDocument();
     unmount();
     renderPlan('plan-4f2a9c1e', 'admin');

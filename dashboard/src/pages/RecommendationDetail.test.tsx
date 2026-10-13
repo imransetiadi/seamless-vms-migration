@@ -149,7 +149,7 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
     expect(await screen.findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' })).toBeInTheDocument();
     admin.unmount();
     renderRec(id, server);
-    await screen.findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await screen.findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
 
@@ -186,7 +186,7 @@ describe('Recommendation detail (SDD §14.5, ADV-05)', () => {
     );
     m.advisor_hold = 'rec-b2c4d6e87199';
     const { queryClient } = renderWithApp(<RecommendationDetail />, { route: `/advisor/recommendations/${older}`, path: '/advisor/recommendations/:recId', token: 'admin', server });
-    await screen.findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await screen.findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     await waitFor(() => expect(queryClient.isFetching()).toBe(0));
     expect(queryClient.getQueryData(['migration', 'mig-b2c4d6e871'])).toMatchObject({ phase: 'ready' });
     expect(screen.queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();

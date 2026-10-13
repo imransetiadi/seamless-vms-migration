@@ -6,6 +6,7 @@
  */
 import type { AdvisorNote, AdvisorRecommendation, DecisionType, Migration } from '../api/types';
 import { formatPct } from './format';
+import { PERMISSIONS } from './roles';
 
 /**
  * The spec's option labels (ADV-03), "(CBT)" only where the strategy uses changed-block tracking: the
@@ -140,11 +141,15 @@ function decisionReason(rec: AdvisorRecommendation): string {
   }
 }
 
+/** Who decides a decision that waits: the role that holds `advisor.approve`, with its article (SDD §13.2, §16). */
+const DECIDER = `${/^[aeiou]/.test(PERMISSIONS['advisor.approve']) ? 'an' : 'a'} ${PERMISSIONS['advisor.approve']}`;
+
 /** What was decided and why: "Cold migration — below threshold, default kept" (the line reads "Decision: …"). */
 export function decisionText(rec: AdvisorRecommendation): string {
   const { final_option: final, status } = rec.decision;
-  // no final option: a decision waiting for approval, or a legacy note that did not record the default
-  const shownFinal = final !== null ? optionLabel(final) : status === 'pending_approval' ? 'Waiting for approval' : 'Not recorded';
+  // no final option: a decision waiting for approval - by whom, also for those who see no controls - or a legacy note
+  // that did not record the default
+  const shownFinal = final !== null ? optionLabel(final) : status === 'pending_approval' ? `Waiting for approval by ${DECIDER}` : 'Not recorded';
   return `${shownFinal} — ${decisionReason(rec)}`;
 }
 

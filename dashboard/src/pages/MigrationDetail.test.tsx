@@ -316,7 +316,7 @@ describe('MigrationDetail', () => {
       `/advisor/recommendations/${recId}`,
     );
     const advisor = await screen.findByRole('region', { name: /^advisor$/i });
-    await within(advisor).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await within(advisor).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     expect(within(advisor).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
 
