@@ -1180,7 +1180,9 @@ source-running check fails. CI's `dashboard-e2e` job runs it after the DEMO-07 j
 UI-01, UI-08) the same way, with a viewer and an admin token of its own: a deep link while signed out asks to sign in,
 and with authentication on Sign in offers no way past it; an empty and a wrong token are refused with a reason, the
 token field keeping the focus; the viewer lands where the deep link pointed and finds Add provider unavailable, with
-the reason; signing out leaves no token in the tab; the admin opens the dashboard and lands on Overview. Restarting the
+the reason; signing out leaves no token in the tab, and Sign in then says no session ended - neither right away nor
+after a page load, though a wrong token was refused earlier in the same page load (RR-06: it did right away, from
+the flag that refusal left); the admin opens the dashboard and lands on Overview. Restarting the
 server without the admin's token revokes it — the server reads the tokens file at startup — and the next page says the
 session ended; restarted with authentication off, Sign in offers to continue without a token, back to the page that
 asked (14 checks, about 10 s). Against the dashboard and server of 2f02025a, before the two Sign in fixes, three of
