@@ -648,7 +648,7 @@ reload (`migration.source_stopped`, ADV-19, SDD §8.1); UI-19 the Overview's Pen
 by kind, and its advisor decision opens the recommendation; UI-20 a plan's settings name the advisor policy in force and
 its link lands focus on the policy's card (ADV-20, SDD §16); UI-21 a recommendation's Evidence card lists six facts with
 Show all, and a fact's Inventory link opens the VM searched for (ADV-02); UI-22 tabbing through New plan, New policy and
-Connect a cloud at 1280×800 and 375×700 never leaves the focused control under their actions, and no dialog panel scrolls
+Add provider at 1280×800 and 375×700 never leaves the focused control under their actions, and no dialog panel scrolls
 past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule finds nothing on seven pages at 320 and 375 px
 (WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
 320 and 1280 px, with the web fonts and with their font files aborted, the system font a browser shows until they arrive (WCAG 1.4.10, SDD §16 — in it an Overview plan name was 3 px too wide at 320 px until 068a64a); UI-27 the plan, policy and provider dialogs' error summaries pass axe's target-size rule (9514b10: their links were 17 px tall); UI-25 the sign-in page requests no chart code and the Overview still draws its charts (40ff6b7: Rolldown had put React inside `charts`, so every page preloaded Recharts); UI-26 the fonts come with the dashboard: no request leaves the page's origin and Fira Sans and Fira Code load (8e4aebd: they came from Google Fonts, render-blocking, unreachable in an air-gapped site); each was checked to fail when the behaviour it

@@ -13,10 +13,19 @@ function renderPage(token = 'admin', server = createTestServer()) {
 
 async function openAdd(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByRole('button', { name: /^add provider$/i }));
-  return screen.findByRole('dialog', { name: /connect a cloud/i });
+  return screen.findByRole('dialog', { name: /^add provider$/i });
 }
 
 describe('Providers page', () => {
+  it('names the add dialog as its button: the action keeps one name through its flow', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('admin');
+    await user.click(await screen.findByRole('button', { name: /^add provider$/i }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAccessibleName('Add provider');
+    expect(within(dialog).getByRole('button', { name: 'Add provider' })).toBeInTheDocument();
+  });
+
   it('shows sources and destinations in the direction of the migration, with the sign-in state', async () => {
     renderPage('viewer');
     const from = await screen.findByRole('region', { name: 'Migrate from' });

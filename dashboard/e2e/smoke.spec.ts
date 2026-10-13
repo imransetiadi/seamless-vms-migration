@@ -117,7 +117,7 @@ test('an admin connects a Kolla-Ansible source and tests the connection', async 
   await signIn(page);
   await page.goto('/providers');
   await page.getByRole('button', { name: /^add provider$/i }).first().click();
-  const dialog = page.getByRole('dialog', { name: /connect a cloud/i });
+  const dialog = page.getByRole('dialog', { name: /^add provider$/i });
   await dialog.getByText('Kolla-Ansible', { exact: true }).click();
   await dialog.getByLabel(/^name/i).fill('Kolla Browser Test');
   await expect(dialog.getByLabel(/^id/i)).toHaveValue('kolla-browser-test');
@@ -241,7 +241,7 @@ test('the error summaries of the plan, policy and provider dialogs keep their li
 
   await page.goto('/providers');
   await page.getByRole('button', { name: /^add provider$/i }).first().click();
-  const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+  const provider = page.getByRole('dialog', { name: /^add provider$/i });
   await provider.getByRole('button', { name: /^add provider$/i }).click();
   await expect(provider.getByRole('alert').first()).toBeVisible();
   expect(await targets(), 'provider dialog').toEqual([]);

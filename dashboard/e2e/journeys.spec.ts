@@ -267,7 +267,7 @@ for (const [width, height] of [
 
     await page.goto('/providers');
     await page.getByRole('button', { name: /^add provider$/i }).first().click();
-    const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+    const provider = page.getByRole('dialog', { name: /^add provider$/i });
     await provider.getByLabel(/^name/i).focus();
     expect(await tabCovered(page, 30)).toEqual([]);
     expect(await panelOverflow(page)).toBeLessThanOrEqual(1);
