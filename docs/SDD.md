@@ -2625,7 +2625,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   link would lead straight back to Sign in; it never asks `GET /me` without a token to find out, a refused request
   that would record `auth.denied` and count toward the per-address lockout, §13.1, on every visit).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
-  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
+  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
+  heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
+  does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
+  indicator reading Reconnecting meanwhile, never Live on events that stopped. When the stream opens again after a
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
   event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
