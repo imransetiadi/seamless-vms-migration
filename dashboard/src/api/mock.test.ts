@@ -2114,6 +2114,32 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect(web01.phase).toBe('completed');
   });
 
+  it('refuses to finalize while the source VM runs again, skips it in a bulk finalize, and finishes a finalize that began deleting it, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    await as(server, 'operator').post(`/demo/vms/${web01.vm.source_id}/power`, { state: 'on' });
+    server.tick();
+    expect([web01.phase, web01.source_running_at !== null]).toEqual(['completed', true]);
+    const reason = 'the source VM runs again: stop it, or roll it back, before finalizing';
+    await expect(as(server, 'approver').post(`/migrations/${web01.id}/finalize`, { confirm: web01.vm.name, delete_source: true })).rejects.toMatchObject({
+      status: 409,
+      message: reason,
+    });
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: wave.id, confirm: wave.name });
+    // the watch's tick moved the wave on: whatever else completed is finalized, web-01 is skipped with the reason
+    expect(out.skipped).toEqual([{ migration_id: web01.id, reason }]);
+    expect(out.finalized).not.toContain(web01.id);
+    expect(web01.phase).toBe('completed');
+    // a finalize that began deleting the source is finalized again from its own page; a bulk finalize skips it too
+    web01.checkpoint = 'finalizing';
+    const again = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: wave.id, confirm: wave.name });
+    expect(again.skipped).toEqual([{ migration_id: web01.id, reason }]);
+    await as(server, 'approver').post(`/migrations/${web01.id}/finalize`, { confirm: web01.vm.name, delete_source: true });
+    expect(web01.phase).toBe('finalized');
+  });
+
   it("refuses to change a plan's providers while one of its migrations is failed, like the API (SDD §12)", async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const failed = server.migrations.find((m) => m.phase === 'failed')!;

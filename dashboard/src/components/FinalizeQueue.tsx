@@ -3,7 +3,7 @@ import { useId, useState, type RefObject } from 'react';
 import { Link } from 'react-router-dom';
 import { useFinalizePlan } from '../api/hooks';
 import type { Plan, PlanFinalizeResult, Wave, MigrationLike } from '../api/types';
-import { completedSince, inScope, isOverdue, queueByWave, type SkippedVm } from '../lib/finalize';
+import { bulkFinalize, completedSince, everySourceRunsText, inScope, isOverdue, queueByWave, skipsText, type SkippedVm } from '../lib/finalize';
 import { formatDateTime, formatRelative } from '../lib/format';
 import type { Availability } from '../lib/planActions';
 import { useNow } from '../lib/useNow';
@@ -69,7 +69,14 @@ export function FinalizeQueue({ plan, migrations, gate, allInHeader, onFinalize 
                 {wave ? wave.name : 'Not in a wave'} <span className="num font-normal text-muted-foreground">({items.length})</span>
               </h3>
               {wave && showWave && (
-                <Button size="sm" icon={BadgeCheck} disabledReason={gate.reason} aria-label={`Finalize wave ${wave.name}`} onClick={() => onFinalize({ wave })}>
+                <Button
+                  size="sm"
+                  icon={BadgeCheck}
+                  // a bulk finalize skips a VM whose source runs again (SDD §8.1): a wave of only such VMs finalizes nothing
+                  disabledReason={gate.reason ?? (bulkFinalize(items).finalizes.length === 0 ? everySourceRunsText(items) : null)}
+                  aria-label={`Finalize wave ${wave.name}`}
+                  onClick={() => onFinalize({ wave })}
+                >
                   Finalize wave
                 </Button>
               )}
@@ -161,9 +168,9 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone, r
   const deleteId = useId();
   const wave = scope?.wave ?? null;
   const name = wave ? wave.name : plan.name;
-  const items = scope ? inScope(plan, migrations, wave) : [];
-  const running = items.filter((m) => m.source_running_at);
-  const one = items.length === 1;
+  // it finalizes the VMs whose source is stopped and skips those whose source VM runs again (SDD §8.1, §16)
+  const { finalizes, skips } = bulkFinalize(scope ? inScope(plan, migrations, wave) : []);
+  const one = finalizes.length === 1;
   const close = () => {
     finalize.reset();
     setDeleteSource(false);
@@ -173,7 +180,7 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone, r
     <ConfirmDialog
       open={scope !== null}
       tone="danger"
-      title={`Finalize ${vms(items.length)} of ${name}?`}
+      title={`Finalize ${vms(finalizes.length)} of ${name}?`}
       description={
         one
           ? 'Finalizing is irreversible: this VM can no longer be rolled back, and the temporary resources of its source VM are cleaned up.'
@@ -198,20 +205,16 @@ export function FinalizePlanDialog({ plan, migrations, scope, onClose, onDone, r
       onCancel={close}
     >
       <ul aria-label="VMs to finalize" className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-        {items.map((m) => (
+        {finalizes.map((m) => (
           <li key={m.id} className="rounded-sm border border-border px-1.5 py-0.5 font-mono text-xs text-foreground">
             {m.vm.name}
           </li>
         ))}
       </ul>
-      {running.length > 0 && (
-        <p className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-2.5 text-sm text-foreground">
-          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
-          <span>
-            {running.length === 1
-              ? `The source VM of ${running[0]?.vm.name} runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.`
-              : `${running.length} of these source VMs run again: what they wrote since is not on RHOSO. Stop them, or roll them back instead.`}
-          </span>
+      {skips.length > 0 && (
+        <p className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-2.5 text-sm text-foreground">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <span>{skipsText(skips)}</span>
         </p>
       )}
       <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">

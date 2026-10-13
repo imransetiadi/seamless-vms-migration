@@ -1173,6 +1173,25 @@ def test_finalize_confirm_mismatch_400(api):
     assert res.status_code == 200 and res.json()["phase"] == "finalized"
 
 
+def test_finalize_is_refused_while_the_source_vm_runs_again(api):
+    """SDD §8.1, §12 (the owner's choice, 2026-10-13): 409 while the source watch sees the source
+    VM running again; once it saw it stopped (source_running_at cleared), it finalizes."""
+    migs = seed_migrations(api.store)
+    completed = migs["completed"]
+    completed.source_running_at = completed.downtime_started_at
+    api.store.put("migration", completed)
+    url = f"/api/v1/migrations/{completed.id}/finalize"
+    refused = api.post(url, Role.approver, json={"confirm": "vm-completed", "delete_source": True})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == (
+        "the source VM runs again: stop it, or roll it back, before finalizing"
+    )
+    completed.source_running_at = None
+    api.store.put("migration", completed)
+    done = api.post(url, Role.approver, json={"confirm": "vm-completed"})
+    assert done.status_code == 200 and done.json()["phase"] == "finalized"
+
+
 def test_events_since(api):
     seed_migrations(api.store)
     events = api.get("/api/v1/events").json()

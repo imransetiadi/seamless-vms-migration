@@ -1,4 +1,5 @@
 import type { MigrationLike, Plan, Role } from '../api/types';
+import { bulkFinalize, everySourceRunsText } from './finalize';
 import { blocksPlanChange, releaseGroups } from './inFlight';
 import { hasRole } from './roles';
 import { WAVE_COMPLETE_PHASES } from './waves';
@@ -27,6 +28,12 @@ function names(list: string[]): string {
  * pause running plans.
  */
 export function planActions(plan: Plan, role: Role | undefined, migrations: readonly MigrationLike[]): Record<PlanActionKey, Availability> {
+  const finalizeGate = (): Availability => {
+    if (!hasRole(role, 'approver')) return { enabled: false, reason: 'Requires the approver role.' };
+    const queue = migrations.filter((m) => m.plan_id === plan.id && m.phase === 'completed');
+    if (queue.length === 0) return { enabled: false, reason: 'No VM awaits finalize.' };
+    return bulkFinalize(queue).finalizes.length > 0 ? { enabled: true, reason: null } : { enabled: false, reason: everySourceRunsText(queue) };
+  };
   const allowed = hasRole(role, 'operator');
   const gate = (ok: boolean, reason: string): Availability => {
     if (!allowed) return { enabled: false, reason: ROLE_REASON };
@@ -112,12 +119,9 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: read
     ),
     start: start(),
     pause: gate(status === 'running', 'Only a running plan can be paused.'),
-    // POST /plans/{id}/finalize (SDD §8.1): an approver, while a VM awaits finalize
-    finalize: !hasRole(role, 'approver')
-      ? { enabled: false, reason: 'Requires the approver role.' }
-      : migrations.some((m) => m.plan_id === plan.id && m.phase === 'completed')
-        ? { enabled: true, reason: null }
-        : { enabled: false, reason: 'No VM awaits finalize.' },
+    // POST /plans/{id}/finalize (SDD §8.1): an approver, while a VM awaits finalize whose source VM is stopped - it skips
+    // one whose source runs again
+    finalize: finalizeGate(),
     // PATCH /plans/{id} (SDD §12): only in draft or validated; saving returns the plan to draft
     edit: gate(
       (status === 'draft' || status === 'validated') && !busy,

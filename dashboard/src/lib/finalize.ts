@@ -31,6 +31,28 @@ export function inScope<M extends MigrationLike>(plan: Plan, migrations: readonl
   return finalizeQueue(migrations).filter((m) => m.plan_id === plan.id && (!wave || wave.vm_ids.includes(m.vm.source_id)));
 }
 
+/**
+ * What a bulk finalize of a scope does (SDD §8.1): it finalizes the VMs whose source is stopped and skips every VM
+ * whose source VM runs again - one whose finalize began deleting it too, finalized again from its own page.
+ */
+export function bulkFinalize<M extends MigrationLike>(items: readonly M[]): { finalizes: M[]; skips: M[] } {
+  return { finalizes: items.filter((m) => !m.source_running_at), skips: items.filter((m) => m.source_running_at) };
+}
+
+/** Why a bulk finalize is unavailable while the source VM of every VM in its scope runs again (SDD §8.1, §16). */
+export function everySourceRunsText(skips: readonly MigrationLike[]): string {
+  return skips.length === 1
+    ? `The source VM of ${skips[0]?.vm.name} runs again: stop it, or roll it back, before finalizing.`
+    : `The source VM of each of the ${skips.length} VMs awaiting finalize runs again: stop them, or roll them back, before finalizing.`;
+}
+
+/** The VMs a bulk finalize skips because their source VM runs again, named (SDD §16). */
+export function skipsText(skips: readonly MigrationLike[]): string {
+  return skips.length === 1
+    ? `${skips[0]?.vm.name} is skipped: its source VM runs again. Stop it, or roll it back, before finalizing it.`
+    : `${skips.length} VMs are skipped, as their source VMs run again: ${skips.map((m) => m.vm.name).join(', ')}. Stop them, or roll them back, before finalizing them.`;
+}
+
 export interface QueueGroup<M extends MigrationLike = MigrationLike> {
   /** null: the VMs in no wave. */
   wave: Wave | null;

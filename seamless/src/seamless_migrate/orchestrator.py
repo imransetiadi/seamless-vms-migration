@@ -263,6 +263,8 @@ OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
 #: the approver who forces a cutover is held to the requester's rule (SDD §5.4)
 OWN_FORCE = "You forced this cutover. Another approver must approve it."
 OWN_DECISION = "You requested this decision. Another approver must decide it."
+#: a finalize refused while the source watch sees the source VM running (SDD §8.1)
+SOURCE_RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before finalizing"
 
 
 def _refuse_unchangeable(m: Migration) -> None:
@@ -1607,6 +1609,11 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase != P.completed:
                 raise NotAllowed(f"only completed migrations can be finalized ({m.phase})")
+            # SDD §8.1 (the owner's choice, 2026-10-13): a source running again diverged - a
+            # finalize would keep it, or delete it with what it wrote since; one that began
+            # deleting it finishes, as a rollback is refused then
+            if m.source_running_at is not None and m.checkpoint != "finalizing":
+                raise NotAllowed(SOURCE_RUNS_AGAIN)
             if confirm != m.vm.name:
                 raise BadRequest("confirm must equal the VM name")
             plan = await self._plan(m.plan_id)
@@ -1675,6 +1682,11 @@ class Orchestrator:
         finalized: list[Migration] = []
         skipped: list[dict[str, str]] = []
         for m in sorted(waiting, key=lambda x: x.vm.name):
+            if m.source_running_at is not None:
+                # SDD §8.1: every VM whose source runs again, also one whose finalize began deleting
+                # it - its own Finalize is its way out - so the plan's summaries tell what this does
+                skipped.append({"migration_id": m.id, "reason": SOURCE_RUNS_AGAIN})
+                continue
             try:
                 finalized.append(
                     await self.finalize(m.id, actor, delete_source=delete_source, confirm=m.vm.name)

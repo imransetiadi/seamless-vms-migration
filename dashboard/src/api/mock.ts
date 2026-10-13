@@ -525,6 +525,8 @@ function intParam(query: URLSearchParams, name: string, fallback: number, min: n
 
 /** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
+/** The API's refusal of a finalize while the source watch sees the source VM running again (SDD §8.1). */
+const SOURCE_RUNS_AGAIN = 'the source VM runs again: stop it, or roll it back, before finalizing';
 /** Phases in which a step runs for the migration (the API's ACTIVE_STEP_PHASES): they fill a wave's max_parallel. */
 const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
@@ -1773,6 +1775,11 @@ export class MockServer {
     const finalized: Migration[] = [];
     const skipped: Array<{ migration_id: string; reason: string }> = [];
     for (const m of waiting) {
+      // like the API (SDD §8.1): every VM whose source runs again, also one whose finalize began deleting it
+      if (m.source_running_at) {
+        skipped.push({ migration_id: m.id, reason: SOURCE_RUNS_AGAIN });
+        continue;
+      }
       // like the API: one VM's error skips that VM, never the others (SDD §8.1)
       try {
         this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
@@ -2326,6 +2333,10 @@ export class MockServer {
       case 'finalize': {
         // like the API (SDD §12): the phase first, then the typed name
         if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
+        // like the API (SDD §8.1): not while the source runs again, unless a finalize began deleting it
+        if (m.source_running_at && m.checkpoint !== 'finalizing') {
+          throw new HttpError(409, 'conflict', SOURCE_RUNS_AGAIN);
+        }
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
         m.checkpoint = 'finalized'; // the API's checkpoint values (SDD §8.1)

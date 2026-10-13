@@ -149,6 +149,12 @@ describe('planActions', () => {
     expect(planActions(plan, 'operator', done).finalize).toEqual({ enabled: false, reason: 'Requires the approver role.' });
     const none = done.map((m) => ({ ...m, phase: 'finalized' as const }));
     expect(planActions(plan, 'approver', none).finalize).toEqual({ enabled: false, reason: 'No VM awaits finalize.' });
+    // a bulk finalize skips a VM whose source runs again (SDD §8.1, §16): with no other, it would finalize nothing
+    const runs = done.map((m, i) => (i === 0 ? { ...m, source_running_at: '2026-10-08T11:00:00Z' } : m));
+    expect(planActions(plan, 'approver', runs).finalize).toEqual({
+      enabled: false,
+      reason: `The source VM of ${runs[0]!.vm.name} runs again: stop it, or roll it back, before finalizing.`,
+    });
   });
 
   it('requires the operator role for every plan action', () => {

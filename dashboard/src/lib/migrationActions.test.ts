@@ -57,6 +57,15 @@ describe('migrationActions rules', () => {
     expect(verifying.reason).toMatch(/completed/i);
   });
 
+  it('keeps Finalize unavailable while the source VM runs again, as the API refuses it, unless a finalize began deleting it (SDD §8.1)', () => {
+    const running = migrationActions(migration('completed', { source_running_at: '2026-10-08T11:00:00Z' }), 'approver');
+    expect(running.finalize).toEqual({ enabled: false, reason: 'The source VM runs again: stop it, or roll it back, before finalizing.' });
+    expect(running.rollback.enabled).toBe(true);
+    // its finalize began deleting the source and a rollback is refused then: finalizing again is the way out
+    const finalizing = migrationActions(migration('completed', { source_running_at: '2026-10-08T11:00:00Z', checkpoint: 'finalizing' }), 'approver');
+    expect([finalizing.finalize.enabled, finalizing.rollback.enabled]).toEqual([true, false]);
+  });
+
   it('keeps Rollback from a completed migration whose finalize began deleting the source, and offers Finalize again (SDD §8.1)', () => {
     const interrupted = migrationActions(migration('completed', { checkpoint: 'finalizing' }), 'approver');
     expect(interrupted.rollback.enabled).toBe(false);

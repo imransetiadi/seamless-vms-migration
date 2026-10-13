@@ -12,7 +12,8 @@
 // batch-01 through New plan with the dialog's defaults (Require approval, a distinct approver), validates,
 // starts and requests each cutover - the dialog asks to request it, not to start it - and cannot approve
 // it; the approver approves - its dialog says the approval starts the cutover and stops the source VM - and
-// each cutover runs and verifies; the approver finalizes report-01, typing its name, and rolls back batch-01.
+// each cutover runs and verifies; while report-01's source VM runs again (the demo's power button) Finalize is
+// unavailable, saying why; the approver finalizes report-01, typing its name, and rolls back batch-01.
 // The API is read only to wait for a phase. SEAMLESS (the seamless command), PORT and SHOT_DIR (a screenshot
 // of the page when a check fails) override the defaults.
 // Exit code = number of failed checks.
@@ -251,6 +252,23 @@ try {
     if (!why.includes('You requested this cutover. Another approver must approve it.')) throw new Error(`it says ${JSON.stringify(why)}`);
   });
   await check('report-01: the approver is told the approval starts the cutover, approves, and it runs and verifies on TCP 22', asApprover, () => approve('report-01'));
+  await check('report-01: while its source VM runs again Finalize is unavailable, saying why, and is offered once it is stopped (SDD §8.1)', asApprover, async () => {
+    await open(asApprover, 'report-01');
+    await asApprover.getByRole('button', { name: 'Power on the source VM (demo)' }).click();
+    // the source watch looks every SEAMLESS_SOURCE_WATCH_S, divided by the demo speed: 5 s here
+    const alert = asApprover.getByRole('alert', { name: 'Source VM running' });
+    await alert.waitFor({ timeout: 30_000 });
+    const finalize = asApprover.getByRole('button', { name: 'Finalize', exact: true }).first();
+    // an available button carries no aria-disabled at all
+    const disabled = async () => (await finalize.getAttribute('aria-disabled')) ?? 'false';
+    await until(disabled, (v) => v === 'true', 10);
+    if ((await disabled()) !== 'true') throw new Error('Finalize is available while the source VM runs again');
+    const why = await finalize.evaluate((el) => document.getElementById(el.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+    if (!why.includes('The source VM runs again: stop it, or roll it back, before finalizing.')) throw new Error(`it says ${JSON.stringify(why)}`);
+    await asApprover.getByRole('button', { name: 'Power off the source VM (demo)' }).click();
+    await alert.waitFor({ state: 'detached', timeout: 30_000 });
+    if (!(await until(disabled, (v) => v !== 'true', 10))) throw new Error('Finalize stays unavailable once the source VM is stopped');
+  });
   await check('report-01: Finalize is refused until its name is typed, then the approver finalizes it (QASuite UI-05)', asApprover, async () => {
     await open(asApprover, 'report-01');
     await asApprover.getByRole('button', { name: 'Finalize', exact: true }).first().click();

@@ -442,22 +442,20 @@ describe('PlanDetail', () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
     const cache = server.migrations.find((m) => m.vm.name === 'web-cache-01')!;
-    expect(cache.phase).toBe('completed');
-    cache.source_running_at = '2026-10-08T11:00:00Z';
+    expect([cache.phase, cache.source_running_at]).toEqual(['completed', null]);
     renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
     const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
     expect(queue).toHaveTextContent('1 VM awaits finalize: the source VM is still there until it is finalized.');
     const row = within(queue).getByRole('listitem', { name: 'web-cache-01' });
     // completed 8 days ago: past the plan's 72 h
     expect(row).toHaveTextContent('Finalize overdue');
-    expect(row).toHaveTextContent('Source VM running');
     // its one wave holds every VM listed: the header's Finalize all does what Finalize wave would
     expect(within(queue).queryByRole('button', { name: /^finalize wave/i })).not.toBeInTheDocument();
 
     await user.click(within(screen.getByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' }));
     const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${plan.name}?` });
     expect(dialog).toHaveTextContent('Finalizing is irreversible: this VM can no longer be rolled back, and the temporary resources of its source VM are cleaned up.');
-    expect(dialog).toHaveTextContent('The source VM of web-cache-01 runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.');
+    expect(dialog).not.toHaveTextContent('runs again');
     // one VM: "the source VM", not "VMs"
     expect(within(dialog).getByRole('checkbox', { name: /^also delete the source VM\b/i })).not.toBeChecked();
     const confirm = within(dialog).getByRole('button', { name: 'Finalize all' });
@@ -466,6 +464,57 @@ describe('PlanDetail', () => {
     await user.click(confirm);
     await waitFor(() => expect(cache.phase).toBe('finalized'));
     expect(await screen.findByText('1 VM finalized.')).toBeInTheDocument();
+  });
+
+  it('keeps Finalize all unavailable while the source VM of every VM awaiting finalize runs again, saying why (SDD §8.1, §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-2d5c8b93')!;
+    const cache = server.migrations.find((m) => m.vm.name === 'web-cache-01')!;
+    cache.source_running_at = '2026-10-08T11:00:00Z';
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const row = within(await screen.findByRole('region', { name: 'Awaiting finalize' })).getByRole('listitem', { name: 'web-cache-01' });
+    expect(row).toHaveTextContent('Source VM running');
+    const all = within(screen.getByRole('group', { name: /plan actions/i })).getByRole('button', { name: 'Finalize all' });
+    expect(all).toHaveAttribute('aria-disabled', 'true');
+    expect(all).toHaveAccessibleDescription('The source VM of web-cache-01 runs again: stop it, or roll it back, before finalizing.');
+  });
+
+  it('finalizes the VMs whose source is stopped and names those it skips because their source VM runs again (SDD §8.1, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const other = server.migrations.find((m) => m.plan_id === plan.id && m.id !== web01.id && wave.vm_ids.includes(m.vm.source_id))!;
+    Object.assign(other, { phase: 'completed', source_running_at: '2026-10-08T11:00:00Z' });
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    await user.click(within(queue).getByRole('button', { name: `Finalize wave ${wave.name}` }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Finalize 1 VM of ${wave.name}?` });
+    expect(within(dialog).getByRole('list', { name: 'VMs to finalize' })).toHaveTextContent(/^web-01$/);
+    expect(dialog).toHaveTextContent(`${other.vm.name} is skipped: its source VM runs again. Stop it, or roll it back, before finalizing it.`);
+    await user.type(within(dialog).getByLabelText(`Type ${wave.name} to confirm`), wave.name);
+    await user.click(within(dialog).getByRole('button', { name: 'Finalize wave' }));
+    await waitFor(() => expect(web01.phase).toBe('finalized'));
+    expect(other.phase).toBe('completed');
+  });
+
+  it('keeps Finalize wave unavailable while the source VM of every VM of the wave runs again, saying why (SDD §8.1, §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = server.migrations.find((m) => m.vm.name === 'web-01')!;
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    web01.source_running_at = '2026-10-08T11:00:00Z';
+    // a VM of another wave awaits finalize with its source stopped: the plan's finalize is offered, this wave's is not
+    const elsewhere = server.migrations.find((m) => m.plan_id === plan.id && !wave.vm_ids.includes(m.vm.source_id))!;
+    const other = plan.waves.find((w) => w.vm_ids.includes(elsewhere.vm.source_id))!;
+    elsewhere.phase = 'completed';
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'approver', server });
+    const queue = await screen.findByRole('region', { name: 'Awaiting finalize' });
+    const button = within(queue).getByRole('button', { name: `Finalize wave ${wave.name}` });
+    expect(button).toHaveAttribute('aria-disabled', 'true');
+    expect(button).toHaveAccessibleDescription('The source VM of web-01 runs again: stop it, or roll it back, before finalizing.');
+    expect(within(queue).getByRole('button', { name: `Finalize wave ${other.name}` })).not.toHaveAttribute('aria-disabled');
   });
 
   it('says why a VM in the finalize queue needs a look on hover, focus and tap, never only in a title (SDD §16)', async () => {

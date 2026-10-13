@@ -171,7 +171,10 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
       return canTransition(m.phase, 'cancelled') ? ok : no('Cancel is not possible once cutover has started or the migration has ended.');
     case 'finalize':
       if (m.phase === 'finalized') return no('Already finalized.');
-      return m.phase === 'completed' ? ok : no('Finalize becomes available once the migration is completed and verified.');
+      if (m.phase !== 'completed') return no('Finalize becomes available once the migration is completed and verified.');
+      // SDD §8.1 (the owner's choice): the API refuses it while the source runs again - unless a finalize began deleting
+      // the source, as a rollback is refused then
+      return m.source_running_at && m.checkpoint !== 'finalizing' ? no('The source VM runs again: stop it, or roll it back, before finalizing.') : ok;
   }
 }
 

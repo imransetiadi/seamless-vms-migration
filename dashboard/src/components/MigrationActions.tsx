@@ -6,7 +6,6 @@ import {
   RefreshCw,
   RotateCcw,
   ThumbsUp,
-  TriangleAlert,
   Undo2,
   Zap,
   type LucideIcon,
@@ -437,13 +436,6 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         requireText={m.vm.name}
         onConfirm={() => submit({ action: 'finalize', body: { confirm: m.vm.name, delete_source: deleteSource } })}
       >
-        {m.source_running_at && (
-          // the source watch saw it running (SDD §8.1, ADV-19)
-          <p className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-2.5 text-sm text-foreground">
-            <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
-            The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.
-          </p>
-        )}
         <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">
           <input id={deleteId} type="checkbox" className="mt-1 size-4 accent-accent" checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)} />
           <span>

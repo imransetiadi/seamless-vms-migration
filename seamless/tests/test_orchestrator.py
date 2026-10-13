@@ -5563,6 +5563,70 @@ async def test_a_finalize_step_errors_reason_is_redacted_and_cut(tmp_path, store
     assert len(skipped["reason"]) <= len("finalize failed: ") + 500
 
 
+RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before finalizing"
+
+
+async def _watch(h, plan, vm_id="vm-1"):
+    """One source watch, past its interval, and the migration it looked at (SDD §8.1)."""
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    if h.orch._watch_task is not None:
+        await h.orch._watch_task
+    return await h.by_vm(plan.id, vm_id)
+
+
+async def test_finalize_is_refused_while_the_source_vm_runs_again(tmp_path, store):
+    """SDD §8.1 (the owner's choice, 2026-10-13): while the source watch sees the source VM running
+    again, a finalize answers 409 - it would keep a source that diverged, or delete it with what it
+    wrote since - and a bulk finalize skips that VM with the reason. Seen stopped again, it
+    finalizes."""
+    h, plan = await _completed_plan(tmp_path, store, n=2, waves=[])
+    m1, m2 = [await h.by_vm(plan.id, v) for v in ("vm-1", "vm-2")]
+    # the fake source keeps its VMs running after a simulated cutover: only vm-1 runs again
+    for vm_id, state in (("vm-1", "running"), ("vm-2", "stopped")):
+        h.source.vms[vm_id] = h.source.vms[vm_id].model_copy(update={"power_state": state})
+    assert (await _watch(h, plan)).source_running_at is not None
+    assert (await h.by_vm(plan.id, "vm-2")).source_running_at is None
+    for delete_source in (False, True):
+        with pytest.raises(NotAllowed, match=f"^{RUNS_AGAIN}$"):
+            await h.orch.finalize(m1.id, "rina", delete_source=delete_source, confirm=m1.vm.name)
+    assert (await h.migration(m1.id)).phase == P.completed
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert out == {"finalized": [m2.id], "skipped": [{"migration_id": m1.id, "reason": RUNS_AGAIN}]}
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+    assert (await _watch(h, plan)).source_running_at is None
+    assert (await h.orch.finalize(m1.id, "rina", confirm=m1.vm.name)).phase == P.finalized
+    await h.orch.stop()
+
+
+async def test_a_finalize_that_began_deleting_the_source_finishes_while_it_runs(tmp_path, store):
+    """SDD §8.1: the exception - a migration whose finalize began deleting the source (checkpoint
+    "finalizing") cannot be rolled back, so finalizing it again from its own page stays its way
+    out even while the source watch sees the VM running; a bulk finalize skips it, as it skips
+    every VM whose source runs again (the plan's summaries carry no checkpoint)."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    failed: list[str] = []
+
+    async def finalize(ctx):
+        if not failed:
+            failed.append(ctx.migration.id)
+            raise TransientStepError("finalize: src-osp: call timed out after 300 s")
+        return StepResult(details={"source_deleted": True})
+
+    h.executor.hooks[StepName.FINALIZE] = finalize
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    seen = await _watch(h, plan)
+    assert (seen.checkpoint, seen.source_running_at is not None) == ("finalizing", True)
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert out == {"finalized": [], "skipped": [{"migration_id": m.id, "reason": RUNS_AGAIN}]}
+    done = await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    assert done.phase == P.finalized
+    await h.orch.stop()
+
+
 async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_path, store):
     """SDD §8.1: the source VM of a migration awaiting finalize runs again: its data diverges."""
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
