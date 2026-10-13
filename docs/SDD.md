@@ -1378,8 +1378,12 @@ migration emits `migration.source_stopped` (data `{"power_state"}`), so every vi
 the timeline records it. Any other power state — `paused`, `transitioning` (a reboot or a resize), `error`, `unknown` —
 leaves `source_running_at` as it is: the VM was not seen stopped, and the alert keeps the time it was first seen. A rollback clears `source_running_at`: it starts the source on purpose, and a migration that
 completes again is watched afresh (in demo mode the rollback also drops the power the demo set). A VM
-the provider no longer has (a storage handover rebuilt it, a finalize deleted it) and a provider error are skipped
-(logged), never a failure. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
+the provider no longer has — `get_vm` raises `VMNotFound` (§10): a storage handover rebuilt it, a finalize deleted it, or
+someone deleted the source after it ran again — is not running: while `source_running_at` is set, the watch clears it
+and emits `migration.source_stopped` (data `{"power_state": null, "gone": true}`), so Finalize works again, with no
+source left to keep or delete (the owner's choice, 2026-10-14) — deleting a diverged source in its cloud is a way out
+too; without the flag it is skipped. A provider error is skipped (logged), never a failure, and leaves the flag as it
+is: only a cloud that answers can say the VM is gone. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
 
 **Bulk finalize.** `POST /plans/{id}/finalize {"wave_id": str|null, "confirm": str, "delete_source": bool = false}`
@@ -1600,7 +1604,8 @@ the suggestion; the advisor's part waits for ADV-11 (`TODO(ADV-18): confirm`).
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]          # capabilities; raises ProviderError
     async def list_vms(self) -> list[VMRef]
-    async def get_vm(self, source_id: str) -> VMRef
+    async def get_vm(self, source_id: str) -> VMRef     # raises VMNotFound (a ProviderError) when the cloud answers
+                                                         # it has no such VM; any other failure stays ProviderError
     async def inventory(self) -> SourceInventory     # networks (name→mtu), projects, …
 
 class DestinationProvider(Protocol):
