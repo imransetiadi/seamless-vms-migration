@@ -1348,7 +1348,9 @@ writes data RHOSO no longer receives — stop it, or roll back. While `source_ru
 answers 409 "the source VM runs again: stop it, or roll it back, before finalizing" (the owner's choice, 2026-10-13):
 a finalize would keep a source that diverged, or delete it with what it wrote since. A migration whose checkpoint is
 `finalizing` is the exception — its finalize began deleting the source, and a rollback is refused then, so finalizing
-again is its way out. Seen stopped again, `source_running_at` clears and the
+it again from its own page is its way out; a bulk finalize skips every migration whose source VM runs again, that one
+too, so what it finalizes is known from the plan's summaries (§4), which carry no checkpoint. Seen stopped again,
+`source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
 the timeline records it. Any other power state — `paused`, `transitioning` (a reboot or a resize), `error`, `unknown` —
 leaves `source_running_at` as it is: the VM was not seen stopped, and the alert keeps the time it was first seen. A rollback clears `source_running_at`: it starts the source on purpose, and a migration that
@@ -1362,7 +1364,7 @@ outside demo mode) sets a fake source VM's power state, so the alert shows on th
 `completed` migration of the wave or the plan with one approval: each one as `POST …/finalize` does it (its
 `migration.phase` and `migration.action` events, with the approver as actor), and one `plan.finalized` event whose
 data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, one whose
-source VM runs again (the 409 of `POST …/finalize`), or one whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
+source VM runs again (the reason `POST …/finalize` gives), or one whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
 `completed` for a later finalize, and one VM's error never stops the others. It answers
 `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
 
@@ -2439,7 +2441,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   waiting for approval take the summary's eligible strategies; its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
-  the counts) and no Start, nor does a Finalized one; Cancel plan (operator; danger, one confirmation that types the
+  the counts; the confirmation counts and lists only the VMs it finalizes and names those whose source VM runs
+  again, which it skips, with the reason, and while the source VM of every VM in its scope runs again the action is
+  unavailable, saying so) and no Start, nor does a Finalized one; Cancel plan (operator; danger, one confirmation that types the
   plan's name and says its migrations are cancelled, its VMs freed for another plan and its history kept,
   `POST /plans/{id}/cancel`) is offered while no migration has started and the plan is not running — otherwise it
   stays unavailable, saying why: pause the plan first, or which VMs have started (as the API names them) — and a
