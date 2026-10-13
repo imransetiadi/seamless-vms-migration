@@ -154,6 +154,15 @@ def _matches(value: Any, wanted: Any) -> bool:
     return value == wanted
 
 
+def _index_names(conn: sa.Connection) -> set[str]:
+    """The index names the database has: the current schema's on PostgreSQL, every one on SQLite."""
+    if conn.dialect.name == "postgresql":
+        query = "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+    else:
+        query = "SELECT name FROM sqlite_master WHERE type = 'index'"
+    return {row[0] for row in conn.execute(sa.text(query))}
+
+
 class Store:
     """Synchronous store; see the module docstring."""
 
@@ -165,10 +174,14 @@ class Store:
     def create_schema(self) -> None:
         metadata.create_all(self.engine, checkfirst=True)
         # create_all skips the indexes of tables that already exist, and expression indexes
-        # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
+        # cannot be reflected: add the missing ones by name. A complete schema takes no DDL -
+        # PostgreSQL lets only a table's owner run CREATE INDEX, even IF NOT EXISTS, and the
+        # application role need not own the tables (SDD §11, Security.md §9.4)
         with self.engine.begin() as conn:
+            existing = _index_names(conn)
             for index in (*documents.indexes, *events.indexes):
-                conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
+                if index.name not in existing:
+                    conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
         self.engine.dispose()

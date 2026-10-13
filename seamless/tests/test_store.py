@@ -1,3 +1,4 @@
+import secrets
 import threading
 
 import pytest
@@ -7,6 +8,7 @@ from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.store import ConflictError, NotFound, Store
+from tests.conftest import PG_URL
 from tests.factories import make_migration, make_plan, make_provider
 
 
@@ -491,3 +493,70 @@ def test_a_closed_cross_process_lock_acquires_nothing_more(any_store: Store):
     other = any_store.cross_process_lock("vm-claims")
     assert other.try_acquire()
     other.release()
+
+
+def _statements_of(store: Store, call) -> list[str]:
+    seen: list[str] = []
+
+    def capture(conn, cursor, statement, params, context, executemany):
+        seen.append(statement.strip())
+
+    sa.event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        call()
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", capture)
+    return seen
+
+
+def test_create_schema_on_a_complete_schema_issues_no_ddl(any_store: Store):
+    """SDD §11 (docs drift DD-01): PostgreSQL lets only a table's owner run CREATE INDEX, even
+    IF NOT EXISTS, and every server start calls create_schema - on a complete schema it issues no
+    DDL, so a role that does not own the tables (Security.md §9.4) can start the control plane."""
+    seen = _statements_of(any_store, any_store.create_schema)
+    ddl = [s for s in seen if s.split()[0].upper() in ("CREATE", "ALTER", "DROP")]
+    assert ddl == []
+
+
+def test_create_schema_adds_only_the_index_a_table_lacks(any_store: Store):
+    with any_store.engine.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ix_events_kind_seq"))
+    seen = _statements_of(any_store, any_store.create_schema)
+    created = [s for s in seen if s.split()[0].upper() == "CREATE"]
+    assert len(created) == 1 and "ix_events_kind_seq" in created[0]
+    seen = _statements_of(any_store, any_store.create_schema)
+    assert not [s for s in seen if s.split()[0].upper() == "CREATE"], "it is there again"
+
+
+@pytest.mark.skipif(not PG_URL, reason="SEAMLESS_TEST_PG_URL is not set")
+def test_a_role_that_does_not_own_the_tables_starts_once_the_owner_created_them():
+    """SDD §11, Security.md §9.4: the application role - no table ownership, events insert-only -
+    starts the control plane (create_schema) once the owner created the schema, writes documents and
+    events, and cannot rewrite the audit trail."""
+    owner = Store(PG_URL)
+    owner.create_schema()
+    url = sa.engine.make_url(PG_URL)
+    role, password = f"seamless_app_{secrets.token_hex(4)}", secrets.token_urlsafe(16)
+    with owner.engine.begin() as conn:
+        conn.execute(sa.text(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        conn.execute(sa.text(f'GRANT CONNECT ON DATABASE "{url.database}" TO {role}'))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT ON events TO {role}"))
+        conn.execute(sa.text(f"GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO {role}"))
+    app = Store(url.set(username=role, password=password).render_as_string(hide_password=False))
+    try:
+        app.create_schema()  # what every server start and CLI command runs
+        app.put("migration", make_migration(), expected_version=0)
+        app.append_event(Event(kind="plan.created", message="as the application role"))
+        with pytest.raises(sa.exc.ProgrammingError, match="permission denied"):
+            with app.engine.begin() as conn:
+                conn.execute(sa.text("UPDATE events SET message = 'rewritten'"))
+    finally:
+        app.dispose()
+        with owner.engine.begin() as conn:
+            conn.execute(sa.text(f"REVOKE ALL ON documents, events FROM {role}"))
+            conn.execute(sa.text(f"REVOKE ALL ON SEQUENCE events_seq_seq FROM {role}"))
+            conn.execute(sa.text(f'REVOKE CONNECT ON DATABASE "{url.database}" FROM {role}'))
+            conn.execute(sa.text(f"DROP ROLE {role}"))
+        owner.truncate_for_tests()
+        owner.dispose()
