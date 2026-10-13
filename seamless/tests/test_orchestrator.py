@@ -3894,6 +3894,8 @@ async def test_similar_incidents_attached_on_failure(tmp_path, store):
         if any(n.kind == "similar_incidents" for n in m.advisor_notes):
             break
         await asyncio.sleep(0.01)
+    # the note is saved before its event (SDD §14.3): stopping on the note alone would cancel it
+    await h.wait_kind("advisor.similar_incidents")
     await h.orch.stop()
     [note] = [n for n in m.advisor_notes if n.kind == "similar_incidents"]
     assert note.source == "memory" and note.data["hits"][0]["title"].startswith("Attach")
