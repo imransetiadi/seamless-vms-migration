@@ -76,11 +76,15 @@
   register: import_from_hypervisor_disk_paths
   changed_when: false
 
+# find already picks the files by name. The config drive is left out (SDD §6.6): Nova gives
+# the destination server its own and records no format for it at spawn, and carried over it
+# would be a data disk holding the source's metadata. (Matching the whole path here once
+# dropped every disk of an instances path that contained "disk", any character, "info".)
 - name: Parse disk paths
   ansible.builtin.set_fact:
     import_from_hypervisor_disks_found: >-
-      {{ import_from_hypervisor_disk_paths.stdout_lines
-         | select('match', '.*disk.*') | reject('search', 'disk.info') | list }}
+      {{ import_from_hypervisor_disk_paths.stdout_lines | map('trim') | select
+         | reject('search', '/disk[.]config$') | list }}
 
 - name: Fail if no disks found
   ansible.builtin.fail:
@@ -92,6 +96,76 @@
 - name: Display found disks
   ansible.builtin.debug:
     msg: "Found {{ import_from_hypervisor_disks_found | length }} disk(s): {{ import_from_hypervisor_disks_found }}"
+
+# SDD §6.6: qemu never guesses a disk's format. A raw disk's first block is the guest's: probed,
+# a qcow2 header written there would make qemu-nbd (run with sudo) follow a backing file of the
+# guest's choosing. Nova records each disk's format in disk.info (one line of JSON, path ->
+# format) when it first opens the disk, before the guest runs.
+- name: Set the path of the instance's disk.info
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disk_info_path: >-
+      {{ os_migrate_nbdkit_nova_instances_dir ~ '/' ~ import_from_hypervisor_instance_id ~ '/disk.info' }}
+    import_from_hypervisor_recorded_formats: {}
+    import_from_hypervisor_disk_formats: {}
+
+- name: Read the disk formats Nova recorded
+  ansible.builtin.raw: cat {{ import_from_hypervisor_disk_info_path | quote }}
+  delegate_to: "{{ import_from_hypervisor_host }}"
+  register: import_from_hypervisor_disk_info_file
+  changed_when: false
+  failed_when: false
+
+- name: Parse the disk formats Nova recorded
+  block:
+    - name: Parse disk.info
+      ansible.builtin.set_fact:
+        import_from_hypervisor_recorded_formats: "{{ import_from_hypervisor_disk_info_file.stdout | from_json }}"
+      when: import_from_hypervisor_disk_info_file.rc == 0
+
+    - name: Refuse a disk.info that is missing or no map of disk to format
+      ansible.builtin.assert:
+        that:
+          - import_from_hypervisor_disk_info_file.rc == 0
+          - import_from_hypervisor_recorded_formats is mapping
+          - import_from_hypervisor_recorded_formats | length > 0
+        quiet: true
+  rescue:
+    - name: Refuse the export without the formats Nova recorded
+      ansible.builtin.fail:
+        msg: >-
+          cannot read the disk formats Nova recorded in {{ import_from_hypervisor_disk_info_path }}
+          (missing, or not one JSON map of disk path to format): refusing to let qemu guess them
+
+# entries are matched by file name: they name this instance directory's files, and
+# os_migrate_nbdkit_nova_instances_dir may spell the directory differently than Nova
+- name: Match each disk to the formats Nova recorded for its file name
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disk_formats: >-
+      {{ import_from_hypervisor_disk_formats | combine({
+           disk_path: import_from_hypervisor_recorded_formats | dict2items
+             | selectattr('key', 'match', '^(.*/)?' ~ (disk_path | basename | regex_escape) ~ '$')
+             | map(attribute='value') | unique | list
+         }) }}
+  loop: "{{ import_from_hypervisor_disks_found }}"
+  loop_control:
+    loop_var: disk_path
+    label: "{{ disk_path | basename }}"
+
+- name: Refuse a disk without one plain format recorded for it
+  ansible.builtin.assert:
+    that: >-
+      (import_from_hypervisor_disk_formats[disk_path] | length == 1)
+      and (import_from_hypervisor_disk_formats[disk_path] | first is string)
+      and (import_from_hypervisor_disk_formats[disk_path] | first is match('^[a-z0-9]+$'))
+    fail_msg: >-
+      {{ disk_path }}: {{ import_from_hypervisor_disk_info_path }} records
+      {{ import_from_hypervisor_disk_formats[disk_path] | to_json }} as its format, not one
+      plain name: refusing to let qemu guess it
+    quiet: true
+  loop: "{{ import_from_hypervisor_disks_found }}"
+  loop_control:
+    loop_var: disk_path
+    label: "{{ disk_path | basename }}"
 
 - name: Initialize nbdkit disk info list
   ansible.builtin.set_fact:

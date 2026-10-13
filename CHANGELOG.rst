@@ -202,3 +202,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   it. Before, such a problem failed a pass that may copy a disk for hours,
   although it could be fixed while the copy ran. The cutover's check still
   refuses it before the source stops.
+- ``import_from_hypervisor`` never lets qemu guess a disk's format. It takes
+  each disk's format from the instance's ``disk.info``, where Nova records it,
+  and passes it to ``qemu-img info -f`` and ``qemu-nbd --format``. Before, the
+  format came from ``qemu-img info`` without ``-f``: a raw disk whose first
+  block the guest had written as a qcow2 header was exported as qcow2, and
+  ``qemu-nbd``, run with sudo, followed the backing file that header named,
+  reading a file of the hypervisor into the destination volume. The role stops
+  before any export when ``disk.info`` is missing or unreadable, or records no
+  single plain format for a disk. It no longer exports the config drive
+  (``disk.config``): Nova gives the destination server its own. Disks are
+  picked by file name only: an instances path containing ``disk``, any
+  character, then ``info`` no longer hides every disk.

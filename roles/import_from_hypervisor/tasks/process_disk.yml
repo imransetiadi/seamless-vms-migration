@@ -7,8 +7,13 @@
     import_from_hypervisor_disk_name: "{{ disk_item | basename }}"
     import_from_hypervisor_disk_index: "{{ disk_loop_index }}"
 
+# the format Nova recorded in disk.info (workload.yml checked it): qemu never guesses it (SDD §6.6)
+- name: Take the disk's format from Nova's disk.info
+  ansible.builtin.set_fact:
+    import_from_hypervisor_disk_format: "{{ import_from_hypervisor_disk_formats[disk_item] | first }}"
+
 - name: Inspect disk with qemu-img info
-  ansible.builtin.raw: qemu-img info {{ disk_item | quote }}
+  ansible.builtin.raw: qemu-img info -f {{ import_from_hypervisor_disk_format | quote }} {{ disk_item | quote }}
   delegate_to: "{{ import_from_hypervisor_host }}"
   register: import_from_hypervisor_qemu_img_info
   changed_when: false
@@ -17,10 +22,8 @@
   ansible.builtin.debug:
     msg: "{{ import_from_hypervisor_disk_name }}: {{ import_from_hypervisor_qemu_img_info.stdout }}"
 
-- name: Parse disk format and size
+- name: Parse disk size
   ansible.builtin.set_fact:
-    import_from_hypervisor_format_match: >-
-      {{ import_from_hypervisor_qemu_img_info.stdout | regex_search('file format: (\w+)', '\1') }}
     # the exact byte count every qemu-img version prints, whatever unit it rounds to:
     # "virtual size: 1.5 GiB (1610612736 bytes)", or "virtual size: 10G (10737418240 bytes)"
     # before qemu 4.0
@@ -37,8 +40,6 @@
 
 - name: Set disk properties
   ansible.builtin.set_fact:
-    import_from_hypervisor_disk_format: >-
-      {{ import_from_hypervisor_format_match | first | trim if import_from_hypervisor_format_match else 'qcow2' }}
     # whole GiB, rounded up: the destination volume is never smaller than the disk
     import_from_hypervisor_disk_size_gb: >-
       {{ ((import_from_hypervisor_size_match | first | int) / 1073741824) | round(0, 'ceil') | int }}

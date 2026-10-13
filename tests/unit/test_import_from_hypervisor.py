@@ -11,6 +11,7 @@ __metaclass__ = type
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -47,12 +48,28 @@ os.setsid()
 os.execvp(sys.argv[1], sys.argv[1:])
 """
 
-QEMU_IMG = """#!/bin/sh
-echo "image: $2"
-echo "file format: qcow2"
-# a disk file may hold the size line this qemu-img reports for it; an empty one is 10 GiB
-if [ -s "$2" ]; then cat "$2"; else echo "virtual size: 10 GiB (10737418240 bytes)"; fi
+QEMU_IMG = """#!%(python)s
+import json, sys
+args = sys.argv[1:]
+with open(%(img_records)r, "a") as f:
+    f.write(json.dumps(args) + "\\n")
+path = args[-1]
+with open(path, "rb") as f:
+    data = f.read()
+if "-f" in args:
+    fmt = args[args.index("-f") + 1]
+else:
+    # like qemu, guess the format from the content: a qcow2 header reads as qcow2, whatever wrote it
+    fmt = "qcow2" if data.startswith(b"QFI\\xfb") else "raw"
+print("image: " + path)
+print("file format: " + fmt)
+# a disk file may hold the size line this qemu-img reports for it; otherwise it is 10 GiB
+sizes = [line for line in data.decode("latin-1").splitlines() if line.startswith("virtual size:")]
+print(sizes[0] if sizes else "virtual size: 10 GiB (10737418240 bytes)")
 """
+
+# the first bytes of a qcow2 file: its magic and version 3
+QCOW2_HEADER = b"QFI\xfb\x00\x00\x00\x03"
 
 QEMU_NBD = """#!%(python)s
 import json, os, signal, sys, time
@@ -95,6 +112,7 @@ class Hypervisor:
         self.bin = os.path.join(root, "bin")
         self.listening = os.path.join(root, "listening")
         self.records = os.path.join(root, "qemu-nbd.jsonl")
+        self.img_records = os.path.join(root, "qemu-img.jsonl")
         self.log_dir = os.path.join(root, "var", "log", "os-migrate-nbd")
         for path in (self.bin, self.listening):
             os.makedirs(path)
@@ -104,14 +122,17 @@ class Hypervisor:
             path = os.path.join(self.bin, name)
             with open(path, "w") as f:
                 f.write(text % {"python": sys.executable, "records": self.records,
-                                "listening": self.listening})
+                                "img_records": self.img_records, "listening": self.listening})
             os.chmod(path, 0o755)
         # A space in the instances path checks that paths are quoted.
         self.instances = os.path.join(root, "nova instances")
         self.disk_dir = os.path.join(self.instances, "srv-1")
         os.makedirs(self.disk_dir)
-        for name in ("disk", "disk.eph0", "disk.info"):
-            open(os.path.join(self.disk_dir, name), "w").close()
+        # a qcow2 root disk and ephemeral disk, and the formats Nova recorded for them
+        for name in ("disk", "disk.eph0"):
+            with open(os.path.join(self.disk_dir, name), "wb") as f:
+                f.write(QCOW2_HEADER)
+        self.record_formats({"disk": "qcow2", "disk.eph0": "qcow2"})
         self.data_dir = os.path.join(root, "data")
         os.makedirs(self.data_dir)
         self.workloads = os.path.join(self.data_dir, "workloads.yml")
@@ -166,10 +187,23 @@ class Hypervisor:
         )
         return proc.returncode, proc.stdout
 
+    def record_formats(self, formats):
+        """Write disk.info as Nova does: one line of JSON, each disk's path -> its format (a name
+        is a file of this instance's directory, an absolute path is kept as it is)."""
+        recorded = {os.path.join(self.disk_dir, name): fmt for name, fmt in formats.items()}
+        with open(os.path.join(self.disk_dir, "disk.info"), "w") as f:
+            f.write(json.dumps(recorded) + "\n")
+
     def started(self):
         if not os.path.exists(self.records):
             return []
         with open(self.records) as f:
+            return [json.loads(line) for line in f]
+
+    def qemu_img_calls(self):
+        if not os.path.exists(self.img_records):
+            return []
+        with open(self.img_records) as f:
             return [json.loads(line) for line in f]
 
     def nbdkit_disks(self):
@@ -247,6 +281,89 @@ def test_a_disk_whose_size_cannot_be_read_fails_the_export(hypervisor):
     assert rc != 0
     assert "cannot read the virtual size" in out
     assert hypervisor.nbdkit_disks() is None
+
+
+def test_the_format_comes_from_nova_disk_info_never_from_the_disk(hypervisor):
+    """SDD §6.6: a raw disk's first block is the guest's. A qcow2 header the guest wrote there must
+    not make qemu-nbd, run with sudo, follow a backing file of the guest's choosing."""
+    disk, eph0 = (os.path.join(hypervisor.disk_dir, name) for name in ("disk", "disk.eph0"))
+    with open(disk, "wb") as f:
+        f.write(QCOW2_HEADER + b"\nbacking file: /etc/shadow\n")
+    hypervisor.record_formats({"disk": "raw", "disk.eph0": "qcow2"})
+
+    rc, out = hypervisor.run()
+
+    assert rc == 0, out
+    exported = {entry["argv"][-1]: entry["argv"] for entry in hypervisor.started()}
+    assert "--format=raw" in exported[disk]
+    assert "--format=qcow2" in exported[eph0]
+    # qemu-img is told the format as well: nothing probes the disk
+    assert sorted(hypervisor.qemu_img_calls()) == [["info", "-f", "qcow2", eph0], ["info", "-f", "raw", disk]]
+
+
+@pytest.mark.parametrize(
+    ("disk_info", "named"),
+    [
+        (None, "disk.info"),  # no disk.info at all
+        ("not json\n", "disk.info"),
+        ('["disk", "disk.eph0"]\n', "disk.info"),  # not a map of disk -> format
+        ({"disk": "qcow2"}, "disk.eph0"),  # a disk it records no format for
+        ({"disk": "qcow2", "disk.eph0": "qcow2 --object x"}, "disk.eph0"),  # not a plain name
+        ({"disk": "qcow2", "/old/instances/srv-1/disk": "raw", "disk.eph0": "qcow2"}, "disk"),  # two formats
+    ],
+    ids=["missing", "not-json", "not-a-map", "unrecorded-disk", "not-a-plain-name", "two-formats"],
+)
+def test_a_disk_without_one_recorded_format_is_refused_before_any_export(hypervisor, disk_info, named):
+    path = os.path.join(hypervisor.disk_dir, "disk.info")
+    if disk_info is None:
+        os.remove(path)
+    elif isinstance(disk_info, dict):
+        hypervisor.record_formats(disk_info)
+    else:
+        with open(path, "w") as f:
+            f.write(disk_info)
+
+    rc, out = hypervisor.run()
+
+    assert rc != 0
+    assert "refusing to let qemu guess" in out
+    assert os.path.join(hypervisor.disk_dir, named) in out
+    if named == "disk.info":
+        # refused by the disk.info check itself, not by a later step tripping over what it let through
+        assert re.search(r"fatal: \[localhost\]: FAILED! => .*cannot read the disk formats Nova recorded", out)
+    assert hypervisor.started() == []
+    assert hypervisor.nbdkit_disks() is None
+
+
+def test_disk_info_entries_are_matched_by_file_name(hypervisor):
+    """Nova keys disk.info by its own instances path; os_migrate_nbdkit_nova_instances_dir may
+    spell the same directory differently (here with a trailing slash)."""
+    hypervisor.record_formats({
+        "/var/lib/nova/instances/srv-1/disk": "raw",
+        "/var/lib/nova/instances/srv-1/disk.eph0": "qcow2",
+    })  # fmt: skip
+
+    rc, out = hypervisor.run(os_migrate_nbdkit_nova_instances_dir=hypervisor.instances + "/")
+
+    assert rc == 0, out
+    formats = [[a for a in entry["argv"] if a.startswith("--format=")] for entry in hypervisor.started()]
+    assert formats == [["--format=raw"], ["--format=qcow2"]]
+
+
+def test_the_config_drive_is_not_exported(hypervisor):
+    """SDD §6.6: Nova gives the destination server a config drive of its own and records no format
+    for the source's at spawn; carried over, it would be a data disk with the source's metadata."""
+    with open(os.path.join(hypervisor.disk_dir, "disk.config"), "wb") as f:
+        f.write(b"\0" * 64)  # an ISO 9660 image starts with its system area
+
+    rc, out = hypervisor.run()
+
+    assert rc == 0, out
+    assert [entry["argv"][-1] for entry in hypervisor.started()] == [
+        os.path.join(hypervisor.disk_dir, "disk"),
+        os.path.join(hypervisor.disk_dir, "disk.eph0"),
+    ]
+    assert [d["device"] for d in hypervisor.nbdkit_disks()] == ["/dev/vda", "/dev/vdb"]
 
 
 def test_tcp_protocol_refuses_a_loopback_export(hypervisor):
