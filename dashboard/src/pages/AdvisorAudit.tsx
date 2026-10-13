@@ -1,7 +1,7 @@
 import { Download, FileJson, ScrollText, SearchX } from 'lucide-react';
 import { useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { fetchEventTail, useApi, useEventTail, usePlans, useProviders } from '../api/hooks';
+import { fetchEventTail, useApi, useEventTail, usePlans, usePolicies, useProviders } from '../api/hooks';
 import type { Event } from '../api/types';
 import { AUDIT_EVENT_KINDS } from '../api/types';
 import { Button } from '../components/Button';
@@ -92,6 +92,9 @@ export default function AdvisorAudit() {
     () => new Map([...(providers.data ?? []), ...(plans.data ?? [])].map((x) => [x.id, x.name] as [string, string])),
     [providers.data, plans.data],
   );
+  // the policies that still exist: a policy event links to its card, a deleted one's name is marked (SDD §14.5)
+  const policies = usePolicies();
+  const policyIds = useMemo(() => (policies.data ? new Set(policies.data.items.map((p) => p.id)) : null), [policies.data]);
   const actors = useMemo(() => [...new Set(events.map((e) => e.actor))].sort(), [events]);
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -212,9 +215,19 @@ export default function AdvisorAudit() {
                       <td className="font-mono text-xs">{e.actor}</td>
                       <td>
                         {target && e.kind.startsWith('policy.') ? (
-                          <Link to="/advisor/policies" className="underline underline-offset-4">
-                            {policyName || target}
-                          </Link>
+                          policyIds?.has(target) === false ? (
+                            <span>
+                              {policyName || target} <span className="text-muted-foreground">(deleted)</span>
+                            </span>
+                          ) : (
+                            // its card while it exists; the policies page while that is unknown (ADV-20)
+                            <Link
+                              to={policyIds ? `/advisor/policies#policy-${encodeURIComponent(target)}` : '/advisor/policies'}
+                              className="underline underline-offset-4"
+                            >
+                              {policyName || target}
+                            </Link>
+                          )
                         ) : target && forced ? (
                           <Link to={`/migrations/${encodeURIComponent(target)}`} className="font-mono underline underline-offset-4">
                             {text(e.data.vm) || target}

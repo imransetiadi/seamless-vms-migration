@@ -30,9 +30,11 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(kept).toHaveTextContent('policy:global-default');
     expect(kept).toHaveTextContent('jev-1.13.0');
     expect(within(kept).getByRole('link', { name: 'static-cdn-01' })).toHaveAttribute('href', '/advisor/recommendations/rec-d4e6f8a09001');
-    // a policy change names the policy and leads to the policies page
+    // a policy change names the policy and leads to its card on the policies page (SDD §14.5, ADV-20)
     const policy = rows.find((r) => within(r).queryByText('Policy created'))!;
-    expect(within(policy).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies');
+    await waitFor(() =>
+      expect(within(policy).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies#policy-pol-finance'),
+    );
     expect(policy).toHaveTextContent('user:rina');
   });
 
@@ -83,11 +85,42 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
         'Distinct approver: Required → Not required',
       ]),
     );
-    expect(within(changed!).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies');
+    expect(within(changed!).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies#policy-pol-finance');
     expect(again).toHaveTextContent('No setting changed');
     expect(within(again!).queryByRole('listitem')).not.toBeInTheDocument();
     expect(bare).not.toHaveTextContent('No setting changed');
     expect(within(bare!).queryByRole('listitem')).not.toBeInTheDocument();
+  });
+
+  it('marks a deleted policy in its rows instead of linking to a page that no longer shows it (SDD §14.5)', async () => {
+    const server = createTestServer();
+    expect(server.handle('DELETE', '/advisor/policies/pol-finance', new URLSearchParams(), undefined, 'admin').status).toBe(204);
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await auditTable();
+    const rows = within(table)
+      .getAllByRole('row')
+      .filter((r) => within(r).queryByText(/^Policy (created|deleted)$/));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      await waitFor(() => expect(row).toHaveTextContent('Finance — approval required (deleted)'));
+      expect(within(row).queryByRole('link')).not.toBeInTheDocument();
+    }
+  });
+
+  it('links a policy event to the policies page while the policies cannot be read (SDD §14.5)', async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    server.handle = (method, path, query, body, token) =>
+      method === 'GET' && path === '/advisor/policies'
+        ? { status: 400, body: { error: { code: 'bad_request', message: 'refused for the test' } } }
+        : handle(method, path, query, body, token);
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer', server });
+    const table = await auditTable();
+    const row = within(table)
+      .getAllByRole('row')
+      .find((r) => within(r).queryByText('Policy created'))!;
+    expect(within(row).getByRole('link', { name: 'Finance — approval required' })).toHaveAttribute('href', '/advisor/policies');
+    expect(row).not.toHaveTextContent('(deleted)');
   });
 
   it('says how many audit events its filters show from a live region already on the page, also when none match (SDD §16)', async () => {
