@@ -1,6 +1,6 @@
 import type { Approval, Migration, MigrationLike, Phase, Plan, Role } from '../api/types';
 import { completedSince, isOverdue } from './finalize';
-import { formatRelative } from './format';
+import { formatDateTime, formatDuration, formatRelative } from './format';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
@@ -78,6 +78,42 @@ export function waitsOnClosedWindow(m: Migration, plan: Plan | null | undefined,
   const w = plan?.cutover_window;
   if (!m.cutover_requested || m.force_window || !w) return false;
   return now < Date.parse(w.start) || now > Date.parse(w.end);
+}
+
+/** "a", "a and b", "a, b and c". */
+function inWords(parts: readonly string[]): string {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : (parts[0] ?? '');
+}
+
+/**
+ * What the Approve dialog says the approval leads to (SDD §5.4, §16). When the plan requires an approval, none counts
+ * yet and nothing else a person gives is missing, the approval lets the cutover start - the source VM then stops - and
+ * the button says so; otherwise the dialog names what the cutover still waits for, or why the approval changes nothing
+ * now.
+ */
+export function approveDialog(m: Migration, plan: Plan | null | undefined, now: number = Date.now()): { description: string; confirmLabel: string } {
+  const approve = (description: string) => ({ description, confirmLabel: 'Approve' });
+  if (!plan) return approve('Records your approval. What it leads to depends on the plan, which is not loaded.');
+  // a retry keeps the approvals and clears the request (SDD §5.1)
+  if (m.phase === 'failed' || m.phase === 'rolled_back') return approve('Records your approval for the next attempt: a retry keeps it, and its cutover is requested anew.');
+  if (!plan.require_approval) return approve('This plan needs no approval to cut over: yours is recorded in the audit trail.');
+  if (countedApprovals(m, plan).length > 0) return approve('Records your approval. The cutover has the approval it needs already.');
+  const w = plan.cutover_window;
+  const waits = [
+    !m.cutover_requested && !plan.auto_cutover ? 'a cutover request' : '',
+    w && !m.force_window && (now < Date.parse(w.start) || now > Date.parse(w.end)) ? `the cutover window (${formatDateTime(w.start)} → ${formatDateTime(w.end)})` : '',
+    m.advisor_hold ? "the advisor's decision" : '',
+  ].filter(Boolean);
+  if (waits.length) return approve(`Records your approval. The cutover still waits for ${inWords(waits)}.`);
+  const gate = 'the plan, its wave and a free cutover slot allow';
+  // a warm migration cuts over once it converged; a forced one after the running pass, at the downtime the force recorded
+  const passes = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
+  const when = !passes ? `as soon as ${gate}` : m.force_cutover ? `after the running pass, once ${gate}` : `once pre-copy has converged and ${gate}`;
+  const downtime = passes && m.force_cutover ? m.force_cutover.estimated_downtime_s : m.estimate?.downtime_s;
+  return {
+    description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts ${when}. Estimated downtime ${downtime === undefined ? 'unknown' : formatDuration(downtime)} against an SLO of ${formatDuration(plan.downtime_slo_s)}.`,
+    confirmLabel: 'Approve and cut over',
+  };
 }
 
 function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number, user: string | undefined): Availability {

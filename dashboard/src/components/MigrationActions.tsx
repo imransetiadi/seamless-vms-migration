@@ -22,7 +22,7 @@ import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
-import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, requestWaitsForApprover, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
+import { approveDialog, MIGRATION_ACTION_ORDER, migrationActions, nextStep, requestWaitsForApprover, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -160,6 +160,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
   const closedWindow = !windowOpen(plan);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
+  const approval = approveDialog(m, plan);
 
   // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
   const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));
@@ -244,8 +245,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         icon={ICON['approve']}
         subject={`Migration ${m.id}`}
         title={`Approve the cutover of ${m.vm.name}?`}
-        description={`Records your approval. The cutover still waits for a cutover request${plan?.auto_cutover ? ' (automatic in this plan)' : ''} and the window.`}
-        confirmLabel="Approve"
+        // what the approval leads to (SDD §5.4, §16): the one the gate waits for starts the cutover and stops the source
+        description={approval.description}
+        confirmLabel={approval.confirmLabel}
         onConfirm={() => submit({ action: 'approve', body: comment.trim() ? { comment: comment.trim() } : {} })}
       >
         {commentField}

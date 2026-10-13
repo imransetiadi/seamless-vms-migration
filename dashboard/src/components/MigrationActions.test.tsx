@@ -412,6 +412,24 @@ describe('MigrationActions', () => {
     expect(within(group).queryByRole('link', { name: 'See the recommendation' })).toBeNull();
   });
 
+  it('says in the Approve dialog that approving a requested cutover starts it and stops the source VM (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-fileserver-01, vmware_cold, ready
+    Object.assign(migration, { approvals: [], cutover_requested: true, cutover_requested_by: 'rina', advisor_hold: null });
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    Object.assign(plan, { require_approval: true, require_distinct_approver: true, auto_cutover: false, cutover_window: null });
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^approve$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Approve the cutover of ${migration.vm.name}?` });
+    expect(dialog).toHaveTextContent('Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts');
+    expect(dialog).not.toHaveTextContent('still waits for');
+    await user.click(within(dialog).getByRole('button', { name: 'Approve and cut over' }));
+    await waitFor(() => expect(server.migrations.find((x) => x.id === migration.id)!.approvals.map((a) => a.actor)).toEqual(['sari']));
+  });
+
   it('lets an approver request the cutover of a converged warm migration', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('app-billing-01', 'approver');

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
+import { formatDateTime, formatDuration } from './format';
+import { approveDialog, clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
 import { AUTH_OFF_HINT, OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
@@ -389,5 +390,87 @@ describe('what re-validation or a strategy change clears (SDD §5.4)', () => {
     expect(clearedByStrategyChange(migration('ready', { approvals: [approval], cutover_requested: true }))).toBe('1 approval and the cutover request');
     expect(clearedByStrategyChange(migration('ready', { cutover_requested: true }))).toBe('the cutover request');
     expect(clearedByStrategyChange(migration('ready'))).toBeNull();
+  });
+});
+
+describe('approveDialog (SDD §5.4, §16)', () => {
+  const now = Date.parse('2026-10-08T12:00:00Z');
+  const gate: Plan = {
+    ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+    require_approval: true,
+    require_distinct_approver: true,
+    auto_cutover: false,
+    cutover_window: null,
+  };
+  const later = { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' };
+  // another approver requested it and none counts yet: the approval is the one the gate waits for
+  const requested = (phase: Phase, overrides: Partial<Migration> = {}, strategy: Strategy = 'cold') =>
+    migration(phase, { approvals: [], cutover_requested: true, cutover_requested_by: 'rina', advisor_hold: null, force_cutover: null, force_window: false, ...overrides }, strategy);
+  const estimate = (m: Migration) => `Estimated downtime ${formatDuration(m.estimate!.downtime_s)} against an SLO of ${formatDuration(gate.downtime_slo_s)}.`;
+
+  it('says the approval starts the cutover, and stops the source VM, when it is all the gate waits for', () => {
+    for (const m of [requested('ready'), requested('awaiting_cutover', {}, 'warm')]) {
+      expect(approveDialog(m, gate, now)).toEqual({
+        description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts as soon as the plan, its wave and a free cutover slot allow. ${estimate(m)}`,
+        confirmLabel: 'Approve and cut over',
+      });
+    }
+  });
+
+  it('needs no request in a plan that cuts over automatically, nor a window it bypasses', () => {
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), { ...gate, auto_cutover: true }, now).confirmLabel).toBe('Approve and cut over');
+    expect(approveDialog(requested('ready', { force_window: true }), { ...gate, cutover_window: later }, now).confirmLabel).toBe('Approve and cut over');
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: { start: '2026-10-08T11:00:00Z', end: '2026-10-08T13:00:00Z' } }, now).confirmLabel).toBe('Approve and cut over');
+  });
+
+  it('starts a warm cutover once pre-copy converges, or after the running pass when forced', () => {
+    const early = requested('precopy', {}, 'warm');
+    expect(approveDialog(early, gate, now).description).toBe(
+      `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. ${estimate(early)}`,
+    );
+    const forced = requested('syncing', { cutover_requested_by: 'rina', force_cutover: FORCED }, 'warm');
+    expect(approveDialog(forced, gate, now)).toEqual({
+      description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts after the running pass, once the plan, its wave and a free cutover slot allow. Estimated downtime ${formatDuration(FORCED.estimated_downtime_s)} against an SLO of ${formatDuration(gate.downtime_slo_s)}.`,
+      confirmLabel: 'Approve and cut over',
+    });
+  });
+
+  it('names what the cutover still waits for, with Approve', () => {
+    const window = `the cutover window (${formatDateTime(later.start)} → ${formatDateTime(later.end)})`;
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), gate, now)).toEqual({
+      description: 'Records your approval. The cutover still waits for a cutover request.',
+      confirmLabel: 'Approve',
+    });
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: later }, now).description).toBe(`Records your approval. The cutover still waits for ${window}.`);
+    // a window that has ended holds the cutover too
+    const ended = { start: '2026-10-07T22:00:00Z', end: '2026-10-08T02:00:00Z' };
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: ended }, now).description).toBe(
+      `Records your approval. The cutover still waits for the cutover window (${formatDateTime(ended.start)} → ${formatDateTime(ended.end)}).`,
+    );
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), { ...gate, cutover_window: later }, now).description).toBe(
+      `Records your approval. The cutover still waits for a cutover request and ${window}.`,
+    );
+    expect(approveDialog(requested('ready', { advisor_hold: 'rec-1' }), gate, now)).toEqual({
+      description: "Records your approval. The cutover still waits for the advisor's decision.",
+      confirmLabel: 'Approve',
+    });
+  });
+
+  it('says when an approval counts already, the plan needs none, a retry keeps it or the plan is not loaded', () => {
+    const counted = requested('ready', { approvals: [{ actor: 'bayu', at: '2026-10-08T11:30:00Z', comment: null }] });
+    expect(approveDialog(counted, gate, now)).toEqual({ description: 'Records your approval. The cutover has the approval it needs already.', confirmLabel: 'Approve' });
+    expect(approveDialog(requested('ready'), { ...gate, require_approval: false }, now)).toEqual({
+      description: 'This plan needs no approval to cut over: yours is recorded in the audit trail.',
+      confirmLabel: 'Approve',
+    });
+    for (const phase of ['failed', 'rolled_back'] as const) {
+      expect(approveDialog(requested(phase), gate, now)).toEqual({
+        description: 'Records your approval for the next attempt: a retry keeps it, and its cutover is requested anew.',
+        confirmLabel: 'Approve',
+      });
+    }
+    for (const plan of [null, undefined]) {
+      expect(approveDialog(requested('ready'), plan, now)).toEqual({ description: 'Records your approval. What it leads to depends on the plan, which is not loaded.', confirmLabel: 'Approve' });
+    }
   });
 });

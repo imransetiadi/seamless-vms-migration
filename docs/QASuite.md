@@ -1161,10 +1161,12 @@ the same way, with authentication on: it creates two throwaway tokens in its own
 create`, never printed) — a requester and an approver — and, in two browser sessions, plans the free finance VMs
 `report-01` and `batch-01` through New plan with the dialog's approval defaults, requests each cutover (the dialog
 asks to request it, not to start it), checks that the requester cannot approve it and is told why, approves as
-the other user — each cutover runs and verifies on TCP 22 — finalizes `report-01` once its name is typed (Finalize is
+the other user — the Approve dialog says the approval starts the cutover and stops the source VM, its button Approve
+and cut over; each cutover runs and verifies on TCP 22 — finalizes `report-01` once its name is typed (Finalize is
 refused, saying why, before it is typed and with half of it) and rolls back
-`batch-01` with the reason it asks for (10 checks, about 25 s). CI's `dashboard-e2e` job runs it after the DEMO-07
-journey.
+`batch-01` with the reason it asks for (10 checks, about 25 s). Against the dashboard of 24281c87, whose Approve dialog
+said the cutover still waited for a request and the window, both approvals fail. CI's `dashboard-e2e` job runs it
+after the DEMO-07 journey.
 
 [`tests/e2e/demo-signin-browser.mjs`](../tests/e2e/demo-signin-browser.mjs) drives signing in and out (SDD §13.1, §16;
 UI-01, UI-08) the same way, with a viewer and an admin token of its own: a deep link while signed out asks to sign in,

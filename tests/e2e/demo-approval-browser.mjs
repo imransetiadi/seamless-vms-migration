@@ -11,9 +11,10 @@
 // Chromium sessions every action is a person's own: the requester plans the free finance VMs report-01 and
 // batch-01 through New plan with the dialog's defaults (Require approval, a distinct approver), validates,
 // starts and requests each cutover - the dialog asks to request it, not to start it - and cannot approve
-// it; the approver approves, and each cutover runs and verifies; the approver finalizes report-01, typing its
-// name, and rolls back batch-01. The API is read only to wait for a phase. SEAMLESS (the seamless command),
-// PORT and SHOT_DIR (a screenshot of the page when a check fails) override the defaults.
+// it; the approver approves - its dialog says the approval starts the cutover and stops the source VM - and
+// each cutover runs and verifies; the approver finalizes report-01, typing its name, and rolls back batch-01.
+// The API is read only to wait for a phase. SEAMLESS (the seamless command), PORT and SHOT_DIR (a screenshot
+// of the page when a check fails) override the defaults.
 // Exit code = number of failed checks.
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -230,7 +231,12 @@ try {
   const approve = async (name) => {
     await open(asApprover, name);
     await asApprover.getByRole('button', { name: 'Approve', exact: true }).first().click();
-    await asApprover.getByRole('alertdialog').getByRole('button', { name: 'Approve' }).click();
+    // the approval the cutover waits for starts it: the dialog says the source VM stops (SDD §5.4, §16)
+    const dialog = asApprover.getByRole('alertdialog', { name: `Approve the cutover of ${name}?` });
+    await dialog.waitFor({ timeout: 10_000 });
+    const says = (await dialog.textContent()) ?? '';
+    if (!says.includes('Your approval lets the cutover start: the source VM will then be stopped')) throw new Error(`the Approve dialog says ${JSON.stringify(says.slice(0, 160))}`);
+    await dialog.getByRole('button', { name: 'Approve and cut over', exact: true }).click();
     const done = await until(() => migration(name), (x) => ['completed', 'failed', 'rolled_back'].includes(x.phase), 180);
     if (done?.phase !== 'completed') throw new Error(`${name} ended ${done?.phase ?? 'nowhere'}: ${done?.error ?? ''}`);
     const tcp = (done.verification?.checks ?? []).find((c) => c.name === 'tcp:22');
@@ -244,7 +250,7 @@ try {
     const why = await button.evaluate((el) => document.getElementById(el.getAttribute('aria-describedby') ?? '')?.textContent ?? el.title ?? '');
     if (!why.includes('You requested this cutover. Another approver must approve it.')) throw new Error(`it says ${JSON.stringify(why)}`);
   });
-  await check('report-01: the approver approves, and the cutover runs and verifies on TCP 22', asApprover, () => approve('report-01'));
+  await check('report-01: the approver is told the approval starts the cutover, approves, and it runs and verifies on TCP 22', asApprover, () => approve('report-01'));
   await check('report-01: Finalize is refused until its name is typed, then the approver finalizes it (QASuite UI-05)', asApprover, async () => {
     await open(asApprover, 'report-01');
     await asApprover.getByRole('button', { name: 'Finalize', exact: true }).first().click();
