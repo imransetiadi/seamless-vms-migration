@@ -1,5 +1,6 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { buildInventories } from '../api/mockData';
 import type { VMRef } from '../api/types';
@@ -218,4 +219,45 @@ describe('VmTable', () => {
     expect(ubuntu).toHaveTextContent('Ubuntu 24.04');
     expect(within(ubuntu).getByRole('button', { name: 'Test conversion' })).toHaveAccessibleDescription(/^GUEST_CONVERSION_UNVERIFIED: /);
   });
+
+  describe('the plans that hold VMs (SDD §5.4, §16)', () => {
+    const held = openstackVms[0]!;
+    const holders = new Map([[held.source_id, [{ planId: 'plan-1', planName: 'Finance apps', phase: 'precopy' as const }]]]);
+    const inRouter = (ui: React.ReactElement) => render(<MemoryRouter>{ui}</MemoryRouter>);
+
+    it('names the holding plan in the readiness cell, linked, with its phase; the row header stays the name', () => {
+      inRouter(<VmTable vms={openstackVms} providerKind="openstack" holders={holders} />);
+      const row = bodyRows().find((r) => within(r).getByRole('rowheader').textContent === held.name)!;
+      expect(within(row).getByRole('link', { name: 'Finance apps' })).toHaveAttribute('href', '/plans/plan-1');
+      // the phase is named as a phase: never a second 'Ready' beside the readiness one
+      expect(row).toHaveTextContent('In plan Finance apps, phase Pre-copy');
+      expect(within(row).getByRole('rowheader')).toHaveTextContent(new RegExp(`^${held.name}$`));
+      // the free ones name no plan
+      expect(bodyRows().filter((r) => r.textContent?.includes('In plan'))).toHaveLength(1);
+    });
+
+    it('filters the VMs no plan holds, or those one holds; Clear filters resets it', async () => {
+      const user = userEvent.setup({ delay: null });
+      inRouter(<VmTable vms={openstackVms} providerKind="openstack" holders={holders} />);
+      await user.selectOptions(screen.getByLabelText('Plan'), 'Not in a plan');
+      expect(rowNames()).not.toContain(held.name);
+      expect(rowNames()).toHaveLength(openstackVms.length - 1);
+      await user.selectOptions(screen.getByLabelText('Plan'), 'In a plan');
+      expect(rowNames()).toEqual([held.name]);
+      await user.click(screen.getByRole('button', { name: 'Clear filters' }));
+      expect(rowNames()).toHaveLength(openstackVms.length);
+    });
+
+    it('says it does not know which plans hold the VMs while that is unknown, and offers no Plan filter', () => {
+      inRouter(<VmTable vms={openstackVms} providerKind="openstack" holders={null} />);
+      expect(screen.getByText('Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.')).toBeInTheDocument();
+      expect(screen.queryByLabelText('Plan')).not.toBeInTheDocument();
+    });
+
+    it('offers no Plan filter where holders are not tracked', () => {
+      render(<VmTable vms={openstackVms} providerKind="openstack" />);
+      expect(screen.queryByLabelText('Plan')).not.toBeInTheDocument();
+    });
+  });
 });
+

@@ -107,6 +107,34 @@ describe('Inventory', () => {
     expect(screen.queryByText(/select vms below/i)).not.toBeInTheDocument();
   });
 
+  it('names the plan that holds a VM, and lists the free ones with the Plan filter (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const releases = new Set(['cancelled', 'finalized', 'rolled_back']);
+    const plan = server.plans.find((p) => p.source_provider_id === 'rhosp17-dc1')!;
+    const holding = server.migrations.find((m) => m.plan_id === plan.id && !releases.has(m.phase))!;
+    renderWithApp(<Inventory />, { route: '/inventory/rhosp17-dc1', path: '/inventory/:providerId', token: 'operator', server });
+    const table = await screen.findByRole('table', { name: /VMs on/ });
+    const rowOf = (name: string) => within(table).queryAllByRole('row').find((r) => within(r).queryByRole('rowheader')?.textContent === name);
+    await waitFor(() => expect(within(rowOf(holding.vm.name)!).getByRole('link', { name: plan.name })).toBeInTheDocument());
+    await user.selectOptions(screen.getByLabelText('Plan'), 'Not in a plan');
+    expect(rowOf(holding.vm.name)).toBeUndefined();
+  });
+
+  it('says it does not know which plans hold the VMs while the plans cannot be loaded, never reading them free (SDD §16)', async () => {
+    renderWithApp(<Inventory />, {
+      route: '/inventory/rhosp17-dc1',
+      path: '/inventory/:providerId',
+      token: 'operator',
+      wrapFetch: (mock) => (input, init) =>
+        String(input).split('?')[0]!.endsWith('/api/v1/plans') ? Promise.resolve(new Response('{}', { status: 503 })) : mock(input, init),
+    });
+    await screen.findByRole('table', { name: /VMs on/ });
+    expect(await screen.findByText('Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Plan')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^In plan/)).not.toBeInTheDocument();
+  });
+
   it('offers no Create plan on a destination inventory', async () => {
     renderWithApp(<Inventory />, { route: '/inventory/rhoso-prod', path: '/inventory/:providerId', token: 'operator' });
     await screen.findByRole('heading', { level: 1, name: 'Inventory' });

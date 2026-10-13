@@ -1,7 +1,7 @@
 import { ClipboardPlus, HardDrive, Server } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { useInventory, useProviders } from '../api/hooks';
+import { useInventory, useMigrationSummaries, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, type DestinationInventory, type Provider } from '../api/types';
 import { Button } from '../components/Button';
@@ -15,6 +15,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { ProviderStatusBadge } from '../components/StatusBadge';
 import { VmTable } from '../components/VmTable';
 import { formatBytes, formatNumber } from '../lib/format';
+import { holdersOf } from '../lib/holds';
 import { KEEP_FOCUS } from '../lib/navigation';
 import { hasRole } from '../lib/roles';
 import { PROVIDER_KIND_LABELS } from '../lib/status';
@@ -199,6 +200,14 @@ export default function Inventory() {
   const isSource = provider?.role === 'source';
   const canPlan = hasRole(role, 'operator') && isSource;
   const selection = selected.providerId === providerId ? selected.ids : new Set<string>();
+  // which plans hold each VM of a source (SDD §5.4, §16): unknown, never free, while the plans or migrations fail
+  const plans = usePlans();
+  const migrations = useMigrationSummaries();
+  const holders = useMemo(() => {
+    if (!isSource || !provider) return undefined;
+    if (plans.data && migrations.data) return holdersOf(provider.id, plans.data, migrations.data);
+    return (plans.error && !plans.data) || (migrations.error && !migrations.data) ? null : undefined;
+  }, [isSource, provider, plans.data, plans.error, migrations.data, migrations.error]);
 
   if (!providerId) {
     if (providers.isPending) return <LoadingBlock label="Loading providers…" />;
@@ -278,6 +287,7 @@ export default function Inventory() {
               caption={`VMs on ${provider.name}`}
               selected={canPlan ? selection : undefined}
               onSelectedChange={canPlan ? (ids) => setSelected({ providerId: provider.id, ids }) : undefined}
+              holders={holders}
             />
           </div>
         )
