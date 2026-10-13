@@ -297,6 +297,10 @@ Operating rules after Task A4:
   use it only on a dedicated, isolated network.
 * Never run the export before the instance is `SHUTOFF` (the role enforces this); stop it as soon as the
   copy finishes (a previous export is stopped only through its PID file — SEC-10 fixed).
+* The export never lets qemu guess a disk's format (SEC-13 fixed): it takes each disk's format from Nova's
+  `disk.info` and passes it to `qemu-img info -f` and `qemu-nbd --format`. An instance whose `disk.info` is
+  missing or unreadable, or records no single plain format for a disk, is refused before any export, and
+  the config drive (`disk.config`) is not exported (SDD §6.6).
 
 Verification after the fix (QASuite §10 cases S-03/S-04):
 
@@ -653,6 +657,7 @@ repository at commit `fbf3509` (os-migrate 1.0.5 baseline).
 | SEC-10 | qemu-nbd start used a predictable `/tmp/qemu-nbd-<port>.log` and `sudo pkill -f` | `roles/import_from_hypervisor/tasks/process_disk.yml` | Low | Symlink/clobber and killing unrelated processes on a shared hypervisor | Private log directory; exact PID file | **Fixed** (logs and PID files in `os_migrate_nbdkit_log_dir`, stop by PID file only; SDD §6.6) |
 | SEC-11 | Conversion/link SSH keys are generated without a passphrase | `roles/conversion_host/tasks/generate_keypair.yml`, `link_prepare.yml` (`-N ""`); key 0600, directory 0700 (`main.yml`, `generate_keypair.yml`) | Info | Acceptable for ephemeral automation keys if the run directory is protected | Per-migration run directories (SDD §7.2); delete with the run | **Accepted** with that condition |
 | SEC-12 | os-migrate writes `clouds.yaml` with mode 0600 but leaves it in the data directory | `roles/prelude_common/tasks/main.yml:52-55` | Info (good practice, persistence is the issue) | Credentials persist after a run | `AnsibleExecutor` deletes it in a `finally` block (SDD §7.2) | **Mitigated** by the executor |
+| SEC-13 | The hypervisor export let qemu guess each disk's format: `qemu-img info` without `-f`, then `sudo qemu-nbd --format=<the guess>` | `roles/import_from_hypervisor/tasks/process_disk.yml` | High | A raw disk's first block is the guest's: a qcow2 header written there names a backing file on the hypervisor, which qemu-nbd reads as root into the export and the destination volume | Take the format from Nova's `disk.info`, refuse a disk it does not record, leave the config drive out | **Fixed** (SDD §6.6; `tests/unit/test_import_from_hypervisor.py`, QASuite S-27) |
 
 ### 11.2 Design risks in the new 0.1.0 code (verify at integration)
 
