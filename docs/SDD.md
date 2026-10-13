@@ -2418,7 +2418,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   folded back by "Show fewer" or by choosing another kind, so a plan of hundreds of VMs awaiting approval never stretches the Overview;
   ADV-20; the page reads the migrations as summaries, `GET /migrations?view=summary` (§4): what its rules read, not
   every migration whole), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of its
-  migrations that are not `cancelled`, which are never done (a VM taken out of the plan, §5.4), from `Plan.migration_counts`,
+  migrations that are not `cancelled`, which are never done (a VM taken out of the plan, §5.4, or a migration cancelled
+  while its VM stays in `vm_ids`), from `Plan.migration_counts`, naming the cancelled ones it leaves out ("11/21 done,
+  1 cancelled") so a plan's VMs and its done total never differ without a word,
   or of its VMs before validation, and none for a `cancelled` plan, which shows — instead; the Overview's plan progress
   counts the same way; the list reads no migration —, clouds,
   SLO and last change — on a phone the
