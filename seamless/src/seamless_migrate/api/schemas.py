@@ -173,6 +173,8 @@ class Health(BaseModel):
     demo: bool
     #: a demo's time compression: its downtime clock runs in model time (SDD §5.2, ADV-16)
     demo_speed: float | None = None
+    #: authentication is off: Sign in offers to continue without a token only then (SDD §12, §16)
+    auth_disabled: bool
     db: Literal["ok", "error"]
     orchestrator: OrchestratorHealth
 

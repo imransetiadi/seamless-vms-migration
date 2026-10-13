@@ -149,9 +149,10 @@ export default function Login() {
                 The control plane is not reachable right now.
               </p>
             ) : null}
-            {health.data?.demo && (
+            {/* only where it works: with authentication on, the link would lead straight back here (SDD §16) */}
+            {health.data?.auth_disabled && (
               <p>
-                Demo mode on loopback usually runs without authentication:{' '}
+                Authentication is off on this server:{' '}
                 <Link to={from} className="text-foreground underline underline-offset-4">
                   continue without a token
                 </Link>

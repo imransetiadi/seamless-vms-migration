@@ -898,6 +898,8 @@ export interface Health {
   demo: boolean;
   /** Demo mode's time compression (SDD §7.4): a wall second is this many model seconds; null outside demo mode. */
   demo_speed: number | null;
+  /** Authentication is off (SDD §13.1): every request is the anonymous admin, so no token is needed. */
+  auth_disabled: boolean;
   db: 'ok' | 'error';
   orchestrator: OrchestratorHealth;
 }

@@ -75,6 +75,7 @@ async def _health(request: Request) -> Health:
         version=__version__,
         demo=svc.settings.demo,
         demo_speed=svc.settings.demo_speed if svc.settings.demo else None,
+        auth_disabled=svc.settings.auth_disabled,
         db="ok" if db_ok else "error",
         orchestrator=orchestrator,
     )

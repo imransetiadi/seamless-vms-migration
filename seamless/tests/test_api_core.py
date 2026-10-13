@@ -33,6 +33,7 @@ def test_health_public_reports_db(api, monkeypatch):
         "version": "0.1.0",
         "demo": True,
         "demo_speed": 1e7,
+        "auth_disabled": False,
         "db": "ok",
     }
     assert orchestrator["running"] is True and orchestrator["healthy"] is True
@@ -476,6 +477,23 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
         assert client.post("/api/v1/providers", json=SOURCE).status_code == 201
         created = [e for e in store.events(since_seq=0) if e.kind == "provider.created"]
         assert created[0].actor == "anonymous"
+    store.dispose()
+
+
+def test_health_says_whether_authentication_is_off(api, tmp_path):
+    # Sign in offers to continue without a token only when it works, and asks a public route:
+    # GET /me without a token would be refused, an auth.denied event and a lockout tick per
+    # visit (SDD §12, §16)
+    for path in ("/api/v1/health", "/api/v1/ready"):
+        assert api.client.get(path).json()["auth_disabled"] is False
+    assert [e for e in api.store.events(since_seq=0) if e.kind == "auth.denied"] == []
+    (tmp_path / "off").mkdir()
+    settings, _ = api_settings(tmp_path / "off", auth_disabled=True, tokens_file=None)
+    store = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/api/v1/health", "/api/v1/ready"):
+            assert client.get(path).json()["auth_disabled"] is True
     store.dispose()
 
 

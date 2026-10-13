@@ -1781,6 +1781,12 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
   }
   const REASON = 'The change window closes in 20 minutes';
 
+  it('says on GET /health that authentication is off: no token is the anonymous admin (SDD §12, §13.1)', async () => {
+    const { client } = setup(null);
+    expect(await client.get<{ auth_disabled: boolean }>('/health')).toMatchObject({ auth_disabled: true });
+    expect(await client.get('/me')).toEqual({ name: 'anonymous', role: 'admin' });
+  });
+
   it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {
     const { client } = setup('viewer');
     expect(await client.get<{ demo: boolean; demo_speed: number | null }>('/health')).toMatchObject({ demo: true, demo_speed: 1 });

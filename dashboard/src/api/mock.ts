@@ -587,6 +587,8 @@ export class MockServer {
     demo: true,
     // the simulation's model time is its wall time: passes, downtimes and clocks share one base (ADV-16)
     demo_speed: 1,
+    // no token is the anonymous admin, as with authentication off (SDD §13.1)
+    auth_disabled: true,
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
   };

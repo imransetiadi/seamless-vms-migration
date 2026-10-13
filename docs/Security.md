@@ -213,7 +213,7 @@ QASuite case that exercises the control.
 | API5 Broken function-level authorization | Minimum role per route (§5.2) with the exhaustive `test_role_matrix` |
 | API6 Unrestricted access to sensitive business flows | Approval, change window, typed confirmation, cutover concurrency cap |
 | API7 Server-side request forgery | `Provider.endpoint` is admin-only; egress NetworkPolicy (C1-10) |
-| API8 Security misconfiguration | Secure defaults: authentication on, TLS verification on, metrics non-public, empty CORS list, minimal public health |
+| API8 Security misconfiguration | Secure defaults: authentication on, TLS verification on, metrics non-public, empty CORS list, minimal public health (its `auth_disabled` shows only what a request without a token already does: with authentication off every route answers it, with it on every route with a role check refuses it — SDD §12) |
 | API9 Improper inventory management | Only the SDD routes exist (a drift test pins them); the OpenAPI docs are public in demo mode and viewer-authenticated otherwise (C1-08) |
 | API10 Unsafe consumption of APIs | Responses from clouds, Jev and agentmemory are parsed defensively and validated; failures fall back (§10) |
 

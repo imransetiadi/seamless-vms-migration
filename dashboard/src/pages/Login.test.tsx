@@ -3,16 +3,16 @@ import userEvent from '@testing-library/user-event';
 import { Route, Routes } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { clearSessionEnded, endSession, storeToken, TOKEN_STORAGE_KEY } from '../api/auth';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, renderWithApp, type RenderOptions } from '../test/utils';
 import Login from './Login';
 
-function renderLogin() {
+function renderLogin(options: RenderOptions = {}) {
   return renderWithApp(
     <Routes>
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<p>Home page</p>} />
     </Routes>,
-    { route: '/login', storedToken: true },
+    { route: '/login', storedToken: true, ...options },
   );
 }
 
@@ -31,6 +31,30 @@ describe('Login', () => {
     await screen.findByLabelText('API token');
     expect(screen.queryByRole('status', { name: /session ended/i })).not.toBeInTheDocument();
     clearSessionEnded();
+  });
+
+  it('offers to continue without a token only when GET /health says authentication is off, never asking GET /me (SDD §16)', async () => {
+    const requests: string[] = [];
+    const record =
+      (fetchImpl: typeof fetch): typeof fetch =>
+      (input, init) => {
+        requests.push(String(input));
+        return fetchImpl(input, init);
+      };
+    // the mock runs without authentication: no token is the anonymous admin
+    const view = renderLogin({ wrapFetch: record });
+    const link = await screen.findByRole('link', { name: 'continue without a token' });
+    expect(link).toHaveAttribute('href', '/');
+    expect(link.closest('p')).toHaveTextContent(/^Authentication is off on this server: continue without a token\.$/);
+    view.unmount();
+    // a demo with authentication on: the link would lead straight back to Sign in
+    const server = createTestServer();
+    server.health = { ...server.health, demo: true, auth_disabled: false };
+    renderLogin({ server, wrapFetch: record });
+    await screen.findByText(/^Control plane .* reachable · demo mode$/);
+    expect(screen.queryByRole('link', { name: 'continue without a token' })).not.toBeInTheDocument();
+    // with authentication on, GET /me without a token is refused: an auth.denied event and a lockout tick each visit
+    expect(requests.filter((url) => new URL(url, 'http://dashboard.test').pathname.endsWith('/me'))).toEqual([]);
   });
 
   it('shows the brand mark on the sign-in card (SDD §16)', async () => {
