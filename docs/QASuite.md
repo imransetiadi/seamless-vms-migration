@@ -1203,7 +1203,7 @@ third of those dashboards passed. CI's `dashboard-e2e` job runs it after the key
 
 [`tests/e2e/demo-overview-browser.mjs`](../tests/e2e/demo-overview-browser.mjs) drives the Overview (UI-02; SDD §12,
 §16) with a viewer token of its own, half the simulated cutovers failing so some roll back: each key metric —
-Migrations, In progress, Awaiting finalize, Finalized, Failed, Rolled back — and each row of the phase distribution
+Migrations (those not cancelled), In progress, Awaiting finalize, Finalized, Failed, Rolled back — and each row of the phase distribution
 comes to equal `GET /stats` (the page follows the event stream, so page and server are read until they agree); once a
 migration rolled back, the Rolled back tile counts it in the warning tone; choosing a plan scopes the metrics to its
 statistics (7 checks, about 10 s). Against a dashboard whose Rolled back tile counts the failed migrations, whose In

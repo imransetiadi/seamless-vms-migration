@@ -148,7 +148,8 @@ async function stats(planId = '') {
 
 /** The figures the key metrics show for `s`, by tile. */
 const expected = (s) => ({
-  Migrations: s.total,
+  // a cancelled migration is never done: Migrations counts the others (SDD §16)
+  Migrations: s.total - (s.by_phase.cancelled ?? 0),
   'In progress': s.in_progress,
   'Awaiting finalize': s.awaiting_finalize,
   Finalized: s.finalized,

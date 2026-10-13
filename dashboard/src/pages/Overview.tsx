@@ -281,6 +281,9 @@ export default function Overview() {
   const sloS = activePlans.length ? Math.min(...activePlans.map((p) => p.downtime_slo_s)) : null;
   const sloLabel = planId || activePlans.length <= 1 ? 'SLO' : 'Strictest SLO';
   const s = stats.data;
+  // a cancelled migration is never done, as each plan's done count says: Migrations counts the others (SDD §16)
+  const cancelled = s?.by_phase.cancelled ?? 0;
+  const counted = s ? s.total - cancelled : 0;
   // a failed load with nothing cached is unknown, never an empty state or a zero (SDD §16)
   const plansUnknown = Boolean(plansQuery.error) && !plansQuery.data;
   const statsUnknown = Boolean(stats.error) && !s;
@@ -358,11 +361,17 @@ export default function Overview() {
           label="Key metrics"
           busy={stats.isPlaceholderData}
           metrics={[
-            { label: 'Migrations', value: formatNumber(s.total), hint: plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}` },
+            {
+              label: 'Migrations',
+              value: formatNumber(counted),
+              hint: [plansUnknown ? 'plans unknown' : `in ${scopedPlans.length} plan${scopedPlans.length === 1 ? '' : 's'}`, cancelled ? `${formatNumber(cancelled)} cancelled, not counted` : '']
+                .filter(Boolean)
+                .join('; '),
+            },
             { label: 'In progress', value: formatNumber(s.in_progress), hint: 'started, not yet finished' },
             // Completed, split: verified with the source VM kept, and finalized (SDD §4.2, §16, ADV-19)
             { label: 'Awaiting finalize', value: formatNumber(s.awaiting_finalize), hint: 'verified; the source VM is kept' },
-            { label: 'Finalized', value: formatNumber(s.finalized), hint: s.total ? `${formatPct((s.finalized / s.total) * 100)} of all` : undefined },
+            { label: 'Finalized', value: formatNumber(s.finalized), hint: counted ? `${formatPct((s.finalized / counted) * 100)} of all` : undefined },
             { label: 'Failed', value: formatNumber(s.failed), tone: s.failed > 0 ? 'danger' : undefined, hint: s.failed > 0 ? 'retry, roll back or cancel' : 'none' },
             // its source VM runs again and a person retries or cancels it: never all clear while one waits (SDD §16)
             {

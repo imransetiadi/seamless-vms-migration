@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Migration } from '../api/types';
+import { formatPct } from '../lib/format';
 import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
@@ -117,7 +118,8 @@ describe('Overview page (mock data)', () => {
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument();
     const total = await screen.findByRole('group', { name: 'Migrations' });
-    expect(total).toHaveTextContent(String(server.migrations.length));
+    // a cancelled migration is never done: Migrations counts the others (SDD §16)
+    expect(total).toHaveTextContent(String(server.migrations.filter((m) => m.phase !== 'cancelled').length));
     const failed = server.migrations.filter((m) => m.phase === 'failed').length;
     expect(screen.getByRole('group', { name: 'Failed' })).toHaveTextContent(String(failed));
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
@@ -144,6 +146,29 @@ describe('Overview page (mock data)', () => {
     expect(tile).toHaveTextContent('0');
     expect(tile).toHaveTextContent('none');
     expect(within(tile).getByText('0')).not.toHaveClass(TONE_CLASSES.warning.text);
+  });
+
+  it("counts the migrations that are not cancelled, as each plan's done count does, and names the cancelled ones (SDD §16)", async () => {
+    const server = createTestServer();
+    const cancelled = server.migrations.filter((m) => m.phase === 'cancelled').length;
+    expect(cancelled).toBe(2);
+    const counted = server.migrations.length - cancelled;
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Migrations' });
+    expect(within(tile).getByText(String(counted))).toBeInTheDocument();
+    expect(tile).toHaveTextContent('2 cancelled, not counted');
+    // Finalized's share is of those
+    const finalized = server.migrations.filter((m) => m.phase === 'finalized').length;
+    expect(screen.getByRole('group', { name: 'Finalized' })).toHaveTextContent(`${formatPct((finalized / counted) * 100)} of all`);
+  });
+
+  it('names no cancelled migration in the Migrations hint when none was cancelled', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations) if (m.phase === 'cancelled') m.phase = 'ready';
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Migrations' });
+    expect(tile).toHaveTextContent(String(server.migrations.length));
+    expect(tile).not.toHaveTextContent('cancelled');
   });
 
   it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
