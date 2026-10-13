@@ -1314,9 +1314,10 @@ migrations that are not `cancelled`, in this order:
 1. a `draft` plan is `draft` (an edited plan is validated again);
 2. no migration: the stored status — so a `cancelled` plan (§12), whose migrations are all `cancelled`, is `cancelled`;
 3. a migration in `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying` or `rolling_back` (at work): `running`
-   when the stored status is `running`, else `paused` — the tick drives only a running plan (§8), so a paused plan
-   validated again, stored `validated` with its migrations still in flight, reads Paused too, and its start button
-   reads Resume (the owner's choice, 2026-10-13);
+   when the stored status is `running`, `failed` when it is `failed` (its pre-staging failed: Start again pre-stages
+   it, §8), else `paused` — the tick drives only a running plan (§8), so a paused plan validated again, stored
+   `validated` with its migrations still in flight, reads Paused too, and its start button reads Resume (the owner's
+   choice, 2026-10-13);
 4. a `running` or `paused` plan with a migration still to start (`pending`, `ready`, `blocked`, `validating`):
    the stored status;
 5. a `failed` migration: `failed`;
