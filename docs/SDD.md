@@ -2541,7 +2541,18 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cutover and says the source stops once another approver approves it; the Cut over and Force cutover dialogs say
   the request also records the user's approval only when the plan requires no distinct approver, as only then does
   it (§5.4), under maker-checker that the request is not an approval, and otherwise — no approval required, the
-  distinct approver kept, as a plan made without approval keeps it — nothing about an approval; until the migration's plan is
+  distinct approver kept, as a plan made without approval keeps it — nothing about an approval;
+  the Approve dialog says what the approval leads to (§5.4): when the plan requires an approval, none counts yet and
+  nothing else a person gives is missing — a cutover request or `auto_cutover`, the window absent, open or bypassed
+  (`force_window`), no advisor decision waiting — the approval lets the cutover start, so the dialog says that the
+  source VM will then be stopped and the downtime clock starts (once pre-copy has converged, for a warm migration that
+  has not; after the running pass, when forced) as soon as the plan, its wave and a free cutover slot allow, with the
+  estimated downtime against the SLO, and its button reads Approve and cut over; otherwise its button reads Approve and
+  the dialog says what the cutover still waits for — a cutover request, the window with its start and end, the advisor's
+  decision — or that an approval counts already, that the plan needs none, that in `failed` or `rolled_back` a retry
+  keeps the approval and asks for the cutover anew (§5.1), or, while the plan is not loaded, that what the approval
+  leads to depends on the plan;
+  until the migration's plan is
   loaded Cutover stays unavailable — its window and approval policy are unknown, and the dialog would promise an
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
