@@ -185,6 +185,8 @@ export default function AdvisorAudit() {
                   const target = text(e.data.target_id);
                   // a Force cutover's target is the migration it forced (SDD §14.5)
                   const forced = e.kind === 'migration.force_cutover';
+                  // a Force cutover's reason, and the one a person gave with an override, go with the action (SDD §14.5, ADV-16)
+                  const reason = forced ? text(e.data.reason) : e.kind === 'decision.overridden' ? text((e.data.after as { reason_text?: unknown } | null)?.reason_text) : '';
                   // a policy change names the policy (SDD §14.5); the policies page lists it
                   const policyName = text((e.data.after as { name?: unknown } | null)?.name) || text((e.data.before as { name?: unknown } | null)?.name);
                   // and lists the settings it changed: a weakened approval gate shows here, not only in the JSON (SDD §14.5)
@@ -196,8 +198,7 @@ export default function AdvisorAudit() {
                       </td>
                       <td>
                         {auditActionLabel(e.kind)}
-                        {/* a Force cutover's reason goes with it (SDD §14.5, ADV-16) */}
-                        {forced && text(e.data.reason) && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{text(e.data.reason)}</p>}
+                        {reason && <p className="mt-0.5 wrap-break-word text-xs text-muted-foreground">{reason}</p>}
                         {changes &&
                           (changes.length ? (
                             <ul className="mt-0.5 max-w-md text-xs text-muted-foreground">

@@ -161,7 +161,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
 type AuditEvent = Pick<Event, 'kind' | 'message' | 'actor' | 'data'>;
 
 function stateOf(d: AdvisorRecommendation['decision']) {
-  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used };
+  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, reason_text: d.reason_text, policy_id: d.policy_id, threshold_used: d.threshold_used };
 }
 
 /** The event of the status a decision took, with what it replaced (SDD §14.5). */

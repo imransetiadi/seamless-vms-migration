@@ -1467,7 +1467,12 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
     expect([db.strategy, db.advisor_hold]).toEqual(['cold', null]);
     expect(server.plans.find((p) => p.id === 'plan-c81d44a0')!.strategy_overrides).toMatchObject({ [db.vm.source_id]: 'cold' });
-    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({ kind: 'decision.overridden', actor: 'user:rina', data: { before: { status: 'pending_approval' } } });
+    // the trail itself says why (SDD §14.5)
+    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({
+      kind: 'decision.overridden',
+      actor: 'user:rina',
+      data: { before: { status: 'pending_approval', reason_text: null }, after: { status: 'overridden', reason_text: 'The change window fits a cold cutover' } },
+    });
   });
 
   it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
@@ -1547,7 +1552,7 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
       target_id: rec!.id,
       model_version: 'jev-1.13.0',
       before: null,
-      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
+      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', reason_text: null, policy_id: 'global-default', threshold_used: 0.6 },
     });
     expect(server.events.filter((e) => e.migration_id === db.id && e.kind === 'advisor.strategy')).toEqual([]);
     // the input snapshot is named by the SHA-256 of its canonical JSON

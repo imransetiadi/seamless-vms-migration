@@ -58,6 +58,8 @@ def _state(decision: Decision) -> dict[str, Any]:
         "status": str(decision.status),
         "final_option": decision.final_option,
         "reason_code": str(decision.reason_code),
+        # the reason in words - a person's for an override, or why the advisor fell back (SDD §14.5)
+        "reason_text": decision.reason_text,
         "policy_id": decision.policy_id,
         "threshold_used": decision.threshold_used,
     }

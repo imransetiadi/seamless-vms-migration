@@ -53,6 +53,21 @@ describe('Advisor audit page (SDD §14.5, ADV-05)', () => {
     expect(within(row).getByRole('link', { name: warm.vm.name })).toHaveAttribute('href', `/migrations/${warm.id}`);
   });
 
+  it('lists an override with the reason its decider gave, as a Force cutover (SDD §14.5)', async () => {
+    renderWithApp(<AdvisorAudit />, { route: '/advisor/audit', token: 'viewer' });
+    const table = await auditTable();
+    const row = within(table)
+      .getAllByRole('row')
+      .find((r) => within(r).queryByText('Decision: overridden'))!;
+    expect(within(row).getByText('Domain controllers move cold: the AD replication window was rehearsed that way')).toBeInTheDocument();
+    expect(row).toHaveTextContent('user:bayu');
+    // a decision without a reason shows none
+    const applied = within(table)
+      .getAllByRole('row')
+      .find((r) => within(r).queryByText('Decision: applied automatically'))!;
+    expect(applied.querySelectorAll('td:nth-child(2) p')).toHaveLength(0);
+  });
+
   it('lists under a policy change the settings it changed, so a weakened approval gate shows on the page (SDD §14.5)', async () => {
     const server = createTestServer();
     const plan = server.plans[0]!;

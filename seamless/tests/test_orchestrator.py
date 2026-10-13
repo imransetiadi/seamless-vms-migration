@@ -3398,6 +3398,7 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
             "status": status,
             "final_option": rec.decision.final_option,
             "reason_code": str(rec.decision.reason_code),
+            "reason_text": None,
             "policy_id": "global-default",
             "threshold_used": 0.6,
         },
@@ -3462,6 +3463,29 @@ async def test_with_the_finance_policy_a_decision_waits_and_holds_its_migration(
         "user:rina",
         "pending_approval",
     )
+
+
+async def test_an_override_records_its_reason_in_the_audit_trail(tmp_path, store):
+    """SDD §14.5: the trail itself says why a decision was overridden - the decision event carries
+    the reason a person gave (``after``) and the decision it replaced (``before``, none given)."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    waiting = _audit(store)[-1]
+    assert (waiting.kind, waiting.data["after"]["reason_text"]) == (
+        "decision.pending_approval",
+        None,
+    )
+    reason = "the batch window allows a longer downtime"
+    await h.orch.override_recommendation(rec.id, "cold", reason, "rina")
+    overridden = _audit(store)[-1]
+    assert (overridden.kind, overridden.actor) == ("decision.overridden", "user:rina")
+    assert overridden.data["after"]["reason_text"] == reason
+    assert overridden.data["before"] == waiting.data["after"]
 
 
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
@@ -3787,6 +3811,9 @@ async def test_with_jev_off_an_automatic_choice_is_recorded_as_a_rules_fallback(
     assert (created.data["model_version"], created.data["option"]) == ("rules", None)
     assert (decided.kind, decided.actor) == ("decision.fallback", "system:fallback")
     assert decided.data["after"]["status"] == "fallback_rules"
+    # and why: the advisor's answer could not be used (SDD §14.5)
+    assert decided.data["after"]["reason_text"] == rec.decision.reason_text
+    assert rec.decision.reason_text and rec.decision.reason_text.startswith("advisor unavailable")
     snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
     assert "vCPU" in snapshot.payload["arguments"]["evidence"]
 
