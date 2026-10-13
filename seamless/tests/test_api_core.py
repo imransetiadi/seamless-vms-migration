@@ -290,6 +290,8 @@ def test_metrics_format(api, tmp_path):
         "# TYPE seamless_tick_slow_total counter",
         "# TYPE seamless_step_duration_seconds summary",
         "# TYPE seamless_advisor_calls_total counter",
+        "# TYPE seamless_cutover_refusals gauge",
+        "seamless_cutover_refusals 0",
     ):
         assert line in text, line
     assert all(f'seamless_migrations{{phase="{p.value}"}}' in text for p in Phase)
@@ -493,6 +495,30 @@ def test_render_metrics_escapes_labels_and_formats_numbers():
     assert 'seamless_advisor_calls_total{tool="tool\\"x",outcome="error"} 1' in text
     assert "seamless_tick_seconds_count 4" in text and "seamless_tick_slow_total 1" in text
     assert text.endswith("\n")
+
+
+def test_the_cutover_refusals_gauge_counts_the_migrations_dashboard_lists_so():
+    """SDD §18: the migrations in precopy, syncing or awaiting_cutover whose last pass found what
+    their cutover will refuse - not one in another phase, not one whose pass found nothing."""
+    from seamless_migrate.metrics import render_metrics
+
+    refusal = ["the NIC 00:50:56:40:d5:b3 of portal-02 on 'dc2-prod': port p-1 holds 10.2.0.32"]
+    migrations = [
+        make_migration(id=f"mig-{i:010x}", phase=phase, cutover_refusals=refusals)
+        for i, (phase, refusals) in enumerate(
+            [
+                (Phase.precopy, refusal),
+                (Phase.syncing, refusal * 2),  # one migration, however many problems
+                (Phase.awaiting_cutover, refusal),
+                (Phase.awaiting_cutover, []),  # its last pass found nothing
+                (Phase.failed, refusal),  # refused already: Needs attention lists it as failed
+                (Phase.ready, refusal),  # a retry: its pre-copy looks again
+            ]
+        )
+    ]
+    text = render_metrics(migrations, {}, {})
+    assert "# TYPE seamless_cutover_refusals gauge" in text
+    assert "\nseamless_cutover_refusals 3\n" in text
 
 
 def test_every_route_is_documented_in_sdd_12(api):

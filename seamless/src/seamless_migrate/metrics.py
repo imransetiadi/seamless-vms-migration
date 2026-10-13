@@ -9,6 +9,9 @@ from .domain import fsm
 from .domain.enums import Phase
 from .domain.models import Migration
 
+#: where what a warm pass found still stands before the cutover (SDD §7.2, §16)
+REFUSABLE = frozenset({Phase.precopy, Phase.syncing, Phase.awaiting_cutover})
+
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
@@ -39,6 +42,15 @@ def render_metrics(
         counts[str(m.phase)] += 1
     for phase, count in counts.items():
         lines.append(f'seamless_migrations{{phase="{phase}"}} {count}')
+
+    # SDD §18: the migrations the dashboard lists as "Cutover will refuse" (§16)
+    family(
+        "seamless_cutover_refusals",
+        "gauge",
+        "Migrations whose cutover will refuse what their last pass found.",
+    )
+    refusing = sum(1 for m in migrations if m.phase in REFUSABLE and m.cutover_refusals)
+    lines.append(f"seamless_cutover_refusals {refusing}")
 
     family("seamless_bytes_transferred_total", "counter", "Bytes transferred by migrations.")
     lines.append(f"seamless_bytes_transferred_total {sum(m.bytes_transferred for m in migrations)}")
