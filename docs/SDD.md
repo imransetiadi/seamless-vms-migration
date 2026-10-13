@@ -2416,7 +2416,10 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   migration rolled back."; its page says so with the next step — "Nothing was migrated: every migration rolled back and
   its source VM runs again. Retry each one from its page once the cause is fixed, or cancel it." — and offers no
   Finalize all, as nothing awaits finalize; a wave whose migrations it did not cancel all rolled back reads "Rolled
-  back", not "Complete", though the waves after it start (§5.1).
+  back", not "Complete", though the waves after it start (§5.1); a wave whose migrations are all cancelled — every
+  wave of a cancelled plan — reads "Cancelled" in the neutral tone, with no count, never a green "Complete"; and a
+  wave's VMs done count as the plan's do: `completed` and `finalized` of its migrations that are not `cancelled`,
+  which are never done (a rolled-back wave reads 0 done).
 * Approvals: two kinds, and every entry names its kind (ADV-20) — a **cutover approval** ("Cutover approval":
   the plan's Require approval, `Migration.approvals`, the cutover request and the maker-checker rule
   `counted_approvals`, §5.4) and an **advisor decision** ("Advisor decision · {decision type}": a decision
