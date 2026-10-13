@@ -356,6 +356,7 @@ def test_seamless_check_says_which_ci_checks_it_leaves_out():
         "demo-signin-browser.mjs",
         "demo-keyboard-browser.mjs",
         "demo-stream-browser.mjs",
+        "demo-overview-browser.mjs",
         "SEAMLESS_TEST_PG_URL",
         "pip-audit",
         "npm audit",
