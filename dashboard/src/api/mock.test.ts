@@ -1090,6 +1090,20 @@ describe('mock API', () => {
     expect(m.approvals.map((a) => a.actor)).toEqual(['ana']);
   });
 
+  it('refuses to cancel a plan while an unstarted migration has its source stopped, before cancelling anything, like the API (SDD §12)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const mine = server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').sort((a, b) => (a.id < b.id ? -1 : 1));
+    expect(mine.length).toBeGreaterThan(1);
+    // the last one in id order: a cancel loop would reach the others first
+    const last = mine.at(-1)!;
+    Object.assign(last, { phase: 'ready', downtime_started_at: '2026-10-08T10:00:00Z', downtime_ended_at: null });
+    const before = mine.map((m) => m.phase);
+    const res = server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), {}, 'operator');
+    expect(res.status).toBe(409);
+    expect((res.body as { error: { message: string } }).error.message).toMatch(new RegExp(`${last.vm.name}; cut it over`));
+    expect(mine.map((m) => m.phase)).toEqual(before);
+  });
+
   it('cancels a plan like the API: its unstarted migrations cancelled, a running plan paused first, a started migration named (SDD §12)', () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const call = (id: string, token = 'operator') => server.handle('POST', `/plans/${id}/cancel`, new URLSearchParams(), { reason: 'made by mistake' }, token);

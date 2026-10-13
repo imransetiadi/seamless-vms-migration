@@ -2132,6 +2132,17 @@ export class MockServer {
     }
     const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
     const todo = mine.filter((m) => m.phase !== 'cancelled').sort((a, b) => (a.id < b.id ? -1 : 1));
+    // like the API (SDD §12): refused before any change while a source is stopped - a cancel cannot restart it
+    const stopped = todo.filter((m) => m.downtime_started_at && !m.downtime_ended_at).map((m) => m.vm.name).sort();
+    if (stopped.length) {
+      const rest = stopped.length - 10;
+      throw new HttpError(
+        409,
+        'conflict',
+        `the source VM is stopped after a failed cutover: ${stopped.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+          'cut it over before cancelling the plan - a cancel cannot restart it',
+      );
+    }
     // each one as POST /migrations/{id}/cancel does, with its own event
     for (const m of todo) this.migrationAction(me, m, 'cancel', { reason: reason ? `plan cancelled: ${reason}` : 'plan cancelled' });
     plan.status = 'cancelled';

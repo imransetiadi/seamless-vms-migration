@@ -60,6 +60,10 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: read
 
   // POST /plans/{id}/cancel (SDD §12) names each VM whose migration started, with its phase
   const startedVms = migrations.filter((m) => m.plan_id === plan.id && !UNSTARTED.has(m.phase)).map((m) => `${m.vm.name} (${m.phase})`);
+  // ... and each VM whose source is stopped: a retry kept the open clock, and a cancel cannot restart it (SDD §5.1, §12)
+  const stoppedVms = migrations
+    .filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled' && m.downtime_started_at && !m.downtime_ended_at)
+    .map((m) => m.vm.name);
   const cancel = (): Availability => {
     if (status === 'cancelled') return gate(false, 'The plan is cancelled.');
     if (status === 'running') return gate(false, 'Pause the plan before cancelling it.');
@@ -68,6 +72,9 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: read
         false,
         `Only a plan whose migrations have not started can be cancelled: ${names(startedVms)}. Cancel a failed or rolled-back migration on its own first.`,
       );
+    }
+    if (stoppedVms.length) {
+      return gate(false, `The source VM is stopped after a failed cutover: ${names(stoppedVms)}. Cut it over before cancelling the plan.`);
     }
     return gate(true, '');
   };

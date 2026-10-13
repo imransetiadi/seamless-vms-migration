@@ -44,6 +44,17 @@ describe('planActions', () => {
     expect(planActions(planWith('validated'), 'viewer', ready).cancel.reason).toBe('Requires the operator role.');
   });
 
+  it('keeps Cancel plan unavailable while a migration that has not started has its source stopped, naming it to cut over first, as the API refuses it (SDD §12)', () => {
+    // a retry after a failed cutover keeps the open downtime clock (SDD §5.2), and a cancel cannot restart the source
+    const stopped = ready.map((m, i) => (i === 1 ? { ...m, phase: 'ready' as const, downtime_started_at: '2026-10-08T10:00:00Z', downtime_ended_at: null } : m));
+    const cancel = planActions(planWith('paused'), 'operator', stopped).cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toBe(`The source VM is stopped after a failed cutover: ${stopped[1]!.vm.name}. Cut it over before cancelling the plan.`);
+    // a closed clock (the cutover ended, or a rollback restarted the source) does not hold it
+    const closed = stopped.map((m, i) => (i === 1 ? { ...m, downtime_ended_at: '2026-10-08T10:05:00Z' } : m));
+    expect(planActions(planWith('paused'), 'operator', closed).cancel.enabled).toBe(true);
+  });
+
   it('asks to validate a draft before starting', () => {
     expect(planActions(planWith('draft'), 'operator', ready).start.reason).toMatch(/validate/i);
   });
