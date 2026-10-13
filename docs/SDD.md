@@ -2597,7 +2597,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
   a VM that a migration of a plan holds (§5.4: one not `cancelled`, `finalized` or `rolled_back`) names that plan
-  under its name, linked to the plan, with the migration's phase, and a Plan filter shows all VMs, those no plan
+  in its readiness cell, beside its name — the row header stays the VM's name, as a screen reader repeats it for each
+  cell — linked to the plan, with the migration's phase, and a Plan filter shows all VMs, those no plan
   holds or those one holds, so an operator picks free VMs before New plan warns about held ones — while the plans
   or the migrations cannot be loaded the table says it does not know which plans hold its VMs, instead of reading
   them free;
