@@ -8,7 +8,7 @@ import { createContext, useContext, useEffect, useRef, useSyncExternalStore } fr
 import { isSummaryList, summaryOf } from '../lib/summary';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration, MigrationListQuery, MigrationSummary, SyncPass } from './types';
+import { AUDIT_EVENT_KINDS, type Event, type Migration, type MigrationListQuery, type MigrationSummary, type SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -379,6 +379,8 @@ export function applyEventToCache(
   // not memory.lesson_saved: a lesson changes no migration, list or figure, and the Events page and the timeline take
   // it from the stream (SDD §16)
   if (kind.startsWith('migration.') || kind.startsWith('advisor.')) {
+    // a Force cutover is an audit event too (SDD §5.4, §14.5): the live audit page reads the audit lists
+    if ((AUDIT_EVENT_KINDS as readonly string[]).includes(kind)) invalidate(['events', 'tail']);
     // advisor.strategy announces a recorded recommendation (SDD §14.4); a note is the Advisor page's too (§16)
     if (kind.startsWith('advisor.')) {
       invalidate(['advisor', 'recommendations']);

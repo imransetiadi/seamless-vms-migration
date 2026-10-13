@@ -4,7 +4,7 @@ import { ApiError } from './client';
 import { applyEventToCache, createBatchedInvalidator, documentVisibility, keepStreamFresh, refetchAfterReconnect, type LiveStatus } from './live';
 import { buildFixtures } from './mockData';
 import { summaryOf } from '../lib/summary';
-import type { Event, Migration, MigrationSummary } from './types';
+import { AUDIT_EVENT_KINDS, type Event, type Migration, type MigrationSummary } from './types';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const migration = fx.migrations.find((m) => m.phase === 'precopy') as Migration;
@@ -194,6 +194,20 @@ describe('applyEventToCache', () => {
       expect(invalidate, kind).toHaveBeenCalledWith(['events', 'tail']);
       expect(invalidate, kind).toHaveBeenCalledWith(['migration', migration.id]);
     }
+  });
+
+  it.each(AUDIT_EVENT_KINDS)('refreshes the audit lists on %s, which the live audit page shows (SDD §14.5, §16)', (kind) => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: migration.id }), seq: 50, kind }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['events', 'tail']);
+  });
+
+  it('still reads the forced migration again on a Force cutover, an audit event too (SDD §5.4, §14.5)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: migration.id }), seq: 51, kind: 'migration.force_cutover' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['events', 'tail']);
+    expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
+    expect(invalidate).toHaveBeenCalledWith(['stats']);
   });
 
   it("refreshes the migrations lists on a decision: approving clears a hold another viewer's plan page shows (SDD §14.6)", () => {
