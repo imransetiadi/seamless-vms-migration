@@ -186,6 +186,12 @@ jobs:
         env:
           SHOT_DIR: ${{ runner.temp }}/demo07
         run: mkdir -p "$SHOT_DIR" && SEAMLESS=seamless node ../tests/e2e/demo-keyboard-browser.mjs
+      - name: The event stream across a dropped connection and a server restart on a throwaway demo server (QASuite §14.7)
+        # about 20 s: live events with no reload, Reconnecting… and Live again, the events written meanwhile listed once
+        timeout-minutes: 5
+        env:
+          SHOT_DIR: ${{ runner.temp }}/demo07
+        run: mkdir -p "$SHOT_DIR" && SEAMLESS=seamless node ../tests/e2e/demo-stream-browser.mjs
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:

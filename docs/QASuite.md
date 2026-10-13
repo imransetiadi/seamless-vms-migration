@@ -653,10 +653,9 @@ past its content (WCAG 2.4.11, SDD §16); UI-23 axe-core's target-size rule find
 (WCAG 2.5.8 — the Events rows' stacked links keep 8 px apart); UI-24 no text is cut off with an ellipsis on those pages at
 320 and 1280 px, with the web fonts and with their font files aborted, the system font a browser shows until they arrive (WCAG 1.4.10, SDD §16 — in it an Overview plan name was 3 px too wide at 320 px until 068a64a); UI-27 the plan, policy and provider dialogs' error summaries pass axe's target-size rule (9514b10: their links were 17 px tall); UI-25 the sign-in page requests no chart code and the Overview still draws its charts (40ff6b7: Rolldown had put React inside `charts`, so every page preloaded Recharts); UI-26 the fonts come with the dashboard: no request leaves the page's origin and Fira Sans and Fira Code load (8e4aebd: they came from Google Fonts, render-blocking, unreachable in an air-gapped site); each was checked to fail when the behaviour it
 guards is broken; UI-19 timed out on a busy machine until its kind filters were matched by pattern — the mock's migrations move on and a second one can reach an advisor hold mid-test; UI-24's former flake was that Overview plan name, cut off whenever it measured before Fira Sans arrived — it waits for `document.fonts.ready` since 068a64a) — and `tests/e2e/browser-demo.mjs` (`TOKEN_FILE=… node tests/e2e/browser-demo.mjs`,
-Chromium against the running demo stack through the real control plane); UI-01 sign in with a token and land on Overview and UI-08 a 401 returns to `/login` run in `tests/e2e/demo-signin-browser.mjs`, UI-04 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, in `smoke.spec.ts`) and UI-05 Finalize needs the typed VM name in `tests/e2e/demo-approval-browser.mjs`, UI-03 plan detail → Validate → Start as operator and UI-10 its keyboard-only run in `tests/e2e/demo-keyboard-browser.mjs` (§14.7). Cases still manual, to automate next: UI-02 KPI
+Chromium against the running demo stack through the real control plane); UI-01 sign in with a token and land on Overview and UI-08 a 401 returns to `/login` run in `tests/e2e/demo-signin-browser.mjs`, UI-04 migration detail → Approve/Cutover as approver (a viewer's actions, shown unavailable, in `smoke.spec.ts`) and UI-05 Finalize needs the typed VM name in `tests/e2e/demo-approval-browser.mjs`, UI-03 plan detail → Validate → Start as operator and UI-10 its keyboard-only run in `tests/e2e/demo-keyboard-browser.mjs`, UI-06 the Events page appends live events and UI-09 an SSE reconnect after a dropped connection resumes without duplicates in `tests/e2e/demo-stream-browser.mjs` (§14.7). Cases still manual, to automate next: UI-02 KPI
 tiles and phase distribution render with demo data;
-UI-06 Events page appends live events; UI-07 theme toggle persists; UI-09 SSE
-reconnect after a dropped connection resumes without duplicates.
+UI-07 theme toggle persists.
 
 ```bash
 cd dashboard && npm ci && npx playwright install --with-deps chromium
@@ -1185,6 +1184,19 @@ it back to New plan on Escape; the plan opens from the list; Validate runs, and 
 before the plan's heading has it; and every stop is visible with a focus indicator (11 checks, about 15 s). Against a
 dashboard without the skip link, without the dialog's Tab wrap or without the focus ring, the check of that guarantee
 fails. CI's `dashboard-e2e` job runs it after the sign-in journey.
+
+[`tests/e2e/demo-stream-browser.mjs`](../tests/e2e/demo-stream-browser.mjs) drives the Events page's live stream across
+a dropped connection (UI-06, UI-09; SDD §12, §16), with a viewer token of its own; the browser reaches the server
+through a TCP relay of the script. The Events page appends the seeded plans' events as they come, with no reload. The
+relay then drops every connection and refuses new ones while the server goes on writing: the indicator reads
+Reconnecting… while the page is cut off and Live once the relay lets it through again, and the page then lists the
+events written meanwhile, each once. The server restarts on the same data: Reconnecting… while it is down, Live once
+it is back, and every event of the window listed once, from before the restart and after it (12 checks, about 20 s).
+The page's whole window is checked against the server's tail: each event listed once, newest first, none missing.
+Against a dashboard whose Events page ignores live events, whose stream never reconnects, whose reconnect neither
+resumes from `since` nor refetches, or that keys live events apart from the loaded history, the check of that
+guarantee fails. A stopped server writes nothing, so only the relay's drop leaves events to resume: without it the
+third of those dashboards passed. CI's `dashboard-e2e` job runs it after the keyboard journey.
 
 The committed scripts pass `shellcheck`.
 

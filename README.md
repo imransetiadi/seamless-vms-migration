@@ -108,8 +108,9 @@ make seamless-check              # CI's checks that need only the venv and node_
                                  # gate, ruff, DEMO-07, collection tests, playbook syntax, ansible-lint, installed scanners,
                                  # dashboard unit tests and build. The rest of CI, each on its own:
 (cd dashboard && npx playwright install chromium && npm run test:e2e)   # browser smoke of the built dashboard (mock mode)
-npm --prefix dashboard run build && node tests/e2e/demo-cutover-refusal-browser.mjs && node tests/e2e/demo-approval-browser.mjs && node tests/e2e/demo-signin-browser.mjs && node tests/e2e/demo-keyboard-browser.mjs
-                                 # the browser journeys: DEMO-07, maker-checker, signing in and the keyboard run
+npm --prefix dashboard run build && node tests/e2e/demo-cutover-refusal-browser.mjs && node tests/e2e/demo-approval-browser.mjs && node tests/e2e/demo-signin-browser.mjs && node tests/e2e/demo-keyboard-browser.mjs && node tests/e2e/demo-stream-browser.mjs
+                                 # the browser journeys: DEMO-07, maker-checker, signing in, the keyboard run and the
+                                 # event stream across a dropped connection
 SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db>' make seamless-test   # PostgreSQL store tests
 seamless/.venv/bin/pip install pip-audit && seamless/.venv/bin/pip-audit && npm --prefix dashboard audit --omit=dev --audit-level=high
                                  # the dependency audits, as CI runs them (pip-audit; npm audit)
