@@ -2381,7 +2381,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19), and Rolled back beside Failed
   (`Stats.by_phase.rolled_back`, in the warning tone while there is one): a rolled-back migration's source VM runs
   again and it waits for a person to fix the cause and retry it, or cancel it, so the tiles never read as all clear
-  while one waits. A plan Completed with nothing migrated — every
+  while one waits; Migrations counts the migrations that are not `cancelled` (`Stats.total` less
+  `by_phase.cancelled`) — a cancelled one is never done, as each plan's done count says — its hint naming how many
+  were cancelled, and Finalized's share is of those. A plan Completed with nothing migrated — every
   migration it did not cancel rolled back (§8.1 rule 6: `migration_counts` holds `rolled_back` and no `completed` or
   `finalized`) — never reads as a success: its badge takes the neutral tone and explains "Nothing was migrated: every
   migration rolled back."; its page says so with the next step — "Nothing was migrated: every migration rolled back and
