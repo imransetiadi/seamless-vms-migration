@@ -1400,6 +1400,58 @@ def test_a_completed_plan_keeps_its_providers_while_a_migration_holds_its_vm(api
     assert delete().status_code == 204
 
 
+def test_a_cancelled_migrations_pending_cleanup_keeps_its_providers(api):
+    """SDD §12/§5.1 (review RR-08): a migration cancelled with a data path keeps checkpoint
+    "cleanup" until its cleanup records an outcome, and the cleanup needs both providers to remove
+    what the data path left - in a cancelled plan (the rest never started) as in a completed one."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "cancelled mid-copy",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = api.store.list("migration", Migration, plan_id=plan["id"])
+    first.phase, first.checkpoint = Phase.cancelled, "cleanup"
+    second.phase = Phase.cancelled
+    for m in (first, second):
+        api.store.put("migration", m)
+    stored = api.store.get("plan", plan["id"], Plan)
+    stored.status = PlanStatus.cancelled
+    api.store.put("plan", stored)
+    delete = lambda provider: api.client.delete(  # noqa: E731
+        f"/api/v1/providers/{provider}", headers=api.h(Role.admin)
+    )
+    for provider in ("dst-rhoso", "src-osp"):
+        refused = delete(provider)
+        assert refused.status_code == 409, (provider, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("cancelled mid-copy", '
+            "1 cancelled VM still being cleaned up); a plan needs its providers until it completes "
+            "and its VMs are finalized"
+        )
+    # in a completed plan, beside a VM not finalized
+    stored.status = PlanStatus.completed
+    api.store.put("plan", stored)
+    second.phase = Phase.completed
+    api.store.put("migration", second)
+    assert (
+        '("cancelled mid-copy", 1 VM not finalized, 1 cancelled VM still being cleaned up)'
+        in delete("dst-rhoso").json()["error"]["message"]
+    )
+    second.phase = Phase.finalized
+    api.store.put("migration", second)
+    # its cleanup recorded an outcome: removed - or failed, and left to rollback_workloads.yml
+    first.checkpoint = "cleaned"
+    api.store.put("migration", first)
+    assert delete("dst-rhoso").status_code == 204
+    first.checkpoint = "cleanup_failed"
+    api.store.put("migration", first)
+    assert delete("src-osp").status_code == 204
+
+
 def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):
     body = {
         "name": "still a draft",

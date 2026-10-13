@@ -165,6 +165,12 @@ _RELEASES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def cleanup_pending(m: Migration) -> bool:
+    """A cancel's cleanup that has not recorded its outcome: it runs again at the next start, and
+    it needs both providers to remove what the cancelled data path left (SDD §5.1, §12)."""
+    return m.phase == P.cancelled and m.checkpoint == "cleanup"
+
+
 def blocks_plan_change(m: Migration) -> bool:
     """A migration in flight or whose source VM is stopped keeps its plan as it is (SDD §12)."""
     return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
@@ -1620,7 +1626,7 @@ class Orchestrator:
         (SDD §5.1)."""
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.phase == P.cancelled and m.checkpoint == "cleanup":
+            if cleanup_pending(m):
                 m.checkpoint = outcome
                 await self._save(m, v)
 
@@ -2040,9 +2046,7 @@ class Orchestrator:
         for m in await self.db.list("migration", Migration):
             if m.phase in fsm.RESUMABLE_PHASES:
                 self._launch(m.id)
-            elif (
-                m.phase == P.cancelled and m.checkpoint == "cleanup" and m.id not in self._cleanups
-            ):
+            elif cleanup_pending(m) and m.id not in self._cleanups:
                 # a cleanup a stop or a crash cut short runs again (SDD §5.1)
                 self._cleanups[m.id] = asyncio.create_task(
                     self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"

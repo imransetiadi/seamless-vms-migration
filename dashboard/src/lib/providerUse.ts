@@ -16,7 +16,9 @@ const notFinalized = (n: number) => `${n} VM${n === 1 ? '' : 's'} not finalized`
 /**
  * The plans that still need a provider, as source or destination (SDD §12): one stored neither completed nor
  * cancelled, or a completed one with VMs not finalized, rolled back or cancelled - a rollback needs both providers
- * until a VM is finalized. The stored status decides, as in the API; the reason reads as the plan shows it.
+ * until a VM is finalized. The stored status decides, as in the API; the reason reads as the plan shows it. A cancelled
+ * migration's cleanup still under way keeps the providers too, but the plan list does not carry it: the API's 409 names
+ * it (SDD §16).
  */
 export function plansThatNeed(providerId: string, plans: readonly Plan[]): ProviderUser[] {
   return plans.flatMap((plan) => {

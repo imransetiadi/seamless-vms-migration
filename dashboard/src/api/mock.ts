@@ -1882,7 +1882,8 @@ export class MockServer {
       .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return plans.flatMap((p) => {
-      // a cancelled plan's migrations never started and are all cancelled (SDD §12)
+      // a cancelled plan's migrations are all cancelled, and the mock's cleanup after a cancel ends at once: none is
+      // pending, as one keeps the API's providers (SDD §5.1, §12)
       if (p.status === 'cancelled') return [];
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
       const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
