@@ -534,8 +534,12 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
   GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO seamless_app;
   ```
 
-  Confirm first that the control plane issues no DDL against an existing schema (`Store.create_schema()` uses
-  `checkfirst`) and that `events` is never updated by the application; it is deleted only by
+  Create or upgrade the schema as the owner role first — start the control plane, or run any `seamless` command,
+  once with the owner's `SEAMLESS_DB_URL` — then give the control plane the application role's URL: on a complete
+  schema `Store.create_schema()`, which every start runs, issues no DDL (SDD §11), and that is what a role that does
+  not own the tables needs, as PostgreSQL lets only a table's owner run `CREATE INDEX`, even for an index that exists.
+  After an upgrade that adds an index, start once as the owner again. `events` is never updated by the application;
+  it is deleted only by
   `seamless events prune` (older than a cut-off, SDD §15) and the test helper, so run the prune as the owner role,
   or grant DELETE on `events` to the role that runs it. The owner can still alter rows, so also export `events` periodically to write-once storage.
 * Data at rest: storage-class encryption for PVCs; encrypted backups; restore drills ([Performance.md](Performance.md) §9).

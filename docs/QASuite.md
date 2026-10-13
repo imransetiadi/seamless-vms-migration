@@ -183,7 +183,8 @@ application owner (viewer). "Demo" scenarios run unattended in E2 against `--dem
 of ≥ 200 GiB, at least ten single-disk VMs of ≤ 100 GiB (the G1a population) and one single-disk VM of 500 GiB (P-XL,
 LAB-W12); network, flavor and volume-type mappings are defined; the plan has `require_approval: true`,
 `downtime_slo_s: 600` (the backend default and the G1a budget: `270 s + scan` fits single disks up to ≈ 161 GiB), a
-`cutover_window` on Saturday, `keep_warm_interval_s: 900`.
+`cutover_window` on Saturday, `keep_warm_interval_s: 900`; besides Sari, a second approver (Dewi) holds the approver
+role, as the plan keeps `require_distinct_approver: true` (the default).
 **When** Rina creates the plan (the policy fields `require_approval`, `auto_cutover` and `cutover_window` need role
 **approver** (SDD §12), so Sari sets them, in the create call or by `PATCH`), runs `POST /plans/{id}/waves/auto`,
 `POST /plans/{id}/validate` and `POST /plans/{id}/start`;
@@ -197,7 +198,9 @@ LAB-W12); network, flavor and volume-type mappings are defined; the plan has `re
 3. a keep-warm pass runs when the last pass ended more than `keep_warm_interval_s` ago and the migration returns to
    `awaiting_cutover`;
 4. outside the window `POST …/cutover` without `force_window` does not start the cutover (gate 2); inside the
-   window Sari's call records an approval (`migration.approved`) and sets `cutover_requested`;
+   window Sari's call sets `cutover_requested` (`cutover_requested_by`: Sari) and records no approval — with
+   `require_distinct_approver` the requester's approval never counts, and Sari's own `POST …/approve` answers 409 —
+   so Dewi's `POST …/approve` (`migration.approved`) opens gate 1 (SDD §5.4);
 5. at cutover the source stops **once** (`downtime_started_at`), a `SyncPass` of kind `final` transfers only changed
    chunks (`bytes_transferred ≪ disk size`), the destination server is created from the warm block-device mapping
    (`delete_on_termination: false`), verification passes (`server_active`, `ports_up`, configured `tcp:<port>`,
