@@ -66,6 +66,25 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     }
   });
 
+  it('names the field of each number it refuses: the summary lists them together', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    await user.click(screen.getByRole('button', { name: 'New policy' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New policy' });
+    await user.type(within(dialog).getByLabelText(/^Name/), 'Numbers');
+    await user.clear(within(dialog).getByLabelText('Threshold (%)'));
+    await user.type(within(dialog).getByLabelText('Threshold (%)'), '101');
+    await user.clear(within(dialog).getByLabelText(/^minimum evidence/i));
+    await user.type(within(dialog).getByLabelText(/^minimum evidence/i), '1.5');
+    await user.click(within(dialog).getByRole('button', { name: 'Create policy' }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(within(summary).getAllByRole('link').map((a) => a.textContent)).toEqual([
+      'Enter the threshold as a percent from 0 to 100.',
+      'Enter the minimum evidence as a whole number from 0 to 100.',
+    ]);
+  });
+
   it('creates a policy for chosen plans once the form says what to fix', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });
