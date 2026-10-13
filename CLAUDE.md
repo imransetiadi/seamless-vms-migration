@@ -139,3 +139,35 @@ allowlists no secret path, plus `.gitleaksignore`) before pushing.
 2. Behavior matches the SDD section referenced by the task; docs that mention it are updated.
 3. No secrets, no unrelated edits, only files your track owns.
 4. Commit message follows §2.7. For completion claims on a whole branch, run `jev_gate` with the evidence.
+
+## Git workflow
+
+Other teammates merge into `main` regularly, so always work on top of the latest `main`.
+
+**Start of every session**
+
+1. Run `git status`. If there are uncommitted changes, stash them or make a WIP commit before switching
+   branches or pulling. Never discard changes.
+2. Update `main`: `git checkout main && git pull --ff-only`. If `--ff-only` fails, stop and report it. Do not
+   merge into, reset, or rewrite `main`.
+3. Switch to the feature branch, then run `git rebase main`. If the branch is already pushed and shared with
+   others, use `git merge main` instead.
+4. If you stashed in step 1, run `git stash pop`.
+
+**Branching**
+
+- Never commit directly to `main`. All work happens on a feature branch (e.g. `feature/<short-name>`) and goes
+  into `main` via a PR.
+- If a task starts while you are on `main`, create a feature branch first.
+
+**Before pushing or opening a PR**
+
+- Sync again — repeat the `main` update, then rebase or merge — since `main` may have moved during the session.
+- After rebasing a branch that was already pushed, push with `git push --force-with-lease`. Never use
+  `git push --force`, and never force-push to `main`.
+
+**Conflicts**
+
+- If a rebase or merge hits conflicts, stop, list the conflicting files, and ask the user before continuing.
+  Do not resolve them by blindly taking one side (`--ours` / `--theirs`).
+- To back out safely: `git rebase --abort` or `git merge --abort`.
