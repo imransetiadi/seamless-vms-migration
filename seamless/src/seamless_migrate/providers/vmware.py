@@ -17,7 +17,7 @@ from ..config import Settings
 from ..domain.models import Disk, Nic, Provider, VMRef
 from ..planning.preflight import SourceInventory
 from ..security.secrets import SecretNotFound, resolve
-from .base import ProviderError, missing_dependency
+from .base import ProviderError, VMNotFound, missing_dependency
 from .openstack import PROVIDER_CALL_TIMEOUT_S
 
 log = logging.getLogger(__name__)
@@ -357,7 +357,8 @@ class VMwareProvider:
         for vm in await self.list_vms():  # moId-addressed or index-less setups
             if vm.source_id == source_id:
                 return vm
-        raise ProviderError(f"{self.provider.id}: VM {source_id!r} not found")
+        # vCenter answered (the walk ran): it has no such VM (SDD §10)
+        raise VMNotFound(f"{self.provider.id}: VM {source_id!r} not found")
 
     async def power_on(self, source_id: str) -> None:
         """Power the source VM on again (rollback of VMware strategies)."""

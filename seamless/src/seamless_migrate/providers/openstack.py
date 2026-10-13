@@ -20,7 +20,7 @@ from ..guest_os import identify
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
-from .base import ProviderError, missing_dependency
+from .base import ProviderError, VMNotFound, missing_dependency
 
 log = logging.getLogger(__name__)
 
@@ -248,7 +248,14 @@ class OpenStackProvider:
 
     def _get_vm(self, source_id: str) -> VMRef:
         conn = self._connection()
-        return _MapContext(conn).server_to_vmref(conn.compute.get_server(source_id))
+        import openstack.exceptions
+
+        try:
+            server = conn.compute.get_server(source_id)
+        except openstack.exceptions.NotFoundException:
+            # Nova answered 404: it has no such server (SDD §10), not an unreachable cloud
+            raise VMNotFound(f"{self.provider.id}: VM {source_id!r} not found") from None
+        return _MapContext(conn).server_to_vmref(server)
 
     def _project_name(self, conn: Any) -> str:
         pid = _attr(conn, "current_project_id", default="")

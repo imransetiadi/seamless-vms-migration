@@ -107,7 +107,7 @@ from .planning.preflight import (
 from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
-from .providers.base import ProviderError
+from .providers.base import ProviderError, VMNotFound
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
 from .verification import VerificationResult, Verifier, review_reason
 
@@ -1798,8 +1798,15 @@ class Orchestrator:
                 if plan.source_provider_id not in clients:
                     clients[plan.source_provider_id] = await self.source_client(plan)
                 vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)
+            except VMNotFound:
+                # SDD §8.1 (the owner's choice, 2026-10-14): the cloud says the VM is gone - a
+                # finalize deleted it, a handover rebuilt it, or someone deleted the source after
+                # it ran again: nothing left to keep or roll back to, so a flag set clears
+                if m.source_running_at is not None:
+                    await self._source_gone(m.id)
+                continue
             except (ProviderError, NotFound):
-                continue  # gone (a finalize deleted it, a handover rebuilt it) or unreachable
+                continue  # unreachable, or the plan is gone: the flag stays as it is
             except Exception:
                 log.warning("source watch failed for %s", m.id, exc_info=True)
                 continue
@@ -1833,6 +1840,22 @@ class Orchestrator:
                     migration=cur,
                     data={"power_state": str(vm.power_state)},
                 )
+
+    async def _source_gone(self, mid: str) -> None:
+        """Clear source_running_at of a completed migration whose source VM its cloud no longer
+        has (SDD §8.1), with migration.source_stopped marked gone."""
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            if cur.phase != P.completed or cur.source_running_at is None:
+                return
+            cur.source_running_at = None
+            await self._save(cur, v)
+        await self._emit(
+            "migration.source_stopped",
+            f"{cur.vm.name}: the source VM no longer exists - nothing left to keep or roll back to",
+            migration=cur,
+            data={"power_state": None, "gone": True},
+        )
 
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)

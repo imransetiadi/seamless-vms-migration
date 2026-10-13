@@ -13,7 +13,7 @@ from typing import Any
 from ..domain.enums import ProviderKind
 from ..domain.models import Disk, Nic, VMRef
 from ..planning.preflight import DestinationInventory, SourceInventory
-from .base import ProviderError
+from .base import ProviderError, VMNotFound
 
 MIB = 2**20
 
@@ -356,7 +356,7 @@ class FakeSourceProvider:
         try:
             return self._as_now(self._by_id[source_id])
         except KeyError:
-            raise ProviderError(f"VM {source_id!r} not found") from None
+            raise VMNotFound(f"VM {source_id!r} not found") from None
 
     async def power_on(self, source_id: str) -> None:
         await self.get_vm(source_id)

@@ -8,7 +8,7 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
-from seamless_migrate.providers.base import ProviderError, provider_caps
+from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_caps
 from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
 from seamless_migrate.providers.openstack import OpenStackProvider
 from seamless_migrate.providers.vmware import VMwareProvider
@@ -41,7 +41,8 @@ async def test_fake_openstack_inventory_has_required_traits():
     assert isinstance(inv, SourceInventory) and inv.networks and inv.projects
     caps = await src.check()
     assert caps["admin"] is True and "compute_microversion" in caps
-    with pytest.raises(ProviderError):
+    # the cloud answers it has no such VM: VMNotFound, a ProviderError (SDD §10)
+    with pytest.raises(VMNotFound):
         await src.get_vm("does-not-exist")
 
 
@@ -129,6 +130,11 @@ class FakeCompute:
         return list(self._servers.values())
 
     def get_server(self, server_id):
+        if server_id not in self._servers:
+            import openstack.exceptions
+
+            # what the SDK raises on HTTP 404
+            raise openstack.exceptions.NotFoundException(f"No Server found for {server_id}")
         return self._servers[server_id]
 
     def volume_attachments(self, server):
@@ -541,6 +547,24 @@ async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
     stub_openstack(conn)
     [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
     assert vm.power_state == "transitioning"
+
+
+async def test_openstack_get_vm_tells_a_server_the_cloud_lacks_from_a_failing_cloud(stub_openstack):
+    """SDD §8.1, §10: the source watch clears a source that ran again once its cloud says the VM is
+    gone - a 404 is VMNotFound; any other failure stays a plain ProviderError (not gone)."""
+    conn = fake_conn()
+    stub_openstack(conn)
+    provider = OpenStackProvider(make_provider(), settings())
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("srv-gone")
+
+    def unreachable(server_id):
+        raise RuntimeError("Unable to establish connection to https://nova:8774")
+
+    conn.compute.get_server = unreachable
+    with pytest.raises(ProviderError) as failed:
+        await provider.get_vm("srv-1")
+    assert not isinstance(failed.value, VMNotFound)
 
 
 async def test_openstack_image_booted_server_gets_image_root_disk(stub_openstack):
@@ -1024,7 +1048,7 @@ async def test_vmware_power_on_and_inventory(tmp_path):
         await provider_for([PoweredOffVM(task_state="error")]).power_on("5012-abcd")
     with pytest.raises(ProviderError, match="not found"):
         await provider_for([vm]).power_on("missing")
-    with pytest.raises(ProviderError, match="not found"):
+    with pytest.raises(VMNotFound, match="not found"):
         await provider_for([vm]).get_vm("missing")
     inv = await provider_for([vm]).inventory()
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
@@ -1071,7 +1095,7 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     await provider.power_on("5012-abcd")
     assert len(vm.tasks) == 1 and len(lookups) == 2
     assert not any("VirtualMachine" in t for t in walked)
-    with pytest.raises(ProviderError, match="not found"):
+    with pytest.raises(VMNotFound, match="not found"):
         await provider.get_vm("missing")  # falls back to the walk, then fails
 
 

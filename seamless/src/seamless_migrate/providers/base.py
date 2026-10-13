@@ -12,6 +12,10 @@ class ProviderError(Exception):
     """A provider could not be reached or answered with an error (message is credential-free)."""
 
 
+class VMNotFound(ProviderError):
+    """The cloud answered that it has no such VM (SDD §10): gone, never merely unreachable."""
+
+
 @runtime_checkable
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]: ...

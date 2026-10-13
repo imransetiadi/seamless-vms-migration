@@ -5967,6 +5967,57 @@ async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_pa
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None
 
 
+async def test_the_source_watch_clears_a_source_running_again_once_its_cloud_says_it_is_gone(
+    tmp_path, store
+):
+    """SDD §8.1 (RR-02, the owner's choice): a source that ran again and was then deleted - or that
+    its cloud no longer has - leaves nothing to keep or roll back to: the watch clears the flag
+    with migration.source_stopped marked gone, and Finalize works again."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+
+    async def watch():
+        h.clock.advance(h.settings.source_watch_s + 1)
+        await h.orch.tick()
+        if h.orch._watch_task is not None:
+            await h.orch._watch_task  # the watch runs beside the tick (SDD §8.1)
+        return await h.by_vm(plan.id, "vm-1")
+
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    assert (await watch()).source_running_at is not None
+    with pytest.raises(NotAllowed, match="runs again"):
+        await h.orch.finalize(m.id, "ana", confirm=m.vm.name)
+    del h.source.vms["vm-1"]  # deleted in the source cloud after it diverged
+    assert (await watch()).source_running_at is None
+    events = [e for e in store.events(since_seq=0, limit=100000) if e.migration_id == m.id]
+    [gone] = [e for e in events if e.kind == "migration.source_stopped"]
+    assert gone.data == {"power_state": None, "gone": True}
+    assert "no longer exists" in gone.message
+    assert (await h.orch.finalize(m.id, "ana", confirm=m.vm.name)).phase == P.finalized
+    await h.orch.stop()
+
+
+async def test_the_source_watch_keeps_a_source_running_again_while_its_cloud_fails(tmp_path, store):
+    """SDD §8.1: only a cloud that answers can say the VM is gone - an error keeps the flag."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    seen = (await h.by_vm(plan.id, "vm-1")).source_running_at
+    assert seen is not None
+
+    async def unreachable(source_id):
+        raise ProviderError("src-osp: Unable to establish connection")
+
+    h.source.get_vm = unreachable
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    assert (await h.by_vm(plan.id, "vm-1")).source_running_at == seen
+    await h.orch.stop()
+
+
 async def test_the_earlier_attempts_evidence_names_the_strategy_those_attempts_used(
     tmp_path, store
 ):
