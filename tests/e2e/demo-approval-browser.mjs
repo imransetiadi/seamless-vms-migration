@@ -245,12 +245,21 @@ try {
     if (!why.includes('You requested this cutover. Another approver must approve it.')) throw new Error(`it says ${JSON.stringify(why)}`);
   });
   await check('report-01: the approver approves, and the cutover runs and verifies on TCP 22', asApprover, () => approve('report-01'));
-  await check('report-01: the approver finalizes it, typing its name', asApprover, async () => {
+  await check('report-01: Finalize is refused until its name is typed, then the approver finalizes it (QASuite UI-05)', asApprover, async () => {
     await open(asApprover, 'report-01');
     await asApprover.getByRole('button', { name: 'Finalize', exact: true }).first().click();
     const dialog = asApprover.getByRole('alertdialog');
+    const confirm = dialog.getByRole('button', { name: 'Finalize' });
+    const refused = async (when) => {
+      if ((await confirm.getAttribute('aria-disabled')) !== 'true') throw new Error(`Finalize is offered ${when}`);
+      const why = await confirm.evaluate((el) => (el.getAttribute('aria-describedby') ?? '').split(' ').map((id) => document.getElementById(id)?.textContent ?? '').join(' '));
+      if (!why.includes('Type report-01 to confirm.')) throw new Error(`${when}, it says ${JSON.stringify(why)}`);
+    };
+    await refused('before the name is typed');
+    await dialog.getByLabel(/Type .* to confirm/).fill('report-0');
+    await refused('with half the name typed');
     await dialog.getByLabel(/Type .* to confirm/).fill('report-01');
-    await dialog.getByRole('button', { name: 'Finalize' }).click();
+    await confirm.click();
     if (!(await until(() => migration('report-01'), (x) => x.phase === 'finalized', 60))) throw new Error('report-01 was not finalized');
   });
   await check('batch-01: requested by the requester, approved by the approver, completed', asApprover, async () => {
