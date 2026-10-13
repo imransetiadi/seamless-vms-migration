@@ -113,6 +113,27 @@ test('light theme switches the token values', async ({ page }) => {
     .toBe('rgb(248, 250, 252)');
 });
 
+test('the theme chosen stays after a reload, light and dark (QASuite UI-07)', async ({ page }) => {
+  await signIn(page);
+  // the sidebar toggle is labelled by its visible text: the theme it switches to
+  const toggle = page.locator('aside').getByRole('button', { name: /^(light|dark) theme$/i });
+  const background = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  // dark is the default (SDD §16)
+  await expect(toggle).toHaveText(/^light theme$/i);
+  await toggle.click();
+  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await page.reload();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await expect(toggle).toHaveText(/^dark theme$/i);
+  // and back: the dark choice stays too
+  await toggle.click();
+  await page.reload();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await expect.poll(background).toBe('rgb(15, 23, 42)');
+  await expect(toggle).toHaveText(/^light theme$/i);
+});
+
 test('an admin connects a Kolla-Ansible source and tests the connection', async ({ page }) => {
   await signIn(page);
   await page.goto('/providers');
