@@ -2480,7 +2480,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cutover, §5.4),
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
-  (§5.4: that plan and the phase, from the migrations as summaries, read while the form is open), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
+  (§5.4: that plan and the phase, from the migrations as summaries, read while the form is open), as validation refuses it,
+  and its VM table names, as the Inventory's does, the plan that holds each VM with the Plan filter — the plan being
+  edited never holding its own VMs — so the free VMs are picked before any warning; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
   with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
