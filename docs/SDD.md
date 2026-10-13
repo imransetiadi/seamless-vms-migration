@@ -2729,7 +2729,9 @@ Structured logs (JSON when `SEAMLESS_LOG_JSON=true`), audit events in the DB, `/
 `seamless_downtime_seconds_sum/_count` and `seamless_downtime_seconds_max`,
 `seamless_step_duration_seconds_sum/_count{step}`, `seamless_advisor_calls_total{tool,outcome}`,
 `seamless_tick_seconds_sum/_count`, `seamless_tick_seconds_max` and `seamless_tick_slow_total` (ticks
-over half of `tick_s`; QASuite PERF-CP-02).
+over half of `tick_s`; QASuite PERF-CP-02), and `seamless_cutover_refusals` gauge — the migrations in `precopy`,
+`syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, §7.2), the
+ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is to fix before a cutover.
 
 ---
 
