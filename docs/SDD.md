@@ -2596,6 +2596,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  a VM that a migration of a plan holds (§5.4: one not `cancelled`, `finalized` or `rolled_back`) names that plan
+  under its name, linked to the plan, with the migration's phase, and a Plan filter shows all VMs, those no plan
+  holds or those one holds, so an operator picks free VMs before New plan warns about held ones — while the plans
+  or the migrations cannot be loaded the table says it does not know which plans hold its VMs, instead of reading
+  them free;
   `?vm={source id}` opens it searching for that VM, ADV-02;
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
