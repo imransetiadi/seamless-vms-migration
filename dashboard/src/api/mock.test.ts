@@ -291,6 +291,19 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it('cancels a rolled-back migration and cleans up the data path its rollback kept, like the API (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const actions = (id: string) =>
+      server.events.filter((e) => e.migration_id === id && e.kind === 'migration.action').map((e) => e.data.action);
+    const rolled = byPhase(server, 'rolled_back');
+    // a warm migration whose rollback kept its destination volumes and warm state for a retry
+    rolled.strategy = 'warm';
+    rolled.sync_passes = server.migrations.find((m) => m.vm.name === 'app-billing-01')!.sync_passes.map((p) => ({ ...p }));
+    const cancelled = await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
+    expect(cancelled.phase).toBe('cancelled');
+    expect(actions(rolled.id).slice(-2)).toEqual(['cancel', 'cleanup']);
+  });
+
   it('reopens a completed plan at a retry, and refuses one whose provider is gone, like the API (SDD §5.1)', async () => {
     const { server, client } = setup('operator');
     const rolled = byPhase(server, 'rolled_back');

@@ -30,7 +30,8 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   // an approval given ahead of a retry lasts through it (SDD §5.1, §16)
   failed: ['approve', 'rollback', 'retry', 'cancel'],
   rolling_back: [],
-  rolled_back: ['approve', 'retry'],
+  // a rolled-back VM can be dropped for good: the cancel cleans up what its rollback kept (SDD §5.1)
+  rolled_back: ['approve', 'retry', 'cancel'],
   cancelled: [],
 };
 
