@@ -27,3 +27,26 @@ export function clearStoredToken(): void {
     // ignore
   }
 }
+
+/**
+ * Set when the server refused the stored token of a signed-in session (401, SDD §16), so Sign in says the session
+ * ended. Kept in memory: a new page load is a new visit. Signing out clears the token without setting it.
+ */
+let ended = false;
+
+/** A 401 for the stored token: drop it once and mark that the session ended. False when no token was stored. */
+export function endSession(): boolean {
+  if (!getStoredToken()) return false;
+  clearStoredToken();
+  ended = true;
+  return true;
+}
+
+/** Whether the last session ended because its token was refused; reading it changes nothing. */
+export function sessionEnded(): boolean {
+  return ended;
+}
+
+export function clearSessionEnded(): void {
+  ended = false;
+}

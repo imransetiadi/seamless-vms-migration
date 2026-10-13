@@ -2,7 +2,7 @@ import { QueryClient } from '@tanstack/react-query';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
-import { clearStoredToken, getStoredToken } from './api/auth';
+import { endSession, getStoredToken } from './api/auth';
 import { ApiClient, DEFAULT_API_BASE, setDefaultClient } from './api/client';
 import { queryKeys } from './api/hooks';
 // SDD §16 fonts, bundled (Latin, the weights in use): an air-gapped install loads nothing from another host
@@ -37,11 +37,9 @@ async function bootstrap() {
     getToken: getStoredToken,
     fetchImpl,
     onUnauthorized: () => {
-      // Drop a rejected token once; RequireAuth then redirects to /login when /me fails.
-      if (getStoredToken()) {
-        clearStoredToken();
-        void queryClient.invalidateQueries({ queryKey: queryKeys.me });
-      }
+      // Drop a rejected token once, marking that the session ended (Sign in says so, SDD §16); RequireAuth then
+      // redirects to /login when /me fails.
+      if (endSession()) void queryClient.invalidateQueries({ queryKey: queryKeys.me });
     },
   });
   setDefaultClient(client);

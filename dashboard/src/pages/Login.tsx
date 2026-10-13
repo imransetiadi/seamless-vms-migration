@@ -1,6 +1,7 @@
 import { CircleAlert, CircleCheck, CircleX, Eye, EyeOff, LogIn } from 'lucide-react';
-import { useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { clearSessionEnded, sessionEnded } from '../api/auth';
 import { ApiError, errorMessage } from '../api/client';
 import { useHealth } from '../api/hooks';
 import { useSignIn } from '../api/session';
@@ -27,6 +28,9 @@ export default function Login() {
   const [pending, setPending] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const mock = import.meta.env.VITE_SEAMLESS_MOCK === '1';
+  // a session the server ended (its token refused, SDD §16): said once, on this visit
+  const [ended] = useState(sessionEnded);
+  useEffect(() => clearSessionEnded(), []);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -71,6 +75,17 @@ export default function Login() {
           <p className="mt-1 text-sm text-muted-foreground">
             Paste the API token issued with <code>seamless token create</code>. It is kept in this browser tab only.
           </p>
+          {ended && (
+            <div
+              id={`${tokenId}-ended`}
+              role="status"
+              aria-label="Session ended"
+              className="mt-4 flex gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm text-foreground"
+            >
+              <CircleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+              <p>Your session ended: the server no longer accepts your token. It was revoked, or the server’s tokens changed. Sign in with a valid token.</p>
+            </div>
+          )}
 
           <form onSubmit={submit} noValidate className="mt-5 flex flex-col gap-4">
             {/* Lets password managers associate the saved token with this service. */}
@@ -92,7 +107,8 @@ export default function Login() {
                   value={token}
                   onChange={(e) => setToken(e.target.value)}
                   aria-invalid={error ? true : undefined}
-                  aria-describedby={error ? `${tokenId}-error` : `${tokenId}-hint`}
+                  // the field says why the session ended too: a note shown on load is not reliably announced
+                  aria-describedby={`${ended ? `${tokenId}-ended ` : ''}${error ? `${tokenId}-error` : `${tokenId}-hint`}`}
                 />
                 <button
                   type="button"
