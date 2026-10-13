@@ -575,6 +575,26 @@ describe('PlanDetail', () => {
     expect(await within(actions).findByRole('button', { name: 'Resume' })).toBeInTheDocument();
   });
 
+  it('reads a paused plan validated again while its migrations are at work as Paused, with Resume (SDD §8.1, the owner\'s choice)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    // validated again while paused: stored validated, its migrations still in flight, and no longer driven
+    plan.status = 'validated';
+    expect(server.migrations.some((m) => m.plan_id === plan.id && ['precopy', 'syncing', 'awaiting_cutover', 'cutover'].includes(m.phase))).toBe(true);
+    renderWithApp(<PlanDetail />, { route: `/plans/${plan.id}`, path: '/plans/:planId', token: 'operator', server });
+    await screen.findByRole('heading', { level: 1, name: plan.name });
+    const header = screen.getByRole('heading', { level: 1, name: plan.name }).closest('header')!;
+    expect(header).toHaveTextContent('Paused');
+    expect(header).not.toHaveTextContent('Running');
+    const actions = await screen.findByRole('group', { name: /plan actions/i });
+    expect(within(actions).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+    expect(within(actions).queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+    // its active wave reads as the plan does
+    const waves = screen.getByRole('region', { name: /^Waves/ });
+    const pilot = within(waves).getByRole('heading', { name: 'Pilot — stateless web' }).closest('li')!;
+    await waitFor(() => expect(within(pilot).queryByText('Planned')).not.toBeInTheDocument());
+  });
+
   it.each([
     ['plan-c81d44a0', 'Start', 'Start this plan?', 'Start plan'],
     ['plan-7b3e0d52', 'Resume', 'Resume this plan?', 'Resume plan'],

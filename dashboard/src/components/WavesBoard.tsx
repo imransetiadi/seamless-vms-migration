@@ -53,9 +53,10 @@ export function WavesBoard({ plan, migrations, emptyAction }: { plan: Plan; migr
             ? waveRolledBack(members)
               ? 'rolled_back'
               : 'complete'
-            : plan.status === 'running'
+            : plan.derived_status === 'running'
               ? computed
-              : plan.status === 'paused' && computed === 'active'
+              : // a Paused plan's active wave waits as the plan does (SDD §8.1)
+                plan.derived_status === 'paused' && computed === 'active'
                 ? 'paused'
                 : 'planned';
         const meta = STATE_META[state];

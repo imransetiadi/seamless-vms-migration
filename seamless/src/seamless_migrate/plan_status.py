@@ -14,7 +14,7 @@ from .domain.enums import Phase as P
 from .domain.enums import PlanStatus
 from .domain.models import Migration, Plan
 
-#: a migration in these is at work: the plan runs (or is paused)
+#: a migration in these is at work: the plan runs, or is paused when it is not driven
 AT_WORK = frozenset(
     {P.precopy, P.syncing, P.awaiting_cutover, P.cutover, P.verifying, P.rolling_back}
 )
@@ -39,7 +39,11 @@ def derive_plan_status_from_phases(plan: Plan, phases: Iterable[P]) -> D:
     if not phases:
         return stored
     if phases & AT_WORK:
-        return D.paused if plan.status == PlanStatus.paused else D.running
+        # only a running plan is driven: one validated again while paused is paused too; a
+        # failed pre-staging keeps Failed, as Start again pre-stages it (SDD §8.1)
+        if plan.status == PlanStatus.running:
+            return D.running
+        return D.failed if plan.status == PlanStatus.failed else D.paused
     if plan.status in (PlanStatus.running, PlanStatus.paused) and phases & TO_START:
         return stored
     if P.failed in phases:

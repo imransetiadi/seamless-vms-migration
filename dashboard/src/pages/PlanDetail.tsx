@@ -362,6 +362,8 @@ export default function PlanDetail() {
   const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
   const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
   const startShown = p.status !== 'running' && !ended;
+  // a Paused plan resumes, also one validated again while its migrations are at work (SDD §8.1)
+  const resumes = p.derived_status === 'paused';
   const askStart = () => {
     afterActionRef.current = null;
     setConfirm('start');
@@ -423,7 +425,7 @@ export default function PlanDetail() {
             ) : (
               startShown && (
                 <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={askStart}>
-                  {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
+                  {resumes ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
                 </Button>
               )
             )}
@@ -562,7 +564,7 @@ export default function PlanDetail() {
 
       <ConfirmDialog
         open={confirm === 'start'}
-        title={p.status === 'paused' ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
+        title={resumes ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
         description={
           <>
             {p.status === 'failed' &&
@@ -571,7 +573,7 @@ export default function PlanDetail() {
             source VMs keep running. {p.require_approval ? 'Every cutover still needs an approver.' : 'Cutovers do not need approval in this plan.'}
           </>
         }
-        confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
+        confirmLabel={resumes ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
         returnFocusRef={afterActionRef}
