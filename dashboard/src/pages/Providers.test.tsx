@@ -526,20 +526,19 @@ describe('Providers page', () => {
     await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
   });
 
-  it('names the plans that still need a provider when its deletion is refused (SDD §12)', async () => {
+  it('does not offer Delete while plans still need the provider, and says which (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('admin');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
     const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
-    await user.click(within(card).getByRole('button', { name: /^delete /i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /delete rhosp 17\.1/i });
-    // what happens, row by row (SDD §16)
-    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it');
-    await user.type(within(dialog).getByLabelText(/type rhosp17-dc1 to confirm/i), 'rhosp17-dc1');
-    await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
-    const refusal = await within(dialog).findByRole('alert');
-    expect(refusal).toHaveTextContent('plan-4f2a9c1e ("DC1 → RHOSO production rollout", running)');
-    expect(within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' })).toBeInTheDocument();
+    const remove = within(card).getByRole('button', { name: /^delete /i });
+    await waitFor(() => expect(remove).toHaveAttribute('aria-disabled', 'true'));
+    // as the API refuses it: the plans neither completed nor cancelled, a completed one whose VMs are not finalized
+    expect(remove).toHaveAccessibleDescription(
+      'Plans still need it: “DC1 → RHOSO production rollout” (running), “Shared Ceph handover — analytics” (validated), “Pilot — static content” (1 VM not finalized) and 1 more. A plan needs its providers until it completes and its VMs are finalized.',
+    );
+    await user.click(remove);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
   it('moves the focus to the column heading once a deleted provider is gone (SDD §16)', async () => {
@@ -549,6 +548,8 @@ describe('Providers page', () => {
     const card = within(from).getByRole('article', { name: 'Kolla Edge (Bobcat)' });
     await user.click(within(card).getByRole('button', { name: /^delete /i }));
     const dialog = await screen.findByRole('alertdialog', { name: /delete kolla edge/i });
+    // what happens, row by row (SDD §16): no plan needs it any more
+    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then finished plans keep its id: none of them needs it any more');
     await user.type(within(dialog).getByLabelText(/type kolla-edge to confirm/i), 'kolla-edge');
     await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
     await waitFor(() => expect(within(from).queryByRole('article', { name: 'Kolla Edge (Bobcat)' })).not.toBeInTheDocument());
