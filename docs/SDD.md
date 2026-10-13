@@ -2363,7 +2363,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   a region already on the page, never the clock's every tick.
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
   Finalized, Failed, Cancelled — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
-  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
+  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19). A plan Completed with nothing migrated — every
+  migration it did not cancel rolled back (§8.1 rule 6: `migration_counts` holds `rolled_back` and no `completed` or
+  `finalized`) — never reads as a success: its badge takes the neutral tone and explains "Nothing was migrated: every
+  migration rolled back."; its page says so with the next step — "Nothing was migrated: every migration rolled back and
+  its source VM runs again. Retry each one from its page once the cause is fixed, or cancel it." — and offers no
+  Finalize all, as nothing awaits finalize; a wave whose migrations it did not cancel all rolled back reads "Rolled
+  back", not "Complete", though the waves after it start (§5.1).
 * Approvals: two kinds, and every entry names its kind (ADV-20) — a **cutover approval** ("Cutover approval":
   the plan's Require approval, `Migration.approvals`, the cutover request and the maker-checker rule
   `counted_approvals`, §5.4) and an **advisor decision** ("Advisor decision · {decision type}": a decision
