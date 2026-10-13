@@ -1694,7 +1694,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/providers` | viewer | — | `Provider[]` |
@@ -2609,8 +2609,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`; when a request of a signed-in
   session is refused, 401, the token is dropped and Sign in says the session ended — the token is no longer accepted:
   revoked, or the server's tokens changed — before asking for one again, which signing out never does; it offers to
-  continue without a token only when the server answers `GET /me` without one, authentication being off — with it on,
-  that link would lead straight back to Sign in — and asks without the tab's token, so the question ends no session).
+  continue without a token only when `GET /health` says authentication is off (`auth_disabled`) — with it on, that
+  link would lead straight back to Sign in; it never asks `GET /me` without a token to find out, a refused request
+  that would record `auth.denied` and count toward the per-address lockout, §13.1, on every visit).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
