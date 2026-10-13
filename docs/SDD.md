@@ -728,6 +728,19 @@ PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`
 export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
+The role never lets qemu guess a disk's format. It reads the instance directory's `disk.info`, where Nova records
+each disk's format when it first opens the disk, before the guest runs (one line of JSON, disk path → format;
+launchpad bug 1221190), and passes that format to `qemu-img info -f` and `qemu-nbd --format`. A raw disk's first
+block belongs to the guest: probed, a qcow2 header the guest wrote there reads as qcow2, and `qemu-nbd`, run with
+sudo, would follow the backing file that header names — any file on the hypervisor — into the export and so into
+the destination volume. A disk is matched to its `disk.info` entry by file name (the entries name the instance
+directory's files). Before any export the role refuses an instance whose `disk.info` is missing or unreadable, a disk
+it records no format for or more than one format for, and a format that is not a plain name (lower-case letters and
+digits). The config drive (`disk.config`) is not exported: it holds no guest data, Nova records no format for it at
+spawn (it builds the drive after the XML that resolves the other disks), and the destination server gets a new one
+from Nova when it asks for one — carried over as a plain data disk it would put a second `config-2` filesystem with
+the source's metadata in front of cloud-init.
+
 Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conversion host with `flock` and a
 `{lock}.lock` file that names its owner as `{migrator hostname}:{pid}`. Before it waits, a module removes such a file
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
