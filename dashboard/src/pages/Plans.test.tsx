@@ -117,7 +117,8 @@ describe('Plans page', () => {
     renderWithApp(<Plans />, { server });
     const link = await screen.findByRole('link', { name: plan.name });
     const n = ofPlan.length - 1;
-    expect(within(link.closest('th')!).getByText(`${n}/${n} done`)).toBeInTheDocument();
+    // and named: the plan's VMs and its done total never differ without a word
+    expect(link.closest('th')!).toHaveTextContent(`${n}/${n} done, 1 cancelled`);
     const cancelled = server.plans.find((p) => p.status === 'cancelled')!;
     const row = screen.getByRole('link', { name: cancelled.name }).closest('tr')!;
     expect(within(row).queryByText(/\d+\/\d+/)).not.toBeInTheDocument();
@@ -389,6 +390,37 @@ describe('Plans page', () => {
     await user.type(screen.getByRole('searchbox', { name: /search plans/i }), 'zzzz-no-match');
     expect(status).toHaveTextContent(`Showing 0 of ${n} plans`);
     expect(screen.getByText('No plans match these filters')).toBeInTheDocument();
+  });
+
+  it("names the cancelled migrations a plan's done figure leaves out, so its VMs and its total never differ without a word (SDD §16)", async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-95a7e3f1')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    const cancelled = mine.filter((m) => m.phase === 'cancelled').length;
+    expect(cancelled).toBe(1);
+    const done = mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length;
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('rowheader', { name: new RegExp(plan.name) })).closest('tr')!;
+    expect(row).toHaveTextContent(`${done}/${mine.length - cancelled}, 1 cancelled`);
+  });
+
+  it('names them on a line of their own under the bar, never beside it, where they squeezed the bar to a dot (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-95a7e3f1')!;
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('rowheader', { name: new RegExp(plan.name) })).closest('tr')!;
+    // the line under the name (a phone) and the Done column each keep the bar beside its count alone
+    const bars = within(row).getAllByRole('progressbar');
+    expect(bars).toHaveLength(2);
+    for (const bar of bars) {
+      expect(bar.parentElement).not.toHaveTextContent(/cancelled/);
+      expect(bar.parentElement!.nextElementSibling).toHaveTextContent(/^, 1 cancelled$/);
+    }
+    // and only when it leaves some out
+    const whole = server.plans.find(
+      (p) => p.status !== 'cancelled' && server.migrations.some((m) => m.plan_id === p.id) && !server.migrations.some((m) => m.plan_id === p.id && m.phase === 'cancelled'),
+    )!;
+    expect(screen.getByRole('link', { name: whole.name }).closest('tr')).not.toHaveTextContent(/cancelled/i);
   });
 
   it('names a selected VM that another plan holds, as validation would refuse it (SDD §5.4, §16)', async () => {

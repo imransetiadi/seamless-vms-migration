@@ -11,14 +11,15 @@ export function phaseCounts(migrations: ReadonlyArray<{ phase: Phase }>): PhaseC
 
 /**
  * A plan's migrations done (SDD §16): `completed` and `finalized` of those that are not `cancelled` — a cancelled
- * migration is never done (a VM taken out of the plan, §5.4) — or of its VMs before validation; null for a
- * cancelled plan, which has nothing left to do.
+ * migration is never done (a VM taken out of the plan, §5.4, or one cancelled while its VM stays) — with how many were
+ * cancelled, or of its VMs before validation; null for a cancelled plan, which has nothing left to do.
  */
-export function planDone(plan: Pick<Plan, 'status' | 'vm_ids'>, counts: PhaseCounts): { done: number; total: number } | null {
+export function planDone(plan: Pick<Plan, 'status' | 'vm_ids'>, counts: PhaseCounts): { done: number; total: number; cancelled: number } | null {
   if (plan.status === 'cancelled') return null;
   const total = Object.entries(counts).reduce((sum, [phase, n]) => (phase === 'cancelled' ? sum : sum + (n ?? 0)), 0);
-  if (!total) return { done: 0, total: plan.vm_ids.length };
-  return { done: (counts.completed ?? 0) + (counts.finalized ?? 0), total };
+  if (!total) return { done: 0, total: plan.vm_ids.length, cancelled: 0 };
+  // the cancelled ones it leaves out are named under it (SDD §16)
+  return { done: (counts.completed ?? 0) + (counts.finalized ?? 0), total, cancelled: counts.cancelled ?? 0 };
 }
 
 /** Why a Completed plan that migrated nothing is no success, and what to do next (SDD §16). */

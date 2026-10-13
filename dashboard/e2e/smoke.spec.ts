@@ -189,6 +189,31 @@ test("the plans list keeps each plan's progress and clouds on a phone, without s
   await expect(row.getByText(/^RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production$/).filter({ visible: true })).toHaveCount(1);
 });
 
+for (const width of [320, 768, 1280]) {
+  test(`at ${width} px a plan's done count names its cancelled migrations on a line of its own: the bar keeps its width and no cell spills (QASuite UI-28, SDD §16)`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page, 'viewer');
+    await page.goto('/plans');
+    // Legacy apps keeps a VM whose migration was cancelled (plan-95a7e3f1 in src/api/mockData.ts)
+    const row = page
+      .getByRole('table', { name: /migration plans/i })
+      .getByRole('row')
+      .filter({ has: page.getByRole('link', { name: 'Legacy apps' }) });
+    await expect(row.getByText('1 cancelled').filter({ visible: true })).toHaveCount(1);
+    await page.evaluate(() => document.fonts.ready);
+    const sideways = await page.locator('.table-wrap').first().evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(sideways, 'the list scrolls sideways').toBeLessThanOrEqual(1);
+    // without a cancelled count the bar is 81 px wide at 320, 50 at 768 and 106 at 1280; beside one it was 13 px or none
+    const bar = await row.getByRole('progressbar').filter({ visible: true }).boundingBox();
+    expect(bar?.width ?? 0, 'the done bar').toBeGreaterThanOrEqual(40);
+    // beside the bar the count ran into the status badge at 320 px and out of the Done column at 768 px
+    const spills = await row.evaluate((tr) => Array.from(tr.children).filter((c) => c.scrollWidth > c.clientWidth + 1).map((c) => c.textContent));
+    expect(spills, 'cells whose content runs over their edge').toEqual([]);
+  });
+}
+
 test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
   // a viewer sees the most soft-disabled controls, each with a visually hidden reason

@@ -41,6 +41,17 @@ function NothingLeft() {
   );
 }
 
+/** The cancelled migrations a done count leaves out, on a line of its own: beside the count they squeezed its bar to a dot (SDD §16). */
+function CancelledLine({ n, className = '' }: { n: number; className?: string }) {
+  return (
+    <span className={`mt-0.5 block text-xs font-normal text-muted-foreground ${className}`}>
+      {/* read on from the count above it */}
+      <span className="sr-only">, </span>
+      {n} cancelled
+    </span>
+  );
+}
+
 export default function Plans() {
   usePageTitle('Plans');
   const searchId = useId();
@@ -200,6 +211,7 @@ export default function Plans() {
                           </>
                         )}
                       </span>
+                      {pr?.cancelled ? <CancelledLine n={pr.cancelled} className="sm:hidden" /> : null}
                       <span className="mt-0.5 block text-xs font-normal text-muted-foreground sm:hidden">
                         {providerName.get(p.source_provider_id) ?? p.source_provider_id} → {providerName.get(p.destination_provider_id) ?? p.destination_provider_id}
                       </span>
@@ -217,12 +229,15 @@ export default function Plans() {
                       {pr === null ? (
                         <NothingLeft />
                       ) : (
-                        <div className="flex items-center gap-2">
-                          <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
-                          <span className="num shrink-0 text-xs">
-                            {pr.done}/{pr.total}
-                          </span>
-                        </div>
+                        <>
+                          <div className="flex items-center gap-2">
+                            <ProgressBar value={pr.total ? (pr.done / pr.total) * 100 : 0} label={`${p.name}: migrations done`} tone="success" size="sm" />
+                            <span className="num shrink-0 text-xs">
+                              {pr.done}/{pr.total}
+                            </span>
+                          </div>
+                          {pr.cancelled ? <CancelledLine n={pr.cancelled} /> : null}
+                        </>
                       )}
                     </td>
                     <td className="num hidden whitespace-nowrap text-right lg:table-cell">{formatDuration(p.downtime_slo_s)}</td>
