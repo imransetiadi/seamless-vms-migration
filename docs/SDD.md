@@ -124,7 +124,7 @@ Phase          = pending | validating | blocked | ready | precopy | syncing | aw
                  rolled_back | cancelled
 Severity       = blocker | warning | info
 Role           = viewer | operator | approver | admin          (ordered, see §13)
-PlanStatus     = draft | validated | running | paused | completed | failed
+PlanStatus     = draft | validated | running | paused | completed | failed | cancelled
 SyncPassKind   = full | delta | final
 DecisionType   = migration_strategy | workload_tier | verification_review | console_screening   (§14.4)
 DecisionStatus = auto_applied | pending_approval | approved | overridden | below_threshold | fallback_rules
@@ -241,7 +241,7 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
                                         # phase that has any (§8.1, §11); {} before the first validation
        created_at: datetime, updated_at: datetime }
 
-DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed
+DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed | cancelled
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
@@ -359,15 +359,15 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
 `migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5), `migration.source_running`,
-`migration.source_stopped`, `plan.finalized` (§8.1), `plan.deleted` (§12),
+`migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `auth.denied`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
-never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. `plan.deleted`
-carries the plan's name, its `vm_ids` and how many migrations went with it; the plan's earlier events stay.
+never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. `plan.cancelled`
+carries the reason given and how many migrations it cancelled.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -1237,7 +1237,7 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   (`terminationGracePeriodSeconds`).
 * Public async API used by routes: `validate_plan(plan_id, actor)`, `start_plan`, `pause_plan`,
   `approve(migration_id, actor, comment)`, `request_cutover(migration_id, actor, force_window)`,
-  `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `finalize(…,
+  `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `cancel_plan(plan_id, actor, reason)`, `finalize(…,
   delete_source)`, `set_strategy(migration_id, strategy, actor)`.
 * Each tick: for every `running` plan, compute active waves (all `depends_on` waves complete, §5.1),
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
@@ -1312,7 +1312,7 @@ route and never stored (the rules read only the set of the plan's phases: the ro
 migrations that are not `cancelled`, in this order:
 
 1. a `draft` plan is `draft` (an edited plan is validated again);
-2. no migration: the stored status;
+2. no migration: the stored status — so a `cancelled` plan (§12), whose migrations are all `cancelled`, is `cancelled`;
 3. a migration in `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying` or `rolling_back` (at work): `paused` when the stored status is `paused`, else `running`;
 4. a `running` or `paused` plan with a migration still to start (`pending`, `ready`, `blocked`, `validating`):
    the stored status;
@@ -1703,7 +1703,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -1714,7 +1714,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| DELETE | `/plans/{id}` | operator | — | `204` — a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock, the VM-claim lock and each migration's lock (in that order, §5.4, §8) it deletes the migrations, then the plan, and emits `plan.deleted`: its VMs are free for another plan and its providers for deletion; pre-staged destination resources stay, as after a finished plan. 409 while the plan is `running` ("pause the plan before deleting it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled first, which cleans up what it copied (§8), and a plan with a finalized migration is history; 404 for an unknown plan |
+| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied, and a plan with a migration that completed or was finalized keeps its status |
 | GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
@@ -2356,7 +2356,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   migration page the crossings seen while it is open — into the warning, past the SLO — are announced once each from
   a region already on the page, never the clock's every tick.
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
-  Finalized, Failed — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
+  Finalized, Failed, Cancelled — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
   showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
 * Approvals: two kinds, and every entry names its kind (ADV-20) — a **cutover approval** ("Cutover approval":
   the plan's Require approval, `Migration.approvals`, the cutover request and the maker-checker rule
@@ -2417,11 +2417,11 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   waiting for approval take the summary's eligible strategies; its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
-  the counts) and no Start, nor does a Finalized one; Delete plan (operator; danger, one confirmation that types the
-  plan's name and says the plan and its migrations go, its events stay and its VMs are free for another plan,
-  `DELETE /plans/{id}`) is offered while no migration has started and the plan is not running — otherwise it stays
-  unavailable, saying why: pause the plan first, or which VMs have started (as the API names them) — and once deleted
-  the page goes to `/plans`, whose live region says the plan was deleted; a finalize queue lists the `completed` migrations oldest first, each with its time
+  the counts) and no Start, nor does a Finalized one; Cancel plan (operator; danger, one confirmation that types the
+  plan's name and says its migrations are cancelled, its VMs freed for another plan and its history kept,
+  `POST /plans/{id}/cancel`) is offered while no migration has started and the plan is not running — otherwise it
+  stays unavailable, saying why: pause the plan first, or which VMs have started (as the API names them) — and a
+  cancelled plan shows Cancelled and offers no action but its history; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
   `source_running_at` is set; settings summary — with "Ports: MAC and fixed IPs kept" when `port_creation_mode` is
   `"neutron"`, "Network overrides: {n} VMs" when `nic_overrides` has entries, and "Advisor policy: {name}", its mode
