@@ -2110,7 +2110,10 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
   `pending_approval`, `approved`, `overridden`, `below_threshold`, and `decision.fallback` for
   `fallback_rules`. Actor `<kind>:<id>` of the decision's actor (`policy:global-default`, `system:fallback`,
   `user:<name>`); data `{target_id, model_version, before, after}`, where `before` (null for the first
-  decision) and `after` are `{status, final_option, reason_code, policy_id, threshold_used}`.
+  decision) and `after` are `{status, final_option, reason_code, reason_text, policy_id, threshold_used}` —
+  `reason_text` the reason a person gave with an override (§14.6), null otherwise, so the trail itself records
+  why a decision was overridden; the audit page shows an override's reason with the action, as a Force
+  cutover's. An event recorded before the field existed has none.
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
   (the policy, null where there is none). The audit page lists with a `policy.updated` the settings it changed, one
