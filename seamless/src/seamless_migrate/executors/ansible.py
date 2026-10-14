@@ -1518,7 +1518,7 @@ class AnsibleExecutor:
                 raise PermanentStepError(
                     "the export lists none of the volume(s) " + ", ".join(lacking) + " the VM "
                     "had at validation: attach them to the source VM again (an earlier attempt "
-                    "may have left them detached) and retry, or validate the plan again"
+                    "may have left them detached) and retry (SDD §7.2)"
                 )
         if nic_overrides:
             doc = apply_nic_overrides(doc, nic_overrides)

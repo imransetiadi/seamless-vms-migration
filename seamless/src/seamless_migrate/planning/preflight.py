@@ -68,6 +68,14 @@ CATALOG: dict[str, CatalogEntry] = {
         (),
         "Wait until the Nova task finishes and the VM is ACTIVE or SHUTOFF, then re-validate.",
     ),
+    "SRC_VM_VOLUME_DETACHED": CatalogEntry(
+        Severity.blocker,
+        (),
+        "Attach the volume(s) to the source VM again, then re-validate: an earlier cutover "
+        "attempt's export may have left them detached, and the migration never drops a disk the VM "
+        "had at a cutover attempt. To migrate the VM without one, cancel the migration and plan "
+        "the VM anew.",
+    ),
     "SRC_VM_DUPLICATE_NAME": CatalogEntry(
         Severity.blocker,
         (),
@@ -265,6 +273,27 @@ _QUOTA_KEYS = ("cores", "ram_mb", "instances", "volumes", "gigabytes")
 def is_legacy_os(os_type: str | None) -> bool:
     """True when the guest is out of standard vendor support (SDD §9.5 catalog)."""
     return identify(os_type).lifecycle == "legacy"
+
+
+def keep_detached_volumes(previous: VMRef, current: VMRef) -> tuple[VMRef, list[Finding]]:
+    """``current`` with every volume of ``previous`` - the VM as a migration whose history reached
+    cutover was validated - that it no longer lists, and the blocker ``SRC_VM_VOLUME_DETACHED``
+    naming them: a cold export detaches the data volumes, and one that failed may have left them
+    so; a validation that dropped them would let the next cutover complete one disk short
+    (SDD §5.4, §9.3, review RV7-01). Root and ephemeral disks are no volumes and never kept."""
+    listed = {d.id for d in current.disks}
+    gone = [d for d in previous.disks if d.kind == "volume" and d.id not in listed]
+    if not gone:
+        return current, []
+    kept = current.model_copy(update={"disks": [*current.disks, *gone]})
+    names = ", ".join(d.id for d in gone)
+    return kept, [
+        finding(
+            "SRC_VM_VOLUME_DETACHED",
+            f"volume(s) {names} of {current.name}, which it had at a cutover attempt, are no "
+            "longer attached to it",
+        )
+    ]
 
 
 def finding(

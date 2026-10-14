@@ -101,6 +101,7 @@ from .planning.estimator import (
 from .planning.preflight import (
     flavor_prestaged,
     has_blocker,
+    keep_detached_volumes,
     keypair_prestaged,
     resolve_mappings,
     run_preflight,
@@ -998,6 +999,11 @@ class Orchestrator:
             steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
                 steps.append((P.validating, "pre-flight validation", None))
+            if any(change.to_phase == P.cutover for change in m.phase_history):
+                # a disk the VM had at a cutover attempt never leaves the migration by a
+                # validation: an attempt's cold export may have left it detached (SDD §5.4)
+                vm, detached = keep_detached_volumes(m.vm, vm)
+                findings = [*findings, *detached]
             final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
             # both transitions in one write (SDD §5.4)
             m, v = await self._transitions(m, v, [*steps, final], actor)

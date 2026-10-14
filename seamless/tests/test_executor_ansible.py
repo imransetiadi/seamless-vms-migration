@@ -1950,8 +1950,11 @@ async def test_a_retried_cold_cutover_refuses_an_export_without_a_disk_the_vm_wa
     monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-1,vol-data")
     monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
     before = len(read_log(env.log))
-    with pytest.raises(PermanentStepError, match="vol-quorum"):
+    with pytest.raises(PermanentStepError, match="vol-quorum") as refused:
         await env.executor.run(StepName.CUTOVER, ctx)
+    # it asks for the disk back and offers no validation: one would drop the disk (RV7-01)
+    assert "attach them to the source VM again" in str(refused.value)
+    assert "validate the plan" not in str(refused.value)
     retried = [c["playbook"] for c in read_log(env.log)[before:]]
     assert "import_workloads.yml" not in retried
     assert retried[-1] == "export_workloads.yml"
