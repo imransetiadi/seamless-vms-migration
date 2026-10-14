@@ -508,10 +508,20 @@ def build_vars(
         # after the stop, since the role creates the server after it; before it a same-named
         # server is not this migration's (a cutover refused or skipped for a collision, SDD §7.2)
         out["os_migrate_rollback_match_by_name"] = True
-    if step == StepName.ROLLBACK and ctx.options.get("delete_dest_volumes"):
-        # cleanup after a cancel: the destination volumes of the abandoned pass go too
+    if step == StepName.ROLLBACK and (
+        ctx.options.get("delete_dest_volumes")
+        or (m.strategy == Strategy.cold and _cold_volumes_recorded(rdir / "osm", m.vm.source_id))
+    ):
+        # cleanup after a cancel: the destination volumes of the abandoned pass go too; and a
+        # cold rollback deletes the volumes the cold import recorded - a cold retry never reuses
+        # them, its transfer creates new ones (SDD §6.3, §7, the owner's choice, 2026-10-14)
         out["os_migrate_rollback_delete_dest_volumes"] = True
     return out
+
+
+def _cold_volumes_recorded(osm: Path, server_id: str) -> bool:
+    """The cold import recorded destination volumes it created for the workload (SDD §6.3)."""
+    return bool((_read_warm_state(osm, server_id) or {}).get("dest_volumes"))
 
 
 class _Unsafe(str):

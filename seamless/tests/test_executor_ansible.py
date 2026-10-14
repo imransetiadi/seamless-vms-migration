@@ -1779,6 +1779,28 @@ def test_cold_rollback_before_any_stop_never_matches_by_name(env):
         assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
 
 
+def test_a_cold_rollback_deletes_the_volumes_the_cold_import_recorded(env):
+    """SDD §6.3/§7 (the owner's choice, 2026-10-14): a cold retry never reuses the volumes the
+    cold import created - its transfer creates new ones - so a cold rollback deletes exactly the
+    volumes the import recorded; without such a record it deletes the server alone, as before,
+    never a volume it cannot tell is the migration's. A warm rollback keeps its volumes for a
+    retry."""
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, stopped)
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"server_id": "srv-1", "server_name": "web-01", "dest_volumes": {}, "passes": []}
+    # the server alone: the import copied no disk (data_copy false), it created no volume
+    path.write_text(json.dumps({**record, "destination_server_id": "dst-1"}))
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, stopped)
+    record["dest_volumes"] = {"/dev/vdb": {"dest_id": "dvol-1"}}
+    path.write_text(json.dumps(record))
+    assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_delete_dest_volumes"] is True
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.CUTOVER, stopped)
+    warm, _ = ctx_for(env, strategy=Strategy.warm, downtime_started_at=utcnow())
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, warm)
+
+
 def _finished_cutover_state(env, record_server=True):
     """The warm state an attempt leaves when it ran the final pass and created the server, then
     failed (a timeout while the server booted, an error adding its floating IPs)."""
