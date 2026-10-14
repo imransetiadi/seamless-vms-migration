@@ -1219,9 +1219,48 @@ describe('mock API', () => {
     expect(listed).not.toContain('plan-extra008');
     server.plans.splice(server.plans.findIndex((p) => p.id === 'plan-extra000'), 9);
     other.status = 'completed';
-    // a rolled-back VM lets it go: a retry refuses when the provider is gone (SDD §5.1)
+    // a rolled-back VM that kept no copied data lets it go: a retry refuses when the provider is gone (SDD §5.1)
     first!.phase = 'rolled_back';
+    first!.sync_passes = [];
     second!.phase = 'cancelled';
+    expect(remove().status).toBe(204);
+  });
+
+  it('keeps a provider while a rolled-back VM keeps its copied data, like the API: until a cancel cleans it up (SDD §12, §5.1)', async () => {
+    const { server, client } = setup('admin');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    const id = plan.destination_provider_id;
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    const passes = server.migrations.find((m) => m.vm.name === 'app-billing-01')!.sync_passes.map((p) => ({ ...p }));
+    for (const m of server.migrations.filter((x) => users.some((p) => p.id === x.plan_id))) m.phase = 'finalized';
+    const remove = () => server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin');
+    const tail = 'a plan needs its providers until it completes and its VMs are finalized';
+    const provider = server.providers.find((p) => p.id === id)!;
+    // a rolled-back VM that recorded no passes kept nothing: it lets the provider go
+    rolled.phase = 'rolled_back';
+    rolled.sync_passes = [];
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    // a warm rollback kept the destination volumes and warm state for a retry, and a cancel cleans them up with the provider
+    rolled.strategy = 'warm';
+    rolled.sync_passes = passes;
+    expect(remove()).toMatchObject({
+      status: 409,
+      body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", 1 rolled-back VM keeping its copied data); ${tail}` } },
+    });
+    const second = server.migrations.find((m) => m.plan_id === plan.id && m.id !== rolled.id)!;
+    second.phase = 'rolled_back';
+    second.sync_passes = passes.map((p) => ({ ...p }));
+    expect(remove().body).toMatchObject({ error: { message: expect.stringContaining(`("${plan.name}", 2 rolled-back VMs keeping their copied data)`) } });
+    second.phase = 'completed';
+    expect(remove().body).toMatchObject({
+      error: { message: expect.stringContaining(`("${plan.name}", 1 VM not finalized, 1 rolled-back VM keeping its copied data)`) },
+    });
+    second.phase = 'finalized';
+    // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
+    await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
     expect(remove().status).toBe(204);
   });
 

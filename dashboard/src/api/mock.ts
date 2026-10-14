@@ -1875,7 +1875,9 @@ export class MockServer {
   /**
    * The plans that still need a provider, like the API (SDD §12), in creation order with why: one that has not
    * completed (a failed one can start again), or a completed one with a migration that holds its VM — it can be
-   * rolled back until it is finalized, and its rollback needs both providers (§8.1).
+   * rolled back until it is finalized, and its rollback needs both providers (§8.1) — or with a rolled-back one that
+   * kept its copied data: its warm rollback kept the destination volumes for a retry, and a cancel cleans them up
+   * with both providers (§5.1).
    */
   private plansThatNeed(providerId: string): string[] {
     const plans = this.plans
@@ -1886,8 +1888,14 @@ export class MockServer {
       // pending, as one keeps the API's providers (SDD §5.1, §12)
       if (p.status === 'cancelled') return [];
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
-      const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
-      return n ? [`${p.id} ("${p.name}", ${n} VM${n === 1 ? '' : 's'} not finalized)`] : [];
+      const mine = this.migrations.filter((m) => m.plan_id === p.id);
+      const n = mine.filter((m) => !RELEASES_VM.has(m.phase)).length;
+      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.sync_passes.length > 0).length;
+      const why = [
+        ...(n ? [`${n} VM${n === 1 ? '' : 's'} not finalized`] : []),
+        ...(kept ? [`${kept} rolled-back VM${kept === 1 ? ' keeping its' : 's keeping their'} copied data`] : []),
+      ];
+      return why.length ? [`${p.id} ("${p.name}", ${why.join(', ')})`] : [];
     });
   }
 
