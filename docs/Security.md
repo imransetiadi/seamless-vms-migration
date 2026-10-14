@@ -538,6 +538,10 @@ unreviewed change that adds an MCP server, a hook, a marketplace or a permission
   once with the owner's `SEAMLESS_DB_URL` — then give the control plane the application role's URL: on a complete
   schema `Store.create_schema()`, which every start runs, issues no DDL (SDD §11), and that is what a role that does
   not own the tables needs, as PostgreSQL lets only a table's owner run `CREATE INDEX`, even for an index that exists.
+  The application role may also own a schema of its own, first in its `search_path` (PostgreSQL's secure schema usage
+  pattern, `CREATE SCHEMA seamless_app AUTHORIZATION seamless_app`): the store's tables still resolve to the owner's,
+  and `create_schema()` reads their indexes there (review RV-07,
+  `test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_tables`).
   After an upgrade that adds an index, start once as the owner again. `events` is never updated by the application;
   it is deleted only by
   `seamless events prune` (older than a cut-off, SDD §15) and the test helper, so run the prune as the owner role,
