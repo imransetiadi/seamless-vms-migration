@@ -8,6 +8,7 @@ import subprocess
 from unittest import mock
 
 import pytest
+from openstack import exceptions as sdk_exceptions
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
     server,
@@ -385,30 +386,109 @@ def test_the_fake_conversion_host_refuses_a_lock_its_holder_takes_again():
     assert inner(transfer) == "inner"
 
 
-def test_a_detach_waits_for_cinder_only_within_the_timeout():
-    """SDD 6.6 (review 5): openstacksdk 4.x's detach_volume(wait=True) ignores its timeout and
-    waits forever for a detach that never ends; detach_volume_bounded asks Nova without waiting,
-    then waits for Cinder's `available` within the timeout."""
+def _cinder_wait_for_status(cloud):
+    """block_storage.wait_for_status as openstacksdk 4.21 runs it, for a volume whose status no
+    longer changes during the wait: the status asked for returns at once, one of `failures` raises
+    ResourceFailure, anything else raises ResourceTimeout once `wait` seconds are up."""
+
+    def wait_for_status(res, status="available", failures=None, interval=2, wait=None, **kwargs):
+        assert wait is not None
+        cloud.record("wait_for_status", id=res.id, status=status)
+        volume = cloud.volumes[res.id]
+        if volume.status == status:
+            return volume
+        if volume.status in (failures or ["error"]):
+            raise sdk_exceptions.ResourceFailure("Volume:%s transitioned to failure state" % res.id)
+        raise sdk_exceptions.ResourceTimeout(
+            "Timeout waiting for Volume:%s to transition to %s (it is %s)"
+            % (res.id, status, volume.status)
+        )
+
+    return wait_for_status
+
+
+def test_a_cold_export_detaches_a_disk_another_server_shares_from_the_source_vm():
+    """SDD 6.6 (review RV6-01): the cold export detaches each data disk from the stopped source VM;
+    a multi-attach disk another server also holds stays `in-use`, so the detach is done once the
+    source VM's attachment is gone - waiting for `available` timed out, and the transient retry
+    then migrated the VM without that disk."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_export_volumes as export_module,
+    )
+
+    src = fake.FakeCloud("src")
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    src.add_server("srv-1", "vm1", image={"id": "img-1"})  # image-booted, no boot_disk_copy
+    src.servers["srv-1"].status = "SHUTOFF"
+    src.add_server("peer-1", "vm1-peer")
+    shared = src.add_volume("vol-shared", "quorum", 1, server_id="srv-1", device="/dev/vdb")
+    shared.attachments.append({"server_id": "peer-1", "device": "/dev/vdb", "volume_id": "vol-shared"})
+    src.servers["peer-1"].volumes.append({"id": "vol-shared"})
+    src.block_storage.wait_for_status = _cinder_wait_for_status(src)
+    data = fake.workload_data(
+        volumes=[fake.server_volume_data("vol-shared", "quorum", 1, "/dev/vdb", "srv-1")],
+        image_ref={"name": "img-1"},
+        boot_disk_copy=False,
+    )
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([src])):
+        export = export_module.OpenStackSourceVolume(
+            src, "src-conv", "/keys/k", "cloud-user", "srv-1", server.Server.from_data(data)
+        )
+    export._get_root_and_data_volumes()
+
+    # a detach that waits for `available` fails here at once instead of polling for 30 minutes
+    with mock.patch.object(volume_common.time, "sleep"):
+        export._detach_data_volumes_from_source()
+
+    assert {a["server_id"] for a in src.volumes["vol-shared"].attachments} == {"peer-1"}
+
+
+def test_a_detach_waits_for_available_when_no_other_server_holds_the_volume():
+    """SDD 6.6: with no other holder, the detach waits until Cinder shows the volume available -
+    `detaching` first - as openstacksdk's own wait did, within the timeout."""
     dst = cloud()
     dst.add_volume("vol-1", "vol-1", 1)
     conversion_host = dst.servers["dst-conv"]
     dst.attach_volume(conversion_host, dst.volumes["vol-1"])
-    calls = []
-    nova_detach, cinder_wait = dst.detach_volume, dst.block_storage.wait_for_status
+    nova_detach, cinder_get, reads = dst.detach_volume, dst.get_volume_by_id, []
 
     def detach(server, volume, **kwargs):
-        calls.append(("detach_volume", kwargs.get("wait")))
-        return nova_detach(server, volume, **kwargs)
+        nova_detach(server, volume, **kwargs)
+        dst.volumes["vol-1"].status = "detaching"
 
-    def wait_for_status(res, **kwargs):
-        calls.append(("wait_for_status", kwargs.get("status"), kwargs.get("wait")))
-        return cinder_wait(res, **kwargs)
+    def get_volume_by_id(volume_id):
+        reads.append(volume_id)
+        if len(reads) == 3:
+            dst.volumes["vol-1"].status = "available"
+        return cinder_get(volume_id)
 
-    dst.detach_volume, dst.block_storage.wait_for_status = detach, wait_for_status
-    volume_common.detach_volume_bounded(dst, conversion_host, dst.volumes["vol-1"], 7)
+    dst.detach_volume, dst.get_volume_by_id = detach, get_volume_by_id
+    with mock.patch.object(volume_common.time, "sleep") as sleep:
+        volume_common.detach_volume_bounded(dst, conversion_host, dst.volumes["vol-1"], 7)
 
-    assert calls == [("detach_volume", False), ("wait_for_status", "available", 7)]
-    assert not dst.volumes["vol-1"].attachments
+    assert dst.volumes["vol-1"].status == "available"
+    assert sleep.call_count == 2
+
+
+def test_a_detach_that_never_ends_fails_at_the_timeout():
+    """SDD 6.6 (review 5): openstacksdk 4.x's detach_volume(wait=True) would wait forever for a
+    detach that never ends; detach_volume_bounded asks Nova without waiting and gives up at the
+    timeout, naming the volume and the server."""
+    dst = cloud()
+    dst.add_volume("vol-1", "vol-1", 1)
+    conversion_host = dst.servers["dst-conv"]
+    dst.attach_volume(conversion_host, dst.volumes["vol-1"])
+    waits = []
+
+    def nova_accepts_and_never_detaches(server, volume, **kwargs):
+        waits.append(kwargs.get("wait"))
+
+    dst.detach_volume = nova_accepts_and_never_detaches
+    with mock.patch.object(volume_common.time, "sleep"), pytest.raises(
+        RuntimeError, match="Timed out after 3 s .*vol-1.*dst-conv"
+    ):
+        volume_common.detach_volume_bounded(dst, conversion_host, dst.volumes["vol-1"], 3)
+    assert waits == [False]
 
 
 def test_every_detach_goes_through_the_bounded_wait():

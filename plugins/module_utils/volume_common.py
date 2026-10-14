@@ -65,16 +65,32 @@ def volume_or_none(conn, volume_id):
 def detach_volume_bounded(conn, server, volume, timeout):
     """
     Detach ``volume`` from ``server`` and wait, within ``timeout`` seconds,
-    until Cinder shows it available: openstacksdk 4.x's detach_volume(wait=True)
-    ignores its timeout and would wait forever for a detach that never ends
-    (Seamless Migrate SDD 6.6, review 5).
+    until the volume no longer lists that server's attachment and - unless
+    another server still holds it, as it does a shared multi-attach disk, which
+    stays `in-use` - until Cinder shows it available. openstacksdk 4.x's
+    detach_volume(wait=True) ignores its timeout and waits for `available`,
+    which a shared disk never reaches (Seamless Migrate SDD 6.6, review 5,
+    RV6-01).
     """
     conn.detach_volume(server=server, volume=volume, wait=False)
-    detached = volume_or_none(conn, volume["id"])
-    if detached is not None:
-        conn.block_storage.wait_for_status(
-            detached, status="available", failures=["error"], wait=timeout
-        )
+    for second in range(timeout):
+        current = volume_or_none(conn, volume["id"])
+        if current is None:
+            return
+        holders = set(a["server_id"] for a in getattr(current, "attachments", None) or [])
+        status = getattr(current, "status", None)
+        if status == "error":
+            raise RuntimeError(
+                "Volume %s went to error while detaching from server %s"
+                % (volume["id"], server["id"])
+            )
+        if server["id"] not in holders and (holders or status == "available"):
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        "Timed out after %s s waiting to detach volume %s from server %s"
+        % (timeout, volume["id"], server["id"])
+    )
 
 
 def _lock_host():
