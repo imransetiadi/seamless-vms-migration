@@ -200,6 +200,24 @@ ROUTES = [
     ("GET", "/api/v1/advisor/status", Role.viewer, None),
     ("GET", "/api/v1/advisor/notes", Role.viewer, None),
     ("POST", "/api/v1/advisor/similar-incidents", Role.operator, {"query": "timeout"}),
+    ("GET", "/api/v1/advisor/data-sent", Role.viewer, None),
+    ("GET", "/api/v1/advisor/recommendations", Role.viewer, None),
+    ("GET", "/api/v1/advisor/recommendations/rec-nope", Role.viewer, None),
+    ("POST", "/api/v1/advisor/recommendations/rec-nope/approve", Role.admin, {"comment": "ok"}),
+    (
+        "POST",
+        "/api/v1/advisor/recommendations/rec-nope/override",
+        Role.admin,
+        {"strategy": "cold", "reason": "r"},
+    ),
+    ("GET", "/api/v1/advisor/snapshots/snap-nope", Role.viewer, None),
+    # a body that creates or changes nothing, even for a role the route allows
+    ("GET", "/api/v1/advisor/policies", Role.viewer, None),
+    ("POST", "/api/v1/advisor/policies", Role.admin, {}),
+    ("PUT", "/api/v1/advisor/policies/pol-nope", Role.admin, {}),
+    ("DELETE", "/api/v1/advisor/policies/pol-nope", Role.admin, None),
+    ("POST", "/api/v1/migrations/mig-0000000000/force-cutover", Role.approver, {"reason": "r"}),
+    ("POST", "/api/v1/plans/plan-00000000/finalize", Role.approver, {"confirm": "x"}),
     ("GET", "/api/v1/metrics", Role.viewer, None),
 ]
 
@@ -537,6 +555,53 @@ def test_the_cutover_refusals_gauge_counts_the_migrations_dashboard_lists_so():
     text = render_metrics(migrations, {}, {})
     assert "# TYPE seamless_cutover_refusals gauge" in text
     assert "\nseamless_cutover_refusals 3\n" in text
+
+
+# routes test_role_matrix cannot drive, and the test that checks their role instead
+MATRIX_EXCEPTIONS = {
+    ("GET", "/events/stream"): "test_sse_route_requires_viewer (a stream never ends)",
+    ("POST", "/demo/vms/{id}/power"): (
+        "test_the_demo_power_route_sets_a_fake_source_vms_power_and_exists_only_in_demo_mode"
+    ),
+}
+
+
+def _route_key(app, method, path):
+    """(method, path template with every placeholder written {id}) of the route serving path: of
+    the templates that match, the one with the fewest placeholders, as a literal route wins."""
+    matching = [
+        template
+        for template, operations in app.openapi()["paths"].items()
+        if method.lower() in operations
+        and re.match("^" + re.sub(r"\\\{[^}]+\\\}", "[^/]+", re.escape(template)) + "$", path)
+    ]
+    assert matching, f"no route serves {method} {path}"
+    template = min(matching, key=lambda t: t.count("{"))
+    return method, re.sub(r"\{[^}]+\}", "{id}", template[len("/api/v1") :])
+
+
+def test_the_role_matrix_covers_every_route_sdd_12_lists(api):
+    """SDD §12: test_role_matrix drives every route with the role the table gives it - a route
+    added without its matrix row, or a row whose role drifted from the table, fails here - and
+    every public route answers without a token."""
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    documented = {
+        (m, re.sub(r"\{[^}]+\}", "{id}", p)): role
+        for m, p, role in re.findall(
+            r"^\| (GET|POST|PUT|PATCH|DELETE) \| `([^`]+)` \| (\w+)", sdd, re.M
+        )
+    }
+    matrix = {_route_key(api.client.app, m, p): r.value for m, p, r, _ in ROUTES}
+    expected = {
+        key: role
+        for key, role in documented.items()
+        if role != "public" and key not in MATRIX_EXCEPTIONS
+    }
+    assert matrix == expected
+    for method, path in [key for key, role in documented.items() if role == "public"]:
+        assert api.client.request(method, "/api/v1" + path).status_code not in (401, 403), path
 
 
 def test_every_route_is_documented_in_sdd_12(api):
