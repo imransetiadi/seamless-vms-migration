@@ -1,5 +1,6 @@
 import ast
 import copy
+import importlib
 import json
 import logging
 import os
@@ -1888,6 +1889,139 @@ async def test_a_cold_cutover_first_removes_the_volumes_an_earlier_cold_attempt_
     assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
     assert cleanup["os_migrate_rollback_start_source"] is False
     assert "os_migrate_rollback_match_by_name" not in cleanup
+
+
+def test_a_cold_cutover_writes_the_workloads_record_before_its_playbooks(env, monkeypatch):
+    """SDD §6.3, §7 (review RV3-03): with no record yet, the control plane writes one - no volume,
+    pass or server - before a cold cutover's playbooks; a record already there is left as it is."""
+    import asyncio
+
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    asyncio.run(env.executor.run(StepName.CUTOVER, ctx))
+    assert json.loads(path.read_text()) == {
+        "server_id": "srv-1",
+        "server_name": "web-01",
+        "transfer_uuid": None,
+        "dest_volumes": {},
+        "passes": [],
+        "pending_snapshot": None,
+        "destination_server_id": None,
+    }
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    recorded = {"server_id": "srv-1", "server_name": "web-01", "destination_server_id": "dst-1"}
+    path.write_text(json.dumps(recorded))
+    resumed, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    asyncio.run(env.executor.run(StepName.CUTOVER, resumed))
+    assert json.loads(path.read_text()) == recorded
+    # a warm cutover's record is the warm path's own: the control plane writes none for it
+    path.unlink()
+    written = []
+    monkeypatch.setattr(
+        "seamless_migrate.executors.ansible._ensure_record", lambda *args: written.append(args)
+    )
+    warm, _ = ctx_for(env, strategy=Strategy.warm, downtime_started_at=utcnow())
+    asyncio.run(env.executor.run(StepName.CUTOVER, warm))
+    assert written == []
+    asyncio.run(env.executor.run(StepName.CUTOVER, resumed))
+    assert written == [(run_dir(env) / "osm", "srv-1", "web-01")]
+
+
+@pytest.fixture
+def collection(tmp_path_factory, monkeypatch):
+    """The repository's collection, importable as ansible_collections.os_migrate.os_migrate."""
+    layout = tmp_path_factory.mktemp("coll")
+    namespace = layout / "ansible_collections" / "os_migrate"
+    namespace.mkdir(parents=True)
+    (namespace / "os_migrate").symlink_to(find_repo_root())
+    monkeypatch.syspath_prepend(str(layout))
+    importlib.invalidate_caches()
+    package = "ansible_collections.os_migrate.os_migrate"
+    wm = importlib.import_module(f"{package}.plugins.module_utils.warm_migration")
+    fake = importlib.import_module(f"{package}.tests.unit.fake_openstack")
+    return wm, fake
+
+
+def role_rollback(wm, cloud, state_dir, variables):
+    """What rollback.yml makes import_workload_rollback do with the variables the control plane
+    passed (the role's defaults where it passed none)."""
+    return wm.WarmRollback(
+        cloud,
+        wm.WarmState.load(str(state_dir), "srv-1"),
+        server_name="web-01",
+        match_by_name=bool(variables.get("os_migrate_rollback_match_by_name", False)),
+        timeout=5,
+        conversion_host=variables.get("os_migrate_dst_conversion_host_name"),
+    ).run(delete_volumes=bool(variables.get("os_migrate_rollback_delete_dest_volumes", False)))
+
+
+def _foreign_server(cloud):
+    """Another plan's VM named web-01 in the destination project, with its boot volume."""
+    cloud.add_server("plan-b-web-01", "web-01")
+    cloud.add_volume(
+        "plan-b-boot", "web-01", 20, bootable=True, server_id="plan-b-web-01", device="/dev/vda"
+    )
+
+
+async def test_after_a_resumed_cold_cutovers_cleanup_no_rollback_deletes_a_same_named_server(
+    env, collection, monkeypatch
+):
+    """SDD §6.3, §7 (review RV3-03): the cleanup before a resumed cold cutover deletes the volumes
+    an earlier transfer recorded and empties the record instead of removing it; when the cold role
+    then skips the VM for a same-named server that appeared meanwhile, the rollback after the stop
+    - match_by_name - still finds the record and never deletes that server."""
+    wm, fake = collection
+    path = _state_file(
+        env,
+        {
+            "dest_volumes": {
+                "/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True, "name": "web-01"}
+            },
+            "passes": [],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    cloud = fake.FakeCloud("dst")
+    cloud.add_conversion_host("conv-dst", "192.0.2.10")
+    cloud.add_volume("dvol-1", "web-01", 20, bootable=True)
+    _foreign_server(cloud)
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")  # prelim skips web-01
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    with pytest.raises(PermanentStepError, match="roll the migration back"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert calls[0]["playbook"] == "rollback_workloads.yml"
+    cleanup = role_rollback(wm, cloud, path.parent, calls[0]["vars"])
+    assert cleanup["deleted_volume_ids"] == ["dvol-1"] and path.exists()
+    env.log.write_text("")
+    await env.executor.run(StepName.ROLLBACK, ctx)
+    (rollback,) = read_log(env.log)
+    assert rollback["vars"]["os_migrate_rollback_match_by_name"] is True
+    role_rollback(wm, cloud, path.parent, rollback["vars"])
+    assert "plan-b-web-01" in cloud.servers and "plan-b-boot" in cloud.volumes
+
+
+async def test_a_cold_cutover_that_recorded_nothing_never_rolls_back_by_name(
+    env, collection, monkeypatch
+):
+    """SDD §6.3, §7: a cold cutover that failed after the stop before its transfer recorded a
+    volume still leaves the record the control plane wrote before its playbooks, so its rollback
+    never takes a same-named server that appeared meanwhile for the migration's."""
+    wm, fake = collection
+    cloud = fake.FakeCloud("dst")
+    cloud.add_conversion_host("conv-dst", "192.0.2.10")
+    _foreign_server(cloud)
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    with pytest.raises(PermanentStepError, match="roll the migration back"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    env.log.write_text("")
+    await env.executor.run(StepName.ROLLBACK, ctx)
+    (rollback,) = read_log(env.log)
+    result = role_rollback(wm, cloud, run_dir(env) / "osm" / "workload_warm", rollback["vars"])
+    assert result["deleted_server_id"] is None
+    assert "plan-b-web-01" in cloud.servers and "plan-b-boot" in cloud.volumes
 
 
 async def test_a_cold_cutover_keeps_a_cold_record_and_a_warm_record_with_its_server(env):

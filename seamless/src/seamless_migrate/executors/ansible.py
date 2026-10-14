@@ -742,6 +742,37 @@ def _read_warm_state(osm: Path, server_id: str) -> dict[str, Any] | None:
         return None
 
 
+#: a source id the collection accepts as a state file name (warm_migration._SAFE_SERVER_ID)
+_STATE_FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
+    """Write the workload's record - no volume, pass or server - before a cold cutover's
+    playbooks when it has none: the file is the sign that the migration records its workload, so
+    its rollbacks never take a same-named server it does not record for the migration's (SDD §6.3,
+    §7, review RV3-03). An id the collection would refuse as a file name writes nothing."""
+    if not _STATE_FILE_ID.match(server_id):
+        return
+    path = osm / "workload_warm" / f"{server_id}.json"
+    if path.exists():
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    record = {
+        "server_id": server_id,
+        "server_name": server_name,
+        "transfer_uuid": None,
+        "dest_volumes": {},
+        "passes": [],
+        "pending_snapshot": None,
+        "destination_server_id": None,
+    }
+    # as WarmState.save: mode 0600, renamed into place
+    tmp = path.with_name(f".{path.name}.tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(record, f)
+    os.replace(tmp, path)
+
+
 @dataclass(frozen=True)
 class _Playbook:
     name: str
@@ -904,6 +935,10 @@ class AnsibleExecutor:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        if strategy == Strategy.cold and step == StepName.CUTOVER:
+            await asyncio.to_thread(
+                _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
+            )
         # the kit powers the VM off at the cutover: its networks are settled before it runs
         network_map = None
         if strategy in VMWARE:
