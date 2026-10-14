@@ -2150,10 +2150,10 @@ async def test_a_rolled_back_migration_without_passes_is_cancelled_and_then_its_
 async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data_path(
     tmp_path, store
 ):
-    """SDD §5.1 (review RV-01, RV-02): the rollback of a completed cold migration matched its server
-    by name and started its source; the cleanup when it is then cancelled matches nothing by name,
-    deletes no port and leaves the source as it is - the VM the rollback released may since be
-    another plan's, with a same-named server, ports keyed to the VM and a source its cutover
+    """SDD §5.1 (review RV-01, RV-02): a warm rollback deleted the server, started the source and
+    kept the copied data; the cleanup when the migration is then cancelled matches nothing by
+    name, deletes no port and leaves the source as it is - the VM the rollback released may since
+    be another plan's, with a same-named server, ports keyed to the VM and a source its cutover
     stopped."""
     from seamless_migrate.executors.ansible import build_vars
 
@@ -2166,7 +2166,7 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
 
     executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
     h, plan = await setup(
-        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
         executor=executor, settings=settings,
     )  # fmt: skip
     await run_plan(h, plan)
@@ -2174,9 +2174,7 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
     await h.orch.rollback(m.id, "rina", "the application owner wants it back")
     m = await h.wait_phase(m.id, P.rolled_back)
     assert m.sync_passes and m.downtime_started_at is not None
-    rollback_vars = seen[0]["vars"]
-    assert rollback_vars["os_migrate_rollback_match_by_name"] is True
-    assert "os_migrate_rollback_start_source" not in rollback_vars  # it starts the source
+    assert "os_migrate_rollback_start_source" not in seen[0]["vars"]  # it starts the source
 
     await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
     assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
@@ -2187,6 +2185,99 @@ async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data
     assert "os_migrate_rollback_match_by_name" not in cleanup["vars"]
     assert cleanup["vars"]["os_migrate_rollback_start_source"] is False
     assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
+
+
+def _write_record(settings, plan_id, m, **record):
+    """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    path = run_dir(settings, plan_id, m.id) / "osm" / "workload_warm" / f"{m.vm.source_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "server_id": m.vm.source_id,
+                "dest_volumes": {},
+                "passes": [],
+                "pending_snapshot": None,
+                "destination_server_id": None,
+                **record,
+            }
+        )
+    )
+    return path
+
+
+async def test_a_cancel_after_a_failed_first_pass_removes_what_its_record_holds(tmp_path, store):
+    """SDD §5.1 (review RV3-05): a first warm pass that created its destination volumes, recorded
+    them and then failed for good (a volume quota) recorded no pass - its record still holds them,
+    so the cancel runs the cleanup that removes them."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    async def first_pass(ctx):
+        _write_record(
+            settings,
+            ctx.plan.id,
+            ctx.migration,
+            dest_volumes={"/dev/vda": {"dest_id": "dvol-1", "size": 20}},
+        )
+        raise PermanentStepError(
+            "import_workloads_precopy.yml failed (exit 2): VolumeLimitExceeded: Maximum number of "
+            "volumes allowed (10) exceeded"
+        )
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: first_pass, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    assert not m.sync_passes and m.downtime_started_at is None
+
+    await h.orch.cancel(m.id, "rina", "the quota is not ours to raise")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    assert rollbacks == [{"delete_dest_volumes": True}]
+
+
+async def test_a_rolled_back_cold_migrations_cancel_runs_no_cleanup(tmp_path, store):
+    """SDD §5.1 (review RV3-07): a cold cutover lists a full pass, but the cold rollback deleted
+    what the cold import recorded - its record holds nothing, so a cancel has no data path and
+    runs no cleanup (with no record at all, a cold migration's passes do not count either)."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    rolled = []
+    for name in ("vm-1", "vm-2"):
+        m = await h.wait_phase((await h.by_vm(plan.id, name)).id, P.completed)
+        await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+        rolled.append(await h.wait_phase(m.id, P.rolled_back))
+    assert all(m.sync_passes for m in rolled)
+    _write_record(settings, plan.id, rolled[0])  # emptied by the cold rollback
+
+    for m in rolled:
+        await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+        assert (await _settled(h, m.id))[-1] == "cancel"
+    await h.orch.stop()
+    assert len(rollbacks) == 2  # the two rollbacks, no cleanup
 
 
 async def test_a_cleanup_stays_tracked_until_its_outcome_is_recorded(tmp_path, store):

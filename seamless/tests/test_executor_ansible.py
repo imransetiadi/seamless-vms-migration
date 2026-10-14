@@ -1927,6 +1927,30 @@ def test_a_cold_cutover_writes_the_workloads_record_before_its_playbooks(env, mo
     assert written == [(run_dir(env) / "osm", "srv-1", "web-01")]
 
 
+def test_the_workloads_record_tells_whether_the_migration_keeps_copied_data(env):
+    """SDD §5.1, §12 (review RV3-05, RV3-07): destination volumes or a pending source snapshot in
+    the record are copied data; an emptied record is none; no record cannot tell; a record that
+    cannot be read counts as data kept - its cleanup reports what it finds."""
+    from seamless_migrate.executors.ansible import recorded_copied_data
+
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    m, settings = ctx.migration, env.executor.settings
+    assert recorded_copied_data(settings, ctx.plan.id, m) is None
+    path = _state_file(env, {"dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}}})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    _state_file(env, {"dest_volumes": {}, "pending_snapshot": {"transfer_uuid": "uuid-1"}})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    _state_file(env, {"dest_volumes": {}, "passes": [], "pending_snapshot": None})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is False
+    path.write_text("{not json")
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    # a source id the collection would refuse as a file name is never made into a path: with
+    # "../srv-1" the record would be read from outside workload_warm
+    (path.parent.parent / "srv-1.json").write_text(json.dumps({"dest_volumes": {"x": {}}}))
+    outside = m.model_copy(update={"vm": m.vm.model_copy(update={"source_id": "../srv-1"})})
+    assert recorded_copied_data(settings, ctx.plan.id, outside) is None
+
+
 @pytest.fixture
 def collection(tmp_path_factory, monkeypatch):
     """The repository's collection, importable as ansible_collections.os_migrate.os_migrate."""

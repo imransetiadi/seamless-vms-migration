@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import ConversionHostConfig, Migration, Plan, Provider, utcnow
 from ..events import emit
-from ..orchestrator import RELEASES_VM, cleanup_pending, keeps_copied_data
+from ..orchestrator import RELEASES_VM, cleanup_pending
 from ..security.auth import Principal
 from ..security.secret_store import (
     SecretStoreError,
@@ -374,7 +374,7 @@ async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
         for m in await svc.db.list("migration", Migration, plan_id=completed):
             if m.phase not in RELEASES_VM:
                 holding[m.plan_id] += 1
-            elif keeps_copied_data(m):
+            elif await svc.orchestrator.keeps_copied_data(m):
                 keeping[m.plan_id] += 1
             elif cleanup_pending(m):
                 cleaning[m.plan_id] += 1

@@ -79,6 +79,7 @@ from .domain.models import (
     utcnow,
 )
 from .events import EventBus, emit
+from .executors.ansible import recorded_copied_data
 from .executors.base import (
     PermanentStepError,
     StepContext,
@@ -169,13 +170,6 @@ def cleanup_pending(m: Migration) -> bool:
     """A cancel's cleanup that has not recorded its outcome: it runs again at the next start, and
     it needs both providers to remove what the cancelled data path left (SDD §5.1, §12)."""
     return m.phase == P.cancelled and m.checkpoint == "cleanup"
-
-
-def keeps_copied_data(m: Migration) -> bool:
-    """A rolled-back migration with recorded passes: its warm rollback kept the destination volumes
-    and the warm state for a retry, and a cancel of it cleans them up - a cleanup that needs both
-    providers (SDD §5.1, §12)."""
-    return m.phase == P.rolled_back and bool(m.sync_passes)
 
 
 def blocks_plan_change(m: Migration) -> bool:
@@ -1522,10 +1516,10 @@ class Orchestrator:
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
             m.advisor_hold = None  # a cancelled migration takes no decision (SDD §14.6)
             # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
-            # the retries, §8) or has just finished unrecorded; with the passes a migration
-            # recorded, that data path left snapshots, temporary and destination volumes behind,
-            # and `cancelled` is terminal: no later action could remove them
-            data_path = m.phase in (P.precopy, P.syncing) or bool(m.sync_passes)
+            # the retries, §8) or has just finished unrecorded; a migration that keeps copied data
+            # left snapshots, temporary and destination volumes behind, and `cancelled` is
+            # terminal: no later action could remove them
+            data_path = m.phase in (P.precopy, P.syncing) or await self.copied_data(m)
             if data_path:
                 m.checkpoint = "cleanup"  # saved with cancelled: a crash cannot lose the cleanup
             m, v = await self._transition(
@@ -1548,6 +1542,20 @@ class Orchestrator:
             )
         self.wake()
         return m
+
+    async def copied_data(self, m: Migration) -> bool:
+        """Whether the migration keeps copied data (SDD §5.1, §12): what its workload's record
+        says - destination volumes or a pending source snapshot - and, where no record can tell,
+        recorded passes of a strategy other than cold (a cold rollback deletes what it copied)."""
+        recorded = await asyncio.to_thread(recorded_copied_data, self.settings, m.plan_id, m)
+        if recorded is not None:
+            return recorded
+        return m.strategy != Strategy.cold and bool(m.sync_passes)
+
+    async def keeps_copied_data(self, m: Migration) -> bool:
+        """A rolled-back migration that keeps copied data: a cancel of it cleans the data up, a
+        cleanup that needs both providers (SDD §5.1, §12)."""
+        return m.phase == P.rolled_back and await self.copied_data(m)
 
     async def _cleanup_after_cancel(
         self, m: Migration, step: asyncio.Task[Any] | None, actor: str

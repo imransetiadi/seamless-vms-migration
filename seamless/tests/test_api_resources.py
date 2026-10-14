@@ -1501,7 +1501,7 @@ def test_a_rolled_back_migration_keeping_its_copied_data_keeps_its_providers(api
             ", 1 rolled-back VM keeping its copied data); a plan needs its providers until it "
             "completes and its VMs are finalized"
         )
-    other.sync_passes = passes
+    other.strategy, other.sync_passes = Strategy.warm, passes
     api.store.put("migration", other)
     assert (
         '("rolled back mid-plan", 2 rolled-back VMs keeping their copied data)'
@@ -1526,6 +1526,66 @@ def test_a_rolled_back_migration_keeping_its_copied_data_keeps_its_providers(api
     assert res.status_code == 200 and res.json()["phase"] == "cancelled", res.text
     wait_for(lambda: api.get(f"/api/v1/migrations/{warm.id}").json()["checkpoint"] == "cleaned")
     assert delete("dst-rhoso").status_code == 204
+
+
+def _rolled_back_in_a_completed_plan(api, name, strategy, sync_passes=()):
+    vm_ids = first_clean_vms(api, n=1)
+    body = {
+        "name": name,
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    (m,) = api.store.list("migration", Migration, plan_id=plan["id"])
+    m.strategy, m.phase, m.sync_passes = strategy, Phase.rolled_back, list(sync_passes)
+    api.store.put("migration", m)
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    return plan, m
+
+
+def _record(api, plan, m, **record):
+    """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    path = run_dir(api.settings, plan["id"], m.id) / "osm" / "workload_warm"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / f"{m.vm.source_id}.json").write_text(json.dumps({
+        "server_id": m.vm.source_id, "dest_volumes": {}, "passes": [], "pending_snapshot": None,
+        "destination_server_id": None, **record,
+    }))  # fmt: skip
+
+
+def test_a_rolled_back_migration_whose_record_keeps_volumes_keeps_its_providers(api):
+    """SDD §12, §5.1 (review RV3-05): a warm first pass that failed after creating its destination
+    volumes recorded no pass; rolled back, the migration keeps them all the same - its record says
+    so - and its providers stay until a cancel cleans them up."""
+    plan, m = _rolled_back_in_a_completed_plan(api, "first pass failed", Strategy.warm)
+    delete = lambda: api.client.delete(  # noqa: E731
+        "/api/v1/providers/dst-rhoso", headers=api.h(Role.admin)
+    )
+    _record(api, plan, m, dest_volumes={"/dev/vda": {"dest_id": "dvol-1", "size": 20}})
+    refused = delete()
+    assert refused.status_code == 409, refused.text
+    assert "1 rolled-back VM keeping its copied data" in refused.json()["error"]["message"]
+    _record(api, plan, m, pending_snapshot={"transfer_uuid": "uuid-1"})  # source temporaries
+    assert delete().status_code == 409
+    _record(api, plan, m)  # emptied: nothing kept
+    assert delete().status_code == 204
+
+
+def test_a_rolled_back_cold_migration_frees_its_providers(api):
+    """SDD §12, §5.1 (review RV3-07): a cold cutover lists a full pass, but the cold rollback
+    deleted what the cold import recorded - without a record holding anything, the rolled-back cold
+    migration keeps no copied data, and its providers can go."""
+    now = utcnow()
+    passes = [SyncPass(number=1, kind=SyncPassKind.full, started_at=now, ended_at=now)]
+    plan, m = _rolled_back_in_a_completed_plan(api, "cold, rolled back", Strategy.cold, passes)
+    res = api.client.delete("/api/v1/providers/dst-rhoso", headers=api.h(Role.admin))
+    assert res.status_code == 204, res.text
 
 
 def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):

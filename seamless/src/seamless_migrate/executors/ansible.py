@@ -742,6 +742,29 @@ def _read_warm_state(osm: Path, server_id: str) -> dict[str, Any] | None:
         return None
 
 
+def recorded_copied_data(settings: Settings, plan_id: str, migration: Migration) -> bool | None:
+    """What the workload's record (SDD §6.3) says of the data the migration copied: whether it
+    holds destination volumes or a pending source snapshot; None without a record (the simulator,
+    VMware, a storage handover, nothing run yet) or for an id the collection would refuse as a
+    file name. An unreadable record counts as data kept: its cleanup reports what it finds (SDD
+    §5.1, §12)."""
+    if not _STATE_FILE_ID.match(migration.vm.source_id):
+        return None
+    path = (
+        run_dir(settings, plan_id, migration.id)
+        / "osm"
+        / "workload_warm"
+        / f"{migration.vm.source_id}.json"
+    )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return True
+    return bool(record.get("dest_volumes") or record.get("pending_snapshot"))
+
+
 #: a source id the collection accepts as a state file name (warm_migration._SAFE_SERVER_ID)
 _STATE_FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
