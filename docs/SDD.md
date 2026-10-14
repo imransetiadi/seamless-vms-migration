@@ -434,7 +434,12 @@ no further attempt starts. Whenever the migration has a data path — it was can
 `sync_passes` (a warm migration cancelled in `awaiting_cutover`, after a retry, a failed pass or its rollback) — the
 cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
-volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
+volumes): `cancelled` is terminal, so no later action could remove them. That cleanup touches only what the
+migration recorded of its own: it matches no destination server by name, deletes no port and leaves the source as it
+is (`os_migrate_rollback_start_source: false` and `os_migrate_rollback_delete_ports: false`, §6.5; on VMware no
+power-on and no kit port, §7.2) — whatever server and ports its cutover made went with its rollback, its source runs,
+and the VM it released (§5.4) may since be another plan's, whose same-named server, ports and stopped source are not
+this migration's. The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
 in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
@@ -687,7 +692,7 @@ rollback reads it (§7); a cold migration cut over before the cold import record
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
 | `import_workload_record_volumes` | — | Record the destination volumes a cold transfer created (`volume_map` of `import_workload_transfer_volumes`: each device's `dest_id`, with its `size`, `bootable` and `name`) in the workload's state file (§6.3), as the warm path records its volumes, keeping what the file already holds; changes no cloud. |
-| `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and the warm state file (kept while a source snapshot is pending). Starting the source is left to the role. |
+| `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and the warm state file (kept while a source snapshot is pending); with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
 (`_create_destination_volumes`), so mapped types would be ignored. A new variable
@@ -732,6 +737,7 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_rollback_delete_dest_volumes` | `false` | `delete_dest_volumes` |
 | `os_migrate_rollback_match_by_name` | `false` | `match_by_name` |
 | `os_migrate_rollback_start_source` | `true` | — (the rollback role's last step: start the source server) |
+| `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
 ### 6.6 Hardening of existing code (required)
@@ -787,7 +793,8 @@ a port exported without `security_group_refs` (an export from before this rule) 
 project's default group: Nova applies a server's security groups only to the ports it creates itself. The rollback
 (`WarmRollback`) deletes, after the destination server, every destination port whose description names one of the
 workload's source ports and that is unbound or bound to the deleted server. It does so also when there is no server,
-since a cutover can fail between creating the ports and creating the server. Nova keeps such ports when their server
+since a cutover can fail between creating the ports and creating the server. A cancel's cleanup deletes none
+(`delete_ports` `false`, §5.1): it made none, and the unbound ones may be another plan's migration of the VM. Nova keeps such ports when their server
 is deleted later, so a migrated server's ports outlive it: delete them with the server when it is decommissioned
 (only then does Neutron free their addresses).
 
@@ -1066,6 +1073,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
   refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
   (`<VM name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted.
+  A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
+  kit port and powers nothing on.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
