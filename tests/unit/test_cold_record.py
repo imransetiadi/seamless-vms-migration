@@ -882,7 +882,11 @@ def test_an_earlier_volume_the_conversion_host_and_a_server_hold_is_kept(tmp_pat
     src, dst = _clouds()
     state_dir = str(tmp_path / "workload_warm")
     _earlier_attempt(state_dir, dst, data_holder="dst-s1-renamed")
-    dst.attach_volume(dst.servers["dst-conv"], dst.volumes["dvol-data"])
+    # a multi-attach volume: the conversion host holds it too (openstacksdk's attach_volume would
+    # refuse to attach it, in-use; a transfer cut short left it there)
+    dst.volumes["dvol-data"].attachments.append(
+        {"server_id": "dst-conv", "device": "/dev/vdb", "volume_id": "dvol-data"}
+    )
     with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
         transfer = _transfer(dst, state_dir)
     transfer._create_destination_volumes()

@@ -168,15 +168,22 @@ workload.yml:
 
 RETURN = r"""
 transfer_uuid:
-  description: UUID to identify this transfer when needed
-  returned: Only on success.
+  description:
+    - UUID to identify this transfer when needed.
+    - A failed export returns it too, for the source cleanup.
+  returned: always
   type: str
   sample: 9b8a64b3-c976-4103-b34e-995e4ab9f57b
 volume_map:
   description:
     - Mapping of source volume devices to NBD export URLs.
     - This structure only has source-related fields filled out.
-  returned: Only after successfully moving volumes on source cloud.
+    - A failed export returns what it got to - each port is recorded as soon
+      as it is claimed - so the role's rescue (import_workload_src_cleanup)
+      puts back what it took - its NBD exports and ports, detached data
+      volumes, attachments to the conversion host, the root copy, its
+      snapshot or image (Seamless Migrate SDD 6.6).
+  returned: always
   type: dict
   sample:
     "volume_map": {
@@ -207,6 +214,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     OpenstackVolumeExport,
 )
 
+import traceback
 import uuid
 
 
@@ -370,7 +378,19 @@ def run_module():
         timeout=timeout,
     )
 
-    source_host.prepare_exports()
+    try:
+        source_host.prepare_exports()
+    except Exception as err:  # pylint: disable=broad-except
+        # Fail with the map, so the role's rescue puts back what this export took
+        # (Seamless Migrate SDD 6.6, review RV6-01). Nothing more here: a step
+        # over SSH could wait for the port lock while the conversion host is
+        # unreachable; the cleanup checks SSH first.
+        module.fail_json(
+            msg=str(err),
+            exception=traceback.format_exc(),
+            transfer_uuid=source_host.transfer_uuid,
+            volume_map=source_host.volume_map,
+        )
 
     result["transfer_uuid"] = source_host.transfer_uuid
     result["volume_map"] = source_host.volume_map

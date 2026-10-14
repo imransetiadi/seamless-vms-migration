@@ -322,3 +322,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   it, until Cinder shows it ``available``. A volume that goes to ``error``
   raises, and a detach still not done at the timeout fails with ``Timed out
   after N s waiting to detach volume V from server S``.
+- A cold export that fails puts back what it took.
+  ``import_workload_export_volumes`` fails with its volume map, which records
+  each port as soon as it is claimed, so the role's rescue runs
+  ``import_workload_src_cleanup``: it stops the transfer's NBD exports and
+  frees those ports. Before, the export failed
+  without the map, nothing was put back, and the rollback started the source
+  VM without the data volumes the export had detached. The source cleanup
+  takes such a partial map: it detaches each volume Cinder lists on the
+  conversion host, whether or not its device was recorded, re-attaches the
+  data volumes, and removes the root copy, its snapshot or the image only
+  when the export made them, never the VM's own boot volume. The export
+  records the snapshot and the image as soon as each exists.

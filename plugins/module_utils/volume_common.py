@@ -843,6 +843,9 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 name=f"{self.boot_volume_prefix}{volume_id}",
                 timeout=self.timeout,
             )
+            # Recorded at once: an export failing before the copy exists leaves
+            # the cleanup a snapshot to remove (Seamless Migrate SDD 6.6)
+            self.volume_map["/dev/vda"]["snap_id"] = root_snapshot.id
 
             # Create a new volume from the snapshot
             self.log.info("Creating new volume from boot volume snapshot")
@@ -856,7 +859,6 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
 
             # Update the volume map with the new volume ID
             self.volume_map["/dev/vda"]["source_id"] = root_volume_copy.id
-            self.volume_map["/dev/vda"]["snap_id"] = root_snapshot.id
         elif sourcevm.image and self.ser_server.migration_params()["boot_disk_copy"]:
             self.log.info(
                 "Image-based instance, boot_disk_copy enabled: creating snapshot"
@@ -868,6 +870,22 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 timeout=self.timeout,
             )
             image = self.conn.get_image_by_id(image.id)  # refresh
+            # Recorded at once, the volume to come: an export failing before it
+            # exists leaves the cleanup an image to remove (Seamless Migrate SDD 6.6)
+            self.volume_map["/dev/vda"] = dict(
+                source_dev=None,
+                source_id=None,
+                dest_dev=None,
+                dest_id=None,
+                snap_id=None,
+                image_id=image.id,
+                name=image.name,
+                size=None,
+                port=None,
+                url=None,
+                progress=None,
+                bootable=True,
+            )
             if image.status != "active":
                 raise RuntimeError(
                     "Could not create new image of image-based instance!"
@@ -880,18 +898,10 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 timeout=self.timeout,
                 size=max(image.size // (1024**3), image.min_disk),
             )
-            self.volume_map["/dev/vda"] = dict(
-                source_dev=None,
+            self.volume_map["/dev/vda"].update(
                 source_id=volume["id"],
-                dest_dev=None,
-                dest_id=None,
-                snap_id=None,
-                image_id=image.id,
                 name=volume["name"],
                 size=volume["size"],
-                port=None,
-                url=None,
-                progress=None,
                 bootable=volume["bootable"],
             )
             self._update_progress("/dev/vda", 0.0)
@@ -941,6 +951,10 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
             port = self._find_free_port()
+            # Recorded at once: an export failing before this disk's export is
+            # ready leaves the source cleanup its port to free (Seamless Migrate
+            # SDD 6.6, review RV6-01)
+            mapping["port"] = port
             volume_id = mapping["source_id"]
             disk = mapping["source_dev"]
             self.log.info("Exporting %s from volume %s", disk, volume_id)
@@ -1019,8 +1033,6 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             else:
                 raise RuntimeError("Timed out starting nbdkit exports!")
 
-            # pylint: disable=unnecessary-dict-index-lookup
-            self.volume_map[path]["port"] = port
             self.log.info("Volume map so far: %s", self.volume_map)
 
 
@@ -1433,13 +1445,20 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
 
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_source_converter(self):
-        """Detach volumes from conversion host."""
+        """
+        Detach volumes from conversion host: each mapped volume Cinder lists as
+        attached there, whether or not the export recorded its device - a failed
+        export may have stopped after Nova attached a volume and before its
+        device showed (Seamless Migrate SDD 6.6, review RV6-01).
+        """
         self.log.info("Detaching volumes from the source conversion host.")
         converter = self._converter()
         for path, mapping in self.volume_map.items():
-            volume = self.conn.get_volume_by_id(mapping["source_id"])
+            volume = self._get_volume_maybe(mapping["source_id"])
+            if volume is None:
+                continue
             self.log.info("Inspecting volume %s", volume.id)
-            if mapping["source_dev"] is None:
+            if not self._volume_still_attached(volume, converter):
                 self.log.info(
                     "Volume is not attached to conversion host, skipping detach."
                 )
@@ -1458,15 +1477,29 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
                 )
 
     def _attach_data_volumes_to_source(self):
-        """Clean up the copy of the root volume and reattach data volumes."""
+        """
+        Clean up the copy of the root volume and reattach data volumes. The
+        map may be one a failed export left: the root entry names the source
+        VM's own boot volume until the copy exists, and that volume is never
+        deleted (Seamless Migrate SDD 6.6, review RV6-01).
+        """
         self.log.info("Re-attaching volumes to source VM...")
         for path, mapping in sorted(self.volume_map.items()):
             if path == "/dev/vda":
-                # Delete the temporary copy of the source root disk
-                self.log.info("Removing copy of root volume")
-                self.conn.delete_volume(
-                    name_or_id=mapping["source_id"], wait=True, timeout=self.timeout
-                )
+                root = self._get_volume_maybe(mapping["source_id"])
+                if root is None:
+                    self.log.info("No copy of the root volume to remove")
+                elif self._volume_still_attached(root, self._source_vm()):
+                    self.log.info(
+                        "Volume %s is the source VM's own boot volume, keeping it",
+                        root.id,
+                    )
+                else:
+                    # Delete the temporary copy of the source root disk
+                    self.log.info("Removing copy of root volume")
+                    self.conn.delete_volume(
+                        name_or_id=root.id, wait=True, timeout=self.timeout
+                    )
 
                 # Remove the root volume snapshot
                 if mapping["snap_id"]:

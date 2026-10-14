@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -151,10 +152,13 @@ class OpenStackSourceHostCleanup(OpenstackVolumeClean):
         self.source_instance_id = source_instance_id
         self.volume_map = volume_map
 
-        # This will make _release_ports clean up ports from the export module
+        # This will make _release_ports clean up ports from the export module;
+        # an export that failed before it claimed a disk's port leaves None
+        # there (Seamless Migrate SDD 6.6)
         for path, mapping in volume_map.items():
-            port = mapping["port"]
-            self.claimed_ports.append(port)
+            port = mapping.get("port")
+            if port is not None:
+                self.claimed_ports.append(port)
 
 
 def run_module():

@@ -15,10 +15,13 @@ import json
 import re
 
 try:
-    from openstack.exceptions import NotFoundException
+    from openstack.exceptions import NotFoundException, SDKException
 except ImportError:  # openstacksdk is optional for these tests
 
-    class NotFoundException(Exception):
+    class SDKException(Exception):
+        pass
+
+    class NotFoundException(SDKException):
         status_code = 404
 
 GIB = 1024 ** 3
@@ -194,6 +197,14 @@ class FakeCloud:
     def attach_volume(self, server, volume, device=None, wait=True, timeout=None):
         self.record("attach_volume", server=server.id, volume=volume.id)
         volume = self.volumes[volume.id]
+        # as openstacksdk 4.x's attach_volume: never a volume that server holds already, nor one
+        # that is not available - a volume another server holds stays in-use
+        if any(a["server_id"] == server.id for a in volume.attachments):
+            raise SDKException("Volume %s already attached to server %s" % (volume.id, server.id))
+        if volume.status != "available":
+            raise SDKException(
+                "Volume %s is not available. Status is '%s'" % (volume.id, volume.status)
+            )
         devices = self.devices.setdefault(server.id, [])
         dev = next(
             "/dev/vd" + letter
@@ -264,11 +275,17 @@ class _FakeBlockStorage:
     def __init__(self, cloud):
         self.cloud = cloud
 
+    # the statuses Cinder leaves on its own: a wait for another status sees it reached
+    TRANSITIONAL = ("creating", "attaching", "detaching", "downloading", "extending")
+
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=None, **kwargs):
         if wait is None:
             raise AssertionError("wait_for_status without a wait bound waits forever")
         self.cloud.record("wait_for_status", id=res.id, status=status)
-        return self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id) or res
+        found = self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id) or res
+        if found.get("status") in self.TRANSITIONAL:
+            found.status = status
+        return found
 
     def set_volume_bootable_status(self, volume, bootable):
         self.cloud.record("set_volume_bootable_status", volume=volume.id, bootable=bootable)
