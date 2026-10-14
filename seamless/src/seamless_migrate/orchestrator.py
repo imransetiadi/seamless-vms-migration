@@ -171,6 +171,13 @@ def cleanup_pending(m: Migration) -> bool:
     return m.phase == P.cancelled and m.checkpoint == "cleanup"
 
 
+def keeps_copied_data(m: Migration) -> bool:
+    """A rolled-back migration with recorded passes: its warm rollback kept the destination volumes
+    and the warm state for a retry, and a cancel of it cleans them up - a cleanup that needs both
+    providers (SDD §5.1, §12)."""
+    return m.phase == P.rolled_back and bool(m.sync_passes)
+
+
 def blocks_plan_change(m: Migration) -> bool:
     """A migration in flight or whose source VM is stopped keeps its plan as it is (SDD §12)."""
     return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)

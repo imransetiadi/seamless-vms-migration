@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from ..domain.enums import PlanStatus, ProviderKind, ProviderRole, Role
 from ..domain.models import ConversionHostConfig, Migration, Plan, Provider, utcnow
 from ..events import emit
-from ..orchestrator import RELEASES_VM, cleanup_pending
+from ..orchestrator import RELEASES_VM, cleanup_pending, keeps_copied_data
 from ..security.auth import Principal
 from ..security.secret_store import (
     SecretStoreError,
@@ -358,8 +358,9 @@ async def set_conversion_key(
 async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
     """The plans that still need the provider (SDD §12), each with why: one that has not completed
     (a failed one can start again), or a completed one with a migration that holds its VM - it can
-    be rolled back until it is finalized, and its rollback needs both providers (§8.1) - and a
-    completed or cancelled one with a cancelled migration whose cleanup is pending (§5.1)."""
+    be rolled back until it is finalized, and its rollback needs both providers (§8.1), or a
+    rolled-back one that kept its copied data, which a cancel cleans up - and a completed or
+    cancelled one with a cancelled migration whose cleanup is pending (§5.1)."""
     plans = [
         p
         for p in await svc.db.list("plan", Plan)
@@ -367,11 +368,14 @@ async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
     ]
     completed = [p.id for p in plans if p.status in TERMINAL_PLAN_STATUSES]
     holding: Counter[str] = Counter()
+    keeping: Counter[str] = Counter()
     cleaning: Counter[str] = Counter()
     if completed:
         for m in await svc.db.list("migration", Migration, plan_id=completed):
             if m.phase not in RELEASES_VM:
                 holding[m.plan_id] += 1
+            elif keeps_copied_data(m):
+                keeping[m.plan_id] += 1
             elif cleanup_pending(m):
                 cleaning[m.plan_id] += 1
     users = []
@@ -382,6 +386,10 @@ async def _plans_that_need(svc: Any, provider_id: str) -> list[str]:
         why: list[str] = []
         if n := holding[p.id]:
             why.append(f"{n} VM{'' if n == 1 else 's'} not finalized")
+        if n := keeping[p.id]:
+            why.append(
+                f"{n} rolled-back VM{' keeping its' if n == 1 else 's keeping their'} copied data"
+            )
         if n := cleaning[p.id]:
             why.append(f"{n} cancelled VM{'' if n == 1 else 's'} still being cleaned up")
         if why:

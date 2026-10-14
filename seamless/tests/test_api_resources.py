@@ -1465,6 +1465,69 @@ def test_a_cancelled_migrations_pending_cleanup_keeps_its_providers(api):
     assert delete("src-osp").status_code == 204
 
 
+def test_a_rolled_back_migration_keeping_its_copied_data_keeps_its_providers(api):
+    """SDD §12/§5.1 (review RV-04): a warm rollback deletes only the destination server and keeps
+    the destination volumes and warm state for a retry; a cancel of the rolled-back migration
+    removes them, and that cleanup needs both providers - so one that recorded passes keeps them
+    until it is cancelled and cleaned up, while one that recorded none lets them go."""
+    vm_ids = first_clean_vms(api, n=3)
+    body = {
+        "name": "rolled back mid-plan",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    warm, other, third = api.store.list("migration", Migration, plan_id=plan["id"])
+    now = utcnow()
+    passes = [SyncPass(number=1, kind=SyncPassKind.full, started_at=now, ended_at=now)]
+    warm.strategy, warm.phase, warm.sync_passes = Strategy.warm, Phase.rolled_back, passes
+    other.phase = Phase.rolled_back  # nothing copied kept: its VM and the providers are free
+    third.phase = Phase.finalized
+    for m in (warm, other, third):
+        api.store.put("migration", m)
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    delete = lambda provider: api.client.delete(  # noqa: E731
+        f"/api/v1/providers/{provider}", headers=api.h(Role.admin)
+    )
+    for provider in ("dst-rhoso", "src-osp"):
+        refused = delete(provider)
+        assert refused.status_code == 409, (provider, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("rolled back mid-plan"'
+            ", 1 rolled-back VM keeping its copied data); a plan needs its providers until it "
+            "completes and its VMs are finalized"
+        )
+    other.sync_passes = passes
+    api.store.put("migration", other)
+    assert (
+        '("rolled back mid-plan", 2 rolled-back VMs keeping their copied data)'
+        in delete("dst-rhoso").json()["error"]["message"]
+    )
+    # beside a VM not finalized and a cancelled one still being cleaned up
+    other.phase, other.sync_passes = Phase.failed, []
+    third.phase, third.checkpoint = Phase.cancelled, "cleanup"
+    for m in (other, third):
+        api.store.put("migration", m)
+    assert (
+        '("rolled back mid-plan", 1 VM not finalized, 1 rolled-back VM keeping its copied data, '
+        "1 cancelled VM still being cleaned up)" in delete("dst-rhoso").json()["error"]["message"]
+    )
+    other.phase = Phase.rolled_back
+    third.phase, third.checkpoint = Phase.finalized, None
+    for m in (other, third):
+        api.store.put("migration", m)
+    # the cancel removes what the rollback kept (SDD §5.1); once its cleanup recorded that, the
+    # providers go
+    res = api.post(f"/api/v1/migrations/{warm.id}/cancel", Role.operator, json={"reason": "kept"})
+    assert res.status_code == 200 and res.json()["phase"] == "cancelled", res.text
+    wait_for(lambda: api.get(f"/api/v1/migrations/{warm.id}").json()["checkpoint"] == "cleaned")
+    assert delete("dst-rhoso").status_code == 204
+
+
 def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):
     body = {
         "name": "still a draft",
