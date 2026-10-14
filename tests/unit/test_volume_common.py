@@ -385,6 +385,57 @@ def test_the_fake_conversion_host_refuses_a_lock_its_holder_takes_again():
     assert inner(transfer) == "inner"
 
 
+def test_a_detach_waits_for_cinder_only_within_the_timeout():
+    """SDD 6.6 (review 5): openstacksdk 4.x's detach_volume(wait=True) ignores its timeout and
+    waits forever for a detach that never ends; detach_volume_bounded asks Nova without waiting,
+    then waits for Cinder's `available` within the timeout."""
+    dst = cloud()
+    dst.add_volume("vol-1", "vol-1", 1)
+    conversion_host = dst.servers["dst-conv"]
+    dst.attach_volume(conversion_host, dst.volumes["vol-1"])
+    calls = []
+    nova_detach, cinder_wait = dst.detach_volume, dst.block_storage.wait_for_status
+
+    def detach(server, volume, **kwargs):
+        calls.append(("detach_volume", kwargs.get("wait")))
+        return nova_detach(server, volume, **kwargs)
+
+    def wait_for_status(res, **kwargs):
+        calls.append(("wait_for_status", kwargs.get("status"), kwargs.get("wait")))
+        return cinder_wait(res, **kwargs)
+
+    dst.detach_volume, dst.block_storage.wait_for_status = detach, wait_for_status
+    volume_common.detach_volume_bounded(dst, conversion_host, dst.volumes["vol-1"], 7)
+
+    assert calls == [("detach_volume", False), ("wait_for_status", "available", 7)]
+    assert not dst.volumes["vol-1"].attachments
+
+
+def test_every_detach_goes_through_the_bounded_wait():
+    """SDD 6.6 (review 5): no module calls openstacksdk's detach_volume itself - with wait=True it
+    would wait without bound - but through detach_volume_bounded."""
+    import ast
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugins")
+    offenders = []
+    for directory, dirs, files in os.walk(root):
+        for name in files:
+            path = os.path.join(directory, name)
+            if not name.endswith(".py") or os.path.islink(path):
+                continue  # the vendored openstack.cloud modules are links (make vendor-links)
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "detach_volume":
+                    owner = parents.get(node)
+                    while owner is not None and not isinstance(owner, ast.FunctionDef):
+                        owner = parents.get(owner)
+                    if owner is None or owner.name != "detach_volume_bounded":
+                        offenders.append("%s:%d" % (os.path.relpath(path, root), node.lineno))
+    assert offenders == []
+
+
 def test_a_volume_cinder_no_longer_has_reads_as_none():
     """openstacksdk 4.x's get_volume_by_id raises NotFoundException for a missing volume - its
     docstring's "else None" notwithstanding: volume_or_none reads that as None, and lets any

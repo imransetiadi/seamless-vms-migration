@@ -62,6 +62,21 @@ def volume_or_none(conn, volume_id):
         raise
 
 
+def detach_volume_bounded(conn, server, volume, timeout):
+    """
+    Detach ``volume`` from ``server`` and wait, within ``timeout`` seconds,
+    until Cinder shows it available: openstacksdk 4.x's detach_volume(wait=True)
+    ignores its timeout and would wait forever for a detach that never ends
+    (Seamless Migrate SDD 6.6, review 5).
+    """
+    conn.detach_volume(server=server, volume=volume, wait=False)
+    detached = volume_or_none(conn, volume["id"])
+    if detached is not None:
+        conn.block_storage.wait_for_status(
+            detached, status="available", failures=["error"], wait=timeout
+        )
+
+
 def _lock_host():
     """This host's name as a lock records it (SDD §6.6)."""
     host = socket.gethostname()
@@ -318,9 +333,7 @@ class OpenStackVolumeBase:
                 continue
 
             self.log.info("Detaching volume %s.", volume["id"])
-            self.conn.detach_volume(
-                server=converter, volume=volume, timeout=self.timeout, wait=True
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             for second in range(self.timeout):
                 converter = self._converter()
                 volume = volume_or_none(self.conn, volume_id)
@@ -880,9 +893,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 volume_id = mapping["source_id"]
                 volume = self.conn.get_volume_by_id(volume_id)
                 self.log.info("Detaching %s from %s", volume["id"], sourcevm.id)
-                self.conn.detach_volume(
-                    server=sourcevm, volume=volume, wait=True, timeout=self.timeout
-                )
+                detach_volume_bounded(self.conn, sourcevm, volume, self.timeout)
 
     # Lock this part to have a better chance of the OpenStack device path
     # matching the device path seen inside the conversion host.
@@ -1393,9 +1404,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         for path, mapping in self.volume_map.items():
             volume_id = mapping["dest_id"]
             volume = self.conn.get_volume_by_id(volume_id)
-            self.conn.detach_volume(
-                server=self._converter(), timeout=self.timeout, volume=volume, wait=True
-            )
+            detach_volume_bounded(self.conn, self._converter(), volume, self.timeout)
 
 
 class OpenstackVolumeClean(OpenStackVolumeBase):
@@ -1419,9 +1428,7 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
                     "Volume is not attached to conversion host, skipping detach."
                 )
                 continue
-            self.conn.detach_volume(
-                server=converter, volume=volume, timeout=self.timeout, wait=True
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             for second in range(self.timeout):
                 converter = self._converter()
                 volume = self.conn.get_volume_by_id(mapping["source_id"])

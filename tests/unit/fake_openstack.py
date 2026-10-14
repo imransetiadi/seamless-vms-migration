@@ -207,6 +207,10 @@ class FakeCloud:
         volume.status = "in-use"
 
     def detach_volume(self, server, volume, wait=True, timeout=None):
+        if wait:
+            # openstacksdk 4.x waits for `available` with no bound, its timeout unused: a test that
+            # reaches this fails at once instead of a migration hanging (detach_volume_bounded)
+            raise AssertionError("detach_volume(wait=True) waits without a bound in openstacksdk 4.x")
         self.record("detach_volume", server=server.id, volume=volume.id)
         volume = self.volumes[volume.id]
         for attachment in list(volume.attachments):
@@ -261,6 +265,8 @@ class _FakeBlockStorage:
         self.cloud = cloud
 
     def wait_for_status(self, res, status="available", failures=None, interval=2, wait=None, **kwargs):
+        if wait is None:
+            raise AssertionError("wait_for_status without a wait bound waits forever")
         self.cloud.record("wait_for_status", id=res.id, status=status)
         return self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id) or res
 

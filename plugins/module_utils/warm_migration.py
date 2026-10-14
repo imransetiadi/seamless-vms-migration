@@ -41,6 +41,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     OpenStackVolumeBase,
     RemoteShell,
     destination_volume_sdk_params,
+    detach_volume_bounded,
     use_lock,
     volume_or_none,
 )
@@ -357,9 +358,7 @@ class _WarmVolumeBase(OpenStackVolumeBase):
             if volume is None or not self._volume_still_attached(volume, converter):
                 continue
             self.log.info("Detaching volume %s from the %s conversion host", volume_id, side)
-            self.conn.detach_volume(
-                server=converter, volume=volume, wait=True, timeout=self.timeout
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             self._wait_detached(volume_id, side)
 
     def _forget_transfer(self, shell, transfer_uuid):
@@ -1279,9 +1278,7 @@ class WarmRollback:
                     )
                     return None
                 self.log.info("Detaching volume %s from %s", volume_id, holder.id)
-                self.conn.detach_volume(
-                    server=holder, volume=volume, wait=True, timeout=self.timeout
-                )
+                detach_volume_bounded(self.conn, holder, volume, self.timeout)
             time.sleep(1)
         else:
             raise RuntimeError("Volume %s is still attached, cannot delete it" % volume_id)
