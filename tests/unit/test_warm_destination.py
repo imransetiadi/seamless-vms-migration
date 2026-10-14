@@ -185,6 +185,35 @@ def test_create_instance_module_finishes_a_recorded_server(tmp_path):
     ]
 
 
+def test_create_instance_module_finishes_a_recorded_server_an_operator_renamed(tmp_path):
+    """SDD §6 (lead 8, decided): a recorded server an operator renamed is finished like any
+    recorded server. A refusal would fail the cutover after the source stopped, and the automatic
+    rollback (SDD §8, plan.verification.auto_rollback, on by default) would then delete that very
+    server - the one the rename set aside - with the recorded volumes; a fresh server cannot be
+    built from those volumes anyway, as the renamed server holds them."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    dst.servers["dst-srv"].name = "vm1-aside"
+    finished = []
+
+    def record_fips(self, conn, sdk_srv):
+        finished.append(sdk_srv.id)
+
+    with mock.patch.object(server.Server, "create") as create, mock.patch.object(
+        server.Server, "_create_floating_ips", record_fips
+    ):
+        result = fake.run_module(create_module, _create_instance_args(state_dir), dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["server_id"] == "dst-srv"
+    create.assert_not_called()
+    assert finished == ["dst-srv"]
+    assert "dst-srv" in dst.servers
+
+
 # --- rollback ------------------------------------------------------------------
 
 
