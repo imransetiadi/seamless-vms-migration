@@ -38,6 +38,26 @@ describe('Overview page (mock data)', () => {
     for (const summary of summaries) expect(summary).not.toHaveTextContent('1m 00s');
   });
 
+  it('names the cancelled migrations its done count leaves out, as the Plans list does, and none when there are none (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    const n = ofPlan.length - 1;
+    await waitFor(() => expect(item).toHaveTextContent(`${n} of ${n} done, 1 cancelled, downtime SLO`));
+    const others = server.plans.filter(
+      (p) => p.id !== plan.id && p.status !== 'cancelled' && !server.migrations.some((m) => m.plan_id === p.id && m.phase === 'cancelled'),
+    );
+    expect(others.length).toBeGreaterThan(0);
+    for (const other of others) {
+      const row = screen.getByRole('link', { name: other.name }).closest('li')!;
+      expect(row).not.toHaveTextContent(/cancelled/);
+    }
+  });
+
   it('counts plan progress over the migrations that are not cancelled, and a cancelled plan shows none (SDD §16)', async () => {
     const server = createTestServer();
     const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;

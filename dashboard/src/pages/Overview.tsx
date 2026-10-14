@@ -251,9 +251,12 @@ function PlanProgress({ plans, migrations }: { plans: Plan[]; migrations: Migrat
                   <span className="sr-only">Nothing left to do</span>
                 </>
               ) : (
-                `${pr.done} of ${pr.total} done`
+                // the cancelled ones the count leaves out, named as the Plans list does (SDD §16)
+                `${pr.done} of ${pr.total} done${pr.cancelled ? `, ${pr.cancelled} cancelled` : ''}`
               )}
-              , downtime SLO {formatDuration(plan.downtime_slo_s)}
+              ,{' '}
+              {/* one unit: a narrow card breaks the line before it, never inside the duration */}
+              <span className="whitespace-nowrap">downtime SLO {formatDuration(plan.downtime_slo_s)}</span>
             </p>
           </li>
         );
