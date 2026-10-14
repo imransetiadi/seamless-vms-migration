@@ -791,11 +791,25 @@ def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
         "pending_snapshot": None,
         "destination_server_id": None,
     }
-    # as WarmState.save: mode 0600, renamed into place
+    # as WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
+    # too, so the rename outlives a crash: a missing record would let a later rollback take a
+    # same-named server by its name (review RV4-07)
     tmp = path.with_name(f".{path.name}.tmp")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    try:
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        # some filesystems (network or FUSE mounts) cannot sync a directory: the record is written
+        # and synced all the same, and failing every cold cutover there would gain nothing
+        log.warning("could not sync %s after writing the workload record: %s", path.parent, exc)
 
 
 @dataclass(frozen=True)

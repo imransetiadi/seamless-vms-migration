@@ -1927,6 +1927,89 @@ def test_a_cold_cutover_writes_the_workloads_record_before_its_playbooks(env, mo
     assert written == [(run_dir(env) / "osm", "srv-1", "web-01")]
 
 
+def test_the_workloads_record_is_synced_before_and_after_its_rename(tmp_path, monkeypatch):
+    """SDD §6.3, §7 (review RV4-07): the record is synced whole before it is renamed into place,
+    as WarmState.save syncs its file, and its directory after the rename - a crash right after the
+    write leaves neither an empty nor a missing record, which would let a later rollback take a
+    same-named server by its name."""
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("fsync", stat.S_ISDIR(st.st_mode), st.st_ino, st.st_size))
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", os.stat(src).st_ino))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+
+    path = tmp_path / "osm" / "workload_warm" / "srv-1.json"
+    record, directory = path.stat(), path.parent.stat()
+    assert [event[:3] for event in events] == [
+        ("fsync", False, record.st_ino),
+        ("replace", record.st_ino),
+        ("fsync", True, directory.st_ino),
+    ]
+    assert events[0][3] == record.st_size  # the whole record was written when it was synced
+
+
+def test_a_directory_that_cannot_be_synced_still_gets_the_workloads_record(
+    tmp_path, monkeypatch, caplog
+):
+    """Review RV4-07: some filesystems (network or FUSE mounts) refuse to sync a directory; the
+    record is written and synced all the same, and the cutover goes on with a warning - failing
+    every cold cutover there would gain nothing."""
+    import errno
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.executors.ansible"):
+        _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+
+    path = tmp_path / "osm" / "workload_warm" / "srv-1.json"
+    assert json.loads(path.read_text())["server_id"] == "srv-1"
+    assert "could not sync" in caplog.text and "Invalid argument" in caplog.text
+
+
+def test_a_workloads_record_that_cannot_be_synced_is_an_error(tmp_path, monkeypatch):
+    """Review RV4-07: only the directory's sync is best-effort - a record file that cannot be
+    synced fails its write, and so the cutover, before its playbooks stop the source."""
+    import errno
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "Input/output error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+    assert not (tmp_path / "osm" / "workload_warm" / "srv-1.json").exists()
+
+
 def test_the_workloads_record_tells_whether_the_migration_keeps_copied_data(env):
     """SDD §5.1, §12 (review RV3-05, RV3-07): destination volumes or a pending source snapshot in
     the record are copied data; an emptied record is none; no record cannot tell; a record that
