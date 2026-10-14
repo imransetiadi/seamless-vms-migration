@@ -43,3 +43,23 @@ build_ignore:
   - requirements-tests.txt
   - inventory
   - media
+  # Seamless Migrate around the collection: the control plane, the dashboard and the deployment
+  # ship as container images, and the agent configuration stays in the checkout
+  - seamless
+  - dashboard
+  - deploy
+  - .claude
+  - .mcp.json
+  - CLAUDE.md
+  # git-ignored local secret files a checkout may hold, at any depth: ansible-galaxy packs files
+  # from disk, not from git (CLAUDE.md §7, Security.md R-26)
+  - .env
+  - "*/.env"
+  - tokens.yaml
+  - "*/tokens.yaml"
+  - clouds.yaml
+  - "*/clouds.yaml"
+  - secure.yaml
+  - "*/secure.yaml"
+  - "*.pem"
+  - "*.key"
