@@ -797,6 +797,18 @@ attachment and, unless another server still holds it (a shared multi-attach disk
 shared disk never reaches, holding the attach lock meanwhile; a detach still not done at the timeout fails the module
 (review 5, RV6-01).
 
+A cold export that fails puts back what it took (review RV6-01). `import_workload_export_volumes` fails with its volume
+map and transfer id, so the role's rescue runs `import_workload_src_cleanup`, which stops the transfer's NBD exports and
+frees the ports the map records - the export records each port as soon as it claims it, so the ports stay claimed until
+then. The export does nothing more on failure: a step over SSH could wait for the port lock while the conversion host is
+unreachable, and the cleanup checks SSH before anything else. Before, the module failed without the map, the rescue skipped
+the cleanup, and the rollback that follows started the source VM without the data volumes the export had detached. The
+cleanup takes a partial map: it detaches from the source conversion host each mapped volume Cinder lists as attached
+there, whether or not its device was recorded; it re-attaches each data volume the source VM no longer holds; and it
+removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
+volume the source VM holds, such as its own boot volume before a copy exists. The export records the root snapshot and
+the image as soon as each exists, so a failure between them and the copy leaves neither behind.
+
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
 keeps the servers whose name is equal, as the warm rollback does — an unescaped `web.01` matched an unrelated
