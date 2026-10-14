@@ -59,15 +59,19 @@ def test_cold_create_destination_volumes_params(tmp_path):
 
     transfer._create_destination_volumes()
 
+    # created without waiting - each is recorded before it is waited for - and the bootable flag
+    # set once the volume is available (Seamless Migrate SDD 6.3)
     boot, data = [call[1] for call in dst.calls_to("create_volume")]
     assert boot == {
-        "name": "vm1-boot", "bootable": True, "size": 20, "wait": True,
+        "name": "vm1-boot", "bootable": None, "size": 20, "wait": False,
         "image": None, "description": "boot copy",
     }
     assert data == {
-        "name": "vm1-data", "bootable": False, "size": 10, "wait": True,
+        "name": "vm1-data", "bootable": None, "size": 10, "wait": False,
         "image": None, "availability_zone": "nova", "description": "data disk",
     }
+    flags = [call[1]["bootable"] for call in dst.calls_to("set_volume_bootable_status")]
+    assert flags == [True, False]
     assert all(entry["dest_id"] for entry in transfer.volume_map.values())
 
 

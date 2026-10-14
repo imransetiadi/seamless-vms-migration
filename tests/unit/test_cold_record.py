@@ -472,3 +472,107 @@ def test_the_conversion_host_is_never_taken_for_the_migrations_server(tmp_path):
     assert result["deleted_server_id"] is None
     assert "vm1" in dst.servers
     assert result["deleted_volume_ids"] == ["dvol-boot"]
+
+
+try:
+    from openstack.exceptions import ResourceFailure
+except ImportError:  # openstacksdk is optional for the unit tests
+
+    class ResourceFailure(Exception):
+        pass
+
+
+def _cinder_puts_in_error(dst, name):
+    """Cinder accepts the volume called ``name`` and then puts it in `error` (no valid backend):
+    the SDK's wait fails - inside create_volume(wait=True) as in an explicit wait_for_status."""
+    create, wait = dst.create_volume, dst.block_storage.wait_for_status
+
+    def fail(volume):
+        volume.status = "error"
+        raise ResourceFailure("Volume %s transitioned to failure state error" % volume.id)
+
+    def sdk_create_volume(size, wait=True, timeout=None, image=None, bootable=None, **kwargs):
+        volume = create(size, wait=False, timeout=timeout, image=image, bootable=bootable, **kwargs)
+        if wait and kwargs.get("name") == name:
+            fail(volume)
+        return volume
+
+    def sdk_wait_for_status(res, status="available", failures=None, **kwargs):
+        if dst.volumes[res.id].name == name:
+            fail(dst.volumes[res.id])
+        return wait(res, status=status, failures=failures, **kwargs)
+
+    dst.create_volume = sdk_create_volume
+    dst.block_storage.wait_for_status = sdk_wait_for_status
+
+
+def test_a_volume_that_ends_in_error_is_recorded_before_its_wait_fails(tmp_path):
+    """SDD 6.3 (review RV3-01): each volume is recorded as soon as Cinder accepted it, before the
+    transfer waits for it - one Cinder puts in error is recorded too, and the rollback removes it
+    with its quota."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _cinder_puts_in_error(dst, "vm1-data")
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with pytest.raises(ResourceFailure):
+        transfer._create_destination_volumes()
+
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+    WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), timeout=5, conversion_host="dst-conv"
+    ).run(delete_volumes=True)
+    assert not dst.volumes
+
+
+def test_the_boot_volume_is_marked_bootable_once_available(tmp_path):
+    """SDD 6.3: the transfer waits for each volume after recording it, then sets the boot
+    volume's bootable flag - Cinder sets it only on an available volume."""
+    src, dst = _clouds()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, str(tmp_path / "workload_warm"))
+    transfer._create_destination_volumes()
+
+    names = [c[0] for c in dst.calls if c[0] in ("create_volume", "wait_for_status",
+                                                  "set_volume_bootable_status")]
+    assert names[:3] == ["create_volume", "wait_for_status", "set_volume_bootable_status"]
+    boot = next(v for v in dst.volumes.values() if v.name == "vm1-boot")
+    assert boot.bootable is True
+    assert all(c[1].get("wait") is False for c in dst.calls_to("create_volume"))
+
+
+def test_a_volume_whose_record_cannot_be_written_is_deleted(tmp_path):
+    """SDD 6.3 (review RV3-01): a volume no record names would outlive every rollback - when its
+    record cannot be written, the transfer deletes it (once Cinder settled it) before it fails."""
+    import errno
+
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    # as Cinder: a volume is `creating` until it is waited for, and cannot be deleted before
+    create, wait, delete = dst.create_volume, dst.block_storage.wait_for_status, dst.delete_volume
+
+    def creating(*args, **kwargs):
+        volume = create(*args, **kwargs)
+        volume.status = "creating"
+        return volume
+
+    def settles(res, **kwargs):
+        dst.volumes[res.id].status = "available"
+        return wait(res, **kwargs)
+
+    def refuses_creating(name_or_id=None, **kwargs):
+        if dst.volumes[name_or_id].status == "creating":
+            raise RuntimeError("Invalid volume: Volume status must be available or error")
+        return delete(name_or_id=name_or_id, **kwargs)
+
+    dst.create_volume, dst.delete_volume = creating, refuses_creating
+    dst.block_storage.wait_for_status = settles
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with mock.patch.object(
+        WarmState, "save", side_effect=OSError(errno.ENOSPC, "No space left on device")
+    ), pytest.raises(OSError, match="No space left"):
+        transfer._create_destination_volumes()
+
+    assert not dst.volumes

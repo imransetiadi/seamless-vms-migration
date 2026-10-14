@@ -1089,7 +1089,10 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
     def _create_destination_volumes(self):
         """
         Volume mapping step 5: create new volumes on the destination OpenStack,
-        and fill in dest_id with the new volumes.
+        and fill in dest_id with the new volumes. Each is handed to
+        _destination_volume_created as soon as Cinder accepted it, before it is
+        waited for - one Cinder then puts in error is recorded too - and its
+        bootable flag is set once it is available (Seamless Migrate SDD 6.3).
         """
         self.log.info("Creating volumes on destination cloud")
         # Detached-volume transfers have no workload (no ser_server).
@@ -1103,9 +1106,38 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                 self.timeout,
                 preserve_volume_type=self.preserve_volume_type,
             )
-            new_volume = self.conn.create_volume(**sdk_params)
+            sdk_params.pop("wait", None)
+            timeout = sdk_params.pop("timeout", self.timeout)
+            bootable = sdk_params.pop("bootable", None)
+            new_volume = self.conn.create_volume(wait=False, **sdk_params)
             self.volume_map[path]["dest_id"] = new_volume.id
-            self._destination_volume_created(path)
+            try:
+                self._destination_volume_created(path)
+            except Exception:
+                self._delete_unrecorded_volume(new_volume, timeout)
+                raise
+            new_volume = self.conn.block_storage.wait_for_status(
+                new_volume, status="available", failures=["error"], wait=timeout
+            )
+            if bootable is not None:
+                self.conn.block_storage.set_volume_bootable_status(new_volume, bootable)
+
+    def _delete_unrecorded_volume(self, volume, timeout):
+        """
+        Delete a volume whose record could not be written - it would outlive
+        every rollback - once Cinder settled it: a volume still being created
+        cannot be deleted. A failure here is logged; the record's error stands.
+        """
+        try:
+            self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=timeout
+            )
+        except Exception as err:  # an errored volume is deleted all the same
+            self.log.warning("Volume %s did not become available: %s", volume.id, err)
+        try:
+            self.conn.delete_volume(name_or_id=volume.id, wait=False)
+        except Exception as err:
+            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
 
     def _destination_volume_created(self, path):
         """

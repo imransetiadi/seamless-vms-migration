@@ -265,3 +265,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   destination conversion host, is the workload's and is deleted. Before, it
   kept running beside the restarted source. A same-named server holding none
   of them is kept, and two such servers are an error.
+- The volume transfers create each destination volume without waiting, hand
+  it to the record (the cold import's ``warm_state_dir``) as soon as Cinder
+  accepted it, then wait for it and set its bootable flag. A volume Cinder
+  puts in ``error`` is recorded too, and a rollback deletes it with its
+  quota. A volume whose record cannot be written is deleted once Cinder
+  settled it, before the transfer fails. Before, a failure while the SDK
+  waited for the volume lost its id.
