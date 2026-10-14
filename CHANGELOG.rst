@@ -272,3 +272,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   quota. A volume whose record cannot be written is deleted once Cinder
   settled it, before the transfer fails. Before, a failure while the SDK
   waited for the volume lost its id.
+- A cold re-run's transfer deletes the volume an earlier attempt recorded for
+  the same device before it records its own, unless a server holds it: the
+  cold path never reuses a volume, so an earlier attempt's data volume, left
+  detached when its server was deleted, no longer drops out of the record
+  unremoved. A volume a server holds (a server renamed rather than deleted)
+  is that server's and only leaves the record; one the transfer cannot
+  delete fails it with the record unchanged.

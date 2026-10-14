@@ -576,3 +576,69 @@ def test_a_volume_whose_record_cannot_be_written_is_deleted(tmp_path):
         transfer._create_destination_volumes()
 
     assert not dst.volumes
+
+
+def _earlier_attempt(state_dir, dst, data_holder=None):
+    """Attempt 1 recorded its volumes and its server S1; then S1 went - Nova deleted its boot
+    volume with it and detached the data volume (or, renamed, S1 still holds the data volume)."""
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1", "vm1")
+    if data_holder:
+        dst.add_server(data_holder, "vm1-kept")
+    dst.add_volume("dvol-data", "vm1-data", 10, server_id=data_holder, device="/dev/vdb")
+
+
+def test_a_rerun_deletes_the_earlier_attempts_volume_no_server_holds(tmp_path):
+    """SDD 6.3 (review RV3-02): the cold path never reuses a volume - before a re-run records its
+    new volume for a device, the earlier attempt's volume no server holds is deleted, so it never
+    drops out of the record unremoved."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _earlier_attempt(state_dir, dst)
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    transfer._create_destination_volumes()
+
+    assert "dvol-data" not in dst.volumes
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+
+
+def test_a_rerun_keeps_the_earlier_attempts_volume_a_server_holds(tmp_path):
+    """SDD 6.3: an earlier volume a server holds - S1 renamed rather than deleted - is that
+    server's: the re-run keeps it, and the record drops it."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _earlier_attempt(state_dir, dst, data_holder="dst-s1-renamed")
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    transfer._create_destination_volumes()
+
+    assert "dvol-data" in dst.volumes
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert "dvol-data" not in [entry["dest_id"] for entry in recorded.values()]
+
+
+def test_an_earlier_volume_the_rerun_cannot_delete_fails_the_transfer(tmp_path):
+    """SDD 6.3: an earlier volume the re-run cannot delete fails the transfer with the record
+    unchanged - and the new volume, recorded nowhere, is removed."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _earlier_attempt(state_dir, dst)
+    delete = dst.delete_volume
+
+    def cinder_delete(name_or_id=None, **kwargs):
+        if name_or_id == "dvol-data":
+            raise RuntimeError("Invalid volume: Volume status must be available or error")
+        return delete(name_or_id=name_or_id, **kwargs)
+
+    dst.delete_volume = cinder_delete
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with pytest.raises(RuntimeError, match="dvol-data"):
+        transfer._create_destination_volumes()
+
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert recorded["/dev/vdb"]["dest_id"] == "dvol-data"  # unchanged
+    # every volume left in the destination is recorded: this run's data volume was removed
+    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)

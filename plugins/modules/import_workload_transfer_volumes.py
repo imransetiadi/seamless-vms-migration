@@ -339,12 +339,46 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         created, which a rollback deletes them by (Seamless Migrate SDD 6.3).
         """
         if self.warm_state_dir:
+            server_id = self.ser_server.info()["id"]
+            self._remove_earlier_volume(path, server_id)
             warm_migration.record_destination_volumes(
                 self.warm_state_dir,
-                self.ser_server.info()["id"],
+                server_id,
                 {path: self.volume_map[path]},
                 server_name=self.ser_server.params().get("name"),
             )
+
+    def _remove_earlier_volume(self, path, server_id):
+        """
+        Before a re-run records its volume for ``path``, delete the volume an
+        earlier attempt recorded for it unless a server holds it: the cold path
+        never reuses a volume, and one a server holds (a server the operator
+        renamed rather than deleted) is that server's - it only leaves the
+        record. An earlier volume that cannot be deleted fails the transfer
+        with the record unchanged (Seamless Migrate SDD 6.3).
+        """
+        state = warm_migration.WarmState.load(self.warm_state_dir, server_id)
+        earlier_id = (state.dest_volumes.get(path) or {}).get("dest_id")
+        if not earlier_id or earlier_id == self.volume_map[path]["dest_id"]:
+            return
+        volume = self.conn.get_volume_by_id(earlier_id)
+        if volume is None:
+            return  # gone already: Nova deletes a boot volume with its server
+        if getattr(volume, "attachments", None):
+            self.log.warning(
+                "Keeping volume %s an earlier attempt made for %s: a server holds it",
+                earlier_id,
+                path,
+            )
+            return
+        self.log.info("Deleting volume %s an earlier attempt left for %s", earlier_id, path)
+        try:
+            self.conn.delete_volume(name_or_id=earlier_id, wait=False)
+        except Exception as err:
+            raise RuntimeError(
+                "Could not delete volume %s an earlier attempt left for %s: %s"
+                % (earlier_id, path, err)
+            ) from err
 
     def _setup_nbdkit_disks_urls(self, nbdkit_disks):
         """
