@@ -714,7 +714,7 @@ environment block as `import_workloads.yml`):
 |---|---|
 | `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent |
 | `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery |
-| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and the warm state — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server. Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
+| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and the warm state — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server, unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
 
 Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_src_auth`,
 `os_migrate_dst_auth`, `os_migrate_workloads_filter`, conversion host variables including
@@ -731,6 +731,7 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_workloads_preserve_volume_type` | `false` | `preserve_volume_type` |
 | `os_migrate_rollback_delete_dest_volumes` | `false` | `delete_dest_volumes` |
 | `os_migrate_rollback_match_by_name` | `false` | `match_by_name` |
+| `os_migrate_rollback_start_source` | `true` | — (the rollback role's last step: start the source server) |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
 ### 6.6 Hardening of existing code (required)
@@ -937,6 +938,15 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   transfer creates new volumes each time), so the rollback deletes exactly those and keeps any other volume attached
   to the server (`kept_volume_ids`); without such a record it deletes the server alone, as before - never a volume
   it cannot tell is the migration's (the owner's choice, 2026-10-14).
+* A cold cutover first removes what an earlier warm pre-copy of the migration left: a warm migration rolled back
+  keeps its pre-copy volumes and warm state for a retry (§5.1), and should it be switched to cold, the cold import
+  never uses them and would replace their record. When the migration's state file holds a warm record — passes or a
+  pending source snapshot — and no destination server, the cutover runs `rollback_workloads.yml` before the export,
+  with `os_migrate_rollback_delete_dest_volumes: true` and `os_migrate_rollback_start_source: false`: it removes a
+  pending snapshot's temporaries, deletes exactly the recorded volumes and the warm state, never matches a server
+  by name and leaves the source as it is (a retry may keep it stopped with an open clock, §5.2). A cold record
+  (§6.3: volumes and a server, no pass) is never removed - it is a resumed cutover's own. Should the cleanup fail,
+  the cutover fails before the source stops (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
 * `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
@@ -1008,7 +1018,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 | Strategy | precopy / sync | cutover | rollback |
 |---|---|---|---|
-| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` | `rollback_workloads.yml` |
+| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — after `rollback_workloads.yml` when an earlier warm pre-copy left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
 | `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
