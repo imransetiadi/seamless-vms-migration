@@ -1210,6 +1210,11 @@ class WarmRollback:
             volume = self.conn.get_volume_by_id(volume_id)
             if volume is None:
                 return False
+            if getattr(volume, "status", None) == "deleting":
+                # Cinder deletes it already - the boot volume Nova deletes with its server
+                # (delete_on_termination): a second DELETE is refused (SDD 6.4)
+                self._wait_gone(volume_id)
+                return False
             if not volume.attachments:
                 break
             # Attachments left on the destination conversion host after an
@@ -1237,5 +1242,25 @@ class WarmRollback:
         else:
             raise RuntimeError("Volume %s is still attached, cannot delete it" % volume_id)
         self.log.info("Deleting destination volume %s", volume_id)
-        self.conn.delete_volume(name_or_id=volume_id, wait=True, timeout=self.timeout)
+        try:
+            self.conn.delete_volume(name_or_id=volume_id, wait=True, timeout=self.timeout)
+        except Exception:  # pylint: disable=broad-except
+            # Nova may have begun deleting it since the read above: then it is going anyway
+            volume = self.conn.get_volume_by_id(volume_id)
+            if volume is None:
+                return False
+            if getattr(volume, "status", None) != "deleting":
+                raise
+            self._wait_gone(volume_id)
+            return False
         return True
+
+    def _wait_gone(self, volume_id):
+        """Wait until a volume Cinder is deleting is gone (SDD 6.4)."""
+        for _ in range(self.timeout):
+            if self.conn.get_volume_by_id(volume_id) is None:
+                return
+            time.sleep(1)
+        raise RuntimeError(
+            "Volume %s is still being deleted after %s s" % (volume_id, self.timeout)
+        )

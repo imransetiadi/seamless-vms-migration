@@ -229,3 +229,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   Migrate uses it before a cold cutover of a migration an earlier warm
   pre-copy left data for, to remove those volumes and the warm state without
   starting a source a retry may keep stopped.
+- ``import_workload_rollback`` waits for a destination volume Cinder is
+  already deleting, such as the boot volume Nova deletes together with its
+  server (``delete_on_termination``), instead of deleting it a second time,
+  which Cinder refuses: a cold rollback no longer fails before it starts the
+  source.
