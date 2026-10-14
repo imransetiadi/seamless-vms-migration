@@ -259,12 +259,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   workload's. Before, a cleanup before a re-run removed the file and the next
   rollback matched any server by its name.
 - ``import_workload_rollback`` finds the destination server Nova accepted
-  while its answer was lost, so the workload's record names no server, by
-  the recorded volumes the server holds. The single server named like the
-  workload that holds one of them, attached through Nova and not to the
-  destination conversion host, is the workload's and is deleted. Before, it
-  kept running beside the restarted source. A same-named server holding none
-  of them is kept, and two such servers are an error.
+  while its answer was lost by the recorded volumes the server holds, when
+  the workload's record names no server or one Nova no longer has (an
+  operator deleted the recorded server and retried). The single server named
+  like the workload that holds one of them, attached through Nova and not to
+  the destination conversion host, is the workload's and is deleted. Before,
+  it kept running beside the restarted source. A same-named server holding
+  none of them is kept, also with ``os_migrate_rollback_match_by_name``, and
+  two such servers are an error.
 - The volume transfers create each destination volume without waiting, hand
   it to the record (the cold import's ``warm_state_dir``) as soon as Cinder
   accepted it, then wait for it and set its bootable flag. A volume Cinder
@@ -272,13 +274,22 @@ This project follows a simple changelog to satisfy collection metadata validatio
   quota. A volume whose record cannot be written is deleted once Cinder
   settled it, before the transfer fails. Before, a failure while the SDK
   waited for the volume lost its id.
-- A cold re-run's transfer deletes the volume an earlier attempt recorded for
-  the same device before it records its own, unless a server holds it: the
-  cold path never reuses a volume, so an earlier attempt's data volume, left
-  detached when its server was deleted, no longer drops out of the record
-  unremoved. A volume a server holds (a server renamed rather than deleted)
-  is that server's and only leaves the record; one the transfer cannot
-  delete fails it with the record unchanged.
+- A cold re-run's transfer removes the volume an earlier attempt recorded for
+  each device before it creates any volume: the cold path never reuses a
+  volume, so an earlier attempt's data volume, left detached when its server
+  was deleted, no longer drops out of the record unremoved. A volume only the
+  destination conversion host holds (a transfer cut short) is detached from
+  it, under the host's attach lock, and deleted. A volume another server
+  holds (a server renamed rather than deleted) is that server's and only
+  leaves the record. Each deleted volume is waited for until Cinder no longer
+  has it, within the transfer's timeout; one Cinder is already deleting, such
+  as the boot volume Nova deletes with its server, is not deleted a second
+  time. A volume the transfer cannot detach or delete, one that leaves
+  ``deleting`` without going, or one still there at the timeout, fails the
+  transfer before it creates a volume, with the record unchanged. Before, a
+  re-run failed on every retry, with the source stopped, when it sent a
+  second delete to such a boot volume, and a stop during the removal could
+  leave a volume it had just created unrecorded.
 - A volume Cinder no longer has reads as gone with the openstacksdk 4.x the
   collection runs on, whose ``get_volume_by_id`` raises ``NotFoundException``
   for a missing volume instead of returning ``None`` as its docstring says.
@@ -300,3 +311,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   under ``.worktrees/``. ``galaxy.yml``'s ``build_ignore`` now mirrors the
   ``.gitignore`` patterns, and a unit test derives a sample from every
   pattern. Never publish a tarball built before this change.
+- Every detach of a volume from a server ends within the module's
+  ``timeout``: the source VM's data volumes, the conversion hosts, the warm
+  passes and the rollback. openstacksdk 4.21's ``detach_volume`` with
+  ``wait=True`` ignores its ``timeout`` and waits without bound for the
+  volume to be ``available``, so a detach that never ended hung the module,
+  holding the conversion host's attach lock in a locked section. A detach
+  now asks Nova without waiting, then polls the volume until it no longer
+  lists that server's attachment and, unless another server still holds
+  it, until Cinder shows it ``available``. A volume that goes to ``error``
+  raises, and a detach still not done at the timeout fails with ``Timed out
+  after N s waiting to detach volume V from server S``.
