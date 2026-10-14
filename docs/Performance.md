@@ -108,7 +108,7 @@ at 500 MiB/s)".
 |---|---|---|
 | G1a, 600 s | single 100 GiB disk: `scan` = 205 s ⇒ **475 s (7.9 min)**. 4 × 100 GiB: still 475 s with four concurrent streams, but **614 s (10.2 min)** behind a 1,190 MiB/s storage path | Met with 125 s (21 %) margin for single disks; multi-disk VMs depend on the aggregate ceiling (note 1) |
 | G1b, warm beats cold | `warm < cold ⟺ U/L > scan`. Single disk: `U/D > L/S` = **25 %** at 125 MiB/s, 50 % at 250 MiB/s, never at ≥ 500 MiB/s; four equal disks: 6.25 % at 125 MiB/s | Matches the PRD at the 1 Gbit/s planning link; on faster links a single-disk VM is cheaper cold (note 2) |
-| G1c, 360 s | `240 s + 20 s × V` ⇒ **1 volume 4.3 min, 3 → 5.0, 6 → 6.0 (the limit), 7 → 6.3** | Met up to six volumes, for any disk size; recalibrate `handover_per_volume_s` in the lab |
+| G1c, 360 s | `240 s + 20 s × V` ⇒ **1 volume 4.3 min, 3 → 5.0, 6 → 6.0 (the limit), 7 → 6.3** | Met up to six volumes, for any disk size; recalibrate `handover_per_volume_s` in the lab. The model counts the source's shutdown, but the handover's clock starts at `SHUTOFF` (SDD §7.3, `TODO(LAB)`): compare a measured downtime plus the measured shutdown |
 | G2 | after the first delta pass `c` and the per-stream scan rate are measured and the estimate is recomputed (§1); what remains is `F` and write amplification (§5.4) | Put lab-measured fixed costs into `Plan.estimator_overrides` (§6.4); PERF-E2E-G2 evaluates the final calibrated estimate |
 | NFR-02a | Feasible: BLAKE2b-128 alone runs at ≈ 1.5 GiB/s per thread on an Apple-silicon laptop and scales with threads (§5.2); the bound is storage read and SSH | Verify with `bench_blocksync.py` and `fio` on the lab hosts |
 | NFR-02b | `10 Gbit/s × 90 % = 1,125 MiB/s` ⇒ 3 streams at 400–500 MiB/s, 4 streams give margin | Consistent with "≥ 4 parallel disks" (the default `P`); a single SSH stream is window-limited on high-RTT links (§5.3) |
@@ -403,7 +403,7 @@ QASuite §9 (PERF-E2E). Downtime is `actual_downtime_s` over ≥ 10 runs.
 | P-DB 200 GiB at 10 MiB/s | LAB-W03 | `warm`, 10 G | 680 s; never converges | G2; record `change_rate_bps` | 5 → *to be filled* | *to be filled* |
 | **P-XL 500 GiB single disk, 2 MiB/s writer** | **LAB-W12** | `warm`, 10 G and 1 G | **1,294 s (21.6 min)** at `S` = 500; 1,550 s (25.8 min) at `S` = 400 | **SM-1 p95**: max of 10 runs ≤ 1,500 s ⇔ measured `S` ≥ 416 MiB/s | 5 with the defaults; tuned (§7.3): 2 at 10 G, 3 at 1 G → *to be filled* | *to be filled* |
 | P-L 200 GiB, cold | LAB-C01 (on P-L) | `cold`, 1 G | 1,253 s (20.9 min) | none (reference) | — | *to be filled* |
-| P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes | — | *to be filled* |
+| P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes, the measured shutdown added to the clock (SDD §7.3) | — | *to be filled* |
 | VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 2 → *to be filled* | *to be filled* |
 
 ### 6.4 Calibrating the estimator
@@ -490,7 +490,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
 | `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each); since 376eec7 a live event about one migration reads only that one (`GET /migrations/{id}`) and splices it into the cached lists, while new migrations, plan and wave events, lists filtered by phase, wave or page, lists that do not hold it, lists being read and a failed single read still read the lists again (SDD §16); `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
+| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each); since 376eec7 a live event about one migration reads only that one (`GET /migrations/{id}`) and splices it into the cached lists, while new migrations, plan and wave events, lists filtered by phase, wave or page, lists that do not hold it, lists being read and a failed single read still read the lists again, and so does a batch that would read more than 50 migrations one by one (a long-hidden page in a busy wave) (SDD §16); `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -641,7 +641,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 |---|---|
 | Size | 1 vCPU / 1–2 GiB, 20 GiB volume is generous (manifests: request 250 m / 512 Mi, limit 2 CPU / 1 GiB, 20 Gi PVC) |
 | Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process plus CLI/psql) |
-| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
+| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)`, `events(kind, seq)` (`ix_events_kind_seq`: the audit trail's `kinds` filter and its `before` pages) |
 | Bloat | frequently updated documents: `ALTER TABLE documents SET (fillfactor = 70)` and an aggressive autovacuum (`autovacuum_vacuum_scale_factor = 0.05`) |
 | Retention | archive `events` older than 13 months ([MEMORY.md](MEMORY.md) §3.4); `VACUUM (ANALYZE)` after bulk deletes |
 | Backups | `pg_dump` nightly (encrypted) plus a restore drill each release; the dump of 1,000 migrations is tens of MiB |
@@ -669,6 +669,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | `seamless_step_duration_seconds_sum`, `_count{step}` | counters | mean duration per step (`prestage`, `precopy`, `sync`, `cutover`, `rollback`, `finalize`) |
 | `seamless_advisor_calls_total{tool,outcome}` | counter | Jev usage and failures (label values are defined by the implementation) |
 | `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above half of `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
+| `seamless_cutover_refusals` | gauge | migrations in `precopy`, `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, SDD §7.2, §18) — the dashboard's "Cutover will refuse"; above 0, something is to fix before a cutover |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. Queries:
@@ -731,7 +732,7 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 |---|---|---|
 | G1a | p90 of `actual_downtime_s` of completed `warm` migrations whose largest disk ≤ 100 GiB and total ≤ 400 GiB (gate 600 s, `n ≥ 10`) | §6.4 population query |
 | G1b | warm versus cold downtime of the same VM profile at 20 % and 40 % used (lab only: production runs one strategy per VM) | LAB-W14 |
-| G1c | p90 of `actual_downtime_s` of `storage_handover` migrations (gate 360 s) | §6.4 population query |
+| G1c | p90 of `actual_downtime_s` of `storage_handover` migrations, each with its source's measured shutdown added while the handover's clock starts at `SHUTOFF` (SDD §7.3, `TODO(LAB)`) (gate 360 s) | §6.4 population query |
 | SM-1 | median (≤ 600 s, largest disk ≤ 100 GiB) and p95 (≤ 1,500 s, largest disk ≤ 500 GiB) of warm downtime | §6.4 population query |
 | G2 | share of calibrated migrations (≥ 1 delta pass) with `abs(actual − estimate) / estimate ≤ 0.3` | jq query in §6.4 |
 | NFR-02 | MiB/s scanned per side and link utilization during pre-copy | `bench_blocksync` results, `node_exporter` |
