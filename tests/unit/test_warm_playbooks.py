@@ -532,6 +532,30 @@ def test_rollback_keeps_destination_volumes_by_default(env):
     assert not [c for c in calls if c["module"] == "os_conversion_host_info"]
 
 
+def test_a_rollback_can_leave_the_source_as_it_is(env):
+    """SDD 6.5, 7 (COLD-02): the cleanup before a cold cutover removes what a warm pre-copy left
+    and leaves the source as it is - a retry may keep it stopped with an open clock; any other
+    rollback starts it."""
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_rollback_delete_dest_volumes=True,
+        os_migrate_rollback_start_source=False,
+    )
+
+    assert rc == 0, out
+    assert modules_for(calls, "vm1", "srv-1") == ["import_workload_rollback"]
+    assert env.state("srv-1") is None  # the volumes and the warm state are gone
+    assert "source server left as it was" in out
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
+    assert rc == 0, out
+    assert modules_for(calls, "vm2", "srv-2") == ["import_workload_rollback", "server_action:start"]
+
+
 def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     """SDD 6.5: without a workload filter a rollback would revert every cut-over workload of the
     data dir; it refuses unless os_migrate_rollback_all is true. An exact filter rolls back one."""

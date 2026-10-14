@@ -224,3 +224,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   rollback found the server by name and left its data volumes behind,
   unrecorded: a cold retry creates new volumes, so they were never used or
   deleted again. A workload imported before keeps the old behaviour.
+- ``rollback_workloads.yml`` takes ``os_migrate_rollback_start_source``
+  (default ``true``): ``false`` leaves the source server as it is. Seamless
+  Migrate uses it before a cold cutover of a migration an earlier warm
+  pre-copy left data for, to remove those volumes and the warm state without
+  starting a source a retry may keep stopped.

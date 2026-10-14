@@ -25,7 +25,7 @@ the task file:
 |---|---|
 | `import_workloads_precopy.yml` | snapshot → sync (`auto`: `full` on the first pass, then `delta`) → remove the snapshot |
 | `import_workloads_cutover.yml` | stop the source (wait for SHUTOFF) → snapshot → sync (`final`) → remove the snapshot → create the destination server from the synchronised volumes (`import_workload_create_instance`) and record its ID |
-| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes and the warm state) → start the source server |
+| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes and the warm state) → start the source server (unless `os_migrate_rollback_start_source: false`) |
 
 Run `export_workloads.yml` first, as for `import_workloads.yml`. Pre-copy can
 run any number of times; a cutover that already created the destination
@@ -79,6 +79,7 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | warm state files |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | destination conversion host; the only server a rollback detaches destination volumes from |
 | `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. one the cold import copied before it recorded its workload): delete the only destination server named exactly like the workload |
+| `os_migrate_rollback_start_source` | `true` | the rollback's last step starts the source server; `false` leaves it as it is (Seamless Migrate's cleanup before a cold cutover, when the source may stay stopped) |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |
 | `os_migrate_workload_cleanup_on_failure` | `true` | remove the temporary snapshot when a pass fails |
 | `os_migrate_workload_boot_volume_prefix` | `os-migrate-` | name prefix of the temporary snapshots, volumes and images |
