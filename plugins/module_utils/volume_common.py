@@ -1066,8 +1066,10 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
 
     def _stop_forwarding_process(self):
         self.log.info("Stopping export forwarding on source conversion host...")
-        self.log.debug("(PID was %s)", self.forwarding_process.pid)
+        # a transfer that failed before the forwarding started has none: its own error stands,
+        # and the ports it claimed are still released after this
         if self.forwarding_process:
+            self.log.debug("(PID was %s)", self.forwarding_process.pid)
             self.forwarding_process.terminate()
 
         if self.forwarding_process_command:

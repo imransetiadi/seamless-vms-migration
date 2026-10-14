@@ -4,7 +4,10 @@ __metaclass__ = type
 
 import json
 import os
+import subprocess
 from unittest import mock
+
+import pytest
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
     server,
@@ -267,3 +270,69 @@ def test_conversion_host_ssh_keeps_the_link_alive():
     )
     sender = words[words.index("--") + 1:]
     assert "ServerAliveInterval=15" in sender and "ServerAliveCountMax=4" in sender
+
+
+class PortShell:
+    """A destination conversion host with its shared port map (PORT_MAP_FILE): its first ``free``
+    listen tests find a port free, every later one finds it taken."""
+
+    def __init__(self, free):
+        self.free = free
+        self.ports = set()  # what PORT_MAP_FILE holds
+        self.ssh_user = "cloud-user"
+        self.commands = []
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command == ["sudo", "cat", volume_common.PORT_MAP_FILE]:
+            return json.dumps(sorted(self.ports))
+        if command[:2] == ["sudo", "cat"]:
+            raise subprocess.CalledProcessError(1, command)  # no lock file
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:4] == ["timeout", "1", "nc", "-l"]:
+            self.free -= 1
+            return 124 if self.free >= 0 else 1
+        return 0
+
+    def cmd_sub(self, command, **kwargs):
+        self.commands.append(list(command))
+        shell = self
+
+        class PortMapWriter:
+            def communicate(self, data=None, timeout=None):
+                shell.ports = set(json.loads(data))
+                return "", ""
+
+        return PortMapWriter()
+
+
+def test_a_transfer_failing_before_its_forwarding_starts_reports_why_and_frees_its_ports():
+    """The teardown read the forwarding process's PID before it checked that one exists: a
+    transfer that failed before the forwarding started (no free port, an SSH error) ended in
+    AttributeError instead of its own error, and skipped the release - the ports it had claimed
+    stayed claimed on the conversion host for every later transfer."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {
+        "/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809),
+        "/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810),
+    }
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(),
+        )
+        # a free port for the first disk, none left for the second
+        transfer.shell = PortShell(free=1)
+        with pytest.raises(RuntimeError, match="No free ports on conversion host"):
+            transfer.transfer_exports()
+
+    assert transfer.shell.ports == set()  # the first disk's port is free again
+    assert not dst.calls_to("create_volume")

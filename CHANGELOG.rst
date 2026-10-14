@@ -245,3 +245,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   name only when the workload has no state file at all; a state file that
   records no server means Nova never accepted one, so a same-named server
   is another one and is kept.
+- A volume transfer that fails before its port forwarding starts (no free
+  port on the destination conversion host, an SSH error) reports its own
+  error. Before, its teardown read the PID of a forwarding process that did
+  not exist, so it ended in ``AttributeError`` and skipped releasing the
+  ports it had claimed, which then stayed claimed on the conversion host.
