@@ -681,8 +681,9 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
 
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
 volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
-records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) as soon
-as they exist, and `destination_server_id` as soon as Nova accepts the server. A cold
+records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
+soon as Cinder created it, before its data is copied - a transfer that fails or is cut short leaves the record of
+every volume it created - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7); a cold migration cut over before the cold import recorded anything has no file.
 
 ### 6.4 New Ansible modules
@@ -691,7 +692,6 @@ rollback reads it (§7); a cold migration cut over before the cold import record
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
-| `import_workload_record_volumes` | — | Record the destination volumes a cold transfer created (`volume_map` of `import_workload_transfer_volumes`: each device's `dest_id`, with its `size`, `bootable` and `name`) in the workload's state file (§6.3), as the warm path records its volumes, keeping what the file already holds; changes no cloud. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; a state file that records no server means Nova never accepted one) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and the warm state file (kept while a source snapshot is pending); with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
@@ -711,7 +711,9 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 
 Role `import_workloads_warm` with task files `precopy.yml`, `cutover.yml`, `rollback.yml`, reusing
 the conversion-host inventory logic of `import_workloads`. The cold role `import_workloads` (upstream, modified)
-records its workload for a rollback (§6.3): `import_workload_record_volumes` right after the transfer, and
+records its workload for a rollback (§6.3): `import_workload_transfer_volumes` (upstream, modified) with
+`warm_state_dir`, which records each destination volume as soon as Cinder created it - its `dest_id`, `size`,
+`bootable` and `name`, as the warm path records its volumes, keeping what the file already holds - and
 `import_workload_create_instance` with `warm_state_dir`, which records the server as soon as Nova accepts it. Playbooks (hosts: `migrator`, same
 environment block as `import_workloads.yml`):
 
@@ -945,14 +947,18 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   transfer creates new volumes each time), so the rollback deletes exactly those and keeps any other volume attached
   to the server (`kept_volume_ids`); without such a record it deletes the server alone, as before - never a volume
   it cannot tell is the migration's (the owner's choice, 2026-10-14).
-* A cold cutover first removes what an earlier warm pre-copy of the migration left: a warm migration rolled back
+* A cold cutover first removes what an earlier attempt of the migration left: a warm migration rolled back
   keeps its pre-copy volumes and warm state for a retry (§5.1), and should it be switched to cold, the cold import
-  never uses them and would replace their record. When the migration's state file holds a warm record — passes or a
-  pending source snapshot — and no destination server, the cutover runs `rollback_workloads.yml` before the export,
+  never uses them and would replace their record; a cold transfer that failed or was cut short (a transient retry,
+  a retry, a resume) recorded the volumes it created, and a cold re-run never reuses them either - its transfer
+  creates new ones, whose record would replace theirs. When the migration's state file holds such a record —
+  passes, a pending source snapshot or recorded volumes — and no destination server, the cutover runs
+  `rollback_workloads.yml` before the export,
   with `os_migrate_rollback_delete_dest_volumes: true` and `os_migrate_rollback_start_source: false`: it removes a
   pending snapshot's temporaries, deletes exactly the recorded volumes and the warm state, never matches a server
-  by name and leaves the source as it is (a retry may keep it stopped with an open clock, §5.2). A cold record
-  (§6.3: volumes and a server, no pass) is never removed - it is a resumed cutover's own. Should the cleanup fail,
+  by name and leaves the source as it is (a retry may keep it stopped with an open clock, §5.2). A record that
+  names a destination server (§6.3: a cold one with volumes and a server, no pass) is never removed - it is a
+  resumed cutover's own. Should the cleanup fail,
   the cutover fails before the source stops (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
@@ -1025,7 +1031,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 | Strategy | precopy / sync | cutover | rollback |
 |---|---|---|---|
-| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — after `rollback_workloads.yml` when an earlier warm pre-copy left data (below) | `rollback_workloads.yml` |
+| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — after `rollback_workloads.yml` when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
 | `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
