@@ -1181,9 +1181,12 @@ class WarmRollback:
             return self.conn.compute.find_server(
                 self.state.destination_server_id, ignore_missing=True
             )
-        if not (self.match_by_name and self.server_name) or self.state.exists():
-            # the name serves only a workload migrated before anything was recorded for it: a
-            # state file without a server means Nova never accepted one (SDD 6.4, 7)
+        if self.state.exists():
+            # no server recorded: Nova may have accepted a create whose answer never arrived (SDD
+            # 6.4, review RV3-06)
+            return self._server_built_from_recorded_volumes()
+        if not (self.match_by_name and self.server_name):
+            # the name serves only a workload migrated before anything was recorded for it
             return None
         # Nova filters names by regular expression; compare exactly as well.
         candidates = [
@@ -1199,6 +1202,31 @@ class WarmRollback:
                 % (self.server_name, ", ".join(sorted(c.id for c in candidates)))
             )
         return candidates[0] if candidates else None
+
+    def _server_built_from_recorded_volumes(self):
+        """The single server named like the workload that holds one of the recorded volumes,
+        attached through Nova and not to the destination conversion host: built from them, it is
+        the migration's own; a same-named server holding none of them is another one (SDD 6.4)."""
+        if not self.server_name:
+            return None
+        holders = set()
+        for entry in self.state.dest_volumes.values():
+            volume = self.conn.get_volume_by_id(entry["dest_id"])
+            for attachment in getattr(volume, "attachments", None) or []:
+                holder = self.conn.get_server_by_id(attachment["server_id"])
+                if holder is None or self._is_conversion_host(holder):
+                    continue
+                if holder.name == self.server_name:
+                    holders.add(holder.id)
+        if len(holders) > 1:
+            raise RuntimeError(
+                "Several destination servers named %s hold the volumes recorded for %s (%s); "
+                "refusing to guess"
+                % (self.server_name, self.state.server_id, ", ".join(sorted(holders)))
+            )
+        if not holders:
+            return None
+        return self.conn.compute.find_server(holders.pop(), ignore_missing=True)
 
     def _is_conversion_host(self, holder):
         return self.conversion_host is not None and self.conversion_host in (

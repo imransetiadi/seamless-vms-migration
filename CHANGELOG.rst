@@ -258,3 +258,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   then never takes a same-named server, such as another workload's, for the
   workload's. Before, a cleanup before a re-run removed the file and the next
   rollback matched any server by its name.
+- ``import_workload_rollback`` finds the destination server Nova accepted
+  while its answer was lost, so the workload's record names no server, by
+  the recorded volumes the server holds. The single server named like the
+  workload that holds one of them, attached through Nova and not to the
+  destination conversion host, is the workload's and is deleted. Before, it
+  kept running beside the restarted source. A same-named server holding none
+  of them is kept, and two such servers are an error.
