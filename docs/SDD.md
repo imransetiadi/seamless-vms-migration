@@ -682,8 +682,9 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
 volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
 records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
-soon as Cinder created it, before its data is copied - a transfer that fails or is cut short leaves the record of
-every volume it created - and `destination_server_id` as soon as Nova accepts the server. A cold
+soon as Cinder accepted it, before the transfer waits for it to become available and before its data is copied - a
+transfer that fails or is cut short, a volume that ends in `error` included, leaves the record of every volume it
+created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
 playbooks when the workload has none, and a rollback or cleanup that deletes the recorded volumes empties the file
 instead of removing it: the file is the sign that the migration records its workload, so no later rollback takes a
@@ -716,7 +717,7 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 Role `import_workloads_warm` with task files `precopy.yml`, `cutover.yml`, `rollback.yml`, reusing
 the conversion-host inventory logic of `import_workloads`. The cold role `import_workloads` (upstream, modified)
 records its workload for a rollback (§6.3): `import_workload_transfer_volumes` (upstream, modified) with
-`warm_state_dir`, which records each destination volume as soon as Cinder created it - its `dest_id`, `size`,
+`warm_state_dir`, which records each destination volume as soon as Cinder accepted it, before waiting for it - its `dest_id`, `size`,
 `bootable` and `name`, as the warm path records its volumes, keeping what the file already holds - and
 `import_workload_create_instance` with `warm_state_dir`, which records the server as soon as Nova accepts it. Playbooks (hosts: `migrator`, same
 environment block as `import_workloads.yml`):
