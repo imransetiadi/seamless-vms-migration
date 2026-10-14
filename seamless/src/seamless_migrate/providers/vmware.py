@@ -273,14 +273,20 @@ class VMwareProvider:
     @staticmethod
     def _find_by_uuid(content: Any, source_id: str) -> Any:
         """One SOAP call instead of a walk over every VM (``instanceUuid`` lookup)."""
+        return VMwareProvider._lookup_by_uuid(content, source_id)[0]
+
+    @staticmethod
+    def _lookup_by_uuid(content: Any, source_id: str) -> tuple[Any, bool]:
+        """The VM the ``instanceUuid`` index finds, and whether the index answered at all: none
+        on a vCenter without one, or a fault (SDD §10)."""
         index = getattr(content, "searchIndex", None)
         find = getattr(index, "FindByUuid", None)
         if not callable(find):
-            return None
+            return None, False
         try:
-            return find(None, source_id, True, True)
+            return find(None, source_id, True, True), True
         except Exception:
-            return None
+            return None, False
 
     @staticmethod
     def _objects(content: Any, vim: Any, type_name: str) -> list[Any]:
@@ -344,27 +350,47 @@ class VMwareProvider:
         return await self._run(self._vms)
 
     async def get_vm(self, source_id: str) -> VMRef:
+        unavailable = (
+            f"{self.provider.id}: VM {source_id!r} found but its configuration is unavailable"
+        )
+
         def work(content: Any, vim: Any) -> VMRef | None:
-            vm = self._find_by_uuid(content, source_id)
-            if vm is None:
-                return None
-            if getattr(vm, "config", None) is None:
-                # vCenter has the VM but cannot read its configuration (its files are unreachable,
-                # a datastore outage): it is there, not gone (SDD §10, review RV-06)
-                raise ProviderError(
-                    f"{self.provider.id}: VM {source_id!r} found but its configuration is "
-                    "unavailable"
-                )
+            vm, answered = self._lookup_by_uuid(content, source_id)
+            if vm is not None:
+                if getattr(vm, "config", None) is None:
+                    # vCenter has the VM but cannot read its configuration (its files are
+                    # unreachable, a datastore outage): it is there, not gone (SDD §10, RV-06)
+                    raise ProviderError(unavailable)
+                fields, portgroups = self._context(content, vim)
+                return map_vm(vm, vim, portgroups, fields)
+            # moId-addressed or index-less setups: the walk over every VM decides
             fields, portgroups = self._context(content, vim)
-            return map_vm(vm, vim, portgroups, fields)
+            unreadable = 0
+            for candidate in self._objects(content, vim, "VirtualMachine"):
+                config = getattr(candidate, "config", None)
+                if config is None:
+                    if getattr(candidate, "_moId", None) == source_id:
+                        raise ProviderError(unavailable)
+                    unreadable += 1
+                    continue
+                if getattr(config, "template", False):
+                    continue
+                ref = map_vm(candidate, vim, portgroups, fields)
+                if ref.source_id == source_id:
+                    return ref
+            if unreadable and not answered:
+                # without the index's answer, a VM vCenter cannot read may be the one sought:
+                # "not found" is no answer (SDD §10, review RV3-04)
+                raise ProviderError(
+                    f"{self.provider.id}: VM {source_id!r} is none of the VMs vCenter can read; "
+                    f"{unreadable} VM(s) cannot be read and may be it"
+                )
+            return None
 
         found = await self._run(work)
         if found is not None:
             return found
-        for vm in await self.list_vms():  # moId-addressed or index-less setups
-            if vm.source_id == source_id:
-                return vm
-        # vCenter answered (the walk ran): it has no such VM (SDD §10)
+        # vCenter answered (the walk read every VM, or the index said so): no such VM (SDD §10)
         raise VMNotFound(f"{self.provider.id}: VM {source_id!r} not found")
 
     async def power_on(self, source_id: str) -> None:

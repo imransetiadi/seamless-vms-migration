@@ -1099,6 +1099,64 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
         await provider.get_vm("missing")  # falls back to the walk, then fails
 
 
+def _vcenter(tmp_path, vms, find=None):
+    """A VMwareProvider over ``vms``; ``find`` replaces the uuid index (None: no index at all)."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+
+    def service_instance(**_):
+        si = fake_service_instance(vms)
+        content = si.RetrieveContent()
+        content.searchIndex = NS(FindByUuid=find) if find else NS()
+        return si
+
+    return VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+
+
+async def test_vmware_get_vm_never_calls_a_vm_gone_while_one_it_cannot_read_may_be_it(tmp_path):
+    """SDD §10 (review RV3-04): when the uuid index cannot answer (a fault, or none) the walk over
+    every VM decides - and a VM whose configuration vCenter cannot read may be the one sought, so
+    "not found" is no answer: a ProviderError, which leaves the source-running alert as it is."""
+    unreadable = PoweredOffVM(state="poweredOn")
+    unreadable.config = None
+
+    def faulting(dc, uuid, is_vm, instance):
+        raise RuntimeError("vmodl.fault.SystemError")
+
+    for find in (faulting, None):
+        provider = _vcenter(tmp_path, [unreadable], find=find)
+        with pytest.raises(ProviderError, match="cannot be read") as failed:
+            await provider.get_vm("5012-abcd")
+        assert not isinstance(failed.value, VMNotFound), find
+    # addressed by its moId, the unreadable VM is the one sought: there, not gone
+    with pytest.raises(ProviderError, match="configuration is unavailable") as failed:
+        await _vcenter(tmp_path, [unreadable]).get_vm("vm-101")
+    assert not isinstance(failed.value, VMNotFound)
+
+
+async def test_vmware_get_vm_without_an_index_still_calls_a_vm_gone_once_it_read_every_vm(
+    tmp_path,
+):
+    """SDD §10: with every VM readable, the walk is vCenter's answer: no such VM is VMNotFound."""
+
+    def faulting(dc, uuid, is_vm, instance):
+        raise RuntimeError("vmodl.fault.SystemError")
+
+    provider = _vcenter(tmp_path, [PoweredOffVM(state="poweredOn")], find=faulting)
+    assert (await provider.get_vm("5012-abcd")).source_id == "5012-abcd"
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("missing")
+
+
 async def test_vmware_get_vm_of_an_inaccessible_vm_is_not_vm_not_found(tmp_path):
     """SDD §10 (review RV-06): vCenter leaves a VM's config unset while its files are unreachable
     (a datastore outage) - FindByUuid still finds it: the VM is there, not gone. A VMNotFound would
