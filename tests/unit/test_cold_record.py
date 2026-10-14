@@ -415,6 +415,55 @@ def test_a_server_built_from_the_recorded_volumes_is_the_migrations_unrecorded(
     assert not {"dvol-boot", "dvol-data"} & set(dst.volumes)
 
 
+@pytest.mark.parametrize("match_by_name", [True, False])
+def test_a_rollback_whose_recorded_server_is_gone_finds_the_one_built_from_the_recorded_volumes(
+    tmp_path, match_by_name
+):
+    """SDD 6.4, 7 (review RV4-04): the operator deleted the recorded server and retried; the
+    re-run's create lost Nova's answer, so the record still names the deleted server - the rollback
+    finds the re-run's server by the recorded volumes it holds and deletes it, rather than leave it
+    running beside the restarted source."""
+    dst = fake.FakeCloud("dst")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1-deleted", "vm1")
+    _unrecorded_server(dst)
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=match_by_name,
+        timeout=5, conversion_host="dst-conv",
+    ).run(delete_volumes=True)
+
+    assert result["deleted_server_id"] == "dst-srv-unrecorded"
+    assert "dst-srv-unrecorded" not in dst.servers
+    assert not {"dvol-boot", "dvol-data"} & set(dst.volumes)
+    assert WarmState.load(state_dir, "srv-1").destination_server_id is None
+
+
+def test_a_rollback_whose_recorded_server_is_gone_never_matches_one_by_name(tmp_path):
+    """SDD 6.4, 7 (review RV4-04): with the recorded server gone, a same-named server that holds
+    none of the recorded volumes is another one - kept even by a cold rollback (match_by_name) -
+    and the recorded volumes go."""
+    dst = fake.FakeCloud("dst")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    dst.add_server("someone-elses", "vm1")
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1-deleted", "vm1")
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=True,
+        timeout=5, conversion_host="dst-conv",
+    ).run(delete_volumes=True)
+
+    assert result["deleted_server_id"] is None, result
+    assert "someone-elses" in dst.servers
+    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
+
+
 def test_a_differently_named_server_holding_a_recorded_volume_is_kept(tmp_path):
     """SDD 6.4: only a server named like the workload is taken for the migration's; one with
     another name that holds a recorded volume (attached by someone since) is not, and the volume it

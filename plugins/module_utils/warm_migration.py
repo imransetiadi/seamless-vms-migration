@@ -1179,12 +1179,15 @@ class WarmRollback:
 
     def _find_destination_server(self):
         if self.state.destination_server_id:
-            return self.conn.compute.find_server(
+            recorded = self.conn.compute.find_server(
                 self.state.destination_server_id, ignore_missing=True
             )
+            if recorded is not None:
+                return recorded
         if self.state.exists():
-            # no server recorded: Nova may have accepted a create whose answer never arrived (SDD
-            # 6.4, review RV3-06)
+            # no server recorded, or the recorded one is gone - deleted since, while a re-run's
+            # create whose answer was lost left its id recorded: Nova may have accepted a create
+            # whose answer never arrived (SDD 6.4, review RV3-06, RV4-04)
             return self._server_built_from_recorded_volumes()
         if not (self.match_by_name and self.server_name):
             # the name serves only a workload migrated before anything was recorded for it
