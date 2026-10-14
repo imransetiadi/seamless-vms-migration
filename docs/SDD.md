@@ -827,8 +827,13 @@ attach, before its device shows, so a volume whose device was never recorded is 
 multi-attach volume another migration's export attached is never (Cinder's attachment names the server, not the
 migration; review RV8-02); it re-attaches each data volume the source VM no longer holds; and it
 removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
-volume the source VM holds, such as its own boot volume before a copy exists. The export records the root snapshot and
-the image as soon as each exists, so a failure between them and the copy leaves neither behind.
+volume the source VM holds, such as its own boot volume before a copy exists. The export creates the root snapshot, the
+root copy and the image without openstacksdk's own wait, records each id at once, then waits for each within the module's
+timeout: the SDK's `wait=True` raises after Cinder or Glance already made the resource - on a timeout or an error status -
+and the id never reached the map, so the rescue left the resource behind, and a root copy left so kept the snapshot it
+was made from undeletable (review RV8-03). The cleanup puts the data volumes back before it removes the root disk's
+copy, snapshot and image, and tries every step: what it could not do fails it at the end, naming each, so one failed
+removal never keeps a data volume off the source VM.
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
