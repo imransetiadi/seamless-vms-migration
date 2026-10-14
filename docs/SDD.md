@@ -438,7 +438,9 @@ recorded, review RV3-07), or, where no record can tell (the simulator, VMware, a
 `sync_passes` of a strategy other than `cold` — the cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
 volumes): `cancelled` is terminal, so no later action could remove them. That cleanup touches only what the
-migration recorded of its own: it matches no destination server by name, deletes no port and leaves the source as it
+migration recorded of its own: it matches no destination server by its name alone - the one server it deletes besides
+a recorded one is the single server named like the VM that holds a volume it recorded, built from them and so its own
+(§6.4, review RV4-08), whose volumes it could not delete otherwise - deletes no port and leaves the source as it
 is (`os_migrate_rollback_start_source: false` and `os_migrate_rollback_delete_ports: false`, §6.5; on VMware no
 power-on and no kit port, §7.2) — whatever server and ports its cutover made went with its rollback, its source runs,
 and the VM it released (§5.4) may since be another plan's, whose same-named server, ports and stopped source are not
@@ -974,7 +976,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   since the earlier attempt's export would match nothing in that one, review lead A),
   with `os_migrate_rollback_delete_dest_volumes: true` and `os_migrate_rollback_start_source: false`: it removes a
   pending snapshot's temporaries, deletes exactly the recorded volumes and empties the warm state, never matches a server
-  by name and leaves the source as it is (a retry may keep it stopped with an open clock, §5.2). A record that
+  by its name alone (only the single same-named server holding a recorded volume is the migration's, §6.4) and leaves
+  the source as it is (a retry may keep it stopped with an open clock, §5.2). A record that
   names a destination server (§6.3: a cold one with volumes and a server, no pass) is never removed - it is a
   resumed cutover's own. Should the cleanup fail,
   the cutover fails before the source stops (the owner's choice, 2026-10-14).
