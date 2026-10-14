@@ -2169,7 +2169,7 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
 ### 14.5 Audit trail and input snapshots (`ai/snapshots.py`)
 
 Audit events are persisted events of the append-only `events` table (§4.3): no route updates or deletes
-them (`seamless events purge` is the only deletion, by hand, Security.md §12).
+them (`seamless events prune` is the only deletion, by hand, §15, Security.md §12).
 
 * `recommendation.created` — actor `system:advisor`; data `{target_id, model_version, decision_type, subject,
   option, confidence, snapshot_sha256}`.
