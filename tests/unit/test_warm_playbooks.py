@@ -175,6 +175,18 @@ elif NAME == "import_workload_export_volumes":
 elif NAME == "import_workload_transfer_volumes":
     volume_map = dict((dev, dict(entry, dest_id="dvol-%%s-%%s" %% (name, dev.split("/")[-1])))
                       for dev, entry in args["volume_map"].items())
+    if args.get("warm_state_dir"):
+        # as the module does: each volume recorded as soon as Cinder created it (SDD 6.3)
+        path = state_path(args["warm_state_dir"])
+        state = load(path)
+        for dev, entry in volume_map.items():
+            state["dest_volumes"][dev] = dict(
+                (key, entry[key]) for key in ("dest_id", "size", "bootable", "name"))
+        save(path, state)
+    if [NAME, name] in world.get("fail_after", []):
+        # cut short after creating its volumes: the module crashes and returns no volume_map
+        print(json.dumps({"failed": True, "msg": "MODULE FAILURE: attach refused"}))
+        sys.exit(1)
     result = {"changed": True, "volume_map": volume_map, "block_device_mapping": [
         {"boot_index": 0 if dev == "/dev/vda" else -1,
          "delete_on_termination": dev == "/dev/vda", "destination_type": "volume",
@@ -616,8 +628,10 @@ def test_the_cold_import_records_its_volumes_and_server_for_a_rollback(env):
     rc, out, calls = env.run("import_workloads", **COLD)
 
     assert rc == 0, out
-    create = next(c["args"] for c in calls if c["module"] == "import_workload_create_instance")
-    assert create["warm_state_dir"] == env.state_dir
+    # each writes its part of the record itself: no other task records the volumes (SDD 6.5)
+    for module in ("import_workload_transfer_volumes", "import_workload_create_instance"):
+        args = next(c["args"] for c in calls if c["module"] == module)
+        assert args["warm_state_dir"] == env.state_dir, module
     state = env.state("srv-1")
     assert state["dest_volumes"] == RECORDED
     assert state["destination_server_id"] == "dst-vm1"
@@ -639,6 +653,20 @@ def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
         cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
         assert bool(cleaned) is cleanup
 
+
+
+def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(env):
+    """SDD 6.3 (review lead B): the transfer created the volumes, then failed before it returned
+    its volume_map - the failure cleanup cannot see them, and a rollback deletes them by the
+    record alone."""
+    env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc != 0, out
+    assert env.state("srv-1")["dest_volumes"] == RECORDED
+    assert not [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    assert not [c for c in calls if c["module"] == "import_workload_create_instance"]
 
 
 def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):

@@ -11,9 +11,10 @@ from the recently imported volume.
 
 It records each workload it copies for a rollback, in the state file the warm
 path keeps (`{{ os_migrate_warm_state_dir }}/{source_server_id}.json`, by
-default under `{{ os_migrate_data_dir }}/workload_warm/`): the volumes its
-transfer created, as soon as they exist, and the new server, as soon as Nova
-accepts it. `rollback_workloads.yml` with
+default under `{{ os_migrate_data_dir }}/workload_warm/`): each volume its
+transfer creates, as soon as Cinder created it - before its data is copied, so
+a transfer that fails or is cut short leaves their record - and the new server,
+as soon as Nova accepts it. `rollback_workloads.yml` with
 `os_migrate_rollback_delete_dest_volumes: true` then deletes exactly those
 volumes; a cold retry never reuses them, as the transfer creates new ones.
 

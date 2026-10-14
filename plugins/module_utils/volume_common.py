@@ -1103,6 +1103,14 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             )
             new_volume = self.conn.create_volume(**sdk_params)
             self.volume_map[path]["dest_id"] = new_volume.id
+            self._destination_volume_created(path)
+
+    def _destination_volume_created(self, path):
+        """
+        Called as soon as Cinder created the destination volume of ``path``,
+        before its data is copied: a subclass may record it for a rollback
+        (Seamless Migrate SDD 6.3). Does nothing here.
+        """
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _attach_destination_volumes(self):

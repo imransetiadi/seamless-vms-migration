@@ -138,20 +138,13 @@
         nbdkit_socket_uri: "{{ item['_migration_params']['nbdkit_socket_uri'] | default(omit) }}"
         nbdkit_export_name: "{{ item['_migration_params']['nbdkit_export_name'] | default(omit) }}"
         preserve_volume_type: "{{ os_migrate_workloads_preserve_volume_type }}"
+        # records each volume as soon as Cinder created it: a rollback deletes
+        # exactly those, as a cold retry never reuses them (Seamless Migrate SDD 6.3, 7)
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
       register: transfer
       when:
         - prelim is defined and prelim.changed
         - item["_migration_params"]["data_copy"] | default(true)
-
-    # a rollback deletes exactly the volumes this transfer created: a cold retry
-    # never reuses them, it creates new ones (Seamless Migrate SDD 6.3, 7)
-    - name: Record the destination volumes for a rollback
-      os_migrate.os_migrate.import_workload_record_volumes:
-        data: "{{ item }}"
-        state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
-        volume_map: "{{ transfer.volume_map }}"
-      when:
-        - transfer is defined and 'volume_map' in transfer
 
     - name: Create destination instance
       os_migrate.os_migrate.import_workload_create_instance:

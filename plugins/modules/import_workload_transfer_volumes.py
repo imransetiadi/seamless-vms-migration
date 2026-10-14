@@ -136,6 +136,17 @@ options:
       - Optional, used when the nbdkit server requires an export name.
     required: false
     type: str
+  warm_state_dir:
+    description:
+      - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).
+      - When set, each destination volume is recorded in the workload's state file
+        C({warm_state_dir}/{source_server_id}.json) as soon as Cinder created it, before its
+        data is copied - its C(dest_id), C(size), C(bootable) flag and C(name), as the warm
+        path records its volumes, keeping what the file already holds. A transfer that fails
+        or is cut short leaves the record of every volume it created, and a rollback with
+        C(delete_dest_volumes) deletes exactly those.
+    required: false
+    type: str
 """
 
 EXAMPLES = r"""
@@ -244,6 +255,7 @@ from ansible.module_utils.basic import AnsibleModule
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     OpenstackVolumeTransfer,
@@ -272,6 +284,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         nbdkit_socket_uri=None,
         nbdkit_export_name=None,
         preserve_volume_type=False,
+        warm_state_dir=None,
     ):
 
         super().__init__(
@@ -307,6 +320,23 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         self.use_nbdkit_direct = use_nbdkit_direct
         self.nbdkit_socket_uri = nbdkit_socket_uri
         self.nbdkit_export_name = nbdkit_export_name
+
+        self.warm_state_dir = warm_state_dir
+
+    def _destination_volume_created(self, path):
+        """
+        With warm_state_dir, record the volume Cinder just created in the
+        workload's warm state file, before its data is copied: a transfer
+        that fails or is cut short leaves the record of every volume it
+        created, which a rollback deletes them by (Seamless Migrate SDD 6.3).
+        """
+        if self.warm_state_dir:
+            warm_migration.record_destination_volumes(
+                self.warm_state_dir,
+                self.ser_server.info()["id"],
+                {path: self.volume_map[path]},
+                server_name=self.ser_server.params().get("name"),
+            )
 
     def _setup_nbdkit_disks_urls(self, nbdkit_disks):
         """
@@ -401,6 +431,7 @@ def run_module():
         nbdkit_socket_uri=dict(type="str", default=None),
         nbdkit_export_name=dict(type="str", default=None),
         preserve_volume_type=dict(type="bool", default=False),
+        warm_state_dir=dict(type="str", default=None),
     )
 
     result = dict(
@@ -460,6 +491,7 @@ def run_module():
         nbdkit_socket_uri=nbdkit_socket_uri,
         nbdkit_export_name=nbdkit_export_name,
         preserve_volume_type=module.params["preserve_volume_type"],
+        warm_state_dir=module.params["warm_state_dir"],
     )
     destination_host.transfer_exports()
 

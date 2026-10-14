@@ -14,7 +14,11 @@ from unittest import mock
 
 import pytest
 
-from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import (
+    server,
+    volume_common,
+    warm_migration,
+)
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.warm_migration import (
     WarmRollback,
     WarmState,
@@ -32,31 +36,118 @@ TRANSFERRED = {
 }
 
 
-def _record(state_dir, volume_map, data=None):
+def _record(state_dir, volume_map):
+    """What the cold transfer records of vm1's volumes (SDD 6.3)."""
+    return warm_migration.record_destination_volumes(state_dir, "srv-1", volume_map, "vm1")
+
+
+def _cold_volume_map():
+    # as import_workload_export_volumes leaves it, before the transfer created anything: each disk
+    # exported over NBD on the source conversion host
+    return {
+        "/dev/vda": {"source_id": "svol-boot", "name": "vm1-boot", "size": 20, "bootable": True,
+                     "port": 10809, "dest_id": None, "progress": 0.0},
+        "/dev/vdb": {"source_id": "svol-data", "name": "vm1-data", "size": 10, "bootable": False,
+                     "port": 10810, "dest_id": None, "progress": 0.0},
+    }
+
+
+def _clouds():
+    src, dst = fake.FakeCloud("src"), fake.FakeCloud("dst")
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    return src, dst
+
+
+def _transfer(dst, state_dir):
+    """vm1's cold transfer as import_workload_transfer_volumes runs it, with warm_state_dir."""
     from ansible_collections.os_migrate.os_migrate.plugins.modules import (
-        import_workload_record_volumes as record_module,
+        import_workload_transfer_volumes as transfer_module,
     )
 
-    args = {"data": data or fake.workload_data(), "state_dir": state_dir, "volume_map": volume_map}
-    return fake.run_module(record_module, args, None)
+    return transfer_module.OpenStackDestinationVolume(
+        dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", _cold_volume_map(),
+        server.Server.from_data(fake.workload_data()), warm_state_dir=state_dir,
+    )
 
 
-def test_the_cold_import_records_the_volumes_its_transfer_created(tmp_path):
+def test_the_cold_transfer_records_each_volume_as_soon_as_cinder_created_it(tmp_path):
+    """SDD 6.3, 6.5 (review lead B): a volume is recorded before the next one is created - a
+    transfer that fails at its second volume leaves the first one recorded, as the warm path
+    records its volumes (a warm sync reusing one reads all four)."""
+    src, dst = _clouds()
     state_dir = str(tmp_path / "workload_warm")
+    create = dst.create_volume
 
-    result = _record(state_dir, TRANSFERRED)
+    def cinder_create(**kwargs):
+        if kwargs["name"] == "vm1-data":
+            raise RuntimeError("VolumeLimitExceeded: maximum number of volumes allowed exceeded")
+        return create(**kwargs)
 
-    assert result["_exit_code"] in (None, 0), result
-    assert result["changed"] is True
-    assert result["dest_volume_ids"] == ["dvol-boot", "dvol-data"]
+    dst.create_volume = cinder_create
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with pytest.raises(RuntimeError, match="VolumeLimitExceeded"):
+        transfer._create_destination_volumes()
+
+    (boot,) = dst.volumes
     state = WarmState.load(state_dir, "srv-1")
-    # as the warm path records its volumes (SDD 6.3): a warm sync reusing one reads all four
     assert state.dest_volumes == {
-        "/dev/vda": {"dest_id": "dvol-boot", "size": 20, "bootable": True, "name": "vm1-boot"},
-        "/dev/vdb": {"dest_id": "dvol-data", "size": 10, "bootable": False, "name": "vm1-data"},
+        "/dev/vda": {"dest_id": boot, "size": 20, "bootable": True, "name": "vm1-boot"},
     }
     assert state.server_name == "vm1"
     assert state.passes == [] and state.destination_server_id is None
+
+
+def test_a_cold_transfer_that_fails_after_creating_its_volumes_leaves_their_record(tmp_path):
+    """The transfer creates every volume, then attaches, converts and detaches them: a failure
+    there crashes the module, which returns no volume_map - the record names them all (SDD 6.3)."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+        with mock.patch.object(
+            transfer, "_attach_destination_volumes", side_effect=RuntimeError("attach refused")
+        ), pytest.raises(RuntimeError, match="attach refused"):
+            transfer.transfer_exports()
+
+    state = WarmState.load(state_dir, "srv-1")
+    assert sorted(state.dest_volumes) == ["/dev/vda", "/dev/vdb"]
+    assert sorted(v["dest_id"] for v in state.dest_volumes.values()) == sorted(dst.volumes)
+
+
+def test_the_transfer_module_takes_warm_state_dir_and_hands_it_to_its_transfer(tmp_path):
+    """The role passes warm_state_dir (SDD 6.5): the module accepts it and its transfer records."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    state_dir = str(tmp_path / "workload_warm")
+    args = {
+        "data": fake.workload_data(), "conversion_host": {"id": "dst-conv"},
+        "ssh_key_path": "/keys/k", "ssh_user": "cloud-user", "transfer_uuid": "uuid-1",
+        "src_conversion_host_address": "10.0.0.10", "volume_map": _cold_volume_map(),
+        "warm_state_dir": state_dir,
+    }
+    with mock.patch.object(transfer_module, "OpenStackDestinationVolume") as transfer:
+        transfer.return_value.volume_map = TRANSFERRED
+        result = fake.run_module(transfer_module, args, fake.FakeCloud("dst"))
+
+    assert result["_exit_code"] in (None, 0), result
+    assert transfer.call_args.kwargs["warm_state_dir"] == state_dir
+    transfer.return_value.transfer_exports.assert_called_once_with()
+
+
+def test_a_transfer_without_warm_state_dir_records_nothing(tmp_path):
+    """Upstream behaviour: without warm_state_dir no state file is written."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, None)
+    transfer._create_destination_volumes()
+
+    assert len(dst.volumes) == 2
+    assert not os.path.exists(state_dir)
 
 
 def test_the_record_keeps_what_the_state_file_holds_and_a_rerun_changes_nothing(tmp_path):
@@ -65,20 +156,21 @@ def test_the_record_keeps_what_the_state_file_holds_and_a_rerun_changes_nothing(
     warm_migration.record_destination_server(state_dir, "srv-1", "dst-srv", "vm1")
 
     _record(state_dir, TRANSFERRED)
-    again = _record(state_dir, TRANSFERRED)
+    changed, volume_ids = _record(state_dir, TRANSFERRED)
 
-    assert again["changed"] is False
+    assert changed is False and volume_ids == ["dvol-boot", "dvol-data"]
     state = WarmState.load(state_dir, "srv-1")
     assert state.destination_server_id == "dst-srv"
-    assert sorted(state.dest_volumes) == ["/dev/vda", "/dev/vdb"]
+    assert state.dest_volumes == {
+        "/dev/vda": {"dest_id": "dvol-boot", "size": 20, "bootable": True, "name": "vm1-boot"},
+        "/dev/vdb": {"dest_id": "dvol-data", "size": 10, "bootable": False, "name": "vm1-data"},
+    }
 
 
 def test_a_disk_the_transfer_created_no_volume_for_is_not_recorded(tmp_path):
     state_dir = str(tmp_path / "workload_warm")
 
-    result = _record(state_dir, {"/dev/vda": {"source_id": "svol-boot", "size": 20}})
-
-    assert result["changed"] is False and result["dest_volume_ids"] == []
+    assert _record(state_dir, {"/dev/vda": {"source_id": "svol-boot", "size": 20}}) == (False, [])
     assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
 
 
