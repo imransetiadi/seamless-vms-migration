@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by the Seamless Migrate project, 2026.
 
 # Exit immediately if a command exits with a non-zero status, if a variable is
 # unset, and if a command in a pipeline fails.
@@ -36,13 +37,18 @@ while (( "$#" )); do
             if [[ -z "${2:-}" ]]; then
                 error "A value is required for the --galaxy-key option."
             fi
+            echo "Warning: -k puts the Galaxy API key on the command line, where ps and the shell" \
+                "history show it. Next time, export ANSIBLE_GALAXY_API_KEY instead:" \
+                "read -rs ANSIBLE_GALAXY_API_KEY && export ANSIBLE_GALAXY_API_KEY" >&2
             GALAXY_API_KEY="$2"
             shift 2
             ;;
         -h|--help)
             echo "Usage: $(basename "$0") [-k <galaxy_key>]"
-            echo "Publish an Ansible collection to Galaxy if the version is new."
-            echo "The Galaxy API key can also be provided via the ANSIBLE_GALAXY_API_KEY environment variable."
+            echo "Build the collection and publish it to Galaxy if the version is new."
+            echo "Give the Galaxy API key in the ANSIBLE_GALAXY_API_KEY environment variable"
+            echo "(read -rs ANSIBLE_GALAXY_API_KEY && export ANSIBLE_GALAXY_API_KEY): -k puts it on"
+            echo "the command line, where ps and the shell history show it."
             exit 0
             ;;
         *) # preserve positional arguments
@@ -93,12 +99,21 @@ elif [[ "$http_status" -eq 404 ]]; then
 
     COLLECTION_TARBALL="${NAMESPACE}-${NAME}-${CURRENT_VERSION}.tar.gz"
 
-    if [[ ! -f "$COLLECTION_TARBALL" ]]; then
-        make build
-    fi
+    # Build the tarball of this checkout even when one is there: the documented release builds
+    # before its pull request and publishes after checking out the merge commit, and a tarball
+    # built before galaxy.yml mirrored the .gitignore files may hold local secrets
+    # (Security.md R-26).
+    rm -f "$COLLECTION_TARBALL"
+    make build
+    [[ -f "$COLLECTION_TARBALL" ]] || error "make build did not write $COLLECTION_TARBALL."
 
     echo "Publishing $COLLECTION_TARBALL to Ansible Galaxy..."
-    ansible-galaxy collection publish "$COLLECTION_TARBALL" --api-key "$GALAXY_API_KEY"
+    # The key reaches ansible-galaxy through its environment, as the token of a Galaxy server the
+    # environment defines, never through its command line, which ps shows every user of the host.
+    ANSIBLE_GALAXY_SERVER_LIST=release_galaxy \
+        ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_URL=https://galaxy.ansible.com/ \
+        ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN="$GALAXY_API_KEY" \
+        ansible-galaxy collection publish "$COLLECTION_TARBALL"
     echo "Successfully published version $CURRENT_VERSION!"
 else
     error "Failed to check collection version on Ansible Galaxy. Received HTTP status: $http_status"

@@ -1,3 +1,5 @@
+.. Modified by the Seamless Migrate project, 2026.
+
 Releasing the OS Migrate collection
 ===================================
 
@@ -25,12 +27,21 @@ A build is required to update const.py:
    ./toolbox/run make
 
 Create a pull request with these changes. Once it's merged, check out
-the merge commit and release to galaxy:
+the merge commit and release to galaxy. ``scripts/publish.sh`` builds the
+tarball of the checked-out commit itself, even when an earlier build left
+one, and reads the Galaxy API key from the ``ANSIBLE_GALAXY_API_KEY``
+environment variable. ``read -rs`` keeps the key off the command line and
+out of the shell history:
 
 ::
 
    git checkout $MERGED_COMMIT
-   ./toolbox/run ./scripts/publish.sh -k <YOUR_GALAXY_TOKEN>
+   read -rs ANSIBLE_GALAXY_API_KEY && export ANSIBLE_GALAXY_API_KEY
+   ./toolbox/run ./scripts/publish.sh
+
+``./toolbox/run`` has to pass ``ANSIBLE_GALAXY_API_KEY`` into its
+container. ``-k <YOUR_GALAXY_TOKEN>`` still works, but puts the key where
+``ps`` and the shell history show it.
 
 After a successful release, create a tag on the commit you built the
 release from, and push the tag to the upstream repo:

@@ -587,3 +587,107 @@ def test_makefile_recipes_edit_files_in_place_portably():
 
     bare = [line for line in _makefile_recipe_lines() if re.search(r"\bsed -i(\s|$)", line)]
     assert not bare, bare
+
+
+#: a stand-in Galaxy API key: the publish tests follow where scripts/publish.sh hands it
+GALAXY_KEY = "dummy-galaxy-key"
+
+
+def _publish(
+    tmp_path: Path,
+    *args: str,
+    key: str | None = GALAXY_KEY,
+    stale: bool = True,
+    builds: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run scripts/publish.sh in a scratch checkout with stub tools, and return the run and the
+    stubs' log. Galaxy lacks the version (curl answers 404); with ``stale`` an earlier build's
+    tarball is there; ``make build`` writes a fresh one when ``builds``; ansible-galaxy logs its
+    arguments, its Galaxy server variables and the tarball it was given."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "galaxy.yml").write_text(
+        "namespace: os_migrate\nname: os_migrate\nversion: 9.9.9\n"
+    )
+    tarball = "os_migrate-os_migrate-9.9.9.tar.gz"
+    if stale:
+        (checkout / tarball).write_text("stale\n")
+    log = tmp_path / "calls.log"
+    record = 'printf "%s\\n" "$(basename "$0") $*" >> "$CALLS_LOG"\n'
+    fakes = {
+        "yq": '#!/bin/sh\ncase "$2" in .namespace|.name) echo os_migrate;;'
+        " .version) echo 9.9.9;; esac\n",
+        "jq": "#!/bin/sh\nexit 0\n",
+        "curl": "#!/bin/sh\n" + record + "echo 404\n",
+        "make": "#!/bin/sh\n" + record + (f"echo fresh > {tarball}\n" if builds else ""),
+        "ansible-galaxy": "#!/bin/sh\n"
+        + record
+        + 'env | grep "^ANSIBLE_GALAXY_SERVER" | sort >> "$CALLS_LOG"\n'
+        + 'printf "published: %s\\n" "$(cat "$3")" >> "$CALLS_LOG"\n',
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in fakes.items():
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "CALLS_LOG": str(log)}
+    if key is not None:
+        env["ANSIBLE_GALAXY_API_KEY"] = key
+    run = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "publish.sh"), *args],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return run, log.read_text() if log.exists() else ""
+
+
+def test_publish_builds_the_tarball_it_publishes_even_when_one_is_there(tmp_path):
+    """The documented release (docs/src/devel/releasing.rst) builds before its pull request and
+    publishes after checking out the merge commit. scripts/publish.sh published the tarball it
+    found, a build of another tree, which may hold local secrets when it was made before galaxy.yml
+    mirrored the .gitignore files (Security.md R-26). It now builds the tarball it publishes."""
+    run, log = _publish(tmp_path)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "make build" in log.splitlines()
+    assert "published: fresh" in log
+    assert "published: stale" not in log
+
+
+def test_publish_never_publishes_a_tarball_its_own_build_did_not_write(tmp_path):
+    run, log = _publish(tmp_path, builds=False)
+
+    assert run.returncode != 0
+    assert "did not write os_migrate-os_migrate-9.9.9.tar.gz" in run.stderr
+    assert "published:" not in log
+
+
+def test_publish_hands_the_galaxy_key_to_ansible_galaxy_through_its_environment_only(tmp_path):
+    """CLAUDE.md §4: a key reaches a process only through its environment, never its command line,
+    which ps shows every user of the host. ansible-galaxy gets the key as a Galaxy server's token
+    variable."""
+    run, log = _publish(tmp_path)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    lines = log.splitlines()
+    calls = [line for line in lines if line.split(" ")[0] in ("curl", "make", "ansible-galaxy")]
+    assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in calls
+    assert not [call for call in calls if GALAXY_KEY in call], calls
+    assert "ANSIBLE_GALAXY_SERVER_LIST=release_galaxy" in lines
+    assert "ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_URL=https://galaxy.ansible.com/" in lines
+    assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
+
+
+def test_publish_warns_when_the_key_is_on_its_own_command_line(tmp_path):
+    """``-k`` still works, for the releases that pass it, but says how to keep the key off the
+    command line; ansible-galaxy gets the key through its environment either way."""
+    run, log = _publish(tmp_path, "-k", GALAXY_KEY, key=None)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    lines = log.splitlines()
+    assert "export ANSIBLE_GALAXY_API_KEY" in run.stderr
+    assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
+    assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in lines
