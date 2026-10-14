@@ -268,6 +268,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
+    volume_or_none,
 )
 
 import re
@@ -361,7 +362,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         earlier_id = (state.dest_volumes.get(path) or {}).get("dest_id")
         if not earlier_id or earlier_id == self.volume_map[path]["dest_id"]:
             return
-        volume = self.conn.get_volume_by_id(earlier_id)
+        volume = volume_or_none(self.conn, earlier_id)
         if volume is None:
             return  # gone already: Nova deletes a boot volume with its server
         if getattr(volume, "attachments", None):

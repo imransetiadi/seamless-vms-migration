@@ -42,6 +42,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     RemoteShell,
     destination_volume_sdk_params,
     use_lock,
+    volume_or_none,
 )
 
 BOOT_DEVICE = "/dev/vda"
@@ -340,7 +341,7 @@ class _WarmVolumeBase(OpenStackVolumeBase):
 
     def _wait_detached(self, volume_id, side):
         for second in range(self.timeout):
-            volume = self.conn.get_volume_by_id(volume_id)
+            volume = volume_or_none(self.conn, volume_id)
             if volume is None or not self._volume_still_attached(volume, self._converter()):
                 return
             time.sleep(1)
@@ -1211,7 +1212,7 @@ class WarmRollback:
             return None
         holders = set()
         for entry in self.state.dest_volumes.values():
-            volume = self.conn.get_volume_by_id(entry["dest_id"])
+            volume = volume_or_none(self.conn, entry["dest_id"])
             for attachment in getattr(volume, "attachments", None) or []:
                 holder = self.conn.get_server_by_id(attachment["server_id"])
                 if holder is None or self._is_conversion_host(holder):
@@ -1237,11 +1238,11 @@ class WarmRollback:
     def _delete_volume(self, volume_id):
         """True when deleted, False when already gone, None when kept because
         another server than the destination conversion host still uses it."""
-        volume = self.conn.get_volume_by_id(volume_id)
+        volume = volume_or_none(self.conn, volume_id)
         if volume is None:
             return False
         for second in range(self.timeout):
-            volume = self.conn.get_volume_by_id(volume_id)
+            volume = volume_or_none(self.conn, volume_id)
             if volume is None:
                 return False
             if getattr(volume, "status", None) == "deleting":
@@ -1280,7 +1281,7 @@ class WarmRollback:
             self.conn.delete_volume(name_or_id=volume_id, wait=True, timeout=self.timeout)
         except Exception:  # pylint: disable=broad-except
             # Nova may have begun deleting it since the read above: then it is going anyway
-            volume = self.conn.get_volume_by_id(volume_id)
+            volume = volume_or_none(self.conn, volume_id)
             if volume is None:
                 return False
             if getattr(volume, "status", None) != "deleting":
@@ -1292,7 +1293,7 @@ class WarmRollback:
     def _wait_gone(self, volume_id):
         """Wait until a volume Cinder is deleting is gone (SDD 6.4)."""
         for second in range(self.timeout):
-            if self.conn.get_volume_by_id(volume_id) is None:
+            if volume_or_none(self.conn, volume_id) is None:
                 return
             time.sleep(1)
         raise RuntimeError(

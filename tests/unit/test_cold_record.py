@@ -642,3 +642,28 @@ def test_an_earlier_volume_the_rerun_cannot_delete_fails_the_transfer(tmp_path):
     assert recorded["/dev/vdb"]["dest_id"] == "dvol-data"  # unchanged
     # every volume left in the destination is recorded: this run's data volume was removed
     assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+
+
+def test_a_warm_rollback_with_a_recorded_volume_gone_still_runs(tmp_path):
+    """Review RV4-03: a recorded volume deleted out of band (an orphan the sync warned about) is
+    gone - openstacksdk raises NotFound for it - and the rollback looking for the migration's
+    server goes on without it, rather than fail before the source starts."""
+    dst = fake.FakeCloud("dst")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    state_dir = str(tmp_path / "workload_warm")
+    state = WarmState(state_dir, "srv-1", server_name="vm1", transfer_uuid="t-2",
+                      passes=[{"number": 1, "kind": "full"}, {"number": 2, "kind": "final"}])
+    state.dest_volumes = {
+        "/dev/vda": {"dest_id": "dvol-boot", "size": 20, "bootable": True, "name": "vm1-boot"},
+        "/dev/vdc": {"dest_id": "dvol-orphan", "size": 5, "bootable": False, "name": "vm1-old"},
+    }
+    state.save()
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+
+    result = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", timeout=5,
+        conversion_host="dst-conv",
+    ).run(delete_volumes=False)
+
+    assert result["deleted_server_id"] is None
+    assert "dvol-boot" in dst.volumes

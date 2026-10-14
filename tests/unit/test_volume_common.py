@@ -340,3 +340,20 @@ def test_a_transfer_failing_before_its_forwarding_starts_reports_why_and_frees_i
 
     assert transfer.shell.ports == set()  # the first disk's port is free again
     assert not dst.calls_to("create_volume")
+
+
+def test_a_volume_cinder_no_longer_has_reads_as_none():
+    """openstacksdk 4.x's get_volume_by_id raises NotFoundException for a missing volume - its
+    docstring's "else None" notwithstanding: volume_or_none reads that as None, and lets any
+    other error through (Seamless Migrate SDD 6.4, review RV4-06)."""
+    dst = cloud()
+    dst.add_volume("vol-1", "kept", 1)
+    assert volume_common.volume_or_none(dst, "vol-1").id == "vol-1"
+    assert volume_common.volume_or_none(dst, "vol-gone") is None
+
+    class ServerError(Exception):
+        status_code = 503
+
+    dst.get_volume_by_id = mock.Mock(side_effect=ServerError("Service Unavailable"))
+    with pytest.raises(ServerError):
+        volume_common.volume_or_none(dst, "vol-1")

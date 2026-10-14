@@ -279,3 +279,12 @@ This project follows a simple changelog to satisfy collection metadata validatio
   unremoved. A volume a server holds (a server renamed rather than deleted)
   is that server's and only leaves the record; one the transfer cannot
   delete fails it with the record unchanged.
+- A volume Cinder no longer has reads as gone with the openstacksdk 4.x the
+  collection runs on, whose ``get_volume_by_id`` raises ``NotFoundException``
+  for a missing volume instead of returning ``None`` as its docstring says.
+  Before, every check for a gone volume raised instead. A cold rollback then
+  failed once Nova had deleted the boot volume with its server, before
+  starting the source; a warm pass failed on a recorded volume that was
+  gone instead of creating a new one; and a cold re-run failed on an
+  earlier attempt's boot volume. The unit tests' fake cloud now raises the
+  same way.

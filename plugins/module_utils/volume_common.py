@@ -40,6 +40,28 @@ except ImportError:
     DEVNULL = open(os.devnull, "r+", encoding="utf8")
 
 
+def _is_not_found(err):
+    """openstacksdk's NotFoundException (a 404), whatever its version names it."""
+    return getattr(err, "status_code", None) == 404 or any(
+        cls.__name__ == "NotFoundException" for cls in type(err).__mro__
+    )
+
+
+def volume_or_none(conn, volume_id):
+    """
+    The volume ``volume_id``, or None when Cinder no longer has it:
+    openstacksdk 4.x's get_volume_by_id raises NotFoundException for a
+    missing volume, its docstring's "else None" notwithstanding (Seamless
+    Migrate SDD 6.4, review RV4-06).
+    """
+    try:
+        return conn.get_volume_by_id(volume_id)
+    except Exception as err:  # pylint: disable=broad-except
+        if _is_not_found(err):
+            return None
+        raise
+
+
 def _lock_host():
     """This host's name as a lock records it (SDD §6.6)."""
     host = socket.gethostname()
@@ -272,7 +294,7 @@ class OpenStackVolumeBase:
         """Get volume by id, or None if id_maybe is None or if volume doesn't exist."""
         if not id_maybe:
             return None
-        return self.conn.get_volume_by_id(id_maybe)
+        return volume_or_none(self.conn, id_maybe)
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _detach_volumes_from_destination_converter(self):
@@ -296,8 +318,8 @@ class OpenStackVolumeBase:
             )
             for second in range(self.timeout):
                 converter = self._converter()
-                volume = self.conn.get_volume_by_id(mapping["dest_id"])
-                if not self._volume_still_attached(volume, converter):
+                volume = volume_or_none(self.conn, mapping["dest_id"])
+                if volume is None or not self._volume_still_attached(volume, converter):
                     break
                 time.sleep(1)
             else:

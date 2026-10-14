@@ -14,6 +14,13 @@ import itertools
 import json
 import re
 
+try:
+    from openstack.exceptions import NotFoundException
+except ImportError:  # openstacksdk is optional for these tests
+
+    class NotFoundException(Exception):
+        status_code = 404
+
 GIB = 1024 ** 3
 
 
@@ -138,7 +145,12 @@ class FakeCloud:
         return self.servers.get(server_id)
 
     def get_volume_by_id(self, volume_id):
-        return self.volumes.get(volume_id)
+        # as openstacksdk 4.x: get_volume_by_id is block_storage.get_volume, which raises for a
+        # volume Cinder does not have (its docstring's "else None" notwithstanding)
+        volume = self.volumes.get(volume_id)
+        if volume is None:
+            raise NotFoundException("No Volume found for %s" % volume_id)
+        return volume
 
     def get_image_by_id(self, image_id):
         return self.images.get(image_id)
