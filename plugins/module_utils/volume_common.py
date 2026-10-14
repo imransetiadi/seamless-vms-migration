@@ -1122,6 +1122,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         bootable flag is set once it is available (Seamless Migrate SDD 6.3).
         """
         self.log.info("Creating volumes on destination cloud")
+        self._before_destination_volumes_created()
         # Detached-volume transfers have no workload (no ser_server).
         ser_server = getattr(self, "ser_server", None)
         for path, mapping in self.volume_map.items():
@@ -1165,6 +1166,14 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self.conn.delete_volume(name_or_id=volume.id, wait=False)
         except Exception as err:
             self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
+
+    def _before_destination_volumes_created(self):
+        """
+        Called before _create_destination_volumes creates any volume: a
+        subclass may remove what an earlier attempt left, so that no new
+        volume waits unrecorded meanwhile (Seamless Migrate SDD 6.3, review
+        RV5-01). Does nothing here.
+        """
 
     def _destination_volume_created(self, path):
         """

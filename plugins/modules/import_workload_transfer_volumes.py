@@ -272,6 +272,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
 )
 
 import re
+import time
 
 
 class OpenStackDestinationVolume(OpenstackVolumeTransfer):
@@ -341,7 +342,6 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         """
         if self.warm_state_dir:
             server_id = self.ser_server.info()["id"]
-            self._remove_earlier_volume(path, server_id)
             warm_migration.record_destination_volumes(
                 self.warm_state_dir,
                 server_id,
@@ -349,28 +349,40 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
                 server_name=self.ser_server.params().get("name"),
             )
 
+    def _before_destination_volumes_created(self):
+        """
+        With warm_state_dir, remove the volume an earlier attempt recorded for
+        each device before any volume is created: an earlier volume stays
+        recorded until it is gone, and no new volume waits unrecorded while
+        the lock, a detach or a delete is waited for (Seamless Migrate SDD 6.3,
+        review RV5-01).
+        """
+        if self.warm_state_dir:
+            server_id = self.ser_server.info()["id"]
+            for path in self.volume_map:
+                self._remove_earlier_volume(path, server_id)
+
     def _remove_earlier_volume(self, path, server_id):
         """
-        Before a re-run records its volume for ``path``, delete the volume an
-        earlier attempt recorded for it unless a server holds it: the cold path
-        never reuses a volume, and one a server holds (a server the operator
-        renamed rather than deleted) is that server's - it only leaves the
-        record. One Cinder is already deleting (the boot volume Nova deletes
-        with its server) is gone already, and one only the destination
-        conversion host holds (a transfer cut short) is the migration's own:
-        detached from it under the attach lock, then deleted. An earlier volume
-        that cannot be deleted fails the transfer with the record unchanged
-        (Seamless Migrate SDD 6.3, review RV3-02, RV4-02, RV4-05).
+        Remove the volume an earlier attempt recorded for ``path`` unless a
+        server holds it: the cold path never reuses a volume, and one a server
+        holds (a server the operator renamed rather than deleted) is that
+        server's - it only leaves the record when the new volume is recorded.
+        One only the destination conversion host holds (a transfer cut short)
+        is the migration's own: detached from it under the attach lock. Each
+        earlier volume removed is deleted - one Cinder is already deleting
+        (the boot volume Nova deletes with its server) is not deleted again -
+        and waited for until Cinder no longer has it. An earlier volume that
+        cannot be removed fails the transfer with the record unchanged
+        (Seamless Migrate SDD 6.3, review RV3-02, RV4-02, RV4-05, RV5-02).
         """
         state = warm_migration.WarmState.load(self.warm_state_dir, server_id)
         earlier_id = (state.dest_volumes.get(path) or {}).get("dest_id")
         if not earlier_id or earlier_id == self.volume_map[path]["dest_id"]:
             return
         volume = volume_or_none(self.conn, earlier_id)
-        if volume is None or getattr(volume, "status", None) == "deleting":
-            # gone already, or going: Nova deletes a boot volume with its server, and Cinder
-            # refuses a second delete meanwhile
-            return
+        if volume is None:
+            return  # gone already
         converter = self._converter()
         holders = [a["server_id"] for a in getattr(volume, "attachments", None) or []]
         if any(holder != converter.id for holder in holders):
@@ -385,12 +397,32 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             if holders:
                 # a transfer cut short left it on the destination conversion host
                 self._detach_volumes_from_destination_converter([earlier_id])
-            self.conn.delete_volume(name_or_id=earlier_id, wait=False)
+            if getattr(volume, "status", None) != "deleting":
+                # Nova deletes a boot volume with its server, and Cinder refuses a second delete
+                self.conn.delete_volume(name_or_id=earlier_id, wait=False)
+            self._wait_until_gone(earlier_id)
         except Exception as err:
             raise RuntimeError(
                 "Could not delete volume %s an earlier attempt left for %s: %s"
                 % (earlier_id, path, err)
             ) from err
+
+    def _wait_until_gone(self, volume_id):
+        """
+        Wait, within the transfer's timeout, until Cinder no longer has the
+        earlier volume ``volume_id``: one that leaves `deleting` without going
+        (VolumeIsBusy puts it back to `available`, or `error_deleting`) is one
+        Cinder gave up deleting (Seamless Migrate SDD 6.3, review RV5-02).
+        """
+        for second in range(self.timeout):
+            volume = volume_or_none(self.conn, volume_id)
+            if volume is None:
+                return
+            status = getattr(volume, "status", None)
+            if status != "deleting":
+                raise RuntimeError("Cinder did not delete it: it is %s" % status)
+            time.sleep(1)
+        raise RuntimeError("it is still being deleted after %s s" % self.timeout)
 
     def _setup_nbdkit_disks_urls(self, nbdkit_disks):
         """

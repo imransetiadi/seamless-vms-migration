@@ -10,6 +10,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import os
+import time
 from unittest import mock
 
 import pytest
@@ -675,8 +676,8 @@ def test_a_rerun_keeps_the_earlier_attempts_volume_a_server_holds(tmp_path):
 
 
 def test_an_earlier_volume_the_rerun_cannot_delete_fails_the_transfer(tmp_path):
-    """SDD 6.3: an earlier volume the re-run cannot delete fails the transfer with the record
-    unchanged - and the new volume, recorded nowhere, is removed."""
+    """SDD 6.3 (review RV5-01): an earlier volume the re-run cannot delete fails the transfer with
+    the record unchanged, before it creates any volume."""
     src, dst = _clouds()
     state_dir = str(tmp_path / "workload_warm")
     _earlier_attempt(state_dir, dst)
@@ -695,8 +696,9 @@ def test_an_earlier_volume_the_rerun_cannot_delete_fails_the_transfer(tmp_path):
 
     recorded = WarmState.load(state_dir, "srv-1").dest_volumes
     assert recorded["/dev/vdb"]["dest_id"] == "dvol-data"  # unchanged
-    # every volume left in the destination is recorded: this run's data volume was removed
-    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+    # it failed before it created any volume: every volume left in the destination is recorded
+    assert not dst.calls_to("create_volume")
+    assert set(dst.volumes) <= {entry["dest_id"] for entry in recorded.values()}
 
 
 def test_a_warm_rollback_with_a_recorded_volume_gone_still_runs(tmp_path):
@@ -724,10 +726,9 @@ def test_a_warm_rollback_with_a_recorded_volume_gone_still_runs(tmp_path):
     assert "dvol-boot" in dst.volumes
 
 
-def test_a_rerun_takes_the_earlier_boot_volume_nova_is_deleting_as_gone(tmp_path):
-    """SDD 6.3 (review RV4-02): the operator deleted the recorded server; Nova deletes its boot
-    volume with it, which Cinder shows `deleting` for a while and refuses to delete again - the
-    re-run takes it as gone and carries on, deleting the earlier data volume no server holds."""
+def _nova_deleted_the_recorded_server(tmp_path, reads_until_gone):
+    """Attempt 1 recorded its volumes and its server S1; the operator deleted S1, and Nova deletes
+    its boot volume with it - Cinder shows it `deleting` - and leaves the data volume detached."""
     src, dst = _clouds()
     state_dir = str(tmp_path / "workload_warm")
     _record(state_dir, TRANSFERRED)
@@ -735,17 +736,110 @@ def test_a_rerun_takes_the_earlier_boot_volume_nova_is_deleting_as_gone(tmp_path
     dst.add_server("dst-s1", "vm1")
     dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True, server_id="dst-s1", device="/dev/vda")
     dst.add_volume("dvol-data", "vm1-data", 10, server_id="dst-s1", device="/dev/vdb")
-    nova_deletes_on_termination(dst, "dst-s1", ["dvol-boot"], reads_until_gone=50)
+    deleting = nova_deletes_on_termination(dst, "dst-s1", ["dvol-boot"], reads_until_gone)
     dst.compute.delete_server(dst.servers["dst-s1"])
     assert dst.volumes["dvol-boot"].status == "deleting"
     with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
         transfer = _transfer(dst, state_dir)
-    transfer._create_destination_volumes()
+    return dst, state_dir, transfer, deleting
 
+
+def test_a_rerun_waits_until_the_earlier_boot_volume_nova_deletes_is_gone(tmp_path):
+    """SDD 6.3 (review RV4-02, RV5-02): Cinder refuses a second delete of the boot volume Nova is
+    deleting with the operator-deleted server - the re-run sends none and waits until Cinder no
+    longer has it, deletes the earlier data volume no server holds, and only then creates a volume:
+    an earlier volume stays recorded until it is gone."""
+    dst, state_dir, transfer, deleting = _nova_deleted_the_recorded_server(tmp_path, 50)
+    create, earlier_left = dst.create_volume, []
+
+    def cinder_create(**kwargs):
+        earlier_left.append(sorted({"dvol-boot", "dvol-data"} & set(dst.volumes)))
+        return create(**kwargs)
+
+    dst.create_volume = cinder_create
+    with mock.patch.object(time, "sleep"):
+        transfer._create_destination_volumes()
+
+    assert earlier_left == [[], []]  # both gone before the first new volume
     recorded = WarmState.load(state_dir, "srv-1").dest_volumes
-    assert "dvol-data" not in dst.volumes
     assert not {"dvol-boot", "dvol-data"} & {entry["dest_id"] for entry in recorded.values()}
     assert not [c for c in dst.calls_to("delete_volume") if c[1]["name_or_id"] == "dvol-boot"]
+
+
+def test_an_earlier_volume_cinder_gives_up_deleting_fails_the_rerun_with_its_record(tmp_path):
+    """SDD 6.3 (review RV5-02): Cinder can give up deleting the boot volume Nova deletes - an RBD
+    image still watched is busy, and Cinder puts it back to `available` - so the re-run fails before
+    it creates any volume, the earlier volume still recorded, rather than drop a copy of the disk
+    from the record."""
+    dst, state_dir, transfer, deleting = _nova_deleted_the_recorded_server(tmp_path, 50)
+
+    def cinder_gives_up(seconds):
+        deleting.pop("dvol-boot", None)
+        dst.volumes["dvol-boot"].status = "available"
+
+    with mock.patch.object(time, "sleep", side_effect=cinder_gives_up), pytest.raises(
+        RuntimeError, match="dvol-boot .*available"
+    ):
+        transfer._create_destination_volumes()
+
+    assert WarmState.load(state_dir, "srv-1").dest_volumes["/dev/vda"]["dest_id"] == "dvol-boot"
+    assert "dvol-boot" in dst.volumes
+    assert not dst.calls_to("create_volume")
+
+
+def test_an_earlier_volume_still_being_deleted_at_the_timeout_fails_the_rerun_with_its_record(
+    tmp_path,
+):
+    """SDD 6.3 (review RV5-02): the re-run waits for an earlier volume Cinder is deleting only
+    within the transfer's timeout; still there then, it fails before it creates any volume, the
+    earlier volume still recorded."""
+    dst, state_dir, transfer, deleting = _nova_deleted_the_recorded_server(tmp_path, None)
+
+    with mock.patch.object(time, "sleep"), pytest.raises(
+        RuntimeError, match="dvol-boot .*still being deleted"
+    ):
+        transfer._create_destination_volumes()
+
+    assert WarmState.load(state_dir, "srv-1").dest_volumes["/dev/vda"]["dest_id"] == "dvol-boot"
+    assert not dst.calls_to("create_volume")
+
+
+class _Killed(BaseException):
+    """The orchestrator's stop or a step timeout kills the playbook's process group: the module
+    dies without running an except or finally clause."""
+
+
+def test_a_rerun_removes_the_earlier_volumes_before_it_creates_any(tmp_path):
+    """SDD 6.3 (review RV5-01): the re-run waits for the conversion host's attach lock - another
+    migration attaching holds it - to detach the earlier volumes a transfer cut short left there.
+    Killed meanwhile, it has created no volume yet: every volume left in the destination is
+    recorded, so no new volume waits unrecorded."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1", "vm1")  # stale
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    for volume_id in ("dvol-boot", "dvol-data"):
+        dst.attach_volume(dst.servers["dst-conv"], dst.volumes[volume_id])
+    lock_waits = []
+
+    def conversion_host(command):
+        if command[:2] == ["sudo", "flock"] and command[6] == volume_common.ATTACH_LOCK_FILE_DESTINATION:
+            lock_waits.append(command)
+            if len(lock_waits) > 3:
+                raise _Killed()
+            return 16  # "Another conversion has the lock."
+        return None
+
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src], val=conversion_host)):
+        transfer = _transfer(dst, state_dir)
+    with mock.patch.object(time, "sleep"), pytest.raises(_Killed):
+        transfer._create_destination_volumes()
+
+    assert not dst.calls_to("create_volume")
+    recorded = {e["dest_id"] for e in WarmState.load(state_dir, "srv-1").dest_volumes.values()}
+    assert set(dst.volumes) <= recorded
 
 
 def test_a_rerun_removes_the_earlier_volumes_left_on_the_conversion_host(tmp_path):
@@ -818,8 +912,9 @@ def test_an_earlier_volume_the_rerun_cannot_detach_fails_the_transfer(tmp_path):
 
     recorded = WarmState.load(state_dir, "srv-1").dest_volumes
     assert recorded["/dev/vdb"]["dest_id"] == "dvol-data"  # unchanged
-    # every volume left in the destination is recorded: this run's data volume was removed
-    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+    # it failed before it created any volume: every volume left in the destination is recorded
+    assert not dst.calls_to("create_volume")
+    assert set(dst.volumes) <= {entry["dest_id"] for entry in recorded.values()}
 
 
 def _holds_lock(shells, lock_file):
