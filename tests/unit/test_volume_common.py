@@ -491,14 +491,15 @@ def test_a_detach_that_never_ends_fails_at_the_timeout():
     assert waits == [False]
 
 
-def test_every_detach_goes_through_the_bounded_wait():
-    """SDD 6.6 (review 5): no module calls openstacksdk's detach_volume itself - with wait=True it
-    would wait without bound - but through detach_volume_bounded."""
+def _unbounded_detach_calls(root):
+    """The detach_volume calls under the plugins directory root that are not inside
+    detach_volume_bounded, as sorted "relative/path.py:line" entries."""
     import ast
 
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugins")
     offenders = []
     for directory, dirs, files in os.walk(root):
+        if directory == os.path.join(root, "modules") and "_vendor" in dirs:
+            dirs.remove("_vendor")  # openstack.cloud's own checkout (make vendor-links), not ours
         for name in files:
             path = os.path.join(directory, name)
             if not name.endswith(".py") or os.path.islink(path):
@@ -513,7 +514,34 @@ def test_every_detach_goes_through_the_bounded_wait():
                         owner = parents.get(owner)
                     if owner is None or owner.name != "detach_volume_bounded":
                         offenders.append("%s:%d" % (os.path.relpath(path, root), node.lineno))
-    assert offenders == []
+    return sorted(offenders)
+
+
+def test_every_detach_goes_through_the_bounded_wait():
+    """SDD 6.6 (review 5): no module calls openstacksdk's detach_volume itself - with wait=True it
+    would wait without bound - but through detach_volume_bounded."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugins")
+    assert _unbounded_detach_calls(root) == []
+
+
+def test_the_detach_guard_leaves_the_vendored_openstack_cloud_checkout_out(tmp_path):
+    """Review RV6-03: `make vendor-links`, which `make test-ansible-units` runs first, checks
+    openstack.cloud out under plugins/modules/_vendor as real files, and its server_volume module
+    calls conn.detach_volume itself. The guard leaves that upstream tree out, and still flags a
+    module of this collection."""
+    vendored = tmp_path / "modules" / "_vendor" / "openstack.cloud" / "plugins" / "modules"
+    vendored.mkdir(parents=True)
+    (vendored / "server_volume.py").write_text(
+        "def run(self, server, volume, wait, timeout):\n"
+        "    self.conn.detach_volume(server, volume, wait=wait, timeout=timeout)\n"
+    )
+    (tmp_path / "module_utils").mkdir()
+    (tmp_path / "module_utils" / "ours.py").write_text(
+        "def detach(conn, server, volume):\n"
+        "    conn.detach_volume(server=server, volume=volume, wait=True)\n"
+    )
+
+    assert _unbounded_detach_calls(str(tmp_path)) == [os.path.join("module_utils", "ours.py") + ":2"]
 
 
 def test_a_volume_cinder_no_longer_has_reads_as_none():
