@@ -1661,6 +1661,8 @@ class SourceProvider(Protocol):
     async def list_vms(self) -> list[VMRef]
     async def get_vm(self, source_id: str) -> VMRef     # raises VMNotFound (a ProviderError) when the cloud answers
                                                          # it has no such VM; any other failure stays ProviderError
+                                                         # (vCenter answers only once it read every VM: one whose
+                                                         # configuration it cannot read may be the VM - review RV3-04)
     async def inventory(self) -> SourceInventory     # networks (name→mtu), projects, …
 
 class DestinationProvider(Protocol):
