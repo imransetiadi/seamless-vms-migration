@@ -869,12 +869,18 @@ SUMMARY_FIELDS = {
 }
 
 
-def test_a_summary_list_holds_the_fields_the_overview_reads(api):
+def test_a_summary_list_holds_the_fields_the_overview_reads(api, monkeypatch):
     """SDD §4, §12 GET /migrations?view=summary (perf audit PF-02): each migration as a
     MigrationSummary - its list fields as the full list has them, phase_since the last
     PhaseChange's time (created_at without one) - in the same order, filtered and paged alike."""
     from datetime import timedelta
 
+    async def no_watch() -> None:
+        return None
+
+    # the demo source watch runs every tick here: the demo cloud has no "vm-completed", so it would
+    # clear that migration's source_running_at (VMNotFound, SDD §8.1) between the two reads compared
+    monkeypatch.setattr(api.client.app.state.services.orchestrator, "_watch_sources_once", no_watch)
     migs = seed_migrations(api.store)
     awaiting = migs["awaiting"]
     at = utcnow()
@@ -1173,9 +1179,16 @@ def test_finalize_confirm_mismatch_400(api):
     assert res.status_code == 200 and res.json()["phase"] == "finalized"
 
 
-def test_finalize_is_refused_while_the_source_vm_runs_again(api):
+def test_finalize_is_refused_while_the_source_vm_runs_again(api, monkeypatch):
     """SDD §8.1, §12 (the owner's choice, 2026-10-13): 409 while the source watch sees the source
     VM running again; once it saw it stopped (source_running_at cleared), it finalizes."""
+
+    async def no_watch() -> None:
+        return None
+
+    # the flag is set and cleared here by hand: the demo source watch, which runs every tick, would
+    # clear it on its own - the demo cloud has no "vm-completed" (VMNotFound, SDD §8.1)
+    monkeypatch.setattr(api.client.app.state.services.orchestrator, "_watch_sources_once", no_watch)
     migs = seed_migrations(api.store)
     completed = migs["completed"]
     completed.source_running_at = completed.downtime_started_at
