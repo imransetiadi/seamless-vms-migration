@@ -185,7 +185,7 @@ LAB-W12); network, flavor and volume-type mappings are defined; the plan has `re
 `downtime_slo_s: 600` (the backend default and the G1a budget: `270 s + scan` fits single disks up to ≈ 161 GiB), a
 `cutover_window` on Saturday, `keep_warm_interval_s: 900`; besides Sari, a second approver (Dewi) holds the approver
 role, as the plan keeps `require_distinct_approver: true` (the default).
-**When** Rina creates the plan (the policy fields `require_approval`, `auto_cutover` and `cutover_window` need role
+**When** Rina creates the plan (the policy fields `require_approval`, `require_distinct_approver`, `auto_cutover` and `cutover_window` need role
 **approver** (SDD §12), so Sari sets them, in the create call or by `PATCH`), runs `POST /plans/{id}/waves/auto`,
 `POST /plans/{id}/validate` and `POST /plans/{id}/start`;
 **Then**
