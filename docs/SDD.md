@@ -968,7 +968,8 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   a retry, a resume) recorded the volumes it created, and a cold re-run never reuses them either - its transfer
   creates new ones, whose record would replace theirs. When the migration's state file holds such a record —
   passes, a pending source snapshot or recorded volumes — and no destination server, the cutover runs
-  `rollback_workloads.yml` before the export,
+  `rollback_workloads.yml` right after the export, which selects the workload by its name of now (a source VM renamed
+  since the earlier attempt's export would match nothing in that one, review lead A),
   with `os_migrate_rollback_delete_dest_volumes: true` and `os_migrate_rollback_start_source: false`: it removes a
   pending snapshot's temporaries, deletes exactly the recorded volumes and empties the warm state, never matches a server
   by name and leaves the source as it is (a retry may keep it stopped with an open clock, §5.2). A record that
@@ -1017,8 +1018,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   export it is about to replace: a name that no longer resolves there (a mapping fixed since) must not hold up
   the new export, whose references are resolved after it.
 * Export record: once the rewrite after an export has finished, the executor records beside the export
-  (`osm/rewrite.json`) the mappings it applied — the plan's, overlaid with the migration's resolved mappings — and
-  the VM's `plan.nic_overrides` entries. It removes the record before each export, so an export whose rewrite did
+  (`osm/rewrite.json`) the mappings it applied — the plan's, overlaid with the migration's resolved mappings — the
+  VM's `plan.nic_overrides` entries and the exported server's name: a source VM renamed since the export (and validated
+  again) no longer carries the name each run selects its workload by, so its next run exports it again first (review
+  lead A). It removes the record before each export, so an export whose rewrite did
   not finish has none. A warm pre-copy, sync or cutover on an existing export exports the workload again first when
   the record differs from what the plan holds now — a plan edited after a failed attempt (§12 `PATCH
   /plans/{id}`), so that the retry uses the fixed mapping — or when the export has none (written before this rule,
@@ -1046,7 +1049,7 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 | Strategy | precopy / sync | cutover | rollback |
 |---|---|---|---|
-| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — after `rollback_workloads.yml` when an earlier attempt left data (below) | `rollback_workloads.yml` |
+| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — `rollback_workloads.yml` between the two when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
 | `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
