@@ -22,8 +22,7 @@ def _tasks(node):
         if isinstance(task, dict):
             yield task
             for key in ("block", "rescue", "always"):
-                for inner in _tasks(task.get(key)):
-                    yield inner
+                yield from _tasks(task.get(key))
 
 
 def _workload_loops():
