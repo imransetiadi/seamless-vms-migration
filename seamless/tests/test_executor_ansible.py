@@ -1818,7 +1818,8 @@ def test_a_cold_rollback_deletes_the_volumes_the_cold_import_recorded(env):
     record["dest_volumes"] = {"/dev/vdb": {"dest_id": "dvol-1"}}
     path.write_text(json.dumps(record))
     assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_delete_dest_volumes"] is True
-    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.CUTOVER, stopped)
+    # with no server recorded, a cold re-run removes them first: it never reuses them (SDD §7)
+    assert build_vars(StepName.CUTOVER, stopped)["os_migrate_rollback_delete_dest_volumes"] is True
     warm, _ = ctx_for(env, strategy=Strategy.warm, downtime_started_at=utcnow())
     assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, warm)
 
@@ -1857,6 +1858,36 @@ async def test_a_cold_cutover_first_removes_what_an_earlier_warm_pre_copy_left(e
     assert cleanup["os_migrate_rollback_start_source"] is False
     assert "os_migrate_rollback_match_by_name" not in cleanup
     assert rec.downtime_marks == 1  # the import stopped the source, the cleanup did not
+
+
+async def test_a_cold_cutover_first_removes_the_volumes_an_earlier_cold_attempt_recorded(env):
+    """SDD §7 (review lead B): a cold transfer that failed or was cut short recorded the volumes it
+    created and no server; a cold re-run never reuses them, and its own record would replace
+    theirs - so the cutover deletes them first, as a warm pre-copy's, leaving the source as it is
+    (a retry keeps it stopped, its clock open) and matching no server by name."""
+    _state_file(
+        env,
+        {
+            "dest_volumes": {
+                "/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True, "name": "web-01"}
+            },
+            "passes": [],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "rollback_workloads.yml",
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    cleanup = calls[0]["vars"]
+    assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
+    assert cleanup["os_migrate_rollback_start_source"] is False
+    assert "os_migrate_rollback_match_by_name" not in cleanup
 
 
 async def test_a_cold_cutover_keeps_a_cold_record_and_a_warm_record_with_its_server(env):

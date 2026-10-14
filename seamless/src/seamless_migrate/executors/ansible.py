@@ -518,10 +518,10 @@ def build_vars(
     if (
         m.strategy == Strategy.cold
         and step == StepName.CUTOVER
-        and _warm_leftover(rdir / "osm", m.vm.source_id)
+        and _leftover(rdir / "osm", m.vm.source_id)
     ):
-        # the cleanup before the export removes what an earlier warm pre-copy left, and leaves
-        # the source as it is: a retry may keep it stopped (SDD §7, COLD-02, the owner's choice)
+        # the cleanup before the export removes what an earlier attempt left, and leaves the
+        # source as it is: a retry may keep it stopped (SDD §7, COLD-02, the owner's choice)
         out["os_migrate_rollback_delete_dest_volumes"] = True
         out["os_migrate_rollback_start_source"] = False
     if cancel_cleanup:
@@ -546,14 +546,15 @@ def _cold_volumes_recorded(osm: Path, server_id: str) -> bool:
     return bool((_read_warm_state(osm, server_id) or {}).get("dest_volumes"))
 
 
-def _warm_leftover(osm: Path, server_id: str) -> bool:
-    """What an earlier warm pre-copy of the migration left - passes or a pending source snapshot -
-    with no destination server: a cold cutover removes it first (SDD §7). A cold record has no
-    pass, and is a resumed cutover's own."""
+def _leftover(osm: Path, server_id: str) -> bool:
+    """What an earlier attempt of the migration left with no destination server - a warm
+    pre-copy's passes or pending source snapshot, or the volumes a cold transfer that failed or was
+    cut short recorded: a cold re-run never reuses them, so its cutover removes them first (SDD
+    §7). A record that names a server is a resumed cutover's own."""
     state = _read_warm_state(osm, server_id) or {}
-    return bool(state.get("passes") or state.get("pending_snapshot")) and not state.get(
-        "destination_server_id"
-    )
+    return bool(
+        state.get("passes") or state.get("pending_snapshot") or state.get("dest_volumes")
+    ) and not state.get("destination_server_id")
 
 
 class _Unsafe(str):
@@ -822,7 +823,7 @@ class AnsibleExecutor:
         export = [] if exported else [_Playbook("export_workloads.yml")]
         if strategy == Strategy.cold:
             if step == StepName.CUTOVER:
-                # what an earlier warm pre-copy left goes first, before the stop (SDD §7)
+                # what an earlier attempt left goes first, before the stop (SDD §7)
                 cleanup = [_Playbook("rollback_workloads.yml")] if leftover else []
                 return [
                     *cleanup,
@@ -896,7 +897,7 @@ class AnsibleExecutor:
         leftover = (
             strategy == Strategy.cold
             and step == StepName.CUTOVER
-            and await asyncio.to_thread(_warm_leftover, osm, ctx.migration.vm.source_id)
+            and await asyncio.to_thread(_leftover, osm, ctx.migration.vm.source_id)
         )
         playbooks = self._playbooks(step, strategy, osm, reexport=reexport, leftover=leftover)
         if not playbooks:
