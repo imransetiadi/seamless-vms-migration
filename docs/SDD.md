@@ -687,7 +687,11 @@ volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `
 records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
 soon as Cinder accepted it, before the transfer waits for it to become available and before its data is copied - a
 transfer that fails or is cut short, a volume that ends in `error` included, leaves the record of every volume it
-created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails - and `destination_server_id` as soon as Nova accepts the server. A cold
+created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails;
+and a re-run that records a new volume for a device the record holds an earlier attempt's volume for deletes that one
+first unless a server holds it - the cold path never reuses a volume, while one a server holds (a server the operator
+renamed rather than deleted) is that server's and only leaves the record; an earlier volume it cannot delete fails the
+transfer with the record unchanged (review RV3-02) - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
 playbooks when the workload has none, and a rollback or cleanup that deletes the recorded volumes empties the file
 instead of removing it: the file is the sign that the migration records its workload, so no later rollback takes a
