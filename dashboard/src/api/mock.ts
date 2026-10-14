@@ -1890,7 +1890,9 @@ export class MockServer {
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
       const mine = this.migrations.filter((m) => m.plan_id === p.id);
       const n = mine.filter((m) => !RELEASES_VM.has(m.phase)).length;
-      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.sync_passes.length > 0).length;
+      // the mock keeps no record: like the API without one, passes of a strategy other than cold - a cold rollback deleted
+      // what it copied (SDD §5.1, §12)
+      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.strategy !== 'cold' && m.sync_passes.length > 0).length;
       const why = [
         ...(n ? [`${n} VM${n === 1 ? '' : 's'} not finalized`] : []),
         ...(kept ? [`${kept} rolled-back VM${kept === 1 ? ' keeping its' : 's keeping their'} copied data`] : []),

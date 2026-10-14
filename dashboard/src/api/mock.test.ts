@@ -1252,6 +1252,7 @@ describe('mock API', () => {
     });
     const second = server.migrations.find((m) => m.plan_id === plan.id && m.id !== rolled.id)!;
     second.phase = 'rolled_back';
+    second.strategy = 'warm';
     second.sync_passes = passes.map((p) => ({ ...p }));
     expect(remove().body).toMatchObject({ error: { message: expect.stringContaining(`("${plan.name}", 2 rolled-back VMs keeping their copied data)`) } });
     second.phase = 'completed';
@@ -1259,6 +1260,11 @@ describe('mock API', () => {
       error: { message: expect.stringContaining(`("${plan.name}", 1 VM not finalized, 1 rolled-back VM keeping its copied data)`) },
     });
     second.phase = 'finalized';
+    // a cold rollback deleted what the cold import copied, though its cutover lists a pass (SDD §5.1, §12)
+    rolled.strategy = 'cold';
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.strategy = 'warm';
     // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
     await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
     expect(remove().status).toBe(204);
