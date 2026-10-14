@@ -199,7 +199,7 @@ def test_rollback_deletes_recorded_server_and_keeps_volumes(tmp_path):
         "deleted_volume_ids": [],
         "kept_volume_ids": [],
         "deleted_port_ids": [],
-        "state_deleted": False,
+        "state_cleared": False,
     }
     assert "dst-srv" not in dst.servers and "other" in dst.servers
     assert {"dvol-boot", "dvol-data", "unrelated"} <= set(dst.volumes)
@@ -224,9 +224,11 @@ def test_rollback_deletes_volumes_and_state_when_asked(tmp_path):
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
     assert result["kept_volume_ids"] == ["dvol-extra"]
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
     assert set(dst.volumes) == {"unrelated", "dvol-extra"}
-    assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
+    # emptied, not removed: the sign that the migration recorded the workload (SDD 6.3)
+    state = WarmState.load(state_dir, "srv-1")
+    assert state.exists() and (state.dest_volumes, state.passes) == ({}, [])
 
 
 def test_rollback_keeps_state_while_a_snapshot_is_pending(tmp_path):
@@ -237,7 +239,7 @@ def test_rollback_keeps_state_while_a_snapshot_is_pending(tmp_path):
         delete_volumes=True
     )
 
-    assert result["state_deleted"] is False
+    assert result["state_cleared"] is True
     state = WarmState.load(state_dir, "srv-1")
     assert state.pending_snapshot == pending  # source temporaries still to clean up
     assert state.dest_volumes == {} and state.passes == []
@@ -274,8 +276,8 @@ def test_rollback_keeps_volumes_held_by_another_server(tmp_path):
     assert result["kept_volume_ids"] == ["dvol-data"]
     assert "dvol-data" in dst.volumes
     assert not [c for c in dst.calls_to("detach_volume") if c[1]["volume"] == "dvol-data"]
-    assert result["state_deleted"] is True  # the kept volume is no longer recorded
-    assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
+    assert result["state_cleared"] is True  # the kept volume is no longer recorded
+    assert WarmState.load(state_dir, "srv-1").dest_volumes == {}
 
 
 def test_rollback_without_a_conversion_host_keeps_every_attached_volume(tmp_path):
@@ -403,7 +405,7 @@ def test_rollback_module(tmp_path):
     assert result["changed"] is True
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
 
     again = fake.run_module(rollback_module, args, dst)
     assert again["changed"] is False

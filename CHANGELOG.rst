@@ -250,3 +250,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   error. Before, its teardown read the PID of a forwarding process that did
   not exist, so it ended in ``AttributeError`` and skipped releasing the
   ports it had claimed, which then stayed claimed on the conversion host.
+- A rollback with ``os_migrate_rollback_delete_dest_volumes`` empties the
+  workload's warm state record instead of removing the file
+  (``import_workload_rollback`` returns ``state_cleared`` in place of
+  ``state_deleted``). The file is the sign that the workload's migration
+  recorded it: a later rollback with ``os_migrate_rollback_match_by_name``
+  then never takes a same-named server, such as another workload's, for the
+  workload's. Before, a cleanup before a re-run removed the file and the next
+  rollback matched any server by its name.

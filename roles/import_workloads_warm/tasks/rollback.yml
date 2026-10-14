@@ -1,7 +1,8 @@
 ---
 # Rollback of a workload: delete the destination server recorded in the
 # warm state (and, with os_migrate_rollback_delete_dest_volumes, the
-# destination volumes and the warm state), then start the source server -
+# destination volumes, emptying the warm state - the file stays), then start
+# the source server -
 # unless os_migrate_rollback_start_source is false (the cleanup before a cold
 # cutover, which leaves the source as it is).
 - name: Read the warm state of the workload

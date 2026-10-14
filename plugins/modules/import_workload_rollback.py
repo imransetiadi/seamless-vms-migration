@@ -129,8 +129,11 @@ deleted_port_ids:
   type: list
   elements: str
   sample: [6f2b0c1e-2d0a-4f4e-9a55-0d1f8c3b7a21]
-state_deleted:
-  description: Whether the warm state file was removed.
+state_cleared:
+  description:
+    - Whether the workload's warm state record holds no destination volume, pass or server
+      after the rollback. The file itself stays, as the sign that the workload's migration
+      recorded it, so no later rollback takes a same-named server for the migration's.
   returned: success
   type: bool
   sample: true

@@ -191,8 +191,59 @@ def test_a_cold_rollback_deletes_exactly_the_recorded_volumes(tmp_path):
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
     assert result["kept_volume_ids"] == ["dvol-extra"]
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
     assert set(dst.volumes) == {"unrelated", "dvol-extra"}
+
+
+def test_a_rollback_empties_the_record_and_keeps_the_file(tmp_path):
+    """SDD 6.3, 6.4 (review RV3-03): a rollback that deletes the recorded volumes empties the
+    record - no volume, pass or server - and keeps the file, the sign that the migration recorded
+    its workload; a second rollback finds nothing more to do."""
+    dst, state_dir = migrated(tmp_path, record=False)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-srv", "vm1")
+    _record(state_dir, TRANSFERRED)
+    rollback = lambda: WarmRollback(  # noqa: E731
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=True, timeout=5
+    ).run(delete_volumes=True)
+
+    result = rollback()
+
+    assert result["changed"] is True and result["state_cleared"] is True
+    state = WarmState.load(state_dir, "srv-1")
+    assert state.exists() and state.server_name == "vm1"
+    assert (state.dest_volumes, state.passes, state.destination_server_id) == ({}, [], None)
+    again = rollback()
+    assert again["changed"] is False and again["state_cleared"] is True
+
+
+def test_after_a_cleanup_no_rollback_takes_a_same_named_server_for_the_migrations(tmp_path):
+    """SDD 6.4, 7 (review RV3-03): the cleanup before a cold re-run deletes the recorded volumes
+    and empties the record instead of removing it, so the cold rollback after the stop - with
+    match_by_name - still finds the record and never takes another plan's server named vm1 (and
+    the boot volume Nova would delete with it) for the migration's."""
+    dst = fake.FakeCloud("dst")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)  # a transfer that failed before any server
+    dst.add_server("plan-b-vm1", "vm1")
+    dst.add_volume(
+        "plan-b-boot", "vm1-boot", 20, bootable=True, server_id="plan-b-vm1", device="/dev/vda"
+    )
+
+    cleanup = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", timeout=5,
+        conversion_host="dst-conv",
+    ).run(delete_volumes=True)
+    rollback = WarmRollback(
+        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=True, timeout=5,
+        conversion_host="dst-conv",
+    ).run(delete_volumes=False)
+
+    assert cleanup["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
+    assert rollback["deleted_server_id"] is None
+    assert "plan-b-vm1" in dst.servers and "plan-b-boot" in dst.volumes
 
 
 # Cinder's answer to a DELETE of a volume that is already being deleted (openstacksdk: a volume in
@@ -262,7 +313,7 @@ def test_a_cold_rollback_waits_for_the_boot_volume_nova_deletes_with_the_server(
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-data"]  # the boot volume went with the server
     assert set(dst.volumes) == {"unrelated"}
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
     assert not [c for c in dst.calls_to("delete_volume") if c[1]["name_or_id"] == "dvol-boot"]
 
 

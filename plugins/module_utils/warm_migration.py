@@ -1090,7 +1090,7 @@ class WarmRollback:
             "deleted_volume_ids": [],
             "kept_volume_ids": [],
             "deleted_port_ids": [],
-            "state_deleted": False,
+            "state_cleared": False,
         }
         recorded = self.state.exists()
         volume_ids = [
@@ -1138,20 +1138,22 @@ class WarmRollback:
             if recorded:
                 self.state.save()
         if recorded:
-            if self.state.pending_snapshot is None:
-                self.state.delete()
-                result["state_deleted"] = True
-            else:
+            if self.state.pending_snapshot is not None:
                 self.log.warning(
-                    "Keeping the warm state of %s: its source snapshot of transfer %s "
+                    "Keeping the pending snapshot of %s: its source snapshot of transfer %s "
                     "still has to be cleaned up",
                     self.state.server_id,
                     self.state.pending_snapshot.get("transfer_uuid"),
                 )
+            # emptied, never removed: the file is the sign that the workload's migration recorded
+            # it, so no later rollback takes a same-named server it does not record for the
+            # migration's (SDD 6.3, 6.4)
+            if self.state.dest_volumes or self.state.passes:
                 self.state.dest_volumes = {}
                 self.state.passes = []
                 self.state.save()
-            result["changed"] = True
+                result["changed"] = True
+            result["state_cleared"] = True
         return result
 
     def _delete_ports(self, deleted_server_id):

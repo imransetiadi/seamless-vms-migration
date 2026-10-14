@@ -25,7 +25,7 @@ the task file:
 |---|---|
 | `import_workloads_precopy.yml` | snapshot → sync (`auto`: `full` on the first pass, then `delta`) → remove the snapshot |
 | `import_workloads_cutover.yml` | stop the source (wait for SHUTOFF) → snapshot → sync (`final`) → remove the snapshot → create the destination server from the synchronised volumes (`import_workload_create_instance`) and record its ID |
-| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes and the warm state) → start the source server (unless `os_migrate_rollback_start_source: false`) |
+| `rollback_workloads.yml` | delete the recorded destination server (and, with `os_migrate_rollback_delete_dest_volumes`, the destination volumes, emptying the warm state) → start the source server (unless `os_migrate_rollback_start_source: false`) |
 
 Run `export_workloads.yml` first, as for `import_workloads.yml`. Pre-copy can
 run any number of times; a cutover that already created the destination
@@ -71,7 +71,7 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 |---|---|---|
 | `os_migrate_warm_chunk_size` | `4194304` | blocksync chunk size in bytes |
 | `os_migrate_warm_workers` | `4` | read-ahead hashing threads per conversion host and disk |
-| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and the warm state; a volume still attached to a server other than the destination conversion host is kept and reported |
+| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and empties the warm state - the file stays, the sign that the workload's migration recorded it, so no later rollback takes a same-named server for the workload's; a volume still attached to a server other than the destination conversion host is kept and reported |
 | `os_migrate_warm_parallel_disks` | `4` | disks of a workload synchronised at the same time |
 | `os_migrate_warm_assume_zero` | `false` | skip reading destination volumes created by the first pre-copy pass; only for backends that return zeros for never-written blocks (Ceph RBD, thin LVM). Never applied to a final pass |
 | `os_migrate_workloads_preserve_volume_type` | `false` | create destination volumes with the serialized `volume_type` (rewrite it to a destination type in the workload data first) instead of the destination default; also honoured by `import_workloads` |

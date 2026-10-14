@@ -151,21 +151,17 @@ elif NAME == "import_workload_rollback":
     exists = os.path.exists(path)
     state = load(path)
     result = {"changed": False, "deleted_server_id": state["destination_server_id"],
-              "deleted_volume_ids": [], "state_deleted": False}
+              "deleted_volume_ids": [], "state_cleared": False}
     if exists:
         result["changed"] = True
         state["destination_server_id"] = None
         if args["delete_dest_volumes"]:
             result["deleted_volume_ids"] = sorted(
                 v["dest_id"] for v in state["dest_volumes"].values())
-            state["dest_volumes"] = {}
-            if state["pending_snapshot"] is None:
-                os.remove(path)
-                result["state_deleted"] = True
-            else:
-                save(path, state)
-        else:
-            save(path, state)
+            # as the module does: the record is emptied, the file stays (SDD 6.3)
+            state["dest_volumes"], state["passes"] = {}, []
+            result["state_cleared"] = True
+        save(path, state)
 elif NAME == "import_workload_export_volumes":
     result = {"changed": True, "transfer_uuid": "uuid-cold-" + name, "volume_map": {
         "/dev/vda": {"source_id": "svol-%%s-vda" %% name, "size": 1, "bootable": True,
@@ -462,7 +458,10 @@ def test_warm_playbooks_story(env):
     assert rollback["match_by_name"] is False
     conversion = [c for c in calls if c["module"] == "os_conversion_host_info"]
     assert len(conversion) == 1 and conversion[0]["args"]["cloud"] == "src"
-    assert env.state("srv-1") is None and env.state("srv-2") is None
+    for server_id in ("srv-1", "srv-2"):  # emptied, not removed (SDD 6.3)
+        state = env.state(server_id)
+        assert (state["dest_volumes"], state["passes"]) == ({}, []), server_id
+        assert state["destination_server_id"] is None and state["pending_snapshot"] is None
 
 
 def test_failed_precopy_removes_the_snapshot_and_reports(env):
@@ -560,7 +559,8 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
 
     assert rc == 0, out
     assert modules_for(calls, "vm1", "srv-1") == ["import_workload_rollback"]
-    assert env.state("srv-1") is None  # the volumes and the warm state are gone
+    # the volumes are gone, the record is emptied - the file stays (SDD 6.3)
+    assert (env.state("srv-1")["dest_volumes"], env.state("srv-1")["passes"]) == ({}, [])
     assert "source server left as it was" in out
 
     rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
