@@ -791,9 +791,11 @@ whose owner ran on its own host and is no longer alive — a module killed by a 
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check. Each detach of a volume - from a conversion
-host or from the source VM - waits, within the module's timeout, until Cinder shows the volume `available`:
-openstacksdk 4.x's `detach_volume(wait=True)` ignores its `timeout` and would wait forever for a detach that never
-ends, holding the attach lock meanwhile; a detach still not done at the timeout fails the module (review 5).
+host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
+attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
+`available`: openstacksdk 4.x's `detach_volume(wait=True)` ignores its `timeout` and waits for `available`, which a
+shared disk never reaches, holding the attach lock meanwhile; a detach still not done at the timeout fails the module
+(review 5, RV6-01).
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
@@ -1052,6 +1054,11 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   on a cold cutover stopped and migrated. After `export_workloads.yml` the executor keeps only the
   server resource whose `_info.id` equals `vm.source_id` (other resource types are kept); when the
   export holds no such server the step fails permanently before any import playbook runs.
+* Every validated disk: the kept server must still list, in `params.volumes[]._info.id`, every volume the
+  migration validated (`vm.disks` of kind `volume`). A volume detached from the source VM since - by an
+  operator, or by an earlier attempt whose export failed after it detached the VM's data volumes - is
+  otherwise left out of the import, and the migration would report success without that disk; the step
+  fails permanently, naming the volumes, before any import playbook runs (review RV6-01).
 * Mappings: after `export_workloads.yml`, the executor rewrites the exported `workloads.yml` with the
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
