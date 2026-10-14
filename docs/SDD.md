@@ -690,12 +690,16 @@ records, from the transfer's `volume_map` — never a volume it did not create, 
 soon as Cinder accepted it, before the transfer waits for it to become available and before its data is copied - a
 transfer that fails or is cut short, a volume that ends in `error` included, leaves the record of every volume it
 created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails;
-and a re-run that records a new volume for a device the record holds an earlier attempt's volume for deletes that one
-first unless a server holds it - the cold path never reuses a volume, while one a server holds (a server the operator
-renamed rather than deleted) is that server's and only leaves the record; one Cinder is already deleting (the boot
-volume Nova deletes with its server) is gone already, and one only the destination conversion host holds (a transfer
-cut short) is the migration's own: detached from it, then deleted; an earlier volume it cannot delete fails the
-transfer with the record unchanged (review RV3-02, RV4-02, RV4-05) - and `destination_server_id` as soon as Nova accepts the server. A cold
+and a re-run whose record holds an earlier attempt's volume for one of its devices removes it before it creates any
+volume - the cold path never reuses a volume - unless a server holds it: one a server holds (a server the operator
+renamed rather than deleted) is that server's and only leaves the record, when the new volume of its device is
+recorded; one only the destination conversion host holds (a transfer cut short) is the migration's own and is detached
+from it. The re-run deletes each earlier volume it removes - one Cinder is already deleting (the boot volume Nova
+deletes with its server) is not deleted again - and waits, within the transfer's timeout, until Cinder no longer has
+it: an earlier volume stays recorded until it is gone, and no new volume waits unrecorded meanwhile. An earlier volume
+it cannot remove - its detach or delete fails, Cinder gives up deleting it, or it is still there at the timeout -
+fails the transfer before any volume is created, with the record unchanged (review RV3-02, RV4-02, RV4-05, RV5-01,
+RV5-02) - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
 playbooks when the workload has none, and a rollback or cleanup that deletes the recorded volumes empties the file
 instead of removing it: the file is the sign that the migration records its workload, so no later rollback takes a
