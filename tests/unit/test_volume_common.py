@@ -342,6 +342,49 @@ def test_a_transfer_failing_before_its_forwarding_starts_reports_why_and_frees_i
     assert not dst.calls_to("create_volume")
 
 
+def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
+    """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
+    host's attach lock - detaches those and leaves the volume map's volumes attached; given none,
+    it detaches the volume map's, as before."""
+    dst = cloud()
+    shells = fake.ShellFactory([dst])
+    with mock.patch.object(volume_common, "RemoteShell", shells):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", timeout=5
+        )
+    conversion_host = dst.servers["dst-conv"]
+    for volume_id in ("vol-mine", "vol-earlier"):
+        dst.add_volume(volume_id, volume_id, 1)
+        dst.attach_volume(conversion_host, dst.volumes[volume_id])
+    transfer.volume_map = {"/dev/vda": {"dest_id": "vol-mine"}}
+
+    transfer._detach_volumes_from_destination_converter(["vol-earlier"])
+    assert not dst.volumes["vol-earlier"].attachments
+    assert dst.volumes["vol-mine"].attachments  # the volume map's stay attached
+    flocks = [c for c in shells.commands_at(CONV) if c[:2] == ["sudo", "flock"]]
+    assert volume_common.ATTACH_LOCK_FILE_DESTINATION in flocks[-1]
+
+    transfer._detach_volumes_from_destination_converter()
+    assert not dst.volumes["vol-mine"].attachments
+
+
+def test_the_fake_conversion_host_refuses_a_lock_its_holder_takes_again():
+    """use_lock does not nest - on a real conversion host a holder taking its lock again waits for
+    itself until it times out - so the fake fails a test that nests it at once, and the lock is
+    free again once the outer holder released it."""
+    dst = cloud()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1"
+        )
+    lock = volume_common.use_lock(volume_common.ATTACH_LOCK_FILE_DESTINATION)
+    inner = lock(lambda self: "inner")
+    outer = lock(inner)
+    with pytest.raises(AssertionError, match="does not nest"):
+        outer(transfer)
+    assert inner(transfer) == "inner"
+
+
 def test_a_volume_cinder_no_longer_has_reads_as_none():
     """openstacksdk 4.x's get_volume_by_id raises NotFoundException for a missing volume - its
     docstring's "else None" notwithstanding: volume_or_none reads that as None, and lets any

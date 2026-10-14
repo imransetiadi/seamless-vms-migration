@@ -72,7 +72,7 @@ def use_lock(lock_file):
     """Boilerplate for functions that need to take a lock."""
 
     def _decorate_lock(function):
-        def wait_for_lock(self):
+        def wait_for_lock(self, *args, **kwargs):
             if self.check_and_cleanup_lockfiles():
                 self.log.info("Cleaned up unused lockfiles before start")
             for second in range(DEFAULT_TIMEOUT):
@@ -114,7 +114,7 @@ def use_lock(lock_file):
             else:
                 raise RuntimeError("Unable to acquire lock " + lock_file)
             try:
-                return function(self)
+                return function(self, *args, **kwargs)
             finally:
                 try:
                     lock = lock_file + ".lock"
@@ -297,12 +297,17 @@ class OpenStackVolumeBase:
         return volume_or_none(self.conn, id_maybe)
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
-    def _detach_volumes_from_destination_converter(self):
-        """Detach volumes from conversion host."""
+    def _detach_volumes_from_destination_converter(self, volume_ids=None):
+        """
+        Detach volumes from conversion host: the volume map's destination
+        volumes, or the volumes ``volume_ids`` names (Seamless Migrate SDD 6.3).
+        """
         self.log.info("Detaching volumes from the destination conversion host.")
+        if volume_ids is None:
+            volume_ids = [mapping["dest_id"] for mapping in self.volume_map.values()]
         converter = self._converter()
-        for path, mapping in self.volume_map.items():
-            volume = self._get_volume_maybe(mapping["dest_id"])
+        for volume_id in volume_ids:
+            volume = self._get_volume_maybe(volume_id)
             if not volume:
                 continue
             if not self._volume_still_attached(volume, converter):
@@ -318,7 +323,7 @@ class OpenStackVolumeBase:
             )
             for second in range(self.timeout):
                 converter = self._converter()
-                volume = volume_or_none(self.conn, mapping["dest_id"])
+                volume = volume_or_none(self.conn, volume_id)
                 if volume is None or not self._volume_still_attached(volume, converter):
                     break
                 time.sleep(1)

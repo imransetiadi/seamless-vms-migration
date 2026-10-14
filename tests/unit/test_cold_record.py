@@ -667,3 +667,110 @@ def test_a_warm_rollback_with_a_recorded_volume_gone_still_runs(tmp_path):
 
     assert result["deleted_server_id"] is None
     assert "dvol-boot" in dst.volumes
+
+
+def test_a_rerun_takes_the_earlier_boot_volume_nova_is_deleting_as_gone(tmp_path):
+    """SDD 6.3 (review RV4-02): the operator deleted the recorded server; Nova deletes its boot
+    volume with it, which Cinder shows `deleting` for a while and refuses to delete again - the
+    re-run takes it as gone and carries on, deleting the earlier data volume no server holds."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1", "vm1")
+    dst.add_server("dst-s1", "vm1")
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True, server_id="dst-s1", device="/dev/vda")
+    dst.add_volume("dvol-data", "vm1-data", 10, server_id="dst-s1", device="/dev/vdb")
+    nova_deletes_on_termination(dst, "dst-s1", ["dvol-boot"], reads_until_gone=50)
+    dst.compute.delete_server(dst.servers["dst-s1"])
+    assert dst.volumes["dvol-boot"].status == "deleting"
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    transfer._create_destination_volumes()
+
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert "dvol-data" not in dst.volumes
+    assert not {"dvol-boot", "dvol-data"} & {entry["dest_id"] for entry in recorded.values()}
+    assert not [c for c in dst.calls_to("delete_volume") if c[1]["name_or_id"] == "dvol-boot"]
+
+
+def test_a_rerun_removes_the_earlier_volumes_left_on_the_conversion_host(tmp_path):
+    """SDD 6.3 (review RV4-05): a transfer cut short left its volumes attached to the destination
+    conversion host - the migration's own, no other server's: the re-run detaches them from it and
+    deletes them, so none drops out of the record unremoved."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    warm_migration.record_destination_server(state_dir, "srv-1", "dst-s1", "vm1")  # stale
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    conversion_host = dst.servers["dst-conv"]
+    for volume_id in ("dvol-boot", "dvol-data"):
+        dst.attach_volume(conversion_host, dst.volumes[volume_id])
+    shells = fake.ShellFactory([dst, src])
+    with mock.patch.object(volume_common, "RemoteShell", shells):
+        transfer = _transfer(dst, state_dir)
+    nova_detach, locked = dst.detach_volume, []
+
+    def detach_volume(server, volume, **kwargs):
+        locked.append(_holds_lock(shells, volume_common.ATTACH_LOCK_FILE_DESTINATION))
+        return nova_detach(server, volume, **kwargs)
+
+    dst.detach_volume = detach_volume
+    transfer._create_destination_volumes()
+
+    recorded = {e["dest_id"] for e in WarmState.load(state_dir, "srv-1").dest_volumes.values()}
+    assert recorded == set(dst.volumes)  # nothing in the destination the record does not name
+    assert not {"dvol-boot", "dvol-data"} & set(dst.volumes)
+    # under the conversion host's attach lock, as every detach: another migration's attach
+    # finds its device by what lsblk lists before and after it
+    assert locked == [True, True]
+
+
+def test_an_earlier_volume_the_conversion_host_and_a_server_hold_is_kept(tmp_path):
+    """SDD 6.3 (review RV4-05): only a volume the conversion host alone holds is the migration's -
+    one a server holds as well (a multi-attach volume) stays that server's: never detached from
+    the conversion host, never deleted, and the record drops it."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _earlier_attempt(state_dir, dst, data_holder="dst-s1-renamed")
+    dst.attach_volume(dst.servers["dst-conv"], dst.volumes["dvol-data"])
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    transfer._create_destination_volumes()
+
+    assert "dvol-data" in dst.volumes
+    assert not [c for c in dst.calls_to("detach_volume") if c[1]["volume"] == "dvol-data"]
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert "dvol-data" not in [entry["dest_id"] for entry in recorded.values()]
+
+
+def test_an_earlier_volume_the_rerun_cannot_detach_fails_the_transfer(tmp_path):
+    """SDD 6.3 (review RV4-05): an earlier volume left on the conversion host that the re-run
+    cannot detach fails the transfer with the record unchanged, as one it cannot delete does."""
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _earlier_attempt(state_dir, dst)
+    dst.attach_volume(dst.servers["dst-conv"], dst.volumes["dvol-data"])
+
+    def nova_detach(server, volume, **kwargs):
+        raise RuntimeError("Nova refused the detach")
+
+    dst.detach_volume = nova_detach
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    with pytest.raises(RuntimeError, match="Could not delete volume dvol-data .*: Nova refused"):
+        transfer._create_destination_volumes()
+
+    recorded = WarmState.load(state_dir, "srv-1").dest_volumes
+    assert recorded["/dev/vdb"]["dest_id"] == "dvol-data"  # unchanged
+    # every volume left in the destination is recorded: this run's data volume was removed
+    assert sorted(entry["dest_id"] for entry in recorded.values()) == sorted(dst.volumes)
+
+
+def _holds_lock(shells, lock_file):
+    """Whether the transfer holds ``lock_file`` on the conversion host now: its last flock of it
+    came after its last removal of the lock file."""
+    commands = [c for shell in shells.shells for c in shell.commands]
+    taken = [i for i, c in enumerate(commands) if c[:2] == ["sudo", "flock"] and lock_file in c]
+    freed = [i for i, c in enumerate(commands) if c[:3] == ["sudo", "rm", "-vf"] and lock_file + ".lock" in c]
+    return bool(taken) and (not freed or taken[-1] > freed[-1])

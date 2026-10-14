@@ -355,17 +355,25 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         earlier attempt recorded for it unless a server holds it: the cold path
         never reuses a volume, and one a server holds (a server the operator
         renamed rather than deleted) is that server's - it only leaves the
-        record. An earlier volume that cannot be deleted fails the transfer
-        with the record unchanged (Seamless Migrate SDD 6.3).
+        record. One Cinder is already deleting (the boot volume Nova deletes
+        with its server) is gone already, and one only the destination
+        conversion host holds (a transfer cut short) is the migration's own:
+        detached from it under the attach lock, then deleted. An earlier volume
+        that cannot be deleted fails the transfer with the record unchanged
+        (Seamless Migrate SDD 6.3, review RV3-02, RV4-02, RV4-05).
         """
         state = warm_migration.WarmState.load(self.warm_state_dir, server_id)
         earlier_id = (state.dest_volumes.get(path) or {}).get("dest_id")
         if not earlier_id or earlier_id == self.volume_map[path]["dest_id"]:
             return
         volume = volume_or_none(self.conn, earlier_id)
-        if volume is None:
-            return  # gone already: Nova deletes a boot volume with its server
-        if getattr(volume, "attachments", None):
+        if volume is None or getattr(volume, "status", None) == "deleting":
+            # gone already, or going: Nova deletes a boot volume with its server, and Cinder
+            # refuses a second delete meanwhile
+            return
+        converter = self._converter()
+        holders = [a["server_id"] for a in getattr(volume, "attachments", None) or []]
+        if any(holder != converter.id for holder in holders):
             self.log.warning(
                 "Keeping volume %s an earlier attempt made for %s: a server holds it",
                 earlier_id,
@@ -374,6 +382,9 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             return
         self.log.info("Deleting volume %s an earlier attempt left for %s", earlier_id, path)
         try:
+            if holders:
+                # a transfer cut short left it on the destination conversion host
+                self._detach_volumes_from_destination_converter([earlier_id])
             self.conn.delete_volume(name_or_id=earlier_id, wait=False)
         except Exception as err:
             raise RuntimeError(

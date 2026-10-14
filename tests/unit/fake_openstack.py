@@ -51,6 +51,8 @@ class FakeCloud:
         self.subnets = {}
         self.floating_ips = {}
         self.addresses = {}
+        # the lock files each conversion host holds now, by its address (use_lock)
+        self.held_locks = {}
         self.fail_on = {}
         # the credential: its project, and the role names of its token (a member by default)
         self.current_project_id = "project-%s" % name
@@ -481,6 +483,8 @@ class FakeShell:
 
     def cmd_out(self, command, **kwargs):
         self.commands.append(list(command))
+        if command[:3] == ["sudo", "rm", "-vf"]:  # use_lock releases its lock
+            self.cloud.held_locks.get(self.address, set()).discard(command[3])
         if command and command[0] == "lsblk":
             server_id = self.cloud.addresses[self.address]
             return "\n".join(self.cloud.devices[server_id])
@@ -494,6 +498,14 @@ class FakeShell:
                 return rc
         if command[:2] == ["timeout", "1"]:
             return 124  # "timeout 1 nc -l PORT" timed out: the port is free
+        if command[:2] == ["sudo", "flock"]:
+            # use_lock takes the lock file; on a real conversion host a holder taking it again
+            # waits for itself until it times out - here the test fails at once
+            lock = command[6] + ".lock"
+            held = self.cloud.held_locks.setdefault(self.address, set())
+            if lock in held:
+                raise AssertionError("%s is held already on %s: use_lock does not nest" % (lock, self.address))
+            held.add(lock)
         return 0
 
     def cmd_sub(self, command, **kwargs):
