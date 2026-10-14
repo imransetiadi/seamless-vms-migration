@@ -1177,7 +1177,9 @@ class WarmRollback:
             return self.conn.compute.find_server(
                 self.state.destination_server_id, ignore_missing=True
             )
-        if not (self.match_by_name and self.server_name):
+        if not (self.match_by_name and self.server_name) or self.state.exists():
+            # the name serves only a workload migrated before anything was recorded for it: a
+            # state file without a server means Nova never accepted one (SDD 6.4, 7)
             return None
         # Nova filters names by regular expression; compare exactly as well.
         candidates = [

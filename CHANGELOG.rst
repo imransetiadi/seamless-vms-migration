@@ -239,3 +239,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   deletes no destination port. Seamless Migrate's cleanup after a cancel
   uses it, as it made no port and an unbound one keyed to the VM's source
   port may belong to another migration of the same VM.
+- ``import_workload_rollback`` with ``match_by_name`` looks a server up by
+  name only when the workload has no state file at all; a state file that
+  records no server means Nova never accepted one, so a same-named server
+  is another one and is kept.

@@ -212,3 +212,29 @@ def test_a_volume_nova_begins_deleting_during_the_rollbacks_own_delete_is_waited
 
     assert result["deleted_volume_ids"] == ["dvol-boot"]
     assert set(dst.volumes) == {"unrelated"}
+
+
+def test_a_cold_record_without_a_server_never_matches_one_by_name(tmp_path):
+    """SDD 6.4, 7 (review RV-05): the cold import recorded its volumes, then Nova never accepted a
+    server - the name serves only a workload migrated before anything was recorded, so a
+    same-named server is another one, and is kept; the recorded volumes go."""
+    dst = fake.FakeCloud("dst")
+    dst.add_conversion_host("dst-conv", "10.1.0.10")
+    dst.add_server("someone-elses", "vm1")
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+
+    result = WarmRollback(
+        dst,
+        WarmState.load(state_dir, "srv-1"),
+        server_name="vm1",
+        match_by_name=True,
+        timeout=5,
+        conversion_host="dst-conv",
+    ).run(delete_volumes=True)
+
+    assert result["deleted_server_id"] is None, result
+    assert "someone-elses" in dst.servers
+    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
