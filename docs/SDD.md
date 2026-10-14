@@ -791,10 +791,12 @@ whose owner ran on its own host and is no longer alive — a module killed by a 
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check. A lock wait gives up once ssh to the conversion
-host has failed for a minute without a break (ssh's own exit status 255), with "Cannot reach conversion host {address} over
-SSH for {n} s to take lock {lock}": the wait tried up to 1800 times, each try up to the 10 s connect timeout, about 5.5 h,
-while a cold cutover's source stays stopped. One failed connection, or a lock another migration holds, starts that minute
-again. Each detach of a volume - from a conversion
+host has failed for a minute without a break (ssh's own exit status 255), with "Lock timeout: conversion host {address}
+unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s connect
+timeout, about 5.5 h, while a cold cutover's source stays stopped. The executor retries that failure as transient, as it
+does a conversion host reboot mid-pass (QASuite R-07); a retry while the host is still down fails at once on the module's
+SSH check. One failed connection, or a lock another migration holds, starts that minute again. Each detach of a volume -
+from a conversion
 host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
 attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
 `available`: openstacksdk 4.x's `detach_volume(wait=True)` ignores its `timeout` and waits for `available`, which a
