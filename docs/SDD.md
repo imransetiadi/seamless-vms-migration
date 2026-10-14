@@ -675,8 +675,9 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
 ```
 
 The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
-volumes its transfer created (`dest_volumes`, a `dest_id` each — never a volume it did not create, as with
-`data_copy: false`) as soon as they exist, and `destination_server_id` as soon as Nova accepts the server. A cold
+volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
+records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) as soon
+as they exist, and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7); a cold migration cut over before the cold import recorded anything has no file.
 
 ### 6.4 New Ansible modules
@@ -685,7 +686,7 @@ rollback reads it (§7); a cold migration cut over before the cold import record
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
-| `import_workload_record_volumes` | — | Record the destination volumes a cold transfer created (`volume_map` of `import_workload_transfer_volumes`: a `dest_id` per device) in the workload's state file (§6.3), keeping what the file already holds; changes no cloud. |
+| `import_workload_record_volumes` | — | Record the destination volumes a cold transfer created (`volume_map` of `import_workload_transfer_volumes`: each device's `dest_id`, with its `size`, `bootable` and `name`) in the workload's state file (§6.3), as the warm path records its volumes, keeping what the file already holds; changes no cloud. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`) — and the warm state file (kept while a source snapshot is pending). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
