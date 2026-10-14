@@ -346,8 +346,15 @@ class VMwareProvider:
     async def get_vm(self, source_id: str) -> VMRef:
         def work(content: Any, vim: Any) -> VMRef | None:
             vm = self._find_by_uuid(content, source_id)
-            if vm is None or getattr(vm, "config", None) is None:
+            if vm is None:
                 return None
+            if getattr(vm, "config", None) is None:
+                # vCenter has the VM but cannot read its configuration (its files are unreachable,
+                # a datastore outage): it is there, not gone (SDD §10, review RV-06)
+                raise ProviderError(
+                    f"{self.provider.id}: VM {source_id!r} found but its configuration is "
+                    "unavailable"
+                )
             fields, portgroups = self._context(content, vim)
             return map_vm(vm, vim, portgroups, fields)
 

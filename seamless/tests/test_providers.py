@@ -1099,6 +1099,40 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
         await provider.get_vm("missing")  # falls back to the walk, then fails
 
 
+async def test_vmware_get_vm_of_an_inaccessible_vm_is_not_vm_not_found(tmp_path):
+    """SDD §10 (review RV-06): vCenter leaves a VM's config unset while its files are unreachable
+    (a datastore outage) - FindByUuid still finds it: the VM is there, not gone. A VMNotFound would
+    let the source watch clear the running flag of a VM that exists."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM(state="poweredOn")
+    vm.config = None
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        content = si.RetrieveContent()
+        content.searchIndex = NS(
+            FindByUuid=lambda dc, uuid, is_vm, instance: vm if uuid == "5012-abcd" else None
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError, match="configuration is unavailable") as failed:
+        await provider.get_vm("5012-abcd")
+    assert not isinstance(failed.value, VMNotFound)
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("missing")  # vCenter has no such VM: gone
+
+
 async def test_vmware_used_bytes_come_from_the_disk_layout(tmp_path):
     """Thin disks: the extent files behind a disk's chain are its used space (no 60 % rule)."""
     secret_dir = tmp_path / "secrets" / "vcenter-dc2"
