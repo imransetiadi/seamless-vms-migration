@@ -821,8 +821,11 @@ needs only the OpenStack API, and the cleanup checks SSH before anything else, s
 once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). It runs no
 step over SSH there. Before, the module failed without the map, the rescue skipped
 the cleanup, and the rollback that follows started the source VM without the data volumes the export had detached. The
-cleanup takes a partial map: it detaches from the source conversion host each mapped volume Cinder lists as attached
-there, whether or not its device was recorded; it re-attaches each data volume the source VM no longer holds; and it
+cleanup takes a partial map: it detaches from the source conversion host each mapped volume this transfer attached there
+and Cinder still lists there - the export marks a volume `source_attached` in its map as soon as Nova accepts the
+attach, before its device shows, so a volume whose device was never recorded is detached too, while a shared
+multi-attach volume another migration's export attached is never (Cinder's attachment names the server, not the
+migration; review RV8-02); it re-attaches each data volume the source VM no longer holds; and it
 removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
 volume the source VM holds, such as its own boot volume before a copy exists. The export records the root snapshot and
 the image as soon as each exists, so a failure between them and the copy leaves neither behind.
