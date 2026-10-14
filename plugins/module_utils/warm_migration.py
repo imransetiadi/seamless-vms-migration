@@ -339,7 +339,7 @@ class _WarmVolumeBase(OpenStackVolumeBase):
         self._progress_lock = threading.Lock()
 
     def _wait_detached(self, volume_id, side):
-        for _ in range(self.timeout):
+        for second in range(self.timeout):
             volume = self.conn.get_volume_by_id(volume_id)
             if volume is None or not self._volume_still_attached(volume, self._converter()):
                 return
@@ -569,7 +569,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_tmp_volumes(self):
         self._detach_from_converter(
-            [entry.get("tmp_volume_id") for _, entry in sorted(self.volume_map.items())],
+            [self.volume_map[dev].get("tmp_volume_id") for dev in sorted(self.volume_map)],
             "source",
         )
 
@@ -1093,7 +1093,9 @@ class WarmRollback:
             "state_deleted": False,
         }
         recorded = self.state.exists()
-        volume_ids = [entry["dest_id"] for _, entry in sorted(self.state.dest_volumes.items())]
+        volume_ids = [
+            self.state.dest_volumes[dev]["dest_id"] for dev in sorted(self.state.dest_volumes)
+        ]
         # With a warm state its volumes are the migration's; another volume attached to the
         # destination server (e.g. by an operator after the cutover) is kept (SDD 6.5). Without
         # one (cold) the destination server's attachments are the migration's.
@@ -1208,7 +1210,7 @@ class WarmRollback:
         volume = self.conn.get_volume_by_id(volume_id)
         if volume is None:
             return False
-        for _ in range(self.timeout):
+        for second in range(self.timeout):
             volume = self.conn.get_volume_by_id(volume_id)
             if volume is None:
                 return False
@@ -1259,7 +1261,7 @@ class WarmRollback:
 
     def _wait_gone(self, volume_id):
         """Wait until a volume Cinder is deleting is gone (SDD 6.4)."""
-        for _ in range(self.timeout):
+        for second in range(self.timeout):
             if self.conn.get_volume_by_id(volume_id) is None:
                 return
             time.sleep(1)

@@ -21,7 +21,7 @@ extends_documentation_fragment:
 
 version_added: "1.1.0"
 
-author: "Seamless Migrate contributors"
+author: "Seamless Migrate contributors (!UNKNOWN)"
 
 description:
   - "Deletes the destination server recorded as C(destination_server_id) in the

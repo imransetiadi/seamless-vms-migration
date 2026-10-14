@@ -136,6 +136,14 @@ options:
       - Optional, used when the nbdkit server requires an export name.
     required: false
     type: str
+  preserve_volume_type:
+    description:
+      - Create the destination volumes with the serialized C(volume_type) instead
+        of the destination's default type. Set it when the volume types in the
+        workload data were already rewritten to destination types.
+    required: false
+    default: false
+    type: bool
   warm_state_dir:
     description:
       - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).

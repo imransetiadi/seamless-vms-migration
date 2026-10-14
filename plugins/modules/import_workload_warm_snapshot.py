@@ -21,7 +21,7 @@ extends_documentation_fragment:
 
 version_added: "1.1.0"
 
-author: "Seamless Migrate contributors"
+author: "Seamless Migrate contributors (!UNKNOWN)"
 
 description:
   - "Source-cloud half of a warm migration pass. With C(state=present) every
