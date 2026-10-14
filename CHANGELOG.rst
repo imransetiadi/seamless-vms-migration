@@ -332,9 +332,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   the export failed without the map, nothing was put back, and the rollback
   started the source VM without the data volumes the export had detached. The
   source cleanup
-  takes such a partial map: it detaches each volume Cinder lists on the
-  conversion host, whether or not its device was recorded, re-attaches the
-  data volumes, and removes the root copy, its snapshot or the image only
+  takes such a partial map: it detaches each volume this transfer attached to
+  the conversion host - marked as soon as Nova accepted the attach, whether or
+  not its device was recorded, never a shared multi-attach volume another
+  migration's export attached - re-attaches the data volumes, and removes the
+  root copy, its snapshot or the image only
   when the export made them, never the VM's own boot volume. The export
   records the snapshot and the image as soon as each exists.
 - A wait for a conversion host's attach or port lock gives up once ssh to the

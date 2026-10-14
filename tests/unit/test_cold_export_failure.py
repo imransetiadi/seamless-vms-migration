@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server as server_util
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import volume_common
 from ansible_collections.os_migrate.os_migrate.plugins.modules import (
     import_workload_export_volumes as export_module,
@@ -289,3 +290,73 @@ def test_the_source_cleanup_frees_only_the_ports_the_map_records():
     volume_map = {"/dev/vdb": _mapping("vol-data1", port=50001), "/dev/vdc": _mapping("vol-data2")}
 
     assert _cleanup(src, volume_map).claimed_ports == [50001]
+
+
+def _shared_volume_vms():
+    """Two shut-off VMs, each booted from its own volume, sharing a multi-attach data volume."""
+    src = fake.FakeCloud("src")
+    src.add_conversion_host("src-conv", CONV)
+    names = {"srv-a": "vma", "srv-b": "vmb"}
+    for server_id, name in names.items():
+        src.add_server(server_id, name)
+        src.servers[server_id].status = "SHUTOFF"
+        src.add_volume("root-" + server_id, name + "-root", 10, bootable=True,
+                       server_id=server_id, device="/dev/vda")
+    src.add_volume("vol-shared", "shared", 10, server_id="srv-a", device="/dev/vdb")
+    src.volumes["vol-shared"].attachments.append(
+        {"server_id": "srv-b", "device": "/dev/vdb", "volume_id": "vol-shared"}
+    )
+    src.servers["srv-b"].volumes.append({"id": "vol-shared"})
+    data = {
+        server_id: fake.workload_data(server_id=server_id, name=name, volumes=[
+            fake.server_volume_data("root-" + server_id, name + "-root", 10, "/dev/vda", server_id,
+                                    bootable=True),
+            fake.server_volume_data("vol-shared", "shared", 10, "/dev/vdb", server_id),
+        ])
+        for server_id, name in names.items()
+    }
+    return src, data
+
+
+def test_a_failed_exports_rescue_never_detaches_the_volume_another_export_holds():
+    """Review RV8-02: two cold cutovers of one wave share the source conversion host, and their
+    VMs a multi-attach volume. Both exports detached it from their VM; A's export attached it, B's
+    attach was refused. Cinder's attachment names the server, not the migration: B's rescue, which
+    detached every mapped volume the conversion host held, took it from under A's export. It now
+    detaches only what B's transfer attached, and fails, saying it cannot give B the volume back
+    while A's export holds it (the cold path cannot move a disk another server holds)."""
+    src, data = _shared_volume_vms()
+    host = SourceHost(src)
+    with mock.patch.object(volume_common, "RemoteShell", host):
+        a, b = (
+            export_module.OpenStackSourceVolume(
+                src, "src-conv", "/keys/k", "cloud-user", server_id,
+                server_util.Server.from_data(data[server_id]), timeout=3,
+            )
+            for server_id in ("srv-a", "srv-b")
+        )
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        for export in (a, b):
+            export._test_source_vm_shutdown()
+            export._get_root_and_data_volumes()
+            export._validate_volumes_match_data()
+        for export in (a, b):
+            export._detach_data_volumes_from_source()
+        a._attach_volumes_to_converter()
+        with pytest.raises(Exception, match="already attached"):
+            b._attach_volumes_to_converter()
+        # B's module fails with its map, and the role's rescue cleans up after B
+        with mock.patch.object(volume_common, "RemoteShell", host):
+            cleanup = cleanup_module.OpenStackSourceHostCleanup(
+                src, "src-conv", "/keys/k", "cloud-user", "srv-b", b.transfer_uuid, b.volume_map,
+                timeout=3,
+            )
+        with pytest.raises(Exception, match="vol-shared is not available"):
+            cleanup.close_exports()
+
+    held_by_a = a.volume_map["/dev/vdb"]
+    assert held_by_a["source_id"] == "vol-shared" and held_by_a["source_dev"], held_by_a
+    assert held_by_a.get("source_attached") is True
+    assert not b.volume_map["/dev/vdb"].get("source_attached")
+    assert "src-conv" in _holders(src, "vol-shared"), _holders(src, "vol-shared")

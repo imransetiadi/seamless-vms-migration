@@ -508,7 +508,7 @@ class OpenStackVolumeBase:
                 pass
             raise
 
-    def _attach_volumes(self, conn, name, funcs):
+    def _attach_volumes(self, conn, name, funcs, mark=None):
         """
         Attach all volumes in the volume map to the specified conversion host.
         Check the list of disks before and after attaching to be absolutely
@@ -541,8 +541,14 @@ class OpenStackVolumeBase:
             self.log.debug("Initial disk list: %s", disks_before)
 
             conn.attach_volume(
-                volume=volume, wait=True, server=host_func(), timeout=self.timeout
+                volume=volume, wait=False, server=host_func(), timeout=self.timeout
             )
+            if mark:
+                # Nova accepted the attach: this transfer's from here on, before
+                # its device shows - a cleanup detaches what is marked, never a
+                # volume another migration's export attached (Seamless Migrate
+                # SDD 6.6, review RV8-02)
+                mapping[mark] = True
             self.log.info("Waiting for volume to appear in %s wrapper", name)
             self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
 
@@ -996,6 +1002,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             self.conn,
             "source",
             (self._converter, self.shell.cmd_out, update_source, volume_id),
+            mark="source_attached",
         )
 
     def _export_volumes_from_converter(self):
@@ -1501,14 +1508,19 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_source_converter(self):
         """
-        Detach volumes from conversion host: each mapped volume Cinder lists as
-        attached there, whether or not the export recorded its device - a failed
-        export may have stopped after Nova attached a volume and before its
-        device showed (Seamless Migrate SDD 6.6, review RV6-01).
+        Detach volumes from conversion host: each mapped volume this transfer
+        attached there - its device recorded, or marked source_attached as soon
+        as Nova accepted the attach, so one a failed export left before its
+        device showed is detached too - that Cinder still lists there. A volume
+        another migration's export attached, a shared multi-attach volume, is
+        never: Cinder's attachment names the server, not the migration
+        (Seamless Migrate SDD 6.6, review RV6-01, RV8-02).
         """
         self.log.info("Detaching volumes from the source conversion host.")
         converter = self._converter()
         for path, mapping in self.volume_map.items():
+            if not (mapping.get("source_attached") or mapping.get("source_dev")):
+                continue  # this transfer never attached it
             volume = self._get_volume_maybe(mapping["source_id"])
             if volume is None:
                 continue
