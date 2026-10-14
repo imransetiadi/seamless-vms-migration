@@ -790,7 +790,10 @@ Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conv
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
-host, or one in the earlier bare-pid form, is never removed by this check.
+host, or one in the earlier bare-pid form, is never removed by this check. Each detach of a volume - from a conversion
+host or from the source VM - waits, within the module's timeout, until Cinder shows the volume `available`:
+openstacksdk 4.x's `detach_volume(wait=True)` ignores its `timeout` and would wait forever for a detach that never
+ends, holding the attach lock meanwhile; a detach still not done at the timeout fails the module (review 5).
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
