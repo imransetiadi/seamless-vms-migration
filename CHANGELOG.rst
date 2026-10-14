@@ -214,3 +214,13 @@ This project follows a simple changelog to satisfy collection metadata validatio
   (``disk.config``): Nova gives the destination server its own. Disks are
   picked by file name only: an instances path containing ``disk``, any
   character, then ``info`` no longer hides every disk.
+- The cold import (``import_workloads``) records its workload for a rollback,
+  in the state file the warm path keeps: the volumes its transfer created, as
+  soon as they exist (new module ``import_workload_record_volumes``), and the
+  server, as soon as Nova accepts it (``import_workload_create_instance`` with
+  ``warm_state_dir``). A rollback with
+  ``os_migrate_rollback_delete_dest_volumes`` then deletes exactly those
+  volumes and keeps any other volume attached to the server. Before, a cold
+  rollback found the server by name and left its data volumes behind,
+  unrecorded: a cold retry creates new volumes, so they were never used or
+  deleted again. A workload imported before keeps the old behaviour.

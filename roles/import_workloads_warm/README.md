@@ -78,7 +78,7 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 | `os_migrate_warm_python_interpreter` | `python3` | Python 3.6+ on the conversion hosts (`/usr/libexec/platform-python` on RHEL 8) |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | warm state files |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | destination conversion host; the only server a rollback detaches destination volumes from |
-| `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. migrated cold): delete the only destination server named exactly like the workload |
+| `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. one the cold import copied before it recorded its workload): delete the only destination server named exactly like the workload |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |
 | `os_migrate_workload_cleanup_on_failure` | `true` | remove the temporary snapshot when a pass fails |
 | `os_migrate_workload_boot_volume_prefix` | `os-migrate-` | name prefix of the temporary snapshots, volumes and images |

@@ -143,6 +143,16 @@
         - prelim is defined and prelim.changed
         - item["_migration_params"]["data_copy"] | default(true)
 
+    # a rollback deletes exactly the volumes this transfer created: a cold retry
+    # never reuses them, it creates new ones (Seamless Migrate SDD 6.3, 7)
+    - name: Record the destination volumes for a rollback
+      os_migrate.os_migrate.import_workload_record_volumes:
+        data: "{{ item }}"
+        state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
+        volume_map: "{{ transfer.volume_map }}"
+      when:
+        - transfer is defined and 'volume_map' in transfer
+
     - name: Create destination instance
       os_migrate.os_migrate.import_workload_create_instance:
         cloud: dst
@@ -152,6 +162,8 @@
         client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
         data: "{{ item }}"
         block_device_mapping: "{{ transfer.block_device_mapping | default([]) }}"
+        # records the server as soon as Nova accepts it, for a rollback (SDD 6.5)
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
       register: os_migrate_destination_instance
       when:
         - prelim is defined and prelim.changed

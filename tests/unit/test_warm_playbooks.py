@@ -1,4 +1,4 @@
-"""Runs the warm playbooks with ansible-playbook.
+"""Runs the warm playbooks - and the cold import's record for a rollback - with ansible-playbook.
 
 The collection is copied into a temporary collections path; only the modules
 that talk to clouds or conversion hosts (and the conversion host lookup) are
@@ -33,6 +33,10 @@ STUBBED = (
     "import_workload_prelim",
     "import_workload_dst_check",
     "import_workload_src_check",
+    "import_workload_export_volumes",
+    "import_workload_transfer_volumes",
+    "import_workload_src_cleanup",
+    "import_workload_dst_failure_cleanup",
     "import_workload_warm_snapshot",
     "import_workload_warm_sync",
     "import_workload_create_instance",
@@ -78,6 +82,9 @@ def load(path):
 
 
 def save(path, state):
+    # as WarmState.save does: the first record creates the state directory
+    if not os.path.isdir(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path))
     with open(path + ".tmp", "w") as f:
         json.dump(state, f)
     os.rename(path + ".tmp", path)
@@ -159,6 +166,22 @@ elif NAME == "import_workload_rollback":
                 save(path, state)
         else:
             save(path, state)
+elif NAME == "import_workload_export_volumes":
+    result = {"changed": True, "transfer_uuid": "uuid-cold-" + name, "volume_map": {
+        "/dev/vda": {"source_id": "svol-%%s-vda" %% name, "size": 1, "bootable": True,
+                     "name": "os-migrate-" + name},
+        "/dev/vdb": {"source_id": "svol-%%s-vdb" %% name, "size": 2, "bootable": False,
+                     "name": name + "-data"}}}
+elif NAME == "import_workload_transfer_volumes":
+    volume_map = dict((dev, dict(entry, dest_id="dvol-%%s-%%s" %% (name, dev.split("/")[-1])))
+                      for dev, entry in args["volume_map"].items())
+    result = {"changed": True, "volume_map": volume_map, "block_device_mapping": [
+        {"boot_index": 0 if dev == "/dev/vda" else -1,
+         "delete_on_termination": dev == "/dev/vda", "destination_type": "volume",
+         "device_name": dev.split("/")[-1], "source_type": "volume",
+         "uuid": volume_map[dev]["dest_id"]} for dev in sorted(volume_map)]}
+elif NAME in ("import_workload_src_cleanup", "import_workload_dst_failure_cleanup"):
+    result = {"changed": True}
 elif NAME == "server_action":
     result = {"changed": True}
 elif NAME == "server_info":
@@ -233,6 +256,12 @@ class Env:
                 "resources": [server_data("srv-1", "vm1"), server_data("srv-2", "vm2")],
             }, f)
         self.state_dir = os.path.join(self.data_dir, "workload_warm")
+        # the cold role reads the clouds file for its source volume API version (synthetic)
+        with open(os.path.join(self.data_dir, "clouds.yaml"), "w") as f:
+            yaml.safe_dump({"clouds": {
+                "src": {"auth": {"auth_url": "https://src.example.invalid:5000/v3"}},
+                "dst": {"auth": {"auth_url": "https://dst.example.invalid:5000/v3"}},
+            }}, f)
         self.world = {}
 
     def state(self, server_id):
@@ -517,3 +546,69 @@ def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm1$"}])
     assert rc == 0, out
     assert len([c for c in calls if c["module"] == "import_workload_rollback"]) == 1
+
+
+# --- the cold import's record (SDD 6.3, 6.5, 7) --------------------------------------------
+
+# vm1's volumes as the transfer stub created them, recorded as the warm path records its own
+RECORDED = {
+    "/dev/vda": {"dest_id": "dvol-vm1-vda", "size": 1, "bootable": True, "name": "os-migrate-vm1"},
+    "/dev/vdb": {"dest_id": "dvol-vm1-vdb", "size": 2, "bootable": False, "name": "vm1-data"},
+}
+
+COLD = {
+    "os_migrate_workloads_filter": [{"regex": "^vm1$"}],
+    "os_migrate_workload_stop_before_migration": True,
+    "os_migrate_conversion_host_ssh_user": "cloud-user",
+    "os_migrate_dst_filters": {},
+}
+
+
+def test_the_cold_import_records_its_volumes_and_server_for_a_rollback(env):
+    """The owner's choice (2026-10-14): a cold rollback deletes exactly the volumes the cold
+    import created - a cold retry never reuses them - so the import records them as soon as its
+    transfer created them, and the server as soon as Nova accepts it."""
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc == 0, out
+    create = next(c["args"] for c in calls if c["module"] == "import_workload_create_instance")
+    assert create["warm_state_dir"] == env.state_dir
+    state = env.state("srv-1")
+    assert state["dest_volumes"] == RECORDED
+    assert state["destination_server_id"] == "dst-vm1"
+    assert state["passes"] == []
+    assert env.state("srv-2") is None  # filtered out
+
+
+def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
+    """A failure after the transfer: with the failure cleanup off nothing else knows the volumes
+    the transfer created, and with it on the record of a volume already gone costs nothing."""
+    env.world["fail"] = [["import_workload_create_instance", "vm1"]]
+    for cleanup in (False, True):
+        rc, out, calls = env.run(
+            "import_workloads", os_migrate_workload_cleanup_on_failure=cleanup, **COLD
+        )
+
+        assert rc != 0, out
+        assert env.state("srv-1")["dest_volumes"] == RECORDED
+        cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+        assert bool(cleaned) is cleanup
+
+
+
+def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
+    """data_copy false: the server boots from volumes the import did not create, so only the
+    server is recorded - a rollback must never delete those volumes (SDD 6.3)."""
+    with open(os.path.join(env.data_dir, "workloads.yml")) as f:
+        workloads = yaml.safe_load(f)
+    workloads["resources"][0]["_migration_params"]["data_copy"] = False
+    with open(os.path.join(env.data_dir, "workloads.yml"), "w") as f:
+        yaml.safe_dump(workloads, f)
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc == 0, out
+    assert not [c for c in calls if c["module"] == "import_workload_transfer_volumes"]
+    state = env.state("srv-1")
+    assert state["destination_server_id"] == "dst-vm1"
+    assert state["dest_volumes"] == {}

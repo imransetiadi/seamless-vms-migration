@@ -1004,6 +1004,10 @@ class OpenstackWarmSync(_WarmVolumeBase):
             raise first_failure
 
 
+#: what the state file keeps of a destination volume (SDD 6.3)
+RECORDED_VOLUME_KEYS = ("dest_id", "size", "bootable", "name")
+
+
 def record_destination_server(state_dir, server_id, destination_server_id, server_name=None):
     """Record the destination server created for ``server_id`` (cutover)."""
     state = WarmState.load(state_dir, server_id)
@@ -1012,6 +1016,33 @@ def record_destination_server(state_dir, server_id, destination_server_id, serve
         state.server_name = server_name
     state.save()
     return state
+
+
+def record_destination_volumes(state_dir, server_id, volume_map, server_name=None):
+    """Record the destination volumes a cold transfer created for ``server_id`` (SDD 6.3): each
+    device of ``volume_map`` with a ``dest_id``, with its size, bootable flag and name as the warm
+    path records its volumes, keeping what the state file already holds. A cold retry never
+    reuses them, so a cold rollback deletes exactly these (SDD 7). Returns whether the file
+    changed and the recorded volume ids; a map with no created volume writes nothing."""
+    created = dict(
+        (dev, dict((key, entry[key]) for key in RECORDED_VOLUME_KEYS if key in entry))
+        for dev, entry in (volume_map or {}).items()
+        if isinstance(entry, dict) and entry.get("dest_id")
+    )
+    if not created:
+        return False, []
+    state = WarmState.load(state_dir, server_id)
+    changed = False
+    for dev, recorded in sorted(created.items()):
+        if state.dest_volumes.get(dev) != recorded:
+            state.dest_volumes[dev] = recorded
+            changed = True
+    if server_name and not state.server_name:
+        state.server_name = server_name
+        changed = True
+    if changed:
+        state.save()
+    return changed, sorted(entry["dest_id"] for entry in created.values())
 
 
 class WarmRollback:
