@@ -316,6 +316,9 @@ def test_seamless_check_runs_the_ci_checks_that_run_locally():
     make_lint = re.search(targets, recipe)
     assert ci_lint and make_lint
     assert make_lint.group(1).split() == ci_lint.group(1).split()
+    # ansible-test sanity on a copied collection tree, as upstream runs it (QASuite §14.2)
+    assert "scripts/collection-sanity.sh" in _ci_step_run("ansible-test sanity")
+    assert "scripts/collection-sanity.sh" in recipe
     # the venv the target runs in has what the gate needs
     extras = tomllib.loads((ROOT / "seamless" / "pyproject.toml").read_text())["project"]
     assert any(req.startswith("pytest-cov") for req in extras["optional-dependencies"]["dev"])

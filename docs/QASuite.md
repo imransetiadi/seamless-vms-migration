@@ -997,6 +997,10 @@ for p in import_workloads_precopy import_workloads_cutover rollback_workloads im
 done
 .venv/bin/ansible-lint roles/import_workloads_warm roles/import_from_hypervisor      # Task A3/A4: no errors
 
+# ansible-test sanity over the collection, as upstream runs it (CI's collection job and make seamless-check run it):
+# ansible-test refuses the symlinked layout above, so the script copies the tracked collection files into a real tree
+PATH="$PWD/.venv/bin:$PATH" scripts/collection-sanity.sh
+
 # CI path (podman container, as upstream)
 make test-ansible-lint test-ansible-sanity test-ansible-units
 ```

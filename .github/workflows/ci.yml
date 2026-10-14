@@ -94,6 +94,8 @@ jobs:
           pytest -q -rs tests/unit > "$RUNNER_TEMP/unit.txt" 2>&1 || { cat "$RUNNER_TEMP/unit.txt"; exit 1; }
           tail -n 15 "$RUNNER_TEMP/unit.txt"
           if grep -qE '[0-9]+ skipped' "$RUNNER_TEMP/unit.txt"; then echo "unexpected skipped tests"; exit 1; fi
+      - name: ansible-test sanity on the collection, as upstream runs it, from a copied tree (QASuite §14.2)
+        run: scripts/collection-sanity.sh
       - name: Playbook syntax checks
         run: |
           for pb in import_workloads.yml import_workloads_precopy.yml import_workloads_cutover.yml \
