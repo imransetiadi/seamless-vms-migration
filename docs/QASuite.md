@@ -550,6 +550,7 @@ Controls and threats are in [Security.md](Security.md); IDs below are referenced
 | S-25 | Request body limit (Security.md R-17) | without a token, `curl --data-binary @2MiB.json` to `POST /api/v1/migrations/<id>/approve`, once with `Content-Length` and once with `-H 'Transfer-Encoding: chunked'`; then a 1 KiB body | both 2 MiB requests: 413 `payload_too_large` with `X-Content-Type-Options: nosniff`, before the token is checked; the small body: 401. Unit: `test_request_body_over_1_mib_is_refused_with_413_before_auth` (exactly 1 MiB still reaches the route), `test_chunked_request_body_over_1_mib_is_refused_with_413`, `test_body_limit_counts_streamed_chunks` |
 | S-26 | Ansible template injection (Security.md R-16, C1-05) | `test_generated_ansible_input_is_never_templated` (every value and every key of a nested map in `vars.yml`, `secrets.yml` and the inventory carries `!unsafe`; the top-level keys are plain identifiers) and `test_ansible_reads_generated_input_verbatim` (the real `ansible-playbook` with a Jinja VM name, password and `network_map` key, the key looped with `dict2items`) | the Jinja is printed verbatim and no command runs; the playbook still connects through the inventory and resolves its host variables |
 | S-27 | Hypervisor export never guesses a disk's format (Security.md SEC-13, SDD §6.6) | `tests/unit/test_import_from_hypervisor.py` (ansible-playbook with qemu shims): `test_the_format_comes_from_nova_disk_info_never_from_the_disk`, `test_a_disk_without_one_recorded_format_is_refused_before_any_export` (missing, not JSON, not a map, a disk not recorded, a format that is not a plain name, two formats for one file name), `test_disk_info_entries_are_matched_by_file_name`, `test_the_config_drive_is_not_exported` | a raw disk whose first block holds a qcow2 header is exported `--format=raw` and `qemu-img info` gets `-f` for every disk; every refusal names the disk or `disk.info` and starts no qemu-nbd; the config drive is never exported; on a lab hypervisor, `ps -o args= -C qemu-nbd` shows `--format=` equal to the disk's entry in `disk.info` |
+| S-28 | The collection artifact packs no local secret (Security.md R-26) | `tests/unit/test_collection_build.py`: `test_the_collection_build_packs_no_local_secret_and_nothing_around_the_collection` (ansible-core's build file walk with `galaxy.yml`, on dummy files only); once per release, a real `ansible-galaxy collection build` of a scratch copy of the tracked files with dummy `.env`, `tokens.yaml`, `clouds.yaml`, `secure.yaml`, `*.key` and `*.pem` files added, then `tar -tzf` | none of the dummies, nothing under `seamless/`, `dashboard/`, `deploy/` or `.claude/`, nor `.mcp.json` or `CLAUDE.md`, is in the tarball |
 
 ZAP (S-23) — run only against the **demo** stack, never against one connected to real clouds:
 
@@ -920,7 +921,7 @@ Twenty-three further iterations after the integration run, each verified with th
    below 416 MiB/s, or a G1a p90 above 600 s for P-MULTI-L behind a saturated storage path — blocks the release
    unless it carries an accepted, documented waiver as in item 4 (a changed target or population, or a recorded lab
    deviation, each with the measured numbers and the reason); PERF-CP thresholds met.
-7. Security: S-01…S-25 executed; no open High finding ([Security.md](Security.md) §11); no secret-scan findings;
+7. Security: S-01…S-28 executed; no open High finding ([Security.md](Security.md) §11); no secret-scan findings;
    no unaccepted High/Critical dependency or image vulnerability; checklist §12 signed.
 8. Resilience: R-01…R-13 executed with all invariants holding.
 9. No open **S1** or **S2** defects; S3 defects triaged with owners.
@@ -1269,5 +1270,5 @@ VIEWER=... OPERATOR=... APPROVER=... ADMIN=... bash tests/e2e/rbac-live.sh      
 | 4 Image | build, S-19, S-20 | no unaccepted High/Critical |
 | 5 Demo E2E | §14.6, `smoke-demo.sh`, `demo-journey.sh`, `rbac-live.sh`, `demo-restart.sh`, `browser-demo.mjs`, DEMO-01…07, UI manual checklist | pass |
 | 6 Lab | §7 matrix, §8 integrity, §9 performance | exit criteria §13.2 |
-| 7 Security and resilience | S-03…S-16, S-21…S-25, R-01…R-13 | no S1/S2 |
+| 7 Security and resilience | S-03…S-16, S-21…S-28, R-01…R-13 | no S1/S2 |
 | 8 Sign-off | report (§13.5), Security.md §12 checklist, docs reconciled | release |
