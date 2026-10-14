@@ -99,6 +99,12 @@ def _lock_host():
     return host if re.match(r"^[A-Za-z0-9._-]+$", host or "") else "unknown"
 
 
+# ssh's own exit status when it cannot reach or log in to the host
+SSH_FAILED = 255
+# a lock wait gives up once ssh to the conversion host failed this long without a break
+SSH_UNREACHABLE_S = 60
+
+
 def use_lock(lock_file):
     """Boilerplate for functions that need to take a lock."""
 
@@ -106,6 +112,7 @@ def use_lock(lock_file):
         def wait_for_lock(self, *args, **kwargs):
             if self.check_and_cleanup_lockfiles():
                 self.log.info("Cleaned up unused lockfiles before start")
+            unreachable_since = None
             for second in range(DEFAULT_TIMEOUT):
                 try:
                     self.log.info("Waiting for lock %s...", lock_file)
@@ -132,6 +139,23 @@ def use_lock(lock_file):
                         + '"',
                     ]
                     result = self.shell.cmd_val(cmd)
+                    if result == SSH_FAILED:
+                        # the conversion host cannot be reached: give up after a minute
+                        # of that rather than try 1800 times (Seamless Migrate SDD 6.6)
+                        now = time.monotonic()
+                        if unreachable_since is None:
+                            unreachable_since = now
+                        elif now - unreachable_since >= SSH_UNREACHABLE_S:
+                            raise RuntimeError(
+                                "Cannot reach conversion host %s over SSH for %d s to take lock %s"
+                                % (
+                                    getattr(self.shell, "address", "?"),
+                                    now - unreachable_since,
+                                    lock_file,
+                                )
+                            )
+                    else:
+                        unreachable_since = None
                     if result == 16:
                         self.log.info("Another conversion has the lock.")
                     elif result == 17:

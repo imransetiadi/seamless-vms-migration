@@ -334,3 +334,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   data volumes, and removes the root copy, its snapshot or the image only
   when the export made them, never the VM's own boot volume. The export
   records the snapshot and the image as soon as each exists.
+- A wait for a conversion host's attach or port lock gives up once ssh to the
+  host has failed for a minute without a break, with ``Cannot reach
+  conversion host ADDRESS over SSH for N s to take lock LOCK``. It tried up
+  to 1800 times, each try up to the 10 s connect timeout, about 5.5 hours,
+  while a cold cutover's source stayed stopped. One failed connection, or a
+  lock another migration holds, starts that minute again.

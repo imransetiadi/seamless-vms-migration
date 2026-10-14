@@ -5,6 +5,7 @@ __metaclass__ = type
 import json
 import os
 import subprocess
+import time
 from unittest import mock
 
 import pytest
@@ -256,6 +257,85 @@ def test_a_live_owner_another_hosts_lock_and_a_bare_pid_keep_their_locks():
         assert not transfer.check_and_cleanup_lockfiles()
         assert transfer.shell.removed() == [], owner
         assert not any(c[:2] == ["sudo", "kill"] for c in transfer.shell.commands)
+
+
+class FlockShell(LockShell):
+    """A conversion host whose ``sudo flock`` tries end, in turn, with ``results`` - 255 is ssh's
+    own status when it cannot reach the host, and such a try costs ``clock`` the 10 s connect
+    timeout; after the last result every try takes the lock."""
+
+    address = "10.1.0.10"
+
+    def __init__(self, results, clock):
+        super().__init__({})
+        self.results = list(results)
+        self.clock = clock
+
+    def cmd_val(self, command, **kwargs):
+        if command[:2] == ["sudo", "flock"]:
+            self.commands.append(list(command))
+            result = self.results.pop(0) if self.results else 0
+            if result == 255:
+                self.clock.now += 10  # ConnectTimeout=10
+            return result
+        return super().cmd_val(command, **kwargs)
+
+
+class Clock:
+    """volume_common's time module, its clock moved on by sleep at once."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _guarded_attach(results):
+    clock = Clock()
+    transfer = lock_transfer({})
+    transfer.shell = FlockShell(results, clock)
+    guarded = volume_common.use_lock(volume_common.ATTACH_LOCK_FILE_DESTINATION)(
+        lambda self: "attached"
+    )
+    return transfer, clock, guarded
+
+
+def test_a_lock_wait_gives_up_when_ssh_cannot_reach_the_conversion_host():
+    """SDD 6.6: ssh exits 255 when it cannot reach the host. The lock wait gives up after a minute
+    of that - it tried 1800 times, each up to the 10 s connect timeout, about 5.5 h, while a cold
+    cutover's source stays stopped."""
+    transfer, clock, guarded = _guarded_attach([255] * 1800)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(
+            RuntimeError,
+            match=r"Cannot reach conversion host 10\.1\.0\.10 over SSH for \d+ s to take lock "
+            + volume_common.ATTACH_LOCK_FILE_DESTINATION,
+        ):
+            guarded(transfer)
+
+    tries = [c for c in transfer.shell.commands if c[:2] == ["sudo", "flock"]]
+    assert 6 <= len(tries) <= 8, len(tries)
+    assert 60 <= clock.now <= 90, clock.now
+
+
+def test_a_lock_wait_rides_out_a_failed_ssh_now_and_then_and_a_busy_lock():
+    """One failed connection, or a lock another migration holds, starts that minute again: a wait
+    that sees ssh fail now and then, between busy answers, for far longer than a minute, still
+    takes the lock."""
+    transfer, clock, guarded = _guarded_attach([255, 16] * 40 + [255, 255, 0])
+
+    with mock.patch.object(volume_common, "time", clock):
+        assert guarded(transfer) == "attached"
+
+    assert clock.now > 400
 
 
 def test_conversion_host_ssh_keeps_the_link_alive():
