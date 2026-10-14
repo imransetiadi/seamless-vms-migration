@@ -85,6 +85,15 @@ options:
         attached to any other server are kept.
     required: false
     type: str
+  delete_ports:
+    description:
+      - Delete the destination ports created through Neutron for the
+        workload's source ports. False for a cleanup that made no port, where
+        an unbound port keyed to the source port may belong to another
+        migration of the same VM.
+    required: false
+    default: true
+    type: bool
 """
 
 EXAMPLES = r"""
@@ -149,6 +158,7 @@ def run_module():
         dst_filters=dict(type="dict", default={}),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
         conversion_host=dict(type="str", default=None),
+        delete_ports=dict(type="bool", default=True),
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
@@ -174,7 +184,9 @@ def run_module():
             dst_filters=params["dst_filters"],
             timeout=params["timeout"],
             conversion_host=params["conversion_host"],
-            source_port_ids=[port_id for port_id in source_port_ids if port_id],
+            source_port_ids=(
+                [port_id for port_id in source_port_ids if port_id] if params["delete_ports"] else []
+            ),
         ).run(delete_volumes=params["delete_dest_volumes"])
     except Exception as err:  # pylint: disable=broad-except
         module.fail_json(msg="Rollback of server %s failed: %s" % (server_id, err))

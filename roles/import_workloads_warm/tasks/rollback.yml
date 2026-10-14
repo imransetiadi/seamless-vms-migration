@@ -71,6 +71,7 @@
     dst_filters: "{{ os_migrate_dst_filters }}"
     timeout: "{{ os_migrate_timeout }}"
     conversion_host: "{{ os_migrate_dst_conversion_host_name }}"
+    delete_ports: "{{ os_migrate_rollback_delete_ports | bool }}"
   register: import_workloads_warm_rollback
 
 - name: Report destination volumes kept because another server uses them

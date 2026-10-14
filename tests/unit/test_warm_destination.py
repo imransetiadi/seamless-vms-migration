@@ -409,6 +409,36 @@ def test_rollback_module(tmp_path):
     assert again["changed"] is False
 
 
+def test_rollback_module_deletes_no_port_when_told(tmp_path):
+    """SDD 6.4, 6.6 (review RV-02): a cancel's cleanup deletes no port - it made none, and an unbound
+    port keyed to the VM's source port may be another plan's migration of the VM."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_rollback as rollback_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    dst.add_port("p-plan-b", "fa:16:3e:00:00:01", description="os-migrate:sp-1")  # unbound
+    port = {
+        "type": "openstack.network.ServerPort",
+        "params": {"mac_address": "fa:16:3e:00:00:01"},
+        "_info": {"id": "sp-1", "device_id": "srv-1", "device_owner": "compute:nova"},
+    }
+    args = {
+        "cloud": "dst",
+        "data": fake.workload_data(ports=[port]),
+        "state_dir": state_dir,
+        "delete_dest_volumes": True,
+        "delete_ports": False,
+    }
+
+    result = fake.run_module(rollback_module, args, dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["deleted_port_ids"] == []
+    assert "p-plan-b" in dst.ports
+    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]  # its own data path still goes
+
+
 def test_rollback_module_deletes_the_workloads_neutron_ports(tmp_path):
     """The module names the workload's source ports from its data (SDD 6.6)."""
     from ansible_collections.os_migrate.os_migrate.plugins.modules import (

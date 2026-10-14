@@ -234,3 +234,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   server (``delete_on_termination``), instead of deleting it a second time,
   which Cinder refuses: a cold rollback no longer fails before it starts the
   source.
+- ``import_workload_rollback`` takes ``delete_ports`` (default ``true``), and
+  ``rollback_workloads.yml`` ``os_migrate_rollback_delete_ports``: ``false``
+  deletes no destination port. Seamless Migrate's cleanup after a cancel
+  uses it, as it made no port and an unbound one keyed to the VM's source
+  port may belong to another migration of the same VM.

@@ -556,6 +556,27 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
     assert modules_for(calls, "vm2", "srv-2") == ["import_workload_rollback", "server_action:start"]
 
 
+def test_a_rollback_can_leave_the_ports_alone(env):
+    """SDD 6.5 (review RV-02): a cancel's cleanup passes os_migrate_rollback_delete_ports false, which
+    reaches the module as delete_ports; any other rollback deletes the workload's ports."""
+    rc, out, _ = env.run("import_workloads_precopy")
+    assert rc == 0, out
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_rollback_delete_ports=False,
+    )
+    assert rc == 0, out
+    rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
+    assert [r["delete_ports"] for r in rollback] == [False]
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
+    assert rc == 0, out
+    rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
+    assert [r["delete_ports"] for r in rollback] == [True]
+
+
 def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     """SDD 6.5: without a workload filter a rollback would revert every cut-over workload of the
     data dir; it refuses unless os_migrate_rollback_all is true. An exact filter rolls back one."""
