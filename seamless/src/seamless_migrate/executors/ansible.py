@@ -333,15 +333,17 @@ EXPORT_RECORD = "rewrite.json"
 
 
 def export_record(
-    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None
+    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None, name: str | None
 ) -> dict[str, Any]:
     """The export record (SDD §7.2): the mappings a rewrite applies - the plan's overlaid with the
-    migration's resolved ones - and the VM's NIC override entries."""
+    migration's resolved ones -, the VM's NIC override entries and the exported server's name, by
+    which each run selects its workload (a renamed VM is exported again, review lead A)."""
     return {
         "mappings": mappings.model_dump(mode="json"),
         "nic_overrides": {
             mac: entry.model_dump(mode="json") for mac, entry in (nic_overrides or {}).items()
         },
+        "name": name,
     }
 
 
@@ -877,11 +879,12 @@ class AnsibleExecutor:
         export = [] if exported else [_Playbook("export_workloads.yml")]
         if strategy == Strategy.cold:
             if step == StepName.CUTOVER:
-                # what an earlier attempt left goes first, before the stop (SDD §7)
+                # what an earlier attempt left goes before the stop, right after the export: the
+                # cleanup selects the workload by its name of now (SDD §7, review lead A)
                 cleanup = [_Playbook("rollback_workloads.yml")] if leftover else []
                 return [
-                    *cleanup,
                     _Playbook("export_workloads.yml"),
+                    *cleanup,
                     _Playbook("import_workloads.yml", stops_source=True),
                 ]
             if step == StepName.ROLLBACK:
@@ -943,7 +946,7 @@ class AnsibleExecutor:
                 step == StepName.CUTOVER and not finishing,
                 bool(nics),
                 networks,
-                export_record(mappings, nics) if judged else None,
+                export_record(mappings, nics, ctx.migration.vm.name) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
             )
@@ -1492,7 +1495,9 @@ class AnsibleExecutor:
                 "security groups: recreated through Neutron they would get the project's default "
                 "group. Update the os-migrate collection, or recreate the ports with Nova."
             )
-        record = export_record(mappings or Mappings(), nic_overrides)
+        exported = [r for r in doc.get("resources") or [] if r.get("type") == SERVER_TYPE]
+        name = (exported[0].get("params") or {}).get("name") if exported else None
+        record = export_record(mappings or Mappings(), nic_overrides, name)
         (osm / EXPORT_RECORD).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
 
     def _playbook_arg(self, name: str) -> str:

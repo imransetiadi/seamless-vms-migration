@@ -1850,11 +1850,11 @@ async def test_a_cold_cutover_first_removes_what_an_earlier_warm_pre_copy_left(e
     await env.executor.run(StepName.CUTOVER, ctx)
     calls = read_log(env.log)
     assert [c["playbook"] for c in calls] == [
-        "rollback_workloads.yml",
         "export_workloads.yml",
+        "rollback_workloads.yml",
         "import_workloads.yml",
     ]
-    cleanup = calls[0]["vars"]
+    cleanup = calls[1]["vars"]
     assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
     assert cleanup["os_migrate_rollback_start_source"] is False
     assert "os_migrate_rollback_match_by_name" not in cleanup
@@ -1881,11 +1881,11 @@ async def test_a_cold_cutover_first_removes_the_volumes_an_earlier_cold_attempt_
     await env.executor.run(StepName.CUTOVER, ctx)
     calls = read_log(env.log)
     assert [c["playbook"] for c in calls] == [
-        "rollback_workloads.yml",
         "export_workloads.yml",
+        "rollback_workloads.yml",
         "import_workloads.yml",
     ]
-    cleanup = calls[0]["vars"]
+    cleanup = calls[1]["vars"]
     assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
     assert cleanup["os_migrate_rollback_start_source"] is False
     assert "os_migrate_rollback_match_by_name" not in cleanup
@@ -2015,8 +2015,8 @@ async def test_after_a_resumed_cold_cutovers_cleanup_no_rollback_deletes_a_same_
     with pytest.raises(PermanentStepError, match="roll the migration back"):
         await env.executor.run(StepName.CUTOVER, ctx)
     calls = read_log(env.log)
-    assert calls[0]["playbook"] == "rollback_workloads.yml"
-    cleanup = role_rollback(wm, cloud, path.parent, calls[0]["vars"])
+    assert calls[1]["playbook"] == "rollback_workloads.yml"
+    cleanup = role_rollback(wm, cloud, path.parent, calls[1]["vars"])
     assert cleanup["deleted_volume_ids"] == ["dvol-1"] and path.exists()
     env.log.write_text("")
     await env.executor.run(StepName.ROLLBACK, ctx)
@@ -2846,12 +2846,54 @@ async def test_the_export_record_holds_what_the_rewrite_applied(env):
         "nic_overrides": {
             "fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}
         },
+        "name": "web-01",
     }
     # an entry whose MAC no exported port has: the rewrite fails after the export, before the stop
     gone, _ = nic_ctx(env, Strategy.warm, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
     with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
         await env.executor.run(StepName.CUTOVER, gone)
     assert not record.exists()
+
+
+async def test_a_renamed_vm_is_exported_again_before_its_next_run(env, monkeypatch):
+    """SDD §7.2 (review lead A): the export record holds the exported server's name - a source VM
+    renamed since (and validated again) is exported again before its next run, which selects its
+    workload by its name of now; the old export would match nothing."""
+    first, _ = ctx_for(env, strategy=Strategy.warm)
+    result = await env.executor.run(StepName.PRECOPY, first)
+    env.log.write_text("")
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web-01-renamed")
+    renamed, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[result.sync_pass])
+    renamed.migration.vm = renamed.migration.vm.model_copy(update={"name": "web-01-renamed"})
+    await env.executor.run(StepName.SYNC, renamed)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    assert json.loads((run_dir(env) / "osm" / "rewrite.json").read_text())["name"] == (
+        "web-01-renamed"
+    )
+
+
+async def test_a_cold_cutovers_cleanup_selects_the_workload_by_its_name_of_now(env, monkeypatch):
+    """SDD §7 (review lead A): the cleanup before a cold cutover runs after the cutover's export,
+    so a source VM renamed since the earlier attempt is selected by its new name."""
+    _state_file(
+        env,
+        {"dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}}, "passes": [{"number": 1}]},
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web-01-renamed")
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    ctx.migration.vm = ctx.migration.vm.model_copy(update={"name": "web-01-renamed"})
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_workloads.yml",
+        "rollback_workloads.yml",
+        "import_workloads.yml",
+    ]
+    assert calls[1]["vars"]["os_migrate_workloads_filter"] == [{"regex": "^web\\-01\\-renamed$"}]
+    assert calls[1]["servers"] == ["web-01-renamed"]  # what the cleanup reads: the new export
 
 
 async def test_an_export_without_a_record_is_exported_again(env):

@@ -58,6 +58,10 @@ SCRIPT = textwrap.dedent(
         record["port_creation_mode"] = [
             (r.get("_migration_params") or {{}}).get("port_creation_mode")
             for r in resources if r.get("type") == "openstack.compute.Server"]
+        # the servers the playbook finds there by name (its workload filter selects among these)
+        record["servers"] = [
+            (r.get("params") or {{}}).get("name")
+            for r in resources if r.get("type") == "openstack.compute.Server"]
     log = Path(os.environ["ANSIBLE_FAKE_LOG"])
     with log.open("a") as fh:
         fh.write(json.dumps(record) + "\\n")
