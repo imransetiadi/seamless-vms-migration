@@ -690,8 +690,10 @@ transfer that fails or is cut short, a volume that ends in `error` included, lea
 created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails;
 and a re-run that records a new volume for a device the record holds an earlier attempt's volume for deletes that one
 first unless a server holds it - the cold path never reuses a volume, while one a server holds (a server the operator
-renamed rather than deleted) is that server's and only leaves the record; an earlier volume it cannot delete fails the
-transfer with the record unchanged (review RV3-02) - and `destination_server_id` as soon as Nova accepts the server. A cold
+renamed rather than deleted) is that server's and only leaves the record; one Cinder is already deleting (the boot
+volume Nova deletes with its server) is gone already, and one only the destination conversion host holds (a transfer
+cut short) is the migration's own: detached from it, then deleted; an earlier volume it cannot delete fails the
+transfer with the record unchanged (review RV3-02, RV4-02, RV4-05) - and `destination_server_id` as soon as Nova accepts the server. A cold
 rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
 playbooks when the workload has none, and a rollback or cleanup that deletes the recorded volumes empties the file
 instead of removing it: the file is the sign that the migration records its workload, so no later rollback takes a
