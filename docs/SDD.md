@@ -2528,7 +2528,8 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   1 cancelled", the cancelled count on a line of its own under the done count and its bar, as beside them it squeezed
   the bar to a dot) so a plan's VMs and its done total never differ without a word,
   or of its VMs before validation, and none for a `cancelled` plan, which shows — instead; the Overview's plan progress
-  counts the same way; the list reads no migration —, clouds,
+  counts the same way and names the cancelled ones it leaves out right after its done count, on its one line under the
+  bar ("11 of 21 done, 1 cancelled, downtime SLO 15m 00s"), none when no migration was cancelled; the list reads no migration —, clouds,
   SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
   scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
