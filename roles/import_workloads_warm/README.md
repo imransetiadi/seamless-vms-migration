@@ -71,14 +71,14 @@ name with `%`, `/` and NUL written `%25`, `%2F` and `%00`
 |---|---|---|
 | `os_migrate_warm_chunk_size` | `4194304` | blocksync chunk size in bytes |
 | `os_migrate_warm_workers` | `4` | read-ahead hashing threads per conversion host and disk |
-| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (recorded ones and those attached to the deleted server) and empties the warm state - the file stays, the sign that the workload's migration recorded it, so no later rollback takes a same-named server for the workload's; a volume still attached to a server other than the destination conversion host is kept and reported |
+| `os_migrate_rollback_delete_dest_volumes` | `false` | rollback also deletes the destination volumes (the recorded ones; for a workload without a warm state file, those attached to the deleted server) and empties the warm state - the file stays, the sign that the workload's migration recorded it, so no later rollback takes a same-named server for the workload's; a volume still attached to a server other than the destination conversion host is kept and reported |
 | `os_migrate_warm_parallel_disks` | `4` | disks of a workload synchronised at the same time |
 | `os_migrate_warm_assume_zero` | `false` | skip reading destination volumes created by the first pre-copy pass; only for backends that return zeros for never-written blocks (Ceph RBD, thin LVM). Never applied to a final pass |
 | `os_migrate_workloads_preserve_volume_type` | `false` | create destination volumes with the serialized `volume_type` (rewrite it to a destination type in the workload data first) instead of the destination default; also honoured by `import_workloads` |
 | `os_migrate_warm_python_interpreter` | `python3` | Python 3.6+ on the conversion hosts (`/usr/libexec/platform-python` on RHEL 8) |
 | `os_migrate_warm_state_dir` | `{{ os_migrate_data_dir }}/workload_warm` | warm state files |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | destination conversion host; the only server a rollback detaches destination volumes from |
-| `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state (e.g. one the cold import copied before it recorded its workload): delete the only destination server named exactly like the workload |
+| `os_migrate_rollback_match_by_name` | `false` | rollback of a workload without a warm state file (e.g. one the cold import copied before it recorded its workload): delete the only destination server named exactly like the workload; with a state file, even an empty one, no server is taken by its name alone |
 | `os_migrate_rollback_start_source` | `true` | the rollback's last step starts the source server; `false` leaves it as it is (Seamless Migrate's cleanup before a cold cutover, when the source may stay stopped) |
 | `os_migrate_rollback_delete_ports` | `true` | the rollback deletes the destination ports created through Neutron for the workload's source ports; `false` deletes none (Seamless Migrate's cleanup after a cancel, which made no port, where an unbound one may belong to another migration of the VM) |
 | `os_migrate_workloads_filter` | `[{regex: .*}]` | workloads to process (name filter, as for `import_workloads`) |

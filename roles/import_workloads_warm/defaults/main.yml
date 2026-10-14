@@ -6,7 +6,7 @@
 # blocksync chunk size in bytes and read-ahead hashing threads per host.
 os_migrate_warm_chunk_size: 4194304  # noqa: var-naming[no-role-prefix]
 os_migrate_warm_workers: 4  # noqa: var-naming[no-role-prefix]
-# Rollback: also delete the destination volumes and the warm state.
+# Rollback: also delete the destination volumes and empty the warm state.
 os_migrate_rollback_delete_dest_volumes: false  # noqa: var-naming[no-role-prefix]
 # false: the rollback leaves the source as it is (the cleanup before a cold cutover, SDD 7)
 os_migrate_rollback_start_source: true  # noqa: var-naming[no-role-prefix]
@@ -30,8 +30,9 @@ os_migrate_workloads_preserve_volume_type: false  # noqa: var-naming[no-role-pre
 os_migrate_warm_python_interpreter: python3  # noqa: var-naming[no-role-prefix]
 # Warm state files: {{ os_migrate_warm_state_dir }}/{source_server_id}.json
 os_migrate_warm_state_dir: "{{ os_migrate_data_dir }}/workload_warm"  # noqa: var-naming[no-role-prefix]
-# Rollback of workloads without a warm state (e.g. cold): delete the only
-# destination server named exactly like the workload.
+# Rollback of a workload without a warm state file (one migrated before
+# anything was recorded for it): delete the only destination server named
+# exactly like the workload.
 os_migrate_rollback_match_by_name: false  # noqa: var-naming[no-role-prefix]
 
 # Standard os-migrate variables, with the defaults of import_workloads

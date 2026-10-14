@@ -1049,16 +1049,22 @@ def record_destination_volumes(state_dir, server_id, volume_map, server_name=Non
 class WarmRollback:
     """Destination-side rollback of one workload (SDD 6.5).
 
-    Deletes the destination server recorded in the warm state (or, with
-    ``match_by_name``, the only destination server with exactly the
-    workload's name, for workloads migrated without a warm state), then the
-    destination ports created through Neutron for ``source_port_ids`` - Nova
-    keeps them when it deletes their server, and a cutover can fail between
-    creating them and creating the server (SDD 6.6). With
-    ``delete_volumes`` it also deletes the destination volumes - the
-    recorded ones and every volume attached to that server - and the warm
-    state itself; the state is kept while a source snapshot is pending so
-    its temporary resources can still be cleaned up.
+    Deletes the destination server recorded in the warm state - or, when
+    none is recorded or Nova no longer has the recorded one, the single
+    server named like the workload that holds a recorded volume, built from
+    them though Nova's answer to its create was lost; with ``match_by_name``
+    and no state file at all (a workload migrated before anything was
+    recorded for it), the only destination server with exactly the
+    workload's name (SDD 6.4) - then the destination ports created through
+    Neutron for ``source_port_ids`` - Nova keeps them when it deletes their
+    server, and a cutover can fail between creating them and creating the
+    server (SDD 6.6). With ``delete_volumes`` it also deletes the
+    destination volumes - the recorded ones, or without a state file every
+    volume attached to that server - and empties the warm state: the file
+    stays, holding no volume, pass or server, as the sign that the
+    workload's migration recorded it, and a pending source snapshot's
+    record stays so its temporary resources can still be cleaned up (SDD
+    6.3).
     """
 
     def __init__(
