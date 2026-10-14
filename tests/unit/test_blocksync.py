@@ -753,7 +753,7 @@ def _mutate(data, rng, pattern, chunk_size):
     if size == 0:
         return bytes(out)
     if pattern == "extents":
-        for _ in range(rng.randint(1, 8)):
+        for extent in range(rng.randint(1, 8)):
             start = rng.randrange(size)
             length = min(size - start, rng.randint(1, max(1, size // 4)))
             out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
@@ -764,7 +764,7 @@ def _mutate(data, rng, pattern, chunk_size):
             length = min(chunk_size, size - start)
             out[start : start + length] = rand_bytes(length, rng.randrange(1 << 30))
     elif pattern == "zero-runs":
-        for _ in range(rng.randint(1, 4)):
+        for zero_run in range(rng.randint(1, 4)):
             start = rng.randrange(size)
             length = min(size - start, rng.randint(1, max(1, size // 3)))
             out[start : start + length] = b"\0" * length
@@ -788,7 +788,7 @@ def test_randomized_engine_fuzz(tmp_path, seed):
     # the source: random data with zero runs sprinkled in according to the zero ratio
     source = bytearray(rand_bytes(size, seed))
     if size and zero_ratio:
-        for _ in range(int(zero_ratio * 6)):
+        for zero_run in range(int(zero_ratio * 6)):
             start = rng.randrange(size)
             length = min(size - start, rng.randint(1, max(1, size // 2)))
             source[start : start + length] = b"\0" * length

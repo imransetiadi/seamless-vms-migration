@@ -31,7 +31,7 @@ def _makefile_list(name):
 def _referenced():
     out = set()
     for base in ("roles", "playbooks"):
-        for dirpath, _, files in os.walk(os.path.join(ROOT, base)):
+        for dirpath, dirnames, files in os.walk(os.path.join(ROOT, base)):
             for name in files:
                 if name.endswith((".yml", ".yaml")):
                     text = open(os.path.join(dirpath, name), errors="replace").read()

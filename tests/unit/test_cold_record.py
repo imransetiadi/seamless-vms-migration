@@ -90,7 +90,8 @@ def test_the_cold_transfer_records_each_volume_as_soon_as_cinder_created_it(tmp_
     with pytest.raises(RuntimeError, match="VolumeLimitExceeded"):
         transfer._create_destination_volumes()
 
-    (boot,) = dst.volumes
+    assert len(dst.volumes) == 1
+    boot = next(iter(dst.volumes))
     state = WarmState.load(state_dir, "srv-1")
     assert state.dest_volumes == {
         "/dev/vda": {"dest_id": boot, "size": 20, "bootable": True, "name": "vm1-boot"},
@@ -202,9 +203,12 @@ def test_a_rollback_empties_the_record_and_keeps_the_file(tmp_path):
     dst, state_dir = migrated(tmp_path, record=False)
     warm_migration.record_destination_server(state_dir, "srv-1", "dst-srv", "vm1")
     _record(state_dir, TRANSFERRED)
-    rollback = lambda: WarmRollback(  # noqa: E731
-        dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=True, timeout=5
-    ).run(delete_volumes=True)
+
+    def rollback():
+        return WarmRollback(
+            dst, WarmState.load(state_dir, "srv-1"), server_name="vm1", match_by_name=True,
+            timeout=5,
+        ).run(delete_volumes=True)
 
     result = rollback()
 
@@ -583,8 +587,10 @@ def test_the_boot_volume_is_marked_bootable_once_available(tmp_path):
         transfer = _transfer(dst, str(tmp_path / "workload_warm"))
     transfer._create_destination_volumes()
 
-    names = [c[0] for c in dst.calls if c[0] in ("create_volume", "wait_for_status",
-                                                  "set_volume_bootable_status")]
+    names = [
+        c[0] for c in dst.calls
+        if c[0] in ("create_volume", "wait_for_status", "set_volume_bootable_status")
+    ]
     assert names[:3] == ["create_volume", "wait_for_status", "set_volume_bootable_status"]
     boot = next(v for v in dst.volumes.values() if v.name == "vm1-boot")
     assert boot.bootable is True

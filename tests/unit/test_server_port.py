@@ -267,7 +267,7 @@ class TestServerPortNeutron(unittest.TestCase):
 
         result = sp.create_or_update(self.dst)
 
-        [(_, created)] = self.dst.calls_to("create_port")
+        [created] = [call[1] for call in self.dst.calls_to("create_port")]
         # never binding_profile: admin-only in Neutron's policy and host-specific
         self.assertEqual(
             created,
@@ -349,7 +349,7 @@ class TestServerPortNeutron(unittest.TestCase):
 
         sp.create_or_update(self.dst)
 
-        [(_, created)] = self.dst.calls_to("create_port")
+        [created] = [call[1] for call in self.dst.calls_to("create_port")]
         self.assertIs(created["is_port_security_enabled"], False)
         self.assertEqual(created["security_group_ids"], [])
 
@@ -382,7 +382,7 @@ class TestServerPortNeutron(unittest.TestCase):
         sp = ServerPort.from_sdk(None, sdk_server_port())
         sp._refs_from_ser = lambda conn: dict(server_port_refs(), fixed_ips=sent, fixed_ips_refs=[])
         sp.create_or_update(self.dst)
-        [(_, created)] = self.dst.calls_to("create_port")
+        [created] = [call[1] for call in self.dst.calls_to("create_port")]
         self.assertEqual(created["fixed_ips"], [ipv4, stateful])
 
         # an IPv6-only SLAAC port: an explicit empty list, so Neutron adds that address and no other
@@ -392,7 +392,7 @@ class TestServerPortNeutron(unittest.TestCase):
             server_port_refs(), fixed_ips=[sent[1]], fixed_ips_refs=[]
         )
         sp.create_or_update(self.dst)
-        [(_, created)] = self.dst.calls_to("create_port")
+        [created] = [call[1] for call in self.dst.calls_to("create_port")]
         self.assertEqual(created["fixed_ips"], [])
 
     def test_uses_again_the_earlier_port_with_the_addresses_neutron_derived(self):
@@ -434,7 +434,7 @@ class TestServerPortNeutron(unittest.TestCase):
 
         sp.create_or_update(self.dst)
 
-        [(_, created)] = self.dst.calls_to("create_port")
+        [created] = [call[1] for call in self.dst.calls_to("create_port")]
         self.assertEqual(created["fixed_ips"], [])
 
     def test_refuses_an_export_without_the_security_groups(self):
@@ -510,5 +510,5 @@ class TestAddressOnlyFixedIps(unittest.TestCase):
         )
         dst = fake.FakeCloud("dst")
         sp.create_or_update(dst)
-        [(_, created)] = dst.calls_to("create_port")
+        [created] = [call[1] for call in dst.calls_to("create_port")]
         self.assertEqual(created["fixed_ips"], [{"ip_address": "192.168.10.5"}])

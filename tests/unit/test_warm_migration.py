@@ -520,8 +520,9 @@ def test_sync_preserves_volume_type_when_asked(tmp_path):
     typed = Scenario(tmp_path / "typed")
     typed.data["_migration_params"]["boot_volume_params"]["volume_type"] = "rhoso-boot"
     typed.run_pass("uuid-1", preserve_volume_type=True)
-    boot, _ = typed.dst.calls_to("create_volume")
-    assert boot[1]["volume_type"] == "rhoso-boot"
+    calls = typed.dst.calls_to("create_volume")
+    assert len(calls) == 2
+    assert calls[0][1]["volume_type"] == "rhoso-boot"  # the boot volume
 
 
 def test_cold_boot_copy_preserves_serialized_volume_type(tmp_path):

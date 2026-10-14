@@ -364,12 +364,12 @@ def test_a_pass_records_what_the_cutover_will_refuse(env):
 
     problem = "Destination prerequisites not met: port p2 on network 'gone' does not resolve"
     env.world["refusals"] = {"vm1": [problem]}
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
     assert refusals("srv-1") == [problem]
     assert refusals("srv-2") == []
     env.world["refusals"] = {}  # fixed meanwhile
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
     assert refusals("srv-1") == []
 
@@ -484,7 +484,7 @@ def test_failed_precopy_removes_the_snapshot_and_reports(env):
 
 def test_cutover_rerun_refuses_a_failed_destination_server(env):
     """A recorded destination server in ERROR is not 'already cut over'."""
-    rc, out, _ = env.run("import_workloads_cutover")
+    rc, out = env.run("import_workloads_cutover")[:2]
     assert rc == 0, out
     env.world["server_status"] = {"dst-vm1": "ERROR"}
 
@@ -503,7 +503,7 @@ def test_cutover_rerun_refuses_a_failed_destination_server(env):
 def test_cutover_rerun_finishes_a_healthy_destination_server(env):
     """SDD §6.5: the re-run neither stops, syncs nor creates again; it finishes the recorded
     server (ACTIVE, missing floating IPs), which an earlier attempt may have left half done."""
-    rc, out, _ = env.run("import_workloads_cutover")
+    rc, out = env.run("import_workloads_cutover")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("import_workloads_cutover")
@@ -518,7 +518,7 @@ def test_cutover_rerun_finishes_a_healthy_destination_server(env):
 
 
 def test_rollback_passes_the_destination_conversion_host(env):
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run(
@@ -531,7 +531,7 @@ def test_rollback_passes_the_destination_conversion_host(env):
 
 
 def test_rollback_keeps_destination_volumes_by_default(env):
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_all=True)
@@ -547,7 +547,7 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
     """SDD 6.5, 7 (COLD-02): the cleanup before a cold cutover removes what a warm pre-copy left
     and leaves the source as it is - a retry may keep it stopped with an open clock; any other
     rollback starts it."""
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run(
@@ -571,7 +571,7 @@ def test_a_rollback_can_leave_the_source_as_it_is(env):
 def test_a_rollback_can_leave_the_ports_alone(env):
     """SDD 6.5 (review RV-02): a cancel's cleanup passes os_migrate_rollback_delete_ports false, which
     reaches the module as delete_ports; any other rollback deletes the workload's ports."""
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run(
@@ -592,7 +592,7 @@ def test_a_rollback_can_leave_the_ports_alone(env):
 def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     """SDD 6.5: without a workload filter a rollback would revert every cut-over workload of the
     data dir; it refuses unless os_migrate_rollback_all is true. An exact filter rolls back one."""
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("rollback_workloads")
@@ -652,7 +652,6 @@ def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
         assert env.state("srv-1")["dest_volumes"] == RECORDED
         cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
         assert bool(cleaned) is cleanup
-
 
 
 def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(env):
