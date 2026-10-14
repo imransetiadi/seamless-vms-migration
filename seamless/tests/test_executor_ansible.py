@@ -1801,6 +1801,78 @@ def test_a_cold_rollback_deletes_the_volumes_the_cold_import_recorded(env):
     assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, warm)
 
 
+def _state_file(env, state):
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"server_id": "srv-1", "server_name": "web-01", **state}))
+    return path
+
+
+async def test_a_cold_cutover_first_removes_what_an_earlier_warm_pre_copy_left(env):
+    """SDD §7 (COLD-02, the owner's choice, 2026-10-14): a warm migration rolled back keeps its
+    pre-copy volumes for a retry; switched to cold, its cutover first runs the rollback playbook
+    with the volumes deleted and the source left as it is (a retry may keep it stopped), matching
+    no server by name - before the export and the stop."""
+    _state_file(
+        env,
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True}},
+            "passes": [{"number": 1, "kind": "full"}],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    ctx, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "rollback_workloads.yml",
+        "export_workloads.yml",
+        "import_workloads.yml",
+    ]
+    cleanup = calls[0]["vars"]
+    assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
+    assert cleanup["os_migrate_rollback_start_source"] is False
+    assert "os_migrate_rollback_match_by_name" not in cleanup
+    assert rec.downtime_marks == 1  # the import stopped the source, the cleanup did not
+
+
+async def test_a_cold_cutover_keeps_a_cold_record_and_a_warm_record_with_its_server(env):
+    """SDD §7: a cold record (volumes and a server, no pass) is a resumed cutover's own, and a
+    warm record that names a destination server is not a pre-copy's leftover: neither is removed."""
+    for state in (
+        # the cold import's record of an interrupted attempt
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}},
+            "passes": [],
+            "destination_server_id": "dst-1",
+        },
+        # a warm cutover's server
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}},
+            "passes": [{"number": 1}],
+            "destination_server_id": "dst-1",
+        },
+    ):
+        path = _state_file(env, state)
+        if env.log.exists():
+            env.log.write_text("")  # this case's runs only
+        ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert [c["playbook"] for c in read_log(env.log)] == [
+            "export_workloads.yml",
+            "import_workloads.yml",
+        ], state
+        assert "os_migrate_rollback_start_source" not in build_vars(StepName.CUTOVER, ctx)
+        path.unlink()
+    # a pending source snapshot alone (a first pass cut short) is a leftover too
+    _state_file(env, {"dest_volumes": {}, "passes": [], "pending_snapshot": {"transfer_uuid": "u"}})
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    assert build_vars(StepName.CUTOVER, cold)["os_migrate_rollback_start_source"] is False
+    warm, _ = ctx_for(env, strategy=Strategy.warm)
+    assert "os_migrate_rollback_start_source" not in build_vars(StepName.CUTOVER, warm)
+
+
 def _finished_cutover_state(env, record_server=True):
     """The warm state an attempt leaves when it ran the final pass and created the server, then
     failed (a timeout while the server booted, an error adding its floating IPs)."""
