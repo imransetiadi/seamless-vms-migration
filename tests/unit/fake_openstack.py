@@ -612,9 +612,10 @@ def run_module(module, args, conn, shell_factory=None):
     with contextlib.ExitStack() as stack:
         try:
             from ansible.module_utils import _internal
-        except ImportError:  # ansible-core < 2.19
-            pass
-        else:
+        except ImportError:  # ansible-core < 2.18
+            _internal = None
+        # ansible-core 2.18 has the package but not the flag (CI's collection job pins < 2.19)
+        if hasattr(_internal, "is_controller"):
             # never the controller, which ansible-core 2.19 and later mark once a test imported
             # its code: a controller's module.warn() displays instead of returning the warning
             stack.enter_context(mock.patch.object(_internal, "is_controller", False))
