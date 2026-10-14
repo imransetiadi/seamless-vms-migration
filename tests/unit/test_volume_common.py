@@ -310,14 +310,14 @@ def _guarded_attach(results):
 def test_a_lock_wait_gives_up_when_ssh_cannot_reach_the_conversion_host():
     """SDD 6.6: ssh exits 255 when it cannot reach the host. The lock wait gives up after a minute
     of that - it tried 1800 times, each up to the 10 s connect timeout, about 5.5 h, while a cold
-    cutover's source stays stopped."""
+    cutover's source stays stopped - with a "Lock timeout" the control plane retries (R-07)."""
     transfer, clock, guarded = _guarded_attach([255] * 1800)
 
     with mock.patch.object(volume_common, "time", clock):
         with pytest.raises(
             RuntimeError,
-            match=r"Cannot reach conversion host 10\.1\.0\.10 over SSH for \d+ s to take lock "
-            + volume_common.ATTACH_LOCK_FILE_DESTINATION,
+            match=r"Lock timeout: conversion host 10\.1\.0\.10 unreachable over SSH for \d+ s, "
+            r"waiting for " + volume_common.ATTACH_LOCK_FILE_DESTINATION,
         ):
             guarded(transfer)
 

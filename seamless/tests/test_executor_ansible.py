@@ -1351,6 +1351,22 @@ def test_workload_file_stem_matches_the_collection():
     assert all("/" not in workload_file_stem(n) for n in names)
 
 
+def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says():
+    """SDD §6.6, QASuite R-07: a lock wait that cannot reach the conversion host is retried - the
+    host may be rebooting - and a detach that never ends is not (review RV6-01). The messages are
+    read from the collection's source, so rewording one cannot move it out of its class."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/volume_common.py"
+    ).read_text()
+    templates = re.findall(r'"([^"]*%[sd][^"]*)"', source)
+    unreachable = next(t for t in templates if "unreachable over SSH" in t)
+    stuck = next(t for t in templates if "waiting to detach volume" in t)
+
+    lock = "/var/lock/v2v-destination-volume-lock"
+    assert classify_failure(unreachable % ("10.1.0.10", 66, lock)) is TransientStepError
+    assert classify_failure(stuck % (1800, "vol-1", "srv-1")) is PermanentStepError
+
+
 def test_transient_vs_permanent_failure_classifier():
     assert classify_failure("fatal: Timeout when waiting for 192.0.2.10:22") is TransientStepError
     assert classify_failure("keystoneauth: HTTP 503 Service Unavailable") is TransientStepError

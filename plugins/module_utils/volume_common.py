@@ -141,13 +141,14 @@ def use_lock(lock_file):
                     result = self.shell.cmd_val(cmd)
                     if result == SSH_FAILED:
                         # the conversion host cannot be reached: give up after a minute
-                        # of that rather than try 1800 times (Seamless Migrate SDD 6.6)
+                        # of that rather than try 1800 times; the control plane retries
+                        # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
                         now = time.monotonic()
                         if unreachable_since is None:
                             unreachable_since = now
                         elif now - unreachable_since >= SSH_UNREACHABLE_S:
                             raise RuntimeError(
-                                "Cannot reach conversion host %s over SSH for %d s to take lock %s"
+                                "Lock timeout: conversion host %s unreachable over SSH for %d s, waiting for %s"
                                 % (
                                     getattr(self.shell, "address", "?"),
                                     now - unreachable_since,
