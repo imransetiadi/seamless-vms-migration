@@ -288,3 +288,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   gone instead of creating a new one; and a cold re-run failed on an
   earlier attempt's boot volume. The unit tests' fake cloud now raises the
   same way.
+- The collection artifact leaves out the Seamless Migrate control plane,
+  dashboard and deployment around the collection (``seamless/``,
+  ``dashboard/``, ``deploy/`` and the agent configuration), and everything the
+  checkout's ``.gitignore`` files name, at the depths they name it.
+  ``ansible-galaxy collection build`` packs files from disk rather than from
+  git, so a tarball built at the repository root (``make build``,
+  ``scripts/publish.sh``) could carry local secrets: the cloud credentials
+  ``make generate-auth-files`` writes to ``tests/auth_tenant.yml``,
+  ``clouds.yml`` files, ``secrets/``, ``.env`` files and the track checkouts
+  under ``.worktrees/``. ``galaxy.yml``'s ``build_ignore`` now mirrors the
+  ``.gitignore`` patterns, and a unit test derives a sample from every
+  pattern. Never publish a tarball built before this change.
