@@ -1435,6 +1435,11 @@ class AnsibleExecutor:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
                     mode = ctx.plan.port_creation_mode if ctx is not None else None
                     nics = ctx.plan.nic_overrides.get(planned or "") if ctx is not None else None
+                    volumes = (
+                        [d.id for d in ctx.migration.vm.disks if d.kind == "volume"]
+                        if ctx is not None
+                        else None
+                    )
                     await asyncio.to_thread(
                         self._rewrite_workloads,
                         osm,
@@ -1444,6 +1449,7 @@ class AnsibleExecutor:
                         nics,
                         networks,
                         deferred,
+                        volumes,
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)
@@ -1461,8 +1467,10 @@ class AnsibleExecutor:
         nic_overrides: Mapping[str, NicOverride] | None = None,
         networks: Sequence[dict[str, Any]] | None = None,
         deferred: list[str] | None = None,
+        validated_volumes: Sequence[str] | None = None,
     ) -> None:
-        """Keep only the planned server of the export, apply the mappings, the VM's NIC
+        """Keep only the planned server of the export, check that it still lists every volume
+        the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
         overrides and the plan's port_creation_mode, and resolve the network references against
         the destination's ``networks`` - a warm pass adds a port network that does not resolve
         to ``deferred`` -; once all of it succeeded, write the export record (SDD §7.2)."""
@@ -1495,6 +1503,23 @@ class AnsibleExecutor:
             doc = set_port_creation_mode(doc, port_mode)
         # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if validated_volumes:
+            # a volume detached from the VM since - by an operator, or by an earlier attempt's
+            # export that failed after it detached the data volumes - would be left out of the
+            # import, and the migration would succeed without that disk (review RV6-01)
+            kept = [r for r in doc.get("resources") or [] if r.get("type") == SERVER_TYPE]
+            listed = {
+                (volume.get("_info") or {}).get("id")
+                for resource in kept
+                for volume in (resource.get("params") or {}).get("volumes") or []
+            }
+            lacking = [v for v in validated_volumes if v not in listed]
+            if lacking:
+                raise PermanentStepError(
+                    "the export lists none of the volume(s) " + ", ".join(lacking) + " the VM "
+                    "had at validation: attach them to the source VM again (an earlier attempt "
+                    "may have left them detached) and retry, or validate the plan again"
+                )
         if nic_overrides:
             doc = apply_nic_overrides(doc, nic_overrides)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))

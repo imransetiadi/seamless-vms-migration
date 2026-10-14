@@ -1891,6 +1891,81 @@ async def test_a_cold_cutover_first_removes_the_volumes_an_earlier_cold_attempt_
     assert "os_migrate_rollback_match_by_name" not in cleanup
 
 
+# the export module's failure as Ansible prints it when a detach timed out (review RV6-01)
+EXPORT_TIMED_OUT = (
+    '{"changed": false, "module_stderr": "Traceback (most recent call last):\\n'
+    '  File \\"volume_common.py\\", line 75, in detach_volume_bounded\\n'
+    "openstack.exceptions.ResourceTimeout: Timeout waiting for Volume:vol-quorum to transition "
+    'to available\\n", "msg": "MODULE FAILURE\\nSee stdout/stderr for the exact error", "rc": 1}'
+)
+
+
+async def test_a_retried_cold_cutover_refuses_an_export_without_a_disk_the_vm_was_validated_with(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV6-01): attempt 1 stopped the VM and its export detached the shared disk,
+    then failed transiently; the retry exports the VM again from Nova's attachments, without that
+    disk - the step fails permanently, naming it, before any import playbook runs, rather than
+    migrate the VM one disk short."""
+    from tests.executor_support import make_ctx
+    from tests.factories import make_disk, make_migration, make_plan, make_vm
+
+    vm = make_vm(
+        source_id="srv-1",
+        name="web-01",
+        disks=[
+            make_disk(id="vol-1"),
+            make_disk(id="vol-quorum", bootable=False, device="/dev/vdb", multiattach=True),
+            make_disk(id="vol-data", bootable=False, device="/dev/vdc"),
+        ],
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings)
+
+    # attempt 1: the export lists all three; the import then fails as a detach timeout does
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-1,vol-quorum,vol-data")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "import_workloads.yml")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", EXPORT_TIMED_OUT)
+    with pytest.raises(TransientStepError):
+        await env.executor.run(StepName.CUTOVER, ctx)
+
+    # the retry: Nova no longer lists the shared disk on the source VM
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-1,vol-data")
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    before = len(read_log(env.log))
+    with pytest.raises(PermanentStepError, match="vol-quorum"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    retried = [c["playbook"] for c in read_log(env.log)[before:]]
+    assert "import_workloads.yml" not in retried
+    assert retried[-1] == "export_workloads.yml"
+
+
+async def test_the_export_is_checked_against_the_vms_volumes_only(env, monkeypatch):
+    """SDD §7.2 (review RV6-01): an image-booted VM's root and ephemeral disks are no Cinder
+    volumes and never appear among the exported volumes - only the validated volumes must."""
+    from tests.executor_support import make_ctx
+    from tests.factories import make_disk, make_migration, make_plan, make_vm
+
+    vm = make_vm(
+        source_id="srv-1",
+        name="web-01",
+        disks=[
+            make_disk(id="srv-1-root", kind="image_root", volume_type=None),
+            make_disk(id="srv-1-ephemeral", kind="ephemeral", bootable=False, device=None),
+            make_disk(id="vol-data", bootable=False, device="/dev/vdb"),
+        ],
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings)
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-data")
+
+    await env.executor.run(StepName.CUTOVER, ctx)
+
+    assert "import_workloads.yml" in [c["playbook"] for c in read_log(env.log)]
+
+
 def test_a_cold_cutover_writes_the_workloads_record_before_its_playbooks(env, monkeypatch):
     """SDD §6.3, §7 (review RV3-03): with no record yet, the control plane writes one - no volume,
     pass or server - before a cold cutover's playbooks; a record already there is left as it is."""

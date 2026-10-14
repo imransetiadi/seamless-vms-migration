@@ -71,6 +71,8 @@ SCRIPT = textwrap.dedent(
     (osm / "clouds.yaml").write_text("clouds: {{src: {{auth: {{password: leak}}}}}}\\n")
     name = os.environ.get("ANSIBLE_FAKE_VM_NAME", "web-01")
     server_id = os.environ.get("ANSIBLE_FAKE_SERVER_ID", "srv-1")
+    # the volumes the export lists for the server, by Cinder id (the default VM's boot volume)
+    volume_ids = [v for v in os.environ.get("ANSIBLE_FAKE_VOLUME_IDS", "vol-1").split(",") if v]
     base = record["playbook"]
     print("PLAY [migrator] ****")
     print("TASK [" + base + "] ****")
@@ -93,7 +95,8 @@ SCRIPT = textwrap.dedent(
                     "fixed_ips_refs": [{{"ip_address": "10.0.0.5", "subnet_ref": {{
                         "name": "app-subnet", "project_name": "finance",
                         "domain_name": "Default"}}}}]}}}}],
-                "volumes": [{{"params": {{"name": "data", "volume_type": "ceph-hdd"}}}}],
+                "volumes": [{{"params": {{"name": "data", "volume_type": "ceph-hdd"}},
+                             "_info": {{"id": volume_id}}}} for volume_id in volume_ids],
                 "security_group_refs": [{{"name": "default", "project_name": "finance",
                                           "domain_name": "Default"}}],
             }},
