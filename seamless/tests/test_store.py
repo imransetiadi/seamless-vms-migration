@@ -560,3 +560,42 @@ def test_a_role_that_does_not_own_the_tables_starts_once_the_owner_created_them(
             conn.execute(sa.text(f"DROP ROLE {role}"))
         owner.truncate_for_tests()
         owner.dispose()
+
+
+@pytest.mark.skipif(not PG_URL, reason="SEAMLESS_TEST_PG_URL is not set")
+def test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_tables():
+    """SDD §11 (review RV-07): with PostgreSQL's secure schema usage pattern the application role
+    owns a schema named after it, first in its search_path ("$user", public), while the tables
+    are the owner's: create_schema reads the indexes of the tables its names resolve to - not of
+    the current schema, the role's own and empty one - so it finds them all and runs no CREATE
+    INDEX, which only the tables' owner may run."""
+    owner = Store(PG_URL)
+    owner.create_schema()
+    url = sa.engine.make_url(PG_URL)
+    role, password = f"seamless_app_{secrets.token_hex(4)}", secrets.token_urlsafe(16)
+    with owner.engine.begin() as conn:
+        conn.execute(sa.text(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        conn.execute(sa.text(f'GRANT CONNECT ON DATABASE "{url.database}" TO {role}'))
+        conn.execute(sa.text(f"CREATE SCHEMA {role} AUTHORIZATION {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT ON events TO {role}"))
+        conn.execute(sa.text(f"GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO {role}"))
+    app = Store(url.set(username=role, password=password).render_as_string(hide_password=False))
+    try:
+        with app.engine.connect() as conn:  # the premise: its current schema is its own
+            assert conn.execute(sa.text("SELECT current_schema()")).scalar() == role
+        seen = _statements_of(app, app.create_schema)  # what every server start runs
+        assert not [s for s in seen if s.split()[0].upper() == "CREATE"], seen
+        migration = make_migration()
+        app.put("migration", migration, expected_version=0)
+        assert owner.get("migration", migration.id, Migration) == migration  # the owner's table
+    finally:
+        app.dispose()
+        with owner.engine.begin() as conn:
+            conn.execute(sa.text(f"DROP SCHEMA {role} CASCADE"))
+            conn.execute(sa.text(f"REVOKE ALL ON documents, events FROM {role}"))
+            conn.execute(sa.text(f"REVOKE ALL ON SEQUENCE events_seq_seq FROM {role}"))
+            conn.execute(sa.text(f'REVOKE CONNECT ON DATABASE "{url.database}" FROM {role}'))
+            conn.execute(sa.text(f"DROP ROLE {role}"))
+        owner.truncate_for_tests()
+        owner.dispose()

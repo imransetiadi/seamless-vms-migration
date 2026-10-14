@@ -155,12 +155,18 @@ def _matches(value: Any, wanted: Any) -> bool:
 
 
 def _index_names(conn: sa.Connection) -> set[str]:
-    """The index names the database has: the current schema's on PostgreSQL, every one on SQLite."""
+    """The index names the store's tables have: on PostgreSQL those of the tables their names
+    resolve to through search_path, as every statement of the store does - not the current
+    schema's, which may be the role's own and hold no table (SDD §11); every one on SQLite."""
     if conn.dialect.name == "postgresql":
-        query = "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+        query = sa.text(
+            "SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid"
+            " WHERE x.indrelid IN (to_regclass(:documents), to_regclass(:events))"
+        )
+        rows = conn.execute(query, {"documents": documents.name, "events": events.name})
     else:
-        query = "SELECT name FROM sqlite_master WHERE type = 'index'"
-    return {row[0] for row in conn.execute(sa.text(query))}
+        rows = conn.execute(sa.text("SELECT name FROM sqlite_master WHERE type = 'index'"))
+    return {row[0] for row in rows}
 
 
 class Store:
