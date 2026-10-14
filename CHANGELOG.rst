@@ -326,22 +326,25 @@ This project follows a simple changelog to satisfy collection metadata validatio
   ``import_workload_export_volumes`` fails with its volume map, which records
   each port as soon as it is claimed, so the role's rescue runs
   ``import_workload_src_cleanup``: it stops the transfer's NBD exports and
-  frees those ports. Before, the export failed
-  without the map, nothing was put back, and the rollback started the source
-  VM without the data volumes the export had detached. The source cleanup
+  frees those ports. Before it fails, the export attaches the data volumes
+  it detached, and no server holds, back to the source VM through the API
+  alone, as a conversion host still unreachable stops the cleanup. Before,
+  the export failed without the map, nothing was put back, and the rollback
+  started the source VM without the data volumes the export had detached. The
+  source cleanup
   takes such a partial map: it detaches each volume Cinder lists on the
   conversion host, whether or not its device was recorded, re-attaches the
   data volumes, and removes the root copy, its snapshot or the image only
   when the export made them, never the VM's own boot volume. The export
   records the snapshot and the image as soon as each exists.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
-  host has failed for a minute without a break, with ``Lock timeout:
+  host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,
-  which Seamless Migrate retries as transient, as it does a conversion host
-  reboot mid-pass. It tried up to 1800 times, each try up to the 10 s connect
-  timeout, about 5.5 hours, while a cold cutover's source stayed stopped. One
-  failed connection, or a lock another migration holds, starts that minute
-  again.
+  which Seamless Migrate retries as transient. It tried up to 1800 times, each
+  try up to the 10 s connect timeout, about 5.5 hours, while a cold cutover's
+  source stayed stopped. The window rides out a conversion host reboot or a
+  network blip, and the step then completes. One failed connection, or a lock
+  another migration holds, starts the window again.
 - The roles' loops over workloads (``import_workloads``,
   ``import_workloads_warm``, ``export_workloads``, ``import_from_hypervisor``)
   label each item with its id only. Ansible printed the whole workload, or

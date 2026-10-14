@@ -308,9 +308,12 @@ def _guarded_attach(results):
 
 
 def test_a_lock_wait_gives_up_when_ssh_cannot_reach_the_conversion_host():
-    """SDD 6.6: ssh exits 255 when it cannot reach the host. The lock wait gives up after a minute
-    of that - it tried 1800 times, each up to the 10 s connect timeout, about 5.5 h, while a cold
-    cutover's source stays stopped - with a "Lock timeout" the control plane retries (R-07)."""
+    """SDD 6.6: ssh exits 255 when it cannot reach the host. The lock wait gives up once that
+    lasted the 15-minute window - it tried 1800 times, each up to the 10 s connect timeout, about
+    5.5 h, while a cold cutover's source stays stopped - with a "Lock timeout" the control plane
+    retries (R-07)."""
+    window = volume_common.SSH_UNREACHABLE_S
+    assert window == 900  # rides out a reboot (review RV8-01)
     transfer, clock, guarded = _guarded_attach([255] * 1800)
 
     with mock.patch.object(volume_common, "time", clock):
@@ -322,20 +325,21 @@ def test_a_lock_wait_gives_up_when_ssh_cannot_reach_the_conversion_host():
             guarded(transfer)
 
     tries = [c for c in transfer.shell.commands if c[:2] == ["sudo", "flock"]]
-    assert 6 <= len(tries) <= 8, len(tries)
-    assert 60 <= clock.now <= 90, clock.now
+    # each try costs the 10 s connect timeout and the 1 s sleep
+    assert len(tries) <= window // 11 + 3, len(tries)
+    assert window <= clock.now <= window + 25, clock.now
 
 
 def test_a_lock_wait_rides_out_a_failed_ssh_now_and_then_and_a_busy_lock():
-    """One failed connection, or a lock another migration holds, starts that minute again: a wait
-    that sees ssh fail now and then, between busy answers, for far longer than a minute, still
+    """One failed connection, or a lock another migration holds, starts the window again: a wait
+    that sees ssh fail now and then, between busy answers, for far longer than the window, still
     takes the lock."""
-    transfer, clock, guarded = _guarded_attach([255, 16] * 40 + [255, 255, 0])
+    transfer, clock, guarded = _guarded_attach([255, 16] * 100 + [255, 255, 0])
 
     with mock.patch.object(volume_common, "time", clock):
         assert guarded(transfer) == "attached"
 
-    assert clock.now > 400
+    assert clock.now > volume_common.SSH_UNREACHABLE_S
 
 
 def test_conversion_host_ssh_keeps_the_link_alive():

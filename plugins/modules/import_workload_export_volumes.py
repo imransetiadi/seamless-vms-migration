@@ -381,10 +381,11 @@ def run_module():
     try:
         source_host.prepare_exports()
     except Exception as err:  # pylint: disable=broad-except
-        # Fail with the map, so the role's rescue puts back what this export took
-        # (Seamless Migrate SDD 6.6, review RV6-01). Nothing more here: a step
-        # over SSH could wait for the port lock while the conversion host is
-        # unreachable; the cleanup checks SSH first.
+        # The data volumes this export detached go back to the source VM through
+        # the API alone, then it fails with the map, so the role's rescue puts
+        # back the rest (Seamless Migrate SDD 6.6, review RV6-01, RV8-01). No step
+        # over SSH here: the conversion host may be what failed.
+        source_host.reattach_detached_volumes()
         module.fail_json(
             msg=str(err),
             exception=traceback.format_exc(),

@@ -101,8 +101,9 @@ def _lock_host():
 
 # ssh's own exit status when it cannot reach or log in to the host
 SSH_FAILED = 255
-# a lock wait gives up once ssh to the conversion host failed this long without a break
-SSH_UNREACHABLE_S = 60
+# a lock wait gives up once ssh to the conversion host failed this long without a break: long
+# enough to ride out a reboot or a network blip (Seamless Migrate SDD 6.6, review RV8-01)
+SSH_UNREACHABLE_S = 900
 
 
 def use_lock(lock_file):
@@ -140,7 +141,7 @@ def use_lock(lock_file):
                     ]
                     result = self.shell.cmd_val(cmd)
                     if result == SSH_FAILED:
-                        # the conversion host cannot be reached: give up after a minute
+                        # the conversion host cannot be reached: give up after 15 minutes
                         # of that rather than try 1800 times; the control plane retries
                         # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
                         now = time.monotonic()
@@ -813,6 +814,35 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
         class that exports the VM or the list of detached volumes
         """
         raise NotImplementedError("Please Implement this method")
+
+    def reattach_detached_volumes(self):
+        """
+        After a failed export: attach each data volume of the map that no
+        server holds - the export detached it from the source VM, and never
+        attached it to the conversion host - back to the source VM. Only the
+        OpenStack API is used: the conversion host may be what failed, and the
+        source cleanup checks SSH first, so without this the rollback that
+        follows would start the source VM without them (Seamless Migrate SDD
+        6.6, review RV8-01). Best effort: what cannot be attached is left to the
+        source cleanup.
+        """
+        for path, mapping in sorted(self.volume_map.items()):
+            if path == "/dev/vda" or not mapping.get("source_id"):
+                continue  # the root disk or its copy is the source cleanup's
+            try:
+                volume = volume_or_none(self.conn, mapping["source_id"])
+                if volume is None or getattr(volume, "attachments", None):
+                    continue
+                self.log.info("Attaching %s back to the source VM", volume["id"])
+                self.conn.attach_volume(
+                    volume=volume, server=self._source_vm(), wait=True, timeout=self.timeout
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                self.log.warning(
+                    "Could not attach volume %s back to the source VM: %s",
+                    mapping["source_id"],
+                    err,
+                )
 
     def _get_root_and_data_volumes(self):
         """
