@@ -2147,6 +2147,48 @@ async def test_a_rolled_back_migration_without_passes_is_cancelled_and_then_its_
     await h.orch.stop()
 
 
+async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data_path(
+    tmp_path, store
+):
+    """SDD §5.1 (review RV-01, RV-02): the rollback of a completed cold migration matched its server
+    by name and started its source; the cleanup when it is then cancelled matches nothing by name,
+    deletes no port and leaves the source as it is - the VM the rollback released may since be
+    another plan's, with a same-named server, ports keyed to the VM and a source its cutover
+    stopped."""
+    from seamless_migrate.executors.ansible import build_vars
+
+    settings = make_settings(tmp_path)
+    seen: list[dict] = []
+
+    async def rollback(ctx):
+        seen.append({"options": dict(ctx.options), "vars": build_vars(StepName.ROLLBACK, ctx)})
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    assert m.sync_passes and m.downtime_started_at is not None
+    rollback_vars = seen[0]["vars"]
+    assert rollback_vars["os_migrate_rollback_match_by_name"] is True
+    assert "os_migrate_rollback_start_source" not in rollback_vars  # it starts the source
+
+    await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    cleanup = seen[1]
+    assert cleanup["options"] == {"delete_dest_volumes": True}
+    assert cleanup["vars"]["os_migrate_rollback_delete_dest_volumes"] is True
+    assert "os_migrate_rollback_match_by_name" not in cleanup["vars"]
+    assert cleanup["vars"]["os_migrate_rollback_start_source"] is False
+    assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
+
+
 async def test_a_cleanup_stays_tracked_until_its_outcome_is_recorded(tmp_path, store):
     """The cleanup after a cancel leaves _cleanups only once it has finished, its outcome event
     included, however slowly the event store answers: whoever waits for it (stop() cancels what it

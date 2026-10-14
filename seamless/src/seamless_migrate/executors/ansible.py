@@ -503,7 +503,14 @@ def build_vars(
     )
     # SDD §6.4: keep mapped volume types (apply_mappings rewrote them to RHOSO types)
     out["os_migrate_workloads_preserve_volume_type"] = bool(ctx.plan.mappings.volume_types)
-    if m.strategy == Strategy.cold and step == StepName.ROLLBACK and m.downtime_started_at:
+    # the cleanup after a cancel is the only step that asks for delete_dest_volumes (SDD §5.1)
+    cancel_cleanup = step == StepName.ROLLBACK and bool(ctx.options.get("delete_dest_volumes"))
+    if (
+        m.strategy == Strategy.cold
+        and step == StepName.ROLLBACK
+        and m.downtime_started_at
+        and not cancel_cleanup
+    ):
         # the cold path records no destination server id: the rollback matches by name — only
         # after the stop, since the role creates the server after it; before it a same-named
         # server is not this migration's (a cutover refused or skipped for a collision, SDD §7.2)
@@ -517,8 +524,14 @@ def build_vars(
         # the source as it is: a retry may keep it stopped (SDD §7, COLD-02, the owner's choice)
         out["os_migrate_rollback_delete_dest_volumes"] = True
         out["os_migrate_rollback_start_source"] = False
+    if cancel_cleanup:
+        # it touches only what the migration recorded of its own: its rollback removed its server
+        # and ports and started its source, and the VM it released may since be another plan's,
+        # whose server, ports and stopped source are not this migration's (SDD §5.1, review RV-02)
+        out["os_migrate_rollback_start_source"] = False
+        out["os_migrate_rollback_delete_ports"] = False
     if step == StepName.ROLLBACK and (
-        ctx.options.get("delete_dest_volumes")
+        cancel_cleanup
         or (m.strategy == Strategy.cold and _cold_volumes_recorded(rdir / "osm", m.vm.source_id))
     ):
         # cleanup after a cancel: the destination volumes of the abandoned pass go too; and a
@@ -1204,6 +1217,8 @@ class AnsibleExecutor:
     async def _vmware_rollback(self, ctx: StepContext) -> StepResult:
         m = ctx.migration
         vm = m.vm
+        if ctx.options.get("delete_dest_volumes"):
+            return await self._vmware_cancel_cleanup(ctx)
         try:
             dst = self.providers.get(ctx.destination)
             server_id = m.destination_server_id
@@ -1225,6 +1240,18 @@ class AnsibleExecutor:
                 "deleted_ports": deleted_ports,
             }
         )
+
+    async def _vmware_cancel_cleanup(self, ctx: StepContext) -> StepResult:
+        """A cancel's cleanup on VMware deletes only a server the migration recorded: no lookup by
+        name, no kit port, no power-on - the VM it released may since be another plan's (SDD §5.1,
+        §7.2, review RV-01, RV-02)."""
+        server_id = ctx.migration.destination_server_id
+        if server_id:
+            try:
+                await self.providers.get(ctx.destination).delete_server(server_id)
+            except ProviderError as exc:
+                raise TransientStepError(f"rollback: {exc}") from exc
+        return StepResult(details={"deleted_server": server_id, "deleted_ports": []})
 
     async def _finalize(self, ctx: StepContext) -> StepResult:
         if not ctx.options.get("delete_source"):

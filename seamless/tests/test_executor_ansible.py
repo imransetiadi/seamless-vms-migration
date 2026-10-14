@@ -1767,16 +1767,38 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
 def test_cold_rollback_before_any_stop_never_matches_by_name(env):
     """SDD §7.2: the cold role creates the destination server after it stops the source, so
     before a stop a same-named server is not this migration's — a cutover refused or skipped
-    for a name collision is rolled back without deleting it (or, after a cancel, its volumes)."""
-    for options in ({}, {"delete_dest_volumes": True}):
-        ctx, _ = ctx_for(env, strategy=Strategy.cold)
-        ctx.options.update(options)
-        assert ctx.migration.downtime_started_at is None
-        rollback = build_vars(StepName.ROLLBACK, ctx)
-        assert "os_migrate_rollback_match_by_name" not in rollback
-        stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
-        stopped.options.update(options)
-        assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+    for a name collision is rolled back without deleting it. A cancel's cleanup never matches by
+    name, stopped or not (SDD §5.1, review RV-01): the migration's rollback already removed its
+    server, and the VM it released may since be another plan's."""
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    assert ctx.migration.downtime_started_at is None
+    assert "os_migrate_rollback_match_by_name" not in build_vars(StepName.ROLLBACK, ctx)
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+    for cleanup in (ctx, stopped):
+        cleanup.options["delete_dest_volumes"] = True
+        assert "os_migrate_rollback_match_by_name" not in build_vars(StepName.ROLLBACK, cleanup)
+
+
+def test_a_cancels_cleanup_touches_only_the_migrations_own_data_path(env):
+    """SDD §5.1 (review RV-01, RV-02): the cleanup after a cancel - the rollback step with
+    delete_dest_volumes - matches no server by name, deletes no port and leaves the source as it
+    is: its rollback removed its server and ports and started its source, and the VM it released
+    may since be another plan's. A rollback deletes its ports and starts its source as before."""
+    for strategy in (Strategy.cold, Strategy.warm):
+        cleanup, _ = ctx_for(
+            env, strategy=strategy, downtime_started_at=utcnow(), downtime_ended_at=utcnow()
+        )
+        cleanup.options["delete_dest_volumes"] = True
+        v = build_vars(StepName.ROLLBACK, cleanup)
+        assert v["os_migrate_rollback_delete_dest_volumes"] is True, strategy
+        assert v["os_migrate_rollback_start_source"] is False, strategy
+        assert v["os_migrate_rollback_delete_ports"] is False, strategy
+        assert "os_migrate_rollback_match_by_name" not in v, strategy
+        rollback, _ = ctx_for(env, strategy=strategy, downtime_started_at=utcnow())
+        v = build_vars(StepName.ROLLBACK, rollback)
+        assert "os_migrate_rollback_start_source" not in v, strategy
+        assert "os_migrate_rollback_delete_ports" not in v, strategy
 
 
 def test_a_cold_rollback_deletes_the_volumes_the_cold_import_recorded(env):
@@ -1921,6 +1943,50 @@ async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_fa
     retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
     with pytest.raises(PermanentStepError, match="recorded no new pass"):
         await env.executor.run(StepName.CUTOVER, retry)
+
+
+async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
+    """SDD §7.2 (review RV-01, RV-02): a cancel's cleanup on VMware looks up no server by name,
+    deletes no kit port and powers nothing on - another plan may migrate the VM it released, with
+    a same-named server, kit ports of the VM's MACs and a source its cutover stopped."""
+    mac = "00:50:56:00:00:01"
+    nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
+    env.registry.existing = {"web-01"}  # another plan's server of the VM
+    env.registry.ports = [
+        {
+            "id": "kit-of-plan-b",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": "net-app-net-mine",
+            "device_id": "",
+            "mac_address": mac,
+            "fixed_ips": ["10.0.0.5"],
+        }
+    ]
+    for strategy in (Strategy.vmware_warm, Strategy.vmware_cold):
+        env.registry.calls.clear()
+        ctx, _ = ctx_for(
+            env,
+            strategy=strategy,
+            source=VCENTER,
+            nics=[nic],
+            downtime_started_at=utcnow(),
+            downtime_ended_at=utcnow(),
+        )
+        ctx.options["delete_dest_volumes"] = True
+        await env.executor.run(StepName.ROLLBACK, ctx)
+        assert env.registry.calls == [], strategy
+    assert [p["id"] for p in env.registry.ports] == ["kit-of-plan-b"]
+    # a server the migration recorded is its own: the cleanup deletes it
+    recorded, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    recorded.options["delete_dest_volumes"] = True
+    await env.executor.run(StepName.ROLLBACK, recorded)
+    assert env.registry.calls == [("delete_server", "dst-9")]
 
 
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
