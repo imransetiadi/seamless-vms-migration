@@ -342,3 +342,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   timeout, about 5.5 hours, while a cold cutover's source stayed stopped. One
   failed connection, or a lock another migration holds, starts that minute
   again.
+- The roles' loops over workloads (``import_workloads``,
+  ``import_workloads_warm``, ``export_workloads``, ``import_from_hypervisor``)
+  label each item with its id only. Ansible printed the whole workload, or
+  its name, on each include and result line, and Seamless Migrate classifies
+  a failure as transient by the playbook output: a workload whose name or
+  boot image properties (Nova's ``os_shutdown_timeout``) held "timeout" made
+  a failure meant to be permanent, such as a stuck detach, be retried. The
+  lines now read ``(item=<id>)``.
