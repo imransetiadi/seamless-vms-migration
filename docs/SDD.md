@@ -548,7 +548,12 @@ Approvals, `cutover_requested` (with its requester) and a pending `force_window`
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
 `blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. A validation writes each migration once — a new one is
+its lock, so no other validation is still at work on it. A re-assessment of a migration whose history reached
+`cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
+volumes, and one that failed may have left them so when its rescue failed too (§6.6) - among the migration's disks,
+as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the export check (§7.2) drops a disk the
+VM had at a cutover attempt until it is attached again; a re-assessment that read the VM without it would
+otherwise let the next cutover complete one disk short (review RV7-01). A validation writes each migration once — a new one is
 created already assessed, its history running from `pending` through `validating` to `ready` or `blocked`, and an
 existing one takes both transitions in one write — and then emits the same events: `migration.created` for a new
 one and one `migration.phase` per transition. Only an earlier version wrote the two transitions apart, so that a
@@ -1076,7 +1081,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   migration validated (`vm.disks` of kind `volume`). A volume detached from the source VM since - by an
   operator, or by an earlier attempt whose export failed after it detached the VM's data volumes - is
   otherwise left out of the import, and the migration would report success without that disk; the step
-  fails permanently, naming the volumes, before any import playbook runs (review RV6-01).
+  fails permanently, naming the volumes and asking to attach them to the source VM again and retry, before any
+  import playbook runs (review RV6-01). A new validation keeps them (§5.4, `SRC_VM_VOLUME_DETACHED`): it never
+  offers a way past this check (review RV7-01).
 * Mappings: after `export_workloads.yml`, the executor rewrites the exported `workloads.yml` with the
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
@@ -1595,6 +1602,7 @@ Finding catalog (code — severity — condition):
 |---|---|---|
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
 | `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
+| `SRC_VM_VOLUME_DETACHED` | blocker | a re-assessment of a migration whose history reached `cutover` finds a volume of its validated `vm.disks` no longer attached to the VM (an earlier attempt's cold export may have left it detached, §6.6); the volume stays among the migration's disks (§5.4) — attach it to the source VM again, then re-validate; to migrate the VM without it, cancel the migration and plan the VM anew |
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
