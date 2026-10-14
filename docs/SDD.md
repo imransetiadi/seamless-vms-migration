@@ -790,7 +790,11 @@ Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conv
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
-host, or one in the earlier bare-pid form, is never removed by this check.
+host, or one in the earlier bare-pid form, is never removed by this check. The control plane therefore keeps one
+hostname, `seamless-migrate`, across restarts (§17): the pod's or container's own name changes with every rollout or
+recreate, and a lock a module of the previous instance left - killed inside a locked section by the restart - would
+otherwise read as another host's forever, failing every attach on that conversion host until it is removed by hand
+(review RV5, lead 6).
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
@@ -2832,8 +2836,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   Node 22 runtime for `npx`-launched Jev, and the built dashboard). Runs as non-root UID.
 * OpenShift manifests (`deploy/openshift/`, kustomize): Namespace, ServiceAccount, PVC (data dir),
   ConfigMap (non-secret settings), Secret references (clouds.yaml, tokens, VMware credentials,
-  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica,
-  `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `shareProcessNamespace`
+  Jev/agentmemory keys — example file with placeholders only), Deployment (1 replica, strategy `Recreate`, pod
+  `hostname: seamless-migrate` as the Compose service's `hostname` — one name across restarts, which the conversion
+  hosts' attach locks name (§6.6) — `readOnlyRootFilesystem`, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `shareProcessNamespace`
   — the pod's pause process is PID 1 and reaps what Ansible leaves behind, the ssh `ControlPersist` masters,
   as `init: true` does in Compose; `seamless serve` would leave them as zombies — liveness
   `/api/v1/health`, readiness `/api/v1/ready`), Service, Route (TLS edge in 0.1.0 — the pod serves plain HTTP; re-encrypt once it serves TLS; `Strict-Transport-Security: max-age=31536000` from the router's `hsts_header` annotation, as ingress-nginx sends it by default on the Kubernetes overlay), NetworkPolicy (ingress from router only;
