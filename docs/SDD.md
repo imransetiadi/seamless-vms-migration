@@ -411,8 +411,9 @@ while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at`
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
 it stopped with nothing left to restart it. `rolled_back → cancelled` ends a migration for good once its
 rollback ran, for a VM that is not to be migrated again: its source runs again (the rollback closed the clock) and its
-VM is already free (§5.4), but the rollback deleted only the destination server and kept the warm data path for a
-retry (destination volumes and the warm state, §6.5), so a cancel cleans that up as one from `failed` does (below);
+VM is already free (§5.4), but a warm rollback deleted only the destination server and kept the warm data path for a
+retry (destination volumes and the warm state, §6.5) - a cold rollback deletes the volumes the cold import recorded
+too, as a cold retry never reuses them (§7) - so a cancel cleans up what is left as one from `failed` does (below);
 Needs attention offers it, and Cancel plan's refusal asks for it first (§12, §16). `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
 granted with it (`cutover_requested` with its requester, `force_window`, `force_cutover`, §5.4) — a new attempt is requested anew, and a
@@ -673,12 +674,18 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
   "destination_server_id": null }
 ```
 
+The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
+volumes its transfer created (`dest_volumes`, a `dest_id` each — never a volume it did not create, as with
+`data_copy: false`) as soon as they exist, and `destination_server_id` as soon as Nova accepts the server. A cold
+rollback reads it (§7); a cold migration cut over before the cold import recorded anything has no file.
+
 ### 6.4 New Ansible modules
 
 | Module | Cloud | Purpose |
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
+| `import_workload_record_volumes` | — | Record the destination volumes a cold transfer created (`volume_map` of `import_workload_transfer_volumes`: a `dest_id` per device) in the workload's state file (§6.3), keeping what the file already holds; changes no cloud. |
 | `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`) — and the warm state file (kept while a source snapshot is pending). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
@@ -697,7 +704,9 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 ### 6.5 New role and playbooks
 
 Role `import_workloads_warm` with task files `precopy.yml`, `cutover.yml`, `rollback.yml`, reusing
-the conversion-host inventory logic of `import_workloads`. Playbooks (hosts: `migrator`, same
+the conversion-host inventory logic of `import_workloads`. The cold role `import_workloads` (upstream, modified)
+records its workload for a rollback (§6.3): `import_workload_record_volumes` right after the transfer, and
+`import_workload_create_instance` with `warm_state_dir`, which records the server as soon as Nova accepts it. Playbooks (hosts: `migrator`, same
 environment block as `import_workloads.yml`):
 
 | Playbook | Behavior per filtered workload |
@@ -917,11 +926,16 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `import_workload_prelim` names, with its `.log`, after the VM: the stem is the VM name with `%` written `%25`,
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
   never names a file outside `workload_logs`, and two names never share a file.
-* Cold rollback passes `os_migrate_rollback_match_by_name: true` (the cold path does not record the
-  destination server id in a warm state file) only once the source was stopped (`downtime_started_at` set), as
-  the VMware rollback looks up the server by name only then: the cold role creates the server after the stop, so
-  before it a same-named destination server is not this migration's — a cutover refused for a name collision, or
-  skipped by the role for one, is rolled back by starting the source alone and deletes nothing.
+* Cold rollback passes `os_migrate_rollback_match_by_name: true` only once the source was stopped
+  (`downtime_started_at` set), as the VMware rollback looks up the server by name only then: the cold role creates
+  the server after the stop, so before it a same-named destination server is not this migration's — a cutover
+  refused for a name collision, or skipped by the role for one, is rolled back by starting the source alone and
+  deletes nothing. A server the cold import recorded (§6.3) is found by its id first; the name serves a migration
+  cut over before it recorded anything. When the workload's state file records the volumes the cold import created,
+  the rollback also passes `os_migrate_rollback_delete_dest_volumes: true`: a cold retry never reuses them (its
+  transfer creates new volumes each time), so the rollback deletes exactly those and keeps any other volume attached
+  to the server (`kept_volume_ids`); without such a record it deletes the server alone, as before - never a volume
+  it cannot tell is the migration's (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
 * `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
