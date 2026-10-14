@@ -796,11 +796,16 @@ whose owner ran on its own host and is no longer alive — a module killed by a 
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
 host, or one in the earlier bare-pid form, is never removed by this check. A lock wait gives up once ssh to the conversion
-host has failed for a minute without a break (ssh's own exit status 255), with "Lock timeout: conversion host {address}
-unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s connect
-timeout, about 5.5 h, while a cold cutover's source stays stopped. The executor retries that failure as transient, as it
-does a conversion host reboot mid-pass (QASuite R-07); a retry while the host is still down fails at once on the module's
-SSH check. One failed connection, or a lock another migration holds, starts that minute again. Each detach of a volume -
+host has failed for 15 minutes without a break (ssh's own exit status 255), with "Lock timeout: conversion host
+{address} unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s
+connect timeout, about 5.5 h, while a cold cutover's source stays stopped. The window rides out a conversion host reboot or
+a network blip, which the step then completes as if nothing happened (QASuite R-07): a first window of one minute gave up
+inside a two-minute reboot, when the export had detached the source VM's data volumes or the final cleanup still held
+them on the conversion host, and the source VM came back from the rollback without them (review RV8-01). The executor
+retries the Lock timeout as transient; the module's own SSH check, which a retry while the host is still down meets
+first, is retried too (its error quotes the ssh command line, ConnectTimeout included), so a host that stays down fails
+the step once `max_step_retries` is spent. One failed connection, or a lock another migration holds, starts the window
+again. Each detach of a volume -
 from a conversion
 host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
 attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
@@ -811,8 +816,10 @@ shared disk never reaches, holding the attach lock meanwhile; a detach still not
 A cold export that fails puts back what it took (review RV6-01). `import_workload_export_volumes` fails with its volume
 map and transfer id, so the role's rescue runs `import_workload_src_cleanup`, which stops the transfer's NBD exports and
 frees the ports the map records - the export records each port as soon as it claims it, so the ports stay claimed until
-then. The export does nothing more on failure: a step over SSH could wait for the port lock while the conversion host is
-unreachable, and the cleanup checks SSH before anything else. Before, the module failed without the map, the rescue skipped
+then. Before it fails, the export attaches each data volume of its map that no server holds again to the source VM: that
+needs only the OpenStack API, and the cleanup checks SSH before anything else, so a conversion host still unreachable
+once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). It runs no
+step over SSH there. Before, the module failed without the map, the rescue skipped
 the cleanup, and the rollback that follows started the source VM without the data volumes the export had detached. The
 cleanup takes a partial map: it detaches from the source conversion host each mapped volume Cinder lists as attached
 there, whether or not its device was recorded; it re-attaches each data volume the source VM no longer holds; and it
