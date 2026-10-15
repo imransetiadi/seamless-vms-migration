@@ -1236,3 +1236,138 @@ def test_the_transfers_other_errors_still_escape_its_module(error):
         _transfer_module_failing_with(error)
 
     assert raised.value is error
+
+
+class LeavingDestination:
+    """The destination conversion host of a cold transfer, its /dev on a real directory: the disk
+    of the destination volume (a regular file standing for the block device /dev/vdb) and udev's
+    by-id link to it. The volume leaves the host right after the identity check's `test -b` of its
+    link - another actor detaches it - and udev removes the link; no other disk takes the path
+    (review RV15-02). The copy tools open their destination as their sources do: nbdcopy as libnbd's
+    open_local - open(O_WRONLY), and when that fails open(O_WRONLY | O_TRUNC | O_CREAT | O_EXCL,
+    0644) - and qemu-img's host_device with no O_CREAT. `test -b` holds for the disk alone; `test -f`
+    for a regular file at the path itself."""
+
+    address = CONV
+
+    def __init__(self, root, volume_id):
+        self.root = root
+        self.serial = volume_id[:20]
+        self.disk = root / "dev" / "vdb"
+        self.link = root / "dev" / "disk" / "by-id" / ("virtio-" + self.serial)
+        self.link.parent.mkdir(parents=True)
+        self.disk.write_bytes(bytes(4096))
+        self.link.symlink_to("../../vdb")
+        self.left = False
+        self.commands = []
+
+    def _local(self, path):
+        return self.root / path.lstrip("/")
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command == ["cat", "/sys/block/vdb/serial"]:
+            if self.left:
+                raise subprocess.CalledProcessError(1, command)
+            return self.serial
+        return ""  # qemu-img create of the overlay
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["test", "-b"]:
+            path = self._local(command[2])
+            found = self.disk.exists() and os.path.realpath(path) == os.path.realpath(self.disk)
+            if not self.left:  # the volume leaves the host now: udev removes its link
+                self.left = True
+                self.link.unlink()
+                self.disk.unlink()
+            return 0 if found else 1
+        if command[:2] == ["test", "-f"]:
+            path = self._local(command[2])
+            return 0 if path.is_file() and not path.is_symlink() else 1
+        if command[:3] == ["sudo", "rm", "-f"]:
+            path = self._local(command[3])
+            if path.exists() or path.is_symlink():
+                path.unlink()
+            return 0
+        return 0  # rm -f of the overlay
+
+    def cmd_sub(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["sudo", "nbdcopy"]:
+            path = self._local(command[3])
+            try:
+                fd = os.open(str(path), os.O_WRONLY)
+            except OSError:
+                fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT | os.O_EXCL, 0o644)
+            os.write(fd, b"the source volume's data")
+            os.close(fd)
+            return DoneProcess()
+        if command[:3] == ["sudo", "qemu-img", "convert"]:
+            try:
+                os.close(os.open(str(self._local(command[-1])), os.O_RDWR))
+            except OSError as err:
+                return FailedProcess(1, "qemu-img: Could not open '%s': %s" % (command[-1], err))
+            return DoneProcess()
+        return DoneProcess()  # virt-sparsify
+
+
+class FailedProcess:
+    """A process that has ended with ``returncode``, ``output`` on its stdout."""
+
+    def __init__(self, returncode, output):
+        self.returncode = returncode
+        read, write = os.pipe()
+        os.write(write, output.encode())
+        os.close(write)
+        self.stdout = os.fdopen(read, "r")
+        self.stderr = self.stdout
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self):
+        return self.returncode
+
+    def communicate(self, data=None, timeout=None):
+        return self.stdout.read(), ""
+
+
+LEAVING_ID = "3b7a57d7-8210-47f9-b592-a6627ae52d13"
+
+
+def _leaving_transfer(tmp_path):
+    host = LeavingDestination(tmp_path / "dst-conv", LEAVING_ID)
+    transfer = _copying_transfer(tmp_path, {})
+    transfer.volume_map["/dev/vda"]["dest_id"] = LEAVING_ID
+    transfer.shell = host
+    return transfer, host
+
+
+def test_nbdcopy_never_reports_a_destination_volume_that_left_the_host_as_written(tmp_path):
+    """Review RV15-02: nbdcopy opens its destination again with O_CREAT when the first open fails,
+    so a volume that left the host between the identity check and that open had its disk copied
+    into a regular file nbdcopy created at the link's path, and the transfer reported success with
+    the volume never written - on RHEL 8, whose devtmpfs takes half the RAM. The transfer now checks
+    that the path is still a disk, removes the regular file, which would block udev's link, and
+    fails as permanent (Seamless Migrate SDD 6.6)."""
+    transfer, host = _leaving_transfer(tmp_path)
+
+    with pytest.raises(volume_common.DiskIdentityError, match=LEAVING_ID):
+        transfer._convert_destination_volumes_nbdcopy()
+
+    assert not host.link.exists() and not host.link.is_symlink(), "the regular file stayed"
+    assert transfer.volume_map["/dev/vda"]["progress"] != 100.0
+
+
+def test_qemu_img_fails_when_the_destination_volume_left_the_host(tmp_path):
+    """Control (review RV15-02): qemu-img's host_device opens its target with no O_CREAT, so the
+    same sequence fails both converts - the sparsify attempt's and the whole-device fallback's -
+    given the same checked link."""
+    transfer, host = _leaving_transfer(tmp_path)
+
+    with pytest.raises(RuntimeError, match="Could not open"):
+        transfer._convert_destination_volumes()
+
+    converts = [c for c in host.commands if c[:3] == ["sudo", "qemu-img", "convert"]]
+    assert len(converts) == 2 and {c[-1] for c in converts} == {str("/dev/disk/by-id/virtio-" + LEAVING_ID[:20])}

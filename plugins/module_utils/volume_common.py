@@ -1659,10 +1659,37 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self.log.info("nbdcopy return code: %d", nbd_sub.returncode)
             if nbd_sub.returncode != 0:
                 raise RuntimeError(f"Failed to copy volume with nbdcopy! Return code: {nbd_sub.returncode}")
+            self._check_still_a_disk(mapping["dest_id"], dest_dev)
 
             # Mark as 100% complete
             self._update_progress(path, 100.0)
             self.log.info("Successfully copied %s", path)
+
+    def _check_still_a_disk(self, volume_id, path):
+        """
+        nbdcopy opens its destination again with O_CREAT when the first open
+        fails (libnbd's open_local): a volume that left the host between its
+        identity check and that open has its disk copied into a regular file
+        nbdcopy created at ``path``, and nbdcopy exits 0. The path must still be
+        a block device; a regular file there is removed, as it would keep udev
+        from making the link again, and the volume was not written (Seamless
+        Migrate SDD 6.6, review RV15-02).
+        """
+        found = self.shell.cmd_val(["test", "-b", path])
+        if found == 0:
+            return
+        if found == SSH_FAILED:
+            raise RuntimeError(
+                "SSH timeout: conversion host %s unreachable over SSH, checking that %s is still a disk"
+                % (getattr(self.shell, "address", "?"), path)
+            )
+        if self.shell.cmd_val(["test", "-f", path]) == 0:
+            self.shell.cmd_val(["sudo", "rm", "-f", path])
+        raise DiskIdentityError(
+            "%s on the conversion host is no longer a disk: volume %s left the host before "
+            "nbdcopy opened it, and nbdcopy copied into a regular file in its place, now "
+            "removed; the volume was not written" % (path, volume_id)
+        )
 
     def _convert_destination_volumes(self):
         """
