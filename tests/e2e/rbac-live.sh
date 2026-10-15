@@ -54,23 +54,36 @@ policy() { # METHOD OPERATOR-PATH APPROVER-PATH JSON-BODY
 }
 policy POST /plans /plans '{"name":"rbac-probe","source_provider_id":"nope","destination_provider_id":"nope","vm_ids":[],"auto_cutover":true}'
 # PATCH: an operator may send a policy field at the plan's current value - only a change needs the approver
-# (SDD 12) - so the route reads the plan first, and a plan that does not exist is 404 to anyone. The
-# operator's probe goes to a real plan, read with the viewer's token, with a value that plan does not hold:
-# refused before anything is written. The approver's goes to a plan that does not exist: nothing changes.
+# (SDD 12) - so the route reads the plan first, and a plan that does not exist is 404 to an operator. The
+# operator's probe goes to a real plan, read with the viewer's token, with a value that plan does not hold,
+# and names a source provider that does not exist: with the role check in place it is refused 403; with the
+# check regressed it meets the provider check (400) before anything is written (review RV16-01). The
+# approver's goes to a plan that does not exist. A field the plan lacks is skipped by name (RV16-04).
 probes=$(curl -s -H "$VIEWER_H" "$BASE/plans" | python3 -c '
 import json, sys
 try:
     plan = json.load(sys.stdin)[0]
-    window = {"start": "2030-01-01T01:00:00Z", "end": "2030-01-01T05:00:00Z"}
-    print(plan["id"])
-    for field in ("require_approval", "require_distinct_approver"):
-        print(json.dumps({field: not plan[field]}))
-    print(json.dumps({"cutover_window": None if plan.get("cutover_window") else window}))
+    lines = [str(plan["id"])]
 except Exception:
-    pass' 2>/dev/null)
+    sys.exit(0)
+window = {"start": "2030-01-01T01:00:00Z", "end": "2030-01-01T05:00:00Z"}
+guard = {"source_provider_id": "rbac-probe-none"}
+for field in ("require_approval", "require_distinct_approver", "cutover_window"):
+    if field not in plan:
+        lines.append("SKIP " + field)
+    elif field == "cutover_window":
+        lines.append(json.dumps(dict({field: None if plan[field] else window}, **guard)))
+    else:
+        lines.append(json.dumps(dict({field: not plan[field]}, **guard)))
+print("\n".join(lines))' 2>/dev/null)
 if [ -n "$probes" ]; then
   plan_id=$(sed -n 1p <<<"$probes")
-  while IFS= read -r body; do policy PATCH "/plans/$plan_id" /plans/nope "$body"; done < <(sed 1d <<<"$probes")
+  while IFS= read -r body; do
+    case "$body" in
+      "SKIP "*) echo "SKIP PATCH policy probe ${body#SKIP }: the plan has no such field" ;;
+      *) policy PATCH "/plans/$plan_id" /plans/nope "$body" ;;
+    esac
+  done < <(sed 1d <<<"$probes")
 else
   echo "SKIP PATCH policy probes: no plan on the stack to probe"
 fi
