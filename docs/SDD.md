@@ -805,7 +805,15 @@ them on the conversion host, and the source VM came back from the rollback witho
 retries the Lock timeout as transient; the module's own SSH check, which a retry while the host is still down meets
 first, is retried too (its error quotes the ssh command line, ConnectTimeout included), so a host that stays down fails
 the step once `max_step_retries` is spent. One failed connection, or a lock another migration holds, starts the window
-again. Each detach of a volume -
+again. The source cleanup's own SSH check rides out the same window, then fails with "SSH timeout: conversion host
+{address} unreachable over SSH for {n} s, waiting for the source cleanup": a reboot that starts outside a lock wait -
+the export's lsblk between two attaches, the transfer's SSH forward - fails the step at once while the conversion host
+holds data volumes only the cleanup gives back, and a rescue that failed at once let the rollback start the source VM
+without them (review RV9-02). The other modules' checks still fail at once, so a host already down when the export
+starts adds no wait. The export's wait for its NBD exports to answer, and the transfer's waits for the nbdkit socket
+and the forwarded exports, give up the same way once ssh has failed for the window ("SSH timeout: ..."), where they
+tried `timeout` times, each try up to the connect timeout - about 5.5 h with the default (review RV9-04). Each detach
+of a volume -
 from a conversion
 host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
 attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
