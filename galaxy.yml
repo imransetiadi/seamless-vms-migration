@@ -51,6 +51,7 @@ build_ignore:
   - .claude
   - .mcp.json
   - CLAUDE.md
+  - RELEASING.md
   # Everything below mirrors the checkout's .gitignore files, at the depths they name: ansible-galaxy
   # packs files from disk, not from git, and matches each pattern against the path from the
   # collection root, its * spanning "/" (CLAUDE.md §7, Security.md R-26).

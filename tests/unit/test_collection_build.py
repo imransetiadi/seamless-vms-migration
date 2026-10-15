@@ -55,6 +55,7 @@ AROUND = [
     ".claude/settings.json",
     ".mcp.json",
     "CLAUDE.md",
+    "RELEASING.md",  # how the product is released on GitHub, not the collection
     ".worktrees/track-b/seamless/data/secrets/provider-1.json",  # a track's checkout (CLAUDE.md §3)
     ".worktrees/track-b/tests/auth_tenant.yml",
     ".cache/seamless-check/report.txt",  # make seamless-check scratch

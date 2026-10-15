@@ -303,7 +303,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   same way.
 - The collection artifact leaves out the Seamless Migrate control plane,
   dashboard and deployment around the collection (``seamless/``,
-  ``dashboard/``, ``deploy/`` and the agent configuration), and everything the
+  ``dashboard/``, ``deploy/``, the agent configuration and the product's
+  ``RELEASING.md``), and everything the
   checkout's ``.gitignore`` files name, at the depths they name it.
   ``ansible-galaxy collection build`` packs files from disk rather than from
   git, so a tarball built at the repository root (``make build``,
