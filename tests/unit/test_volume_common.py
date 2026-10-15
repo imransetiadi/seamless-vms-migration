@@ -714,6 +714,46 @@ def test_the_port_probe_gives_up_after_the_ssh_window_when_ssh_fails_at_once():
     assert transfer.shell.ports == set()  # no port it could not probe was claimed
 
 
+class PortMapGone(PortShell):
+    """A conversion host whose port map cannot be read: the lock was taken, then ssh fails (exit
+    status 255) or `cat` fails (exit status 1) on the read of PORT_MAP_FILE."""
+
+    def __init__(self, status):
+        super().__init__(free=1)
+        self.status, self.address = status, CONV
+
+    def cmd_out(self, command, **kwargs):
+        if command == ["sudo", "cat", volume_common.PORT_MAP_FILE]:
+            raise subprocess.CalledProcessError(self.status, ["ssh", self.address] + list(command))
+        return super().cmd_out(command, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "status,message",
+    [
+        (volume_common.SSH_FAILED, "SSH timeout: conversion host %s unreachable over SSH, reading the port map" % CONV),
+        (1, "Unable to read the port map"),
+    ],
+)
+def test_a_port_map_read_that_fails_gives_up_with_its_own_error(status, message):
+    """Audit A-17: the read of the port map under the port lock fell through to an unbound
+    variable when the command failed, so a transient ssh failure between taking the lock and the
+    read surfaced as a Python error instead of the "SSH timeout" give-up the control plane retries
+    (SDD 6.6); any other failure of the read names the port map. Neither claims a port."""
+    dst = cloud()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1"
+        )
+    transfer.shell = PortMapGone(status)
+
+    with pytest.raises(RuntimeError, match=message):
+        transfer._find_free_port()
+
+    assert transfer.claimed_ports == []
+    assert not any(c[:4] == ["timeout", "1", "nc", "-l"] for c in transfer.shell.commands)
+
+
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
     """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
     host's attach lock - detaches those and leaves the volume map's volumes attached; given none,

@@ -736,7 +736,14 @@ class OpenStackVolumeBase:
             )
             used_ports = set()
         except subprocess.CalledProcessError as err:
-            self.log.debug("Unable to get port map! %s", str(err))
+            # ssh's own failure is transient: a give-up the control plane retries, as the
+            # waits of SDD 6.6 end; any other failure of the read is the port map's (audit A-17)
+            if err.returncode == SSH_FAILED:
+                raise RuntimeError(
+                    "SSH timeout: conversion host %s unreachable over SSH, reading the port map"
+                    % getattr(self.shell, "address", "?")
+                ) from err
+            raise RuntimeError("Unable to read the port map %s" % PORT_MAP_FILE) from err
 
         self.log.info("Currently used ports: %s", str(list(used_ports)))
         return used_ports

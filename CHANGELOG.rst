@@ -400,3 +400,7 @@ This project follows a simple changelog to satisfy collection metadata validatio
   boot image properties (Nova's ``os_shutdown_timeout``) held "timeout" made
   a failure meant to be permanent, such as a stuck detach, be retried. The
   lines now read ``(item=<id>)``.
+- A read of the conversion host's port map that fails under the port lock
+  ends the transfer with its own error: ssh's failure as ``SSH timeout: ...``,
+  the give-up Seamless Migrate retries, any other as ``Unable to read the port
+  map``. It ended in a Python ``UnboundLocalError`` before.
