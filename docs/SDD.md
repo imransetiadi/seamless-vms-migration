@@ -3355,7 +3355,7 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 |---|---|---|---|
 | Keystone v3, a project-scoped token | every strategy | — | the provider check (authentication) |
 | Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` (`DST_CAPABILITY_MISSING`) |
-| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source); the pre-flight (the destination, `DST_CAPABILITY_MISSING`) |
+| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source); the strategy selector (the destination's, an eligibility reason) |
 | Block Storage v3 | every strategy | 3.0 | the provider check; `block_storage_microversion` (`DST_CAPABILITY_MISSING`) |
 | Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | the strategy selector (eligibility) and `storage_backends` (§7.3.1) |
 | Glance v2 | an image-booted VM | — | the provider check |
@@ -3365,14 +3365,16 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 
 Findings (plan task T4; each enters §9.3's catalog with its code):
 
-* `DST_CAPABILITY_MISSING` (blocker) judges the destination's check report (§10): `compute_microversion` below 2.60
-  (every strategy) or below 2.85 (`storage_handover`), and `block_storage_microversion` below 3.0 (every strategy). A
-  maximum the check could not read (`""`) is not judged. One finding per strategy set - every strategy, or
-  `storage_handover` alone - names each missing capability, the floor and the maximum read. Cinder manage stays with
-  the strategy selector, which makes `storage_handover` ineligible without the destination's `admin`, and with §7.3.1's
-  backend checks. The Neutron row is not judged yet: the collection sets a port's port security only when it recreates
-  ports through Neutron (`port_creation_mode: "neutron"`, §6.6), and which extension each port mode needs waits for the
-  lab (LAB-D04) - a blocker must not rest on an assumption (Jev 0.88).
+* `DST_CAPABILITY_MISSING` (blocker, every strategy) judges the destination's check report (§10): `compute_microversion`
+  below 2.60 or `block_storage_microversion` below 3.0. A maximum the check could not read (`""`) is not judged. The
+  finding names each missing capability, the floor and the maximum read.
+* A gap one strategy alone has is that strategy's eligibility reason, never a finding - a blocker finding blocks the
+  migration whatever its strategy (§9.3): the strategy selector makes `storage_handover` ineligible when the
+  destination's `compute_microversion` is below 2.85 (the handover's `delete_on_termination` update), as it does
+  without the destination's `admin` (Cinder manage) and as §7.3.1's backend checks do (Jev 0.86).
+* The Neutron row is not judged yet: the collection sets a port's port security only when it recreates ports through
+  Neutron (`port_creation_mode: "neutron"`, §6.6), and which extension each port mode needs waits for the lab
+  (LAB-D04) - a blocker must not rest on an assumption (Jev 0.88).
 * `DST_RELEASE_OUTSIDE_SUPPORT` (warning, every strategy) when the check's `support_tier` is `tier3` or `outside`, with
   its reason (End of Life upstream, below the floor, newer than validated, not detected), or when it reports
   `declared_outside_range`: the declared series is not what the APIs read, and the tier is the range's. RHOSO 18.0
