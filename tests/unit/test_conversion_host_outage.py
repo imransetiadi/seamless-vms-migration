@@ -383,3 +383,80 @@ def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
         assert text.startswith("%s: ") or text.split(":", 1)[0] in volume_common.GIVE_UP_PREFIXES, (
             name, text,
         )
+
+
+class StalePortLock(SourceHost):
+    """The source conversion host, reachable, whose port lock file names a module of another
+    migrator - one killed in a container since recreated: check_process keeps another host's
+    owner, so the lock is never removed (Seamless Migrate SDD 6.6). After ``free`` takes of it,
+    every try for the port lock answers 17 ("Another conversion is holding the lock") and costs
+    ``rtt`` seconds of ``clock``; the attach lock works."""
+
+    def __init__(self, cloud, clock, free=0, rtt=0.2):
+        super().__init__(cloud)
+        self.clock, self.free, self.rtt = clock, free, rtt
+        self.port_lock_tries = 0
+        self.port_lock_tried_at = []  # the clock at each refused try
+
+    def __call__(self, address, ssh_user, key_path=None):
+        shell = super().__call__(address, ssh_user, key_path)
+        host, out, val = self, shell.cmd_out, shell.cmd_val
+
+        def cmd_out(command, **kwargs):
+            if command == ["sudo", "cat", volume_common.PORT_LOCK_FILE + ".lock"]:
+                shell.commands.append(list(command))
+                return "migrator-2:4242"
+            return out(command, **kwargs)
+
+        def cmd_val(command, **kwargs):
+            if command[:2] == ["sudo", "flock"] and command[6] == volume_common.PORT_LOCK_FILE:
+                host.port_lock_tries += 1
+                if host.free > 0:
+                    host.free -= 1
+                    return val(command, **kwargs)
+                shell.commands.append(list(command))
+                host.port_lock_tried_at.append(host.clock.now)
+                host.clock.now += host.rtt
+                return 17
+            return val(command, **kwargs)
+
+        shell.cmd_out, shell.cmd_val = cmd_out, cmd_val
+        return shell
+
+
+@pytest.mark.parametrize("free", [0, 1], ids=["no port claimed", "a port claimed first"])
+def test_the_rescue_of_an_export_whose_port_lock_wait_gave_up_puts_the_data_volumes_back(free):
+    """Review RV13-04: the source cleanup freed the map's ports first, under the port lock - even
+    for a map that records none. When another migrator holds that lock, the export's own wait gave
+    up after 1800 tries, and the rescue's gave up 1800 tries later and raised before it put
+    anything back: the rollback started the source VM without its data volumes. The cleanup now
+    puts the volumes back first, logs a release that fails, and takes no port lock for a map with
+    no port (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    host = StalePortLock(src, clock, free=free)
+    attach, put_back_at = src.attach_volume, []
+
+    def attach_volume(server, volume, device=None, wait=True, timeout=None):
+        if server.id == "srv-1":
+            put_back_at.append(clock.now)
+        return attach(server, volume, device=device, wait=wait, timeout=timeout)
+
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+        tries, put_back_at[:] = host.port_lock_tries, []
+        src.attach_volume = attach_volume
+        rescued = _run(cleanup_module, dict(_cleanup_args(data, exported), timeout=1800), src, host)
+
+    assert exported.get("failed"), exported
+    assert "Unable to acquire lock " + volume_common.PORT_LOCK_FILE in exported["msg"], exported
+    claimed = [m["port"] for m in exported["volume_map"].values() if m.get("port")]
+    assert len(claimed) == free, exported["volume_map"]
+    for volume_id in DATA_VOLUMES:
+        assert _holders(src, volume_id) == ["srv-1"], (volume_id, rescued.get("msg"))
+    assert not rescued.get("failed"), rescued  # a release that fails is logged
+    rescue_tries = host.port_lock_tried_at[tries - free:]
+    if not claimed:
+        assert not rescue_tries, "a map with no port takes no port lock"
+    else:  # the volumes went back before the port lock was waited for
+        assert put_back_at and max(put_back_at) <= min(rescue_tries), (put_back_at, rescue_tries[:1])

@@ -452,6 +452,14 @@ class OpenStackVolumeBase:
 
     def _converter_close_exports(self):
         """
+        SSH to source conversion host, close the NBD export process and free
+        the transfer's ports.
+        """
+        self._stop_exports()
+        self._release_ports()
+
+    def _stop_exports(self):
+        """
         SSH to source conversion host and close the NBD export process.
         """
         self.log.info("Stopping exports from source conversion host...")
@@ -466,8 +474,6 @@ class OpenStackVolumeBase:
                     self.log.debug("Error stopping exports! %s", str(err))
         except subprocess.CalledProcessError as err:
             self.log.debug("Unable to get remote NBD PID! %s", str(err))
-
-        self._release_ports()
 
     def _delete_volumes(self):
         """Delete destination volumes."""
@@ -1766,10 +1772,29 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
         return self.shell.test_ssh_connection()
 
     def close_exports(self):
-        """Put the source VM's volumes back where they were."""
-        self._converter_close_exports()
-        self._detach_volumes_from_source_converter()
-        self._attach_data_volumes_to_source()
+        """
+        Put the source VM's volumes back where they were: stop the NBD
+        exports, give the volumes back - the attach lock and the API are all
+        that needs - and only then free the ports the map records. A port lock
+        another migrator holds so never keeps the volumes off the source VM; a
+        release that fails is logged, never raised over the handback, and a map
+        that records no port takes no port lock (Seamless Migrate SDD 6.6,
+        review RV13-04).
+        """
+        self._stop_exports()
+        try:
+            self._detach_volumes_from_source_converter()
+            self._attach_data_volumes_to_source()
+        finally:
+            self._release_claimed_ports()
+
+    def _release_claimed_ports(self):
+        if not self.claimed_ports:
+            return
+        try:
+            self._release_ports()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not release ports %s: %s", self.claimed_ports, err)
 
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_source_converter(self):

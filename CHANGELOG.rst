@@ -359,7 +359,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   fails at the end with ``Source cleanup incomplete: ...`` naming each step
   it could not do. The failure's map carries no volume or VM names, which the
   cleanup never reads: Ansible prints the failed result, and Seamless Migrate
-  retried a stuck detach of a volume whose name held "timeout".
+  retried a stuck detach of a volume whose name held "timeout". The source
+  cleanup puts the volumes back before it frees the transfer's ports, logs a
+  release that fails, and takes no port lock for a map that records no port:
+  a port lock another migrator holds made it give up before the handback, and
+  the rollback started the source VM without its data volumes.
 - After an attach call that succeeded, the wait for the volume's device path,
   which holds the conversion host's attach lock, fails at once when Cinder
   shows the volume ``available`` again or in ``error`` with no attachment:
