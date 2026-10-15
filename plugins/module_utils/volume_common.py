@@ -133,6 +133,11 @@ class SshOutage:
         self.prefix = prefix
         self.since = None
 
+    @property
+    def failing(self):
+        """True while ssh has failed since the last try that reached the host."""
+        return self.since is not None
+
     def seen(self, unreachable):
         """One try: raise once ssh has failed for the window without a break."""
         if not unreachable:
@@ -773,6 +778,11 @@ class OpenStackVolumeBase:
         try:
             port = available_ports.pop()
             while not self._test_port_available(port, outage):
+                if outage.failing:
+                    # ssh failed, not the port: the same port again once a second, so the
+                    # window ends the wait, never the port range (SDD 6.6, review RV11-03)
+                    time.sleep(1)
+                    continue
                 self.log.info("Port %d not available, trying another.", port)
                 used_ports.add(port)  # Mark used to avoid trying again
                 port = available_ports.pop()

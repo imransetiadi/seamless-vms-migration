@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import json
+import logging
 import os
 import subprocess
 import time
@@ -386,6 +387,10 @@ class PortShell:
             return 124 if self.free >= 0 else 1
         return 0
 
+    def test_ssh_connection(self):
+        """As RemoteShell's: one command over ssh, whose failure raises."""
+        self.cmd_out(["echo connected"])
+
     def cmd_sub(self, command, **kwargs):
         self.commands.append(list(command))
         shell = self
@@ -425,6 +430,69 @@ def test_a_transfer_failing_before_its_forwarding_starts_reports_why_and_frees_i
 
     assert transfer.shell.ports == set()  # the first disk's port is free again
     assert not dst.calls_to("create_volume")
+
+
+class UnsetPortMap(PortShell):
+    """A destination conversion host the ssh check reaches whose port map then cannot be set up -
+    sudo fails, its /var/run is full: from that check on, the release's first command exits 1."""
+
+    def __init__(self, free):
+        super().__init__(free)
+        self.checked = False
+
+    def test_ssh_connection(self):
+        super().test_ssh_connection()
+        self.checked = True
+
+    def cmd_out(self, command, **kwargs):
+        if self.checked and command[:3] == ["sudo", "bash", "-c"]:
+            raise subprocess.CalledProcessError(1, command)
+        return super().cmd_out(command, **kwargs)
+
+
+class OddCheck(PortShell):
+    """A destination conversion host whose ssh check raises what no ssh failure does - here the
+    decode of an answer that is no UTF-8."""
+
+    def test_ssh_connection(self):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+@pytest.mark.parametrize(
+    "shell, logged",
+    [
+        (UnsetPortMap, "Could not release ports [49152]"),
+        (OddCheck, "Ports [49152] stay claimed on the conversion host it cannot reach"),
+    ],
+    ids=["the release fails", "the ssh check fails another way"],
+)
+def test_a_failed_transfer_whose_port_release_fails_reports_its_own_error(caplog, shell, logged):
+    """SDD 6.6 (review RV11-02): a failed transfer's release that fails is logged and never
+    replaces the transfer's error - raised in the teardown, its "Unable to initialize port map
+    file!" hid why the transfer failed; nor does an ssh check that fails another way."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {
+        "/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809),
+        "/dev/vdb": dict(cold_volume_map()["/dev/vdb"], port=10810),
+    }
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(),
+        )
+        # a free port for the first disk, none left for the second
+        transfer.shell = shell(free=1)
+        with caplog.at_level(logging.WARNING, logger="osp-osp"):
+            with pytest.raises(RuntimeError, match="No free ports on conversion host"):
+                transfer.transfer_exports()
+
+    assert transfer.shell.ports == {49152}  # still claimed
+    assert logged in caplog.text
 
 
 class SilentHost(PortShell):
@@ -531,6 +599,119 @@ def test_a_transfer_whose_host_went_down_gives_up_after_one_ssh_window():
             transfer.transfer_exports()
 
     assert clock.now - transfer.shell.down_since <= volume_common.SSH_UNREACHABLE_S + 60
+
+
+def _takes_the_attach_lock(command):
+    return command[:2] == ["sudo", "flock"] and command[6] == volume_common.ATTACH_LOCK_FILE_DESTINATION
+
+
+class GoneAtTheAttachLock(PortShell):
+    """The destination conversion host, down for good from the first command ``starts`` matches -
+    by default the transfer's first try for its attach lock - on: every ssh to it then fails as ssh
+    does, exit status 255, each try the 10 s connect timeout. Until then it answers: its ports are
+    free, the forwarded exports answer, lsblk lists the devices of the fake cloud."""
+
+    def __init__(self, clock, address, cloud=None, starts=_takes_the_attach_lock):
+        super().__init__(free=2)
+        self.clock, self.address, self.down_since = clock, address, None
+        self.cloud, self.starts = cloud, starts
+
+    def _down(self, command):
+        if self.down_since is None and self.starts(command):
+            self.down_since = self.clock.now
+        if self.down_since is None:
+            return False
+        self.clock.now += 10
+        return True
+
+    def cmd_out(self, command, **kwargs):
+        if self._down(command):
+            raise subprocess.CalledProcessError(255, ["ssh", self.address] + list(command))
+        if command and command[0] == "lsblk":
+            return "\n".join(self.cloud.devices[self.cloud.addresses[self.address]])
+        return super().cmd_out(command, **kwargs)
+
+    def cmd_val(self, command, **kwargs):
+        return 255 if self._down(command) else super().cmd_val(command, **kwargs)
+
+    def cmd_sub(self, command, **kwargs):
+        if "-N" in command:  # the SSH forward
+            return fake.FakeProcess()
+        return super().cmd_sub(command, **kwargs)
+
+
+def test_a_transfer_whose_host_went_down_between_two_waits_fails_without_a_port_lock_window():
+    """Review RV11-02: the destination conversion host goes down between two waits - here at the
+    lsblk of the attach, as well during the copy, whose ssh then exits 255. The step fails at once
+    on ssh's 255, and its release then waited a whole window for the port lock of the host it
+    cannot reach, the source stopped, its "Lock timeout ... v2v-migration-lock" replacing the
+    error. A failed transfer now releases its ports only if one ssh check reaches the host."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )
+    clock = Clock()
+    transfer.shell = GoneAtTheAttachLock(
+        clock, CONV, cloud=dst, starts=lambda command: command[:1] == ["lsblk"]
+    )
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(Exception) as failure:
+            transfer.transfer_exports()
+
+    assert "lsblk" in str(failure.value), str(failure.value)  # the transfer's own error
+    assert clock.now - transfer.shell.down_since <= 60, str(failure.value)
+
+
+class RefusingHost(PortShell):
+    """A conversion host ssh fails to reach at once from the first port probe on: the migrator's
+    route to it went away or its sshd stopped while the host stays up ("Connection refused"), so
+    ssh exits 255 within milliseconds - 20 ms here - not after the 10 s connect timeout."""
+
+    def __init__(self, clock, address):
+        super().__init__(free=0)
+        self.clock, self.address, self.down = clock, address, False
+
+    def cmd_val(self, command, **kwargs):
+        self.down = self.down or command[:3] == ["timeout", "1", "nc"]
+        if self.down:
+            self.clock.now += 0.02
+            return 255
+        return super().cmd_val(command, **kwargs)
+
+    def cmd_out(self, command, **kwargs):
+        if self.down:
+            self.clock.now += 0.02
+            raise subprocess.CalledProcessError(255, ["ssh", self.address] + list(command))
+        return super().cmd_out(command, **kwargs)
+
+
+def test_the_port_probe_gives_up_after_the_ssh_window_when_ssh_fails_at_once():
+    """Review RV11-03: the probe's give-up is timed - ssh failing for 900 s - but its loop had no
+    pause and ended with the ports: with each failed ssh back in milliseconds it walked all 16383
+    ephemeral ports in about 5.5 minutes and ended with "No free ports on conversion host!", which
+    reads as permanent. It now tries the same port again once a second while ssh fails."""
+    dst = cloud()
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst])):
+        transfer = volume_common.OpenstackVolumeTransfer(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1"
+        )
+    clock = Clock()
+    transfer.shell = RefusingHost(clock, CONV)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="SSH timeout: conversion host %s unreachable" % CONV):
+            transfer._find_free_port()
+
+    assert transfer.shell.ports == set()  # no port it could not probe was claimed
 
 
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():

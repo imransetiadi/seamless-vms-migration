@@ -378,9 +378,14 @@ This project follows a simple changelog to satisfy collection metadata validatio
   and an nbdkit socket, give up the same way after the window (``SSH timeout:
   ...``), where they tried ``timeout`` times, about 5.5 hours by default. So does
   the probe for a free port, which read ssh's 255 as a port in use and walked
-  every ephemeral port, about 45 hours; and a transfer that gave up so releases
-  no port afterwards, where a second wait for the port lock held the source
-  another 15 minutes and replaced its error.
+  every ephemeral port, about 45 hours; it tries the same port again once a
+  second while ssh fails, so an ssh that fails at once, a refused connection
+  or a dropped route, ends in the same give-up, not in ``No free ports on
+  conversion host!``. A failed transfer releases its ports only if one ssh
+  check then reaches the conversion host, where a second wait for the port
+  lock of a host it cannot reach held the source another 15 minutes and
+  replaced its error; a release that fails is logged, never raised over the
+  transfer's error.
 - The warm state file (``workload_warm/{server}.json``) is synced to disk, its
   directory after the rename too, so the rename outlives a crash: a rollback
   reads there which destination volumes and server to delete. A filesystem

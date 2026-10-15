@@ -266,7 +266,6 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import serve
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
-    ConversionHostUnreachable,
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
     volume_or_none,
@@ -483,7 +482,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
                 }
 
     def transfer_exports(self):
-        unreachable = False
+        failed = False
         try:
             if self.use_nbdkit_direct:
                 self.log.info("Using direct nbdkit socket mode with nbdcopy")
@@ -512,22 +511,38 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             else:
                 self._convert_destination_volumes()
             self._detach_destination_volumes()
-        except ConversionHostUnreachable:
-            unreachable = True
+        except BaseException:
+            failed = True
             raise
         finally:
             if not self.use_nbdkit_direct:
                 self._stop_forwarding_process()
-                if unreachable:
-                    # its port map cannot be updated, and a second wait for its port lock
-                    # would hold the stopped source and hide this error (Seamless Migrate
-                    # SDD 6.6, review RV10-04)
-                    self.log.warning(
-                        "Ports %s stay claimed on the conversion host it cannot reach",
-                        self.claimed_ports,
-                    )
+                if failed:
+                    self._release_ports_after_failure()
                 else:
                     self._release_ports()
+
+    def _release_ports_after_failure(self):
+        """
+        After a failed transfer, release its ports only if one ssh check reaches
+        the conversion host now: one it cannot reach cannot update its port map,
+        and a wait for its port lock would hold the stopped source another 15
+        minutes. A release that fails is logged, never raised over the
+        transfer's own error (Seamless Migrate SDD 6.6, review RV10-04, RV11-02).
+        """
+        try:
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "Ports %s stay claimed on the conversion host it cannot reach: %s",
+                self.claimed_ports,
+                err,
+            )
+            return
+        try:
+            self._release_ports()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not release ports %s: %s", self.claimed_ports, err)
 
 
 def run_module():

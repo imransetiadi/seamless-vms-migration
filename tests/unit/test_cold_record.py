@@ -808,6 +808,40 @@ def test_a_rerun_waits_for_an_earlier_volume_nova_began_deleting_while_it_delete
     assert not {"dvol-boot", "dvol-data"} & {entry["dest_id"] for entry in recorded.values()}
 
 
+def test_a_rerun_whose_host_went_down_while_it_removed_an_earlier_volume_gives_up_in_one_window(
+    tmp_path,
+):
+    """Review RV11-02: a cold re-run detaches, under the destination conversion host's attach lock,
+    the earlier volumes a transfer cut short left there. When that lock wait gives up, the re-run
+    wraps the give-up in its own error ("Could not delete volume ..."), and the transfer released
+    its ports all the same: a second 15-minute wait for the port lock on the same dead host, the
+    source stopped, whose "Lock timeout ... v2v-migration-lock" replaced the error."""
+    from ansible_collections.os_migrate.os_migrate.tests.unit.test_volume_common import (
+        Clock,
+        GoneAtTheAttachLock,
+    )
+
+    src, dst = _clouds()
+    state_dir = str(tmp_path / "workload_warm")
+    _record(state_dir, TRANSFERRED)
+    dst.add_volume("dvol-boot", "vm1-boot", 20, bootable=True)
+    dst.add_volume("dvol-data", "vm1-data", 10)
+    for volume_id in ("dvol-boot", "dvol-data"):  # a transfer cut short left them there
+        dst.attach_volume(dst.servers["dst-conv"], dst.volumes[volume_id])
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = _transfer(dst, state_dir)
+    clock = Clock()
+    transfer.shell = GoneAtTheAttachLock(clock, "10.1.0.10")
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError) as failure:
+            transfer.transfer_exports()
+
+    message = str(failure.value)
+    assert "v2v-migration-lock" not in message, message
+    assert clock.now - transfer.shell.down_since <= volume_common.SSH_UNREACHABLE_S + 60, message
+
+
 def test_an_earlier_volume_cinder_gives_up_deleting_fails_the_rerun_with_its_record(tmp_path):
     """SDD 6.3 (review RV5-02): Cinder can give up deleting the boot volume Nova deletes - an RBD
     image still watched is busy, and Cinder puts it back to `available` - so the re-run fails before
