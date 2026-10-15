@@ -859,7 +859,13 @@ volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attac
 keeps the mark only if Cinder then lists the conversion host, or still shows the attach
 under way: an attach Nova refused leaves no mark a later export's attach of the same volume could be taken for
 (review RV10-01, RV10-02). The cleanup waits the same way for a marked volume Cinder still shows `reserved` or
-`attaching` before it checks. It re-attaches each data volume the source VM no longer holds; and it
+`attaching` before it checks. A known residual remains (review RV11-04). Nova may fail an attach that was still under
+way when the two minutes ended, and another export may attach that shared multi-attach volume to the same host before
+this cleanup runs - a window of seconds. The cleanup then takes the volume from under that export, whose transfer fails
+loudly and is retried; the export only reads the volume, so no data is lost. Telling the two attachments apart needs
+this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from microversion
+2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each data volume the
+source VM no longer holds; and it
 removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
 volume the source VM holds, such as its own boot volume before a copy exists. The export creates the root snapshot, the
 root copy and the image without openstacksdk's own wait, records each id at once, then waits for each within the module's
