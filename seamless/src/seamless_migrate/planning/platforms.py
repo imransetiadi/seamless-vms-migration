@@ -1,0 +1,151 @@
+"""Destination release series (SDD §10.1, §21.1–§21.3): the community OpenStack series a destination
+cloud may run, read from its services' maximum microversions, and the support tier that follows.
+
+Pure: no I/O. The provider check reads the version documents (§21.3, T3); the pre-flight warns by
+the tier (T4). Behaviour follows capabilities, never the series name (§21.4): the tier decides only
+what a Seamless release validated and what the pre-flight warns.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any
+
+#: the date the upstream phases below were read on releases.openstack.org (SDD §21.1)
+READ_ON = "2026-10-16"
+
+
+@dataclass(frozen=True)
+class Series:
+    """One community series of the window: its upstream phase and SLURP status decide its tier
+    (§21.2); its services' maximum microversions identify it (§21.3)."""
+
+    name: str
+    codename: str
+    phase: str  # "Maintained" | "Unmaintained" | "End of Life", as releases.openstack.org shows it
+    slurp: bool
+    tier: str  # "tier1" | "tier2" | "tier3"
+    compute_max: str
+    block_storage_max: str | None  # null where §21.3 has not confirmed it
+
+
+#: the window's community series, oldest first (SDD §21.1, §21.3); §21.1's table changes with it
+SERIES: tuple[Series, ...] = (
+    Series("2023.1", "Antelope", "Unmaintained", True, "tier2", "2.95", "3.70"),
+    Series("2023.2", "Bobcat", "End of Life", False, "tier3", "2.95", "3.70"),
+    Series("2024.1", "Caracal", "Unmaintained", True, "tier2", "2.96", "3.71"),
+    Series("2024.2", "Dalmatian", "End of Life", False, "tier3", "2.96", "3.71"),
+    Series("2025.1", "Epoxy", "Maintained", True, "tier1", "2.100", None),
+    Series("2025.2", "Flamingo", "Maintained", False, "tier1", "2.100", None),
+    Series("2026.1", "Gazpacho", "Maintained", True, "tier1", "2.103", None),
+    Series("2026.2", "Hibiscus", "Maintained", False, "tier1", "2.104", None),
+)
+
+#: the newest microversions whose behaviour Seamless's calls were checked against (SDD §21.7)
+REVIEWED_MICROVERSIONS = {"compute": "2.100", "block_storage": "3.71"}
+
+#: the tiers of the window, the most favourable first
+TIERS = ("tier1", "tier2", "tier3")
+
+_REASONS = {"older": "below_floor", "newer": "newer_than_validated"}
+
+
+@dataclass(frozen=True)
+class ReleaseRange:
+    """The series a cloud may run, oldest first; with none, why: ``older`` (below the window),
+    ``newer`` (above it) or ``not_detected``."""
+
+    series: tuple[str, ...]
+    outside: str | None = None
+
+
+@dataclass(frozen=True)
+class SupportTier:
+    """A destination's tier, why it is ``tier3`` or ``outside``, and whether a declared series
+    fell outside the detected range (the pre-flight warns of it)."""
+
+    tier: str
+    reason: str | None = None
+    declared_outside_range: bool = False
+
+
+def _microversion(value: Any) -> tuple[int, int] | None:
+    """A microversion such as ``"2.100"`` as numbers - so 2.9 is below 2.95 - or None."""
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", value) if isinstance(value, str) else None
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def maximum_microversion(document: Any) -> str | None:
+    """The maximum microversion a service's version document gives: its ``version`` object, or in
+    the root document the ``versions`` entry whose status is CURRENT, else the highest one; None
+    when it gives none (SDD §10.1)."""
+    if not isinstance(document, dict):
+        return None
+    if isinstance(document.get("version"), dict):
+        entries = [document["version"]]
+    elif isinstance(document.get("versions"), list):
+        entries = [entry for entry in document["versions"] if isinstance(entry, dict)]
+    else:
+        return None
+    readable = [
+        (version, entry)
+        for entry in entries
+        if (version := _microversion(entry.get("version"))) is not None
+    ]
+    current = [item for item in readable if str(item[1].get("status", "")).upper() == "CURRENT"]
+    if not readable:
+        return None
+    major, minor = max(current or readable, key=lambda item: item[0])[0]
+    return f"{major}.{minor}"
+
+
+def release_range(compute_max: Any, block_storage_max: Any = None) -> ReleaseRange:
+    """The series a cloud with these maximum microversions may run (SDD §10.1, §21.3).
+
+    A compute maximum equal to series' maxima is those series; one between two series' maxima the
+    two series it falls between (Nova never backports a microversion, so only a development
+    snapshot shows one); one outside the window's maxima, or none readable, is no series. A
+    block-storage maximum keeps the series whose maximum equals it or is not confirmed: it narrows
+    the range, never widens it, and a narrowing to nothing is not applied."""
+    compute = _microversion(compute_max)
+    if compute is None:
+        return ReleaseRange((), "not_detected")
+    maxima = [(_microversion(series.compute_max), series) for series in SERIES]
+    if compute < maxima[0][0]:
+        return ReleaseRange((), "older")
+    if compute > maxima[-1][0]:
+        return ReleaseRange((), "newer")
+    found = [series for maximum, series in maxima if maximum == compute]
+    if not found:
+        below = [series for maximum, series in maxima if maximum < compute][-1]
+        above = next(series for maximum, series in maxima if maximum > compute)
+        found = [below, above]
+    block_storage = _microversion(block_storage_max)
+    if block_storage is not None:
+        narrowed = [
+            series
+            for series in found
+            if series.block_storage_max is None
+            or _microversion(series.block_storage_max) == block_storage
+        ]
+        found = narrowed or found
+    return ReleaseRange(tuple(series.name for series in found))
+
+
+def support_tier(found: ReleaseRange, declared: str | None = None) -> SupportTier:
+    """The tier of a cloud whose detected range is ``found`` (SDD §10.1, §21.3).
+
+    A declared series among the range's series decides; otherwise the range does - the least
+    favourable tier of its series, or ``outside`` when it has none - and a declared series sets
+    ``declared_outside_range``. RHOSO 18.0 is ``validated`` by its kind, never by this."""
+    tiers = {series.name: series.tier for series in SERIES}
+    if declared is not None and declared in found.series:
+        tier = tiers[declared]
+        return SupportTier(tier, "end_of_life" if tier == "tier3" else None)
+    outside_range = declared is not None
+    if not found.series:
+        reason = _REASONS.get(found.outside or "", "not_detected")
+        return SupportTier("outside", reason, outside_range)
+    tier = max((tiers[name] for name in found.series), key=TIERS.index)
+    return SupportTier(tier, "end_of_life" if tier == "tier3" else None, outside_range)

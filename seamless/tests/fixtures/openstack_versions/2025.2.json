@@ -1,0 +1,39 @@
+{
+  "series": "2025.2",
+  "note": "Synthetic: the shape of Nova's and Cinder's version documents (their API references), with the maxima of SDD 21.3; Cinder's is left out where 21.3 has not confirmed it. Replace with documents recorded on the reference lab (QASuite LAB-D).",
+  "expected_range": [
+    "2025.1",
+    "2025.2"
+  ],
+  "compute": {
+    "versions": [
+      {
+        "id": "v2.0",
+        "status": "SUPPORTED",
+        "version": "",
+        "min_version": "",
+        "updated": "2011-01-21T11:33:21Z",
+        "links": [
+          {
+            "rel": "self",
+            "href": "https://compute.example.org/v2/"
+          }
+        ]
+      },
+      {
+        "id": "v2.1",
+        "status": "CURRENT",
+        "version": "2.100",
+        "min_version": "2.1",
+        "updated": "2013-07-23T11:33:21Z",
+        "links": [
+          {
+            "rel": "self",
+            "href": "https://compute.example.org/v2.1/"
+          }
+        ]
+      }
+    ]
+  },
+  "block_storage": null
+}
