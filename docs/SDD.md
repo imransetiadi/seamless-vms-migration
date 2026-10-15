@@ -2935,9 +2935,20 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
   heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
   does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
-  indicator reading Reconnecting meanwhile, never Live on events that stopped. When the stream opens again after a
-  drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
-  event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
+  indicator reading Reconnecting meanwhile, never Live on events that stopped. It connects again after a growing
+  delay — 1 s, then twice the last, 15 s at most — that starts over only once a connection has stayed open for one
+  heartbeat interval (15 s): a connection that ends sooner, whatever it delivered, counts as a failed attempt, as a
+  refused or unreachable one does, so a proxy that answers 200 and ends each body at once is tried every 15 s, not
+  every second. A stream refused for the role (403) is not tried again: the indicator reads Offline and the page
+  says live updates stopped. One refused for the per-address lockout (429, §15.1) is tried again once the lockout's
+  minute has passed, the indicator reading Reconnecting meanwhile — a token the server no longer accepts then gets
+  401, and the session ends as `/login` says — so a locked-out dashboard sends one refused request a minute, each
+  recorded as `auth.denied` (§13.1), not one every 15 s. When the stream opens again after a
+  drop, the dashboard refetches the data it shows — a connection that dropped before its first persisted
+  event resumes live-only, so the gap is never replayed, and ephemeral progress never is — once per 30 s at most:
+  the first reopening refetches at once, and one within 30 s of the last refetch is refetched once those 30 s have
+  passed, so a connection that drops and opens again and again never turns into a refetch storm (at 1,000 VMs a plan,
+  NFR-03, each such refetch reads megabytes) while no reopening goes unrefetched as long as the stream lasts. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
   A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
   cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
