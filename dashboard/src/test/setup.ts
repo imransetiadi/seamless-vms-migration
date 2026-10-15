@@ -40,6 +40,11 @@ if (typeof window !== 'undefined') {
   }
   window.scrollTo = (() => undefined) as typeof window.scrollTo;
 
+  // jsdom implements no canvas: getContext reports "Not implemented" with a stack trace, then answers
+  // null. axe-core measures a control's visible text on a canvas to leave icon ligatures out, so every
+  // a11y check printed that trace in a green run (audit F-10). Answer null as jsdom does, unreported.
+  HTMLCanvasElement.prototype.getContext = (() => null) as typeof HTMLCanvasElement.prototype.getContext;
+
   // jsdom has no layout: give Recharts' ResponsiveContainer a real size so charts render their SVG
   // in tests (and axe-core checks it) instead of warning about a 0×0 container.
   const originalRect = HTMLElement.prototype.getBoundingClientRect;
