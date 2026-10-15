@@ -137,6 +137,9 @@ class SshOutage:
     RV12-07).
     """
 
+    #: the give-up: its prefix, the host, the seconds ssh failed and what the wait was for
+    GIVE_UP = "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
+
     def __init__(self, address, waiting_for, prefix="SSH timeout"):
         self.prefix = prefix
         self.address = address
@@ -171,8 +174,7 @@ class SshOutage:
             self.since = now
         elif now - self.since >= SSH_UNREACHABLE_S:
             raise ConversionHostUnreachable(
-                "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
-                % (self.prefix, self.address, now - self.since, self.waiting_for)
+                self.GIVE_UP % (self.prefix, self.address, now - self.since, self.waiting_for)
             )
 
 

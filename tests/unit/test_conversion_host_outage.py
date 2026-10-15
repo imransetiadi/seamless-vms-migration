@@ -11,6 +11,7 @@ from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
 import ast
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -348,41 +349,106 @@ def test_an_ssh_outage_takes_only_a_give_up_prefix_the_control_plane_retries(bui
         assert volume_common.SshOutage("10.0.0.10", "a free port", prefix).prefix == prefix
 
 
-def _give_up_literals():
-    """Every string in the collection's plugins that says a conversion host is "unreachable over
-    SSH", docstrings left out: the text of a give-up, hand-built or SshOutage's."""
-    plugins = Path(volume_common.__file__).resolve().parents[1]
+def _message_texts(tree):
+    """Every string a module can build as a message: each literal, an f-string with its fields
+    as {}, a `+` chain of strings folded into one, a %-formatted part as its template - so a
+    message split across a concatenation is read whole (review RV13-06). Docstrings are left
+    out."""
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+
+    def fold(node):
+        """(text, ids of the nodes it took) or None when ``node`` builds no string."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value, {id(node)}
+        if isinstance(node, ast.JoinedStr):
+            text, taken = "", {id(node)}
+            for value in node.values:
+                if isinstance(value, ast.Constant):
+                    text += value.value
+                    taken.add(id(value))
+                else:
+                    text += "{}"
+            return text, taken
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            left = fold(node.left)
+            return (left[0], left[1] | {id(node)}) if left else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = fold(node.left), fold(node.right)
+            if left and right:
+                return left[0] + right[0], left[1] | right[1] | {id(node)}
+        return None
+
+    texts, taken = [], set()
+    for node in ast.walk(tree):  # outermost first: a chain is read before its parts
+        if id(node) in taken or id(node) in docstrings:
+            continue
+        folded = fold(node)
+        if folded:
+            texts.append(folded[0])
+            taken |= folded[1]
+    return texts
+
+
+def _unretried_give_ups(plugins):
+    """(file, message) for each message under ``plugins`` that says a conversion host is
+    "unreachable over SSH" but carries no prefix the control plane retries: neither SshOutage's
+    own give-up, whose prefix its setter checks, nor one that starts with a GIVE_UP_PREFIXES
+    member."""
     found = []
     for path in sorted(plugins.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        docstrings = {
-            id(node.body[0].value)
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.body and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-        }
-        found.extend(
-            (path.name, node.value)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-            and "unreachable over SSH" in node.value and id(node) not in docstrings
-        )
+        for text in _message_texts(ast.parse(path.read_text(encoding="utf-8"))):
+            if "unreachable over SSH" not in text or text == volume_common.SshOutage.GIVE_UP:
+                continue
+            if text.split(":", 1)[0] not in volume_common.GIVE_UP_PREFIXES:
+                found.append((path.name, text))
     return found
 
 
 def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
-    """Review RV12-07: a give-up built by hand outside SshOutage - the port map's read gives up so -
-    escapes both SshOutage's prefix check and the control plane's guard, which reads only
-    GIVE_UP_PREFIXES. Every such message starts with a GIVE_UP_PREFIXES member, or is SshOutage's
-    own template, whose prefix is checked (Seamless Migrate SDD 6.6)."""
-    literals = _give_up_literals()
+    """Review RV12-07, RV13-06: a give-up built by hand outside SshOutage - the port map's read
+    gives up so - escapes both SshOutage's prefix check and the control plane's guard, which reads
+    only GIVE_UP_PREFIXES. Every such message starts with a GIVE_UP_PREFIXES member, or is
+    SshOutage's own give-up (Seamless Migrate SDD 6.6)."""
+    plugins = Path(volume_common.__file__).resolve().parents[1]
+    assert any(
+        text == volume_common.SshOutage.GIVE_UP
+        for text in _message_texts(ast.parse(Path(volume_common.__file__).read_text(encoding="utf-8")))
+    )
+    assert _unretried_give_ups(plugins) == []
 
-    assert any(text.startswith("%s: conversion host") for _name, text in literals), literals
-    for name, text in literals:
-        assert text.startswith("%s: ") or text.split(":", 1)[0] in volume_common.GIVE_UP_PREFIXES, (
-            name, text,
-        )
+
+@pytest.mark.parametrize(
+    "source, refused",
+    [
+        ('M = "%s: conversion host %s unreachable over SSH, probing" % ("Port probe gave up", "h")\n',
+         True),
+        ('M = "Port probe gave up: conversion host %s unreachable " % "h" + "over SSH"\n', True),
+        ('M = f"Port probe gave up: conversion host {ADDRESS} unreachable over SSH"\n', True),
+        ('M = f"SSH timeout: conversion host {ADDRESS} unreachable over SSH, reading the map"\n',
+         False),
+        ('M = "SSH timeout: conversion host %s unreachable " % "h" + "over SSH"\n', False),
+    ],
+    ids=[
+        "a %s template with another prefix", "the phrase split by +", "an f-string, another prefix",
+        "an f-string, a retried prefix", "split by +, a retried prefix",
+    ],
+)
+def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
+    """Review RV13-06: the guard took any literal starting with "%s: " for SshOutage's give-up,
+    and saw only a literal that held the whole phrase - a give-up split by `+`, or a template
+    filled with another prefix, read "Port probe gave up: ...", which the control plane fails as
+    permanent, and the guard passed."""
+    plugins = tmp_path / "plugins"
+    shutil.copytree(Path(volume_common.__file__).resolve().parents[1], plugins)
+    (plugins / "modules" / "port_probe.py").write_text(source, encoding="utf-8")
+
+    assert bool(_unretried_give_ups(plugins)) is refused
 
 
 class StalePortLock(SourceHost):
