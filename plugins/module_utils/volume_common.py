@@ -1816,6 +1816,18 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
         if not self.claimed_ports:
             return
         try:
+            # as a failed transfer's release: a host it cannot reach cannot update its port
+            # map, and a wait for its port lock would hold the stopped source VM another
+            # window (Seamless Migrate SDD 6.6, review RV14-01)
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "Ports %s stay claimed on the conversion host it cannot reach: %s",
+                self.claimed_ports,
+                err,
+            )
+            return
+        try:
             self._release_ports()
         except Exception as err:  # pylint: disable=broad-except
             self.log.warning("Could not release ports %s: %s", self.claimed_ports, err)

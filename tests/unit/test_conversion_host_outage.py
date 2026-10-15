@@ -526,3 +526,27 @@ def test_the_rescue_of_an_export_whose_port_lock_wait_gave_up_puts_the_data_volu
         assert not rescue_tries, "a map with no port takes no port lock"
     else:  # the volumes went back before the port lock was waited for
         assert put_back_at and max(put_back_at) <= min(rescue_tries), (put_back_at, rescue_tries[:1])
+
+
+def test_a_rescue_whose_handback_met_an_outage_waits_no_second_window_for_the_port_lock():
+    """Review RV14-01: RV13-04 moved the rescue's port release after the handback, with no ssh
+    check first. A conversion host that goes down for good once the cleanup's SSH check passed
+    makes the handback's attach-lock wait give up after the window, and the release then waited a
+    second whole window for the port lock - a host it cannot reach cannot update its port map - the
+    source VM stopped meanwhile. One ssh check now decides the release, as a failed transfer's does
+    (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    host = RebootingHost(src, clock, None, 10 ** 9, starts=lambda command: command[:2] == ["pgrep", "-f"])
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+        assert not exported.get("failed"), exported
+        host.armed = True
+        rescued = _run(cleanup_module, dict(_cleanup_args(data, exported), timeout=1800), src, host)
+
+    assert host.down_since is not None, "the outage never started"
+    assert rescued.get("failed") and "Lock timeout" in rescued["msg"], rescued
+    for volume_id in DATA_VOLUMES:  # the host keeps them, as before: only the time differs
+        assert _holders(src, volume_id) == ["src-conv"], (volume_id, _holders(src, volume_id))
+    took = clock.now - host.down_since
+    assert took <= volume_common.SSH_UNREACHABLE_S + 120, (took, rescued["msg"])

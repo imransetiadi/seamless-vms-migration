@@ -363,7 +363,10 @@ This project follows a simple changelog to satisfy collection metadata validatio
   cleanup puts the volumes back before it frees the transfer's ports, logs a
   release that fails, and takes no port lock for a map that records no port:
   a port lock another migrator holds made it give up before the handback, and
-  the rollback started the source VM without its data volumes.
+  the rollback started the source VM without its data volumes. It frees them
+  only if one ssh check then reaches the conversion host, as a failed transfer
+  does: a host that went down during the handback had the release wait another
+  15 minutes for its port lock, the source VM stopped meanwhile.
 - The warm sync has blocksync check each device it opens. ``blocksync send``
   and ``receive`` take ``--expect-serial ID`` and fail with exit 3, before
   they read or write a byte, when the virtio serial of the device they opened
