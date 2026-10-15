@@ -128,9 +128,11 @@ class ConversionHostUnreachable(RuntimeError):
 
 class DiskIdentityError(RuntimeError):
     """A disk failed its identity check: it is another volume's, or the volume
-    left the conversion host. Permanent: a module reports it by its own message,
-    which the control plane classifies, never by its cause (Seamless Migrate
-    SDD 6.6, review RV15-01)."""
+    left the conversion host. Permanent: import_workload_transfer_volumes, the
+    transfer Seamless Migrate runs, reports it by its own message, which the
+    control plane classifies, never by its cause; upstream's
+    import_volumes_transfer lets it escape (Seamless Migrate SDD 6.6, review
+    RV15-01)."""
 
 
 def _checked_give_up_prefix(prefix):
