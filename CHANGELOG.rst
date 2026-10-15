@@ -369,6 +369,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   migration on that host queued behind the lock. An attach rolled back so
   leaves no mark for the source cleanup. The transfer's attach to the
   destination conversion host waits the same way.
+- The cold export serves each disk by its identity. Before it starts a
+  disk's NBD export it reads the disk's virtio serial, the volume id Nova
+  gives it cut to 20 characters, and fails if the serial names another
+  volume; it then serves udev's ``/dev/disk/by-id/virtio-<serial>`` link,
+  which goes with the volume. It served the ``/dev/vdX`` path, which the
+  kernel gives the next disk attached, and nbdkit opens its path for each
+  connection: a volume taken off the conversion host could have the transfer
+  copy another disk without an error. A disk that shows no serial (not
+  virtio-blk) is still served by its path.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

@@ -668,3 +668,184 @@ def test_an_attach_nova_finishes_after_its_answer_was_lost_is_still_put_back_by_
     assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
     for volume_id in DISKS:
         assert _holders(src, volume_id) == ["srv-1"], volume_id
+
+
+def _served(host):
+    """What each NBD export on the source conversion host serves: nbdkit's file= or qemu-nbd's
+    last argument."""
+    served = []
+    for command in host.commands_at(CONV):
+        if command[:2] == ["sudo", "nbdkit"]:
+            served.append(command[-1][len("file="):])
+        elif command[:2] == ["sudo", "qemu-nbd"]:
+            served.append(command[-1])
+    return served
+
+
+def test_an_export_never_serves_a_disk_whose_path_another_volume_took():
+    """Review RV12-03 (the RV11-04 residual's consequence): B's attach of the shared multi-attach
+    volume fails with its answer lost while Nova is slow, so B keeps its mark; Nova then fails it,
+    A's export attaches the volume, and B's rescue takes it from under A's export. C's export,
+    next for the attach lock, attaches its disks, and the kernel gives the freed path to one of
+    them. A's export named each disk by its path, so it served C's disk as the shared one with no
+    error - the transfer would have copied another VM's disk. It now reads each disk's virtio
+    serial before it serves it, and fails (Seamless Migrate SDD 6.6)."""
+    src, data = _shared_volume_vms()
+    src.add_server("srv-c", "vmc")
+    src.servers["srv-c"].status = "SHUTOFF"
+    src.add_volume("root-srv-c", "vmc-root", 10, bootable=True, server_id="srv-c", device="/dev/vda")
+    src.add_volume("vol-c", "vmc-data", 10, server_id="srv-c", device="/dev/vdb")
+    data["srv-c"] = fake.workload_data(server_id="srv-c", name="vmc", volumes=[
+        fake.server_volume_data("root-srv-c", "vmc-root", 10, "/dev/vda", "srv-c", bootable=True),
+        fake.server_volume_data("vol-c", "vmc-data", 10, "/dev/vdb", "srv-c"),
+    ])
+    host = SourceHost(src)
+    with mock.patch.object(volume_common, "RemoteShell", host):
+        a, b, c = (
+            export_module.OpenStackSourceVolume(
+                src, "src-conv", "/keys/k", "cloud-user", server_id,
+                server_util.Server.from_data(data[server_id]), timeout=3,
+            )
+            for server_id in ("srv-a", "srv-b", "srv-c")
+        )
+    attach, slow = src.attach_volume, {"pending": True}
+
+    def attach_volume(server, volume, device=None, wait=True, timeout=None):
+        if slow["pending"] and server.id == "src-conv" and volume.id == "vol-shared":
+            # B's: nova-api accepted it and reserved the volume, the answer never came back
+            slow["pending"] = False
+            src.record("attach_volume", server=server.id, volume=volume.id)
+            src.volumes["vol-shared"].status = "reserved"
+            raise fake.SDKException("Remote end closed connection without response")
+        return attach(server, volume, device=device, wait=wait, timeout=timeout)
+
+    src.attach_volume = attach_volume
+    with mock.patch.object(volume_common.time, "sleep"):
+        for export in (a, b, c):
+            export._test_source_vm_shutdown()
+            export._get_root_and_data_volumes()
+            export._validate_volumes_match_data()
+        for export in (a, b):
+            export._detach_data_volumes_from_source()
+        with pytest.raises(fake.SDKException):
+            b._attach_volumes_to_converter()
+        assert b.volume_map["/dev/vdb"].get("source_attached")  # kept: still under way (RV11-04)
+        b.reattach_detached_volumes()
+        b.remove_unheld_root_copy()
+        src.volumes["vol-shared"].status = "available"  # nova-compute failed it, unreserved it
+        a._attach_volumes_to_converter()  # A, next for the attach lock, attaches the shared volume
+        shared_path = a.volume_map["/dev/vdb"]["source_dev"]
+        with mock.patch.object(volume_common, "RemoteShell", host):
+            cleanup = cleanup_module.OpenStackSourceHostCleanup(
+                src, "src-conv", "/keys/k", "cloud-user", "srv-b", b.transfer_uuid, b.volume_map,
+                timeout=3,
+            )
+        cleanup.close_exports()  # the residual: it takes the shared volume from A's export
+        c._detach_data_volumes_from_source()
+        c._attach_volumes_to_converter()  # C, next for the lock, attaches its own disks
+        reused_by = {
+            attachment["device"]: volume.id
+            for volume in src.volumes.values()
+            for attachment in volume.attachments
+            if attachment["server_id"] == "src-conv"
+        }.get(shared_path)
+        assert reused_by not in (None, "vol-shared"), reused_by  # the kernel reused the path
+
+        with pytest.raises(RuntimeError, match="not of volume vol-shared"):
+            a._export_volumes_from_converter()
+
+    assert shared_path not in _served(host), _served(host)
+
+
+@pytest.mark.parametrize("tool", ["nbdkit", "qemu-nbd"])
+def test_an_export_serves_each_disk_by_its_virtio_serial_link(tool):
+    """Review RV12-03: each NBD export serves the disk's udev link of its virtio serial - the
+    volume id Nova gives it, cut to 20 characters - which goes with the volume, never the device
+    path the kernel gives the next disk attached (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    host = SourceHost(src)
+    if tool == "qemu-nbd":
+        host.val = lambda command: 1 if command[:2] == ["which", "nbdkit"] else None
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        exported = fake.run_module(export_module, dict(COMMON, data=data), src, host)
+
+    assert exported["_exit_code"] in (None, 0), exported
+    wanted = sorted(
+        "/dev/disk/by-id/virtio-" + mapping["source_id"][:20]
+        for mapping in exported["volume_map"].values()
+    )
+    assert sorted(_served(host)) == wanted
+
+
+class NoSerialHost(SourceHost):
+    """A source conversion host whose disks show no virtio serial - virtio-scsi, say."""
+
+    def __call__(self, address, ssh_user, key_path=None):
+        shell = super().__call__(address, ssh_user, key_path)
+        out = shell.cmd_out
+
+        def cmd_out(command, **kwargs):
+            if command[:1] == ["cat"] and command[1].startswith("/sys/block/"):
+                shell.commands.append(list(command))
+                return ""
+            return out(command, **kwargs)
+
+        shell.cmd_out = cmd_out
+        return shell
+
+
+def test_a_disk_that_shows_no_virtio_serial_is_still_exported_by_its_path():
+    """Review RV12-03: a disk that shows no serial cannot be told by its identity, so it is still
+    served by its path - the case Seamless Migrate SDD 6.6 names as remaining."""
+    src, data = _boot_from_volume_vm()
+    host = NoSerialHost(src)
+
+    with mock.patch.object(volume_common.time, "sleep"):
+        exported = fake.run_module(export_module, dict(COMMON, data=data), src, host)
+
+    assert exported["_exit_code"] in (None, 0), exported
+    assert sorted(_served(host)) == sorted(
+        mapping["source_dev"] for mapping in exported["volume_map"].values()
+    )
+
+
+class SerialShell:
+    """A conversion host as _exported_path sees it: ``serial`` answers the serial read, or it
+    fails with exit status ``error``; ``link`` answers `test -b` on the by-id link."""
+
+    def __init__(self, serial="", error=None, link=0):
+        self.serial, self.error, self.link = serial, error, link
+
+    def cmd_out(self, command, **kwargs):
+        if self.error is not None:
+            raise subprocess.CalledProcessError(self.error, command)
+        return self.serial + "\n"
+
+    def cmd_val(self, command, **kwargs):
+        return self.link
+
+
+@pytest.mark.parametrize(
+    "shell, served",
+    [
+        (SerialShell("vol-data1"), "/dev/disk/by-id/virtio-vol-data1"),
+        (SerialShell("vol-data1", link=1), "/dev/vdb"),  # no udev link: by its path
+        (SerialShell(""), "/dev/vdb"),  # no serial (not virtio-blk): by its path
+        (SerialShell(error=1), "/dev/vdb"),  # no serial file: by its path
+        (SerialShell(error=255), subprocess.CalledProcessError),  # ssh failed
+        (SerialShell("vol-c"), RuntimeError),  # another volume's disk
+    ],
+    ids=["its link", "no link", "no serial", "no serial file", "ssh failed", "another volume"],
+)
+def test_the_path_an_export_serves_for_a_disk(shell, served):
+    """Review RV12-03: the disk's identity decides what the NBD export serves (Seamless Migrate
+    SDD 6.6)."""
+    export = object.__new__(export_module.OpenStackSourceVolume)
+    export.shell, export.log = shell, mock.Mock()
+
+    if isinstance(served, str):
+        assert export._exported_path("vol-data1", "/dev/vdb") == served
+    else:
+        with pytest.raises(served):
+            export._exported_path("vol-data1", "/dev/vdb")

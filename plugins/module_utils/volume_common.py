@@ -1200,10 +1200,44 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mark="source_attached",
         )
 
+    def _exported_path(self, volume_id, device):
+        """
+        The path the NBD export of volume ``volume_id``, attached at
+        ``device``, serves. The kernel gives a freed device path to the next
+        disk attached, and nbdkit's file plugin opens its path for each
+        connection, so a volume taken off this host would have the export
+        serve another disk without an error. The disk's virtio serial - the
+        volume id Nova gives it, cut to 20 characters - must not name another
+        volume, and the export serves udev's link of that serial, which goes
+        with the volume. A disk that shows no serial (not virtio-blk) is served
+        by its path (Seamless Migrate SDD 6.6, review RV12-03).
+        """
+        name = device.rsplit("/", 1)[-1]
+        try:
+            serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
+        except subprocess.CalledProcessError as err:
+            if err.returncode == SSH_FAILED:
+                raise
+            serial = ""  # no such disk any more, or no serial: the path is all there is
+        if not serial:
+            self.log.warning("%s shows no virtio serial: exporting it by its path", device)
+            return device
+        if not volume_id.startswith(serial):
+            raise RuntimeError(
+                "%s on the conversion host is the disk of volume %s, not of volume %s: "
+                "the volume left the host" % (device, serial, volume_id)
+            )
+        link = "/dev/disk/by-id/virtio-" + serial
+        if self.shell.cmd_val(["test", "-b", link]) != 0:
+            self.log.warning("%s has no %s link: exporting it by its path", device, link)
+            return device
+        return link
+
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
-        step 4: fill in the URL to the volume's matching NBD export.
+        step 4: fill in the URL to the volume's matching NBD export. Each disk
+        is served by its identity where it shows one (_exported_path).
         """
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
@@ -1213,7 +1247,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             # SDD 6.6, review RV6-01)
             mapping["port"] = port
             volume_id = mapping["source_id"]
-            disk = mapping["source_dev"]
+            disk = self._exported_path(volume_id, mapping["source_dev"])
             self.log.info("Exporting %s from volume %s", disk, volume_id)
 
             # Fall back to qemu-nbd if nbdkit is not present
