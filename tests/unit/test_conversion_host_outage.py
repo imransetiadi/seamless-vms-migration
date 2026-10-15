@@ -10,8 +10,10 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import ast
 import subprocess
 import time
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -305,14 +307,33 @@ class PortOutage(volume_common.SshOutage):
         super().__init__(address, waiting_for, prefix)
 
 
+class LateWordedOutage(volume_common.SshOutage):
+    """An SshOutage subclass that words its give-up after SshOutage.__init__ checked the default."""
+
+    def __init__(self, address, waiting_for):
+        super().__init__(address, waiting_for)
+        self.prefix = "Port probe gave up"
+
+
+def _reworded_later():
+    outage = volume_common.SshOutage("10.0.0.10", "a free port")
+    outage.prefix = "Port probe gave up"
+    return outage
+
+
 @pytest.mark.parametrize(
     "build",
     [
         lambda: volume_common.SshOutage("10.0.0.10", "a free port", "Port probe gave up"),
         lambda: volume_common.SshOutage("10.0.0.10", "a free port", prefix="Port probe gave up"),
         lambda: PortOutage("10.0.0.10", "a free port"),
+        lambda: LateWordedOutage("10.0.0.10", "a free port"),
+        _reworded_later,
     ],
-    ids=["passed by position", "passed by keyword", "a subclass's default"],
+    ids=[
+        "passed by position", "passed by keyword", "a subclass's default",
+        "set by a subclass after it was built", "assigned later",
+    ],
 )
 def test_an_ssh_outage_takes_only_a_give_up_prefix_the_control_plane_retries(build):
     """Review RV11-05: a give-up reads "{prefix}: conversion host ... unreachable over SSH ...",
@@ -325,3 +346,40 @@ def test_an_ssh_outage_takes_only_a_give_up_prefix_the_control_plane_retries(bui
         build()
     for prefix in volume_common.GIVE_UP_PREFIXES:
         assert volume_common.SshOutage("10.0.0.10", "a free port", prefix).prefix == prefix
+
+
+def _give_up_literals():
+    """Every string in the collection's plugins that says a conversion host is "unreachable over
+    SSH", docstrings left out: the text of a give-up, hand-built or SshOutage's."""
+    plugins = Path(volume_common.__file__).resolve().parents[1]
+    found = []
+    for path in sorted(plugins.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
+        found.extend(
+            (path.name, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and "unreachable over SSH" in node.value and id(node) not in docstrings
+        )
+    return found
+
+
+def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
+    """Review RV12-07: a give-up built by hand outside SshOutage - the port map's read gives up so -
+    escapes both SshOutage's prefix check and the control plane's guard, which reads only
+    GIVE_UP_PREFIXES. Every such message starts with a GIVE_UP_PREFIXES member, or is SshOutage's
+    own template, whose prefix is checked (Seamless Migrate SDD 6.6)."""
+    literals = _give_up_literals()
+
+    assert any(text.startswith("%s: conversion host") for _name, text in literals), literals
+    for name, text in literals:
+        assert text.startswith("%s: ") or text.split(":", 1)[0] in volume_common.GIVE_UP_PREFIXES, (
+            name, text,
+        )

@@ -133,18 +133,28 @@ class SshOutage:
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
     (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
-    one of GIVE_UP_PREFIXES (review RV11-05).
+    one of GIVE_UP_PREFIXES, checked whenever it is set (review RV11-05,
+    RV12-07).
     """
 
     def __init__(self, address, waiting_for, prefix="SSH timeout"):
+        self.prefix = prefix
+        self.address = address
+        self.waiting_for = waiting_for
+        self.since = None
+
+    @property
+    def prefix(self):
+        """The give-up's prefix: one of GIVE_UP_PREFIXES."""
+        return self._prefix
+
+    @prefix.setter
+    def prefix(self, prefix):
         if prefix not in GIVE_UP_PREFIXES:
             raise ValueError(
                 "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
             )
-        self.address = address
-        self.waiting_for = waiting_for
-        self.prefix = prefix
-        self.since = None
+        self._prefix = prefix
 
     @property
     def failing(self):
