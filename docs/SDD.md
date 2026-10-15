@@ -2041,9 +2041,13 @@ tokens and database users. The default role is `viewer`. The response returns a 
 token once with `Cache-Control: no-store`; later listings expose only name and role. A `user`
 document stores the SHA-256 digest in the existing database, with its lowercase name as ID.
 Creation and `user.created` (actor, name, role; never token or digest) commit together, and duplicate
-creates cannot replace an existing token. Authentication reads database users on every request,
-so access survives restarts and changes are visible across processes. Adding users is refused
-while authentication is disabled. The bootstrap token file remains read-only.
+creates cannot replace an existing token. Authentication keeps the database users' digests in
+memory per process and reads them again when the `user` kind's change stamp moved (one aggregate
+query, §11) or at the latest after 5 seconds — a deletion and a re-creation at the same version
+leave the stamp unchanged — so access survives restarts, a change is visible across processes
+within seconds, and a flood of invalid tokens costs no document read; once the bootstrap file does
+not know a token, the per-address lockout (§15.1) is consulted before the database is asked at
+all. Adding users is refused while authentication is disabled. The bootstrap token file remains read-only.
 The dashboard holds the issued token only until Done or navigation; it never puts it in browser
 storage. Editing roles, rotating tokens and deleting users are not exposed by this screen.
 
@@ -2483,7 +2487,7 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 | `SEAMLESS_DB_URL` | `sqlite:///{data_dir}/seamless.db` | database |
 | `SEAMLESS_HOST` / `SEAMLESS_PORT` | `127.0.0.1` / `8080` | bind |
 | `SEAMLESS_DEMO`, `SEAMLESS_DEMO_SPEED`, `SEAMLESS_DEMO_SEED`, `SEAMLESS_DEMO_FAILURE_RATE` | `false`, `60`, `42`, `0.1` | demo mode |
-| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (valid tokens always pass; `0` disables) |
+| `SEAMLESS_AUTH_DISABLED`, `SEAMLESS_TOKENS_FILE`, `SEAMLESS_AUTH_LOCKOUT_PER_MINUTE` | `false`, unset, `60` | auth (§13); failed bearer authentications per client address per minute before further failures get `429` (a valid bootstrap-file token always passes — a shared ingress or NAT address never locks it out; a database user's token is looked up only while its address is not locked out, §13.1; `0` disables) |
 | `SEAMLESS_CORS_ORIGINS` | empty | comma-separated allowed origins |
 | `SEAMLESS_CLOUDS_YAML`, `SEAMLESS_SECRETS_DIR` | unset, `/var/run/secrets/seamless` | credentials |
 | `SEAMLESS_SECRET_STORE`, `SEAMLESS_K8S_NAMESPACE` | `files`, the pod's namespace | where dashboard-entered credentials are written (§13.3): `files` or `kubernetes` |
