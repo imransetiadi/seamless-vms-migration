@@ -523,3 +523,37 @@ def test_a_failed_exports_result_names_no_volume_and_no_vm(vm):
     assert (set(src.volumes), src.snapshots, src.images) == (volumes, {}, {})
     for volume_id in volumes:
         assert _holders(src, volume_id) == ["srv-1"], volume_id
+
+
+def _answer_lost(src, server_id, volume_id):
+    """Nova carries out the attach of ``volume_id`` to ``server_id``, but its answer never reaches
+    openstacksdk - a load balancer's 504 in front of nova-api, a connection reset after the
+    request was processed: the call raises with the attachment made."""
+    attach = src.attach_volume
+
+    def attach_volume(server, volume, device=None, wait=True, timeout=None):
+        attach(server, volume, device=device, wait=wait, timeout=timeout)
+        if server.id == server_id and volume.id == volume_id:
+            raise fake.SDKException("Remote end closed connection without response")
+
+    src.attach_volume = attach_volume
+
+
+def test_an_attach_whose_answer_was_lost_is_put_back_by_the_rescue():
+    """Review RV9-01: Nova carried out the attach of a data volume to the source conversion host,
+    but its answer was lost, so the export failed. The export marked a volume only once the call
+    returned: the rescue skipped this one and could not attach it back to the source VM, where it
+    was in-use, and the rollback started the source VM without it. The export now marks it before
+    the call, once openstacksdk's own checks pass (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    _answer_lost(src, "src-conv", "vol-data1")
+    host = SourceHost(src)
+
+    exported, cleaned = _export_then_rescue(src, host, data)
+
+    assert exported.get("failed") and "volume_map" in exported, exported
+    assert exported["volume_map"]["/dev/vdb"].get("source_attached") is True
+    assert cleaned is not None and cleaned["_exit_code"] in (None, 0), cleaned
+    for volume_id in DISKS:
+        assert _holders(src, volume_id) == ["srv-1"], volume_id
+    assert set(src.volumes) == set(DISKS) and src.snapshots == {}

@@ -333,8 +333,9 @@ This project follows a simple changelog to satisfy collection metadata validatio
   started the source VM without the data volumes the export had detached. The
   source cleanup
   takes such a partial map: it detaches each volume this transfer attached to
-  the conversion host - marked as soon as Nova accepted the attach, whether or
-  not its device was recorded, never a shared multi-attach volume another
+  the conversion host - marked before the export asked Nova to attach it, once
+  openstacksdk's own checks passed, whether or not its device was recorded or
+  the attach's answer was lost, never a shared multi-attach volume another
   migration's export attached - re-attaches the data volumes, and removes the
   root copy, its snapshot or the image only
   when the export made them, never the VM's own boot volume. The export

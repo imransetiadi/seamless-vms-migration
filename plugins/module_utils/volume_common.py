@@ -541,15 +541,22 @@ class OpenStackVolumeBase:
             disks_before = set(disks_before.split())
             self.log.debug("Initial disk list: %s", disks_before)
 
-            conn.attach_volume(
-                volume=volume, wait=False, server=host_func(), timeout=self.timeout
-            )
-            if mark:
-                # Nova accepted the attach: this transfer's from here on, before
-                # its device shows - a cleanup detaches what is marked, never a
-                # volume another migration's export attached (Seamless Migrate
-                # SDD 6.6, review RV8-02)
+            host = host_func()
+            if (
+                mark
+                and volume["status"] == "available"
+                and not self._volume_still_attached(volume, host)
+            ):
+                # openstacksdk's own checks pass, so it asks Nova to attach it:
+                # this transfer's from here on, before its device shows, even if
+                # the answer is lost - a cleanup detaches what is marked and Cinder
+                # lists on this host, never a volume another migration's export
+                # attached, which the SDK refuses (Seamless Migrate SDD 6.6,
+                # review RV8-02, RV9-01)
                 mapping[mark] = True
+            conn.attach_volume(
+                volume=volume, wait=False, server=host, timeout=self.timeout
+            )
             self.log.info("Waiting for volume to appear in %s wrapper", name)
             self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
 
