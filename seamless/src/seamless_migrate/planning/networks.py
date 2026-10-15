@@ -10,34 +10,61 @@ VMware migration kit's network_map (``kit_network_value``), before each run.
 from __future__ import annotations
 
 import ipaddress
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 from ..domain.models import Nic
 from .ipam import address_refusal
 
-# the roles Neutron's policy (2023.1 create_port:fixed_ips:ip_address, :mac_address,
+# the roles Neutron's policy (create_port:fixed_ips:ip_address, :mac_address,
 # :port_security_enabled) lets choose a port's address, MAC or port security on another project's
-# network; the collection's server_port.PORT_ROLES (SDD §6.6)
-PORT_ROLES = ("admin", "advsvc")
+# network, by the destination's policy profile: the 2023.1 rules, the defaults from 2023.2, and
+# the role both count; the collection's server_port.PORT_ROLES_BY_PROFILE (SDD §6.6, §21.5)
+PORT_ROLES_BY_PROFILE = {
+    "legacy": ("admin", "advsvc"),
+    "secure_rbac": ("admin", "service"),
+    "unknown": ("admin",),
+}
+# what each profile's rule says when the token has none of its roles
+_ROLE_RULE = {
+    "legacy": "Neutron lets only the admin or advsvc role, or that project, choose a port's "
+    "address or MAC there, and the credential's token has neither",
+    "secure_rbac": "Neutron's secure-RBAC defaults let only the admin or service role, or that "
+    "project, choose a port's address or MAC there, and the credential's token has neither",
+    "unknown": "the destination's policy profile is unknown, so only the admin role, or that "
+    "project, may choose a port's address or MAC there, and the credential's token lacks it "
+    "(declare the provider's policy profile or series)",
+}
 
 
-def port_refusal(network: dict[str, Any], roles: Collection[str] | None) -> str | None:
+def policy_profile_of(capabilities: Mapping[str, Any] | None) -> str:
+    """The destination's policy profile as its check reports it (SDD §10.1, §21.5): ``legacy``
+    for a report without one - from before the profile was reported -, ``unknown`` for a value
+    no rule knows."""
+    profile = (capabilities or {}).get("policy_profile")
+    if profile is None:
+        return "legacy"
+    return profile if profile in PORT_ROLES_BY_PROFILE else "unknown"
+
+
+def port_refusal(
+    network: dict[str, Any], roles: Collection[str] | None, profile: str = "legacy"
+) -> str | None:
     """Why the destination credential may not put a port on ``network`` (a ``network_details``
     entry), or None (SDD §6.6). Another project's network takes it only when shared with the
     credential's project or external - an admin sees every project's networks - and only from a
-    token with one of ``PORT_ROLES``: every recreated port asks for its address or MAC. An
-    external network that is not shared, the credential's own included, also needs the admin
-    role: Nova attaches no other to a server. ``roles`` None (not reported) leaves the role
-    halves unjudged."""
+    token with a role the destination's policy ``profile`` counts (``PORT_ROLES_BY_PROFILE``;
+    ``policy_profile_of`` reads it from the check report): every recreated port asks for its
+    address or MAC. An external network that is not shared, the credential's own included, also
+    needs the admin role: Nova attaches no other to a server. ``roles`` None (not reported)
+    leaves the role halves unjudged."""
+    if profile not in PORT_ROLES_BY_PROFILE:
+        profile = "unknown"
     if not network.get("own"):
         if not (network.get("shared") or network.get("external")):
             return "it is neither shared with the credential's project nor external"
-        if roles is not None and not set(roles) & set(PORT_ROLES):
-            return (
-                "Neutron lets only the admin or advsvc role, or that project, choose a port's "
-                "address or MAC there, and the credential's token has neither"
-            )
+        if roles is not None and not set(roles) & set(PORT_ROLES_BY_PROFILE[profile]):
+            return _ROLE_RULE[profile]
     # Nova's network:attach_external_network, admin only by default (2023.1)
     if network.get("external") and not network.get("shared"):
         if roles is not None and "admin" not in roles:

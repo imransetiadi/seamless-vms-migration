@@ -45,6 +45,7 @@ from ..planning.networks import (
     kit_network_key,
     kit_network_value,
     kit_subnet,
+    policy_profile_of,
     port_refusal,
     resolve_network,
 )
@@ -155,9 +156,12 @@ def apply_mappings(doc: dict[str, Any], mappings: Mappings) -> dict[str, Any]:
     return out
 
 
-def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
+def set_port_creation_mode(
+    doc: dict[str, Any], mode: str, profile: str = "legacy"
+) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose servers recreate their ports in
-    ``mode`` (``plan.port_creation_mode``, SDD §7.2)."""
+    ``mode`` (``plan.port_creation_mode``, SDD §7.2) and whose destination check judges another
+    project's network by the destination's policy ``profile`` (SDD §6.6, §21.5)."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -165,6 +169,7 @@ def set_port_creation_mode(doc: dict[str, Any], mode: str) -> dict[str, Any]:
         if not isinstance(resource.get("_migration_params"), dict):
             resource["_migration_params"] = {}
         resource["_migration_params"]["port_creation_mode"] = mode
+        resource["_migration_params"]["policy_profile"] = profile
     return out
 
 
@@ -363,8 +368,10 @@ def _apply_port_mode(
     record: dict[str, Any] | None = None,
     exports: bool = False,
     deferred: list[str] | None = None,
+    profile: str = "legacy",
 ) -> bool:
-    """Write the plan's port_creation_mode into an existing export before a run, and resolve its
+    """Write the plan's port_creation_mode and the destination's policy ``profile`` into an
+    existing export before a run, and resolve its
     network references again with the destination's ``networks`` when given, unless the run
     replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
     A warm pass passes ``deferred``, where a port network that does not resolve is added.
@@ -387,7 +394,7 @@ def _apply_port_mode(
             or _overridden_ports(doc)
         )
     ) or (record is not None and _read_export_record(osm) != record)
-    doc = set_port_creation_mode(doc, mode)
+    doc = set_port_creation_mode(doc, mode, profile)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
         doc = resolve_network_refs(doc, networks, deferred)
@@ -963,6 +970,7 @@ class AnsibleExecutor:
                 export_record(mappings, nics, ctx.migration.vm.name) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
                 deferred,
+                policy_profile_of(ctx.destination.capabilities),
             )
             await self._log_deferred(ctx, deferred)
         leftover = (
@@ -1195,7 +1203,7 @@ class AnsibleExecutor:
                     + (why or f"there is no network named {name!r}")
                 )
                 continue
-            refused = port_refusal(network, roles)
+            refused = port_refusal(network, roles, policy_profile_of(ctx.destination.capabilities))
             if refused:
                 problem = (
                     f"{what} cannot go to RHOSO network {name!r} "
@@ -1459,6 +1467,9 @@ class AnsibleExecutor:
                         networks,
                         deferred,
                         volumes,
+                        policy_profile_of(ctx.destination.capabilities)
+                        if ctx is not None
+                        else "legacy",
                     )
                     if ctx is not None:
                         await self._log_deferred(ctx, deferred)
@@ -1477,6 +1488,7 @@ class AnsibleExecutor:
         networks: Sequence[dict[str, Any]] | None = None,
         deferred: list[str] | None = None,
         validated_volumes: Sequence[str] | None = None,
+        profile: str = "legacy",
     ) -> None:
         """Keep only the planned server of the export, check that it still lists every volume
         the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
@@ -1509,7 +1521,7 @@ class AnsibleExecutor:
         if mappings is not None:
             doc = apply_mappings(doc, mappings)
         if port_mode is not None:
-            doc = set_port_creation_mode(doc, port_mode)
+            doc = set_port_creation_mode(doc, port_mode, profile)
         # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if validated_volumes:

@@ -443,6 +443,77 @@ async def test_the_plans_port_creation_mode_reaches_workloads_before_the_import(
     assert sync_call["port_creation_mode"] == ["neutron"]
 
 
+@pytest.mark.parametrize(
+    "capabilities, profile",
+    [
+        ({"policy_profile": "secure_rbac"}, "secure_rbac"),
+        ({"policy_profile": "unknown"}, "unknown"),
+        ({}, "legacy"),
+    ],
+    ids=["secure_rbac", "unknown", "a report without one"],
+)
+async def test_the_destinations_policy_profile_reaches_workloads_before_the_import(
+    env, monkeypatch, capabilities, profile
+):
+    """SDD §6.6, §21.5: the executor writes the destination's policy profile - as its check
+    reports it, legacy for a report without one - into the planned server's _migration_params
+    before every OpenStack run, where the collection's destination check reads it."""
+    monkeypatch.setenv("ANSIBLE_FAKE_PORT_SECURITY_GROUPS", "1")
+    destination = DST.model_copy(update={"capabilities": capabilities})
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS, port_creation_mode="neutron")
+    vm = make_vm(source_id="srv-1", name="web-01")
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, destination, env.settings)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["playbook"] == "import_workloads.yml"
+    assert exported_server(env)["_migration_params"]["policy_profile"] == profile
+
+
+async def test_the_cutover_port_refusal_follows_the_policy_profile(env):
+    """SDD §6.6, §21.5: the VMware kit's network map judges another project's network by the
+    destination's policy profile before the kit runs - service under secure-RBAC, advsvc only
+    under the legacy rules; the OpenStack import's own check reads the profile the executor
+    writes (test_the_destinations_policy_profile_reaches_workloads_before_the_import)."""
+    # the kit's map: another project's shared network from a service token under secure-RBAC
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000ab", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+
+    def token(roles, profile):
+        caps = {"roles": roles, "policy_profile": profile}
+        destination = DST.model_copy(update={"capabilities": caps})
+        return make_ctx(plan, mig, VCENTER, destination, env.settings)
+
+    # a pass maps the NIC and logs nothing when the profile counts the token's role
+    ctx, rec = token(["service", "member"], "secure_rbac")
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-9": "net-shared-net-theirs,sub-net-shared-net-theirs"
+    }
+    assert not [line for line in rec.logs if "cannot go to RHOSO network" in line]
+    # the cutover refuses before the kit runs when it does not
+    for roles, profile, rule in (
+        (
+            ["advsvc", "member"],
+            "secure_rbac",
+            "secure-RBAC defaults let only the admin or service role",
+        ),
+        (["service", "member"], "legacy", "Neutron lets only the admin or advsvc role"),
+        (["service", "member"], "unknown", "the destination's policy profile is unknown"),
+    ):
+        ran = len(read_log(env.log))
+        with pytest.raises(PermanentStepError, match=rule):
+            await env.executor.run(StepName.CUTOVER, token(roles, profile)[0])
+        assert len(read_log(env.log)) == ran, (roles, profile)
+
+
 async def test_a_neutron_warm_cutover_exports_again_a_workload_without_port_security_groups(
     env, monkeypatch
 ):

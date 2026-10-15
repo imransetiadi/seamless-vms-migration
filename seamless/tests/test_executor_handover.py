@@ -1996,6 +1996,46 @@ async def test_handover_step_0_refuses_a_network_the_credential_may_not_put_a_po
         assert clouds["dst"].created[0]["networks"][0]["uuid"] == listed[0].id, name
 
 
+async def test_the_handover_port_check_follows_the_policy_profile(tmp_path):
+    """SDD §7.3 step 0, §6.6, §21.5: another project's shared network takes the port from the
+    roles the destination's policy profile counts - service under secure-RBAC, advsvc only under
+    the legacy rules, admin alone when the profile is unknown."""
+    shared = NS(
+        id="shared-net",
+        name="rhoso-app",
+        project_id="admin-project",
+        is_shared=True,
+        is_router_external=False,
+    )
+    for name, roles, profile, refusal in (
+        (
+            "secure advsvc",
+            ["advsvc"],
+            "secure_rbac",
+            "secure-RBAC defaults let only the admin or service role",
+        ),
+        ("legacy service", ["service"], "legacy", "Neutron lets only the admin or advsvc role"),
+        ("unknown service", ["service"], "unknown", "the destination's policy profile is unknown"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = [shared]
+        clouds["dst"].roles = roles
+        destination = DST.model_copy(update={"capabilities": {"policy_profile": profile}})
+        with pytest.raises(PermanentStepError, match="storage handover refused") as refused:
+            await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, destination, settings)[0])
+        assert refusal in str(refused.value), name
+    for name, roles, profile in (
+        ("secure service", ["service"], "secure_rbac"),
+        ("unknown admin", ["admin"], "unknown"),
+    ):
+        executor, calls, clouds, plan, mig, settings = setup(tmp_path / name)
+        clouds["dst"].network_list = [shared]
+        clouds["dst"].roles = roles
+        destination = DST.model_copy(update={"capabilities": {"policy_profile": profile}})
+        await executor.run(StepName.CUTOVER, make_ctx(plan, mig, SRC, destination, settings)[0])
+        assert clouds["dst"].created[0]["networks"][0]["uuid"] == "shared-net", name
+
+
 async def test_handover_step_0_refuses_an_address_neutron_would_refuse(tmp_path):
     """SDD §7.3 step 0 and §6.6: each address step 8 gives a port must be one Neutron takes on
     that network - a host address of its subnets; on a SLAAC subnet only the kept MAC's EUI-64

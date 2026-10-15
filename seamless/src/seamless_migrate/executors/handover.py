@@ -26,7 +26,7 @@ from ..config import Settings
 from ..domain.enums import Strategy
 from ..domain.models import Mappings, Plan, Provider, utcnow
 from ..planning.ipam import address_refusal, requested_ips
-from ..planning.networks import port_refusal
+from ..planning.networks import policy_profile_of, port_refusal
 from ..providers.base import microversion_text
 from ..storage import (
     StorageError,
@@ -411,16 +411,20 @@ class HandoverExecutor:
         backend_map: dict[str, str],
         plan: Plan | None = None,
         mappings: Mappings | None = None,
+        profile: str = "legacy",
     ) -> dict[str, Any]:
         """Step 0 as a read-only report: what each volume would become, and every problem; with the
         plan, also what would make step 6 or 8 fail on a port, a security group, the flavor or a
-        volume type - ``mappings`` as those steps apply them, the plan's by default."""
+        volume type - ``mappings`` as those steps apply them, the plan's by default; ``profile``
+        is the destination's policy profile (§21.5)."""
         mode = plan.port_creation_mode if plan is not None else "nova"
         definition = self._capture_definition(src, server_id, mode)
         attachments = definition["attachments"]
         problems: list[str] = []
         if plan is not None:
-            problems.extend(self._port_problems(dst, definition["networks"], plan, server_id))
+            problems.extend(
+                self._port_problems(dst, definition["networks"], plan, server_id, profile)
+            )
             problems.extend(self._group_problems(dst, definition))
             problems.extend(self._lookup_problems(dst, definition, mappings or plan.mappings))
         if attachments and not any(a["boot"] for a in attachments):
@@ -499,12 +503,24 @@ class HandoverExecutor:
         dst = await self._conn(destination)
         return await self._call(
             "check the handover readiness",
-            lambda: self._readiness(src, dst, server_id, backend_map, plan, mappings),
+            lambda: self._readiness(
+                src,
+                dst,
+                server_id,
+                backend_map,
+                plan,
+                mappings,
+                policy_profile_of(destination.capabilities),
+            ),
         )
 
     @staticmethod
     def _port_problems(
-        dst: Any, networks: list[dict[str, Any]], plan: Plan, vm_id: str
+        dst: Any,
+        networks: list[dict[str, Any]],
+        plan: Plan,
+        vm_id: str,
+        profile: str = "legacy",
     ) -> list[str]:
         """What would make step 8 fail on a port, or put it where it must not go, found while the
         VM still runs (§7.3 step 0): its RHOSO network does not resolve with step 8's lookup, the
@@ -521,8 +537,9 @@ class HandoverExecutor:
             except PermanentStepError as exc:
                 problems.append(f"{where}: {exc}")
                 continue
-            # another project's network only when shared or external, and from the admin or advsvc
-            # role: the admin credential sees every project's private networks (§6.6)
+            # another project's network only when shared or external, and from a role the
+            # destination's policy profile counts: the admin credential sees every project's
+            # private networks (§6.6, §21.5)
             project = _attr(network, "project_id")
             why_not = port_refusal(
                 {
@@ -531,6 +548,7 @@ class HandoverExecutor:
                     "external": bool(_attr(network, "is_router_external", False)),
                 },
                 roles,
+                profile,
             )
             if why_not:
                 problems.append(f"{where} on {target!r} (project {project}): {why_not}")

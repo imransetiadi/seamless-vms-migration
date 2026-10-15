@@ -1182,6 +1182,62 @@ def test_no_release_warning_for_a_supported_or_validated_destination():
     ]
 
 
+def _another_projects_port(caps):
+    """NET_PORT_NOT_PERMITTED, or None, for a NIC that keeps its address on another project's
+    shared network, judged with the destination's check report ``caps`` (SDD §6.6, §9.3)."""
+    vm = make_vm(
+        source_id="vm-1",
+        nics=[Nic(network="app-net", mac="FA:16:3E:00:00:01", fixed_ips=["10.0.0.5"])],
+    )
+    plan = make_plan(mappings=Mappings(networks={"app-net": "rhoso-net"}))
+    shared = net("p", "rhoso-net", own=False, project_id="project-admin")
+    dst = resolved_dst([shared], [subnet_of("p", "rhoso-net", "10.0.0.0/24")])
+    found = [
+        f
+        for f in check(vm, plan=plan, dst=dst, dst_caps=caps)
+        if f.code == "NET_PORT_NOT_PERMITTED"
+    ]
+    return found[0] if found else None
+
+
+def test_finding_net_port_not_permitted_counts_service_under_secure_rbac():
+    """SDD §21.5, §6.6: under the secure-RBAC defaults (2023.2 on) Neutron lets the admin or
+    service role, or the network's project, choose a port's address on another project's network
+    - and advsvc no longer."""
+    secure = {"policy_profile": "secure_rbac"}
+    for roles in (["service", "member"], ["admin"]):
+        assert _another_projects_port({**secure, "roles": roles}) is None, roles
+    for roles in (["advsvc", "member"], ["member", "reader"]):
+        refused = _another_projects_port({**secure, "roles": roles})
+        assert refused is not None and refused.severity == Severity.blocker, roles
+        assert refused.message == (
+            "The RHOSO credential may not put these NICs on their network: fa:16:3e:00:00:01 on "
+            "'rhoso-net' (project project-admin): Neutron's secure-RBAC defaults let only the "
+            "admin or service role, or that project, choose a port's address or MAC there, and "
+            "the credential's token has neither."
+        )
+
+
+def test_finding_net_port_not_permitted_counts_advsvc_only_under_the_legacy_profile():
+    """SDD §21.5, §6.6: advsvc counts under the legacy rules alone - also for a check report from
+    before the profile was reported -, and an unknown profile counts only admin, the role both
+    count."""
+    for caps in ({"policy_profile": "legacy"}, {}):
+        assert _another_projects_port({**caps, "roles": ["advsvc"]}) is None, caps
+        refused = _another_projects_port({**caps, "roles": ["service", "member"]})
+        assert "Neutron lets only the admin or advsvc role" in refused.message, caps
+    unknown = {"policy_profile": "unknown"}
+    assert _another_projects_port({**unknown, "roles": ["admin"]}) is None
+    for roles in (["advsvc"], ["service"]):
+        refused = _another_projects_port({**unknown, "roles": roles})
+        assert refused is not None, roles
+        assert "the destination's policy profile is unknown, so only the admin role" in (
+            refused.message
+        ), roles
+    # a value the check never reports counts as unknown: admin alone
+    assert _another_projects_port({"policy_profile": "strict", "roles": ["advsvc"]}) is not None
+
+
 def test_finding_net_port_not_permitted_follows_neutrons_rule_for_another_projects_network():
     """SDD §9.3, §6.6: another project's network takes a NIC only when it is shared with the
     credential's project or external, and from a token with the admin or advsvc role - Neutron's

@@ -11,7 +11,7 @@ from ..domain.enums import ProviderKind, Severity, Strategy
 from ..domain.models import Finding, Mappings, NicOverride, Plan, Provider, VMRef
 from ..guest_os import identify
 from .ipam import address_refusal
-from .networks import kit_subnet, port_refusal, resolve_network
+from .networks import kit_subnet, policy_profile_of, port_refusal, resolve_network
 from .platforms import SERIES, parse_microversion
 
 S = Strategy
@@ -777,13 +777,15 @@ def run_preflight(
         )
 
     # whether the credential may put each NIC's port on its resolved network: another project's
-    # takes it only when shared or external, and from the admin or advsvc role (SDD §6.6, §9.3);
-    # the VMware migration kit creates every port with the NIC's MAC (§7.2)
+    # takes it only when shared or external, and from a role the destination's policy profile
+    # counts (SDD §6.6, §9.3, §21.5); the VMware migration kit creates every port with the NIC's
+    # MAC (§7.2)
     roles = (dst_caps or {}).get("roles")
+    profile = policy_profile_of(dst_caps)
     denied = []
     for nic in vm.nics:
         network = resolved.get(id(nic))
-        why = None if network is None else port_refusal(network, roles)
+        why = None if network is None else port_refusal(network, roles, profile)
         if network is not None and why:
             denied.append(
                 f"{(nic.mac or '?').lower()} on {network['name']!r} "
