@@ -642,10 +642,10 @@ file **and** executable as a script (`python3 blocksync.py …`). Hash: BLAKE2b 
 **CLI**
 
 ```text
-blocksync.py send    --device PATH [--chunk-size N] [--workers W]
+blocksync.py send    --device PATH [--chunk-size N] [--workers W] [--expect-serial ID]
     stdin: manifest from receiver; stdout: frames; stderr: logs
 blocksync.py receive --device PATH [--chunk-size N] [--workers W] [--assume-zero]
-                     [--progress-interval S] -- SENDER_COMMAND [ARGS...]
+                     [--progress-interval S] [--expect-serial ID] -- SENDER_COMMAND [ARGS...]
     spawns SENDER_COMMAND with stdin/stdout pipes; stderr: JSON progress lines
     {"event":"progress","bytes_done":int,"bytes_total":int,"pct":float};
     stdout (last line): JSON summary {"ok":true,"chunks":int,"chunks_changed":int,
@@ -655,6 +655,15 @@ blocksync.py hash    --device PATH [--chunk-size N]      prints manifest digest 
 
 Exit codes: `0` ok, `2` usage/IO error, `3` protocol or verification error, `4` destination
 smaller than source.
+
+With `--expect-serial ID`, `send` and `receive` check the device they opened before they read or write a byte of it:
+the virtio-blk serial of the opened descriptor's own device (`/sys/dev/block/<major>:<minor>/serial`, the volume id
+Nova gives the disk, cut to 20 characters) must be a prefix of `ID`, else exit `3`. A device that shows no serial - a
+regular file, a disk that is not virtio-blk - is used as given. The warm sync passes the temporary volume's id to the
+sender and the destination volume's id to the receiver: the kernel gives a freed `/dev/vdX` path to the next disk
+attached, and a path another volume took between the attach and the open would otherwise be read, or written into
+(the hazard of review RV12-03 on the warm path). The check reads the opened descriptor's device, so nothing can take
+the path between the check and the use; a disk taken away after the open fails the transfer's I/O.
 
 **Wire protocol v1** (all integers big-endian):
 
