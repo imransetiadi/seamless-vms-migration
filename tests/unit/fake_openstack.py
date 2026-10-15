@@ -327,9 +327,9 @@ class _FakeBlockStorage:
         """As openstacksdk's block_storage proxy and resource.wait_for_status: a resource
         already in ``status`` returns at once; else Cinder finishes a transitional status on
         its own, a failure status (``error`` unless ``failures`` says otherwise) raises
-        ResourceFailure, as does a resource that went away, and any other status - one Cinder
-        will not leave on its own - never becomes ``status``: ResourceTimeout once ``wait``
-        ran out."""
+        ResourceFailure, a resource that went away raises NotFoundException (4.21's re-read,
+        Resource.fetch, does), and any other status - one Cinder will not leave on its own -
+        never becomes ``status``: ResourceTimeout once ``wait`` ran out."""
         if wait is None:
             raise AssertionError("wait_for_status without a wait bound waits forever")
         self.cloud.record("wait_for_status", id=res.id, status=status)
@@ -337,7 +337,7 @@ class _FakeBlockStorage:
             return res
         found = self.cloud.volumes.get(res.id) or self.cloud.snapshots.get(res.id)
         if found is None:
-            raise ResourceFailure("%s went away while waiting for %s" % (res.id, status))
+            raise NotFoundException("No Volume found for %s" % res.id)
         if res.id in self.cloud.volumes:
             self.cloud._read_detaching(found, settle=True)
         failures = ["error"] if failures is None else failures

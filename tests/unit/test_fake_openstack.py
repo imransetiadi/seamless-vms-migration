@@ -42,7 +42,9 @@ def test_the_fakes_wait_for_status_fails_for_a_resource_that_went_away_or_withou
     volume = cloud.volumes.pop("vol-1")
     volume.status = "creating"
 
-    with pytest.raises(fake.ResourceFailure, match="went away"):
+    # openstacksdk 4.21's wait re-reads it with fetch, which raises NotFoundException for a
+    # resource gone (its own "went away" ResourceFailure is never reached)
+    with pytest.raises(fake.NotFoundException):
         cloud.block_storage.wait_for_status(volume, "available", wait=5)
     with pytest.raises(AssertionError, match="waits forever"):
         cloud.block_storage.wait_for_status(volume, "available")
