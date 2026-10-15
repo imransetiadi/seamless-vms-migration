@@ -60,6 +60,8 @@ class Settings(BaseModel):
     k8s_namespace: str | None = None
     ansible_playbook: str = "ansible-playbook"
     collection_root: Path = Field(default_factory=find_repo_root)
+    #: ANSIBLE_HOST_KEY_CHECKING of every playbook run (SDD §15.1): off while SEC-02 is open
+    ansible_host_key_checking: bool = False
     max_concurrent_migrations: int = 10
     max_concurrent_cutovers: int = 3
     tick_s: float = 1.0
@@ -155,6 +157,7 @@ class Settings(BaseModel):
             "METRICS_PUBLIC": "metrics_public",
             "LOG_JSON": "log_json",
             "CONSOLE_SCREENING_SEND_TO_REMOTE": "console_screening_send_to_remote",
+            "ANSIBLE_HOST_KEY_CHECKING": "ansible_host_key_checking",
         }
         for env_name, field in bool_fields.items():
             value = get(env_name)

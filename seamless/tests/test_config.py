@@ -80,6 +80,16 @@ def test_settings_parses_types(tmp_path):
     assert s.dashboard_dir == tmp_path / "dist"
 
 
+def test_settings_ansible_host_key_checking_is_off_by_default_and_can_be_turned_on():
+    """Audit B-02 (SDD §15.1): the run's ANSIBLE_HOST_KEY_CHECKING comes from an explicit
+    setting - off by default while SEC-02 is open - never from the control plane's environment."""
+    assert Settings.from_env({}).ansible_host_key_checking is False
+    on = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "true"})
+    assert on.ansible_host_key_checking is True
+    off = Settings.from_env({"SEAMLESS_ANSIBLE_HOST_KEY_CHECKING": "false"})
+    assert off.ansible_host_key_checking is False
+
+
 def test_every_setting_is_documented_in_sdd_15_1():
     """Every SEAMLESS_* variable Settings.from_env reads appears in SDD §15.1, and every
     variable the section lists is read (the dashboard-only SEAMLESS_MOCK aside)."""
