@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from pydantic import BaseModel, Field
 
 from ..domain.enums import Role
 
@@ -42,6 +43,15 @@ class TokenEntry:
     name: str
     role: Role
     sha256: str
+
+
+class DashboardUser(BaseModel):
+    """Database-backed identity; only its token digest is persisted."""
+
+    id: str
+    name: str
+    role: Role
+    sha256: str = Field(repr=False)
 
 
 ANONYMOUS_ADMIN = Principal("anonymous", Role.admin)

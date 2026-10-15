@@ -1,0 +1,4 @@
+dist/assets/charts-C_ZLoNif.js                         379.07 kB │ gzip: 100.48 kB
+
+✓ built in 3.16s
+check-bundle: 5 start-up chunks, 281.9 KiB, none of them lazy-only

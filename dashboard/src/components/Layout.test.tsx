@@ -36,7 +36,7 @@ describe('Layout health notice', () => {
     // no token: the anonymous admin of auth-disabled demo mode, who never sees the sign-in page (SDD §13.1)
     renderWithApp(<Layout />, { route: '/', path: '/', server, token: null });
     expect(await screen.findByText(`Control plane ${version}`)).toBeInTheDocument();
-    expect(await screen.findByText('anonymous')).toBeInTheDocument();
+    expect(await within(screen.getByTestId('app-navigation')).findByText('anonymous')).toBeInTheDocument();
   });
 
   it('names the degraded parts: database and a stalled orchestrator', async () => {
@@ -109,13 +109,14 @@ describe('Layout navigation (SDD §16)', () => {
     renderWithApp(<Layout />, { route: '/advisor/recommendations/rec-b2c4d6e87101', path: '/advisor/recommendations/:recId' });
     const nav = await screen.findByRole('navigation', { name: 'Primary' });
     const groups = within(nav).getAllByRole('group');
-    expect(groups).toHaveLength(4);
-    ['Migrations', 'Clouds', 'Activity', 'Advisor'].forEach((name, i) => expect(groups[i]).toHaveAccessibleName(name));
+    expect(groups).toHaveLength(5);
+    ['Migrations', 'Clouds', 'Activity', 'Advisor', 'Administration'].forEach((name, i) => expect(groups[i]).toHaveAccessibleName(name));
     const items = (group: HTMLElement) => within(group).getAllByRole('link').map((link) => [link.textContent, link.getAttribute('href')]);
     expect(items(groups[0]!)).toEqual([['Overview', '/'], ['Plans', '/plans']]);
     expect(items(groups[1]!)).toEqual([['Providers', '/providers'], ['Inventory', '/inventory']]);
     expect(items(groups[2]!)).toEqual([['Events', '/events']]);
     expect(items(groups[3]!)).toEqual([['Recommendations', '/advisor'], ['Policies', '/advisor/policies'], ['Audit trail', '/advisor/audit']]);
+    expect(items(groups[4]!)).toEqual([['Users', '/users']]);
     // a recommendation's page belongs to Recommendations
     expect(within(nav).getByRole('link', { name: 'Recommendations' })).toHaveAttribute('aria-current', 'page');
     expect(within(nav).getAllByRole('link').filter((link) => link.getAttribute('aria-current') === 'page')).toHaveLength(1);
@@ -187,7 +188,7 @@ describe('Layout phone navigation (SDD §16 focus)', () => {
     await user.click(await screen.findByRole('button', { name: 'Open navigation' }));
     const drawer = screen.getByRole('dialog', { name: 'Navigation' });
     const nav = within(drawer).getByRole('navigation', { name: 'Primary' });
-    expect(within(nav).getAllByRole('group')).toHaveLength(4);
+    expect(within(nav).getAllByRole('group')).toHaveLength(5);
     expect(within(drawer).getByRole('button', { name: /sign out/i })).toBeInTheDocument();
   });
 

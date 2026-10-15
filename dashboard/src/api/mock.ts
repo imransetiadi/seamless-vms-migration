@@ -100,6 +100,7 @@ import {
   PROBE_KINDS,
   RECOMMENDATION_LIMIT_DEFAULT,
   RECOMMENDATION_LIMIT_MAX,
+  ROLES,
   STRATEGIES,
   SYNC_PASSES_LATEST,
 } from './types';
@@ -582,6 +583,7 @@ function checkDistribution(input: Record<string, unknown> | Provider) {
 }
 
 export class MockServer {
+  private readonly users = new Map<string, Me>();
   /** What GET /health answers; tests flip it to a degraded state. */
   health: Health = {
     status: 'ok',
@@ -1157,7 +1159,9 @@ export class MockServer {
   // ---------------------------------------------------------------------------------------
 
   principal(token: string | null): Me | null {
-    if (!token) return { name: 'anonymous', role: 'admin' };
+    if (!token) return this.health.auth_disabled ? { name: 'anonymous', role: 'admin' } : null;
+    const user = this.users.get(token.trim());
+    if (user) return user;
     const t = token.trim().toLowerCase();
     for (const role of ['admin', 'approver', 'operator', 'viewer'] as const) {
       if (t === role || t.startsWith(`${role}:`) || t.startsWith(`smg_${role}`)) return { name: PERSONAS[role], role };
@@ -1232,6 +1236,26 @@ export class MockServer {
     if (method === 'GET' && root === 'health') return ok(this.health);
 
     if (root === 'me' && method === 'GET') return ok(this.require(token, 'viewer', path));
+
+    if (root === 'users' && !id) {
+      const me = this.require(token, 'admin', path);
+      const users = [...ROLES.map((role) => ({ name: PERSONAS[role], role })), ...this.users.values()];
+      if (method === 'GET') return ok(users);
+      if (method === 'POST') {
+        if (this.health.auth_disabled) throw new HttpError(409, 'conflict', 'enable authentication before adding dashboard users');
+        const name = typeof input.name === 'string' ? input.name.trim() : '';
+        const role = input.role === undefined ? 'viewer' : input.role;
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$/.test(name) || ['anonymous', 'unauthenticated', 'cli', 'system'].includes(name.toLowerCase()) || !ROLES.includes(role as Role) || Object.keys(input).some((key) => !['name', 'role'].includes(key))) {
+          throw new HttpError(422, 'validation_error', 'Choose a valid user name and role.');
+        }
+        if (users.some((user) => user.name.toLowerCase() === name.toLowerCase())) throw new HttpError(409, 'conflict', 'a user with this name already exists');
+        const user: Me = { name, role: role as Role };
+        const issued = `smg_${crypto.randomUUID()}`;
+        this.users.set(issued, user);
+        this.emit({ kind: 'user.created', actor: me.name, message: `User ${name} created`, plan_id: null, migration_id: null, data: { name, role } });
+        return ok({ ...user, token: issued }, 201);
+      }
+    }
 
     if (root === 'providers') {
       if (!id) {

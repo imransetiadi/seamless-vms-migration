@@ -143,6 +143,8 @@ def test_me_and_forbidden_audit(api):
 
 ROUTES = [
     ("GET", "/api/v1/me", Role.viewer, None),
+    ("GET", "/api/v1/users", Role.admin, None),
+    ("POST", "/api/v1/users", Role.admin, {"name": "matrix-user"}),
     ("GET", "/api/v1/providers", Role.viewer, None),
     ("POST", "/api/v1/providers", Role.admin, {**SOURCE, "id": "matrix-src"}),
     ("GET", "/api/v1/providers/src-osp", Role.viewer, None),

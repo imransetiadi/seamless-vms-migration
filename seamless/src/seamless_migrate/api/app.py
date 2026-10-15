@@ -41,6 +41,7 @@ from . import (
     routes_misc,
     routes_plans,
     routes_providers,
+    routes_users,
 )
 from .deps import ApiError, Services
 
@@ -321,7 +322,7 @@ def build_services(
     else:
         tokens = TokenStore([])
         if not settings.auth_disabled:
-            log.warning("SEAMLESS_TOKENS_FILE is not set: every API call will be refused")
+            log.warning("SEAMLESS_TOKENS_FILE is not set: only database users can authenticate")
     return Services(
         settings=settings,
         store=store,
@@ -389,6 +390,7 @@ def create_app(
         routes_plans,
         routes_migrations,
         routes_events,
+        routes_users,
     ):
         app.include_router(module.router, prefix=API_PREFIX)
     dist = settings.dashboard_dir

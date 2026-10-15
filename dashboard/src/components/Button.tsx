@@ -1,5 +1,5 @@
 import { LoaderCircle, type LucideIcon } from 'lucide-react';
-import { forwardRef, useEffect, useId, useState, type ButtonHTMLAttributes, type KeyboardEvent, type MouseEvent } from 'react';
+import { forwardRef, useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type KeyboardEvent, type MouseEvent } from 'react';
 import { buttonClassName, type ButtonSize, type ButtonVariant } from '../lib/buttonStyles';
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -42,9 +42,18 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   const softDisabled = Boolean(disabledReason);
   // where the note about an unavailable action shows, under the button (viewport coordinates)
   const [note, setNote] = useState<{ top: number; left: number } | null>(null);
+  const noteRef = useRef<HTMLSpanElement>(null);
+  const noteAnchorTop = useRef(0);
+  useLayoutEffect(() => {
+    if (!note || !noteRef.current) return;
+    const box = noteRef.current.getBoundingClientRect();
+    const top = Math.max(8, box.bottom > window.innerHeight - 8 ? noteAnchorTop.current - box.height - 6 : note.top);
+    const left = Math.max(8, Math.min(note.left, window.innerWidth - box.width - 8));
+    if (top !== note.top || left !== note.left) setNote({ top, left });
+  }, [note]);
   useEffect(() => {
     if (!note) return;
-    const hide = () => setNote(null);
+    const hide = (event?: Event) => { if (event?.target !== noteRef.current) setNote(null); };
     const timer = window.setTimeout(hide, 4000);
     window.addEventListener('scroll', hide, true);
     window.addEventListener('resize', hide);
@@ -59,6 +68,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       event.preventDefault();
       if (softDisabled) {
         const rect = event.currentTarget.getBoundingClientRect();
+        noteAnchorTop.current = rect.top;
         setNote({ top: rect.bottom + 6, left: Math.max(8, Math.min(rect.left, window.innerWidth - 296)) });
       }
       return;
@@ -102,6 +112,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       </button>
       {softDisabled && (
         <span
+          ref={noteRef}
           id={reasonId}
           role={note ? 'note' : undefined}
           className={note ? 'disabled-reason' : 'sr-only'}

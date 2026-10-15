@@ -27,12 +27,21 @@ from sqlalchemy.pool import StaticPool
 
 from .domain.enums import Phase
 from .domain.models import Event
+from .security.auth import DashboardUser
 
 log = logging.getLogger(__name__)
 
 M = TypeVar("M", bound=BaseModel)
 
-KINDS = ("provider", "plan", "migration", "recommendation", "advisor_snapshot", "advisor_policy")
+KINDS = (
+    "provider",
+    "plan",
+    "migration",
+    "recommendation",
+    "advisor_snapshot",
+    "advisor_policy",
+    "user",
+)
 
 JSONType = sa.JSON().with_variant(JSONB(), "postgresql")
 
@@ -208,6 +217,40 @@ class Store:
             conn.execute(events.delete())
 
     # -- documents ---------------------------------------------------------------------------
+    def create_user(self, user: DashboardUser, actor: str) -> Event:
+        """Create the identity and its audit event together; a duplicate never rotates a token."""
+        event = Event(
+            kind="user.created",
+            actor=actor,
+            message=f"User {user.name} created",
+            data={"name": user.name, "role": str(user.role)},
+        )
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    documents.insert().values(
+                        kind="user",
+                        id=user.id,
+                        version=1,
+                        data=user.model_dump(mode="json"),
+                        created_at=event.ts,
+                        updated_at=event.ts,
+                    )
+                )
+                result = conn.execute(
+                    events.insert().values(
+                        ts=event.ts,
+                        kind=event.kind,
+                        actor=event.actor,
+                        message=event.message,
+                        data=event.data,
+                    )
+                )
+                seq = int(result.inserted_primary_key[0])
+        except IntegrityError:
+            raise ConflictError("a user with this name already exists") from None
+        return event.model_copy(update={"seq": seq})
+
     def put(self, kind: str, model: BaseModel, expected_version: int | None = None) -> int:
         """Insert or update ``model``; return the new version.
 

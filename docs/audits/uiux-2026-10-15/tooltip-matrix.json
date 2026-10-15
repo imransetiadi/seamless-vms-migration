@@ -1,0 +1,110 @@
+[
+  {
+    "theme": "dark",
+    "width": 320,
+    "edge": "top",
+    "top": 101,
+    "bottom": 167,
+    "left": 24,
+    "right": 312
+  },
+  {
+    "theme": "dark",
+    "width": 320,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 24,
+    "right": 312
+  },
+  {
+    "theme": "dark",
+    "width": 390,
+    "edge": "top",
+    "top": 101,
+    "bottom": 167,
+    "left": 61.96875,
+    "right": 349.96875
+  },
+  {
+    "theme": "dark",
+    "width": 390,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 61.96875,
+    "right": 349.96875
+  },
+  {
+    "theme": "dark",
+    "width": 1280,
+    "edge": "top",
+    "top": 153,
+    "bottom": 219,
+    "left": 610.734375,
+    "right": 898.734375
+  },
+  {
+    "theme": "dark",
+    "width": 1280,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 610.734375,
+    "right": 898.734375
+  },
+  {
+    "theme": "light",
+    "width": 320,
+    "edge": "top",
+    "top": 101,
+    "bottom": 167,
+    "left": 24,
+    "right": 312
+  },
+  {
+    "theme": "light",
+    "width": 320,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 24,
+    "right": 312
+  },
+  {
+    "theme": "light",
+    "width": 390,
+    "edge": "top",
+    "top": 101,
+    "bottom": 167,
+    "left": 61.96875,
+    "right": 349.96875
+  },
+  {
+    "theme": "light",
+    "width": 390,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 61.96875,
+    "right": 349.96875
+  },
+  {
+    "theme": "light",
+    "width": 1280,
+    "edge": "top",
+    "top": 153,
+    "bottom": 219,
+    "left": 610.734375,
+    "right": 898.734375
+  },
+  {
+    "theme": "light",
+    "width": 1280,
+    "edge": "bottom",
+    "top": 683,
+    "bottom": 749,
+    "left": 610.734375,
+    "right": 898.734375
+  }
+]

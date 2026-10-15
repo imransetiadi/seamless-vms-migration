@@ -1,9 +1,9 @@
 import { ClipboardList, Plus, SearchX } from 'lucide-react';
-import { useEffect, useId, useMemo, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
-import { DERIVED_PLAN_STATUSES, type DerivedPlanStatus, type Plan } from '../api/types';
+import { DERIVED_PLAN_STATUSES, type Plan } from '../api/types';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
 import { ErrorBanner } from '../components/ErrorBanner';
@@ -22,6 +22,7 @@ import { nothingMigrated, planDone } from '../lib/planDone';
 import { usePageTitle } from '../lib/usePageTitle';
 
 type SortKey = 'name' | 'status' | 'vms' | 'done' | 'slo' | 'updated';
+const SORT_KEYS: SortKey[] = ['name', 'status', 'vms', 'done', 'slo', 'updated'];
 
 /** Router state used by Inventory to open the dialog with a selection. */
 export interface NewPlanState {
@@ -60,10 +61,24 @@ export default function Plans() {
   const role = useRole();
   const location = useLocation();
   const navigate = useNavigate();
-  const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [params, setParams] = useSearchParams();
+  const query = params.get('q') ?? '';
   // every view shows the status the migrations tell, never the stored lifecycle (SDD §8.1)
-  const [status, setStatus] = useState<DerivedPlanStatus | 'all'>('all');
-  const [sort, setSort] = useState<SortState<SortKey> | null>({ key: 'updated', direction: 'descending' });
+  const statusParam = params.get('status');
+  const status = DERIVED_PLAN_STATUSES.find((value) => value === statusParam) ?? 'all';
+  const sort = useMemo<SortState<SortKey>>(() => ({
+    key: SORT_KEYS.find((value) => value === params.get('sort')) ?? 'updated',
+    direction: params.get('direction') === 'ascending' ? 'ascending' : 'descending',
+  }), [params]);
+  const changeParams = (values: Record<string, string>) => {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(values)) {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    }
+    setParams(next, { replace: true });
+  };
   const [dialog, setDialog] = useState<{ open: boolean; sourceId?: string; vmIds?: string[] }>({ open: false });
   const canCreate = hasRole(role, 'operator');
 
@@ -103,7 +118,10 @@ export default function Plans() {
     });
   }, [plans.data, query, status, sort]);
 
-  const onSort = (key: SortKey) => setSort(nextSort(sort, key));
+  const onSort = (key: SortKey) => {
+    const next = nextSort(sort, key);
+    changeParams({ sort: next.key, direction: next.direction });
+  };
 
   return (
     <>
@@ -128,15 +146,18 @@ export default function Plans() {
           <label htmlFor={searchId} className="field-label">
             Search plans
           </label>
-          <input id={searchId} type="search" className="input" placeholder="Name, id or description" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input ref={searchRef} id={searchId} type="search" className="input" placeholder="Name, id or description" value={query} onChange={(e) => changeParams({ q: e.target.value })} />
         </div>
         <SelectField
           label="Status"
           className="md:w-44"
           value={status}
-          onChange={(e) => setStatus(e.target.value as DerivedPlanStatus | 'all')}
+          onChange={(e) => changeParams({ status: e.target.value === 'all' ? '' : e.target.value })}
           options={[{ value: 'all', label: 'All' }, ...DERIVED_PLAN_STATUSES.map((s) => ({ value: s, label: planStatusMeta(s).label }))]}
         />
+        {(query || status !== 'all') && (
+          <Button onClick={() => { changeParams({ q: '', status: '', sort: '', direction: '' }); searchRef.current?.focus(); }}>Clear filters</Button>
+        )}
       </div>
 
       {/* a live region already on the page: what the filters show is read out, none too (SDD §16) */}

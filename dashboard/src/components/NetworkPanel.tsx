@@ -6,6 +6,7 @@ import { capabilityRoles, portRefusal, resolveNetwork } from '../lib/networks';
 import { nicTarget, parseNicDrafts, toNicDraft, withVmNicOverrides, type NicDraft } from '../lib/nics';
 import { planActions } from '../lib/planActions';
 import { Button } from './Button';
+import { ScrollRegion } from './ScrollRegion';
 import { ErrorBanner } from './ErrorBanner';
 import { Modal } from './Modal';
 
@@ -115,7 +116,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
       {nics.length === 0 ? (
         <p className="text-sm text-muted-foreground">The VM has no NIC.</p>
       ) : (
-        <div className="table-wrap rounded-md border border-border">
+        <ScrollRegion label={`NICs of ${m.vm.name}`} className="rounded-md border border-border">
           <table className="data-table" aria-labelledby={caption}>
             <caption id={caption} className="sr-only">
               NICs of {m.vm.name}
@@ -155,7 +156,7 @@ export function NetworkPanel({ migration: m, plan, role, onSaved }: { migration:
               })}
             </tbody>
           </table>
-        </div>
+        </ScrollRegion>
       )}
       <Modal open={drafts !== null} onClose={() => setDrafts(null)} labelledBy={titleId} dismissible={!patch.isPending} returnFocusRef={editRef}>
         <form onSubmit={submit} noValidate className="flex min-h-0 flex-col">

@@ -1,0 +1,46 @@
+{
+  "browser": "156.0.8078.4",
+  "tooltip": {
+    "text": "Jev's calibrated confidence in its own recommendation, not the probability it gives that option.",
+    "top": 781,
+    "bottom": 847,
+    "height": 800
+  },
+  "backFilter": "",
+  "unsavedPlan": "",
+  "evidence": {
+    "text": "Estimated downtime 5m 11s, SLO 10m 00s",
+    "width": 55.203125,
+    "height": 120
+  },
+  "context": [
+    {
+      "width": 390,
+      "demo": 0,
+      "identity": 0,
+      "role": 0
+    },
+    {
+      "width": 768,
+      "demo": 0,
+      "identity": 0,
+      "role": 0
+    },
+    {
+      "width": 1280,
+      "demo": 1,
+      "identity": 1,
+      "role": 1
+    }
+  ],
+  "chunk": {
+    "errors": [
+      "Failed to fetch dynamically imported module: http://127.0.0.1:4188/assets/Plans-Bcfl6rxF.js"
+    ],
+    "rootText": "",
+    "url": "http://127.0.0.1:4188/plans"
+  },
+  "webkit": {
+    "error": "browserType.launch: Executable doesn't exist at /Users/imboyy/Library/Caches/ms-playwright/webkit-2370/pw_run.sh\n╔════════════════════════════════════════════════════════════╗\n║ Looks like Playwright was just installed or updated.       ║\n║ Please run the following command to download new browsers: ║\n║                                                            ║\n║     npx playwright install                                 ║\n║                                                            ║\n║ <3 Playwright Team                                         ║\n╚════════════════════════════════════════════════════════════╝"
+  }
+}

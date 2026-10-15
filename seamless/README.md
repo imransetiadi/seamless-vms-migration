@@ -56,7 +56,13 @@ rollback) and "DC2 VMware exit" (waits for approvals) — idempotently.
 
 ### Security notes
 
-* Only SHA-256 hashes of API tokens are stored (`SEAMLESS_TOKENS_FILE`); failed authentication
+Sign in as an admin and open **Users > Add user** to issue a person's name, role and login token.
+Save the token before selecting **Done**, then share it securely; the person pastes it into Sign in.
+The default role is Viewer. Authentication must be enabled. New users persist in the database
+across restarts; the bootstrap token file stays read-only. The screen adds users only; token
+replacement and revocation currently need a database administrator (see Security.md §5.1).
+
+* Only SHA-256 hashes of API tokens are stored (`SEAMLESS_TOKENS_FILE` or database users); failed authentication
   emits `auth.denied` (never the token).
 * Credentials are never stored or returned: OpenStack credentials come from `SEAMLESS_CLOUDS_YAML`
   by cloud name, VMware credentials from `SEAMLESS_SECRETS_DIR/<name>/{username,password}` or

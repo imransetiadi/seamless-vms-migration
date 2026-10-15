@@ -13,6 +13,7 @@ import {
   ScrollText,
   Server,
   SlidersHorizontal,
+  Users,
   X,
   type LucideIcon,
 } from 'lucide-react';
@@ -68,6 +69,10 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/advisor/policies', label: 'Policies', icon: SlidersHorizontal, match: (p) => p.startsWith('/advisor/policies') },
       { to: '/advisor/audit', label: 'Audit trail', icon: ScrollText, match: (p) => p.startsWith('/advisor/audit') },
     ],
+  },
+  {
+    label: 'Administration',
+    items: [{ to: '/users', label: 'Users', icon: Users, match: (p) => p === '/users' }],
   },
 ];
 
@@ -134,12 +139,14 @@ function Brand({ compact = false }: { compact?: boolean }) {
  */
 function NavGroups({ pathname, mode, onNavigate }: { pathname: string; mode: NavMode; onNavigate?: (to: string) => void }) {
   const prefix = useId();
+  const me = useMe();
   const stats = useStats();
   const failed = stats.data?.failed ?? 0;
   const rail = mode === 'rail';
   return (
     <div className={cn('flex flex-col', rail ? 'gap-2' : 'gap-4')}>
       {NAV_GROUPS.map((group, index) => {
+        if (group.label === 'Administration' && me.data?.role !== 'admin') return null;
         const headingId = `${prefix}-group-${index}`;
         return (
           <div key={group.label} role="group" aria-labelledby={headingId} className={cn(rail && index > 0 && 'border-t border-border pt-2')}>
@@ -300,6 +307,19 @@ function RailSession() {
           Sign out
         </button>
       )}
+    </div>
+  );
+}
+
+function CompactSession() {
+  const me = useMe();
+  const health = useHealth();
+  if (!me.data) return null;
+  return (
+    <div className="mb-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs md:mb-3">
+      <span className="min-w-0 wrap-anywhere font-medium text-foreground">{me.data.name}</span>
+      <span className="text-muted-foreground">{ROLE_LABELS[me.data.role] ?? me.data.role}</span>
+      {health.data?.demo && <span className="text-status-info">Demo</span>}
     </div>
   );
 }
@@ -496,10 +516,11 @@ export function Layout() {
           id="main"
           ref={mainRef}
           tabIndex={-1}
-          className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-4 outline-hidden md:px-6 md:py-6"
+          className="mx-auto w-full max-w-[1400px] flex-1 px-4 pb-4 pt-2 outline-hidden md:px-6 md:py-6"
         >
           <HealthNotice />
           <StreamNotice />
+          <div className={full ? 'md:hidden' : undefined}><CompactSession /></div>
           <Outlet />
         </main>
       </div>

@@ -13,6 +13,7 @@ import { LoadingBlock } from '../components/Skeleton';
 import { RecommendationActions } from '../components/RecommendationActions';
 import { DecisionLine, RecommendedLine } from '../components/Recommendations';
 import { Tabs } from '../components/Tabs';
+import { ScrollRegion } from '../components/ScrollRegion';
 import { CONFIDENCE_DEFINITION, decidable, DECISION_TYPE_LABELS, distributionRows, formatConfidence, optionLabel } from '../lib/advisor';
 import { evidenceTitle } from '../lib/evidence';
 import { auditActionLabel } from '../lib/audit';
@@ -90,7 +91,7 @@ function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
   const mine = events.data.filter((e) => e.data.target_id === rec.id);
   if (mine.length === 0) return <p className="text-sm text-muted-foreground">No audit events for this recommendation yet.</p>;
   return (
-    <div className="table-wrap rounded-md border border-border">
+    <ScrollRegion label="Audit events of this recommendation" className="rounded-md border border-border">
       <table className="data-table">
         <caption className="sr-only">Audit events of this recommendation, oldest first</caption>
         <thead>
@@ -116,7 +117,7 @@ function AuditTab({ rec }: { rec: AdvisorRecommendation }) {
           ))}
         </tbody>
       </table>
-    </div>
+    </ScrollRegion>
   );
 }
 
@@ -157,7 +158,7 @@ function InputTab({ rec }: { rec: AdvisorRecommendation }) {
         )}
       </p>
       <p className="text-xs text-muted-foreground">Redacted before it was stored: passwords, tokens and keys are removed (SDD §13.4).</p>
-      <pre className="max-h-[28rem] overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words text-foreground">
+      <pre role="region" aria-label="Input snapshot JSON" tabIndex={0} className="max-h-[28rem] overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words text-foreground">
         <code>{JSON.stringify(s.payload, null, 2)}</code>
       </pre>
     </div>

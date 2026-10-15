@@ -20,6 +20,7 @@ const ROUTES: Array<[string, string]> = [
   ['/migrations/mig-5d7e2b4a12', 'app-billing-01'],
   ['/migrations/mig-e5f7a9b1a0', 'legacy-rhel6-app'],
   ['/providers', 'Providers'],
+  ['/users', 'Users'],
   ['/inventory/rhosp17-dc1', 'Inventory'],
   ['/inventory/rhoso-prod', 'Inventory'],
   ['/events', 'Events'],
@@ -61,7 +62,7 @@ async function settled() {
 
 beforeAll(async () => {
   await Promise.all(
-    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
+    ['Overview', 'Plans', 'PlanDetail', 'MigrationDetail', 'Providers', 'Users', 'Inventory', 'Events', 'Advisor', 'AdvisorAudit', 'AdvisorPolicies', 'RecommendationDetail', 'Login'].map(
       (page) => import(`./pages/${page}.tsx`),
     ),
   );
