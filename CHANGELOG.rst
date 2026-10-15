@@ -388,16 +388,18 @@ This project follows a simple changelog to satisfy collection metadata validatio
   wait after a failed call measure their minutes, however slowly Cinder
   answers: they counted polls, each a Cinder GET as well as a second, so a
   loaded Cinder stretched the ten minutes to thirty.
-- The cold export checks each disk's identity before it serves it. It reads
-  the disk's virtio serial, the volume id Nova gives it cut to 20 characters,
-  and fails if the serial names another volume, or if a virtio-blk disk
-  (``vdX``) no longer has a serial file, having left the conversion host. The
-  kernel gives a freed ``/dev/vdX`` path to the next disk attached, so a
-  volume taken off the host could have the export serve another VM's disk
-  without an error. A disk with no serial file (not virtio-blk) is served by
-  its path, unchecked. A volume taken away after the export started is not
-  caught: nbdkit resolves the path it serves, the disk's by-id link
-  included, once, at its start.
+- The cold export checks each disk's identity before it serves it, and the
+  cold transfer each destination volume's before qemu-img or nbdcopy writes
+  it. The check reads the disk's virtio serial, the volume id Nova gives it
+  cut to 20 characters, and fails if the serial names another volume, or if a
+  virtio-blk disk (``vdX``) no longer has a serial file, having left the
+  conversion host; the NBD server, qemu-img or nbdcopy is given the disk's
+  by-id link. The kernel gives a freed ``/dev/vdX`` path to the next disk
+  attached, so a volume taken off the host could have the export serve
+  another VM's disk, or the transfer write over one, without an error. A disk
+  with no serial file (not virtio-blk) is used by its path, unchecked. A
+  volume taken away after the export started is not caught: nbdkit resolves
+  the path it serves, the disk's by-id link included, once, at its start.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,

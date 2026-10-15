@@ -2,9 +2,11 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import io
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from unittest import mock
@@ -1036,3 +1038,102 @@ def test_a_volume_cinder_no_longer_has_reads_as_none():
     dst.get_volume_by_id = mock.Mock(side_effect=ServerError("Service Unavailable"))
     with pytest.raises(ServerError):
         volume_common.volume_or_none(dst, "vol-1")
+
+
+class ConvertShell:
+    """A destination conversion host for the transfer's copy: its disks show the virtio serials of
+    the volumes in ``held`` ({device: volume id}) and their by-id links; qemu-img, virt-sparsify and
+    nbdcopy end at once."""
+
+    address = CONV
+
+    def __init__(self, held):
+        self.held, self.commands = held, []
+
+    def cmd_out(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:1] == ["cat"] and command[1].startswith("/sys/block/"):
+            device = "/dev/" + command[1].split("/")[3]
+            if device not in self.held:
+                raise subprocess.CalledProcessError(1, command)
+            return self.held[device][:20]
+        return ""
+
+    def cmd_val(self, command, **kwargs):
+        self.commands.append(list(command))
+        if command[:2] == ["test", "-b"]:
+            serial = command[2][len("/dev/disk/by-id/virtio-"):]
+            return 0 if any(volume_id[:20] == serial for volume_id in self.held.values()) else 1
+        return 0
+
+    def cmd_sub(self, command, **kwargs):
+        self.commands.append(list(command))
+        return DoneProcess()
+
+
+class DoneProcess:
+    """A process that has ended well, its output already read."""
+
+    returncode = 0
+
+    def __init__(self):
+        read, write = os.pipe()
+        os.close(write)
+        self.stdout = os.fdopen(read, "rb")
+        self.stderr = io.StringIO()
+
+    def poll(self):
+        return 0
+
+    def wait(self):
+        return 0
+
+    def communicate(self, data=None, timeout=None):
+        return "", ""
+
+
+def _copying_transfer(tmp_path, held):
+    transfer = object.__new__(volume_common.OpenstackVolumeTransfer)
+    transfer.log, transfer.log_file, transfer.state_file = mock.Mock(), str(tmp_path / "log"), None
+    transfer.transfer_uuid = "uuid-1"
+    transfer.qemu_progress_re = re.compile(r"\((\d+\.\d+)/100%\)")
+    transfer.volume_map = {
+        "/dev/vda": {"dest_id": "dvol-boot-0123456789-tail", "dest_dev": "/dev/vdb",
+                     "url": "nbd://localhost:10809/uuid-1", "progress": 0.0},
+    }
+    transfer.shell = ConvertShell(held)
+    return transfer
+
+
+@pytest.mark.parametrize("copy", ["qemu-img", "nbdcopy"])
+def test_the_transfer_writes_each_destination_volume_through_its_by_id_link(tmp_path, copy):
+    """Seamless Migrate SDD 6.6 (the RV12-03 hazard on the destination): qemu-img and nbdcopy wrote
+    each destination volume through the /dev/vdX recorded at attach - a path another volume took
+    before their open was written into. They are now given the volume's by-id link, once its serial
+    was checked, which resolves at their open to the volume itself."""
+    transfer = _copying_transfer(tmp_path, {"/dev/vdb": "dvol-boot-0123456789-tail"})
+
+    if copy == "qemu-img":
+        transfer._convert_destination_volumes()
+        writes = [c[-1] for c in transfer.shell.commands if c[:3] == ["sudo", "qemu-img", "convert"]]
+    else:
+        transfer._convert_destination_volumes_nbdcopy()
+        writes = [c[3] for c in transfer.shell.commands if c[:2] == ["sudo", "nbdcopy"]]
+
+    assert writes and set(writes) == {"/dev/disk/by-id/virtio-dvol-boot-0123456789"}, writes
+
+
+@pytest.mark.parametrize("copy", ["qemu-img", "nbdcopy"])
+def test_the_transfer_never_writes_a_destination_path_another_volume_took(tmp_path, copy):
+    """Seamless Migrate SDD 6.6: the destination volume left the conversion host, and the kernel gave
+    its /dev/vdX to another volume's disk - the copy fails before anything is written."""
+    transfer = _copying_transfer(tmp_path, {"/dev/vdb": "other-volume-0123456789"})
+
+    with pytest.raises(RuntimeError, match="not of volume dvol-boot"):
+        if copy == "qemu-img":
+            transfer._convert_destination_volumes()
+        else:
+            transfer._convert_destination_volumes_nbdcopy()
+
+    assert not [c for c in transfer.shell.commands if c[:3] in (["sudo", "qemu-img", "convert"],)]
+    assert not [c for c in transfer.shell.commands if c[:2] == ["sudo", "nbdcopy"]]

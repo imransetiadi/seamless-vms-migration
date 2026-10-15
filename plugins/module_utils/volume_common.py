@@ -850,6 +850,51 @@ class OpenStackVolumeBase:
                 str(err),
             )
 
+    def _identified_path(self, volume_id, device):
+        """
+        The path a tool that opens the disk of volume ``volume_id``, attached
+        at ``device``, is given, once that disk's identity is checked: the
+        export's NBD server, the transfer's qemu-img or nbdcopy. The kernel
+        gives a freed device path to the next disk attached, so a volume taken
+        off the host would have the tool read, or write, another disk without
+        an error. The disk's virtio serial - the volume id Nova gives it, cut to
+        20 characters - must not name another volume, and a virtio-blk disk
+        (vdX), which always shows a serial file, must still have one; a disk
+        with no serial file (not virtio-blk, sdX) is given by its path. The
+        tool is given udev's link of the serial, which resolves at its open to
+        the volume itself; nbdkit resolves it once, at its start, so a swap
+        after that is a known residual (Seamless Migrate SDD 6.6, review
+        RV12-03, RV13-01, RV13-02).
+        """
+        name = device.rsplit("/", 1)[-1]
+        try:
+            serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
+        except subprocess.CalledProcessError as err:
+            if err.returncode == SSH_FAILED:
+                raise
+            if name.startswith("vd"):
+                raise RuntimeError(
+                    "%s on the conversion host is gone: volume %s left the host"
+                    % (device, volume_id)
+                ) from err
+            serial = ""  # not virtio-blk: no serial file to check
+        if not serial:
+            self.log.warning("%s shows no virtio serial: using it by its path", device)
+            return device
+        if not volume_id.startswith(serial):
+            raise RuntimeError(
+                "%s on the conversion host is the disk of volume %s, not of volume %s: "
+                "the volume left the host" % (device, serial, volume_id)
+            )
+        link = "/dev/disk/by-id/virtio-" + serial
+        found = self.shell.cmd_val(["test", "-b", link])
+        if found == SSH_FAILED:
+            raise subprocess.CalledProcessError(SSH_FAILED, ["test", "-b", link])
+        if found != 0:
+            self.log.warning("%s has no %s link: using it by its path", device, link)
+            return device
+        return link
+
     @use_lock(PORT_LOCK_FILE)
     def _find_free_port(self):
         """
@@ -1230,54 +1275,11 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mark="source_attached",
         )
 
-    def _exported_path(self, volume_id, device):
-        """
-        The path the NBD export of volume ``volume_id``, attached at
-        ``device``, serves, once its identity is checked. The kernel gives a
-        freed device path to the next disk attached, so a volume taken off
-        this host would have the export serve another disk without an error.
-        The disk's virtio serial - the volume id Nova gives it, cut to 20
-        characters - must not name another volume, and a virtio-blk disk
-        (vdX), which always shows a serial file, must still have one; a disk
-        with no serial file (not virtio-blk, sdX) is served by its path. The
-        export serves udev's link of the serial, but nbdkit resolves it once,
-        at its start: a swap after that is a known residual (Seamless Migrate
-        SDD 6.6, review RV12-03, RV13-01, RV13-02).
-        """
-        name = device.rsplit("/", 1)[-1]
-        try:
-            serial = self.shell.cmd_out(["cat", "/sys/block/%s/serial" % name]).strip()
-        except subprocess.CalledProcessError as err:
-            if err.returncode == SSH_FAILED:
-                raise
-            if name.startswith("vd"):
-                raise RuntimeError(
-                    "%s on the conversion host is gone: volume %s left the host"
-                    % (device, volume_id)
-                ) from err
-            serial = ""  # not virtio-blk: no serial file to check
-        if not serial:
-            self.log.warning("%s shows no virtio serial: exporting it by its path", device)
-            return device
-        if not volume_id.startswith(serial):
-            raise RuntimeError(
-                "%s on the conversion host is the disk of volume %s, not of volume %s: "
-                "the volume left the host" % (device, serial, volume_id)
-            )
-        link = "/dev/disk/by-id/virtio-" + serial
-        found = self.shell.cmd_val(["test", "-b", link])
-        if found == SSH_FAILED:
-            raise subprocess.CalledProcessError(SSH_FAILED, ["test", "-b", link])
-        if found != 0:
-            self.log.warning("%s has no %s link: exporting it by its path", device, link)
-            return device
-        return link
-
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Volume mapping
         step 4: fill in the URL to the volume's matching NBD export. Each disk
-        is served by its identity where it shows one (_exported_path).
+        is served by its identity where it shows one (_identified_path).
         """
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
@@ -1287,7 +1289,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             # SDD 6.6, review RV6-01)
             mapping["port"] = port
             volume_id = mapping["source_id"]
-            disk = self._exported_path(volume_id, mapping["source_dev"])
+            disk = self._identified_path(volume_id, mapping["source_dev"])
             self.log.info("Exporting %s from volume %s", disk, volume_id)
 
             # Fall back to qemu-nbd if nbdkit is not present
@@ -1589,7 +1591,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         for path, mapping in self.volume_map.items():
             self.log.info("Copying source VM's %s: %s", path, str(mapping))
             url = mapping["url"]
-            dest_dev = mapping["dest_dev"]
+            # the volume itself, never a path another volume took (Seamless Migrate SDD 6.6)
+            dest_dev = self._identified_path(mapping["dest_id"], mapping["dest_dev"])
 
             self.log.info("Using nbdcopy from %s to %s", url, dest_dev)
             cmd = [
@@ -1660,6 +1663,8 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
             self.log.info("Converting source VM's %s: %s", path, str(mapping))
             devname = os.path.basename(mapping["dest_dev"])
             overlay = "/tmp/" + devname + "-" + self.transfer_uuid + ".qcow2"
+            # the volume itself, never a path another volume took (Seamless Migrate SDD 6.6)
+            target = self._identified_path(mapping["dest_id"], mapping["dest_dev"])
 
             def _log_convert(source_disk, source_format, mapping):
                 """Write qemu-img convert progress to the wrapper log."""
@@ -1674,7 +1679,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     "-O",
                     "host_device",
                     source_disk,
-                    mapping["dest_dev"],
+                    target,
                 ]
                 # Non-blocking output processing stolen from pre_copy.py
                 img_sub = self.shell.cmd_sub(

@@ -811,7 +811,7 @@ def test_a_disk_that_shows_no_virtio_serial_is_still_exported_by_its_path():
 
 
 class SerialShell:
-    """A conversion host as _exported_path sees it: ``serial`` answers the serial read, or it
+    """A conversion host as _identified_path sees it: ``serial`` answers the serial read, or it
     fails with exit status ``error``; ``link`` answers `test -b` on the by-id link."""
 
     def __init__(self, serial="", error=None, link=0):
@@ -850,10 +850,10 @@ def test_the_path_an_export_serves_for_a_disk(shell, device, served):
     export.shell, export.log = shell, mock.Mock()
 
     if isinstance(served, str):
-        assert export._exported_path("vol-data1", device) == served
+        assert export._identified_path("vol-data1", device) == served
     else:
         with pytest.raises(served):
-            export._exported_path("vol-data1", device)
+            export._identified_path("vol-data1", device)
 
 
 BY_ID = "/dev/disk/by-id/virtio-"
