@@ -243,6 +243,11 @@ try {
     await page.getByRole('heading', { level: 1, name: 'Overview' }).waitFor({ timeout: 15_000 });
   }, { needed: true });
 
+  await check('the admin opens Providers, the page a revoked token sends back to (SDD §16)', async () => {
+    await page.getByRole('link', { name: 'Providers' }).first().click();
+    await page.getByRole('heading', { level: 1, name: 'Providers' }).waitFor({ timeout: 15_000 });
+  }, { needed: true });
+
   // the server reads the tokens file at startup: restarting it without the admin's token revokes that token
   await stop();
   writeTokens(viewer);
@@ -251,7 +256,12 @@ try {
     await finish('the demo server did not restart');
   }
   await check('a token revoked mid-session leads to Sign in, which says the session ended (QASuite UI-08, SDD §16)', async () => {
-    await page.getByRole('link', { name: 'Providers' }).first().click();
+    // the event stream reconnects by itself after the restart and meets the 401 on its own schedule (its delay
+    // grew while the server was down), or a request of this page - Check all - reaches the server first: both
+    // end the session from Providers, so the next check returns there. Clicking a navigation link here raced
+    // the stream: when the stream won, the link was gone and the click timed out (CI, 2026-10-15).
+    const checkAll = page.getByRole('button', { name: 'Check all' });
+    await Promise.race([signInPage(), checkAll.click({ timeout: 20_000 }).catch(() => {})]);
     await signInPage();
     const note = page.getByRole('status', { name: 'Session ended' });
     await note.waitFor({ timeout: 5_000 });
