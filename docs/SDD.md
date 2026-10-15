@@ -907,10 +907,16 @@ read whatever disk took its path, without an error - a residual the owner decide
 opened, and nbdkit 1.38's `fd=` mode would too; review RV13-01). A disk that shows no serial - no serial file (not
 virtio-blk, `sdX`), or an empty one, which Nova never gives a Cinder volume - is served by its path, unchecked, with a
 warning. A virtio-blk backend that refuses the serial request would fail the export as gone; QEMU always answers it, so
-a Nova conversion host never does (review 14). The transfer writes each destination volume through the same check:
-qemu-img or nbdcopy is given the destination volume's by-id link, once its serial was checked on the destination
-conversion host, and opens it once, at its start - the link resolves then to the volume itself, so a destination path
-another volume took is never written, and a volume that left the host fails the open. Telling the two attachments apart
+a Nova conversion host never does (review 14). The transfer writes each destination volume through the same check, and a
+disk that fails it fails the transfer by its own message, as the export reports its own, so the control plane fails it
+as permanent: the serial read's cause, ssh's command line with its ConnectTimeout, stays out of the message (review
+RV15-01). qemu-img or nbdcopy is given the destination volume's by-id link, once its serial was checked on the
+destination conversion host; each open resolves the link to the volume itself - qemu-img opens its target twice, to
+create and to convert - so a destination path another volume took is never written. A volume that left the host fails
+qemu-img's open. nbdcopy instead opens its destination again with O_CREAT when the first open fails (libnbd's
+open_local) and copies into the regular file it created: the transfer then checks that the path it gave nbdcopy is still
+a block device, removes a regular file found there, which would block udev's link, and fails as permanent - the volume
+was not written (review RV15-02). Telling the two attachments apart
 needs this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from
 microversion 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each
 data volume the source VM no longer holds; and it
