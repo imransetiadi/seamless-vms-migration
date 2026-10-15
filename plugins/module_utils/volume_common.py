@@ -133,6 +133,15 @@ class DiskIdentityError(RuntimeError):
     SDD 6.6, review RV15-01)."""
 
 
+def _checked_give_up_prefix(prefix):
+    """``prefix``, one of GIVE_UP_PREFIXES, which the control plane retries."""
+    if prefix not in GIVE_UP_PREFIXES:
+        raise ValueError(
+            "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
+        )
+    return prefix
+
+
 class SshOutage:
     """
     How long ssh to a conversion host has failed without a break, its own exit
@@ -140,8 +149,8 @@ class SshOutage:
     SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
     over SSH for {n} s, waiting for {what}", which the control plane retries
     (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
-    one of GIVE_UP_PREFIXES, checked whenever it is set (review RV11-05,
-    RV12-07).
+    one of GIVE_UP_PREFIXES, checked whenever it is set and again when the
+    give-up is built (review RV11-05, RV12-07, RV15-03).
     """
 
     #: the give-up: its prefix, the host, the seconds ssh failed and what the wait was for
@@ -160,11 +169,7 @@ class SshOutage:
 
     @prefix.setter
     def prefix(self, prefix):
-        if prefix not in GIVE_UP_PREFIXES:
-            raise ValueError(
-                "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
-            )
-        self._prefix = prefix
+        self._prefix = _checked_give_up_prefix(prefix)
 
     @property
     def failing(self):
@@ -180,8 +185,11 @@ class SshOutage:
         if self.since is None:
             self.since = now
         elif now - self.since >= SSH_UNREACHABLE_S:
+            # checked again as the template is filled: a prefix written past the setter -
+            # _prefix itself, a subclass's own property - never reaches the give-up (review RV15-03)
+            prefix = _checked_give_up_prefix(self.prefix)
             raise ConversionHostUnreachable(
-                self.GIVE_UP % (self.prefix, self.address, now - self.since, self.waiting_for)
+                self.GIVE_UP % (prefix, self.address, now - self.since, self.waiting_for)
             )
 
 

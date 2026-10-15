@@ -404,7 +404,8 @@ def _give_up_uses(tree, home):
     class SshOutage, when ``tree`` is its home module, and every other name or attribute
     GIVE_UP. Only SshOutage.seen fills the template, with the prefix its setter checked; read
     anywhere else it takes any prefix, and assigned anywhere else it is another give-up's text
-    (review RV14-03)."""
+    (review RV14-03). Also strays: the name as a string, and a prefix written past the setter
+    (review RV15-03)."""
     definition, allowed = None, set()
     for cls in ast.walk(tree) if home else ():
         if not (isinstance(cls, ast.ClassDef) and cls.name == "SshOutage"):
@@ -425,8 +426,38 @@ def _give_up_uses(tree, home):
         and (
             (isinstance(node, ast.Name) and node.id == "GIVE_UP")
             or (isinstance(node, ast.Attribute) and node.attr == "GIVE_UP")
+            # the template read by its name as a string: getattr, vars(), __dict__ (RV15-03)
+            or (isinstance(node, ast.Constant) and node.value == "GIVE_UP")
         )
     ]
+    # a prefix written past the setter: _prefix outside SshOutage, or a subclass's own prefix -
+    # a property or a class attribute - which seen() would fill the template with (review RV15-03)
+    inside = {
+        id(node)
+        for cls in (ast.walk(tree) if home else ())
+        if isinstance(cls, ast.ClassDef) and cls.name == "SshOutage"
+        for node in ast.walk(cls)
+    }
+    strays += [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_prefix"
+        and isinstance(node.ctx, ast.Store) and id(node) not in inside
+    ]
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef) or cls.name == "SshOutage" or not any(
+            (isinstance(base, ast.Name) and base.id == "SshOutage")
+            or (isinstance(base, ast.Attribute) and base.attr == "SshOutage")
+            for base in cls.bases
+        ):
+            continue
+        strays += [
+            stmt for stmt in cls.body
+            if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "prefix")
+            or (isinstance(stmt, (ast.Assign, ast.AnnAssign)) and any(
+                isinstance(target, ast.Name) and target.id == "prefix"
+                for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target])
+            ))
+        ]
     return definition, strays
 
 
@@ -441,7 +472,7 @@ def _unretried_give_ups(plugins):
     for path in sorted(plugins.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         definition, strays = _give_up_uses(tree, path.relative_to(plugins) == GIVE_UP_HOME)
-        found += [(path.name, "GIVE_UP at line %d" % node.lineno) for node in strays]
+        found += [(path.name, "a give-up built past its checks, line %d" % node.lineno) for node in strays]
         exempt = {id(definition)} if definition is not None else set()
         for text in _message_texts(tree, exempt):
             if "unreachable over SSH" not in text:
@@ -461,6 +492,14 @@ def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
     assert definition is not None and definition.value == volume_common.SshOutage.GIVE_UP
     assert home.relative_to(home.parents[1]) == GIVE_UP_HOME
     assert _unretried_give_ups(home.parents[1]) == []
+
+
+#: the import a module of the collection would write to use SshOutage
+IMPORT_SSH_OUTAGE = (
+    "from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (\n"
+    "    SshOutage,\n"
+    ")\n"
+)
 
 
 @pytest.mark.parametrize(
@@ -485,12 +524,29 @@ def test_every_hand_built_give_up_carries_a_prefix_the_control_plane_retries():
          "    def seen(self):\n"
          '        return self.GIVE_UP % ("Port probe gave up", "10.0.0.10", 900, "a free port")\n',
          True),
+        (IMPORT_SSH_OUTAGE
+         + 'M = getattr(SshOutage, "GIVE_UP") % ("Port probe gave up", "10.0.0.10", 900, "a port")\n',
+         True),
+        (IMPORT_SSH_OUTAGE
+         + 'M = vars(SshOutage)["GIVE_UP"] % ("Port probe gave up", "10.0.0.10", 900, "a port")\n',
+         True),
+        (IMPORT_SSH_OUTAGE
+         + 'OUTAGE = SshOutage("10.0.0.10", "a free port")\nOUTAGE._prefix = "Port probe gave up"\n',
+         True),
+        (IMPORT_SSH_OUTAGE
+         + "class PortOutage(SshOutage):\n"
+         "    @property\n"
+         "    def prefix(self):\n"
+         '        return "Port probe gave up"\n',
+         True),
     ],
     ids=[
         "a %s template with another prefix", "the phrase split by +", "an f-string, another prefix",
         "an f-string, a retried prefix", "split by +, a retried prefix",
         "SshOutage.GIVE_UP filled outside SshOutage", "its text copied, another prefix",
         "an SshOutage of its own, outside volume_common",
+        "getattr with the name as a string", "vars()", "_prefix written past the setter",
+        "a subclass's own prefix property",
     ],
 )
 def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
@@ -503,6 +559,43 @@ def test_the_give_up_guard_reads_each_message_whole(tmp_path, source, refused):
     (plugins / "modules" / "port_probe.py").write_text(source, encoding="utf-8")
 
     assert bool(_unretried_give_ups(plugins)) is refused
+
+
+class PropertyPortOutage(volume_common.SshOutage):
+    """A subclass whose prefix property gives what the setter never saw (review RV15-03)."""
+
+    @property
+    def prefix(self):
+        return "Port probe gave up"
+
+    @prefix.setter
+    def prefix(self, value):
+        pass
+
+
+def _written_past_the_setter():
+    outage = volume_common.SshOutage("10.0.0.10", "a free port")
+    outage._prefix = "Port probe gave up"
+    return outage
+
+
+@pytest.mark.parametrize(
+    "build",
+    [_written_past_the_setter, lambda: PropertyPortOutage("10.0.0.10", "a free port")],
+    ids=["_prefix written past the setter", "a subclass's own prefix property"],
+)
+def test_seen_refuses_a_give_up_prefix_that_came_past_the_setter(build):
+    """Review RV15-03: the setter checks a prefix as it is set, but a prefix written past it -
+    _prefix itself, or a subclass's own property - reached the give-up: "Port probe gave up: ...",
+    which the control plane fails as permanent. seen() checks the prefix again as it fills the
+    template, so the outage tests, which run every give-up, catch such code (Seamless Migrate SDD
+    6.6)."""
+    outage, clock = build(), Clock()
+    with mock.patch.object(volume_common, "time", clock):
+        outage.seen(True)
+        clock.now += volume_common.SSH_UNREACHABLE_S
+        with pytest.raises(ValueError, match="Port probe gave up"):
+            outage.seen(True)
 
 
 def test_only_ssh_outage_seen_fills_its_give_up():

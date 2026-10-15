@@ -444,7 +444,8 @@ This project follows a simple changelog to satisfy collection metadata validatio
   lock having given up, releases none rather than wait that lock again. A
   give-up reads ``Lock timeout`` or ``SSH timeout`` only: the wait that would
   give up with any other prefix, which Seamless Migrate would not retry, fails
-  as it starts, and so does setting such a prefix later.
+  as it starts, and so does setting such a prefix later, or giving one past
+  the setter: the give-up checks its prefix again as it is built.
 - The warm state file (``workload_warm/{server}.json``) is synced to disk, its
   directory after the rename too, so the rename outlives a crash: a rollback
   reads there which destination volumes and server to delete. A filesystem
