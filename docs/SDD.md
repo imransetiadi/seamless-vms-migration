@@ -2042,7 +2042,10 @@ prints a new token (`smg_` + 32 random URL-safe bytes) once, plus the YAML entry
 the tokens file refuses (empty, or longer than 128 characters) and the names the control plane records
 as actors itself — `anonymous`, `unauthenticated`, `cli`, `system`, in any letter case and with
 blanks around them too, and any name with a colon, the form of the actors the advisor records (`policy:<id>`,
-`user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs.
+`user:<name>`, `system:fallback`, `system:advisor`, §14.4) — so no token's audit events pass for theirs. It also refuses
+a name a dashboard user has (a `user` document, below), ignoring case, so a file token and a database user never share a
+name in the audit trail; when the database cannot be read - a first admin's bootstrap before anything else - it says so
+on stderr and prints the entry all the same (review 12).
 The tokens file is refused at start-up (the server does not start) when an entry carries such a name,
 so a hand-edited file cannot add one either.
 `SEAMLESS_AUTH_DISABLED=true` maps every request to principal `anonymous` with role `admin`; the CLI
