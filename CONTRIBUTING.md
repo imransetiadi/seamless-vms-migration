@@ -195,4 +195,5 @@ you are allowed to. Pull requests with commits that are not signed off will be a
 
 Be respectful, assume good intent, and keep feedback about the work, not the person. Harassment
 and discrimination are not tolerated, and maintainers may remove comments or contributors that
-break these expectations. Report concerns privately to the maintainer at [maintainer email].
+break these expectations. The full text is [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md); report
+concerns privately to the maintainer named in [CONTRIBUTORS.md](CONTRIBUTORS.md).

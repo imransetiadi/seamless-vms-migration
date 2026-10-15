@@ -235,6 +235,12 @@ docs/                        PRD, SDD, MEMORY, QASuite, Security, Performance, p
 `ui-ux-pro-max` plugins and denies agents *reading* secret files. Read [CLAUDE.md](CLAUDE.md) before you
 start: the SDD is binding, work is test-first, and secrets are never committed.
 
+## Contributing
+
+How to set up, test and submit a change: [CONTRIBUTING.md](CONTRIBUTING.md). The project follows
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md); vulnerabilities are reported privately as described in
+[SECURITY.md](SECURITY.md).
+
 ## Security at a glance
 
 Static bearer tokens stored as SHA-256 hashes with four ordered roles; every mutating call audited; cloud
