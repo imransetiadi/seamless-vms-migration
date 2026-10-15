@@ -110,6 +110,11 @@ SSH_FAILED = 255
 SSH_UNREACHABLE_S = 900
 
 
+class ConversionHostUnreachable(RuntimeError):
+    """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
+    without a break (Seamless Migrate SDD 6.6)."""
+
+
 class SshOutage:
     """
     How long ssh to a conversion host has failed without a break, its own exit
@@ -134,7 +139,7 @@ class SshOutage:
         if self.since is None:
             self.since = now
         elif now - self.since >= SSH_UNREACHABLE_S:
-            raise RuntimeError(
+            raise ConversionHostUnreachable(
                 "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
                 % (self.prefix, self.address, now - self.since, self.waiting_for)
             )
@@ -757,10 +762,12 @@ class OpenStackVolumeBase:
         # Choose ports from the available possibilities, and try to bind
         ephemeral_ports = set(range(49152, 65535))
         available_ports = ephemeral_ports - used_ports
+        # ssh's 255 is no port in use: give up after the window (SDD 6.6, review RV10-03)
+        outage = SshOutage(getattr(self.shell, "address", "?"), "a free port")
 
         try:
             port = available_ports.pop()
-            while not self._test_port_available(port):
+            while not self._test_port_available(port, outage):
                 self.log.info("Port %d not available, trying another.", port)
                 used_ports.add(port)  # Mark used to avoid trying again
                 port = available_ports.pop()
@@ -786,12 +793,14 @@ class OpenStackVolumeBase:
         self.log.info("Cleaning used ports: %s", used_ports)
         self.__write_used_ports(used_ports)
 
-    def _test_port_available(self, port):
+    def _test_port_available(self, port, outage=None):
         """
         See if a port is open on the source conversion host by trying to listen
-        on it.
+        on it; ``outage`` notes each try that ssh itself failed.
         """
         result = self.shell.cmd_val(["timeout", "1", "nc", "-l", str(port)])
+        if outage is not None:
+            outage.seen(result == SSH_FAILED)
         # The 'timeout' command returns 124 when the command times out, meaning
         # nc was successful and the port is free.
         return result == 124

@@ -266,6 +266,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils import serve
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
+    ConversionHostUnreachable,
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
     volume_or_none,
@@ -482,6 +483,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
                 }
 
     def transfer_exports(self):
+        unreachable = False
         try:
             if self.use_nbdkit_direct:
                 self.log.info("Using direct nbdkit socket mode with nbdcopy")
@@ -510,10 +512,22 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             else:
                 self._convert_destination_volumes()
             self._detach_destination_volumes()
+        except ConversionHostUnreachable:
+            unreachable = True
+            raise
         finally:
             if not self.use_nbdkit_direct:
                 self._stop_forwarding_process()
-                self._release_ports()
+                if unreachable:
+                    # its port map cannot be updated, and a second wait for its port lock
+                    # would hold the stopped source and hide this error (Seamless Migrate
+                    # SDD 6.6, review RV10-04)
+                    self.log.warning(
+                        "Ports %s stay claimed on the conversion host it cannot reach",
+                        self.claimed_ports,
+                    )
+                else:
+                    self._release_ports()
 
 
 def run_module():

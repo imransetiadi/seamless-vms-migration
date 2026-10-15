@@ -475,6 +475,64 @@ def test_a_transfers_wait_for_its_exports_gives_up_after_the_ssh_window(waits_fo
     assert clock.now <= volume_common.SSH_UNREACHABLE_S + 60
 
 
+class GoneHost(PortShell):
+    """The destination conversion host, down for good from the first `qemu-img info` on: every
+    ssh to it fails as ssh does - exit status 255 - each try the 10 s connect timeout."""
+
+    def __init__(self, clock):
+        super().__init__(free=2)
+        self.clock, self.address, self.down_since = clock, CONV, None
+
+    def _down(self, command):
+        if command[:2] == ["qemu-img", "info"] and self.down_since is None:
+            self.down_since = self.clock.now
+        if self.down_since is not None:
+            self.clock.now += 10
+            return True
+        return False
+
+    def cmd_out(self, command, **kwargs):
+        if self._down(command):
+            raise subprocess.CalledProcessError(255, ["ssh", self.address] + list(command))
+        return super().cmd_out(command, **kwargs)
+
+    def cmd_val(self, command, **kwargs):
+        return 255 if self._down(command) else super().cmd_val(command, **kwargs)
+
+    def cmd_sub(self, command, **kwargs):
+        if "-N" in command:  # the SSH forward
+            return fake.FakeProcess()
+        return super().cmd_sub(command, **kwargs)
+
+
+def test_a_transfer_whose_host_went_down_gives_up_after_one_ssh_window():
+    """Review RV10-04: the transfer's wait for its forwarded exports gives up once ssh to the
+    destination conversion host has failed for the window - and then released its ports under the
+    port lock, a second wait on the same dead host: 31 minutes in all with the source stopped, and
+    its "Lock timeout" replaced the forwarded wait's "SSH timeout". A transfer that gave up so now
+    releases no port, and its error stands (SDD 6.6)."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_transfer_volumes as transfer_module,
+    )
+
+    src, dst = fake.FakeCloud("src"), cloud()
+    src.add_conversion_host("src-conv", "10.0.0.10")
+    volume_map = {"/dev/vda": dict(cold_volume_map()["/dev/vda"], port=10809)}
+    with mock.patch.object(volume_common, "RemoteShell", fake.ShellFactory([dst, src])):
+        transfer = transfer_module.OpenStackDestinationVolume(
+            dst, "dst-conv", "/keys/k", "cloud-user", "uuid-1", "10.0.0.10", volume_map,
+            workload(), timeout=1800,
+        )
+    clock = Clock()
+    transfer.shell = GoneHost(clock)
+
+    with mock.patch.object(volume_common, "time", clock):
+        with pytest.raises(RuntimeError, match="waiting for the forwarded NBD exports"):
+            transfer.transfer_exports()
+
+    assert clock.now - transfer.shell.down_since <= volume_common.SSH_UNREACHABLE_S + 60
+
+
 def test_the_destination_detach_takes_the_volumes_it_is_given_or_the_volume_maps():
     """SDD 6.3 (review RV4-05): given volume ids, the destination detach - under the conversion
     host's attach lock - detaches those and leaves the volume map's volumes attached; given none,

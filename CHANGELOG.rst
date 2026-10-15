@@ -374,7 +374,11 @@ This project follows a simple changelog to satisfy collection metadata validatio
   without them. The other modules' checks still fail at once. The export's
   wait for its NBD exports, and the transfer's waits for the forwarded exports
   and an nbdkit socket, give up the same way after the window (``SSH timeout:
-  ...``), where they tried ``timeout`` times, about 5.5 hours by default.
+  ...``), where they tried ``timeout`` times, about 5.5 hours by default. So does
+  the probe for a free port, which read ssh's 255 as a port in use and walked
+  every ephemeral port, about 45 hours; and a transfer that gave up so releases
+  no port afterwards, where a second wait for the port lock held the source
+  another 15 minutes and replaced its error.
 - The warm state file (``workload_warm/{server}.json``) is synced to disk, its
   directory after the rename too, so the rename outlives a crash: a rollback
   reads there which destination volumes and server to delete. A filesystem

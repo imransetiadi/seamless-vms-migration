@@ -277,3 +277,22 @@ def test_a_failed_root_copy_leaves_its_snapshot_to_no_one_even_when_the_cleanup_
     assert (set(src.volumes), src.snapshots) == (set(DISKS), {})
     for volume_id in DISKS:
         assert _holders(src, volume_id) == ["srv-1"], volume_id
+
+
+def test_the_exports_port_probe_gives_up_after_the_ssh_window():
+    """Review RV10-03: the probe for a free port, `timeout 1 nc -l PORT` over ssh under the port
+    lock, read ssh's exit status 255 as a port in use: a conversion host that went down during it
+    made the probe walk all 16383 ephemeral ports, each try up to the 10 s connect timeout - about
+    45 h with the source VM stopped - before "No free ports on conversion host!". It now gives up
+    after the window, as the other waits do (Seamless Migrate SDD 6.6)."""
+    src, data = _boot_from_volume_vm()
+    clock = Clock()
+    host = RebootingHost(src, clock, None, 10 ** 9,
+                         starts=lambda command: command[:3] == ["timeout", "1", "nc"])
+    host.armed = True
+    with mock.patch.object(volume_common, "time", clock):
+        exported = _run(export_module, dict(COMMON, data=data, timeout=1800), src, host)
+
+    assert exported.get("failed"), exported
+    assert "SSH timeout: conversion host 10.0.0.10 unreachable over SSH" in exported["msg"], exported
+    assert clock.now - host.down_since <= volume_common.SSH_UNREACHABLE_S + 60
