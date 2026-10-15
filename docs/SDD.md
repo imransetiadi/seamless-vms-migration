@@ -856,7 +856,10 @@ port as soon as it claims it, so the ports stay claimed until then. A port lock 
 volumes off the source VM: the handback needs only the attach lock and the API, a release that fails is logged, never
 raised over the handback, and a map that records no port takes no port lock - the cleanup freed the ports first, so a
 port-lock wait that gave up there, after the export's own had, left the data volumes on the conversion host while the
-rollback started the source VM (review RV13-04). Before it fails, the export attaches each data volume of its map that
+rollback started the source VM (review RV13-04). As a failed transfer's release does, it takes the port lock only if one
+ssh check reaches the conversion host: the handback's own wait may have given up on an outage, and a second wait for the
+port lock of a host it cannot reach held the stopped source VM another 15 minutes (review RV14-01). Before it fails, the
+export attaches each data volume of its map that
 no server holds again to the source VM: that
 needs only the OpenStack API, and the cleanup checks SSH before anything else, so a conversion host still unreachable
 once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). Then it
@@ -897,7 +900,10 @@ that adds no protection once the export runs: nbdkit resolves the path it serves
 device path on every later connection, so a volume taken off the host after the export started still has the transfer
 read whatever disk took its path, without an error - a residual the owner decides on (qemu-nbd keeps the descriptor it
 opened, and nbdkit 1.38's `fd=` mode would too; review RV13-01). A disk that shows no serial file (not virtio-blk,
-`sdX`) is served by its path, unchecked. Telling the two attachments apart needs
+`sdX`) is served by its path, unchecked. The transfer writes each destination volume through the same check: qemu-img or
+nbdcopy is given the destination volume's by-id link, once its serial was checked on the destination conversion host,
+and opens it once, at its start - the link resolves then to the volume itself, so a destination path another volume took
+is never written, and a volume that left the host fails the open. Telling the two attachments apart needs
 this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from microversion
 2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each data volume the
 source VM no longer holds; and it
