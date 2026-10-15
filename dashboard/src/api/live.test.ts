@@ -1,7 +1,7 @@
 import { focusManager, QueryClient, QueryObserver, type QueryKey } from '@tanstack/react-query';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
-import { applyEventToCache, createBatchedInvalidator, documentVisibility, keepStreamFresh, refetchAfterReconnect, type LiveStatus } from './live';
+import { applyEventToCache, createBatchedInvalidator, documentVisibility, keepStreamFresh, RECONNECT_REFETCH_MIN_MS, refetchAfterReconnect, type LiveStatus } from './live';
 import { buildFixtures } from './mockData';
 import { summaryOf } from '../lib/summary';
 import { AUDIT_EVENT_KINDS, type Event, type Migration, type MigrationSummary } from './types';
@@ -395,20 +395,47 @@ describe('createBatchedInvalidator', () => {
 
 
 describe('refetchAfterReconnect', () => {
-  it('refetches what the dashboard shows when the stream opens again, not on the first open (SDD §16)', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('refetches what the dashboard shows when the stream opens again, not on the first open, once per 30 s at most (SDD §16)', () => {
+    vi.useFakeTimers();
     const queryClient = new QueryClient();
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue();
     const onStatus = refetchAfterReconnect(queryClient);
 
     for (const status of ['connecting', 'open'] as const) onStatus(status);
     expect(invalidate).not.toHaveBeenCalled();
-    // a drop: the gap may hold persisted events a live-only resume never replays
+    // a drop: the gap may hold persisted events a live-only resume never replays - the first reopening refetches at once
     for (const status of ['reconnecting', 'reconnecting', 'open'] as const) onStatus(status);
     expect(invalidate).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledWith();
+    // a flapping connection: reopenings within 30 s of the last refetch are refetched once, when those 30 s have passed
+    vi.advanceTimersByTime(5_000);
+    for (const status of ['reconnecting', 'open', 'reconnecting', 'open'] as const) onStatus(status);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(24_999);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(RECONNECT_REFETCH_MIN_MS).toBe(30_000);
+    // a reopening 30 s after the last refetch is refetched at once again
+    vi.advanceTimersByTime(30_000);
     onStatus('reconnecting');
     onStatus('open');
-    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(invalidate).toHaveBeenCalledTimes(3);
+  });
+
+  it('drops a refetch it holds when the stream ends: the window regaining focus reads again as before (SDD §16)', () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue();
+    const onStatus = refetchAfterReconnect(queryClient);
+
+    for (const status of ['connecting', 'open', 'reconnecting', 'open', 'reconnecting', 'open'] as const) onStatus(status);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    onStatus('closed');
+    vi.advanceTimersByTime(60_000);
+    expect(invalidate).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -106,12 +106,24 @@ export type StreamStatus = 'connecting' | 'open' | 'reconnecting' | 'closed' | '
 /** Silence - no event, no heartbeat - after which a stream counts as dropped: three of the server's 15 s heartbeats (SDD §12, §16). */
 export const STREAM_IDLE_MS = 3 * 15_000;
 
+/**
+ * How long a connection must stay open to count as a working one, which starts the reconnect delay over: one of the
+ * server's heartbeat intervals (SDD §12, §16). One that ends sooner - a proxy that answers 200 and ends the body at
+ * once - counts as a failed attempt, so the delay keeps growing instead of a reconnect every second.
+ */
+export const STREAM_STABLE_MS = 15_000;
+
+/** The wait before the next attempt after a 429: the per-address lockout's minute (SDD §15.1, §16). */
+export const STREAM_LOCKOUT_MS = 60_000;
+
 export interface StreamOptions {
   client?: ApiClient;
   onStatus?: (status: StreamStatus) => void;
   onHeartbeat?: () => void;
   /** Injected in tests: the silence after which a stream counts as dropped (default `STREAM_IDLE_MS`). */
   idleTimeoutMs?: number;
+  /** Injected in tests: how long a connection must stay open to start the delay over (default `STREAM_STABLE_MS`). */
+  stableAfterMs?: number;
   /** Delay before reconnect attempt `n` (0-based). */
   backoff?: (attempt: number) => number;
   /** Injected in tests; must resolve early when `signal` aborts. */
@@ -165,7 +177,8 @@ function toEvent(message: SseMessage): Event | null {
  * sequence number. Persisted events (seq > 0) are delivered at most once and in order; ephemeral
  * events (seq 0: progress, logs) are passed through; heartbeats are swallowed.
  * `since = null` connects live-only (no `since` parameter) until a persisted event fixes the cursor.
- * Resolves with the last seen sequence number when `signal` aborts or the server rejects the token.
+ * Resolves with the last seen sequence number when `signal` aborts, the server rejects the token (401) or refuses
+ * the role (403); after a 429 it waits the lockout's minute before trying again (SDD §16).
  */
 export async function streamEvents(
   since: number | null,
@@ -178,6 +191,7 @@ export async function streamEvents(
   const backoff = options.backoff ?? defaultBackoff;
   const setStatus = (status: StreamStatus) => options.onStatus?.(status);
   const idleMs = options.idleTimeoutMs ?? STREAM_IDLE_MS;
+  const stableMs = options.stableAfterMs ?? STREAM_STABLE_MS;
 
   let cursorKnown = since !== null;
   let lastSeq = since ?? 0;
@@ -186,6 +200,9 @@ export async function streamEvents(
 
   while (!signal.aborted) {
     setStatus(connected || failures > 0 ? 'reconnecting' : 'connecting');
+    // when this attempt's connection opened (null: it never did), and whether the lockout refused it
+    let openedAt: number | null = null;
+    let lockedOut = false;
     try {
       const response = await client.fetchRaw('/events/stream', {
         query: { since: cursorKnown ? lastSeq : undefined },
@@ -195,8 +212,8 @@ export async function streamEvents(
       });
       if (!response.body) throw new ApiError(0, 'stream_unsupported', 'This browser cannot read streaming responses.');
 
+      openedAt = Date.now();
       connected = true;
-      failures = 0;
       setStatus('open');
 
       const reader = response.body.getReader();
@@ -244,16 +261,25 @@ export async function streamEvents(
       }
     } catch (error) {
       if (signal.aborted || isAbortError(error)) break;
-      if (error instanceof ApiError && error.status === 401) {
-        setStatus('unauthorized');
-        return lastSeq;
+      if (error instanceof ApiError) {
+        if (error.status === 401) {
+          setStatus('unauthorized');
+          return lastSeq;
+        }
+        // the role will not change: not tried again - Offline, "live updates stopped" (SDD §16)
+        if (error.status === 403) break;
+        // the per-address lockout (SDD §15.1): one refused request a minute, not one every 15 s
+        if (error.status === 429) lockedOut = true;
       }
-      failures += 1;
     }
 
     if (signal.aborted) break;
+    // a connection that stayed open for one heartbeat interval was a working one: the delay starts over; one that
+    // ended sooner, whatever it delivered, counts as a failed attempt, as a refused or unreachable one does (SDD §16)
+    if (openedAt !== null && Date.now() - openedAt >= stableMs) failures = 0;
+    else failures += 1;
     setStatus('reconnecting');
-    await sleep(backoff(Math.max(0, failures - 1)), signal);
+    await sleep(lockedOut ? STREAM_LOCKOUT_MS : backoff(Math.max(0, failures - 1)), signal);
   }
 
   setStatus('closed');

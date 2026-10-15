@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiClient } from './client';
-import { SseParser, STREAM_IDLE_MS, streamEvents, type StreamStatus } from './stream';
+import { SseParser, STREAM_IDLE_MS, STREAM_LOCKOUT_MS, STREAM_STABLE_MS, streamEvents, type StreamStatus } from './stream';
 import type { Event } from './types';
 
 function event(seq: number, kind = 'migration.phase', extra: Partial<Event> = {}): Event {
@@ -289,5 +289,116 @@ describe('streamEvents', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
     expect(statuses.at(-1)).toBe('unauthorized');
+  });
+
+  /** A 200 whose body stays open for `ms`, delivering nothing, then ends - a proxy's idle limit. */
+  function openFor(ms: number): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        setTimeout(() => controller.close(), ms);
+      },
+    });
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  }
+
+  it('counts a connection that ends before one heartbeat interval as a failed attempt: the delay grows (SDD §16)', async () => {
+    // a proxy that answers 200 and ends the body at once, every time
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => sseResponse([]));
+    const client = new ApiClient({ fetchImpl });
+    const controller = new AbortController();
+    const delays: number[] = [];
+
+    await streamEvents(0, vi.fn(), controller.signal, {
+      client,
+      stableAfterMs: 10_000,
+      sleep: (ms) => {
+        delays.push(ms);
+        if (delays.length === 4) controller.abort();
+        return Promise.resolve();
+      },
+    });
+
+    expect(delays).toEqual([1_000, 2_000, 4_000, 8_000]);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('starts the delay over once a connection has stayed open for one heartbeat interval (SDD §16)', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(sseResponse([]))
+      .mockResolvedValueOnce(sseResponse([]))
+      // open for longer than the (shortened) interval: a working connection, whatever it delivered
+      .mockResolvedValueOnce(openFor(60));
+    const client = new ApiClient({ fetchImpl });
+    const controller = new AbortController();
+    const delays: number[] = [];
+
+    await streamEvents(0, vi.fn(), controller.signal, {
+      client,
+      stableAfterMs: 20,
+      sleep: (ms) => {
+        delays.push(ms);
+        if (delays.length === 3) controller.abort();
+        return Promise.resolve();
+      },
+    });
+
+    expect(delays).toEqual([1_000, 2_000, 1_000]);
+  });
+
+  it('is not tried again after a 403, which the role will not change: Offline (SDD §16)', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: 'forbidden', message: 'this action requires the viewer role' } }), { status: 403 }),
+    );
+    const onUnauthorized = vi.fn();
+    const client = new ApiClient({ fetchImpl, onUnauthorized });
+    const controller = new AbortController();
+    const sleep = vi.fn((_ms: number) => {
+      controller.abort(); // a retry would loop forever against this mock: end the test instead
+      return Promise.resolve();
+    });
+    const statuses: StreamStatus[] = [];
+
+    const lastSeq = await streamEvents(3, vi.fn(), controller.signal, { client, sleep, onStatus: (s) => statuses.push(s) });
+
+    expect(lastSeq).toBe(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(statuses.at(-1)).toBe('closed');
+  });
+
+  it("waits the lockout's minute before trying again after a 429, Reconnecting meanwhile (SDD §15.1, §16)", async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'too_many_requests', message: 'too many failed authentication attempts from this address; retry in a minute' } }), {
+          status: 429,
+        }),
+      )
+      .mockResolvedValueOnce(sseResponse([frame(event(4))], { keepOpen: true }));
+    const client = new ApiClient({ fetchImpl });
+    const controller = new AbortController();
+    const delays: number[] = [];
+    const statuses: StreamStatus[] = [];
+
+    const lastSeq = await streamEvents(3, () => controller.abort(), controller.signal, {
+      client,
+      onStatus: (s) => statuses.push(s),
+      sleep: (ms) => {
+        delays.push(ms);
+        return Promise.resolve();
+      },
+    });
+
+    expect(delays).toEqual([STREAM_LOCKOUT_MS]);
+    expect(STREAM_LOCKOUT_MS).toBe(60_000);
+    expect(lastSeq).toBe(4);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(statuses.filter((st, i) => st !== statuses[i - 1])).toEqual(['connecting', 'reconnecting', 'open', 'closed']);
+  });
+
+  it('counts a stable connection from one heartbeat interval by default (SDD §12, §16)', () => {
+    expect(STREAM_STABLE_MS).toBe(15_000);
   });
 });
