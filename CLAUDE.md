@@ -44,10 +44,13 @@ reason, never silently.
 | A — collection warm path | `plugins/`, `roles/`, `playbooks/`, `tests/unit/`, `tests/perf/`, `galaxy.yml`, `CHANGELOG.rst` |
 | B — control plane | `seamless/` |
 | C — dashboard | `dashboard/` |
-| D — tooling, deploy, docs | `deploy/`, `scripts/compose-init.sh`, `Makefile`, `README.md`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md` |
+| A — collection warm path (also) | `tests/sanity/`, `tests/func/`, `meta/`, `requirements*.txt`, `requirements.yml`, `bindep.txt`, `docs/src/`, `aee/`, `builder/`, `inventory/` |
+| D — tooling, deploy, docs | `deploy/`, `scripts/`, `Makefile`, `README.md`, `RELEASING.md`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTORS.md`, `CODEOWNERS`, `.github/`, `.pre-commit-config.yaml`, `.gitleaks.toml`, `.gitleaks-tree.toml`, `.gitleaksignore`, `.dockerignore`, `seamless/Containerfile`, `seamless/.containerignore`, `.mcp.json`, `.claude/`, `CLAUDE.md`, `.gitignore`, `tests/e2e/`, `docs/MEMORY.md`, `docs/QASuite.md`, `docs/Security.md`, `docs/Performance.md` |
 
-`docs/SDD.md` and `docs/PRD.md` are owned by the controller. Work in the git worktree of your track
-(`.worktrees/track-*`), never in another track's tree.
+`docs/SDD.md`, `docs/PRD.md`, `docs/advisor/` and `docs/audits/` are owned by the controller. Work in the git worktree of your
+track (`.worktrees/track-*`), never in another track's tree — and **one session per worktree**: a second session in a
+checkout can test, lint or commit a half-resolved tree, and an audit measured a moving target that way (audit F-02).
+Never check out `main` in a worktree (audit D-28); the primary checkout belongs to the controller session.
 
 ## 4. Jev (MCP server `jev`, `@jkudish/jev-mcp@0.14.1`)
 
