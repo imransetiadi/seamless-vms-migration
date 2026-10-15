@@ -13,9 +13,11 @@ on:
 permissions:
   contents: read
 
+# a push to main must not cancel the nightly scans (nor the nightly a push): one group per event kind;
+# only pull-request runs are superseded by a newer push to the same branch (audit D-13)
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   control-plane:
