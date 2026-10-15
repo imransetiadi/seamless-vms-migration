@@ -240,7 +240,9 @@ QASuite case that exercises the control.
   holder, on suspicion, and at least every 90 days.
 * **Database-user revocation:** an administrator with database access deletes only the matching
   `documents` row where `kind = 'user'` and `id` is the lowercase user name. Subsequent requests
-  reject that token without restarting the server. Create the user again to issue a replacement.
+  reject that token without restarting the server, and an open event stream of that user ends within
+  about 20 seconds: it checks its principal again at each 15 s heartbeat, and as often while events
+  flow (SDD §12). Create the user again to issue a replacement.
   The Users screen currently adds access only; it does not expose deletion or rotation. Losing the
   one-time creation response requires this administrator recovery; retrying cannot recover its token.
 * Tokens travel only in the `Authorization` header. Never put a token in a URL, a query string, a ticket or a
