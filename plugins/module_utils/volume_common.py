@@ -105,6 +105,10 @@ ATTACHING = ("reserved", "attaching")
 # how long a settle wait for them holds the attach lock: ample for Nova to finish an attach, and
 # far below what a lock wait queued behind it allows (Seamless Migrate SDD 6.6, review RV11-01)
 ATTACH_SETTLE_S = 120
+# how long an attach Nova accepted may stay under way while the wait for its device path holds the
+# attach lock: ample for a slow Nova, and it bounds a reservation nova-compute abandoned (Seamless
+# Migrate SDD 6.6, review RV12-01)
+ATTACH_UNDER_WAY_S = 600
 
 # ssh's own exit status when it cannot reach or log in to the host
 SSH_FAILED = 255
@@ -613,14 +617,20 @@ class OpenStackVolumeBase:
                     # lock, so no other export attached it meanwhile (Seamless Migrate
                     # SDD 6.6, review RV10-01, RV10-02)
                     settled = self._settled_volume(conn, volume["id"])
-                    if settled is None or not (
-                        self._volume_still_attached(settled, host)
-                        or getattr(settled, "status", None) in ATTACHING
-                    ):
+                    if not self._attach_may_be_ours(settled, host):
                         mapping.pop(mark, None)
                 raise
             self.log.info("Waiting for volume to appear in %s wrapper", name)
-            self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
+            try:
+                self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
+            except Exception:
+                if mark and mapping.get(mark):
+                    # an attach Nova rolled back leaves no mark either; one still under
+                    # way keeps it (Seamless Migrate SDD 6.6, review RV12-01)
+                    now = volume_or_none(conn, volume["id"])
+                    if not self._attach_may_be_ours(now, host):
+                        mapping.pop(mark, None)
+                raise
 
             disks_after = ssh_func(
                 [
@@ -695,14 +705,49 @@ class OpenStackVolumeBase:
                 return attachment
         raise RuntimeError("Volume is not attached to the specified instance!")
 
+    def _attach_may_be_ours(self, volume, host):
+        """
+        Whether an attach of ``volume`` to ``host`` whose outcome this module
+        did not see may be its own: Cinder lists the host, or still shows the
+        attach under way (Seamless Migrate SDD 6.6, review RV10-01, RV10-02).
+        """
+        return volume is not None and (
+            self._volume_still_attached(volume, host)
+            or getattr(volume, "status", None) in ATTACHING
+        )
+
     def _wait_for_volume_dev_path(self, conn, volume, vm, timeout):
+        """
+        After an attach call that succeeded, wait until Cinder lists ``vm``'s
+        attachment of the volume with its device path. nova-api reserves the
+        volume before it answers, so one `available` again, or in `error`,
+        with no attachment means nova-compute rolled the attach back: that
+        fails at once. One still `reserved` or `attaching` fails after
+        ATTACH_UNDER_WAY_S, and only a listed attachment whose device has not
+        shown waits ``timeout``: the wait holds the attach lock (Seamless
+        Migrate SDD 6.6, review RV12-01).
+        """
         volume_id = volume.id
+        under_way = 0
         for second in range(timeout):
             volume = conn.get_volume_by_id(volume_id)
             if volume.attachments:
                 attachment = self._get_attachment(volume, vm)
                 if attachment["device"].startswith("/dev/"):
                     return
+            else:
+                status = getattr(volume, "status", None)
+                if status in ("available", "error"):
+                    raise RuntimeError(
+                        "Nova did not attach volume %s: Cinder shows it %s, attached nowhere"
+                        % (volume_id, status)
+                    )
+                under_way += 1
+                if under_way >= ATTACH_UNDER_WAY_S:
+                    raise RuntimeError(
+                        "Nova did not finish attaching volume %s: Cinder still shows it %s "
+                        "after %d s" % (volume_id, status, under_way)
+                    )
             time.sleep(1)
         raise RuntimeError("Timed out waiting for volume device path!")
 

@@ -360,6 +360,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   it could not do. The failure's map carries no volume or VM names, which the
   cleanup never reads: Ansible prints the failed result, and Seamless Migrate
   retried a stuck detach of a volume whose name held "timeout".
+- After an attach call that succeeded, the wait for the volume's device path,
+  which holds the conversion host's attach lock, fails at once when Cinder
+  shows the volume ``available`` again or in ``error`` with no attachment:
+  nova-compute rolled the attach back. One still ``reserved`` or
+  ``attaching`` gives up after ten minutes, ample for a slow Nova. The wait
+  spent the module's whole timeout, 30 minutes by default, while every other
+  migration on that host queued behind the lock. An attach rolled back so
+  leaves no mark for the source cleanup. The transfer's attach to the
+  destination conversion host waits the same way.
 - A wait for a conversion host's attach or port lock gives up once ssh to the
   host has failed for 15 minutes without a break, with ``Lock timeout:
   conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,
