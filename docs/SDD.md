@@ -829,7 +829,11 @@ transfer's NBD exports and
 frees the ports the map records - the export records each port as soon as it claims it, so the ports stay claimed until
 then. Before it fails, the export attaches each data volume of its map that no server holds again to the source VM: that
 needs only the OpenStack API, and the cleanup checks SSH before anything else, so a conversion host still unreachable
-once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). It runs no
+once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). Then it
+deletes the root disk's copy when no server holds it, and the snapshot or image it was made from, also through the
+API alone: an outage the cleanup cannot outlast left them in the source cloud, recorded nowhere, and with Ceph the
+snapshot keeps the boot volume from being deleted (review RV9-03). A copy the conversion host holds is the cleanup's,
+and the source VM's own boot volume - what the root entry names before a copy exists - is never deleted. It runs no
 step over SSH there. Before, the module failed without the map, the rescue skipped
 the cleanup, and the rollback that follows started the source VM without the data volumes the export had detached. The
 cleanup takes a partial map: it detaches from the source conversion host each mapped volume this transfer attached there
