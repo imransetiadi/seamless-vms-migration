@@ -43,3 +43,70 @@ build_ignore:
   - requirements-tests.txt
   - inventory
   - media
+  # Seamless Migrate around the collection: the control plane, the dashboard and the deployment
+  # ship as container images, and the agent configuration stays in the checkout
+  - seamless
+  - dashboard
+  - deploy
+  - .claude
+  - .mcp.json
+  - CLAUDE.md
+  - RELEASING.md
+  # Everything below mirrors the checkout's .gitignore files, at the depths they name: ansible-galaxy
+  # packs files from disk, not from git, and matches each pattern against the path from the
+  # collection root, its * spanning "/" (CLAUDE.md §7, Security.md R-26).
+  # tests/unit/test_collection_build.py derives a sample from every .gitignore pattern and fails
+  # when one would be packed, so a pattern added to a .gitignore file belongs here too.
+  # git-ignored local secret files a checkout may hold
+  - .env
+  - "*/.env"
+  - "*.env"
+  - ".env.*"
+  - "*/.env.*"
+  - tokens.yaml
+  - "*/tokens.yaml"
+  - clouds.yaml
+  - "*/clouds.yaml"
+  - clouds.yml
+  - "*/clouds.yml"
+  - secure.yaml
+  - "*/secure.yaml"
+  - "*.pem"
+  - "*.key"
+  - secrets
+  - "*/secrets"
+  # cloud credentials of the e2e and functional playbooks (make generate-auth-files, tests/func)
+  - "tests/auth_*.yml"
+  - "tests/*/auth_*.yml"
+  # the tracks' checkouts (CLAUDE.md §3), agent and check scratch, Finder metadata
+  - .worktrees
+  - "*/.worktrees"
+  - .superpowers
+  - "*/.superpowers"
+  - .cache
+  - "*/.cache"
+  - .DS_Store
+  - "*/.DS_Store"
+  # Python, Ansible and Node build and cache output
+  - "*/.venv"
+  - "*/venv"
+  - "*.py[cod]"
+  - "*.egg-info"
+  - "*/.pytest_cache"
+  - .coverage
+  - "*/.coverage"
+  - htmlcov
+  - "*/htmlcov"
+  - .mypy_cache
+  - "*/.mypy_cache"
+  - .ruff_cache
+  - "*/.ruff_cache"
+  - "*/.ansible"
+  - node_modules
+  - "*/node_modules"
+  - "*.sqlite3"
+  # docs/src/.gitignore: the Sphinx build and the files it generates
+  - "*/__pycache__"
+  - docs/src/_build
+  - docs/src/changelog.rst
+  - docs/src/images/plantuml/render

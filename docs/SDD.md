@@ -124,7 +124,7 @@ Phase          = pending | validating | blocked | ready | precopy | syncing | aw
                  rolled_back | cancelled
 Severity       = blocker | warning | info
 Role           = viewer | operator | approver | admin          (ordered, see §13)
-PlanStatus     = draft | validated | running | paused | completed | failed
+PlanStatus     = draft | validated | running | paused | completed | failed | cancelled
 SyncPassKind   = full | delta | final
 DecisionType   = migration_strategy | workload_tier | verification_review | console_screening   (§14.4)
 DecisionStatus = auto_applied | pending_approval | approved | overridden | below_threshold | fallback_rules
@@ -237,9 +237,11 @@ Plan { id: str ("plan-<8 hex>"), name: str, description: str|null,
        finalize_warning_h: int = 72,   # a migration completed longer than this is flagged for finalize (§8.1, ADV-19)
        waves: list[Wave] = [], status: PlanStatus = "draft",
        derived_status: DerivedPlanStatus,   # read-only, never stored: from the plan and its migrations (§8.1, ADV-19)
+       migration_counts: dict[Phase, int],  # read-only, never stored: how many of the plan's migrations are in each
+                                        # phase that has any (§8.1, §11); {} before the first validation
        created_at: datetime, updated_at: datetime }
 
-DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed
+DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed | cancelled
 
 SyncPass { number: int (1-based), kind: SyncPassKind, started_at: datetime,
            ended_at: datetime|null, bytes_scanned: int = 0, bytes_changed: int = 0,
@@ -320,6 +322,7 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             advisor_hold: str|null,     # the recommendation whose decision waits for approval: no start meanwhile (§14.6)
             converged_by: "threshold"|"slo"|"max_passes"|"force"|null,   # the rule that ended the passes (§5.3)
             force_cutover: ForceCutover|null, data_issues: list[str] = [],   # §5.4, §5.5 (ADV-16)
+            cutover_refusals: list[str] = [],   # what the last warm pass met that the cutover refuses before the source stops (§7.2): each pass replaces it, a successful cutover empties it
             downtime_model_s: float|null,   # demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (§5.2)
             verification: VerificationRecord|null,   # the last verification: checks and probe results (§7.5, ADV-18)
             suggested_probes: list[AppProbe] = [],   # the rules' suggestion at validation; inactive until added to the plan (§9.6)
@@ -328,6 +331,18 @@ Migration { id: str ("mig-<10 hex>"), plan_id: str, wave_id: str|null, vm: VMRef
             destination_server_id: str|null, error: str|null, attempts: int = 0,
             attempt_strategies: list[Strategy] = [],   # each retried attempt's strategy, oldest first (§14.4)
             created_at: datetime, updated_at: datetime }
+
+MigrationSummary { id, plan_id, wave_id, vm: { source_id, name, project }, strategy, phase,
+                   phase_since: datetime,   # the last PhaseChange's `at`, when the phase it is in began; created_at without one
+                   preflight_ran: bool,     # a validation assessed it: its history reaches ready or blocked
+                   eligible_strategies: list[Strategy],   # its estimates' eligible strategies, in their order
+                   progress_pct, estimate, actual_downtime_s, downtime_started_at, downtime_ended_at, approvals,
+                   cutover_requested, cutover_requested_by, force_cutover, force_window, advisor_hold,
+                   review_required, review_reason, error, source_running_at, findings, suggested_probes,
+                   cutover_refusals, created_at, updated_at }
+                   # GET /migrations?view=summary (§12): a migration's fields as the Migration has them, those
+                   # the Overview's and the plan page's lists read (§16), without the passes, all the estimates,
+                   # notes, history or VM details
 
 Event { seq: int, ts: datetime, kind: str, plan_id: str|null, migration_id: str|null,
         actor: str, message: str, data: dict = {} }
@@ -344,14 +359,15 @@ Persisted: `plan.created`, `plan.updated`, `plan.validated`, `plan.started`, `pl
 `plan.completed`, `wave.started`, `wave.completed`, `migration.created`, `migration.phase`,
 `migration.sync_pass`, `migration.downtime_started`, `migration.downtime_ended`, `migration.error`,
 `migration.force_cutover`, `migration.data_inconsistent` (§5.4, §5.5), `migration.source_running`,
-`migration.source_stopped`, `plan.finalized` (§8.1),
+`migration.source_stopped`, `plan.finalized` (§8.1), `plan.cancelled` (§12),
 `migration.approved`, `migration.action`, `advisor.strategy`, `advisor.classification`,
 `advisor.verification`, `advisor.similar_incidents`, `memory.lesson_saved`, `provider.created`,
 `provider.updated`, `provider.credentials_updated`, `provider.deleted`, `provider.checked`,
 `auth.denied`, `user.created`, `events.pruned` (§15), and the audit events (§14.5) `recommendation.created`, `decision.auto_applied`,
 `decision.pending_approval`, `decision.approved`, `decision.overridden`, `decision.below_threshold`,
 `decision.fallback`, `policy.created`, `policy.updated`, `policy.deleted`. `advisor.strategy` is no longer emitted (earlier events keep it). `provider.credentials_updated` carries the provider id and the key *names* written,
-never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data.
+never a value. `migration.sync_pass` carries the pass that ended, a `SyncPass` (§4.2), as its data. `plan.cancelled`
+carries the reason given and how many migrations it cancelled.
 
 Ephemeral (bus/SSE only, never stored): `migration.progress` (≤ 1 per second per migration),
 `migration.log`, `heartbeat`. `migration.log` carries one line of a step's output (`StepContext.log`,
@@ -383,7 +399,7 @@ migration's totals.
 | `completed` | `finalized`, `rolling_back` |
 | `failed` | `rolling_back`, `ready`, `cancelled` |
 | `rolling_back` | `rolled_back`, `failed` |
-| `rolled_back` | `ready` |
+| `rolled_back` | `ready`, `cancelled` |
 | `finalized`, `cancelled` | — (terminal) |
 
 `fsm.transition(migration, to, reason, actor) -> Migration` raises `InvalidTransition` for anything
@@ -393,7 +409,12 @@ refuses a migration in `validating` — a validation may be moving it — and sa
 `downtime_started_at is None` (the source VM was never stopped), and no phase moves to `cancelled`
 while the downtime clock is open (`downtime_started_at` set, `downtime_ended_at` null): the source
 VM is stopped, so the way out is a rollback (from `failed`) or another cutover — a cancel would leave
-it stopped with nothing left to restart it. `failed → ready` (retry) increments `attempts`; it keeps
+it stopped with nothing left to restart it. `rolled_back → cancelled` ends a migration for good once its
+rollback ran, for a VM that is not to be migrated again: its source runs again (the rollback closed the clock) and its
+VM is already free (§5.4), but a warm rollback deleted only the destination server and kept the warm data path for a
+retry (destination volumes and the warm state, §6.5) - a cold rollback deletes the volumes the cold import recorded
+too, as a cold retry never reuses them (§7) - so a cancel cleans up what is left as one from `failed` does (below);
+Needs attention offers it, and Cancel plan's refusal asks for it first (§12, §16). `failed → ready` (retry) increments `attempts`; it keeps
 an open clock and resets a closed one (§5.2); it clears the cutover request and the window bypass
 granted with it (`cutover_requested` with its requester, `force_window`, `force_cutover`, §5.4) — a new attempt is requested anew, and a
 bypass never carries over to it — while approvals stay (the assessment did not change); and it clears what the
@@ -404,16 +425,26 @@ earlier attempt's request and bypass, which the next tick would honour outside t
 `completed` plan (a plan completes with a rolled-back migration, which is wave-complete, §8) reopens the plan:
 under the plan's lock it becomes `running` again (event `plan.updated`, data `{"status": "running"}`), so
 the tick runs the new attempt through the usual gate (§5.4); the providers of a completed plan may be
-deleted once none of its migrations holds its VM (§12), so such a retry is refused (409) when one of them no longer
+deleted once none of its migrations holds its VM or keeps copied data (§12), so such a retry is refused (409) when one of them no longer
 exists, and so is a rollback (409, the migration stays as it is): without its providers a rollback fails, and a
 migration whose cutover stopped its source could then be neither rolled back, retried nor cancelled. A cancel from `precopy` or `syncing` cancels the running step (the executor kills the
 playbook) — or, while a failed attempt waits out its transient-retry backoff (§8), ends the retries:
 no further attempt starts. Whenever the migration has a data path — it was cancelled in `precopy` or
-`syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it recorded
-`sync_passes` (a warm migration cancelled in `awaiting_cutover`, after a retry or a failed pass) — the
-cancel then runs the `rollback` step once
+`syncing` (a pass running, waiting for its retry or just finishing, not yet recorded), or it keeps copied data: its
+workload's record (§6.3) holds destination volumes or a pending source snapshot (a warm migration cancelled in
+`awaiting_cutover`, after a retry, a failed pass or its rollback - a first pass that failed after creating its
+destination volumes recorded no pass but left them, review RV3-05; a cold rollback deleted what the cold import
+recorded, review RV3-07), or, where no record can tell (the simulator, VMware, a storage handover), it recorded
+`sync_passes` of a strategy other than `cold` — the cancel then runs the `rollback` step once
 with `delete_dest_volumes` as a best-effort cleanup of it (source snapshots, temporary and destination
-volumes): `cancelled` is terminal, so no later action could remove them. The migration stays
+volumes): `cancelled` is terminal, so no later action could remove them. That cleanup touches only what the
+migration recorded of its own: it matches no destination server by its name alone - the one server it deletes besides
+a recorded one is the single server named like the VM that holds a volume it recorded, built from them and so its own
+(§6.4, review RV4-08), whose volumes it could not delete otherwise - deletes no port and leaves the source as it
+is (`os_migrate_rollback_start_source: false` and `os_migrate_rollback_delete_ports: false`, §6.5; on VMware no
+power-on and no kit port, §7.2) — whatever server and ports its cutover made went with its rollback, its source runs,
+and the VM it released (§5.4) may since be another plan's, whose same-named server, ports and stopped source are not
+this migration's. The migration stays
 `cancelled` and the outcome is recorded as a `migration.action` (`action: cleanup`) or a
 `migration.error` naming the manual `rollback_workloads.yml` run. The cancel saves `checkpoint: "cleanup"`
 in the same write as `cancelled`: a cleanup that a stop or a crash interrupts is run again when the
@@ -440,7 +471,8 @@ Terminal-success phases: `completed`, `finalized`. Wave-complete phases: `comple
   where the downtime is in model seconds, the time base of the passes' `duration_s`, so a demo's downtime compares
   with its estimate and with the clock that ran before it (ADV-16; a wall-clock interval times `SEAMLESS_DEMO_SPEED`
   would multiply the control plane's own overhead too): each simulated step reports the model seconds it kept the
-  source stopped — the cutover its copy or final sync, conversion and create (up to the failure when it fails), a
+  source stopped — the cutover its shutdown (its clock starts when it stops the source, as an Ansible-driven
+  cutover's does, §7.2), its copy or final sync, conversion and create (up to the failure when it fails), a
   rollback its own work, and those of a cutover it interrupted — and `Migration.downtime_model_s` adds them up while
   the clock is open. A verified
   migration's downtime is that sum plus the plan's boot time; a rollback's is that sum, plus the boot time when the
@@ -515,9 +547,17 @@ the force goes with the cutover request (a retry, a new assessment), and the nex
 Approvals, `cutover_requested` (with its requester) and a pending `force_window` belong to the assessment they were given
 for: a re-validation (`validating`) and `set_strategy` clear them, so a changed strategy, finding set
 or estimate is approved again by a human. A validation re-assesses the migrations in `pending`,
-`blocked` and `ready`, and one that an interrupted validation left in `validating` (a write that failed
-between its two transitions — a database error, a restart): a plan's validations run one at a time under
-its lock, so no other validation is still at work on it. A VM whose migration is `cancelled` (terminal) cannot be
+`blocked` and `ready`, and one left in `validating`: a plan's validations run one at a time under
+its lock, so no other validation is still at work on it. A re-assessment of a migration whose history reached
+`cutover` keeps each volume of its validated `vm.disks` that the VM no longer lists - a cold export detaches the data
+volumes, and one that failed may have left them so when its rescue failed too (§6.6) - among the migration's disks,
+as the blocker `SRC_VM_VOLUME_DETACHED` (§9.3): neither a validation nor the export check (§7.2) drops a disk the
+VM had at a cutover attempt until it is attached again; a re-assessment that read the VM without it would
+otherwise let the next cutover complete one disk short (review RV7-01). A validation writes each migration once — a new one is
+created already assessed, its history running from `pending` through `validating` to `ready` or `blocked`, and an
+existing one takes both transitions in one write — and then emits the same events: `migration.created` for a new
+one and one `migration.phase` per transition. Only an earlier version wrote the two transitions apart, so that a
+database error or a restart between them could leave a migration in `validating`. A VM whose migration is `cancelled` (terminal) cannot be
 re-validated inside the plan: `validate_plan` refuses with the VM names (remove them from `vm_ids` or
 plan them anew). It refuses a `vm_ids` list that repeats a VM (a plan written before the API check,
 or by `seamless plan apply`): two migrations of one VM would both cut it over. It cancels the
@@ -527,7 +567,8 @@ failed one would hold its VM and keep the plan from completing, and one an inter
 changing anything — to drop a VM whose source is stopped (open downtime clock, §5.1) or whose failed
 migration stopped it (a cancel is refused then, §5.1): such a VM stays in the plan until it is cut
 over or rolled back. A removed VM's migration that an operator moved meanwhile — rolled back while the
-validation re-assessed the plan's VMs — can no longer be cancelled: the validation leaves it as it is (a
+validation re-assessed the plan's VMs — is no longer the validation's to cancel, even once `rolled_back`, which an
+operator may cancel (§5.1): the validation cancels one only while it is still in a phase listed above, and leaves it as it is (a
 `rolled_back` one releases its VM), cancels the others and still finishes, its `plan.validated` event naming it
 (data `kept`: `[{"vm", "phase"}]`). One VM, one migration holds across plans too: a migration
 *holds* its VM in every phase but `cancelled`, `finalized` and `rolled_back`, and `validate_plan` refuses
@@ -637,7 +678,10 @@ in-order read-ahead hashing threads on each side (hashlib releases the GIL).
 ### 6.3 Warm state file
 
 `{os_migrate_data_dir}/workload_warm/{source_server_id}.json`, written atomically (temp + rename),
-mode 0600, owned by module_utils `warm_migration.WarmState`:
+mode 0600, owned by module_utils `warm_migration.WarmState`. The temporary file is synced before the rename and the
+directory after it, so the rename outlives a crash - a rollback reads here what to delete - as the control plane's
+workload record is (§7, review RV4-07); a filesystem that cannot sync a directory (some network or FUSE mounts) still
+gets the file:
 
 ```json
 { "server_id": "…", "server_name": "…", "transfer_uuid": "…",
@@ -648,13 +692,41 @@ mode 0600, owned by module_utils `warm_migration.WarmState`:
   "destination_server_id": null }
 ```
 
+The cold import (`import_workloads.yml`, §6.5) writes the same file for a workload it copies, with no pass: the
+volumes its transfer created (`dest_volumes`, each with the `dest_id`, `size`, `bootable` and `name` the warm path
+records, from the transfer's `volume_map` — never a volume it did not create, as with `data_copy: false`) each as
+soon as Cinder accepted it, before the transfer waits for it to become available and before its data is copied - a
+transfer that fails or is cut short, a volume that ends in `error` included, leaves the record of every volume it
+created; a volume whose record cannot be written is deleted (once Cinder settled it) before the transfer fails;
+and a re-run whose record holds an earlier attempt's volume for one of its devices removes it before it creates any
+volume - the cold path never reuses a volume - unless a server holds it: one a server holds (a server the operator
+renamed rather than deleted) is that server's and only leaves the record, when the new volume of its device is
+recorded; one only the destination conversion host holds (a transfer cut short) is the migration's own and is detached
+from it. A known residual: the conversion host is the one the re-run is given, so an earlier volume a replaced
+conversion host the operator kept still holds counts as a server's too, and stays on that host unrecorded until the
+operator deletes that host's volumes - nothing is lost, and os-migrate tags no conversion host, so a name match could
+take a renamed destination VM's volume. The re-run deletes each earlier volume it removes - one Cinder is already
+deleting (the boot volume Nova
+deletes with its server) is not deleted again, and a delete Cinder refuses because the volume began going in between
+(Nova deleting it with its server after it read `available`) counts as that one - and waits, within the transfer's
+timeout, until Cinder no longer has it: an earlier volume stays recorded until it is gone, and no new volume waits
+unrecorded meanwhile. An earlier volume it cannot remove - its detach or delete fails otherwise, Cinder gives up
+deleting it, or it is still there at the timeout -
+fails the transfer before any volume is created, with the record unchanged (review RV3-02, RV4-02, RV4-05, RV5-01,
+RV5-02) - and `destination_server_id` as soon as Nova accepts the server. A cold
+rollback reads it (§7). The control plane writes the file, with no volume, pass or server, before a cold cutover's
+playbooks when the workload has none, and a rollback or cleanup that deletes the recorded volumes empties the file
+instead of removing it: the file is the sign that the migration records its workload, so no later rollback takes a
+same-named server it does not record for the migration's (§6.4, §7). Only a cold migration cut over before records
+existed (Seamless 0.1.0) has no file.
+
 ### 6.4 New Ansible modules
 
 | Module | Cloud | Purpose |
 |---|---|---|
 | `import_workload_warm_snapshot` | src | `state: present` — snapshot (force) every workload volume (or server image for `boot_disk_copy` image VMs), create tmp volumes, attach them to the src conversion host, return `volume_map` (`{dev: {source_id, tmp_volume_id, snap_id, image_id, source_dev, size, bootable, name, volume_type}}`). `state: absent` — detach and delete tmp volumes, snapshots and tmp images recorded in the warm state file. Idempotent per `transfer_uuid`. |
 | `import_workload_warm_sync` | dst | Ensure dst volumes exist (created on first pass with the same name/size/bootable/type mapping as `_create_destination_volumes`; a recorded one is reused — one still `creating` is waited for, a bootable one is marked bootable again, since a pass interrupted between the create and the flag leaves it unset and Nova then refuses to boot from it after the source was stopped, and one in `error` is deleted and created again like a missing one), attach them to the dst conversion host, copy `blocksync.py` to both conversion hosts (`/tmp/seamless-blocksync-{transfer_uuid}.py`), run `receive` on the dst host with the sender command `ssh <src> sudo python3 … send` (dst→src SSH link as used by os-migrate forwarding), stream progress into the os-migrate `state_file`, detach dst volumes, append the pass to the warm state. Returns `sync_pass`, `volume_map`, and `block_device_mapping` (all entries `delete_on_termination: false`). `pass_kind: auto` = `full` when no dst volumes exist, else `delta`; `final` is passed by the cutover playbook. |
-| `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name`, the only same-named server) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`) — and the warm state file (kept while a source snapshot is pending). Starting the source is left to the role. |
+| `import_workload_rollback` | dst | Delete the destination server recorded in the warm state (or, with `match_by_name` and no state file at all — a workload migrated before anything was recorded for it, §7 — the only same-named server; when the state file records no server, or the server it records is gone - deleted since, while a re-run's create whose answer was lost left the earlier id recorded (review RV4-04) - the single server named like the workload that holds one of the recorded volumes, attached through Nova and not to the destination conversion host: built from them, it is the migration's own even when Nova's answer to its create was lost, while a same-named server holding none of them is another one and is kept - review RV3-06; several such servers are an error) and clear the record; with `delete_dest_volumes` also the destination volumes — detached only from the destination conversion host (`conversion_host`), any other holder keeps the volume (`kept_volume_ids`); a volume Cinder is already deleting — the boot volume Nova deletes with its server (`delete_on_termination`, the cold import's) — is waited for until it is gone, never deleted a second time, which Cinder refuses — and empties the warm state: the file stays, holding no volume, pass or server (`state_cleared`), as the sign that the workload's migration recorded it (§6.3), and a pending source snapshot's record stays for its cleanup; with `delete_ports` `false` (default `true`) it deletes no destination port (§6.6). Starting the source is left to the role. |
 
 **Volume types.** Upstream os-migrate drops `volume_type` when it creates destination volumes
 (`_create_destination_volumes`), so mapped types would be ignored. A new variable
@@ -672,14 +744,18 @@ Common module options follow the existing conventions (`cloud`, `validate_certs`
 ### 6.5 New role and playbooks
 
 Role `import_workloads_warm` with task files `precopy.yml`, `cutover.yml`, `rollback.yml`, reusing
-the conversion-host inventory logic of `import_workloads`. Playbooks (hosts: `migrator`, same
+the conversion-host inventory logic of `import_workloads`. The cold role `import_workloads` (upstream, modified)
+records its workload for a rollback (§6.3): `import_workload_transfer_volumes` (upstream, modified) with
+`warm_state_dir`, which records each destination volume as soon as Cinder accepted it, before waiting for it - its `dest_id`, `size`,
+`bootable` and `name`, as the warm path records its volumes, keeping what the file already holds - and
+`import_workload_create_instance` with `warm_state_dir`, which records the server as soon as Nova accepts it. Playbooks (hosts: `migrator`, same
 environment block as `import_workloads.yml`):
 
 | Playbook | Behavior per filtered workload |
 |---|---|
 | `playbooks/import_workloads_precopy.yml` | snapshot present → warm sync (`auto`) → snapshot absent |
-| `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery |
-| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and the warm state — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server. Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
+| `playbooks/import_workloads_cutover.yml` | stop source (wait) → snapshot present → warm sync (`final`) → snapshot absent → `import_workload_create_instance` with the warm BDM → record `destination_server_id`. A re-run while the recorded destination server exists and is not in `ERROR` finishes it instead of creating another: `import_workload_create_instance` on the recorded server waits for it to be `ACTIVE` and adds the floating IPs it lacks — a floating IP already on the server's port for that fixed address is kept, never a second one — since the first attempt may have failed after Nova created the server (a timeout while it booted, an error while adding its floating IPs); a recorded server that is gone or in `ERROR` fails the re-run, which names the rollback as the recovery. A recorded server an operator renamed is finished like any other: a refusal would fail the cutover after the source stopped, and the automatic rollback (§8, `plan.verification.auto_rollback`, on by default) would then delete that very server - the one the rename set aside - with the recorded volumes, from which no fresh server can be built while it holds them (lead 8) |
+| `playbooks/rollback_workloads.yml` | delete destination server if recorded; when `os_migrate_rollback_delete_dest_volumes` (default false) also delete dst volumes and empty the warm state (the file stays, §6.3) — with a warm state only the volumes it records (a volume attached to the destination server later is not the migration's: kept and returned as `kept_volume_ids`, like a volume still attached to a server other than the destination conversion host; without a warm state the destination server's attachments are the migration's); start the source server, unless `os_migrate_rollback_start_source` is `false` (the cleanup before a cold cutover, §7, leaves it as it is). Refuses the catch-all filter (`os_migrate_workloads_filter` unset or `[{regex: '.*'}]`) unless `os_migrate_rollback_all: true`: a rollback reverts every cut-over workload it matches (the control plane always passes `^<name>$`) |
 
 Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_src_auth`,
 `os_migrate_dst_auth`, `os_migrate_workloads_filter`, conversion host variables including
@@ -696,6 +772,8 @@ Inputs: the standard os-migrate variables (`os_migrate_data_dir`, `os_migrate_sr
 | `os_migrate_workloads_preserve_volume_type` | `false` | `preserve_volume_type` |
 | `os_migrate_rollback_delete_dest_volumes` | `false` | `delete_dest_volumes` |
 | `os_migrate_rollback_match_by_name` | `false` | `match_by_name` |
+| `os_migrate_rollback_start_source` | `true` | — (the rollback role's last step: start the source server) |
+| `os_migrate_rollback_delete_ports` | `true` | `delete_ports` of `import_workload_rollback` |
 | `os_migrate_dst_conversion_host_name` | `os_migrate_conv_dst` | `conversion_host` of `import_workload_rollback` |
 
 ### 6.6 Hardening of existing code (required)
@@ -708,12 +786,98 @@ PID files live in `os_migrate_nbdkit_log_dir` (default `/var/log/os-migrate-nbd`
 export is stopped only through its PID file (never `pkill -f`). The cold path's nbdkit export of
 source volumes on the conversion hosts is `--readonly` as well. See Security.md §6.
 
+The role never lets qemu guess a disk's format. It reads the instance directory's `disk.info`, where Nova records
+each disk's format when it first opens the disk, before the guest runs (one line of JSON, disk path → format;
+launchpad bug 1221190), and passes that format to `qemu-img info -f` and `qemu-nbd --format`. A raw disk's first
+block belongs to the guest: probed, a qcow2 header the guest wrote there reads as qcow2, and `qemu-nbd`, run with
+sudo, would follow the backing file that header names — any file on the hypervisor — into the export and so into
+the destination volume. A disk is matched to its `disk.info` entry by file name (the entries name the instance
+directory's files). Before any export the role refuses an instance whose `disk.info` is missing or unreadable, a disk
+it records no format for or more than one format for, and a format that is not a plain name (lower-case letters and
+digits). The config drive (`disk.config`) is not exported: it holds no guest data, Nova records no format for it at
+spawn (it builds the drive after the XML that resolves the other disks), and the destination server gets a new one
+from Nova when it asks for one — carried over as a plain data disk it would put a second `config-2` filesystem with
+the source's metadata in front of cloud-init.
+
 Attach locks (`volume_common.use_lock`) serialize attaches and detaches per conversion host with `flock` and a
 `{lock}.lock` file that names its owner as `{migrator hostname}:{pid}`. Before it waits, a module removes such a file
 whose owner ran on its own host and is no longer alive — a module killed by a cancel or a step timeout never
 releases its lock, and every later attach on that host would wait for it in vain; a pid is checked only on the host
 it belongs to (the conversion host's process table knows nothing of the migrator's pids), so a lock of another
-host, or one in the earlier bare-pid form, is never removed by this check.
+host, or one in the earlier bare-pid form, is never removed by this check. A lock wait gives up once ssh to the conversion
+host has failed for 15 minutes without a break (ssh's own exit status 255), with "Lock timeout: conversion host
+{address} unreachable over SSH for {n} s, waiting for {lock}": the wait tried up to 1800 times, each try up to the 10 s
+connect timeout, about 5.5 h, while a cold cutover's source stays stopped. The window rides out a conversion host reboot or
+a network blip, which the step then completes as if nothing happened (QASuite R-07): a first window of one minute gave up
+inside a two-minute reboot, when the export had detached the source VM's data volumes or the final cleanup still held
+them on the conversion host, and the source VM came back from the rollback without them (review RV8-01). The executor
+retries the Lock timeout as transient; the module's own SSH check, which a retry while the host is still down meets
+first, is retried too (its error quotes the ssh command line, ConnectTimeout included), so a host that stays down fails
+the step once `max_step_retries` is spent. One failed connection, or a lock another migration holds, starts the window
+again. The source cleanup's own SSH check rides out the same window, then fails with "SSH timeout: conversion host
+{address} unreachable over SSH for {n} s, waiting for the source cleanup": a reboot that starts outside a lock wait -
+the export's lsblk between two attaches, the transfer's SSH forward - fails the step at once while the conversion host
+holds data volumes only the cleanup gives back, and a rescue that failed at once let the rollback start the source VM
+without them (review RV9-02). The other modules' checks still fail at once, so a host already down when the export
+starts adds no wait. The export's wait for its NBD exports to answer, and the transfer's waits for the nbdkit socket
+and the forwarded exports, give up the same way once ssh has failed for the window ("SSH timeout: ..."), where they
+tried `timeout` times, each try up to the connect timeout - about 5.5 h with the default (review RV9-04). So does the
+probe for a free port, which read ssh's exit status 255 as a port in use and walked all 16,383 ephemeral ports, about
+45 h with the port lock held (review RV10-03); it tries the same port again once a second while ssh fails, so an ssh
+that fails at once - a refused connection, a dropped route - ends in the same give-up, not in "No free ports"
+(review RV11-03). A failed transfer releases its ports only if one ssh check then reaches the conversion host, and a
+release that fails never replaces the transfer's error: a host it cannot reach cannot update its port map, and a wait
+for its port lock held the stopped source VM another 15 minutes (review RV10-04, RV11-02). Each detach of a volume -
+from a conversion
+host or from the source VM - waits, within the module's timeout, until the volume no longer lists that server's
+attachment and, unless another server still holds it (a shared multi-attach disk stays `in-use`), until Cinder shows it
+`available`: openstacksdk 4.x's `detach_volume(wait=True)` ignores its `timeout` and waits for `available`, which a
+shared disk never reaches, holding the attach lock meanwhile; a detach still not done at the timeout fails the module
+(review 5, RV6-01).
+
+A cold export that fails puts back what it took (review RV6-01). `import_workload_export_volumes` fails with its volume
+map and transfer id - the map's entries without their `name`, which the rescue never reads: Ansible prints a failed
+result on the task's line, and a tenant's volume name, or the VM's in an image copy's, holding "timeout" would make the
+failure transient (§7.2; review RV8-05) - so the role's rescue runs `import_workload_src_cleanup`, which stops the
+transfer's NBD exports and
+frees the ports the map records - the export records each port as soon as it claims it, so the ports stay claimed until
+then. Before it fails, the export attaches each data volume of its map that no server holds again to the source VM: that
+needs only the OpenStack API, and the cleanup checks SSH before anything else, so a conversion host still unreachable
+once a lock wait gave up would otherwise leave the volumes off the VM the rollback starts (review RV8-01). Then it
+deletes the root disk's copy when no server holds it, and the snapshot or image it was made from, also through the
+API alone: an outage the cleanup cannot outlast left them in the source cloud, recorded nowhere, and with Ceph the
+snapshot keeps the boot volume from being deleted (review RV9-03). A copy the conversion host holds is the cleanup's,
+and the source VM's own boot volume - what the root entry names before a copy exists - is never deleted. It runs no
+step over SSH there. Before, the module failed without the map, the rescue skipped
+the cleanup, and the rollback that follows started the source VM without the data volumes the export had detached. The
+cleanup takes a partial map: it detaches from the source conversion host each mapped volume this transfer attached there
+and Cinder still lists there - the export marks a volume `source_attached` in its map before it asks Nova to attach
+it, once openstacksdk's own checks pass (the volume `available` and not on that host), so a volume whose device was
+never recorded, or whose attach Nova carried out while its answer was lost, is detached too (review RV9-01), while a
+shared multi-attach volume another migration's export attached - one the SDK refuses to attach - is never (Cinder's
+attachment names the server, not the migration; review RV8-02). When the attach call itself fails, the export, still
+holding the conversion host's attach lock so that no other export attaches the volume meanwhile, waits - up to two
+minutes (`ATTACH_SETTLE_S`), ample for Nova to finish an attach: the module's timeout held the lock against every other
+migration on that host while a reservation Nova abandoned stayed `reserved` (review RV11-01) - while Cinder shows the
+volume `reserved` or `attaching` - Nova still at work, and Cinder lists an attachment only once it is attached - and
+keeps the mark only if Cinder then lists the conversion host, or still shows the attach
+under way: an attach Nova refused leaves no mark a later export's attach of the same volume could be taken for
+(review RV10-01, RV10-02). The cleanup waits the same way for a marked volume Cinder still shows `reserved` or
+`attaching` before it checks. A known residual remains (review RV11-04). Nova may fail an attach that was still under
+way when the two minutes ended, and another export may attach that shared multi-attach volume to the same host before
+this cleanup runs - a window of seconds. The cleanup then takes the volume from under that export, whose transfer fails
+loudly and is retried; the export only reads the volume, so no data is lost. Telling the two attachments apart needs
+this export's own Cinder attachment id, which a lost answer never gave it: Nova shows the id only from microversion
+2.89, newer than RHOSP 17.1, and Cinder's attachments API is not yet used. The cleanup re-attaches each data volume the
+source VM no longer holds; and it
+removes the root disk's copy, its snapshot and the image of an image-booted VM only when the export made them - never a
+volume the source VM holds, such as its own boot volume before a copy exists. The export creates the root snapshot, the
+root copy and the image without openstacksdk's own wait, records each id at once, then waits for each within the module's
+timeout: the SDK's `wait=True` raises after Cinder or Glance already made the resource - on a timeout or an error status -
+and the id never reached the map, so the rescue left the resource behind, and a root copy left so kept the snapshot it
+was made from undeletable (review RV8-03). The cleanup puts the data volumes back before it removes the root disk's
+copy, snapshot and image, and tries every step: what it could not do fails it at the end, naming each, so one failed
+removal never keeps a data volume off the source VM.
 
 `import_workload_prelim` skips a workload whose name a destination server already carries only for a server of
 exactly that name: it asks Nova for `^{re.escape(name)}$` (Nova applies the name filter as a regular expression) and
@@ -738,7 +902,8 @@ a port exported without `security_group_refs` (an export from before this rule) 
 project's default group: Nova applies a server's security groups only to the ports it creates itself. The rollback
 (`WarmRollback`) deletes, after the destination server, every destination port whose description names one of the
 workload's source ports and that is unbound or bound to the deleted server. It does so also when there is no server,
-since a cutover can fail between creating the ports and creating the server. Nova keeps such ports when their server
+since a cutover can fail between creating the ports and creating the server. A cancel's cleanup deletes none
+(`delete_ports` `false`, §5.1): it made none, and the unbound ones may be another plan's migration of the VM. Nova keeps such ports when their server
 is deleted later, so a migrated server's ports outlive it: delete them with the server when it is decommissioned
 (only then does Neutron free their addresses).
 
@@ -747,8 +912,8 @@ override (§7.2). `ServerPort` then gives Nova the address as `fixed_ip` and Neu
 picks the subnet of the port's network that holds it.
 
 `Server.dst_prerequisites_errors` runs in `import_workload_dst_check`, before the cold import or the warm cutover
-stops the source and before a warm pre-copy's first pass. It looks up what each port of the workload needs, the way
-the import will after the stop:
+stops the source and before each warm pre-copy or sync pass. It looks up what each port of the workload needs, the
+way the import will after the stop:
 * The port's network reference and every fixed IP's subnet reference (`reference.network_id`,
   `reference.subnet_id`). A `%auth%` reference searches only the credential's own project, so a shared network that
   another project owns is not found, and a name that two of the project's networks carry is ambiguous.
@@ -789,7 +954,13 @@ the import will after the stop:
   id}`, the MAC and the same addresses (those on a SLAAC or DHCPv6-stateless subnet aside).
 
 Each problem is a `Destination prerequisites not met` error that names the port's network and the address, so the
-cutover fails while the source still runs.
+cutover fails while the source still runs. A pre-copy or sync pass creates and fills the destination volumes and makes
+no port or floating IP, so its check passes `network_as_warnings: true` (default `false`): the problems of the ports
+and floating IPs above become module warnings, which the pass's log shows, and only the server's own prerequisites
+(its flavor, image, security group and key pair references) fail the pass. Copying a large disk takes hours, and a
+network problem can be fixed meanwhile; the cutover's check refuses it before the source stops. The module also
+returns those problems as `cutover_refusals`, which the warm role writes beside the warm state
+(`osm/workload_warm/<server id>.refusals.json`) for the migration's `cutover_refusals` (§7.2).
 
 The conversion-host SSH (`volume_common.RemoteShell`: every module command and the data link a warm pass opens
 from the destination to the source host) runs with `ServerAliveInterval=15` and `ServerAliveCountMax=4`: a silent
@@ -873,11 +1044,34 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   `import_workload_prelim` names, with its `.log`, after the VM: the stem is the VM name with `%` written `%25`,
   `/` written `%2F` and NUL written `%00` — both sides apply the same rule, so a tenant's VM name (`../x`, `/etc/x`)
   never names a file outside `workload_logs`, and two names never share a file.
-* Cold rollback passes `os_migrate_rollback_match_by_name: true` (the cold path does not record the
-  destination server id in a warm state file) only once the source was stopped (`downtime_started_at` set), as
-  the VMware rollback looks up the server by name only then: the cold role creates the server after the stop, so
-  before it a same-named destination server is not this migration's — a cutover refused for a name collision, or
-  skipped by the role for one, is rolled back by starting the source alone and deletes nothing.
+* Cold rollback passes `os_migrate_rollback_match_by_name: true` only once the source was stopped
+  (`downtime_started_at` set), as the VMware rollback looks up the server by name only then: the cold role creates
+  the server after the stop, so before it a same-named destination server is not this migration's — a cutover
+  refused for a name collision, or skipped by the role for one, is rolled back by starting the source alone and
+  deletes nothing. A server the cold import recorded (§6.3) is found by its id first, one whose record Nova's lost answer
+  never wrote - also when the server the record names is gone (review RV4-04) - by the recorded volumes it holds (§6.4); the name serves only a
+  migration cut over before records existed: the control plane writes the workload's record before a cold cutover's
+  playbooks, and a rollback or cleanup empties it rather than removing it (§6.3), so after a cutover of this version
+  a same-named server the record does not name is never taken for the migration's (review RV3-03). When the workload's state file records the volumes the cold import created,
+  the rollback also passes `os_migrate_rollback_delete_dest_volumes: true`: a cold retry never reuses them (its
+  transfer creates new volumes each time), so the rollback deletes exactly those and keeps any other volume attached
+  to the server (`kept_volume_ids`); without such a record it deletes the server alone, as before - never a volume
+  it cannot tell is the migration's (the owner's choice, 2026-10-14).
+* A cold cutover first removes what an earlier attempt of the migration left: a warm migration rolled back
+  keeps its pre-copy volumes and warm state for a retry (§5.1), and should it be switched to cold, the cold import
+  never uses them and would replace their record; a cold transfer that failed or was cut short (a transient retry,
+  a retry, a resume) recorded the volumes it created, and a cold re-run never reuses them either - its transfer
+  creates new ones, whose record would replace theirs. When the migration's state file holds such a record —
+  passes, a pending source snapshot or recorded volumes — and no destination server, the cutover runs
+  `rollback_workloads.yml` right after the export, which selects the workload by its name of now (a source VM renamed
+  since the earlier attempt's export would match nothing in that one, review lead A),
+  with `os_migrate_rollback_delete_dest_volumes: true` and `os_migrate_rollback_start_source: false`: it removes a
+  pending snapshot's temporaries, deletes exactly the recorded volumes and empties the warm state, never matches a server
+  by its name alone (only the single same-named server holding a recorded volume is the migration's, §6.4) and leaves
+  the source as it is (a retry may keep it stopped with an open clock, §5.2). A record that
+  names a destination server (§6.3: a cold one with volumes and a server, no pass) is never removed - it is a
+  resumed cutover's own. Should the cleanup fail,
+  the cutover fails before the source stops (the owner's choice, 2026-10-14).
 * `os_migrate_workloads_preserve_volume_type: true` whenever `plan.mappings.volume_types` is non-empty
   (§6.4).
 * `port_creation_mode`: before every OpenStack playbook run of a migration, the executor writes
@@ -908,7 +1102,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
     another project when the credential's token carries neither the `admin` nor the `advsvc` role.
   Every fixed IP reference of a port becomes address-only (§6.6), so Neutron finds the address in the resolved
   network's subnets whatever their names. A port's network name that does not resolve stops the cutover there,
-  before the source stops: a permanent failure naming the port. A floating IP's network name that does not resolve
+  before the source stops: a permanent failure naming the port. A warm pre-copy or sync run, which makes no port,
+  logs that failure instead, records it in the migration's `cutover_refusals`, and keeps the port's references as exported; the cutover resolves them again, or exports
+  again when the plan's mappings changed, and stops there. A floating IP's network name that does not resolve
   keeps its reference as exported. In `floating_ip_mode` `auto` (the collection's default, which the control plane
   keeps) the import attaches a detached RHOSO floating IP with the address and needs no network. Only an admin can
   create a floating IP with a chosen address. A network the import does need is refused by the destination check
@@ -918,8 +1114,10 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   export it is about to replace: a name that no longer resolves there (a mapping fixed since) must not hold up
   the new export, whose references are resolved after it.
 * Export record: once the rewrite after an export has finished, the executor records beside the export
-  (`osm/rewrite.json`) the mappings it applied — the plan's, overlaid with the migration's resolved mappings — and
-  the VM's `plan.nic_overrides` entries. It removes the record before each export, so an export whose rewrite did
+  (`osm/rewrite.json`) the mappings it applied — the plan's, overlaid with the migration's resolved mappings — the
+  VM's `plan.nic_overrides` entries and the exported server's name: a source VM renamed since the export (and validated
+  again) no longer carries the name each run selects its workload by, so its next run exports it again first (review
+  lead A). It removes the record before each export, so an export whose rewrite did
   not finish has none. A warm pre-copy, sync or cutover on an existing export exports the workload again first when
   the record differs from what the plan holds now — a plan edited after a failed attempt (§12 `PATCH
   /plans/{id}`), so that the retry uses the fixed mapping — or when the export has none (written before this rule,
@@ -938,6 +1136,13 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   on a cold cutover stopped and migrated. After `export_workloads.yml` the executor keeps only the
   server resource whose `_info.id` equals `vm.source_id` (other resource types are kept); when the
   export holds no such server the step fails permanently before any import playbook runs.
+* Every validated disk: the kept server must still list, in `params.volumes[]._info.id`, every volume the
+  migration validated (`vm.disks` of kind `volume`). A volume detached from the source VM since - by an
+  operator, or by an earlier attempt whose export failed after it detached the VM's data volumes - is
+  otherwise left out of the import, and the migration would report success without that disk; the step
+  fails permanently, naming the volumes and asking to attach them to the source VM again and retry, before any
+  import playbook runs (review RV6-01). A new validation keeps them (§5.4, `SRC_VM_VOLUME_DETACHED`): it never
+  offers a way past this check (review RV7-01).
 * Mappings: after `export_workloads.yml`, the executor rewrites the exported `workloads.yml` with the
   pure function `apply_mappings(doc: dict, mappings: Mappings) -> dict` (flavor_ref.name,
   ports[].params.network_ref.name, fixed_ips_refs[].subnet_ref.network_ref?.name when present,
@@ -947,9 +1152,9 @@ state (the orchestrator resumes from `Migration.checkpoint`).
 
 | Strategy | precopy / sync | cutover | rollback |
 |---|---|---|---|
-| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` | `rollback_workloads.yml` |
+| `cold` | — | `export_workloads.yml` then `import_workloads.yml` with `os_migrate_workload_stop_before_migration: true` — `rollback_workloads.yml` between the two when an earlier attempt left data (below) | `rollback_workloads.yml` |
 | `warm` | `export_workloads.yml` (first time, or again by the rules above) then `import_workloads_precopy.yml` | `import_workloads_cutover.yml`, after `export_workloads.yml` when a rule above exports again | `rollback_workloads.yml` |
-| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, power on source |
+| `vmware_cold` | — | `os_migrate.vmware_migration_kit.migration` with `cutover: true`, `cbt_sync: false` | delete destination server via API, then the kit's ports of the VM (below), power on source |
 | `vmware_warm` | kit `migration` with `cbt_sync: true`, `cutover: false` | kit `migration` with `cbt_sync: true`, `cutover: true` | as `vmware_cold` |
 
 * VMware vars: `vcenter_hostname`, `vcenter_username`, `vcenter_password`, `vcenter_datacenter`
@@ -979,8 +1184,24 @@ state (the orchestrator resumes from `Migration.checkpoint`).
   distributed port group up by its key and drop it, so the plan is validated again, after a retry if the migration
   failed), when the network does not resolve, when the credential may not put a port there (§6.6's rule, with the
   roles of the destination's capabilities), when the NIC's IPv4 addresses are not all host addresses of one subnet of
-  that network, or when two NICs share a key but need different values.
-  Destination networks that cannot be read are a transient failure.
+  that network, when two NICs share a key but need different values, or when another port of that network holds
+  the NIC's MAC or one of its IPv4 addresses (`DestinationProvider.ports`): the kit asks Neutron for both, which
+  refuses them (`MacAddressInUse`, `IpAddressAlreadyAllocated`) after the power-off. The failure names the port.
+  Destination networks or ports that cannot be read are a transient failure. A `vmware_warm` pre-copy or sync run, in
+  which the kit makes no port, maps the NIC as usual when its problem is a network the credential may not use or a MAC
+  or address another port holds, and logs the problem and records it in the migration's `cutover_refusals` instead
+  (ports that cannot be read it only logs); the cutover refuses it before the power-off. Each pre-copy or sync pass
+  replaces `cutover_refusals` with what it met - what the executor defers here and what the destination check
+  returns (§6.6), once each - so the list empties once a pass meets the problems fixed, and a successful cutover
+  empties it. The other problems leave the NIC no correct value in the map, which the kit reads in
+  every run, and stop every run.
+
+  The rollback deletes the kit's ports of the VM after the destination server: Nova only unbinds a port it did not
+  create when it deletes the server (`preserve_on_delete`), so the port would keep the NIC's MAC and addresses and
+  refuse the next attempt. They are the unbound ports with one of the VM's NIC MACs and a name of the kit's form
+  (`<VM name>-NIC-<n>-VLAN-<network>`), whichever network they are on; a port bound to a server is never deleted.
+  A cancel's cleanup (§5.1) deletes only the server the migration recorded: it looks up no server by name, deletes no
+  kit port and powers nothing on.
 * `prestage(plan)`: for OpenStack sources runs `export_<r>.yml`/`import_<r>.yml` for each entry of
   `plan.prestage_resources` (in the listed order), then `deploy_conversion_hosts.yml` when any
   migration uses `cold`/`warm`. VMware sources: no prestage (the kit prepares its host). `flavors` is scoped
@@ -1028,7 +1249,9 @@ volumes with their server, so the order is:
    * a volume type step 6 manages a volume into is not one of RHOSO's volume types. §9.3's `MAP_VOLUME_TYPE_MISSING`
      is only a warning when the plan maps no volume type, and step 6, like step 8, runs after the source server was
      deleted.
-1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()`. The stop is journaled as sent once Nova
+1. Stop the source server (wait `SHUTOFF`); `mark_downtime_start()` — after the shutdown, which the estimate's parts
+   count (§9.1) and an Ansible-driven cutover's clock does (§7.2): `TODO(LAB): confirm` whether the handover's clock
+   starts at the stop request instead. The stop is journaled as sent once Nova
    accepted it (`sent:stop_source`), before the wait for `SHUTOFF`, so a step that fails while waiting leaves a
    journal the rollback starts the source from; a stop call that itself fails leaves the journal empty.
 2. Journal the server definition: name, flavor, key name, AZ, metadata, security groups, every port
@@ -1131,16 +1354,24 @@ Used by `--demo` and tests. Time is compressed by `settings.demo_speed` (default
 follow the estimator model (§9.1) with seeded jitter (`settings.demo_seed`). Each pass reports
 `bytes_changed = min(disk_bytes, change_rate_bps · previous_pass_duration)`; a warm cutover's `final` pass starts once the
 source is stopped. A step reports `downtime_model_s`, the model seconds it kept the source stopped (§5.2, ADV-16): the
-cutover its copy, conversion and create — a failed cutover up to its failure, in its `PermanentStepError`'s
-`details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted (cancelled mid-copy,
-the cutover reported none), before it starts the source again. Cutover fails with
+cutover its shutdown — its clock starts when it stops the source, as an Ansible-driven cutover's does (§7.2), so its
+downtime has the parts its estimate has — its copy, conversion and create; a failed cutover up to its failure, in its
+`PermanentStepError`'s `details` — and the rollback its own 90 s, plus the model seconds of a cutover it interrupted
+(cancelled mid-copy, the cutover reported none), before it starts the source again. Cutover fails with
 probability `settings.demo_failure_rate` (default 0.1, exercised rollback path). Supports every
-strategy. The fake destination simulates the guests' services for the application probes (§7.5): a
-guest answers its suggested probes (§9.6) and SSH (RDP on Windows), with HTTP status 200, and refuses every
-other port; a VM tagged `demo-fault: app-down` runs none of its application services, so its probes fail and
+strategy. The fake destination simulates the guests' services for the verification's TCP checks (`tcp_ports`,
+`windows_tcp_ports`) and its application probes (§7.5): a guest answers its suggested probes (§9.6) and SSH
+(RDP on Windows), with HTTP status 200, and refuses every other port - so a demo plan with the dashboard's
+default TCP ports (22, 3389 on Windows) verifies, where a real connection to a simulated address would time out; a VM tagged `demo-fault: app-down` runs none of its application services, so its probes fail and
 its plan's automatic rollback rolls it back (ADV-18). The demo's finance plan probes its three databases (their
 suggested probes as `probe_overrides`; `billing-db-01` carries the fault), the VMware plan probes nothing, so its
-validation warns about its database VMs (`APP_PROBE_MISSING`, §9.3).
+validation warns about its database VMs (`APP_PROBE_MISSING`, §9.3). A VM tagged `demo-fault: cutover-refusal`
+migrated warm meets, on its first two pre-copy or sync passes, a problem the cutover refuses before the source stops
+- another port holds its NIC's address, reported as `cutover_refusals` (§7.2) in the executor's words - and none
+from its third pass on, as if fixed meanwhile; until that third pass ran its cutover refuses before the source
+stops, as the destination check does (§6.6). The demo's VMware inventory holds one such VM, `dc2-portal-02`, which
+no seeded plan holds: planned warm from the dashboard, it shows the migration page's warning, the Cut over dialog's
+note and the plan list's marker (§16), and how they clear.
 
 ### 7.5 Verification (`seamless_migrate.verification`)
 
@@ -1189,7 +1420,7 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
   (`terminationGracePeriodSeconds`).
 * Public async API used by routes: `validate_plan(plan_id, actor)`, `start_plan`, `pause_plan`,
   `approve(migration_id, actor, comment)`, `request_cutover(migration_id, actor, force_window)`,
-  `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `finalize(…,
+  `request_sync`, `rollback(migration_id, actor, reason)`, `retry`, `cancel`, `cancel_plan(plan_id, actor, reason)`, `finalize(…,
   delete_source)`, `set_strategy(migration_id, strategy, actor)`.
 * Each tick: for every `running` plan, compute active waves (all `depends_on` waves complete, §5.1),
   start `ready` migrations within `wave.max_parallel` and `settings.max_concurrent_migrations`,
@@ -1259,13 +1490,17 @@ stored in `Migration.verification` when the step ends, passed or failed, and the
 `Plan.status` stays the lifecycle the orchestrator drives (above). What every view shows is
 `derive_plan_status(plan, migrations) -> DerivedPlanStatus`, returned as `Plan.derived_status` by every plan
 route and never stored (the rules read only the set of the plan's phases: the routes take it from `Store.plan_phases`,
-§11, and never load the migrations for it) — a re-validation of a finished plan stores `validated` although its migrations completed
+§11, and never load the migrations for it; `Plan.migration_counts` comes from the same query) — a re-validation of a finished plan stores `validated` although its migrations completed
 (seen on the demo after 10 October), and a stored status cannot tell a finished plan from a finalized one. Over the
 migrations that are not `cancelled`, in this order:
 
 1. a `draft` plan is `draft` (an edited plan is validated again);
-2. no migration: the stored status;
-3. a migration in `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying` or `rolling_back` (at work): `paused` when the stored status is `paused`, else `running`;
+2. no migration: the stored status — so a `cancelled` plan (§12), whose migrations are all `cancelled`, is `cancelled`;
+3. a migration in `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying` or `rolling_back` (at work): `running`
+   when the stored status is `running`, `failed` when it is `failed` (its pre-staging failed: Start again pre-stages
+   it, §8), else `paused` — the tick drives only a running plan (§8), so a paused plan validated again, stored
+   `validated` with its migrations still in flight, reads Paused too, and its start button reads Resume (the owner's
+   choice, 2026-10-13);
 4. a `running` or `paused` plan with a migration still to start (`pending`, `ready`, `blocked`, `validating`):
    the stored status;
 5. a `failed` migration: `failed`;
@@ -1282,7 +1517,8 @@ fails, the migration stays `completed` with that checkpoint: the source may be g
 may still finish — so it stays in the queue to be finalized again (deleting a VM that is gone already succeeds)
 and can no longer be rolled back: `POST …/rollback` answers 409 ("the finalize began deleting the source VM:
 finalize it again"), since a rollback deletes the destination server and would find no source to start, and the
-dashboard keeps Rollback unavailable with that reason. A provider call is bounded (300 s); the provider's wait
+dashboard keeps Rollback unavailable with that reason, and the migration's next step is to finalize it again
+(approver), never a rollback — also while its source VM runs again. A provider call is bounded (300 s); the provider's wait
 for a deletion stays within that bound.
 
 **Source watch.** While a migration waits in `completed`, every `SEAMLESS_SOURCE_WATCH_S` seconds (default 300;
@@ -1292,21 +1528,31 @@ starts the watch, as a task of its own, one at a time, and never waits for it: a
 (`/ready`, §12); stopping the orchestrator cancels it. Seen `running`, the
 migration records `source_running_at` once — when the provider answered, not when the watch began: one call may take
 minutes — and emits `migration.source_running` (data `{"power_state"}`): the VM
-writes data RHOSO no longer receives — stop it, or roll back. Seen stopped again, `source_running_at` clears and the
+writes data RHOSO no longer receives — stop it, or roll back. While `source_running_at` is set, `POST …/finalize`
+answers 409 "the source VM runs again: stop it, or roll it back, before finalizing" (the owner's choice, 2026-10-13):
+a finalize would keep a source that diverged, or delete it with what it wrote since. A migration whose checkpoint is
+`finalizing` is the exception — its finalize began deleting the source, and a rollback is refused then, so finalizing
+it again from its own page is its way out; a bulk finalize skips every migration whose source VM runs again, that one
+too, so what it finalizes is known from the plan's summaries (§4), which carry no checkpoint. Seen stopped again,
+`source_running_at` clears and the
 migration emits `migration.source_stopped` (data `{"power_state"}`), so every view drops the alert without a reload and
 the timeline records it. Any other power state — `paused`, `transitioning` (a reboot or a resize), `error`, `unknown` —
 leaves `source_running_at` as it is: the VM was not seen stopped, and the alert keeps the time it was first seen. A rollback clears `source_running_at`: it starts the source on purpose, and a migration that
 completes again is watched afresh (in demo mode the rollback also drops the power the demo set). A VM
-the provider no longer has (a storage handover rebuilt it, a finalize deleted it) and a provider error are skipped
-(logged), never a failure. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
+the provider no longer has — `get_vm` raises `VMNotFound` (§10): a storage handover rebuilt it, a finalize deleted it, or
+someone deleted the source after it ran again — is not running: while `source_running_at` is set, the watch clears it
+and emits `migration.source_stopped` (data `{"power_state": null, "gone": true}`), so Finalize works again, with no
+source left to keep or delete (the owner's choice, 2026-10-14) — deleting a diverged source in its cloud is a way out
+too; without the flag it is skipped. A provider error is skipped (logged), never a failure, and leaves the flag as it
+is: only a cloud that answers can say the VM is gone. In demo mode, `POST /demo/vms/{source_id}/power {"state": "on"|"off"}` (operator; 404
 outside demo mode) sets a fake source VM's power state, so the alert shows on the next watch.
 
 **Bulk finalize.** `POST /plans/{id}/finalize {"wave_id": str|null, "confirm": str, "delete_source": bool = false}`
 (approver; `confirm` must equal the wave's name, or the plan's name without `wave_id`, 400 otherwise) finalizes every
 `completed` migration of the wave or the plan with one approval: each one as `POST …/finalize` does it (its
 `migration.phase` and `migration.action` events, with the approver as actor), and one `plan.finalized` event whose
-data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, or
-whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
+data names the finalized VMs and the skipped ones with why: a migration that left `completed` meanwhile, one whose
+source VM runs again (the reason `POST …/finalize` gives), or one whose finalize failed with any error (`finalize failed: …`, the error redacted and cut, §13.4) — it stays
 `completed` for a later finalize, and one VM's error never stops the others. It answers
 `{"finalized": [migration id], "skipped": [{"migration_id", "reason"}]}`; 409 when none is `completed`.
 
@@ -1415,6 +1661,7 @@ Finding catalog (code — severity — condition):
 |---|---|---|
 | `SRC_VM_ERROR_STATE` | blocker | `power_state == "error"` |
 | `SRC_VM_TRANSITIONAL_STATE` | blocker | `power_state == "transitioning"`: a Nova task is in flight (resize, verify-resize, migration, rescue, rebuild, reboot, build) — a stop or snapshot would fail after approval; wait until the VM is ACTIVE or SHUTOFF, then re-validate |
+| `SRC_VM_VOLUME_DETACHED` | blocker | a re-assessment of a migration whose history reached `cutover` finds a volume of its validated `vm.disks` no longer attached to the VM (an earlier attempt's cold export may have left it detached, §6.6); the volume stays among the migration's disks (§5.4) — attach it to the source VM again, then re-validate; to migrate the VM without it, cancel the migration and plan the VM anew |
 | `SRC_VM_DUPLICATE_NAME` | blocker | another selected VM has the same name (os-migrate filters by name) |
 | `SRC_VM_MULTIATTACH` | warning (warm, storage_handover) | any multi-attach disk |
 | `SRC_VM_EPHEMERAL_ROOT` | info (warm) | root disk `image_root`/`ephemeral` |
@@ -1519,7 +1766,10 @@ the suggestion; the advisor's part waits for ADV-11 (`TODO(ADV-18): confirm`).
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]          # capabilities; raises ProviderError
     async def list_vms(self) -> list[VMRef]
-    async def get_vm(self, source_id: str) -> VMRef
+    async def get_vm(self, source_id: str) -> VMRef     # raises VMNotFound (a ProviderError) when the cloud answers
+                                                         # it has no such VM; any other failure stays ProviderError
+                                                         # (vCenter answers only once it read every VM: one whose
+                                                         # configuration it cannot read may be the VM - review RV3-04)
     async def inventory(self) -> SourceInventory     # networks (name→mtu), projects, …
 
 class DestinationProvider(Protocol):
@@ -1528,6 +1778,11 @@ class DestinationProvider(Protocol):
     async def get_server(self, server_id: str) -> dict[str, Any]   # {status, ports:[{status, fixed_ips, floating_ips}]}
     async def console_log(self, server_id: str, lines: int = 200) -> str | None
     async def delete_server(self, server_id: str) -> None
+    async def ports(self, *, network_id: str | None = None, mac_address: str | None = None,
+                    ip_address: str | None = None) -> list[dict[str, Any]]
+        # the ports the credential sees that match every filter given:
+        # [{id, name, network_id, device_id, mac_address, fixed_ips: [address, …]}] (§7.2 VMware networks)
+    async def delete_port(self, port_id: str) -> None   # a port already gone is no error
 ```
 
 `SourceInventory {networks: dict[str, int|None] (name→mtu), projects: list[str], keypairs: list[str] (the names of
@@ -1559,11 +1814,13 @@ lazy; reports CBT, snapshots, independent disks, tools state; `os_type` is the V
 name when Tools report one, else the configured guest id), `FakeSourceProvider`/
 `FakeDestinationProvider` (deterministic demo data: 24 OpenStack VMs including one multi-attach,
 one vGPU flavor, one legacy RHEL 6, one Windows AD controller, three databases with 500 GiB+ disks;
-12 VMware VMs with mixed CBT/snapshot/independent-disk states; a RHOSO destination with networks,
-flavors, volume types and quotas). `providers.registry.build(provider, settings)` returns the right
-implementation (fake when `settings.demo`). The demo seeds two running plans: the finance plan takes
-22 of the 24 OpenStack VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them
-(one VM, one migration across plans, §5.4) — and the VMware plan all 12 VMware VMs.
+13 VMware VMs with mixed CBT/snapshot/independent-disk states, `dc2-portal-02` among them tagged
+`demo-fault: cutover-refusal` (§7.4); a RHOSO destination with networks, flavors, volume types and
+quotas). `providers.registry.build(provider, settings)` returns the right implementation (fake when
+`settings.demo`). The demo seeds two running plans: the finance plan takes 22 of the 24 OpenStack
+VMs — `report-01` and `batch-01` stay unplanned, so a new plan can take them (one VM, one migration
+across plans, §5.4) — and the VMware plan 12 of the 13 VMware VMs: `dc2-portal-02` stays unplanned,
+for the operator to plan warm (§7.4).
 
 ---
 
@@ -1586,14 +1843,24 @@ events(seq INTEGER PK AUTOINCREMENT, ts, kind, plan_id, migration_id, actor, mes
 
 `ix_events_kind_seq` serves the `kinds` filter (`GET /events?audit=true`, its `before` pages): audit events are
 sparse, and without it the newest of them were found by reading the table backwards — 1,000,000 events took
-~0.3 s per page on SQLite, ~1 ms with it. `create_schema()` adds the events indexes to an existing table with
-`CREATE INDEX IF NOT EXISTS`, as it does the document indexes.
+~0.3 s per page on SQLite, ~1 ms with it. `create_schema()` adds an index an existing table lacks — the events
+indexes, as the document indexes — with `CREATE INDEX IF NOT EXISTS`, and only that one: it reads the index names
+the store's tables have (on PostgreSQL the indexes of the tables `documents` and `events` resolve to through
+`search_path`, as every statement of the store does - not the current schema's, which under PostgreSQL's secure schema
+usage pattern is the application role's own, first in its `search_path` and holding no table; `sqlite_master` on
+SQLite), so a complete schema takes no DDL at all.
+PostgreSQL lets only a table's owner run `CREATE INDEX`, even for an index that exists, so this is what lets a role
+that does not own the tables start the control plane — the application role of Security.md §9.4, for which
+`events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
 `advisor_policy` (§14.6).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
-`ConflictError`), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
+`ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
+exists already is a `ConflictError`, and an `UPDATE … WHERE version = n` for `n > 0`, where no row updated is a
+`ConflictError` saying whether the document is missing or at which version it is — and only an unconditional write
+reads the version first), `get(kind, id, model_cls)`, `list(kind, model_cls, **filters)` (filters on
 top-level JSON fields; string values — `plan_id`, `phase`, `wave_id`, `status`, `role` — are
 pushed into SQL and served by expression indexes `ix_documents_<field>` on `(kind, data->>field)`,
 other values are evaluated in Python), `change_stamp(kind) -> (count, sum of versions)` (one
@@ -1602,9 +1869,9 @@ aggregate over the kind; moves on every insert, update or delete — `GET /stats
 moved reload only the documents that changed — sound because those kinds are never deleted: a delete, an insert and an
 update between two reads could leave count and sum as they were; a route that deletes them must first give the stamp
 a value that only grows), `versions(kind) -> [(id, version)]` (in creation order, no document read),
-`get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: set of phases}` (one
-`SELECT DISTINCT` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
-`derived_status` from it, §8.1), `delete(kind, id)`,
+`get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
+`SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
+`derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -1636,7 +1903,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 
 | Method | Path | Min role | Request | Response |
 |---|---|---|---|---|
-| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it |
+| GET | `/health` | public | — | `{"status":"ok"\|"degraded","version":str,"demo":bool,"demo_speed":float\|null,"auth_disabled":bool,"db":"ok"\|"error","orchestrator":{"running":bool,"last_tick_age_s":float\|null,"ticks":int,"healthy":bool}}` — `degraded` when the database is unreachable or the tick loop is dead/stale (no tick for `max(5 × tick_s, 30 s)`) or three consecutive ticks failed; probes use it; `auth_disabled`: authentication is off (§13.1), every request is the anonymous admin — it discloses nothing an unauthenticated request does not already show |
 | GET | `/ready` | public | — | same body as `/health`, HTTP **503** while `status` is `degraded` (Kubernetes readiness) |
 | GET | `/me` | viewer | — | `{"name":str,"role":Role}` |
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
@@ -1647,7 +1914,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
 | PUT | `/providers/{id}/conversion-key` | admin | write-only `{"private_key": str}` (OpenSSH/PEM private key of an existing conversion host) | `Provider` (`conversion_host.ssh_key_secret`, `conversion_key_updated_at` set) |
-| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is not `completed` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
+| DELETE | `/providers/{id}` | admin | — | `204` (409 if referenced by a plan that is neither `completed` nor `cancelled` — a `failed` plan can be started again, §8 — or by a `completed` plan with a migration that still holds its VM (§5.4: `completed` until it is finalized, or a rollback of it and its failure): a rollback needs both providers until the VM is finalized (§8.1); a `rolled_back` migration does not block, a retry refuses when a provider is gone, §5.1 — unless it keeps copied data (§5.1: its workload's record holds destination volumes or a pending source snapshot, as a warm rollback keeps them for a retry; where no record can tell, recorded `sync_passes` of a strategy other than `cold`) blocks until it is cancelled (the cancel's cleanup of that data path removes them and needs both providers, §5.1) or migrated again, named as rolled-back VMs keeping their copied data; a `cancelled` migration whose cleanup has not recorded its outcome (`checkpoint` `cleanup`, §5.1) blocks in a `completed` or `cancelled` plan too - the cleanup needs both providers to remove what its data path left - named as cancelled VMs still being cleaned up. The check and the deletion hold one lock with `POST /plans`, `PATCH /plans/{id}` and a retry, which check their providers under it, so none saves a plan, or reopens one, with a provider deleted meanwhile); also deletes the store-managed secrets |
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
@@ -1658,7 +1925,8 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/plans/{id}/validate` | operator | — | `ValidationReport` |
 | POST | `/plans/{id}/start` | operator | — | `Plan` (from `validated`, `paused` or `failed` — a failed plan pre-stages again; 409 when any migration is `blocked`) |
 | POST | `/plans/{id}/pause` | operator | — | `Plan` |
-| GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0); creation order | `Migration[]` |
+| POST | `/plans/{id}/cancel` | operator | `{"reason": str?}` | `Plan` — retires a plan none of whose migrations started: each is `pending`, `blocked`, `ready` or `cancelled`. Under the plan's lock and the VM-claim lock (§5.4, §8) it cancels each one as `POST /migrations/{id}/cancel` does (§5.1: its lock, its event, and the cleanup of a data path an earlier attempt left), then sets the plan `cancelled` and emits `plan.cancelled`. Nothing is deleted (§11): the plan and its history stay, its VMs are free for another plan and its providers for deletion, and pre-staged destination resources stay, as after a finished plan. `cancelled` is terminal: no edit, validation, waves, start or pause; a cancelled plan answers again as it is. 409 while the plan is `running` ("pause the plan before cancelling it": the tick starts its steps) and while a migration has started, naming each VM and its phase (at most 10, then how many more) — a `failed` or `rolled_back` one is cancelled on its own first, which cleans up what it copied, and a plan with a migration that completed or was finalized keeps its status — and while a migration that has not started has its source stopped, naming each VM: an open downtime clock, which a retry after a failed cutover keeps (§5.2), and a cancel cannot restart a stopped source (§5.1), so it is cut over first. Both are checked before any migration is cancelled: a refused plan cancel changes nothing |
+| GET | `/migrations` | viewer | query `plan_id`, `phase`, `wave_id`, `limit` (1…5000, default all), `offset` (default 0), `view` (`full`, the default, or `summary`); creation order | `Migration[]`; with `view=summary` `MigrationSummary[]` (§4) |
 | GET | `/migrations/{id}` | viewer | — | `Migration` |
 | POST | `/migrations/{id}/approve` | approver | `{"comment": str?}` | `Migration` (409 from the cutover's requester, or from the approver who forced it, when the plan requires a distinct approver, §5.4) |
 | POST | `/migrations/{id}/cutover` | approver | `{"force_window": bool = false, "comment": str?}` | `Migration` (records the request and its requester; an approval only when the plan does not require a distinct approver, §5.4) |
@@ -1667,7 +1935,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/migrations/{id}/rollback` | operator | `{"reason": str}` | `Migration` (409 when a provider of the plan no longer exists: nothing changes, §5.1; 409 after a failed finalize began deleting the source, §8.1) |
 | POST | `/migrations/{id}/retry` | operator | — | `Migration` (in a `completed` plan the plan becomes `running` again, §5.1; 409 when a provider of that plan was deleted) |
 | POST | `/migrations/{id}/cancel` | operator | `{"reason": str?}` | `Migration` |
-| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` |
+| POST | `/migrations/{id}/finalize` | approver | `{"delete_source": bool = false, "confirm": str}` (`confirm` must equal `vm.name`) | `Migration` (409 outside `completed`, and while its source VM runs again — `source_running_at` — unless its checkpoint is `finalizing`, §8.1) |
 | POST | `/plans/{id}/finalize` | approver | `{"wave_id": str\|null, "confirm": str, "delete_source": bool = false}` (`confirm`: the wave's name, or the plan's without `wave_id`; 400 otherwise; 404 for an unknown wave) | `{"finalized": [str], "skipped": [{"migration_id": str, "reason": str}]}` (409 when no migration of the scope is `completed`; §8.1) |
 | POST | `/demo/vms/{source_id}/power` | operator | `{"state": "on"\|"off"}` | `VMRef` (demo mode only, 404 otherwise; the fake source VM's power state, §8.1) |
 | PUT | `/migrations/{id}/strategy` | operator | `{"strategy": Strategy}` (only `pending`/`ready`/`blocked`; must be eligible; 409 while `advisor_hold` is set: approve or override the decision, §14.6) | `Migration` |
@@ -1678,6 +1946,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/advisor/data-sent` | viewer | — | `{"items": [{"decision_type": DecisionType, "tool": str, "fields": [{"key": str, "label": str}], "sent": bool, "note": str?}]}` — generated from the serializers' field specs (§13.4, ADV-06) |
 | GET | `/advisor/recommendations` | viewer | query `migration_id`, `plan_id`, `decision_type`, `limit` (1–200, default 50), `offset` (≥ 0) | `{"items": [AdvisorRecommendation], "total": int, "offset": int, "limit": int}`, newest first, stored and legacy entries together (§14.4) |
 | GET | `/advisor/recommendations/{id}` | viewer | — | `AdvisorRecommendation` (404 unknown; a legacy id resolves too) |
+| GET | `/advisor/notes` | viewer | query `limit` (1–200, default 20) | `{"items": [AdvisorNoteEntry]}`: the advisor notes of every migration except strategy notes (those are listed as legacy recommendations, §14.4), newest first; notes of the same time keep the migrations' creation order and each migration's note order. An `AdvisorNoteEntry` is an `AdvisorNote` (§4) with `migration_id`, `plan_id` and `vm_name` |
 | GET | `/advisor/snapshots/{sha256}` | viewer | `sha256`: 64 lowercase hex characters (422 otherwise) | `AdvisorSnapshot` (404 unknown, §14.5) |
 | POST | `/advisor/recommendations/{id}/approve` | admin (`advisor.approve`) | `{}` | `AdvisorRecommendation` (409: legacy, not the migration's newest, the migration not `pending`/`blocked`/`ready`, the plan setting the VM's strategy, the decision already approved, nothing usable or eligible to approve, or the decision's requester when the decision's recorded `require_distinct_approver` — or, for one that recorded none, the policy in force — requires a distinct approver; §14.6) |
 | POST | `/advisor/recommendations/{id}/override` | admin (`advisor.approve`) | `{"option": Strategy, "reason": str?}` (reason ≤ 2000; at least 10 characters when the decision's recorded `require_override_reason` — or, for a decision that recorded none, the policy in force — requires one (§14.6), 422 otherwise; the option must be eligible, 422) | `AdvisorRecommendation` (409 as approve) |
@@ -1720,6 +1989,16 @@ Stats { total: int, by_phase: dict[Phase,int], completed: int, failed: int, in_p
 **SSE format**: each event is `id: <seq or 0 for ephemeral>\nevent: <kind>\ndata: <Event JSON>\n\n`;
 a `: heartbeat` comment every 15 s. Clients authenticate with the Authorization header (the
 dashboard uses `fetch` streaming, not `EventSource`), and resume with `?since=<last seq>`.
+A stream sends each persisted event once, in `seq` order, also those another process wrote to the store (the
+CLI beside a running server, §15): a stream given an event whose `seq` skips some first reads the store from the
+last `seq` it sent, so what was written in between comes before it, and each tick (`tick_s`, §8) the server
+compares the store's newest `seq` with the newest it published and has every stream read what it lacks - another
+process's events reach an open page within about a tick, also while the server itself emits nothing. A skipped
+`seq` the store does not hold yet, before an event created less than 2 s earlier, may be another process's insert
+not committed yet (PostgreSQL need not commit in `seq` order): the stream sends what comes before it and holds the
+rest, reading the store again every 50 ms, until it appears or 2 s have passed - a `seq` that never comes (a
+rolled-back insert) holds the stream back that once, and an older gap (pruned events) not at all, nor one right after
+`seq` 0: a store whose events were all deleted goes on numbering from where they ended.
 
 The dashboard build (`SEAMLESS_DASHBOARD_DIR`, default `<repo>/dashboard/dist` when present) is
 served at `/` with SPA fallback for non-`/api` paths.
@@ -1792,7 +2071,10 @@ written is removed again. `SEAMLESS_SECRET_STORE` selects it:
 
 * `files` (default; Compose): `{SEAMLESS_SECRETS_DIR}/{name}/{key}`, files 0600 in a 0700 directory,
   each key written to a temporary file and renamed; the directory must be writable (Compose mounts the
-  `seamless-secrets` volume there). The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
+  `seamless-secrets` volume there). When it is not — the default on a host run, where a user cannot write
+  `/var/run/secrets/seamless` — the credential routes answer 503 `unavailable` with "secret store: cannot write
+  the secret store at {directory}: {reason}; set SEAMLESS_SECRETS_DIR to a directory this process can write",
+  which the dashboard shows as is. The store creates `SEAMLESS_SECRETS_DIR` itself 0700 too, and sets
   an existing one it owns to 0700 when it writes, so other local users cannot list the secret names; one
   it does not own (a mount) keeps its mode.
 * `kubernetes` (OpenShift): a `Secret` named `seamless-{name}` in `SEAMLESS_K8S_NAMESPACE` (default:
@@ -1965,9 +2247,10 @@ body `{query, limit, project}`; parses hits tolerantly from `results|memories|it
 
 `KnowledgeService`:
 * `on_failure(migration, step, error)` → `search(f"{strategy} {step} {error_class}: {msg[:200]}")`,
-  attaches up to 3 hits as `AdvisorNote(kind="similar_incidents", source="memory")`, emits
-  `advisor.similar_incidents`; also `remember` type `bug` with concepts `["seamless", strategy,
-  step]`.
+  returns up to 3 hits as `AdvisorNote(kind="similar_incidents", source="memory")`; also `remember` type `bug`
+  with concepts `["seamless", strategy, step]`. The orchestrator attaches the note to the migration and only then
+  emits `advisor.similar_incidents` (the note's summary and data): the event comes after the note it announces, so
+  the refresh it asks for (§16) reads the note.
 * `on_completed(migration)` → `remember` type `fact`: profile (os_type, disk size bucket
   `<50G|50-200G|200-500G|>500G`, strategy), passes, final delta, estimated vs actual downtime.
 * `on_rolled_back(migration, reason)` → `remember` type `workflow`.
@@ -2043,7 +2326,7 @@ document (kind `recommendation`, §4.2); the engine reads only the decision.
 ### 14.5 Audit trail and input snapshots (`ai/snapshots.py`)
 
 Audit events are persisted events of the append-only `events` table (§4.3): no route updates or deletes
-them (`seamless events purge` is the only deletion, by hand, Security.md §12).
+them (`seamless events prune` is the only deletion, by hand, §15, Security.md §12).
 
 * `recommendation.created` — actor `system:advisor`; data `{target_id, model_version, decision_type, subject,
   option, confidence, snapshot_sha256}`.
@@ -2051,10 +2334,22 @@ them (`seamless events purge` is the only deletion, by hand, Security.md §12).
   `pending_approval`, `approved`, `overridden`, `below_threshold`, and `decision.fallback` for
   `fallback_rules`. Actor `<kind>:<id>` of the decision's actor (`policy:global-default`, `system:fallback`,
   `user:<name>`); data `{target_id, model_version, before, after}`, where `before` (null for the first
-  decision) and `after` are `{status, final_option, reason_code, policy_id, threshold_used}`.
+  decision) and `after` are `{status, final_option, reason_code, reason_text, policy_id, threshold_used}` —
+  `reason_text` the decision's reason in words: the reason a person gave with an override (§14.6), or why the
+  advisor's answer could not be used (`fallback_rules`), null otherwise — so the trail itself records why a
+  decision was overridden; the audit page shows an override's reason with the action, as a Force cutover's.
+  An event recorded before the field existed has none.
 
 * `policy.created`, `policy.updated`, `policy.deleted` — actor `user:<name>`; data `{target_id, before, after}`
-  (the policy, null where there is none).
+  (the policy, null where there is none). The audit page lists with a `policy.updated` the settings it changed, one
+  line each, "{setting}: {before} → {after}", worded as the policies page shows them (§16) and in its order: Name,
+  When the advisor decides, Applies to (plans and providers by name, by id when the page does not know it), Decisions,
+  Threshold, Minimum evidence, Override reason, Distinct approver. A list of plans, providers or decision types whose
+  order alone changed did not change; a setting either side lacks is not compared; "No setting changed" when none
+  did, and nothing when `before` or `after` is not a policy. A change that weakens an approval gate so shows on the
+  page, not only in the JSON download. A policy event names the policy and links to its card,
+  `/advisor/policies#policy-{id}` (ADV-20), while the policy exists; a deleted policy's name is plain text marked
+  "(deleted)", as no page shows it any more; while the policies cannot be read it links to `/advisor/policies`.
 * `migration.force_cutover` — a cutover before convergence (§5.4): actor the approver who forced it; data
   `{target_id, vm, reason, delta_bytes, estimated_downtime_s}`, `target_id` the migration id and `vm` its VM's name.
   The audit page shows the reason with the action and links the target to the migration.
@@ -2139,7 +2434,8 @@ seamless version
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
 refuse. Commands operating on the store use the same
-settings as `serve` (they open the DB directly; a running server sees changes on its next tick). An
+settings as `serve` (they open the DB directly; a running server sees changes on its next tick, and its event
+stream sends their events, §12). An
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
 the plan is in flight — with the same message, naming what releases each VM — and back to `draft`; it writes
 only if the plan did not change since it was read (a server that started or validated it meanwhile), and
@@ -2239,14 +2535,20 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (Delete provider) with its icon. Initial focus, Escape, busy and unavailable states are as for every dialog.
 * Accessibility: WCAG 2.2 AA contrast — figures shown while newer ones load too: the Overview greys them to the muted
   foreground and marks them `aria-busy`, never fades them with opacity —, visible focus rings, keyboard reachable
-  actions, `aria-live`
+  actions, a control repeated on each card of a list naming its card's object to assistive technology after its
+  visible label, the rest visually hidden as the card's heading shows it (a policy card's Edit {policy} and Delete
+  {policy}; a provider card's Check {provider}, Inventory of {provider}, Edit {provider} and Delete {provider}), so a
+  list of the page's controls never reads "Edit" three times, `aria-live`
   for progress, for the outcome of an action (a plan started, resumed, paused, saved or validated — with
   the report's counts — or its waves planned; a migration's action or strategy change) and for what a list's
   filters show ("Showing 3 of 12 plans", also when none match; on Events only that none match, as its count moves
   with every live event) and for the live event stream once it has been live — lost (reconnecting), back, stopped or
   signed out, said once for the page, not by each Live indicator, and not its first connection —, announced from a live
   region already on the page (a region inserted together with its text is not reliably read),
-  a form error announced when it appears (not only shown next to its field), focus that never drops to the
+  a form error announced when it appears (not only shown next to its field) — a dialog's request failure (the
+  Provider, Policy, Plan and Confirm dialogs show it at the end of their scrolling body) also scrolled into view when
+  it appears or changes, so it is seen as well as heard; an error a page shows while loading is never scrolled to, so
+  a refetch in the background never moves the page —, focus that never drops to the
   page when the focused control goes away (Clear filters → the search field; a dialog's next step → its
   heading; a deleted item → its list's heading, a removed probe → its list's legend; a plan action whose button
   goes with it — Start, Resume, Start again, Finalize all, Finalize wave, the not-finalized notice's Dismiss — → the
@@ -2297,8 +2599,22 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   migration page the crossings seen while it is open — into the warning, past the SLO — are announced once each from
   a region already on the page, never the clock's every tick.
 * Plan status: every view shows `Plan.derived_status` (§8.1) — Draft, Validated, Running, Paused, Completed,
-  Finalized, Failed — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
-  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19).
+  Finalized, Failed, Cancelled — never the stored lifecycle; the KPI tiles show Awaiting finalize and Finalized where they
+  showed Completed (`Stats.awaiting_finalize`, `finalized`, ADV-19), and Rolled back beside Failed
+  (`Stats.by_phase.rolled_back`, in the warning tone while there is one): a rolled-back migration's source VM runs
+  again and it waits for a person to fix the cause and retry it, or cancel it, so the tiles never read as all clear
+  while one waits; Migrations counts the migrations that are not `cancelled` (`Stats.total` less
+  `by_phase.cancelled`) — a cancelled one is never done, as each plan's done count says — its hint naming how many
+  were cancelled, and Finalized's share is of those. A plan Completed with nothing migrated — every
+  migration it did not cancel rolled back (§8.1 rule 6: `migration_counts` holds `rolled_back` and no `completed` or
+  `finalized`) — never reads as a success: its badge takes the neutral tone and explains "Nothing was migrated: every
+  migration rolled back."; its page says so with the next step — "Nothing was migrated: every migration rolled back and
+  its source VM runs again. Retry each one from its page once the cause is fixed, or cancel it." — and offers no
+  Finalize all, as nothing awaits finalize; a wave whose migrations it did not cancel all rolled back reads "Rolled
+  back", not "Complete", though the waves after it start (§5.1); a wave whose migrations are all cancelled — every
+  wave of a cancelled plan — reads "Cancelled" in the neutral tone, with no count, never a green "Complete"; and a
+  wave's VMs done count as the plan's do: `completed` and `finalized` of its migrations that are not `cancelled`,
+  which are never done (a rolled-back wave reads 0 done).
 * Approvals: two kinds, and every entry names its kind (ADV-20) — a **cutover approval** ("Cutover approval":
   the plan's Require approval, `Migration.approvals`, the cutover request and the maker-checker rule
   `counted_approvals`, §5.4) and an **advisor decision** ("Advisor decision · {decision type}": a decision
@@ -2309,7 +2625,15 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   dashboard builds both from the routes it already reads (no approvals route). On the Overview a pending approval
   is listed once, in Pending approvals: Needs attention keeps every other human action — a cutover request or a
   closed window once the approvals are in — and, while the plans cannot be loaded, a converged migration whose wait
-  is unknown (Pending approvals then says its cutover approvals are unavailable).
+  is unknown (Pending approvals then says its cutover approvals are unavailable). A warm migration whose passes
+  found what its cutover will refuse (`cutover_refusals`, in `precopy`, `syncing` or `awaiting_cutover`) is listed
+  there ahead of what it waits for, as the plan list marks it — "Cutover will refuse {n} problem(s)" — with "fix
+  it, then Sync now" once it waits for its cutover and "fix it before it converges" while its passes run (the next
+  pass looks again); an approval it still needs stays in Pending approvals, whose row then adds to what it waits
+  for "The cutover will refuse {n} problem(s): fix it first.", so the approver sees it where the approval is given.
+  A rolled-back migration waits for a person too — to fix the cause and retry it, or to cancel it — so Needs
+  attention lists it last, after the overdue finalizes: "Rolled back — the source VM runs again", with "Fix the
+  cause, then retry or cancel (operator)".
 * Routes: `/` Overview (filtered by the plan in its address, `?plan=`: one that names no plan stays chosen and the page
   says the plan does not exist, with All plans, instead of showing its zeros as all clear; KPI tiles, phase
   distribution, throughput chart, downtime vs SLO,
@@ -2317,7 +2641,16 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   what it waits for, linking to where it is decided, filtered by kind — All, Cutover approval, Advisor decision;
   the first eight rows of the chosen kind, as many as Needs attention shows, the rest behind "Show all ({n})" and
   folded back by "Show fewer" or by choosing another kind, so a plan of hundreds of VMs awaiting approval never stretches the Overview;
-  ADV-20), `/plans` (the list: each plan's status, VMs, migrations done, clouds, SLO and last change — on a phone the
+  ADV-20; the page reads the migrations as summaries, `GET /migrations?view=summary` (§4): what its rules read, not
+  every migration whole), `/plans` (the list: each plan's status, VMs, migrations done — `completed` and `finalized` of its
+  migrations that are not `cancelled`, which are never done (a VM taken out of the plan, §5.4, or a migration cancelled
+  while its VM stays in `vm_ids`), from `Plan.migration_counts`, naming the cancelled ones it leaves out ("11/21 done,
+  1 cancelled", the cancelled count on a line of its own under the done count and its bar, as beside them it squeezed
+  the bar to a dot) so a plan's VMs and its done total never differ without a word,
+  or of its VMs before validation, and none for a `cancelled` plan, which shows — instead; the Overview's plan progress
+  counts the same way and names the cancelled ones it leaves out right after its done count, on its one line under the
+  bar ("11 of 21 done, 1 cancelled, downtime SLO 15m 00s"), none when no migration was cancelled; the list reads no migration —, clouds,
+  SLO and last change — on a phone the
   done count with its bar and the clouds stand under the plan's name, as their columns do not fit and the list never
   scrolls sideways; New plan opens the plan form: name, clouds, VMs (a selected VM that is no longer in the
   source inventory is listed with Remove: validation cannot reach it), strategy and selection policy, per-VM
@@ -2342,10 +2675,19 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   each field accepts what the API accepts, so a plan created through the API or `seamless plan apply` stays
   editable; while a migration of the plan is `failed`, the destination is unavailable with the reason — the
   failed VMs named, roll them back or cancel them first (§12) — as the source of an existing plan is),
-  `/plans/:id` (its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
+  `/plans/:id` (it reads its plan's migrations as summaries, `GET /migrations?plan_id=&view=summary` (§4): the table, the
+  waves, the finalize queue, the findings and the probe warnings read nothing else, and the actions on a decision
+  waiting for approval take the summary's eligible strategies; its primary action follows its derived status: a Completed plan offers Finalize wave and Finalize all
   (approver; one confirmation that types the wave's or the plan's name, `POST /plans/{id}/finalize`, §8.1 — when
   it skips VMs, a notice names each skipped VM with the API's reason until dismissed, and the announcement gives
-  the counts) and no Start, nor does a Finalized one; a finalize queue lists the `completed` migrations oldest first, each with its time
+  the counts; the confirmation counts and lists only the VMs it finalizes and names those whose source VM runs
+  again, which it skips, with the reason, and while the source VM of every VM in its scope runs again the action is
+  unavailable, saying so) and no Start, nor does a Finalized one; Cancel plan (operator; danger, one confirmation that types the
+  plan's name and says its migrations are cancelled, its VMs freed for another plan and its history kept,
+  `POST /plans/{id}/cancel`) is offered while no migration has started, none has its source stopped and the plan is not
+  running — otherwise it stays unavailable, saying why: pause the plan first, which VMs have started, or which VMs'
+  sources are stopped, to cut over first (as the API names them) — and a
+  cancelled plan shows Cancelled and offers no action but its history; a finalize queue lists the `completed` migrations oldest first, each with its time
   in Completed — flagged past the plan's `finalize_warning_h` — and a "Source VM running" badge while
   `source_running_at` is set; settings summary — with "Ports: MAC and fixed IPs kept" when `port_creation_mode` is
   `"neutron"`, "Network overrides: {n} VMs" when `nic_overrides` has entries, and "Advisor policy: {name}", its mode
@@ -2368,7 +2710,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   cutover, §5.4),
   Automatic cutover and the cutover window — is read-only below the approver role, with the reason shown, as §12 refuses an
   operator's change, and the form names each selected VM that a migration of another plan with the same source holds
-  (§5.4: that plan and the phase), as validation refuses it; Start on a `failed` plan says pre-staging failed and starts
+  (§5.4: that plan and the phase, from the migrations as summaries, read while the form is open), as validation refuses it,
+  and its VM table names, as the Inventory's does, the plan that holds each VM with the Plan filter — the plan being
+  edited never holding its own VMs — so the free VMs are picked before any warning; Start on a `failed` plan says pre-staging failed and starts
   it again (§8); Start is unavailable, saying why and naming the VMs, while a migration is `blocked` or — in a plan
   with waves — a migration that has not finished belongs to no wave (§9.4), as `start_plan` refuses both; Validate asks for confirmation when it would clear recorded approvals or cutover requests — those of
   migrations in `pending`, `blocked` or `ready`, §5.4 — and says how many), `/migrations/:id` (its Findings
@@ -2386,13 +2730,15 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   the estimated downtime or the pass limit decides", ADV-16; it names the running pass the
   same way; once a long wait dropped passes from `sync_passes`, it says how many earlier passes are no longer listed
   and that the bytes they transferred stay counted, §5.4), downtime clock (in demo mode it runs in model time,
-  `/health` `demo_speed`; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
+  `/health` `demo_speed`; it counts whole seconds while it runs, and once the downtime ended it shows the actual
+  downtime rounded to the second, as every other view and the text under it give it; the estimate's parts — shutdown, final sync or copy, conversion, create, boot — and the
   difference between estimate and actual, ADV-16), a "Data inconsistent" badge with the issues (§5.5), Force cutover
   for an approver in `precopy`/`syncing` of a warm migration — the dialog shows the last pass's change and the
   estimated downtime the Force cutover records (the API's formula, §5.4, ported and checked against a case table the
   control plane generates) and asks for the reason (§5.4) —,
   an alert while `source_running_at` is set — the source VM runs again, so its data diverges from RHOSO; stop it, or
-  roll back (§8.1) —, the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
+  roll back (§8.1) — and Finalize unavailable then, saying so, as the API refuses it (a finalize that began deleting
+  the source stays available, §8.1), the time in Completed and the finalize reminder past the plan's `finalize_warning_h`, and in
   demo mode "Power on the source VM" / "Power off" for an operator on a completed migration (`POST /demo/vms/…`), so
   the alert can be shown,
   findings (before pre-flight ran: that it runs at validation, or is running), a Verification panel — the VM's
@@ -2406,13 +2752,13 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   own included) — is marked "not allowed", and when selected a note under the field says why, as
   `NET_PORT_NOT_PERMITTED` does)
   and its addresses (comma separated; empty keeps its own), unavailable with the reason while the plan cannot be
-  edited. A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
+  edited (its migrations, read as summaries while the plan is editable, say whether one is in flight, §12). A network an entry names that RHOSO no longer lists stays selected, marked "not in RHOSO". A refused
   address field is marked invalid, is described by its problem, and gets the focus. A VMware source says the
   migration kit keeps the guest's network settings; its rows name the RHOSO network each NIC's port group goes
   to (the plan's mapping, else the same name, §7.2) with the guest's addresses, and a VMware VM that still has
   entries offers "Remove the overrides" (the same plan edit) —, a Verification panel — the VM's
   application probes (the plan's or its override, §7.5) with Edit for an operator (its `probe_overrides` entry, a
-  plan edit, §12) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
+  plan edit, §12, gated like the Network panel's) and its suggested probes, and the last verification's checks and probes: target, result (Passed,
   Failed, Unreachable), latency and time (ADV-18) —, advisor notes, timeline,
   actions Approve/Cutover/Sync/Rollback/Retry/Cancel/Finalize with confirmation dialogs — those available now
   first, the next step's action first and primary, then the unavailable ones in a quieter, smaller row under
@@ -2426,18 +2772,46 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   each entry names its kind: "Cutover approval" for the request and each approval,
   "Advisor decision · {decision type}" for the migration's advisor decision while it waits for approval and once a
   person approved or overrode it, with who and when (ADV-20); Approve is unavailable to the cutover's requester when the plan requires a distinct
-  approver, with the reason "You requested this cutover. Another approver must approve it."; Approve is offered where an approval lasts (from `ready` until the cutover
+  approver, with the reason "You requested this cutover. Another approver must approve it." — and while authentication
+  is off, when every request is `anonymous` (§13) and nobody else exists to approve, every such maker-checker reason
+  (a requested or forced cutover, a requested advisor decision) adds "With authentication off everyone is anonymous:
+  give each person a token (seamless token create) and turn authentication on.", the control staying; Approve is offered where an approval lasts (from `ready` until the cutover
   starts, and `failed` or `rolled_back` ahead of a retry — not before validation or while blocked, as
   validation clears approvals), Cut over from `ready`, `precopy` and `syncing` too (a warm migration then
-  cuts over once it converges); while a requested cutover waits for a closed window, an approver can let it cut over
+  cuts over once it converges); while the migration's `cutover_refusals` is not empty the page shows them above its actions as a warning,
+  "The cutover will refuse this before the source stops - fix it first" with each problem, and the Cut over
+  dialog repeats them (requesting stays possible: the cutover's own check refuses before the source stops); the
+  next step agrees — waiting for its cutover, requested or not, the migration's next step is to fix them and
+  sync, so a pass looks again, with Sync its action; failed before its source stopped, it says the cutover refused
+  them and that the retry's pass looks again —; the
+  plan page's migration list marks such a migration with a warning naming how many problems the cutover will
+  refuse; while a requested cutover waits for a closed window, an approver can let it cut over
   outside the window — the plan, its wave and the cutover slots still gate it (§5.4); a cutover request is shown
   whether or not the plan needs approval, and while it waits the page says when it may start outside the window
-  (`force_window`, §4.2); until the migration's plan is
+  (`force_window`, §4.2); a request that waits for another approver — maker-checker, and no approval counts but
+  the requester's own — is not a start, so its Cut over dialog asks "Request the cutover of {vm}?" with Request
+  cutover and says the source stops once another approver approves it; the Cut over and Force cutover dialogs say
+  the request also records the user's approval only when the plan requires no distinct approver, as only then does
+  it (§5.4), under maker-checker that the request is not an approval, and otherwise — no approval required, the
+  distinct approver kept, as a plan made without approval keeps it — nothing about an approval;
+  the Approve dialog says what the approval leads to (§5.4): when the plan requires an approval, none counts yet and
+  nothing else a person gives is missing — a cutover request or `auto_cutover`, the window absent, open or bypassed
+  (`force_window`), no advisor decision waiting — the approval lets the cutover start, so the dialog says that the
+  source VM will then be stopped and the downtime clock starts (once pre-copy has converged, for a warm migration that
+  has not; after the running pass, when forced) as soon as the plan, its wave and a free cutover slot allow, with the
+  estimated downtime against the SLO, and its button reads Approve and cut over; otherwise its button reads Approve and
+  the dialog says what the cutover still waits for — a cutover request, the window with its start and end, the advisor's
+  decision — or that an approval counts already, that the plan needs none, that in `failed` or `rolled_back` a retry
+  keeps the approval and asks for the cutover anew (§5.1), or, while the plan is not loaded, that what the approval
+  leads to depends on the plan;
+  until the migration's plan is
   loaded Cutover stays unavailable — its window and approval policy are unknown, and the dialog would promise an
   approval the plan may not grant — saying that the plan is loading, or, when it cannot be loaded, the page says so
   with Retry; choosing another strategy asks the same when it would clear the migration's approvals or cutover
   request, and is unavailable, saying why, while the migration's advisor decision waits for approval (`advisor_hold`,
-  §14.6) — the API refuses it then (§12)), `/providers` (status cards + Check,
+  §14.6) — the API refuses it then (§12); while that decision waits, the Next step leads with a primary "See the
+  recommendation" link to it, ahead of the migration's own actions, so its first control is the decision its text
+  asks for, not the cutover's Approve), `/providers` (status cards + Check,
   each card summarizing the storage backends by driver family —
   `storage_backends`, §7.3.1; admins add and edit providers with a distribution preset —
   OpenStack Community, Kolla-Ansible, RHOSP 17.1, RHOSO 18.0, VMware vCenter — test the connection and
@@ -2445,12 +2819,22 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   (`credentials_secret`, `conversion_host.ssh_key_secret`, §13.3: mounted files, the Kubernetes store or
   `SEAMLESS_SECRET_*` variables), which the dashboard then never writes; a provider added before a later step of
   the dialog failed — its credentials, its key, or a connection test that did not pass — stays added, and
-  the dialog goes on editing it, so Save retries the remaining steps instead of adding it again),
+  the dialog goes on editing it, so Save retries the remaining steps instead of adding it again; Delete is unavailable
+  while a plan still needs the provider, naming each with why, as the API refuses it (§12) — a plan neither completed
+  nor cancelled, with its status, or a completed one with VMs not finalized, rolled back or cancelled, with their
+  number — so nobody types its id to learn that; a cancelled migration's cleanup still under way, and a rolled-back VM keeping
+  its copied data, which the plan list does not carry, are refused by the API alone, its 409 naming the plan; the dialog's Then says what stays: finished plans keep its id),
   `/inventory/:providerId` — `/inventory` opens the first source provider's, or the first provider when there is no
   source —
   (its Provider select switches the inventory in place: focus stays on the select and the address is replaced, so
   arrowing through the providers neither leaves the select nor fills Back — no change of context on input, WCAG 3.2.2;
   a source: VM table with search and power, readiness, project and guest OS filters — family, or legacy per §9.5;
+  a VM that a migration of a plan holds (§5.4: one not `cancelled`, `finalized` or `rolled_back`) names that plan
+  in its readiness cell, beside its name — the row header stays the VM's name, as a screen reader repeats it for each
+  cell — linked to the plan, with the migration's phase, and a Plan filter shows all VMs, those no plan
+  holds or those one holds, so an operator picks free VMs before New plan warns about held ones — while the plans
+  or the migrations cannot be loaded the table says it does not know which plans hold its VMs, instead of reading
+  them free;
   `?vm={source id}` opens it searching for that VM, ADV-02;
   a destination: networks with MTU, flavors, volume types, free quota per project (an unlimited one reads
   Unlimited and an unreported one Not reported, never a number) and the project names that plan
@@ -2463,12 +2847,15 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   operator archives to write-once storage (Security.md) — saying how many events it has read and stoppable meanwhile; its stream line counts the new events without announcing each, and Pause
   live updates stops everything that updates on its own — the list and that count — until Resume live updates, so only
   pausing and resuming are announced, the resume with the number of held events it adds: WCAG 2.2.2, 4.1.3),
-  `/advisor` (Jev/agentmemory status,
+  `/advisor` (Jev/agentmemory status, the 20 newest advisor notes of every migration, strategy notes aside, each
+  naming its VM with a link to its migration (`GET /advisor/notes?limit=20`),
   the recommendations feed — filtered by plan and by decision type, both kept in the address (`?plan=`, `?type=`) and
   sent as `GET /advisor/recommendations?plan_id=&decision_type=`, a change going back to its first page; each entry
   shows "Recommended: <option> · <confidence>% confidence" and "Decision:
   <final option> — <why>" (applied automatically by policy <policy>; below threshold, default kept; advisor
-  unavailable, decided by rules; no usable recommendation, decided by rules; …), never the word "Selected". A
+  unavailable, decided by rules; no usable recommendation, decided by rules; policy <policy> requires approval; …),
+  never the word "Selected"; a decision that waits reads "Waiting for approval by an admin — <why>", naming the role
+  that holds `advisor.approve` (§13.2), so whoever reads it learns who decides it, also without the controls. A
   decision taken against the threshold ends its why with that comparison — "below threshold (57% < 60%), default
   kept", "applied automatically by policy global-default (83% ≥ 60%)", "too little evidence to apply it
   automatically (83% ≥ 60%)" (the owner's review of 10 October 2026) — its sign taken from the decision's reason
@@ -2492,8 +2879,9 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   says so; "Similar past incidents", at most 3, each with its match; Jev's reasons by the item they name, ADV-02;
   tab "Details" with
   the full distribution, labelled and highest first, tab "Audit" with its audit events and tab "Input" with
-  its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`) offers
-  Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
+  its redacted input snapshot and SHA-256, §14.5); an entry the user may act on (`advisor.approve`; on `/advisor`
+  a `pending_approval` entry whose migration still holds on it, §14.6 — the page reads that migration alone,
+  `GET /migrations/{id}`, and no migration list) offers Approve and Override — others see neither; the decision's requester sees both unavailable, with the reason,
   when the policy requires a distinct approver (§14.6) — and Override opens a dialog: another eligible option and the
   reason (required, at least 10 characters, when the policy in force says so); the plan page lists its migrations
   "Waiting for advisor approval" with the same actions and the migration page shows its hold (§14.6);
@@ -2507,22 +2895,52 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
   actor and text filters and downloads of the shown events as CSV — columns time, actor, action, target,
   model version — and as JSON —
   similar-incident search — the query field takes at most 2000 characters and the result count stays in
-  1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`).
+  1–20, as the API accepts, §12), `/login` (token entry stored in `sessionStorage`; when a request of a signed-in
+  session is refused, 401, the token is dropped and Sign in says the session ended — the token is no longer accepted:
+  revoked, or the server's tokens changed — before asking for one again, which signing out never does; it offers to
+  continue without a token only when `GET /health` says authentication is off (`auth_disabled`) — with it on, that
+  link would lead straight back to Sign in; it never asks `GET /me` without a token to find out, a refused request
+  that would record `auth.denied` and count toward the per-address lockout, §13.1, on every visit).
 * Data: `src/api/types.ts` mirrors §4/§12 exactly; `src/api/client.ts` (fetch with bearer token,
-  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). When the stream opens again after a
+  typed errors); `src/api/stream.ts` (fetch-based SSE with resume). A stream that delivers nothing — no event and no
+  heartbeat — for 45 s, three heartbeats (§12), counts as dropped although no error came, as a half-open connection
+  does after a laptop sleeps or a network path dies: the dashboard closes it and connects again with `since`, its
+  indicator reading Reconnecting meanwhile, never Live on events that stopped. When the stream opens again after a
   drop, the dashboard refetches the data it shows: a connection that dropped before its first persisted
   event resumes live-only, so the gap is never replayed, and ephemeral progress never is. The event history
   of the Events page and of a migration's timeline is one `GET /events?tail=true` request (§12).
-  Persisted events refresh the queries they affect in one batch per 400 ms. An event about one migration that
+  A `migration.progress` event, and the pass a `migration.sync_pass` event ended, patch the migration where it is
+  cached: its own query and each cached migration list that holds it. A list that does not hold it keeps its data
+  as it is, so what reads only such lists does not draw again on every progress event. A summary list
+  (`view=summary`) takes the percentage alone: a summary holds neither the passes nor the bytes.
+  Persisted events refresh the queries they affect in one batch per 400 ms. A `migration.phase` or
+  `migration.created` event refreshes the plan list with its plan: their status and counts follow the phases.
+  While the page is hidden (`document.visibilityState` `hidden`, a background tab) the batch waits: what its events
+  would refresh or read again is refreshed once, as one batch, when the page is shown again; progress still patches
+  the cached figures in place. The window regaining focus reads again what the page shows that was read more than
+  5 s before, except what the open stream keeps fresh - the migration lists and pages, the plans, the figures, the
+  providers, the advisor's recommendations, notes and policies, the event lists: each of their changes comes as an
+  event, so a page shown again reads what its held events ask for, and a list whose changes the stream brought is not
+  read again (NFR-03). One of them whose last read failed is read again on focus, as they all are while the stream is
+  not open; what the stream does not keep (the signed-in user, the health, a provider's inventory, the advisor's
+  status and data sent) is read again on focus as before. A batch that would read more than 50 migrations one by one - a long-hidden page in a
+  busy wave - refreshes the cached migration lists and pages instead: one read per list costs less than so many. An event about one migration that
   exists already (a `migration.*` event other than `migration.created`, an `advisor.*` or `decision.*` event naming
   it) reads that migration once per batch (`GET /migrations/{id}`) and puts it into each cached migration list that
-  holds it and is filtered by plan at most, instead of reading those lists again — at 1,000 VMs a plan (NFR-03) a
+  holds it and is filtered by plan at most - a summary list takes its summary, as the API builds it - instead of
+  reading those lists again — at 1,000 VMs a plan (NFR-03) a
   list is megabytes; a list filtered otherwise, one that does not hold the migration and one being read are
-  refreshed as before, and every list is when that read fails. A list that the same batch refreshes is left alone:
+  refreshed as before, and every list is when that read fails. With neither that migration nor any migration list
+  shown (a page that shows none), the event reads nothing: a query counts as shown while an enabled observer holds it,
+  not when it is only disabled - the plan form's while closed, a panel's while its plan cannot be edited - or kept in
+  the cache after its page closed. What it would have read is marked stale where it is cached - that migration's page
+  and the migration lists - so a page that shows one of them later, Back included, reads it again as it opens instead
+  of showing it as it was before the event. A list that the same batch refreshes is left alone:
   its read starts after the batch's events, so it shows them; should that read fail while a migration waited on it,
   the list is read once more, and a list it already failed to read takes the migration as before. `memory.lesson_saved` refreshes nothing: a lesson
   changes no migration, list or figure, and the Events page and a migration's timeline take the event from the
-  stream. A refresh already under way is not
+  stream. An `advisor.*` event refreshes the recommendations feed and the advisor notes. A refresh already under
+  way is not
   cancelled by the next batch, so a slow API still answers while events keep coming, and a query whose refresh
   was under way is refreshed again once it is done, so an event that came after its request still shows.
   `VITE_SEAMLESS_MOCK=1` switches to an in-browser mock adapter (`src/api/mock.ts`) with fixture data
@@ -2587,8 +3005,11 @@ bind mount; `.env` is 0600.
 --disk 40` — `--activate=false` keeps the developer's current Docker context),
 `seamless-init`, `seamless-up` / `seamless-down` / `seamless-ps` / `seamless-logs` / `seamless-reset`
 (all with `DOCKER_CONTEXT=colima-seamless`), `seamless-demo` (control plane started with `SEAMLESS_DEMO=true`
-against PostgreSQL), `seamless-test` and `seamless-check` (the full local gate: control plane,
-collection, dashboard).
+against PostgreSQL), `seamless-test` and `seamless-check` (the CI checks that need only the venv and the
+dashboard's `node_modules`: the control plane with its coverage gate, ruff and DEMO-07, the collection, the
+scanners that are installed, the dashboard's unit tests and build; its comment, `make seamless-help` and the README
+name what it leaves out — the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency
+audits, trivy's configuration scan, the manifest and image jobs — and how to run each).
 
 Other hosts: `SEAMLESS_DOCKER_CONTEXT=default` runs the same targets on any Docker host — on a Linux machine's own
 Docker Engine, which defines no `host.docker.internal`, the targets add `deploy/compose/compose.linux-host.yaml`,
@@ -2609,7 +3030,9 @@ Structured logs (JSON when `SEAMLESS_LOG_JSON=true`), audit events in the DB, `/
 `seamless_downtime_seconds_sum/_count` and `seamless_downtime_seconds_max`,
 `seamless_step_duration_seconds_sum/_count{step}`, `seamless_advisor_calls_total{tool,outcome}`,
 `seamless_tick_seconds_sum/_count`, `seamless_tick_seconds_max` and `seamless_tick_slow_total` (ticks
-over half of `tick_s`; QASuite PERF-CP-02).
+over half of `tick_s`; QASuite PERF-CP-02), and `seamless_cutover_refusals` gauge — the migrations in `precopy`,
+`syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, §7.2), the
+ones the dashboard lists as "Cutover will refuse" (§16): above 0, something is to fix before a cutover.
 
 ---
 

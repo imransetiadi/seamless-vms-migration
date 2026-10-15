@@ -528,7 +528,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
       <form noValidate onSubmit={submit} className="flex max-h-[85vh] flex-col">
         <div className="border-b border-border px-5 py-4">
           <h2 id={titleId} className="text-lg font-semibold text-foreground">
-            {editing ? `Edit ${current?.name}` : 'Connect a cloud'}
+            {editing ? `Edit ${current?.name}` : 'Add provider'}
           </h2>
           <p className="text-sm text-muted-foreground">
             {editing
@@ -941,7 +941,7 @@ export function ProviderDialog({ open, onClose, provider, onSaved }: ProviderDia
             )}
           </Section>
 
-          {failureText && <ErrorBanner error={failure} title={editing ? 'Not all changes were saved' : 'The provider could not be saved'} />}
+          {failureText && <ErrorBanner error={failure} title={editing ? 'Not all changes were saved' : 'The provider could not be saved'} reveal />}
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-5 py-3">

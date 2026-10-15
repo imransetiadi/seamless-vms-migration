@@ -1,7 +1,8 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { phaseMeta } from '../lib/phase';
+import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Plans from './Plans';
 
 describe('Plans page', () => {
@@ -39,6 +40,16 @@ describe('Plans page', () => {
     expect(screen.queryByRole('link', { name: plan.name })).not.toBeInTheDocument();
   });
 
+  it('marks a Completed plan where nothing was migrated, and only that one (SDD §16)', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations.filter((x) => x.plan_id === 'plan-2d5c8b93')) m.phase = 'rolled_back';
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('link', { name: 'Pilot — static content' })).closest('tr')!;
+    expect(within(row).getByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+    // a plan that migrated its VMs keeps the plain badge
+    expect(screen.queryAllByRole('button', { name: 'Completed' })).toHaveLength(1);
+  });
+
   it('says the providers are unavailable when the list shows provider ids instead of names (SDD §16)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
@@ -70,22 +81,91 @@ describe('Plans page', () => {
     await waitFor(() => expect(screen.getByRole('heading', { level: 1, name: 'Plans' })).toHaveFocus());
   });
 
-  it('says migration progress is unavailable instead of showing every plan with nothing done', async () => {
+  it('reads no migration on a live event while the plan form is closed (SDD §16, audit AUD-1)', async () => {
     const server = createTestServer();
     const handle = server.handle.bind(server);
-    server.handle = (method, path, query, body, token) =>
-      method === 'GET' && path === '/migrations'
-        ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
-        : handle(method, path, query, body, token);
-    renderWithApp(<Plans />, { server });
+    const read: string[] = [];
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET') read.push(path);
+      return handle(method, path, query, body, token);
+    };
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server, live: true });
+    await screen.findByRole('table', { name: /migration plans/i });
+    const m = server.migrations[0]!;
+    const phase = (seq: number) =>
+      server.emit({ kind: 'migration.phase', plan_id: m.plan_id, migration_id: m.id, actor: 'orchestrator', message: `phase ${seq}`, data: {} });
+    // the closed form's summary query is disabled: no page shows a migration, so no event reads one
+    for (const seq of [1, 2, 3]) phase(seq);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(read.filter((path) => path.startsWith('/migrations'))).toEqual([]);
+    // the open form shows the summaries: the next event reads that migration, once
+    await user.click(screen.getByRole('button', { name: /new plan/i }));
+    await screen.findByRole('dialog', { name: /new migration plan/i });
+    await waitFor(() => expect(read).toContain('/migrations'));
+    phase(4);
+    await waitFor(() => expect(read).toContain(`/migrations/${m.id}`), { timeout: 3000 });
+  });
 
-    // a 5xx is retried twice with backoff before the query reports the error
-    expect(await screen.findByText(/migration progress is unavailable/i, {}, { timeout: 8000 })).toBeInTheDocument();
-    // the Done column says it does not know, rather than showing every plan at 0 done
-    const table = screen.getByRole('table');
-    expect(within(table).queryByText(/^0\/\d+$/)).not.toBeInTheDocument();
-    expect(within(table).getAllByText('unknown').length).toBeGreaterThan(0);
-  }, 15_000); // the 5xx retries take about 3 s
+  it('counts a plan done over its migrations that are not cancelled, and a cancelled plan shows no count (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'DC1 → RHOSO production rollout')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    // a VM taken out of the plan left a cancelled migration: never done, so out of the count
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Plans />, { server });
+    const link = await screen.findByRole('link', { name: plan.name });
+    const n = ofPlan.length - 1;
+    // and named: the plan's VMs and its done total never differ without a word
+    expect(link.closest('th')!).toHaveTextContent(`${n}/${n} done, 1 cancelled`);
+    const cancelled = server.plans.find((p) => p.status === 'cancelled')!;
+    const row = screen.getByRole('link', { name: cancelled.name }).closest('tr')!;
+    expect(within(row).queryByText(/\d+\/\d+/)).not.toBeInTheDocument();
+    expect(within(row).getAllByText('Nothing left to do').length).toBeGreaterThan(0);
+  });
+
+  it("shows each plan's done count from its migration counts and reads no migration (SDD §16, PF-02)", async () => {
+    const server = createTestServer();
+    const handle = server.handle.bind(server);
+    const read: string[] = [];
+    server.handle = (method, path, query, body, token) => {
+      if (method === 'GET') read.push(path);
+      return handle(method, path, query, body, token);
+    };
+    const plan = server.plans.find((p) => p.name === 'DC1 → RHOSO production rollout')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    // completed and finalized both count as done
+    ofPlan[0]!.phase = 'completed';
+    ofPlan[1]!.phase = 'finalized';
+    const done = ofPlan.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length;
+    // a plan before its first validation counts its VMs, none done
+    server.plans.push({ ...plan, id: 'plan-0d0d0d0d', name: 'Not validated yet', vm_ids: ['vm-a', 'vm-b', 'vm-c'], waves: [], status: 'draft' });
+    renderWithApp(<Plans />, { server });
+    const link = await screen.findByRole('link', { name: 'DC1 → RHOSO production rollout' });
+    expect(within(link.closest('th')!).getByText(`${done}/${ofPlan.length} done`)).toBeInTheDocument();
+    expect(within(screen.getByRole('link', { name: 'Not validated yet' }).closest('th')!).getByText('0/3 done')).toBeInTheDocument();
+    expect(read).toContain('/plans');
+    expect(read.filter((path) => path.startsWith('/migrations'))).toEqual([]);
+  });
+
+  it("names the VMs another plan holds from the migration summaries it reads while open (SDD §5.4, §16, perf audit PF-02)", async () => {
+    const user = userEvent.setup({ delay: null });
+    const reads: string[] = [];
+    renderWithApp(<Plans />, {
+      route: '/plans',
+      path: '/plans',
+      token: 'operator',
+      wrapFetch: (mock) => (input, init) => {
+        if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+        return mock(input, init);
+      },
+    });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    await screen.findByRole('dialog', { name: /new migration plan/i });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
+  });
 
   it('summarises validation errors and moves focus to the summary', async () => {
     const user = userEvent.setup({ delay: null });
@@ -120,6 +200,33 @@ describe('Plans page', () => {
     expect(created?.downtime_slo_s).toBe(600);
     expect(created?.estimator_overrides).toEqual({});
     expect(created?.status).toBe('draft');
+  });
+
+  it('scrolls a plan that was not created into view (SDD §16)', async () => {
+    const recorder = recordScrolls();
+    try {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      const handle = server.handle.bind(server);
+      server.handle = (method, path, query, body, token) =>
+        method === 'POST' && path === '/plans'
+          ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+          : handle(method, path, query, body, token);
+      renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+      await user.click(await screen.findByRole('button', { name: /new plan/i }));
+      const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Not created');
+      await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+      await user.selectOptions(within(dialog).getByLabelText(/destination/i), 'rhoso-prod');
+      await user.click(await within(dialog).findByRole('checkbox', { name: 'Select web-01' }));
+      await user.click(within(dialog).getByRole('button', { name: /create plan with 1 vm/i }));
+      const alert = await within(dialog).findByText('The plan was not created');
+      const banner = alert.closest('[role="alert"]');
+      expect(banner).not.toBeNull();
+      expect(recorder.scrolls.map((s) => s.element)).toContain(banner);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('sets the guest write rate and the aggregate scan cap of a new plan (SDD §16)', async () => {
@@ -285,6 +392,37 @@ describe('Plans page', () => {
     expect(screen.getByText('No plans match these filters')).toBeInTheDocument();
   });
 
+  it("names the cancelled migrations a plan's done figure leaves out, so its VMs and its total never differ without a word (SDD §16)", async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-95a7e3f1')!;
+    const mine = server.migrations.filter((m) => m.plan_id === plan.id);
+    const cancelled = mine.filter((m) => m.phase === 'cancelled').length;
+    expect(cancelled).toBe(1);
+    const done = mine.filter((m) => m.phase === 'completed' || m.phase === 'finalized').length;
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('rowheader', { name: new RegExp(plan.name) })).closest('tr')!;
+    expect(row).toHaveTextContent(`${done}/${mine.length - cancelled}, 1 cancelled`);
+  });
+
+  it('names them on a line of their own under the bar, never beside it, where they squeezed the bar to a dot (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.id === 'plan-95a7e3f1')!;
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'viewer', server });
+    const row = (await screen.findByRole('rowheader', { name: new RegExp(plan.name) })).closest('tr')!;
+    // the line under the name (a phone) and the Done column each keep the bar beside its count alone
+    const bars = within(row).getAllByRole('progressbar');
+    expect(bars).toHaveLength(2);
+    for (const bar of bars) {
+      expect(bar.parentElement).not.toHaveTextContent(/cancelled/);
+      expect(bar.parentElement!.nextElementSibling).toHaveTextContent(/^, 1 cancelled$/);
+    }
+    // and only when it leaves some out
+    const whole = server.plans.find(
+      (p) => p.status !== 'cancelled' && server.migrations.some((m) => m.plan_id === p.id) && !server.migrations.some((m) => m.plan_id === p.id && m.phase === 'cancelled'),
+    )!;
+    expect(screen.getByRole('link', { name: whole.name }).closest('tr')).not.toHaveTextContent(/cancelled/i);
+  });
+
   it('names a selected VM that another plan holds, as validation would refuse it (SDD §5.4, §16)', async () => {
     const server = createTestServer();
     const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
@@ -299,6 +437,38 @@ describe('Plans page', () => {
 
     const note = await within(dialog).findByRole('status', { name: /another plan holds/i });
     expect(note).toHaveTextContent(`${held.vm.name} (plan "${holder.name}", ${holder.id}, ${held.phase})`);
+  });
+
+  it('names in the VM picker the plan that holds each VM before any is selected, with the Plan filter (SDD §16)', async () => {
+    const server = createTestServer();
+    const holder = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const held = server.migrations.find((m) => m.plan_id === holder.id && !['pending', 'cancelled', 'finalized', 'rolled_back'].includes(m.phase))!;
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, { route: '/plans', path: '/plans', token: 'operator', server });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
+    const row = (await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` })).closest('tr')!;
+    await waitFor(() => expect(within(row).getByRole('link', { name: holder.name })).toHaveAttribute('href', `/plans/${holder.id}`));
+    expect(row).toHaveTextContent(`In plan ${holder.name}, phase ${phaseMeta(held.phase).label}`);
+    await user.selectOptions(within(dialog).getByLabelText('Plan'), 'Not in a plan');
+    expect(within(dialog).queryByRole('checkbox', { name: `Select ${held.vm.name}` })).not.toBeInTheDocument();
+  });
+
+  it('says in the VM picker that it does not know which plans hold the VMs while the migrations cannot be loaded (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<Plans />, {
+      route: '/plans',
+      path: '/plans',
+      token: 'operator',
+      wrapFetch: (mock) => (input, init) =>
+        String(input).split('?')[0]!.endsWith('/api/v1/migrations') ? Promise.resolve(new Response('{}', { status: 503 })) : mock(input, init),
+    });
+    await user.click(await screen.findByRole('button', { name: /new plan/i }));
+    const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
+    await user.selectOptions(within(dialog).getByLabelText(/source provider/i), 'rhosp17-dc1');
+    expect(await within(dialog).findByText('Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('Plan')).not.toBeInTheDocument();
   });
 
   it('announces a VM another plan holds from a live region already in the form (SDD §16)', async () => {
@@ -342,7 +512,8 @@ describe('Plans page', () => {
   });
 
   it.each([
-    ['/migrations', /migration progress is unavailable/i],
+    // the list reads no migration, so no page banner names a failed /migrations: only the form does (SDD §16)
+    ['/migrations', null],
     ['/plans', /plans are unavailable/i],
   ])('says it cannot check whether another plan holds a selected VM when %s cannot be loaded (SDD §5.4, §16)', async (failing, pageBanner) => {
     const server = createTestServer();
@@ -359,8 +530,8 @@ describe('Plans page', () => {
     await user.click(await screen.findByRole('button', { name: /new plan/i }));
     const dialog = await screen.findByRole('dialog', { name: /new migration plan/i });
     await user.selectOptions(within(dialog).getByLabelText(/source provider/i), holder.source_provider_id);
-    // the load has failed (the page behind names it), but with no VM selected there is nothing to check
-    await screen.findByText(pageBanner);
+    // the load has failed (the page behind names a failed plan list), but with no VM selected there is nothing to check
+    if (pageBanner) await screen.findByText(pageBanner);
     expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
     await user.click(await within(dialog).findByRole('checkbox', { name: `Select ${held.vm.name}` }));
 

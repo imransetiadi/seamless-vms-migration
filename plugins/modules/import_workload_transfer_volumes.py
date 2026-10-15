@@ -136,6 +136,25 @@ options:
       - Optional, used when the nbdkit server requires an export name.
     required: false
     type: str
+  preserve_volume_type:
+    description:
+      - Create the destination volumes with the serialized C(volume_type) instead
+        of the destination's default type. Set it when the volume types in the
+        workload data were already rewritten to destination types.
+    required: false
+    default: false
+    type: bool
+  warm_state_dir:
+    description:
+      - Directory of the warm state files, normally C({{ os_migrate_data_dir }}/workload_warm).
+      - When set, each destination volume is recorded in the workload's state file
+        C({warm_state_dir}/{source_server_id}.json) as soon as Cinder created it, before its
+        data is copied - its C(dest_id), C(size), C(bootable) flag and C(name), as the warm
+        path records its volumes, keeping what the file already holds. A transfer that fails
+        or is cut short leaves the record of every volume it created, and a rollback with
+        C(delete_dest_volumes) deletes exactly those.
+    required: false
+    type: str
 """
 
 EXAMPLES = r"""
@@ -244,13 +263,16 @@ from ansible.module_utils.basic import AnsibleModule
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import os_auth
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils import server
+from ansible_collections.os_migrate.os_migrate.plugins.module_utils import warm_migration
 
 from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_common import (
     OpenstackVolumeTransfer,
     DEFAULT_TIMEOUT,
+    volume_or_none,
 )
 
 import re
+import time
 
 
 class OpenStackDestinationVolume(OpenstackVolumeTransfer):
@@ -272,6 +294,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         nbdkit_socket_uri=None,
         nbdkit_export_name=None,
         preserve_volume_type=False,
+        warm_state_dir=None,
     ):
 
         super().__init__(
@@ -307,6 +330,115 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
         self.use_nbdkit_direct = use_nbdkit_direct
         self.nbdkit_socket_uri = nbdkit_socket_uri
         self.nbdkit_export_name = nbdkit_export_name
+
+        self.warm_state_dir = warm_state_dir
+
+    def _destination_volume_created(self, path):
+        """
+        With warm_state_dir, record the volume Cinder just created in the
+        workload's warm state file, before its data is copied: a transfer
+        that fails or is cut short leaves the record of every volume it
+        created, which a rollback deletes them by (Seamless Migrate SDD 6.3).
+        """
+        if self.warm_state_dir:
+            server_id = self.ser_server.info()["id"]
+            warm_migration.record_destination_volumes(
+                self.warm_state_dir,
+                server_id,
+                {path: self.volume_map[path]},
+                server_name=self.ser_server.params().get("name"),
+            )
+
+    def _before_destination_volumes_created(self):
+        """
+        With warm_state_dir, remove the volume an earlier attempt recorded for
+        each device before any volume is created: an earlier volume stays
+        recorded until it is gone, and no new volume waits unrecorded while
+        the lock, a detach or a delete is waited for (Seamless Migrate SDD 6.3,
+        review RV5-01).
+        """
+        if self.warm_state_dir:
+            server_id = self.ser_server.info()["id"]
+            for path in self.volume_map:
+                self._remove_earlier_volume(path, server_id)
+
+    def _remove_earlier_volume(self, path, server_id):
+        """
+        Remove the volume an earlier attempt recorded for ``path`` unless a
+        server holds it: the cold path never reuses a volume, and one a server
+        holds (a server the operator renamed rather than deleted) is that
+        server's - it only leaves the record when the new volume is recorded.
+        One only the destination conversion host holds (a transfer cut short)
+        is the migration's own: detached from it under the attach lock. Each
+        earlier volume removed is deleted - one Cinder is already deleting
+        (the boot volume Nova deletes with its server) is not deleted again -
+        and waited for until Cinder no longer has it. An earlier volume that
+        cannot be removed fails the transfer with the record unchanged
+        (Seamless Migrate SDD 6.3, review RV3-02, RV4-02, RV4-05, RV5-02).
+        """
+        state = warm_migration.WarmState.load(self.warm_state_dir, server_id)
+        earlier_id = (state.dest_volumes.get(path) or {}).get("dest_id")
+        if not earlier_id or earlier_id == self.volume_map[path]["dest_id"]:
+            return
+        volume = volume_or_none(self.conn, earlier_id)
+        if volume is None:
+            return  # gone already
+        converter = self._converter()
+        holders = [a["server_id"] for a in getattr(volume, "attachments", None) or []]
+        if any(holder != converter.id for holder in holders):
+            self.log.warning(
+                "Keeping volume %s an earlier attempt made for %s: a server holds it",
+                earlier_id,
+                path,
+            )
+            return
+        self.log.info("Deleting volume %s an earlier attempt left for %s", earlier_id, path)
+        try:
+            if holders:
+                # a transfer cut short left it on the destination conversion host
+                self._detach_volumes_from_destination_converter([earlier_id])
+            if getattr(volume, "status", None) != "deleting":
+                # Nova deletes a boot volume with its server, and Cinder refuses a second delete
+                self._delete_earlier_volume(earlier_id)
+            self._wait_until_gone(earlier_id)
+        except Exception as err:
+            raise RuntimeError(
+                "Could not delete volume %s an earlier attempt left for %s: %s"
+                % (earlier_id, path, err)
+            ) from err
+
+    def _delete_earlier_volume(self, volume_id):
+        """
+        Delete the earlier volume ``volume_id``. Nova, deleting a server whose
+        boot volume goes with it, removes the attachment and then deletes the
+        volume: one read `available` in between may begin going before this
+        delete lands, which Cinder then refuses - it is waited for as one found
+        `deleting` (Seamless Migrate SDD 6.3, review 6 lead).
+        """
+        try:
+            self.conn.delete_volume(name_or_id=volume_id, wait=False)
+        except Exception:  # pylint: disable=broad-except
+            volume = volume_or_none(self.conn, volume_id)
+            if volume is not None and getattr(volume, "status", None) != "deleting":
+                raise
+            self.log.info("Volume %s began going meanwhile", volume_id)
+
+    def _wait_until_gone(self, volume_id):
+        """
+        Wait, within the transfer's timeout, until Cinder no longer has the
+        earlier volume ``volume_id``: one that leaves `deleting` without going
+        (VolumeIsBusy puts it back to `available`, or `error_deleting`) is one
+        Cinder gave up deleting (Seamless Migrate SDD 6.3, review RV5-02).
+        """
+        for second in range(self.timeout):
+            volume = volume_or_none(self.conn, volume_id)
+            if volume is None:
+                return
+            status = getattr(volume, "status", None)
+            if status != "deleting":
+                raise RuntimeError("Cinder did not delete it: it is %s" % status)
+            time.sleep(1)
+        raise RuntimeError("it is still being deleted after %s s" % self.timeout)
 
     def _setup_nbdkit_disks_urls(self, nbdkit_disks):
         """
@@ -350,6 +482,7 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
                 }
 
     def transfer_exports(self):
+        failed = False
         try:
             if self.use_nbdkit_direct:
                 self.log.info("Using direct nbdkit socket mode with nbdcopy")
@@ -378,10 +511,38 @@ class OpenStackDestinationVolume(OpenstackVolumeTransfer):
             else:
                 self._convert_destination_volumes()
             self._detach_destination_volumes()
+        except BaseException:
+            failed = True
+            raise
         finally:
             if not self.use_nbdkit_direct:
                 self._stop_forwarding_process()
-                self._release_ports()
+                if failed:
+                    self._release_ports_after_failure()
+                else:
+                    self._release_ports()
+
+    def _release_ports_after_failure(self):
+        """
+        After a failed transfer, release its ports only if one ssh check reaches
+        the conversion host now: one it cannot reach cannot update its port map,
+        and a wait for its port lock would hold the stopped source another 15
+        minutes. A release that fails is logged, never raised over the
+        transfer's own error (Seamless Migrate SDD 6.6, review RV10-04, RV11-02).
+        """
+        try:
+            self.shell.test_ssh_connection()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning(
+                "Ports %s stay claimed on the conversion host it cannot reach: %s",
+                self.claimed_ports,
+                err,
+            )
+            return
+        try:
+            self._release_ports()
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not release ports %s: %s", self.claimed_ports, err)
 
 
 def run_module():
@@ -401,6 +562,7 @@ def run_module():
         nbdkit_socket_uri=dict(type="str", default=None),
         nbdkit_export_name=dict(type="str", default=None),
         preserve_volume_type=dict(type="bool", default=False),
+        warm_state_dir=dict(type="str", default=None),
     )
 
     result = dict(
@@ -460,6 +622,7 @@ def run_module():
         nbdkit_socket_uri=nbdkit_socket_uri,
         nbdkit_export_name=nbdkit_export_name,
         preserve_volume_type=module.params["preserve_volume_type"],
+        warm_state_dir=module.params["warm_state_dir"],
     )
     destination_host.transfer_exports()
 

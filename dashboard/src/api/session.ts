@@ -1,7 +1,7 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { clearStoredToken, storeToken } from './auth';
+import { clearSessionEnded, clearStoredToken, storeToken } from './auth';
 import { queryKeys, useApi, useMe } from './hooks';
 import type { Me, Role } from './types';
 
@@ -22,6 +22,8 @@ export function useSignIn() {
         });
       } catch (error) {
         clearStoredToken();
+        // a rejected token was never a session: only a signed-in session's refused request says it ended (SDD §16)
+        clearSessionEnded();
         queryClient.removeQueries({ queryKey: queryKeys.me });
         throw error;
       }

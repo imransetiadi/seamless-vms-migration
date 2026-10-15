@@ -58,6 +58,10 @@ SCRIPT = textwrap.dedent(
         record["port_creation_mode"] = [
             (r.get("_migration_params") or {{}}).get("port_creation_mode")
             for r in resources if r.get("type") == "openstack.compute.Server"]
+        # the servers the playbook finds there by name (its workload filter selects among these)
+        record["servers"] = [
+            (r.get("params") or {{}}).get("name")
+            for r in resources if r.get("type") == "openstack.compute.Server"]
     log = Path(os.environ["ANSIBLE_FAKE_LOG"])
     with log.open("a") as fh:
         fh.write(json.dumps(record) + "\\n")
@@ -67,6 +71,8 @@ SCRIPT = textwrap.dedent(
     (osm / "clouds.yaml").write_text("clouds: {{src: {{auth: {{password: leak}}}}}}\\n")
     name = os.environ.get("ANSIBLE_FAKE_VM_NAME", "web-01")
     server_id = os.environ.get("ANSIBLE_FAKE_SERVER_ID", "srv-1")
+    # the volumes the export lists for the server, by Cinder id (the default VM's boot volume)
+    volume_ids = [v for v in os.environ.get("ANSIBLE_FAKE_VOLUME_IDS", "vol-1").split(",") if v]
     base = record["playbook"]
     print("PLAY [migrator] ****")
     print("TASK [" + base + "] ****")
@@ -89,7 +95,8 @@ SCRIPT = textwrap.dedent(
                     "fixed_ips_refs": [{{"ip_address": "10.0.0.5", "subnet_ref": {{
                         "name": "app-subnet", "project_name": "finance",
                         "domain_name": "Default"}}}}]}}}}],
-                "volumes": [{{"params": {{"name": "data", "volume_type": "ceph-hdd"}}}}],
+                "volumes": [{{"params": {{"name": "data", "volume_type": "ceph-hdd"}},
+                             "_info": {{"id": volume_id}}}} for volume_id in volume_ids],
                 "security_group_refs": [{{"name": "default", "project_name": "finance",
                                           "domain_name": "Default"}}],
             }},
@@ -162,6 +169,11 @@ SCRIPT = textwrap.dedent(
         if kind == "final" and not skipped_pass:
             state["destination_server_id"] = "dst-" + server_id
         path.write_text(json.dumps(state))
+        # the warm role's "Record what the cutover will refuse" (SDD 6.6, 7.2)
+        if (base == "import_workloads_precopy.yml" and not skipped_pass
+                and not os.environ.get("ANSIBLE_FAKE_NO_REFUSALS_FILE")):
+            refusals = json.loads(os.environ.get("ANSIBLE_FAKE_REFUSALS", "[]"))
+            (warm / (server_id + ".refusals.json")).write_text(json.dumps(refusals))
 
     failure = os.environ.get("ANSIBLE_FAKE_FAIL", "")
     if failure and (os.environ.get("ANSIBLE_FAKE_FAIL_ON", base) == base):

@@ -1,10 +1,12 @@
 import {
   Activity,
   BadgeCheck,
+  Ban,
   CircleCheck,
   CircleX,
   ClipboardX,
   Gauge,
+  History,
   Hourglass,
   Layers,
   ListChecks,
@@ -18,7 +20,7 @@ import {
 import { useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ApiError } from '../api/client';
-import { useMigrations, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
+import { useMigrationSummaries, usePlan, usePlanAction, usePolicies, useProviders, useStats, type PlanActionRequest } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { AdvisorPolicy, Plan, Provider, ValidationReport } from '../api/types';
 import { AdvisorApprovals } from '../components/AdvisorApprovals';
@@ -47,12 +49,13 @@ import { clearedByValidation } from '../lib/migrationActions';
 import { resolvePolicy } from '../lib/policies';
 import { preflightRan } from '../lib/phase';
 import { planActions } from '../lib/planActions';
+import { NOTHING_MIGRATED_NEXT, nothingMigrated } from '../lib/planDone';
 import { leftOutText } from '../lib/stats';
 import { PROVIDER_KIND_LABELS, strategyLabel } from '../lib/status';
 import { usePageTitle } from '../lib/usePageTitle';
 import { usePlanFindings } from '../lib/usePlanFindings';
 
-type Confirm = 'validate' | 'start' | 'pause' | 'waves' | null;
+type Confirm = 'validate' | 'start' | 'pause' | 'waves' | 'cancel' | null;
 
 function Setting({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -261,7 +264,8 @@ function ReportBanner({ report }: { report: ValidationReport }) {
 export default function PlanDetail() {
   const { planId = '' } = useParams();
   const plan = usePlan(planId);
-  const migrations = useMigrations({ plan_id: planId });
+  // summaries: what its lists read, not every migration whole (SDD §16, perf audit PF-02)
+  const migrations = useMigrationSummaries({ plan_id: planId });
   const providers = useProviders();
   const stats = useStats(planId);
   const policies = usePolicies();
@@ -352,14 +356,25 @@ export default function PlanDetail() {
   // the primary action follows the derived status (SDD §8.1, ADV-19): Start is hidden once it has nothing to
   // start — while the plan runs (Pause is its action) and once its migrations ended; a Completed plan finalizes
   const ended = p.derived_status === 'completed' || p.derived_status === 'finalized';
+  // every migration it did not cancel rolled back: Completed, and no success (SDD §8.1 rule 6, §16)
+  const migratedNothing = nothingMigrated(p);
   // the advisor policy in force for the plan's strategy decisions (SDD §14.6, §16, ADV-20)
   const stored = policies.data ? resolvePolicy(policies.data.items, p.id, p.source_provider_id, 'migration_strategy') : null;
   const policy = policies.data ? { policy: stored ?? policies.data.default, builtIn: stored === null } : undefined;
   const startShown = p.status !== 'running' && !ended;
+  // a Paused plan resumes, also one validated again while its migrations are at work (SDD §8.1)
+  const resumes = p.derived_status === 'paused';
   const askStart = () => {
     afterActionRef.current = null;
     setConfirm('start');
   };
+  const askCancel = () => {
+    afterActionRef.current = null;
+    setConfirm('cancel');
+  };
+  // whether a migration started is unknown while the migrations cannot be loaded: the API checks anyway (SDD §12)
+  const cancelReason = migrationsUnknown ? 'The migrations could not be loaded: whether one has started is unknown.' : actions.cancel.reason;
+  const unstarted = list.filter((m) => m.phase !== 'cancelled').length;
   const askFinalize = (scope: FinalizeScope) => {
     afterActionRef.current = null;
     setFinalizing(scope);
@@ -375,12 +390,14 @@ export default function PlanDetail() {
         description={p.description ?? undefined}
         meta={
           <>
-            <PlanStatusBadge status={p.derived_status} size="md" />
+            <PlanStatusBadge status={p.derived_status} size="md" nothingMigrated={migratedNothing} />
             <code className="text-xs text-muted-foreground">{p.id}</code>
             <span className="text-xs text-muted-foreground">updated {formatRelative(p.updated_at)}</span>
           </>
         }
         actions={
+          // a cancelled plan offers no action but its history (SDD §12, §16)
+          p.status !== 'cancelled' && (
           <div role="group" aria-label="Plan actions" className="flex flex-wrap gap-2">
             <Button size="lg" icon={Pencil} disabledReason={actions.edit.reason} onClick={() => setEditing(true)}>
               Edit plan
@@ -399,13 +416,16 @@ export default function PlanDetail() {
               Auto-plan waves
             </Button>
             {p.derived_status === 'completed' ? (
-              <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
-                Finalize all
-              </Button>
+              // nothing awaits finalize where nothing was migrated: the next step is each VM's own (SDD §16)
+              !migratedNothing && (
+                <Button size="lg" variant="primary" icon={BadgeCheck} disabledReason={actions.finalize.reason} onClick={() => askFinalize({ wave: null })}>
+                  Finalize all
+                </Button>
+              )
             ) : (
               startShown && (
                 <Button size="lg" variant="primary" icon={Play} disabledReason={actions.start.reason} onClick={askStart}>
-                  {p.status === 'paused' ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
+                  {resumes ? 'Resume' : p.status === 'failed' ? 'Start again' : 'Start'}
                 </Button>
               )
             )}
@@ -414,7 +434,11 @@ export default function PlanDetail() {
                 Pause
               </Button>
             )}
+            <Button size="lg" variant="ghost" icon={Ban} disabledReason={cancelReason} onClick={askCancel}>
+              Cancel plan
+            </Button>
           </div>
+          )
         }
       />
 
@@ -437,6 +461,13 @@ export default function PlanDetail() {
       )}
 
       {stats.error && <ErrorBanner error={stats.error} title="Statistics are unavailable" onRetry={() => void stats.refetch()} className="mb-4" />}
+      {migratedNothing && (
+        // a Completed plan that migrated nothing says so, with the next step (SDD §16)
+        <div role="note" aria-label="Nothing was migrated" className="mb-4 flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <History aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <p className="text-foreground">{NOTHING_MIGRATED_NEXT}</p>
+        </div>
+      )}
       {/* a figure the statistics did not deliver is unknown (—), never a zero (SDD §16) */}
       <section aria-label="Plan metrics" className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
         <KpiTile label="Migrations" value={formatNumber(s?.total ?? migrations.data?.length)} icon={Layers} hint={`${p.waves.length} wave${p.waves.length === 1 ? '' : 's'}`} />
@@ -533,7 +564,7 @@ export default function PlanDetail() {
 
       <ConfirmDialog
         open={confirm === 'start'}
-        title={p.status === 'paused' ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
+        title={resumes ? 'Resume this plan?' : p.status === 'failed' ? 'Start this plan again?' : 'Start this plan?'}
         description={
           <>
             {p.status === 'failed' &&
@@ -542,7 +573,7 @@ export default function PlanDetail() {
             source VMs keep running. {p.require_approval ? 'Every cutover still needs an approver.' : 'Cutovers do not need approval in this plan.'}
           </>
         }
-        confirmLabel={p.status === 'paused' ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
+        confirmLabel={resumes ? 'Resume plan' : p.status === 'failed' ? 'Start again' : 'Start plan'}
         pending={pending('start')}
         error={confirm === 'start' ? action.error : null}
         returnFocusRef={afterActionRef}
@@ -579,6 +610,37 @@ export default function PlanDetail() {
         pending={pending('pause')}
         error={confirm === 'pause' ? action.error : null}
         onConfirm={() => run({ action: 'pause' }, () => setAnnouncement('Plan paused.'))}
+        onCancel={() => {
+          setConfirm(null);
+          action.reset();
+        }}
+      />
+      <ConfirmDialog
+        open={confirm === 'cancel'}
+        tone="danger"
+        icon={Ban}
+        title={`Cancel ${p.name}?`}
+        subject={`Plan ${p.id}`}
+        consequences={[
+          { kind: 'kept', text: 'the plan and its history, shown as Cancelled' },
+          {
+            kind: 'then',
+            text: `its ${unstarted} migration${unstarted === 1 ? ' that has' : 's that have'} not started ${unstarted === 1 ? 'is' : 'are'} cancelled: its VMs can be planned again, and its clouds deleted once no other plan uses them`,
+          },
+        ]}
+        confirmLabel="Cancel plan"
+        cancelLabel="Keep plan"
+        requireText={p.name}
+        pending={pending('cancel')}
+        error={confirm === 'cancel' ? action.error : null}
+        returnFocusRef={afterActionRef}
+        onConfirm={() =>
+          run({ action: 'cancel' }, () => {
+            // the plan's actions go with it: the focus goes to its heading, never the page (SDD §16)
+            afterActionRef.current = headingRef.current;
+            setAnnouncement('Plan cancelled.');
+          })
+        }
         onCancel={() => {
           setConfirm(null);
           action.reset();

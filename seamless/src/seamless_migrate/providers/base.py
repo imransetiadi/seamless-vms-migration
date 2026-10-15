@@ -12,6 +12,10 @@ class ProviderError(Exception):
     """A provider could not be reached or answered with an error (message is credential-free)."""
 
 
+class VMNotFound(ProviderError):
+    """The cloud answered that it has no such VM (SDD §10): gone, never merely unreachable."""
+
+
 @runtime_checkable
 class SourceProvider(Protocol):
     async def check(self) -> dict[str, Any]: ...
@@ -39,6 +43,21 @@ class DestinationProvider(Protocol):
 
     async def find_server(self, name: str) -> str | None:
         """Id of the destination server called ``name`` (extension used by executors)."""
+        ...
+
+    async def ports(
+        self,
+        *,
+        network_id: str | None = None,
+        mac_address: str | None = None,
+        ip_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The ports the credential sees that match every filter given:
+        ``[{id, name, network_id, device_id, mac_address, fixed_ips: [address, ...]}]``."""
+        ...
+
+    async def delete_port(self, port_id: str) -> None:
+        """Delete a port; one already gone is no error."""
         ...
 
 

@@ -1,5 +1,5 @@
 # Modified by the Seamless Migrate project, 2026.
-OS_MIGRATE_VERSION = "1.1.0"  # updated by build.sh
+OS_MIGRATE_VERSION = "1.1.0"  # galaxy.yml's version (tests/unit/test_version.py)
 
 # Main serialization sections
 RES_PARAMS = "params"

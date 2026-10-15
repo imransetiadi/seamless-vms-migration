@@ -1,9 +1,9 @@
 import { Bot, BrainCircuit, CircleCheck, CircleSlash, CircleX, ScrollText, Search, SearchX, SlidersHorizontal } from 'lucide-react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { useId, useMemo, useState, type FormEvent, type ReactNode } from 'react';
-import { useAdvisorStatus, useMigrations, usePlans, useRecommendations, useSimilarIncidents } from '../api/hooks';
+import { useId, useMemo, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
+import { useAdvisorNotes, useAdvisorStatus, useMigration, usePlans, useRecommendations, useSimilarIncidents } from '../api/hooks';
 import { useRole } from '../api/session';
-import { ADVISOR_QUERY_MAX, DECISION_TYPES, type DecisionType } from '../api/types';
+import { ADVISOR_QUERY_MAX, DECISION_TYPES, type AdvisorRecommendation, type DecisionType } from '../api/types';
 import { AdvisorNotes, type AdvisorNoteRow } from '../components/AdvisorNotes';
 import { Button } from '../components/Button';
 import { EmptyState } from '../components/EmptyState';
@@ -17,7 +17,7 @@ import { RecommendationActions } from '../components/RecommendationActions';
 import { RecommendationList, RecommendationPager } from '../components/Recommendations';
 import { LoadingBlock } from '../components/Skeleton';
 import { StatusBadge } from '../components/StatusBadge';
-import { DECISION_TYPE_LABELS, nonStrategyNotes } from '../lib/advisor';
+import { DECISION_TYPE_LABELS } from '../lib/advisor';
 import { buttonClassName } from '../lib/buttonStyles';
 import { formatPct } from '../lib/format';
 import { can, hasRole } from '../lib/roles';
@@ -26,6 +26,8 @@ import { usePageTitle } from '../lib/usePageTitle';
 const SUGGESTIONS = ['kernel panic after import', 'warm sync does not converge', 'volume type not mapped', 'MTU after cutover'];
 /** Recommendations per page of the feed. */
 const FEED_PAGE = 20;
+/** Advisor notes the page shows, the newest (SDD §16). */
+const NOTES_SHOWN = 20;
 
 function ServiceCard({
   title,
@@ -78,11 +80,32 @@ function ServiceCard({
   );
 }
 
+/**
+ * Approve or override a decision that waits for a person, while its migration - read alone, not with every
+ * migration - still holds on it (SDD §14.6, §16).
+ */
+function WaitingDecision({
+  rec,
+  migrationId,
+  focusAfterRef,
+  onDecided,
+}: {
+  rec: AdvisorRecommendation;
+  migrationId: string;
+  focusAfterRef?: RefObject<HTMLElement>;
+  onDecided: (message: string) => void;
+}) {
+  const migration = useMigration(migrationId).data;
+  return migration && migration.advisor_hold === rec.id ? (
+    <RecommendationActions rec={rec} migration={migration} focusAfterRef={focusAfterRef} onDecided={onDecided} />
+  ) : null;
+}
+
 export default function Advisor() {
   usePageTitle('Advisor');
   const queryId = useId();
   const status = useAdvisorStatus();
-  const migrations = useMigrations();
+  const notesQuery = useAdvisorNotes(NOTES_SHOWN);
   const search = useSimilarIncidents();
   const role = useRole();
   const canSearch = hasRole(role, 'operator');
@@ -121,16 +144,11 @@ export default function Advisor() {
           ? null
           : 'agentmemory is not enabled.';
 
-  // a decision that waits for a person is decided in the feed (SDD §14.6): the held migration knows it
-  const byId = useMemo(() => new Map((migrations.data ?? []).map((m) => [m.id, m])), [migrations.data]);
   const [decided, setDecided] = useState('');
+  // the newest notes of every migration, from the API: the page reads no migration list (SDD §12, §16)
   const notes = useMemo<AdvisorNoteRow[]>(
-    () =>
-      (migrations.data ?? [])
-        .flatMap((m) => nonStrategyNotes(m.advisor_notes).map((n) => ({ ...n, vmName: m.vm.name, migrationId: m.id })))
-        .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
-        .slice(0, 20),
-    [migrations.data],
+    () => (notesQuery.data?.items ?? []).map((n) => ({ ...n, vmName: n.vm_name, migrationId: n.migration_id })),
+    [notesQuery.data],
   );
 
   const run = (text: string) => {
@@ -226,12 +244,12 @@ export default function Advisor() {
               <RecommendationList
                 items={recommendations.data.items}
                 emptyText={planFilter || typeFilter ? 'No recommendations match these filters.' : 'No recommendations yet.'}
-                actionsFor={(rec, focusAfterRef) => {
-                  const m = rec.migration_id ? byId.get(rec.migration_id) : undefined;
-                  return can(role, 'advisor.approve') && m && m.advisor_hold === rec.id ? (
-                    <RecommendationActions rec={rec} migration={m} focusAfterRef={focusAfterRef} onDecided={setDecided} />
-                  ) : null;
-                }}
+                actionsFor={(rec, focusAfterRef) =>
+                  // only a pending_approval decision holds its migration (SDD §14.6)
+                  can(role, 'advisor.approve') && rec.migration_id && rec.decision.status === 'pending_approval' ? (
+                    <WaitingDecision rec={rec} migrationId={rec.migration_id} focusAfterRef={focusAfterRef} onDecided={setDecided} />
+                  ) : null
+                }
               />
               <RecommendationPager offset={recommendations.data.offset} limit={FEED_PAGE} total={recommendations.data.total} onChange={setFeedOffset} />
             </>
@@ -322,10 +340,10 @@ export default function Advisor() {
           </Panel>
 
           <Panel title="Recent advisor notes" description="Classification, verification, screening and similar incidents across all migrations, newest first">
-            {migrations.isPending ? (
+            {notesQuery.isPending ? (
               <LoadingBlock rows={4} />
-            ) : migrations.error ? (
-              <ErrorBanner error={migrations.error} title="Advisor notes are unavailable" onRetry={() => void migrations.refetch()} />
+            ) : notesQuery.error ? (
+              <ErrorBanner error={notesQuery.error} title="Advisor notes are unavailable" onRetry={() => void notesQuery.refetch()} />
             ) : (
               <AdvisorNotes notes={notes} emptyText="No advisor notes yet." />
             )}

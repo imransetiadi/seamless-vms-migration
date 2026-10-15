@@ -23,6 +23,7 @@ import { probesFor } from '../lib/probes';
 import { hasRole, OWN_CUTOVER, OWN_DECISION, OWN_FORCE } from '../lib/roles';
 import { stable } from '../lib/stable';
 import { endedPassBytes } from '../lib/transfer';
+import { summaryOf } from '../lib/summary';
 import { isWaveActive, WAVE_COMPLETE_PHASES } from '../lib/waves';
 import {
   buildFixtures,
@@ -51,6 +52,8 @@ import type {
   ProbeKind,
   ProbeResult,
   VerificationCheck,
+  AdvisorNoteEntry,
+  AdvisorNoteList,
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
@@ -81,6 +84,8 @@ import type {
 import {
   ACTION_TEXT_MAX,
   ADVISOR_LIMIT_MAX,
+  ADVISOR_NOTES_LIMIT_DEFAULT,
+  ADVISOR_NOTES_LIMIT_MAX,
   ADVISOR_QUERY_MAX,
   AUDIT_EVENT_KINDS,
   DECISION_TYPES,
@@ -272,7 +277,7 @@ function probeProblemsOf(where: string, value: unknown): string[] {
 
 /** The API's `PLAN_EDITABLE_FIELDS` (SDD §12): what a `PlanCreate` and a PATCH may carry. */
 export const PLAN_EDITABLE_FIELDS: ReadonlySet<string> = new Set([
-  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'created_at', 'updated_at'].includes(key)),
+  ...Object.keys(defaultPlanFields(0)).filter((key) => !['waves', 'derived_status', 'migration_counts', 'created_at', 'updated_at'].includes(key)),
   'name',
   'source_provider_id',
   'destination_provider_id',
@@ -521,6 +526,8 @@ function intParam(query: URLSearchParams, name: string, fallback: number, min: n
 
 /** Phases in which a migration lets its VM go: another plan may migrate it (SDD §5.4), as in the API. */
 const RELEASES_VM: ReadonlySet<Phase> = new Set(['cancelled', 'finalized', 'rolled_back']);
+/** The API's refusal of a finalize while the source watch sees the source VM running again (SDD §8.1). */
+const SOURCE_RUNS_AGAIN = 'the source VM runs again: stop it, or roll it back, before finalizing';
 /** Phases in which a step runs for the migration (the API's ACTIVE_STEP_PHASES): they fill a wave's max_parallel. */
 const ACTIVE_STEP_PHASES: ReadonlySet<Phase> = new Set(['precopy', 'syncing', 'cutover', 'verifying', 'rolling_back']);
 /** Phases validation evaluates again; a VM taken out of the plan has its migration cancelled in these. */
@@ -579,12 +586,13 @@ export class MockServer {
   private readonly users = new Map<string, Me>();
   /** What GET /health answers; tests flip it to a degraded state. */
   health: Health = {
-    auth_disabled: true,
     status: 'ok',
     version: '0.1.0-mock',
     demo: true,
     // the simulation's model time is its wall time: passes, downtimes and clocks share one base (ADV-16)
     demo_speed: 1,
+    // no token is the anonymous admin, as with authentication off (SDD §13.1)
+    auth_disabled: true,
     db: 'ok',
     orchestrator: { running: true, last_tick_age_s: 0.4, ticks: 1200, healthy: true },
   };
@@ -917,6 +925,8 @@ export class MockServer {
     // like the simulated executor (SDD §5.2): the seconds the source stayed stopped for the step, here at wall speed
     if (m.downtime_started_at) m.downtime_model_s = Math.round((this.now() - Date.parse(m.downtime_started_at)) / 100) / 10;
     m.checkpoint = 'cutover';
+    // like the control plane (SDD §7.2): the cutover got past what the passes said it would refuse
+    m.cutover_refusals = [];
     this.transition(m, 'verifying', 'destination server created', 'orchestrator');
   }
 
@@ -1333,7 +1343,11 @@ export class MockServer {
         // the API's bounds (SDD §12): limit 1…5000, default all; offset from 0
         const limit = intParam(query, 'limit', rows.length, 1, 5000);
         const offset = intParam(query, 'offset', 0, 0);
-        return ok(rows.slice(offset, offset + limit));
+        // each as its summary, as the API builds it (SDD §4, §12)
+        const view = query.get('view') ?? 'full';
+        if (view !== 'full' && view !== 'summary') throw new HttpError(422, 'validation_error', "query.view: Input should be 'full' or 'summary'");
+        const page = rows.slice(offset, offset + limit);
+        return ok(view === 'summary' ? page.map(summaryOf) : page);
       }
       if (id && !sub && method === 'GET') {
         this.require(token, 'viewer', path);
@@ -1416,6 +1430,10 @@ export class MockServer {
       if (id === 'recommendations' && method === 'GET') {
         this.require(token, 'viewer', path);
         return ok(sub === undefined ? this.listRecommendations(query) : this.recommendation(sub));
+      }
+      if (id === 'notes' && sub === undefined && method === 'GET') {
+        this.require(token, 'viewer', path);
+        return ok(this.listAdvisorNotes(query));
       }
       if (id === 'similar-incidents' && method === 'POST') {
         this.require(token, 'operator', path);
@@ -1585,6 +1603,19 @@ export class MockServer {
     return { items: items.slice(offset, offset + limit), total: items.length, offset, limit };
   }
 
+  /**
+   * Every migration's advisor notes but strategy notes - those read as legacy recommendations - newest first, like the
+   * API (SDD §12): a stable sort keeps notes of the same time in the migrations' creation order and each one's note order.
+   */
+  private listAdvisorNotes(query: URLSearchParams): AdvisorNoteList {
+    const limit = intParam(query, 'limit', ADVISOR_NOTES_LIMIT_DEFAULT, 1, ADVISOR_NOTES_LIMIT_MAX);
+    const items: AdvisorNoteEntry[] = this.migrations.flatMap((m) =>
+      m.advisor_notes.filter((n) => n.kind !== 'strategy').map((n) => ({ ...n, migration_id: m.id, plan_id: m.plan_id, vm_name: m.vm.name })),
+    );
+    items.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    return { items: items.slice(0, limit) };
+  }
+
   private recommendation(id: string): AdvisorRecommendation {
     const found = this.allRecommendations().find((r) => r.id === id);
     if (!found) throw new HttpError(404, 'not_found', `recommendation ${id} not found`);
@@ -1736,13 +1767,18 @@ export class MockServer {
     if (sub === 'validate' && method === 'POST') return this.validatePlan(this.require(token, 'operator', path), this.plan(id));
     if (sub === 'start' && method === 'POST') return this.startPlan(this.require(token, 'operator', path), this.plan(id));
     if (sub === 'pause' && method === 'POST') return this.pausePlan(this.require(token, 'operator', path), this.plan(id));
+    if (sub === 'cancel' && method === 'POST') return this.cancelPlan(this.require(token, 'operator', path), this.plan(id), input);
     if (sub === 'finalize' && method === 'POST') return this.finalizePlan(this.require(token, 'approver', path), this.plan(id), input);
     return null;
   }
 
-  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19). */
+  /** Every plan the API returns carries its derived status (SDD §8.1, ADV-19) and its migrations counted by phase (§4). */
   private withDerivedStatus(res: MockResponse): MockResponse {
-    const out = (plan: Plan): Plan => ({ ...plan, derived_status: derivePlanStatus(plan, this.migrations) });
+    const out = (plan: Plan): Plan => {
+      const counts: Plan['migration_counts'] = {};
+      for (const m of this.migrations) if (m.plan_id === plan.id) counts[m.phase] = (counts[m.phase] ?? 0) + 1;
+      return { ...plan, derived_status: derivePlanStatus(plan, this.migrations), migration_counts: counts };
+    };
     const isPlan = (value: unknown): value is Plan => typeof value === 'object' && value !== null && 'vm_ids' in value && 'waves' in value;
     if (Array.isArray(res.body)) return { ...res, body: res.body.map((item: unknown) => (isPlan(item) ? out(item) : item)) };
     return isPlan(res.body) ? { ...res, body: out(res.body) } : res;
@@ -1763,6 +1799,11 @@ export class MockServer {
     const finalized: Migration[] = [];
     const skipped: Array<{ migration_id: string; reason: string }> = [];
     for (const m of waiting) {
+      // like the API (SDD §8.1): every VM whose source runs again, also one whose finalize began deleting it
+      if (m.source_running_at) {
+        skipped.push({ migration_id: m.id, reason: SOURCE_RUNS_AGAIN });
+        continue;
+      }
       // like the API: one VM's error skips that VM, never the others (SDD §8.1)
       try {
         this.migrationAction(me, m, 'finalize', { confirm: m.vm.name, delete_source: Boolean(input.delete_source) });
@@ -1858,16 +1899,29 @@ export class MockServer {
   /**
    * The plans that still need a provider, like the API (SDD §12), in creation order with why: one that has not
    * completed (a failed one can start again), or a completed one with a migration that holds its VM — it can be
-   * rolled back until it is finalized, and its rollback needs both providers (§8.1).
+   * rolled back until it is finalized, and its rollback needs both providers (§8.1) — or with a rolled-back one that
+   * kept its copied data: its warm rollback kept the destination volumes for a retry, and a cancel cleans them up
+   * with both providers (§5.1).
    */
   private plansThatNeed(providerId: string): string[] {
     const plans = this.plans
       .filter((p) => p.source_provider_id === providerId || p.destination_provider_id === providerId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return plans.flatMap((p) => {
+      // a cancelled plan's migrations are all cancelled, and the mock's cleanup after a cancel ends at once: none is
+      // pending, as one keeps the API's providers (SDD §5.1, §12)
+      if (p.status === 'cancelled') return [];
       if (p.status !== 'completed') return [`${p.id} ("${p.name}", ${p.status})`];
-      const n = this.migrations.filter((m) => m.plan_id === p.id && !RELEASES_VM.has(m.phase)).length;
-      return n ? [`${p.id} ("${p.name}", ${n} VM${n === 1 ? '' : 's'} not finalized)`] : [];
+      const mine = this.migrations.filter((m) => m.plan_id === p.id);
+      const n = mine.filter((m) => !RELEASES_VM.has(m.phase)).length;
+      // the mock keeps no record: like the API without one, passes of a strategy other than cold - a cold rollback deleted
+      // what it copied (SDD §5.1, §12)
+      const kept = mine.filter((m) => m.phase === 'rolled_back' && m.strategy !== 'cold' && m.sync_passes.length > 0).length;
+      const why = [
+        ...(n ? [`${n} VM${n === 1 ? '' : 's'} not finalized`] : []),
+        ...(kept ? [`${kept} rolled-back VM${kept === 1 ? ' keeping its' : 's keeping their'} copied data`] : []),
+      ];
+      return why.length ? [`${p.id} ("${p.name}", ${why.join(', ')})`] : [];
     });
   }
 
@@ -1988,6 +2042,7 @@ export class MockServer {
       converged_by: null,
       force_cutover: null,
       data_issues: [],
+      cutover_refusals: [],
       downtime_model_s: null,
       verification: null,
       suggested_probes: [],
@@ -2008,6 +2063,7 @@ export class MockServer {
 
   private validatePlan(me: Me, plan: Plan): MockResponse {
     if (['running', 'completed'].includes(plan.status)) throw new HttpError(409, 'conflict', `A ${plan.status} plan cannot be re-validated.`);
+    if (plan.status === 'cancelled') throw new HttpError(409, 'conflict', 'a cancelled plan cannot be validated');
     const mine = this.migrations.filter((m) => m.plan_id === plan.id);
     const byVm = new Map(mine.map((m) => [m.vm.source_id, m]));
     const selected = new Set(plan.vm_ids);
@@ -2090,6 +2146,43 @@ export class MockServer {
     plan.status = 'paused';
     plan.updated_at = new Date(this.now()).toISOString();
     this.emit({ kind: 'plan.paused', plan_id: plan.id, migration_id: null, actor: me.name, message: `Plan "${plan.name}" paused`, data: {} });
+    return ok(plan);
+  }
+
+  /** POST /plans/{id}/cancel, like the API (SDD §12): retires a plan none of whose migrations started; nothing is deleted. */
+  private cancelPlan(me: Me, plan: Plan, input: Record<string, unknown>): MockResponse {
+    if (plan.status === 'cancelled') return ok(plan);
+    if (plan.status === 'running') throw new HttpError(409, 'conflict', 'pause the plan before cancelling it');
+    const mine = this.migrations.filter((m) => m.plan_id === plan.id);
+    const started = mine.filter((m) => !['pending', 'blocked', 'ready', 'cancelled'].includes(m.phase));
+    if (started.length) {
+      const named = started.map((m) => `${m.vm.name} (${m.phase})`).sort();
+      const rest = named.length - 10;
+      throw new HttpError(
+        409,
+        'conflict',
+        `only a plan whose migrations have not started can be cancelled: ${named.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+          'cancel a failed or rolled-back migration on its own first, which cleans up what it copied',
+      );
+    }
+    const reason = typeof input.reason === 'string' && input.reason.trim() ? input.reason.trim() : null;
+    const todo = mine.filter((m) => m.phase !== 'cancelled').sort((a, b) => (a.id < b.id ? -1 : 1));
+    // like the API (SDD §12): refused before any change while a source is stopped - a cancel cannot restart it
+    const stopped = todo.filter((m) => m.downtime_started_at && !m.downtime_ended_at).map((m) => m.vm.name).sort();
+    if (stopped.length) {
+      const rest = stopped.length - 10;
+      throw new HttpError(
+        409,
+        'conflict',
+        `the source VM is stopped after a failed cutover: ${stopped.slice(0, 10).join(', ')}${rest > 0 ? ` and ${rest} more` : ''}; ` +
+          'cut it over before cancelling the plan - a cancel cannot restart it',
+      );
+    }
+    // each one as POST /migrations/{id}/cancel does, with its own event
+    for (const m of todo) this.migrationAction(me, m, 'cancel', { reason: reason ? `plan cancelled: ${reason}` : 'plan cancelled' });
+    plan.status = 'cancelled';
+    plan.updated_at = new Date(this.now()).toISOString();
+    this.emit({ kind: 'plan.cancelled', plan_id: plan.id, migration_id: null, actor: me.name, message: `${plan.name} cancelled`, data: { reason, migrations: todo.length } });
     return ok(plan);
   }
 
@@ -2286,6 +2379,10 @@ export class MockServer {
       case 'finalize': {
         // like the API (SDD §12): the phase first, then the typed name
         if (m.phase !== 'completed') throw new HttpError(409, 'conflict', `only completed migrations can be finalized (${m.phase})`);
+        // like the API (SDD §8.1): not while the source runs again, unless a finalize began deleting it
+        if (m.source_running_at && m.checkpoint !== 'finalizing') {
+          throw new HttpError(409, 'conflict', SOURCE_RUNS_AGAIN);
+        }
         if (input.confirm !== m.vm.name) throw new HttpError(400, 'bad_request', `Type the VM name "${m.vm.name}" exactly to finalize.`);
         this.transition(m, 'finalized', input.delete_source ? 'finalized; source deleted' : 'finalized; source kept (stopped)', me.name);
         m.checkpoint = 'finalized'; // the API's checkpoint values (SDD §8.1)

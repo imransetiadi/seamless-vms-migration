@@ -81,7 +81,7 @@ wait polls the right port.
 | `seamless-ps` / `seamless-logs` | status / follow logs (`SEAMLESS_SERVICE=seamless` to filter) |
 | `seamless-reset` | **deletes** containers and volumes; needs `CONFIRM=yes` |
 | `seamless-test` | `cd seamless && .venv/bin/pytest -q` (export `SEAMLESS_TEST_PG_URL` to include PostgreSQL) |
-| `seamless-check` | the full local gate: control-plane tests + ruff, collection tests + lint, dashboard typecheck/lint/tests/build |
+| `seamless-check` | CI's checks that need only the venv and the dashboard's `node_modules`: control-plane tests with the coverage gate, ruff, DEMO-07, collection tests, playbook syntax and ansible-lint, the installed scanners, dashboard unit tests and build — not all of CI: it leaves out the Playwright suite and the browser journeys, the PostgreSQL store tests, the dependency audits, trivy's configuration scan and the manifest and image jobs (SDD §17.1; the repository README says how to run each) |
 | `dashboard-build` | `cd dashboard && npm ci && npm run build` |
 
 Variables: `SEAMLESS_COLIMA_PROFILE` (default `seamless`), `SEAMLESS_COLIMA_CPU/MEMORY/DISK`,

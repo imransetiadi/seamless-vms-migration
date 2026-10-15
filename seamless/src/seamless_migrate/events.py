@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from pydantic_core import to_jsonable_python
 
-from .domain.models import Event
+from .domain.models import Event, utcnow
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ PERSISTED_KINDS = frozenset(
         "migration.source_running",
         "migration.source_stopped",
         "plan.finalized",
+        "plan.cancelled",
         "migration.approved",
         "migration.action",
         "advisor.strategy",
@@ -79,6 +81,11 @@ EPHEMERAL_KINDS = frozenset({"migration.progress", "migration.log", "heartbeat"}
 
 _LAGGED = object()
 
+#: How long a stream holds what follows a skipped seq the store does not hold yet, and how often it
+#: reads the store again meanwhile: another process's insert may commit after a later one (SDD §12)
+HOLE_WAIT_S = 2.0
+HOLE_POLL_S = 0.05
+
 
 class Subscription:
     """Async iterator over events; registered with the bus as soon as it is created."""
@@ -90,13 +97,32 @@ class Subscription:
         self._replay_pending = bus.store is not None
         self._buffer: list[Event] = []
         self._closed = False
+        #: the gap held for: the seq sent before it, and since when (time.monotonic)
+        self._hole: tuple[int, float] | None = None
         bus._subscribers.add(self)
 
     @property
     def last_seq(self) -> int:
         return self._last
 
-    def _offer(self, event: Event) -> None:
+    def _held_from(self, page: list[Event]) -> int | None:
+        """Where ``page`` stops for now: at the first event after a skipped seq that may still be
+        committed - the event created less than HOLE_WAIT_S ago, while that gap's wait lasts (SDD
+        §12). None when nothing is held: no gap, an older one, one right after seq 0 (a store whose
+        events were all deleted numbers on from where they ended), or one waited for long enough."""
+        before = self._last
+        for i, event in enumerate(page):
+            recent = (utcnow() - event.ts).total_seconds() < HOLE_WAIT_S
+            if before and event.seq > before + 1 and recent:
+                now = time.monotonic()
+                if self._hole is None or self._hole[0] != before:
+                    self._hole = (before, now)
+                if now - self._hole[1] < HOLE_WAIT_S:
+                    return i
+            before = event.seq
+        return None
+
+    def _offer(self, event: Event | object) -> None:
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -120,6 +146,14 @@ class Subscription:
                 page = await asyncio.to_thread(
                     self._bus.store.events, since_seq=self._last, limit=self._bus.replay_page
                 )
+                held = self._held_from(page)
+                if held is not None:
+                    # an insert of another process may not be committed yet: send what comes
+                    # before it, and read again a moment later, in seq order (SDD §12)
+                    self._buffer.extend(page[:held])
+                    if not held:
+                        await asyncio.sleep(HOLE_POLL_S)
+                    continue
                 self._buffer.extend(page)
                 if len(page) < self._bus.replay_page:
                     self._replay_pending = False
@@ -132,6 +166,11 @@ class Subscription:
             if event.seq:
                 if event.seq <= self._last:
                     continue  # already delivered by the replay
+                if event.seq > self._last + 1 and self._bus.store is not None:
+                    # seqs skipped: another process wrote events to the store meanwhile (the CLI
+                    # beside the server, SDD §12) - read them first, this one with them, in order
+                    self._replay_pending = True
+                    continue
                 self._last = event.seq
             return event
 
@@ -149,6 +188,8 @@ class EventBus:
         self.replay_page = replay_page
         self._subscribers: set[Subscription] = set()
         self._emit_lock: asyncio.Lock | None = None
+        #: the newest seq published here: a newer one in the store came from another process
+        self._published = 0
 
     @property
     def emit_lock(self) -> asyncio.Lock:
@@ -167,8 +208,22 @@ class EventBus:
         """
         if persist and not event.seq:
             raise ValueError("a persisted event must carry its store sequence number")
+        self._published = max(self._published, event.seq)
         for sub in list(self._subscribers):
             sub._offer(event)
+
+    async def catch_up(self) -> None:
+        """Have every stream read what another process wrote to the store - the CLI beside a
+        running server (SDD §12), called each tick: one look at the store's newest seq, and the
+        streams read the store only when it is ahead of the newest published here."""
+        if self.store is None or not self._subscribers:
+            return
+        newest = await asyncio.to_thread(self.store.max_seq)
+        if newest <= self._published:
+            return
+        self._published = newest
+        for sub in list(self._subscribers):
+            sub._offer(_LAGGED)
 
     def subscribe(self, since: int = 0) -> Subscription:
         """Replay persisted events with ``seq > since`` from the store, then stream live ones."""

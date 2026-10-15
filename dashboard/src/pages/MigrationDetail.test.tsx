@@ -25,6 +25,27 @@ describe('MigrationDetail', () => {
     expect(screen.getByText('Approved by approver-1')).toBeInTheDocument();
   });
 
+  it('warns what the cutover will refuse before the source stops, each problem listed, while the passes find it (SDD §7.2, §16)', async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.phase === 'awaiting_cutover' && x.strategy === 'warm');
+    const other = server.migrations.find((x) => x.phase === 'completed');
+    if (!m || !other) throw new Error('fixture: a warm migration awaiting cutover and a completed one');
+    const problems = [
+      "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC 00:50:56:00:00:01",
+      "Destination prerequisites not met: floating IP 203.0.113.7 on network 'ext' does not resolve",
+    ];
+    m.cutover_refusals = problems;
+    other.cutover_refusals = [];
+    const { unmount } = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    const note = await screen.findByRole('note', { name: 'Cutover will refuse' });
+    expect(note).toHaveTextContent('The cutover will refuse this before the source stops.');
+    for (const problem of problems) expect(within(note).getByText(problem)).toBeInTheDocument();
+    unmount();
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${other.id}`, path: '/migrations/:migrationId', token: 'viewer', server });
+    expect(await screen.findByRole('heading', { level: 1 })).toBeInTheDocument();
+    expect(screen.queryByRole('note', { name: 'Cutover will refuse' })).toBeNull();
+  });
+
   it('names the strategy of each earlier attempt beside the attempts count (SDD §4.2, §14.4)', async () => {
     const server = createTestServer();
     const m = server.migrations.find((x) => x.id === 'mig-5d7e2b4a12')!;
@@ -295,7 +316,7 @@ describe('MigrationDetail', () => {
       `/advisor/recommendations/${recId}`,
     );
     const advisor = await screen.findByRole('region', { name: /^advisor$/i });
-    await within(advisor).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await within(advisor).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     expect(within(advisor).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
   });
 
@@ -388,6 +409,32 @@ describe('MigrationDetail', () => {
     renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'admin', server });
     const again = await screen.findByRole('group', { name: /migration actions/i });
     expect(within(again).getByRole('button', { name: /^approve$/i })).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('asks to request, not to start, a cutover another approver must approve, and to start one already approved (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-5003, ready, in a plan with maker-checker
+    m.approvals = [];
+    const openDialog = async () => {
+      const group = await screen.findByRole('group', { name: /migration actions/i });
+      await waitFor(() => expect(within(group).getByRole('button', { name: /^cut over/i })).not.toHaveAttribute('aria-disabled'));
+      await user.click(within(group).getByRole('button', { name: /^cut over/i }));
+      return screen.findByRole('alertdialog');
+    };
+    const view = renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const waits = await openDialog();
+    expect(waits).toHaveAccessibleName(`Request the cutover of ${m.vm.name}?`);
+    expect(waits).toHaveTextContent('The cutover is requested now and starts once another approver approves it. Then the source VM will be stopped');
+    expect(within(waits).getByRole('button', { name: 'Request cutover' })).toBeInTheDocument();
+    expect(within(waits).queryByRole('button', { name: 'Start cutover' })).toBeNull();
+    view.unmount();
+    // rina approved ahead: sari's request starts the cutover
+    m.approvals = [{ actor: 'rina', at: '2026-10-08T11:50:00Z', comment: null }];
+    renderWithApp(<MigrationDetail />, { route: `/migrations/${m.id}`, path: '/migrations/:migrationId', token: 'approver', server });
+    const starts = await openDialog();
+    expect(starts).toHaveAccessibleName(`Cut over ${m.vm.name} now?`);
+    expect(within(starts).getByRole('button', { name: 'Start cutover' })).toBeInTheDocument();
   });
 
   it("does not offer another strategy while the advisor's decision waits for approval, and says why (SDD §12, §14.6, §16)", async () => {
@@ -599,6 +646,26 @@ describe('MigrationDetail', () => {
     const again = await screen.findByRole('dialog', { name: 'Application probes of analytics-db' });
     await user.click(within(again).getByRole('button', { name: "Use the plan's probes" }));
     await waitFor(() => expect(m.vm.source_id in plan.probe_overrides).toBe(false));
+  });
+
+  it("decides whether its plan can be edited from the plan's migration summaries, not the whole list (SDD §16, perf audit PF-02)", async () => {
+    const server = createTestServer();
+    const m = server.migrations.find((x) => x.vm.name === 'analytics-db')!;
+    const reads: string[] = [];
+    renderWithApp(<MigrationDetail />, {
+      route: `/migrations/${m.id}`,
+      path: '/migrations/:migrationId',
+      token: 'operator',
+      server,
+      wrapFetch: (mock) => (input, init) => {
+        if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+        return mock(input, init);
+      },
+    });
+    const panel = await screen.findByRole('region', { name: 'Network' });
+    await within(panel).findByRole('button', { name: 'Edit network' });
+    await waitFor(() => expect(reads.filter((r) => r.startsWith('/migrations?'))).not.toEqual([]));
+    expect(new Set(reads.filter((r) => r.startsWith('/migrations?')))).toEqual(new Set([`/migrations?plan_id=${m.plan_id}&view=summary`]));
   });
 
   it("shows where each NIC goes and lets an operator send it to another network with other addresses (SDD §16)", async () => {

@@ -1,9 +1,10 @@
-import { QueryClient, QueryObserver } from '@tanstack/react-query';
+import { focusManager, QueryClient, QueryObserver, type QueryKey } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
-import { applyEventToCache, createBatchedInvalidator, refetchAfterReconnect } from './live';
+import { applyEventToCache, createBatchedInvalidator, documentVisibility, keepStreamFresh, refetchAfterReconnect, type LiveStatus } from './live';
 import { buildFixtures } from './mockData';
-import type { Event, Migration } from './types';
+import { summaryOf } from '../lib/summary';
+import { AUDIT_EVENT_KINDS, type Event, type Migration, type MigrationSummary } from './types';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const migration = fx.migrations.find((m) => m.phase === 'precopy') as Migration;
@@ -27,6 +28,12 @@ function setup(m: Migration = migration) {
   queryClient.setQueryData(['migrations', { plan_id: m.plan_id }], [m]);
   const invalidate = vi.fn();
   return { queryClient, invalidate };
+}
+
+/** Holds `queryKey` with an enabled observer, as a page that shows it does; its data stays as it is (SDD §16). */
+function heldByPage(queryClient: QueryClient, queryKey: readonly unknown[]): () => void {
+  const observer = new QueryObserver(queryClient, { queryKey, queryFn: async () => queryClient.getQueryData(queryKey) ?? null, staleTime: Infinity });
+  return observer.subscribe(() => {});
 }
 
 const MiB = 2 ** 20;
@@ -53,6 +60,40 @@ describe('applyEventToCache', () => {
     expect(queryClient.getQueryData<Migration>(['migration', m.id])).toMatchObject(expected);
     expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: m.plan_id }])?.[0]).toMatchObject(expected);
     expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it('leaves a cached list that does not hold the migration untouched, so nothing reading it is told of a change (SDD §16, perf PF-05)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.parse('2026-10-08T12:00:00Z'));
+      const { queryClient, invalidate } = setup();
+      const other = fx.migrations.find((m) => m.plan_id !== migration.plan_id)!;
+      const elsewhere = [other];
+      queryClient.setQueryData(['migrations', { plan_id: other.plan_id }], elsewhere);
+      // a list of every plan holds it among others
+      queryClient.setQueryData(['migrations', {}], [other, migration]);
+      const before = queryClient.getQueryState(['migrations', { plan_id: other.plan_id }])!.dataUpdatedAt;
+      const notified = vi.fn();
+      const observer = new QueryObserver(queryClient, { queryKey: ['migrations', { plan_id: other.plan_id }], enabled: false, notifyOnChangeProps: 'all' });
+      const unsubscribe = observer.subscribe(notified);
+      vi.setSystemTime(Date.parse('2026-10-08T12:00:05Z'));
+      applyEventToCache(queryClient, progressEvent({ pct: 41, bytes_done: MiB }), invalidate);
+      // the event's data is the pass that ended (SDD §4.3)
+      const ended = { number: 9, kind: 'delta', started_at: '2026-10-08T12:00:00Z', ended_at: '2026-10-08T12:00:04Z', bytes_scanned: 0, bytes_changed: 0, bytes_transferred: MiB, duration_s: 4 };
+      applyEventToCache(queryClient, { ...progressEvent(ended), seq: 60, kind: 'migration.sync_pass' }, invalidate);
+      expect(queryClient.getQueryData(['migrations', { plan_id: other.plan_id }])).toBe(elsewhere);
+      expect(queryClient.getQueryState(['migrations', { plan_id: other.plan_id }])!.dataUpdatedAt).toBe(before);
+      expect(notified).not.toHaveBeenCalled();
+      // the lists that hold it are patched, the others in them kept as they are
+      expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.progress_pct).toBe(41);
+      const all = queryClient.getQueryData<Migration[]>(['migrations', {}])!;
+      expect(all[1]?.progress_pct).toBe(41);
+      expect(all[1]?.sync_passes.some((p) => p.number === 9)).toBe(true);
+      expect(all[0]).toBe(other);
+      unsubscribe();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('adds the pass a sync_pass event carries, so the next step does not drop the transferred figure (SDD §4.3, §16)', () => {
@@ -136,7 +177,8 @@ describe('applyEventToCache', () => {
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 42, kind: 'migration.phase' }, invalidate);
     expect(invalidate).toHaveBeenCalledWith(['migrations']);
     expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
-    expect(invalidate).toHaveBeenCalledWith(['plans', migration.plan_id]);
+    // the plan list with its plan: their status and migration counts follow the phases (SDD §16)
+    expect(invalidate).toHaveBeenCalledWith(['plans']);
     expect(invalidate).toHaveBeenCalledWith(['stats']);
 
     invalidate.mockClear();
@@ -152,6 +194,20 @@ describe('applyEventToCache', () => {
       expect(invalidate, kind).toHaveBeenCalledWith(['events', 'tail']);
       expect(invalidate, kind).toHaveBeenCalledWith(['migration', migration.id]);
     }
+  });
+
+  it.each(AUDIT_EVENT_KINDS)('refreshes the audit lists on %s, which the live audit page shows (SDD §14.5, §16)', (kind) => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: migration.id }), seq: 50, kind }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['events', 'tail']);
+  });
+
+  it('still reads the forced migration again on a Force cutover, an audit event too (SDD §5.4, §14.5)', () => {
+    const { queryClient, invalidate } = setup();
+    applyEventToCache(queryClient, { ...progressEvent({ target_id: migration.id }), seq: 51, kind: 'migration.force_cutover' }, invalidate);
+    expect(invalidate).toHaveBeenCalledWith(['events', 'tail']);
+    expect(invalidate).toHaveBeenCalledWith(['migration', migration.id]);
+    expect(invalidate).toHaveBeenCalledWith(['stats']);
   });
 
   it("refreshes the migrations lists on a decision: approving clears a hold another viewer's plan page shows (SDD §14.6)", () => {
@@ -184,6 +240,35 @@ describe('applyEventToCache', () => {
     invalidate.mockClear();
     applyEventToCache(queryClient, { ...progressEvent({}), seq: 45, kind: 'migration.phase' }, invalidate);
     expect(invalidate).not.toHaveBeenCalledWith(['advisor', 'recommendations']);
+  });
+
+  it('patches a summary list with the percentage alone, and leaves it out of a pass (SDD §16, perf audit PF-02)', () => {
+    const { queryClient, invalidate } = setup();
+    const key = ['migrations', { view: 'summary' }];
+    queryClient.setQueryData(key, [summaryOf(migration)]);
+    applyEventToCache(queryClient, progressEvent({ pct: 41, bytes_done: MiB }), invalidate);
+    expect(queryClient.getQueryData<MigrationSummary[]>(key)).toEqual([{ ...summaryOf(migration), progress_pct: 41 }]);
+    // the full list takes the bytes too
+    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.progress_pct).toBe(41);
+    const before = queryClient.getQueryData(key);
+    const ended = { number: 9, kind: 'delta', started_at: '2026-10-08T12:00:00Z', ended_at: '2026-10-08T12:00:04Z', bytes_scanned: 0, bytes_changed: 0, bytes_transferred: MiB, duration_s: 4 };
+    applyEventToCache(queryClient, { ...progressEvent(ended), seq: 60, kind: 'migration.sync_pass' }, invalidate);
+    // a summary holds no passes: the next read brings what the pass changed
+    expect(queryClient.getQueryData(key)).toBe(before);
+    expect(queryClient.getQueryData<Migration[]>(['migrations', { plan_id: migration.plan_id }])?.[0]?.sync_passes.some((p) => p.number === 9)).toBe(true);
+  });
+
+  it('refreshes the advisor notes on an advisor event, and only then (SDD §16, perf audit PF-02)', () => {
+    for (const kind of ['advisor.classification', 'advisor.verification', 'advisor.similar_incidents', 'advisor.strategy']) {
+      const { queryClient, invalidate } = setup();
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 46, kind }, invalidate);
+      expect(invalidate.mock.calls.map(([key]) => key), kind).toContainEqual(['advisor', 'notes']);
+    }
+    const { queryClient, invalidate } = setup();
+    for (const kind of ['migration.phase', 'migration.error', 'decision.approved', 'recommendation.created', 'plan.updated']) {
+      applyEventToCache(queryClient, { ...progressEvent({}), seq: 47, kind }, invalidate);
+    }
+    expect(invalidate.mock.calls.map(([key]) => key)).not.toContainEqual(['advisor', 'notes']);
   });
 });
 
@@ -354,7 +439,10 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
 
   async function flushed(fetchMigration: (id: string) => Promise<Migration>, lists: Array<[object, Migration[]]>) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    for (const [query, list] of lists) queryClient.setQueryData(['migrations', query], list);
+    for (const [query, list] of lists) {
+      queryClient.setQueryData(['migrations', query], list);
+      heldByPage(queryClient, ['migrations', query]);
+    }
     const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
     const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
     batch.refreshMigration(migration.id);
@@ -391,6 +479,123 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       expect(invalidated).not.toContainEqual(['migrations', { plan_id: 'plan-00000000' }]);
       expect(invalidated).not.toContainEqual(['migrations', {}]);
       expect(invalidated).not.toContainEqual(['migrations']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('puts the summary of a migration read alone into a summary list (SDD §16, perf audit PF-02)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing', progress_pct: 3 };
+      const fetchMigration = vi.fn(async () => fresh);
+      const summaries = (list: Migration[]) => list.map(summaryOf) as unknown as Migration[];
+      const { queryClient, invalidated } = await flushed(fetchMigration, [
+        [{ view: 'summary' }, summaries([other, migration])],
+        [{ plan_id: migration.plan_id, view: 'summary' }, summaries([migration])],
+        [{ plan_id: migration.plan_id }, [migration]],
+      ]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      expect(queryClient.getQueryData(['migrations', { view: 'summary' }])).toEqual([summaryOf(other), summaryOf(fresh)]);
+      expect(queryClient.getQueryData(['migrations', { plan_id: migration.plan_id, view: 'summary' }])).toEqual([summaryOf(fresh)]);
+      expect(queryClient.getQueryData(['migrations', { plan_id: migration.plan_id }])).toEqual([fresh]);
+      expect(invalidated).not.toContainEqual(['migrations', { view: 'summary' }]);
+      expect(invalidated).not.toContainEqual(['migrations', { plan_id: migration.plan_id, view: 'summary' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads nothing for a migration when neither its page nor any migration list is cached (SDD §16, perf PF-04)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMigration = vi.fn(async () => migration);
+      // a page that shows no migration (Providers, Inventory): nothing would take the read
+      const none = await flushed(fetchMigration, []);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      expect(none.invalidated).toEqual([]);
+      expect(none.queryClient.getQueryData(['migration', migration.id])).toBeUndefined();
+      // its own page cached, no list: read once, into the page
+      const page = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      page.setQueryData(['migration', migration.id], migration);
+      heldByPage(page, ['migration', migration.id]);
+      const fresh: Migration = { ...migration, progress_pct: 7 };
+      const read = vi.fn(async () => fresh);
+      const batch = createBatchedInvalidator(page, 400, read);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(page.getQueryData(['migration', migration.id])).toEqual(fresh);
+      batch.dispose();
+      // any migration list cached: read, and each list decides as before
+      await flushed(fetchMigration, [[{ plan_id: 'plan-00000000' }, []]]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads nothing for a migration no page shows: a disabled list or one kept after its page closed is not shown (SDD §16, audit AUD-1)", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMigration = vi.fn(async () => migration);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      // the plan form's summary list while the form is closed, and a panel's while its plan cannot be edited
+      const closed = new QueryObserver(queryClient, { queryKey: ['migrations', { view: 'summary' }], queryFn: async () => [], enabled: false });
+      const unsubscribe = closed.subscribe(() => {});
+      const panel = new QueryObserver(queryClient, { queryKey: ['migrations', { plan_id: migration.plan_id, view: 'summary' }], queryFn: async () => [], enabled: false });
+      const unsubscribePanel = panel.subscribe(() => {});
+      // a list and a migration page kept in the cache after their page closed
+      queryClient.setQueryData(['migrations', { plan_id: migration.plan_id }], [migration]);
+      queryClient.setQueryData(['migration', migration.id], migration);
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+      for (let i = 0; i < 5; i++) batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(800);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      // once a page shows one of them, the event reads the migration again
+      const stop = heldByPage(queryClient, ['migrations', { plan_id: migration.plan_id }]);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      stop();
+      unsubscribe();
+      unsubscribePanel();
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks what it does not read stale, so a page opened after the event - Back included - reads it again (SDD §16, review RR-05)', async () => {
+    vi.useFakeTimers();
+    try {
+      const fresh: Migration = { ...migration, phase: 'syncing' };
+      const fetchMigration = vi.fn(async () => fresh);
+      // the dashboard's default: a read stays fresh for 5 s (main.tsx)
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 5_000 } } });
+      const listKey = ['migrations', { plan_id: migration.plan_id }];
+      // a migration page and a list kept in the cache after their page closed, read just before the event
+      queryClient.setQueryData(['migration', migration.id], migration);
+      queryClient.setQueryData(['migration', other.id], other);
+      queryClient.setQueryData(listKey, [migration, other]);
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+      batch.refreshMigration(migration.id);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      // another migration's page is not marked: no event named it
+      expect(queryClient.getQueryState(['migration', other.id])?.isInvalidated).toBe(false);
+      // Back to the migration's page and to the list, within the 5 s: each reads again as it opens
+      const readPage = vi.fn(async () => fresh);
+      const stopPage = new QueryObserver(queryClient, { queryKey: ['migration', migration.id], queryFn: readPage }).subscribe(() => {});
+      const readList = vi.fn(async () => [fresh, other]);
+      const stopList = new QueryObserver(queryClient, { queryKey: listKey, queryFn: readList }).subscribe(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readPage).toHaveBeenCalledTimes(1);
+      expect(readList).toHaveBeenCalledTimes(1);
+      expect(queryClient.getQueryData(['migration', migration.id])).toEqual(fresh);
+      stopPage();
+      stopList();
+      batch.dispose();
     } finally {
       vi.useRealTimers();
     }
@@ -526,6 +731,9 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       const key = ['migrations', { plan_id: migration.plan_id }];
       const other: Migration = { ...migration, id: 'mig-other', phase: 'cutover' };
       client.setQueryData(key, [migration, other]);
+      // a page shows another list, so the reads happen (SDD §16)
+      client.setQueryData(['migrations', {}], [migration, other]);
+      heldByPage(client, ['migrations', {}]);
       const batch = createBatchedInvalidator(client, 400, async (id) => ({ ...(id === other.id ? other : migration), phase: 'completed' }));
       applyEventToCache(client, { ...progressEvent({}), seq: 88, kind: 'plan.updated', migration_id: null }, batch.invalidate, batch.refreshMigration);
       applyEventToCache(client, { ...progressEvent({}), seq: 89, kind: 'migration.phase' }, batch.invalidate, batch.refreshMigration);
@@ -606,6 +814,277 @@ describe('one migration spliced into the cached lists (SDD §16)', () => {
       batch.dispose();
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("the browser's page visibility (SDD §16, perf audit PF-03)", () => {
+  it("is hidden only for document.visibilityState 'hidden', and hears the page shown again on visibilitychange", () => {
+    const state = vi.spyOn(Document.prototype, 'visibilityState', 'get');
+    try {
+      state.mockReturnValue('visible');
+      expect(documentVisibility.hidden()).toBe(false);
+      state.mockReturnValue('hidden');
+      expect(documentVisibility.hidden()).toBe(true);
+      const shown = vi.fn();
+      const stop = documentVisibility.onVisible(shown);
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).not.toHaveBeenCalled(); // still hidden
+      state.mockReturnValue('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).toHaveBeenCalledTimes(1);
+      stop();
+      document.dispatchEvent(new Event('visibilitychange'));
+      expect(shown).toHaveBeenCalledTimes(1);
+    } finally {
+      state.mockRestore();
+    }
+    // jsdom, like a page in front, is not hidden: the batch flushes as before
+    expect(document.visibilityState).not.toBe('hidden');
+    expect(documentVisibility.hidden()).toBe(false);
+  });
+});
+
+describe('a hidden page holds the live-event batch (SDD §16, perf audit PF-03)', () => {
+  it('reads nothing while the page is hidden and refreshes once, as one batch, when it is shown again', async () => {
+    vi.useFakeTimers();
+    try {
+      const fx2 = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
+      const one = fx2.migrations.find((m) => m.phase === 'precopy') as Migration;
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      queryClient.setQueryData(['migrations', {}], [one]);
+      heldByPage(queryClient, ['migrations', {}]);
+      const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+      const fetchMigration = vi.fn(async () => one);
+      let hidden = true;
+      let shown: (() => void) | null = null;
+      const stopWatching = vi.fn();
+      const visibility = {
+        hidden: () => hidden,
+        onVisible: (listener: () => void) => {
+          shown = listener;
+          return stopWatching;
+        },
+      };
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration, visibility);
+      batch.invalidate(['plans']);
+      batch.invalidate(['stats']);
+      batch.invalidate(['plans']);
+      batch.refreshMigration(one.id);
+      // a background tab: no batch timer wakes it - counted on the fake clock: a spy on the global setTimeout, made
+      // while the fake timers are installed, would be restored to the fake before the next test (restoreMocks), and no
+      // later test's own timer would ever fire
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      // nothing is read again
+      expect(spy).not.toHaveBeenCalled();
+      expect(fetchMigration).not.toHaveBeenCalled();
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy.mock.calls.map(([filters]) => filters?.queryKey)).toEqual([['plans'], ['stats']]);
+      expect(fetchMigration).toHaveBeenCalledTimes(1);
+      // shown with nothing waiting: nothing more is read
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy).toHaveBeenCalledTimes(2);
+      batch.dispose();
+      expect(stopWatching).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reads a migration once the page is shown again, also when nothing else waits', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const page = { ...(buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration), id: 'mig-0000000001' };
+      // its page shows it, so the read is wanted (PF-04)
+      queryClient.setQueryData(['migration', page.id], page);
+      heldByPage(queryClient, ['migration', page.id]);
+      const fetchMigration = vi.fn(async () => page);
+      let hidden = true;
+      let shown: (() => void) | null = null;
+      const batch = createBatchedInvalidator(queryClient, 400, fetchMigration, {
+        hidden: () => hidden,
+        onVisible: (listener) => {
+          shown = listener;
+          return () => {};
+        },
+      });
+      batch.refreshMigration('mig-0000000001');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(fetchMigration).not.toHaveBeenCalled();
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(fetchMigration).toHaveBeenCalledWith('mig-0000000001');
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds a batch whose timer started before the page was hidden', async () => {
+    vi.useFakeTimers();
+    try {
+      const queryClient = new QueryClient();
+      const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+      let hidden = false;
+      let shown: (() => void) | null = null;
+      const batch = createBatchedInvalidator(queryClient, 400, undefined, {
+        hidden: () => hidden,
+        onVisible: (listener) => {
+          shown = listener;
+          return () => {};
+        },
+      });
+      batch.invalidate(['plans']);
+      hidden = true;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(spy).not.toHaveBeenCalled();
+      hidden = false;
+      shown!();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(spy).toHaveBeenCalledTimes(1);
+      batch.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('a batch with many migrations to read (SDD §16, perf audit PF-03)', () => {
+  async function batchOf(count: number) {
+    const base = buildFixtures(Date.parse('2026-10-08T12:00:00Z')).migrations[0] as Migration;
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // a list a page shows, so the reads are wanted (PF-04)
+    queryClient.setQueryData(['migrations', {}], [base]);
+    heldByPage(queryClient, ['migrations', {}]);
+    const spy = vi.spyOn(queryClient, 'invalidateQueries').mockResolvedValue(undefined);
+    const fetchMigration = vi.fn(async (id: string) => ({ ...base, id }));
+    const batch = createBatchedInvalidator(queryClient, 400, fetchMigration);
+    for (let n = 0; n < count; n++) batch.refreshMigration(`mig-${String(n).padStart(10, '0')}`);
+    await vi.advanceTimersByTimeAsync(400);
+    batch.dispose();
+    return { fetchMigration, invalidated: spy.mock.calls.map(([filters]) => filters?.queryKey) };
+  }
+
+  it('reads up to 50 migrations one by one, and past 50 reads the lists and pages again instead', async () => {
+    vi.useFakeTimers();
+    try {
+      const fifty = await batchOf(50);
+      expect(fifty.fetchMigration).toHaveBeenCalledTimes(50);
+      expect(fifty.invalidated).not.toContainEqual(['migrations']);
+      const many = await batchOf(51);
+      expect(many.fetchMigration).not.toHaveBeenCalled();
+      expect(many.invalidated).toEqual(expect.arrayContaining([['migrations'], ['migration']]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('the window regaining focus and the open stream (SDD §16, AUD-3)', () => {
+  /** A query a page shows, read once; how often its query function ran, and how to stop showing it. */
+  async function shown(queryClient: QueryClient, queryKey: QueryKey, fail = false) {
+    let reads = 0;
+    const observer = new QueryObserver(queryClient, {
+      queryKey,
+      queryFn: async () => {
+        reads += 1;
+        if (fail) throw new Error('down');
+        return [];
+      },
+    });
+    const stop = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(reads).toBe(1));
+    return { reads: () => reads, stop };
+  }
+
+  /** The window loses and regains focus once the queries are stale; what focus reads has started. */
+  async function refocus() {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  async function withClient(test: (queryClient: QueryClient, status: { now: LiveStatus }) => Promise<void>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10, refetchOnWindowFocus: true, retry: false } } });
+    queryClient.mount();
+    const status = { now: 'open' as LiveStatus };
+    const stop = keepStreamFresh(queryClient, () => status.now);
+    try {
+      await test(queryClient, status);
+    } finally {
+      stop();
+      queryClient.unmount();
+      focusManager.setFocused(undefined);
+    }
+  }
+
+  it('reads nothing the open stream keeps, and what it does not keep as before', async () => {
+    await withClient(async (queryClient) => {
+      const kept = await Promise.all(
+        [
+          ['migrations', { plan_id: 'p1', view: 'summary' }],
+          ['migration', 'm1'],
+          ['plans'],
+          ['plans', 'p1'],
+          ['stats', 'p1'],
+          ['providers'],
+          ['advisor', 'recommendations', {}],
+          ['advisor', 'notes', 20],
+          ['advisor', 'policies'],
+          ['events', 'tail', {}],
+        ].map((key) => shown(queryClient, key)),
+      );
+      const others = await Promise.all(
+        [['me'], ['health'], ['inventory', 'src-1'], ['advisor', 'status'], ['advisor', 'data-sent']].map((key) => shown(queryClient, key)),
+      );
+      await refocus();
+      expect(kept.map((q) => q.reads())).toEqual(kept.map(() => 1));
+      await vi.waitFor(() => expect(others.map((q) => q.reads())).toEqual(others.map(() => 2)));
+      for (const q of [...kept, ...others]) q.stop();
+    });
+  });
+
+  it('reads them all on focus while the stream is not open', async () => {
+    await withClient(async (queryClient, status) => {
+      const list = await shown(queryClient, ['migrations', {}]);
+      for (const now of ['connecting', 'reconnecting', 'closed', 'unauthorized', 'idle'] as LiveStatus[]) {
+        status.now = now;
+        const before = list.reads();
+        await refocus();
+        await vi.waitFor(() => expect(list.reads()).toBe(before + 1));
+      }
+      list.stop();
+    });
+  });
+
+  it('reads one whose last read failed on focus, the stream open or not', async () => {
+    await withClient(async (queryClient) => {
+      const failed = await shown(queryClient, ['stats', 'p1'], true);
+      await refocus();
+      await vi.waitFor(() => expect(failed.reads()).toBe(2));
+      failed.stop();
+    });
+  });
+
+  it('once stopped (signed out), focus reads them as before', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10, refetchOnWindowFocus: true, retry: false } } });
+    queryClient.mount();
+    try {
+      keepStreamFresh(queryClient, () => 'open')();
+      const list = await shown(queryClient, ['migrations', {}]);
+      await refocus();
+      await vi.waitFor(() => expect(list.reads()).toBe(2));
+      list.stop();
+    } finally {
+      queryClient.unmount();
+      focusManager.setFocused(undefined);
     }
   });
 });

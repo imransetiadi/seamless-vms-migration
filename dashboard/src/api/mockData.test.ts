@@ -369,3 +369,76 @@ describe('mock preflight resolves each NIC\'s RHOSO network like the API (SDD §
     expect(codes(preflight(jump, 'openstack', base, dst.networks, [jump.name], { selected: vms, subnets: dst.subnets, networkDetails: dst.network_details, roles: ['member'] }))).toContain('NET_PORT_NOT_PERMITTED');
   });
 });
+
+describe('mock preflight reports a network RHOSO lacks like the API (SDD §9.3 MAP_NETWORK_MISSING, MAP_NETWORK_PRESTAGED)', () => {
+  const base = buildFixtures(now).plans[0]!;
+  const plan = (prestage: string[], networks: Record<string, string> = {}): Plan => ({
+    ...base,
+    prestage_resources: prestage,
+    mappings: { networks, flavors: {}, volume_types: {}, projects: {} },
+  });
+  const nets = { 'tenant-web': 1500 };
+  const networkFindings = (found: { code: string }[]) => found.filter((f) => f.code.startsWith('MAP_NETWORK_'));
+  const MISSING = 'Add a network mapping or create a same-named network in RHOSO.';
+
+  it('blocks an unmapped VMware port group, which nothing pre-stages (review RT-07)', () => {
+    const vm = makeVm({ id: 'vm-x1', name: 'vmw-01', disks: [{ size_gb: 20 }], nics: [{ network: 'DC9-Unmapped', mac: '00:50:56:00:00:01', fixed_ips: ['10.9.0.5'] }] });
+    for (const prestage of [[], ['networks']]) {
+      expect(networkFindings(preflight(vm, 'vmware', plan(prestage), nets, [vm.name]))).toEqual([
+        {
+          code: 'MAP_NETWORK_MISSING',
+          severity: 'blocker',
+          message: 'No mapping or same-named RHOSO network for: DC9-Unmapped. VMware sources are not pre-staged: map every port group.',
+          remediation: MISSING,
+          strategies: [],
+        },
+      ]);
+    }
+  });
+
+  it('names each missing OpenStack network once, as pre-staged when the plan pre-stages networks', () => {
+    const vm = makeVm({
+      id: 'os-n1',
+      name: 'net-01',
+      disks: [{ size_gb: 20 }],
+      nics: [
+        { network: 'lab-b', mac: 'fa:16:3e:00:00:01', fixed_ips: ['10.9.0.5'] },
+        { network: 'lab-a', mac: 'fa:16:3e:00:00:02', fixed_ips: ['10.9.1.5'] },
+        { network: 'lab-a', mac: 'fa:16:3e:00:00:03', fixed_ips: ['10.9.1.6'] },
+      ],
+    });
+    expect(networkFindings(preflight(vm, 'openstack', plan([]), nets, [vm.name]))).toEqual([
+      { code: 'MAP_NETWORK_MISSING', severity: 'blocker', message: 'No mapping or same-named RHOSO network for: lab-a, lab-b.', remediation: MISSING, strategies: [] },
+    ]);
+    expect(networkFindings(preflight(vm, 'openstack', plan(['networks']), nets, [vm.name]))).toEqual([
+      {
+        code: 'MAP_NETWORK_PRESTAGED',
+        severity: 'info',
+        message: 'Pre-staging creates same-named RHOSO network(s): lab-a, lab-b.',
+        remediation: 'Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.',
+        strategies: [],
+      },
+    ]);
+  });
+
+  it('leaves a NIC its override sends to another network to MAP_NIC_OVERRIDE_INVALID', () => {
+    const vm = makeVm({ id: 'os-n3', name: 'net-03', disks: [{ size_gb: 20 }], nics: [{ network: 'lab-a', mac: 'fa:16:3e:00:00:05', fixed_ips: ['10.9.0.5'] }] });
+    const moved = { ...plan([]), nic_overrides: { 'os-n3': { 'fa:16:3e:00:00:05': { network: 'tenant-web', fixed_ips: null } } } };
+    expect(networkFindings(preflight(vm, 'openstack', moved, nets, [vm.name]))).toEqual([]);
+  });
+
+  it('blocks a mapping whose target RHOSO lacks, also when networks are pre-staged', () => {
+    const vm = makeVm({ id: 'os-n2', name: 'net-02', disks: [{ size_gb: 20 }], nics: [{ network: 'lab-a', mac: 'fa:16:3e:00:00:04', fixed_ips: ['10.9.0.5'] }] });
+    for (const prestage of [[], ['networks']]) {
+      expect(networkFindings(preflight(vm, 'openstack', plan(prestage, { 'lab-a': 'gone-net' }), nets, [vm.name]))).toEqual([
+        {
+          code: 'MAP_NETWORK_MISSING',
+          severity: 'blocker',
+          message: 'Network mapping target(s) do not exist in RHOSO: lab-a -> gone-net.',
+          remediation: 'Fix the mapping: the destination network must exist.',
+          strategies: [],
+        },
+      ]);
+    }
+  });
+});

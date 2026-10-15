@@ -38,7 +38,7 @@ from seamless_migrate.domain.models import (
     next_pass_number,
     utcnow,
 )
-from seamless_migrate.events import AUDIT_KINDS, EventBus
+from seamless_migrate.events import AUDIT_KINDS, EventBus, emit
 from seamless_migrate.executors.base import (
     PermanentStepError,
     StepName,
@@ -461,52 +461,181 @@ async def test_a_validation_leaves_a_removed_vms_migration_that_moved_meanwhile_
     assert kept["vm"] == "web-02" and kept["phase"] in ("rolling_back", "rolled_back")
 
 
-async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_validating(
-    tmp_path, store
-):
-    """SDD §5.4: a validation whose second write failed (a database error, a restart) left a
-    migration in validating; the next validation of the plan re-assesses it like a ready one, so
-    the plan can start and the VM is not held for good."""
+async def test_a_validation_leaves_a_removed_vms_migration_rolled_back_meanwhile(tmp_path, store):
+    """SDD §5.4: an operator may cancel a rolled-back migration (§5.1), but the validation does not:
+    a removed VM's migration whose rollback finished while the validation re-assessed the plan stays
+    rolled back - the operator's move stands - and is named in kept."""
+    from seamless_migrate.domain.models import Migration, Plan
+
     h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    transition = h.orch._transition
-    failed: list[str] = []
+    await h.orch.validate_plan(plan.id, "alice")
+    moved = await h.by_vm(plan.id, "vm-2")
+    moved.phase = P.failed  # a pre-copy failed; the source VM kept running
+    store.put("migration", moved)
+    current = store.get("plan", plan.id, Plan)
+    current.vm_ids = ["vm-1"]
+    store.put("plan", current)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    apply_validation = h.orch._apply_validation
 
-    async def failing_transition(m, version, to, reason, actor="system", data=None):
-        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
-            failed.append(m.id)
-            raise ConnectionError("database connection lost")
-        return await transition(m, version, to, reason, actor, data)
+    async def slow_apply_validation(*args, **kwargs):
+        entered.set()
+        await gate.wait()
+        return await apply_validation(*args, **kwargs)
 
-    h.orch._transition = failing_transition
-    with pytest.raises(ConnectionError):
-        await h.orch.validate_plan(plan.id, "alice")
-    stuck = await h.by_vm(plan.id, "vm-2")
-    assert stuck.phase == P.validating
-
-    report = await h.orch.validate_plan(plan.id, "alice")
-    assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
-    assert (await h.migration(stuck.id)).phase == P.ready
-    assert (await h.plan(plan.id)).status == PlanStatus.validated
+    h.orch._apply_validation = slow_apply_validation
+    validation = asyncio.create_task(h.orch.validate_plan(plan.id, "alice"))
+    await asyncio.wait_for(entered.wait(), 5)
+    await h.orch.rollback(moved.id, "bayu", "keep the source running")
+    await h.wait_phase(moved.id, P.rolled_back)  # the rollback finished before the cancel
+    gate.set()
+    await validation
+    await h.orch.stop()
+    assert store.get("migration", moved.id, Migration).phase == P.rolled_back
+    validated = [e for e in store.events(since_seq=0, limit=100000) if e.kind == "plan.validated"]
+    assert validated[-1].data["kept"] == [{"vm": "web-02", "phase": "rolled_back"}]
 
 
 async def _left_validating(tmp_path, store):
-    """A plan of two VMs whose first validation failed between vm-2's two writes (SDD §5.4)."""
+    """A plan of two VMs that an earlier version's validation left as it was when it failed
+    between vm-2's two writes (a database error, a restart): vm-2 in validating, the plan not
+    validated (SDD §5.4). Validation now writes each migration once, so the state is seeded."""
     h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
-    transition = h.orch._transition
-    failed: list[str] = []
+    await h.orch.validate_plan(plan.id, "alice")
+    stuck = await h.by_vm(plan.id, "vm-2")
+    stuck.phase = P.validating
+    stuck.phase_history = stuck.phase_history[:2]
+    store.put("migration", stuck)
+    left = await h.plan(plan.id)
+    left.status = PlanStatus.draft
+    store.put("plan", left)
+    assert h.history(await h.migration(stuck.id)) == [P.pending, P.validating]
+    return h, plan, stuck
 
-    async def failing_transition(m, version, to, reason, actor="system", data=None):
-        if to in (P.ready, P.blocked) and m.vm.source_id == "vm-2" and not failed:
-            failed.append(m.id)
+
+async def test_a_validation_takes_over_a_migration_an_interrupted_one_left_validating(
+    tmp_path, store
+):
+    """SDD §5.4: an earlier version's validation whose second write failed (a database error, a
+    restart) left a migration in validating; the next validation of the plan re-assesses it like a
+    ready one, so the plan can start and the VM is not held for good."""
+    h, plan, stuck = await _left_validating(tmp_path, store)
+    report = await h.orch.validate_plan(plan.id, "alice")
+    assert {item.migration_id: item.phase for item in report.migrations}[stuck.id] == P.ready
+    taken = await h.migration(stuck.id)
+    assert taken.phase == P.ready
+    # taken over as it was: one transition, written once
+    assert h.history(taken) == [P.pending, P.validating, P.ready]
+    assert (await h.plan(plan.id)).status == PlanStatus.validated
+
+
+async def test_a_validation_writes_each_migration_once_with_the_same_events(tmp_path, store):
+    """SDD §5.4 (control-plane perf audit CP-P6): a new migration is created already assessed - its
+    history pending -> validating -> ready or blocked, in one write - and an existing one takes
+    both transitions in one write; the events stay migration.created for a new one and one
+    migration.phase per transition, in that order."""
+    gpu = vm(3, "gpu-01", flavor_extra_specs={"resources:VGPU": "1"})
+    h, plan = await setup(tmp_path, store, [vm(1), gpu])
+
+    def phase_events(m):
+        return [
+            (e.kind, e.data.get("from"), e.data.get("to"))
+            for e in store.events(migration_id=m.id, limit=1000)
+        ]
+
+    await h.orch.validate_plan(plan.id, "alice")
+    expected = {"vm-1": P.ready, "vm-3": P.blocked}
+    for vm_id, last in expected.items():
+        m = await h.by_vm(plan.id, vm_id)
+        assert store.get_versioned("migration", m.id, Migration)[1] == 1, vm_id
+        assert h.history(m) == [P.pending, P.validating, last]
+        assert phase_events(m) == [
+            ("migration.created", None, None),
+            ("migration.phase", "pending", "validating"),
+            ("migration.phase", "validating", str(last)),
+        ]
+        created, validating, assessed = store.events(migration_id=m.id, limit=1000)
+        assert created.data == {"vm": m.vm.name, "source_id": vm_id, "strategy": str(m.strategy)}
+        assert created.message == f"migration of {m.vm.name} created"
+        assert validating.data == {
+            "from": "pending",
+            "to": "validating",
+            "reason": "pre-flight validation",
+        }
+        assert validating.message == f"{m.vm.name}: pending -> validating (pre-flight validation)"
+        reason = m.phase_history[-1].reason
+        extra = {"findings": ["VM_VGPU"]} if last == P.blocked else {"strategy": str(m.strategy)}
+        assert assessed.data == {"from": "validating", "to": str(last), "reason": reason, **extra}
+        assert assessed.message == f"{m.vm.name}: validating -> {last} ({reason})"
+        assert {e.actor for e in (created, validating, assessed)} == {"alice"}
+    await h.orch.validate_plan(plan.id, "alice")
+    for vm_id, last in expected.items():
+        m = await h.by_vm(plan.id, vm_id)
+        assert store.get_versioned("migration", m.id, Migration)[1] == 2, vm_id
+        assert h.history(m) == [P.pending, P.validating, last, P.validating, last]
+        assert phase_events(m)[3:] == [
+            ("migration.phase", str(last), "validating"),
+            ("migration.phase", "validating", str(last)),
+        ]
+
+
+async def test_a_validation_runs_four_statements_per_vm(tmp_path):
+    """SDD §5.4, §11 (CP-P6): per VM, a first validation inserts the migration and its three events,
+    and a validation again reads it, updates it and inserts its two events - four statements each,
+    where it was ten and seven. Each size gets its own store, so no other plan is read."""
+    import sqlalchemy as sa
+
+    seen: list[str] = []
+
+    def count(conn, cursor, statement, params, context, executemany):
+        seen.append(statement)
+
+    async def statements(n):
+        own = Store(f"sqlite:///{tmp_path / f'n{n}.db'}")
+        own.create_schema()
+        h, plan = await setup(tmp_path / f"n{n}", own, [vm(i) for i in range(1, n + 1)])
+        seen.clear()
+        sa.event.listen(own.engine, "before_cursor_execute", count)
+        try:
+            await h.orch.validate_plan(plan.id, "alice")
+            first = len(seen)
+            seen.clear()
+            await h.orch.validate_plan(plan.id, "alice")
+            again = len(seen)
+        finally:
+            sa.event.remove(own.engine, "before_cursor_execute", count)
+            own.dispose()
+        return first, again
+
+    (first4, again4), (first8, again8) = await statements(4), await statements(8)
+    assert ((first8 - first4) / 4, (again8 - again4) / 4) == (4, 4)
+
+
+async def test_a_failed_validation_write_leaves_no_migration_in_validating(tmp_path, store):
+    """SDD §5.4: the one write lands or not - a database error leaves a new VM without a migration
+    and an existing migration as it was, never in validating."""
+    h, plan = await setup(tmp_path, store, [vm(1), vm(2)])
+    put = h.orch.db.put
+
+    async def failing_put(kind, model, expected_version=None):
+        # the write that lands the assessment (an earlier version wrote validating before it)
+        if kind == "migration" and model.vm.source_id == "vm-2" and model.phase != P.validating:
             raise ConnectionError("database connection lost")
-        return await transition(m, version, to, reason, actor, data)
+        return await put(kind, model, expected_version)
 
-    h.orch._transition = failing_transition
+    h.orch.db.put = failing_put
     with pytest.raises(ConnectionError):
         await h.orch.validate_plan(plan.id, "alice")
-    stuck = await h.by_vm(plan.id, "vm-2")
-    assert stuck.phase == P.validating
-    return h, plan, stuck
+    assert [m.vm.source_id for m in await h.migrations(plan.id)] == ["vm-1"]
+    h.orch.db.put = put
+    await h.orch.validate_plan(plan.id, "alice")
+    ready = await h.by_vm(plan.id, "vm-2")
+    _, version = store.get_versioned("migration", ready.id, Migration)
+    h.orch.db.put = failing_put
+    with pytest.raises(ConnectionError):
+        await h.orch.validate_plan(plan.id, "alice")
+    kept, same = store.get_versioned("migration", ready.id, Migration)
+    assert (kept.phase, same, h.history(kept)) == (P.ready, version, h.history(ready))
 
 
 async def test_validation_cancels_a_removed_vms_leftover_in_validating(tmp_path, store):
@@ -1182,6 +1311,112 @@ async def test_start_rejects_blocked_plan(tmp_path, store):
     assert started.status == PlanStatus.running
 
 
+def _refusing(settings, answers):
+    """A warm migration whose pre-copy and sync passes return these cutover_refusals in turn."""
+    executor = ScriptedExecutor(settings)
+    queue = list(answers)
+
+    def hook(step):
+        async def run(ctx):
+            result = await executor.sim.run(step, ctx)
+            result.cutover_refusals = queue.pop(0) if queue else None
+            return result
+
+        return run
+
+    executor.hooks.update(
+        {StepName.PRECOPY: hook(StepName.PRECOPY), StepName.SYNC: hook(StepName.SYNC)}
+    )
+    return executor
+
+
+def _refusals_at_each_pass(store, monkeypatch) -> list[list[str]]:
+    """The stored migration's cutover_refusals as each pass's event is written."""
+    seen: list[list[str]] = []
+    append = store.append_event
+
+    def recording(event):
+        if event.kind == "migration.sync_pass":
+            seen.append(store.get("migration", event.migration_id, Migration).cutover_refusals)
+        return append(event)
+
+    monkeypatch.setattr(store, "append_event", recording)
+    return seen
+
+
+async def test_a_warm_migration_keeps_what_the_cutover_will_refuse_until_its_cutover(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2: a warm pass records on the migration, before its event, what it met that the
+    cutover will refuse; a pass that learned nothing leaves it, and a successful cutover empties
+    it."""
+    settings = make_settings(tmp_path)
+    problem = "the NIC 00:50:56:00:00:01 of vm-1 on 'app-net': port port-old holds its MAC"
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300},
+        executor=_refusing(settings, [[problem], None]),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    done = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert [p.kind for p in done.sync_passes] == ["full", "delta", "final"]
+    assert seen == [[problem], [problem], []]
+    assert done.cutover_refusals == []
+
+
+async def test_a_warm_pass_that_meets_none_empties_the_cutover_refusals(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.2: fixed while the passes run - the next pass's empty list replaces the problems."""
+    settings = make_settings(tmp_path)
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300},
+        executor=_refusing(settings, [["port p2 on network 'gone' does not resolve"], []]),
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.stop()
+    assert seen == [["port p2 on network 'gone' does not resolve"], [], []]
+
+
+async def test_the_demo_fault_refuses_the_cutover_before_the_stop_until_a_pass_finds_it_fixed(
+    tmp_path, store, monkeypatch
+):
+    """SDD §7.4: through the orchestrator, the simulator's `demo-fault: cutover-refusal` - its
+    first two passes record what the cutover will refuse (§7.2), the cutover after them fails
+    before the source stops (no downtime, no rollback), and the retry's pass finds it fixed: the
+    list empties and the migration completes."""
+    seen = _refusals_at_each_pass(store, monkeypatch)
+    nic = Nic(network="app-net", mac="00:50:56:00:00:01", mtu=1500, fixed_ips=["10.0.0.1"])
+    tagged = vm(1, "dc2-portal-02", nics=[nic], tags={"demo-fault": "cutover-refusal"})
+    h, plan = await setup(
+        tmp_path, store, [tagged], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}
+    )
+    refusal = (
+        "the NIC 00:50:56:00:00:01 of dc2-portal-02 on 'app-net': port demo-port-1 holds 10.0.0.1"
+    )
+    await run_plan(h, plan)
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    refused = await h.wait_phase(mid, P.failed)
+    assert refused.downtime_started_at is None and refused.error == f"cutover: {refusal}"
+    assert refused.cutover_refusals == [refusal], "a refused cutover keeps the list"
+    await h.orch.retry(mid, "alice")
+    done = await h.wait_phase(mid, P.completed)
+    await h.orch.stop()
+    assert seen[:3] == [[refusal], [refusal], []] and all(s == [] for s in seen[3:])
+    assert done.cutover_refusals == [] and done.downtime_started_at is not None
+
+
 async def test_warm_flow_reaches_completed_with_downtime(tmp_path, store):
     h, plan = await setup(
         tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm, "downtime_slo_s": 300}
@@ -1829,6 +2064,220 @@ async def test_cancel_with_recorded_passes_cleans_up_the_warm_data_path(tmp_path
     assert await _settled(h, m.id) == ["cancel", "cleanup"]
     assert rollbacks == [{"delete_dest_volumes": True}]
     await h.orch.stop()
+
+
+async def test_a_rolled_back_migration_is_cancelled_and_its_kept_data_path_cleaned_up(
+    tmp_path, store
+):
+    """SDD §5.1 (RR-03): a rollback deletes the destination server but keeps the warm data path for
+    a retry - it passes no delete_dest_volumes. Cancelling the rolled-back migration ends it for
+    good, so the cancel runs the rollback step once more, with delete_dest_volumes."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    async def quota(ctx):
+        raise PermanentStepError("snapshot quota exceeded")
+
+    hooks = {
+        StepName.ROLLBACK: rollback,
+        # a first pass that does not converge, then a delta pass that fails for good
+        StepName.PRECOPY: scripted_pass(recent_base(), 0, 100.0, 10 * 2**30, "full"),
+        StepName.SYNC: quota,
+    }
+    executor = ScriptedExecutor(settings, hooks=hooks)
+    h, plan = await setup(
+        tmp_path,
+        store,
+        [vm(1)],
+        {"default_strategy": Strategy.warm, "downtime_slo_s": 300, "require_approval": True},
+        executor=executor,
+        settings=settings,
+    )
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    await h.orch.rollback(m.id, "rina", "the snapshot quota is not ours to raise")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    assert m.sync_passes and rollbacks == [{}], "the rollback kept the data path for a retry"
+
+    cancelled = await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert cancelled.phase == P.cancelled
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    assert rollbacks == [{}, {"delete_dest_volumes": True}]
+    await h.orch.stop()
+
+
+async def test_a_rolled_back_migration_without_passes_is_cancelled_and_then_its_plan(
+    tmp_path, store
+):
+    """SDD §5.1, §12 (RR-03): a rolled-back migration that recorded no pass - as a storage
+    handover, which copies nothing - leaves no data path, so its cancel cleans nothing up; and
+    with it cancelled, Cancel plan, which refuses while it is rolled back and says to cancel it
+    on its own first, retires the plan."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    await h.wait_plan(plan.id, PlanStatus.completed)
+    assert rollbacks == [{}]
+    m.sync_passes = []  # nothing copied
+    store.put("migration", m)
+    with pytest.raises(NotAllowed, match="on its own first"):
+        await h.orch.cancel_plan(plan.id, "rina", "retired")
+
+    assert (await h.orch.cancel(m.id, "rina", "not migrated after all")).phase == P.cancelled
+    assert "cleanup" not in await _settled(h, m.id)
+    assert rollbacks == [{}]
+    assert (await h.orch.cancel_plan(plan.id, "rina", "retired")).status == PlanStatus.cancelled
+    await h.orch.stop()
+
+
+async def test_a_rolled_back_migrations_cancel_cleanup_touches_only_its_own_data_path(
+    tmp_path, store
+):
+    """SDD §5.1 (review RV-01, RV-02): a warm rollback deleted the server, started the source and
+    kept the copied data; the cleanup when the migration is then cancelled matches nothing by
+    name, deletes no port and leaves the source as it is - the VM the rollback released may since
+    be another plan's, with a same-named server, ports keyed to the VM and a source its cutover
+    stopped."""
+    from seamless_migrate.executors.ansible import build_vars
+
+    settings = make_settings(tmp_path)
+    seen: list[dict] = []
+
+    async def rollback(ctx):
+        seen.append({"options": dict(ctx.options), "vars": build_vars(StepName.ROLLBACK, ctx)})
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.completed)
+    await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+    m = await h.wait_phase(m.id, P.rolled_back)
+    assert m.sync_passes and m.downtime_started_at is not None
+    assert "os_migrate_rollback_start_source" not in seen[0]["vars"]  # it starts the source
+
+    await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    cleanup = seen[1]
+    assert cleanup["options"] == {"delete_dest_volumes": True}
+    assert cleanup["vars"]["os_migrate_rollback_delete_dest_volumes"] is True
+    assert "os_migrate_rollback_match_by_name" not in cleanup["vars"]
+    assert cleanup["vars"]["os_migrate_rollback_start_source"] is False
+    assert cleanup["vars"]["os_migrate_rollback_delete_ports"] is False
+
+
+def _write_record(settings, plan_id, m, **record):
+    """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    path = run_dir(settings, plan_id, m.id) / "osm" / "workload_warm" / f"{m.vm.source_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "server_id": m.vm.source_id,
+                "dest_volumes": {},
+                "passes": [],
+                "pending_snapshot": None,
+                "destination_server_id": None,
+                **record,
+            }
+        )
+    )
+    return path
+
+
+async def test_a_cancel_after_a_failed_first_pass_removes_what_its_record_holds(tmp_path, store):
+    """SDD §5.1 (review RV3-05): a first warm pass that created its destination volumes, recorded
+    them and then failed for good (a volume quota) recorded no pass - its record still holds them,
+    so the cancel runs the cleanup that removes them."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    async def first_pass(ctx):
+        _write_record(
+            settings,
+            ctx.plan.id,
+            ctx.migration,
+            dest_volumes={"/dev/vda": {"dest_id": "dvol-1", "size": 20}},
+        )
+        raise PermanentStepError(
+            "import_workloads_precopy.yml failed (exit 2): VolumeLimitExceeded: Maximum number of "
+            "volumes allowed (10) exceeded"
+        )
+
+    executor = ScriptedExecutor(
+        settings, hooks={StepName.PRECOPY: first_pass, StepName.ROLLBACK: rollback}
+    )
+    h, plan = await setup(
+        tmp_path, store, [vm(1)], {"default_strategy": Strategy.warm},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
+    assert not m.sync_passes and m.downtime_started_at is None
+
+    await h.orch.cancel(m.id, "rina", "the quota is not ours to raise")
+    assert (await _settled(h, m.id))[-2:] == ["cancel", "cleanup"]
+    await h.orch.stop()
+    assert rollbacks == [{"delete_dest_volumes": True}]
+
+
+async def test_a_rolled_back_cold_migrations_cancel_runs_no_cleanup(tmp_path, store):
+    """SDD §5.1 (review RV3-07): a cold cutover lists a full pass, but the cold rollback deleted
+    what the cold import recorded - its record holds nothing, so a cancel has no data path and
+    runs no cleanup (with no record at all, a cold migration's passes do not count either)."""
+    settings = make_settings(tmp_path)
+    rollbacks: list[dict] = []
+
+    async def rollback(ctx):
+        rollbacks.append(dict(ctx.options))
+        return StepResult(details={"source_running": True})
+
+    executor = ScriptedExecutor(settings, hooks={StepName.ROLLBACK: rollback})
+    h, plan = await setup(
+        tmp_path, store, [vm(1), vm(2)], {"default_strategy": Strategy.cold},
+        executor=executor, settings=settings,
+    )  # fmt: skip
+    await run_plan(h, plan)
+    rolled = []
+    for name in ("vm-1", "vm-2"):
+        m = await h.wait_phase((await h.by_vm(plan.id, name)).id, P.completed)
+        await h.orch.rollback(m.id, "rina", "the application owner wants it back")
+        rolled.append(await h.wait_phase(m.id, P.rolled_back))
+    assert all(m.sync_passes for m in rolled)
+    _write_record(settings, plan.id, rolled[0])  # emptied by the cold rollback
+
+    for m in rolled:
+        await h.orch.cancel(m.id, "rina", "this VM is not migrated after all")
+        assert (await _settled(h, m.id))[-1] == "cancel"
+    await h.orch.stop()
+    assert len(rollbacks) == 2  # the two rollbacks, no cleanup
 
 
 async def test_a_cleanup_stays_tracked_until_its_outcome_is_recorded(tmp_path, store):
@@ -3202,6 +3651,7 @@ async def test_a_recommendation_is_audited_once_with_its_redacted_input(
             "status": status,
             "final_option": rec.decision.final_option,
             "reason_code": str(rec.decision.reason_code),
+            "reason_text": None,
             "policy_id": "global-default",
             "threshold_used": 0.6,
         },
@@ -3266,6 +3716,29 @@ async def test_with_the_finance_policy_a_decision_waits_and_holds_its_migration(
         "user:rina",
         "pending_approval",
     )
+
+
+async def test_an_override_records_its_reason_in_the_audit_trail(tmp_path, store):
+    """SDD §14.5: the trail itself says why a decision was overridden - the decision event carries
+    the reason a person gave (``after``) and the decision it replaced (``before``, none given)."""
+    advisor, _ = _tie_advisor("warm", 0.99)
+    h, plan = await setup(
+        tmp_path, store, [vm(1, size_gb=4, used_gb=1.0)], NO_GATE, advisor=advisor
+    )
+    store.put("advisor_policy", _finance(plan))
+    await h.orch.validate_plan(plan.id, "alice")
+    [rec] = _recommendations(store)
+    waiting = _audit(store)[-1]
+    assert (waiting.kind, waiting.data["after"]["reason_text"]) == (
+        "decision.pending_approval",
+        None,
+    )
+    reason = "the batch window allows a longer downtime"
+    await h.orch.override_recommendation(rec.id, "cold", reason, "rina")
+    overridden = _audit(store)[-1]
+    assert (overridden.kind, overridden.actor) == ("decision.overridden", "user:rina")
+    assert overridden.data["after"]["reason_text"] == reason
+    assert overridden.data["before"] == waiting.data["after"]
 
 
 async def test_no_decision_on_a_recommendation_the_plan_overrides_and_no_second_approve(
@@ -3591,6 +4064,9 @@ async def test_with_jev_off_an_automatic_choice_is_recorded_as_a_rules_fallback(
     assert (created.data["model_version"], created.data["option"]) == ("rules", None)
     assert (decided.kind, decided.actor) == ("decision.fallback", "system:fallback")
     assert decided.data["after"]["status"] == "fallback_rules"
+    # and why: the advisor's answer could not be used (SDD §14.5)
+    assert decided.data["after"]["reason_text"] == rec.decision.reason_text
+    assert rec.decision.reason_text and rec.decision.reason_text.startswith("advisor unavailable")
     snapshot = store.get("advisor_snapshot", rec.input_snapshot_sha256, AdvisorSnapshot)
     assert "vCPU" in snapshot.payload["arguments"]["evidence"]
 
@@ -3610,24 +4086,19 @@ async def test_validation_keeps_the_notes_a_migration_already_has(tmp_path, stor
     assert len(_recommendations(store)) == 2, "each validation adds a recommendation"
 
 
-async def test_similar_incidents_attached_on_failure(tmp_path, store):
-    seen = []
+ONE_INCIDENT = [
+    {"title": "Attach timeout on conv host", "content": "Raise os_migrate_timeout", "score": 0.9}
+]
+
+
+async def _fail_with_memory(tmp_path, store, seen: list[str], results: list[dict]):
+    """A warm migration whose pre-copy fails, with agentmemory answering ``results`` to the
+    similar-incident search."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
         if request.url.path.endswith("smart-search"):
-            return httpx.Response(
-                200,
-                json={
-                    "results": [
-                        {
-                            "title": "Attach timeout on conv host",
-                            "content": "Raise os_migrate_timeout",
-                            "score": 0.9,
-                        }
-                    ]
-                },
-            )
+            return httpx.Response(200, json={"results": results})
         return httpx.Response(201, json={"success": True})
 
     memory = MemoryClient("http://m", None, "p", transport=httpx.MockTransport(handler))
@@ -3642,17 +4113,91 @@ async def test_similar_incidents_attached_on_failure(tmp_path, store):
     plan = plan_for([vm(1)], default_strategy=Strategy.warm)
     store.put("plan", plan)
     await run_plan(h, plan)
+    return h, plan
+
+
+async def test_each_tick_has_the_streams_send_what_another_process_wrote(tmp_path, store):
+    """SDD §12: the CLI beside the running server writes an event to the store - no event of the
+    server's own follows it, yet within about a tick it reaches the open streams."""
+    h = build_harness(tmp_path, store, [vm(1)])
+    await h.orch.start()
+    agen = h.bus.subscribe(since=store.max_seq())
+    waiting = asyncio.ensure_future(agen.__anext__())
+    await asyncio.sleep(0.05)  # the stream has read the store and waits for live events
+    try:
+        cli = await emit(store, EventBus(store), "plan.updated", "from the CLI", actor="cli")
+        got = await asyncio.wait_for(waiting, 2)
+        assert (got.seq, got.message, got.actor) == (cli.seq, "from the CLI", "cli")
+    finally:
+        waiting.cancel()
+        await agen.aclose()
+        await h.orch.stop()
+
+
+async def test_similar_incidents_attached_on_failure(tmp_path, store):
+    seen = []
+    h, plan = await _fail_with_memory(tmp_path, store, seen, ONE_INCIDENT)
     m = await h.wait_phase((await h.by_vm(plan.id, "vm-1")).id, P.failed)
     for _ in range(100):
         m = await h.migration(m.id)
         if any(n.kind == "similar_incidents" for n in m.advisor_notes):
             break
         await asyncio.sleep(0.01)
+    # the note is saved before its event (SDD §14.3): stopping on the note alone would cancel it
+    await h.wait_kind("advisor.similar_incidents")
     await h.orch.stop()
     [note] = [n for n in m.advisor_notes if n.kind == "similar_incidents"]
     assert note.source == "memory" and note.data["hits"][0]["title"].startswith("Attach")
     assert "advisor.similar_incidents" in h.kinds()
     assert seen.count("/agentmemory/remember") == 1
+
+
+async def test_the_similar_incidents_event_comes_after_the_note_is_saved(
+    tmp_path, store, monkeypatch
+):
+    """SDD §14.3: advisor.similar_incidents asks for the notes to be read again (§16), so it is
+    written once the note is on the migration - never while agentmemory is still asked."""
+    held: list[bool] = []
+    append = store.append_event
+
+    def recording(event: Event) -> Event:
+        if event.kind == "advisor.similar_incidents":
+            m = store.get("migration", event.migration_id, Migration)
+            held.append(any(n.kind == "similar_incidents" for n in m.advisor_notes))
+        return append(event)
+
+    monkeypatch.setattr(store, "append_event", recording)
+    h, plan = await _fail_with_memory(tmp_path, store, [], ONE_INCIDENT)
+    await h.wait_kind("advisor.similar_incidents")
+    await h.orch.stop()
+    assert held == [True]
+    [event] = [e for e in store.events(since_seq=0) if e.kind == "advisor.similar_incidents"]
+    m = await h.migration(event.migration_id)
+    [note] = [n for n in m.advisor_notes if n.kind == "similar_incidents"]
+    assert (event.plan_id, event.actor) == (plan.id, "system")
+    assert (event.message, event.data) == (note.summary, note.data)
+    assert event.data["hits"][0]["title"] == "Attach timeout on conv host"
+
+
+async def test_a_failure_with_no_similar_incident_announces_none(tmp_path, store):
+    """SDD §14.3: agentmemory knows nothing like the failure - no note and no event announcing one,
+    and the failure is still remembered as a lesson."""
+    seen: list[str] = []
+    h, plan = await _fail_with_memory(tmp_path, store, seen, [])
+    mid = (await h.by_vm(plan.id, "vm-1")).id
+    await h.wait_phase(mid, P.failed)
+    deadline = asyncio.get_running_loop().time() + 10
+    while mid in h.orch._drivers:  # the driver leaves once the failure is handled to its end
+        assert asyncio.get_running_loop().time() < deadline, (
+            "the failure was not handled to its end"
+        )
+        await asyncio.sleep(0.01)
+    await h.orch.stop()
+    assert mid not in h.orch._driver_crashes
+    m = await h.migration(mid)
+    assert not any(n.kind == "similar_incidents" for n in m.advisor_notes)
+    assert "advisor.similar_incidents" not in h.kinds()
+    assert seen.count("/agentmemory/remember") == 1 and "memory.lesson_saved" in h.kinds()
 
 
 async def test_verification_review_flags_without_flipping(tmp_path, store):
@@ -4623,8 +5168,15 @@ async def test_a_simulated_downtime_counts_model_seconds(tmp_path, store):
     await h.orch.stop()
     params = params_for_plan(plan)
     copy = done.sync_passes[-1].duration_s
-    assert done.downtime_model_s == pytest.approx(copy + params.create_s)
-    assert done.actual_downtime_s == pytest.approx(copy + params.create_s + params.boot_s)
+    # its clock starts at the stop: the shutdown counts, as the estimate's parts do (SDD §5.2, §7.4)
+    assert done.downtime_model_s == pytest.approx(params.shutdown_s + copy + params.create_s)
+    assert done.actual_downtime_s == pytest.approx(
+        params.shutdown_s + copy + params.create_s + params.boot_s
+    )
+    parts = done.estimate.downtime_parts
+    assert done.actual_downtime_s - copy == pytest.approx(
+        sum(seconds for part, seconds in parts.items() if part != "copy_s")
+    )
     wall = (done.downtime_ended_at - done.downtime_started_at).total_seconds()
     assert done.actual_downtime_s > wall, "the simulator compresses wall time"
 
@@ -4679,7 +5231,8 @@ async def test_a_rollback_that_interrupts_a_simulated_cutover_counts_its_model_s
     await run_plan(h, plan)
     mid = (await h.by_vm(plan.id, "vm-1")).id
     await asyncio.wait_for(blocked.wait(), 10)
-    # the same seeded copy, run to its end by another simulator: its model seconds without create
+    # the same seeded copy, run to its end by another simulator: its model seconds without the
+    # create - the shutdown and the copy
     ctx, _ = make_ctx(plan, await h.migration(mid), SRC_PROVIDER, DST_PROVIDER, settings)
     whole = (await SimulatedExecutor(settings).run(StepName.CUTOVER, ctx)).details
     copy = whole["downtime_model_s"] - params_for_plan(plan).create_s
@@ -5275,6 +5828,70 @@ async def test_a_finalize_step_errors_reason_is_redacted_and_cut(tmp_path, store
     assert len(skipped["reason"]) <= len("finalize failed: ") + 500
 
 
+RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before finalizing"
+
+
+async def _watch(h, plan, vm_id="vm-1"):
+    """One source watch, past its interval, and the migration it looked at (SDD §8.1)."""
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    if h.orch._watch_task is not None:
+        await h.orch._watch_task
+    return await h.by_vm(plan.id, vm_id)
+
+
+async def test_finalize_is_refused_while_the_source_vm_runs_again(tmp_path, store):
+    """SDD §8.1 (the owner's choice, 2026-10-13): while the source watch sees the source VM running
+    again, a finalize answers 409 - it would keep a source that diverged, or delete it with what it
+    wrote since - and a bulk finalize skips that VM with the reason. Seen stopped again, it
+    finalizes."""
+    h, plan = await _completed_plan(tmp_path, store, n=2, waves=[])
+    m1, m2 = [await h.by_vm(plan.id, v) for v in ("vm-1", "vm-2")]
+    # the fake source keeps its VMs running after a simulated cutover: only vm-1 runs again
+    for vm_id, state in (("vm-1", "running"), ("vm-2", "stopped")):
+        h.source.vms[vm_id] = h.source.vms[vm_id].model_copy(update={"power_state": state})
+    assert (await _watch(h, plan)).source_running_at is not None
+    assert (await h.by_vm(plan.id, "vm-2")).source_running_at is None
+    for delete_source in (False, True):
+        with pytest.raises(NotAllowed, match=f"^{RUNS_AGAIN}$"):
+            await h.orch.finalize(m1.id, "rina", delete_source=delete_source, confirm=m1.vm.name)
+    assert (await h.migration(m1.id)).phase == P.completed
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert out == {"finalized": [m2.id], "skipped": [{"migration_id": m1.id, "reason": RUNS_AGAIN}]}
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "stopped"})
+    assert (await _watch(h, plan)).source_running_at is None
+    assert (await h.orch.finalize(m1.id, "rina", confirm=m1.vm.name)).phase == P.finalized
+    await h.orch.stop()
+
+
+async def test_a_finalize_that_began_deleting_the_source_finishes_while_it_runs(tmp_path, store):
+    """SDD §8.1: the exception - a migration whose finalize began deleting the source (checkpoint
+    "finalizing") cannot be rolled back, so finalizing it again from its own page stays its way
+    out even while the source watch sees the VM running; a bulk finalize skips it, as it skips
+    every VM whose source runs again (the plan's summaries carry no checkpoint)."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+    failed: list[str] = []
+
+    async def finalize(ctx):
+        if not failed:
+            failed.append(ctx.migration.id)
+            raise TransientStepError("finalize: src-osp: call timed out after 300 s")
+        return StepResult(details={"source_deleted": True})
+
+    h.executor.hooks[StepName.FINALIZE] = finalize
+    with pytest.raises(NotAllowed, match="finalize failed"):
+        await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    seen = await _watch(h, plan)
+    assert (seen.checkpoint, seen.source_running_at is not None) == ("finalizing", True)
+    out = await h.orch.finalize_plan(plan.id, "rina", wave_id=None, confirm=plan.name)
+    assert out == {"finalized": [], "skipped": [{"migration_id": m.id, "reason": RUNS_AGAIN}]}
+    done = await h.orch.finalize(m.id, "rina", delete_source=True, confirm=m.vm.name)
+    assert done.phase == P.finalized
+    await h.orch.stop()
+
+
 async def test_the_source_watch_flags_a_completed_vms_source_running_again(tmp_path, store):
     """SDD §8.1: the source VM of a migration awaiting finalize runs again: its data diverges."""
     h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
@@ -5481,6 +6098,57 @@ async def test_the_source_watch_skips_a_source_the_provider_no_longer_has(tmp_pa
     assert h.orch._watch_task is not None
     await h.orch._watch_task
     assert (await h.by_vm(plan.id, "vm-1")).source_running_at is None
+
+
+async def test_the_source_watch_clears_a_source_running_again_once_its_cloud_says_it_is_gone(
+    tmp_path, store
+):
+    """SDD §8.1 (RR-02, the owner's choice): a source that ran again and was then deleted - or that
+    its cloud no longer has - leaves nothing to keep or roll back to: the watch clears the flag
+    with migration.source_stopped marked gone, and Finalize works again."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    m = await h.by_vm(plan.id, "vm-1")
+
+    async def watch():
+        h.clock.advance(h.settings.source_watch_s + 1)
+        await h.orch.tick()
+        if h.orch._watch_task is not None:
+            await h.orch._watch_task  # the watch runs beside the tick (SDD §8.1)
+        return await h.by_vm(plan.id, "vm-1")
+
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    assert (await watch()).source_running_at is not None
+    with pytest.raises(NotAllowed, match="runs again"):
+        await h.orch.finalize(m.id, "ana", confirm=m.vm.name)
+    del h.source.vms["vm-1"]  # deleted in the source cloud after it diverged
+    assert (await watch()).source_running_at is None
+    events = [e for e in store.events(since_seq=0, limit=100000) if e.migration_id == m.id]
+    [gone] = [e for e in events if e.kind == "migration.source_stopped"]
+    assert gone.data == {"power_state": None, "gone": True}
+    assert "no longer exists" in gone.message
+    assert (await h.orch.finalize(m.id, "ana", confirm=m.vm.name)).phase == P.finalized
+    await h.orch.stop()
+
+
+async def test_the_source_watch_keeps_a_source_running_again_while_its_cloud_fails(tmp_path, store):
+    """SDD §8.1: only a cloud that answers can say the VM is gone - an error keeps the flag."""
+    h, plan = await _completed_plan(tmp_path, store, n=1, waves=[])
+    h.source.vms["vm-1"] = h.source.vms["vm-1"].model_copy(update={"power_state": "running"})
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    seen = (await h.by_vm(plan.id, "vm-1")).source_running_at
+    assert seen is not None
+
+    async def unreachable(source_id):
+        raise ProviderError("src-osp: Unable to establish connection")
+
+    h.source.get_vm = unreachable
+    h.clock.advance(h.settings.source_watch_s + 1)
+    await h.orch.tick()
+    await h.orch._watch_task
+    assert (await h.by_vm(plan.id, "vm-1")).source_running_at == seen
+    await h.orch.stop()
 
 
 async def test_the_earlier_attempts_evidence_names_the_strategy_those_attempts_used(

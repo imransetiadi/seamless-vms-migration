@@ -1,3 +1,4 @@
+import secrets
 import threading
 
 import pytest
@@ -7,6 +8,7 @@ from seamless_migrate.domain.enums import Phase, PlanStatus
 from seamless_migrate.domain.models import Event, Migration, Plan, Provider
 from seamless_migrate.events import AUDIT_KINDS
 from seamless_migrate.store import ConflictError, NotFound, Store
+from tests.conftest import PG_URL
 from tests.factories import make_migration, make_plan, make_provider
 
 
@@ -43,6 +45,39 @@ def test_optimistic_conflict_raises(any_store: Store):
         any_store.put("migration", make_migration(), expected_version=4)
 
 
+def test_a_versioned_put_is_one_statement(any_store: Store):
+    """SDD §11 (control-plane perf audit CP-P6): a write with an expected version is one statement -
+    an INSERT for a new document, an UPDATE ... WHERE version for an update; only a conflict reads
+    the version, to say what it found. An unconditional write still reads the version first."""
+    statements: list[str] = []
+
+    def count(conn, cursor, statement, params, context, executemany):
+        statements.append(statement.split()[0].upper())
+
+    mig = make_migration()
+    sa.event.listen(any_store.engine, "before_cursor_execute", count)
+    try:
+        assert any_store.put("migration", mig, expected_version=0) == 1
+        assert statements == ["INSERT"]
+        statements.clear()
+        mig.progress_pct = 10
+        assert any_store.put("migration", mig, expected_version=1) == 2
+        assert statements == ["UPDATE"]
+        with pytest.raises(ConflictError, match="is at version 2, expected 0"):
+            any_store.put("migration", mig, expected_version=0)
+        with pytest.raises(ConflictError, match="is at version 2, expected 1"):
+            any_store.put("migration", mig.model_copy(update={"progress_pct": 99.0}), 1)
+        with pytest.raises(ConflictError, match="does not exist"):
+            any_store.put("migration", make_migration(), expected_version=4)
+        statements.clear()
+        assert any_store.put("migration", mig) == 3
+        assert statements == ["SELECT", "UPDATE"]
+    finally:
+        sa.event.remove(any_store.engine, "before_cursor_execute", count)
+    # a refused write changed nothing
+    assert any_store.get("migration", mig.id, Migration).progress_pct == 10
+
+
 def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     assert any_store.change_stamp("migration") == (0, 0)
     m = make_migration()
@@ -57,8 +92,9 @@ def test_change_stamp_moves_on_insert_update_and_delete(any_store: Store):
     assert any_store.change_stamp("plan") == (0, 0)  # per kind
 
 
-def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
-    """SDD §8.1, §11: the set of each plan's phases, in one query, without loading a document."""
+def test_plan_phases_counts_each_plans_migrations_by_phase(any_store: Store):
+    """SDD §8.1, §11: each plan's phases with how many of its migrations are in each, in one
+    query, without loading a document (PF-02: the plan routes' migration_counts)."""
     for plan_id, phase in (
         ("plan-a", Phase.ready),
         ("plan-a", Phase.blocked),
@@ -68,7 +104,7 @@ def test_plan_phases_gives_each_plans_distinct_phases(any_store: Store):
     ):
         any_store.put("migration", make_migration(plan_id=plan_id, phase=phase))
     got = any_store.plan_phases(["plan-a", "plan-b", "plan-x"])
-    assert got == {"plan-a": {Phase.ready, Phase.blocked}, "plan-b": {Phase.completed}}
+    assert got == {"plan-a": {Phase.ready: 2, Phase.blocked: 1}, "plan-b": {Phase.completed: 1}}
     assert all(isinstance(p, Phase) for phases in got.values() for p in phases)
     assert any_store.plan_phases([]) == {}
 
@@ -457,3 +493,109 @@ def test_a_closed_cross_process_lock_acquires_nothing_more(any_store: Store):
     other = any_store.cross_process_lock("vm-claims")
     assert other.try_acquire()
     other.release()
+
+
+def _statements_of(store: Store, call) -> list[str]:
+    seen: list[str] = []
+
+    def capture(conn, cursor, statement, params, context, executemany):
+        seen.append(statement.strip())
+
+    sa.event.listen(store.engine, "before_cursor_execute", capture)
+    try:
+        call()
+    finally:
+        sa.event.remove(store.engine, "before_cursor_execute", capture)
+    return seen
+
+
+def test_create_schema_on_a_complete_schema_issues_no_ddl(any_store: Store):
+    """SDD §11 (docs drift DD-01): PostgreSQL lets only a table's owner run CREATE INDEX, even
+    IF NOT EXISTS, and every server start calls create_schema - on a complete schema it issues no
+    DDL, so a role that does not own the tables (Security.md §9.4) can start the control plane."""
+    seen = _statements_of(any_store, any_store.create_schema)
+    ddl = [s for s in seen if s.split()[0].upper() in ("CREATE", "ALTER", "DROP")]
+    assert ddl == []
+
+
+def test_create_schema_adds_only_the_index_a_table_lacks(any_store: Store):
+    with any_store.engine.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ix_events_kind_seq"))
+    seen = _statements_of(any_store, any_store.create_schema)
+    created = [s for s in seen if s.split()[0].upper() == "CREATE"]
+    assert len(created) == 1 and "ix_events_kind_seq" in created[0]
+    seen = _statements_of(any_store, any_store.create_schema)
+    assert not [s for s in seen if s.split()[0].upper() == "CREATE"], "it is there again"
+
+
+@pytest.mark.skipif(not PG_URL, reason="SEAMLESS_TEST_PG_URL is not set")
+def test_a_role_that_does_not_own_the_tables_starts_once_the_owner_created_them():
+    """SDD §11, Security.md §9.4: the application role - no table ownership, events insert-only -
+    starts the control plane (create_schema) once the owner created the schema, writes documents and
+    events, and cannot rewrite the audit trail."""
+    owner = Store(PG_URL)
+    owner.create_schema()
+    url = sa.engine.make_url(PG_URL)
+    role, password = f"seamless_app_{secrets.token_hex(4)}", secrets.token_urlsafe(16)
+    with owner.engine.begin() as conn:
+        conn.execute(sa.text(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        conn.execute(sa.text(f'GRANT CONNECT ON DATABASE "{url.database}" TO {role}'))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT ON events TO {role}"))
+        conn.execute(sa.text(f"GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO {role}"))
+    app = Store(url.set(username=role, password=password).render_as_string(hide_password=False))
+    try:
+        app.create_schema()  # what every server start and CLI command runs
+        app.put("migration", make_migration(), expected_version=0)
+        app.append_event(Event(kind="plan.created", message="as the application role"))
+        with pytest.raises(sa.exc.ProgrammingError, match="permission denied"):
+            with app.engine.begin() as conn:
+                conn.execute(sa.text("UPDATE events SET message = 'rewritten'"))
+    finally:
+        app.dispose()
+        with owner.engine.begin() as conn:
+            conn.execute(sa.text(f"REVOKE ALL ON documents, events FROM {role}"))
+            conn.execute(sa.text(f"REVOKE ALL ON SEQUENCE events_seq_seq FROM {role}"))
+            conn.execute(sa.text(f'REVOKE CONNECT ON DATABASE "{url.database}" FROM {role}'))
+            conn.execute(sa.text(f"DROP ROLE {role}"))
+        owner.truncate_for_tests()
+        owner.dispose()
+
+
+@pytest.mark.skipif(not PG_URL, reason="SEAMLESS_TEST_PG_URL is not set")
+def test_a_role_with_a_schema_of_its_own_starts_once_the_owner_created_the_tables():
+    """SDD §11 (review RV-07): with PostgreSQL's secure schema usage pattern the application role
+    owns a schema named after it, first in its search_path ("$user", public), while the tables
+    are the owner's: create_schema reads the indexes of the tables its names resolve to - not of
+    the current schema, the role's own and empty one - so it finds them all and runs no CREATE
+    INDEX, which only the tables' owner may run."""
+    owner = Store(PG_URL)
+    owner.create_schema()
+    url = sa.engine.make_url(PG_URL)
+    role, password = f"seamless_app_{secrets.token_hex(4)}", secrets.token_urlsafe(16)
+    with owner.engine.begin() as conn:
+        conn.execute(sa.text(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+        conn.execute(sa.text(f'GRANT CONNECT ON DATABASE "{url.database}" TO {role}'))
+        conn.execute(sa.text(f"CREATE SCHEMA {role} AUTHORIZATION {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO {role}"))
+        conn.execute(sa.text(f"GRANT SELECT, INSERT ON events TO {role}"))
+        conn.execute(sa.text(f"GRANT USAGE, SELECT ON SEQUENCE events_seq_seq TO {role}"))
+    app = Store(url.set(username=role, password=password).render_as_string(hide_password=False))
+    try:
+        with app.engine.connect() as conn:  # the premise: its current schema is its own
+            assert conn.execute(sa.text("SELECT current_schema()")).scalar() == role
+        seen = _statements_of(app, app.create_schema)  # what every server start runs
+        assert not [s for s in seen if s.split()[0].upper() == "CREATE"], seen
+        migration = make_migration()
+        app.put("migration", migration, expected_version=0)
+        assert owner.get("migration", migration.id, Migration) == migration  # the owner's table
+    finally:
+        app.dispose()
+        with owner.engine.begin() as conn:
+            conn.execute(sa.text(f"DROP SCHEMA {role} CASCADE"))
+            conn.execute(sa.text(f"REVOKE ALL ON documents, events FROM {role}"))
+            conn.execute(sa.text(f"REVOKE ALL ON SEQUENCE events_seq_seq FROM {role}"))
+            conn.execute(sa.text(f'REVOKE CONNECT ON DATABASE "{url.database}" FROM {role}'))
+            conn.execute(sa.text(f"DROP ROLE {role}"))
+        owner.truncate_for_tests()
+        owner.dispose()

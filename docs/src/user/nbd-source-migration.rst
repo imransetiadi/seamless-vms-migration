@@ -65,8 +65,13 @@ For each workload marked with ``use_nbdkit_direct: true``, the role:
 
 1. Verifies the instance is in SHUTOFF state
 2. Connects to the hypervisor via SSH
-3. Discovers all disk files in ``/var/lib/nova/instances/<uuid>/`` (disk, disk.eph0, disk.eph1, etc.)
-4. Inspects each disk with qemu-img info to detect format and size
+3. Discovers all disk files in ``/var/lib/nova/instances/<uuid>/`` (disk, disk.eph0, disk.eph1, etc.); the
+   config drive (``disk.config``) is left out: Nova gives the destination server its own
+4. Takes each disk's format from the instance's ``disk.info``, where Nova recorded it, and reads the size
+   with ``qemu-img info -f <format>``. It never lets qemu guess a format: a raw disk's first block is the
+   guest's, and a qcow2 header written there would make qemu-nbd read a file of the hypervisor into the
+   export. The role stops before any export when ``disk.info`` is missing or unreadable, or records no
+   single format for a disk
 5. Spawns one qemu-nbd process per disk on sequential ports starting from 10809
 6. Updates the workloads.yml file with the nbdkit_disks list
 
@@ -138,15 +143,16 @@ If you want to skip the import_from_hypervisor role and prepare the hypervisor m
     ├── disk          # Boot disk
     ├── disk.eph0     # Ephemeral disk 0 (if present)
     ├── disk.eph1     # Ephemeral disk 1 (if present)
-    └── disk.info     # Metadata file (not used)
+    └── disk.info     # The format Nova recorded for each disk (JSON: path -> format)
 
-2. Inspect the disk format:
+2. Read each disk's format from ``disk.info`` (never let qemu guess it) and inspect the disk with it:
 
 .. code-block:: bash
 
-    qemu-img info /var/lib/nova/instances/<uuid>/disk
+    cat /var/lib/nova/instances/<uuid>/disk.info
+    qemu-img info -f qcow2 /var/lib/nova/instances/<uuid>/disk
 
-3. Start qemu-nbd for each disk:
+3. Start qemu-nbd for each disk, with the format ``disk.info`` records for it:
 
 .. code-block:: bash
 

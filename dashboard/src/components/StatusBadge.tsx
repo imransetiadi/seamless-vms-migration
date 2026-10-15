@@ -1,6 +1,7 @@
 import type { LucideIcon } from 'lucide-react';
 import type { DerivedPlanStatus, Phase, ProviderStatus, Severity } from '../api/types';
 import { cn } from '../lib/cn';
+import { NOTHING_MIGRATED } from '../lib/planDone';
 import { phaseMeta, type Tone } from '../lib/phase';
 import { planStatusMeta, providerStatusMeta, severityMeta, TONE_CLASSES } from '../lib/status';
 import { Term } from './Term';
@@ -44,9 +45,14 @@ export function PhaseBadge({ phase, size, className }: { phase: Phase; size?: 's
   return <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} title={meta.description} size={size} className={className} />;
 }
 
-export function PlanStatusBadge({ status, size }: { status: DerivedPlanStatus; size?: 'sm' | 'md' }) {
+export function PlanStatusBadge({ status, size, nothingMigrated }: { status: DerivedPlanStatus; size?: 'sm' | 'md'; nothingMigrated?: boolean }) {
   const meta = planStatusMeta(status);
-  return <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} size={size} />;
+  // a Completed plan that migrated nothing is no success: neutral, with the rolled-back icon and why (SDD §16)
+  return nothingMigrated ? (
+    <StatusBadge tone="neutral" icon={phaseMeta('rolled_back').icon} label={meta.label} detail={NOTHING_MIGRATED} size={size} />
+  ) : (
+    <StatusBadge tone={meta.tone} icon={meta.icon} label={meta.label} size={size} />
+  );
 }
 
 export function ProviderStatusBadge({ status, size }: { status: ProviderStatus; size?: 'sm' | 'md' }) {

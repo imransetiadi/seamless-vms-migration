@@ -42,6 +42,9 @@ class StepResult:
     sync_pass: SyncPass | None = None
     destination_server_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    #: a warm pre-copy or sync pass: what it met that the cutover refuses before the source
+    #: stops, for the migration's cutover_refusals (SDD §7.2); None when the step learned nothing
+    cutover_refusals: list[str] | None = None
 
 
 class TransientStepError(Exception):

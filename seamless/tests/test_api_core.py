@@ -32,8 +32,8 @@ def test_health_public_reports_db(api, monkeypatch):
         "status": "ok",
         "version": "0.1.0",
         "demo": True,
-        "auth_disabled": False,
         "demo_speed": 1e7,
+        "auth_disabled": False,
         "db": "ok",
     }
     assert orchestrator["running"] is True and orchestrator["healthy"] is True
@@ -186,6 +186,7 @@ ROUTES = [
     ("POST", "/api/v1/plans/plan-00000000/validate", Role.operator, None),
     ("POST", "/api/v1/plans/plan-00000000/start", Role.operator, None),
     ("POST", "/api/v1/plans/plan-00000000/pause", Role.operator, None),
+    ("POST", "/api/v1/plans/plan-00000000/cancel", Role.operator, {}),
     ("GET", "/api/v1/migrations", Role.viewer, None),
     ("GET", "/api/v1/migrations/mig-0000000000", Role.viewer, None),
     ("POST", "/api/v1/migrations/mig-0000000000/approve", Role.approver, {"comment": "ok"}),
@@ -199,7 +200,26 @@ ROUTES = [
     ("GET", "/api/v1/events", Role.viewer, None),
     ("GET", "/api/v1/stats", Role.viewer, None),
     ("GET", "/api/v1/advisor/status", Role.viewer, None),
+    ("GET", "/api/v1/advisor/notes", Role.viewer, None),
     ("POST", "/api/v1/advisor/similar-incidents", Role.operator, {"query": "timeout"}),
+    ("GET", "/api/v1/advisor/data-sent", Role.viewer, None),
+    ("GET", "/api/v1/advisor/recommendations", Role.viewer, None),
+    ("GET", "/api/v1/advisor/recommendations/rec-nope", Role.viewer, None),
+    ("POST", "/api/v1/advisor/recommendations/rec-nope/approve", Role.admin, {"comment": "ok"}),
+    (
+        "POST",
+        "/api/v1/advisor/recommendations/rec-nope/override",
+        Role.admin,
+        {"strategy": "cold", "reason": "r"},
+    ),
+    ("GET", "/api/v1/advisor/snapshots/snap-nope", Role.viewer, None),
+    # a body that creates or changes nothing, even for a role the route allows
+    ("GET", "/api/v1/advisor/policies", Role.viewer, None),
+    ("POST", "/api/v1/advisor/policies", Role.admin, {}),
+    ("PUT", "/api/v1/advisor/policies/pol-nope", Role.admin, {}),
+    ("DELETE", "/api/v1/advisor/policies/pol-nope", Role.admin, None),
+    ("POST", "/api/v1/migrations/mig-0000000000/force-cutover", Role.approver, {"reason": "r"}),
+    ("POST", "/api/v1/plans/plan-00000000/finalize", Role.approver, {"confirm": "x"}),
     ("GET", "/api/v1/metrics", Role.viewer, None),
 ]
 
@@ -291,6 +311,8 @@ def test_metrics_format(api, tmp_path):
         "# TYPE seamless_tick_slow_total counter",
         "# TYPE seamless_step_duration_seconds summary",
         "# TYPE seamless_advisor_calls_total counter",
+        "# TYPE seamless_cutover_refusals gauge",
+        "seamless_cutover_refusals 0",
     ):
         assert line in text, line
     assert all(f'seamless_migrations{{phase="{p.value}"}}' in text for p in Phase)
@@ -478,6 +500,23 @@ def test_auth_disabled_maps_to_anonymous_admin(tmp_path):
     store.dispose()
 
 
+def test_health_says_whether_authentication_is_off(api, tmp_path):
+    # Sign in offers to continue without a token only when it works, and asks a public route:
+    # GET /me without a token would be refused, an auth.denied event and a lockout tick per
+    # visit (SDD §12, §16)
+    for path in ("/api/v1/health", "/api/v1/ready"):
+        assert api.client.get(path).json()["auth_disabled"] is False
+    assert [e for e in api.store.events(since_seq=0) if e.kind == "auth.denied"] == []
+    (tmp_path / "off").mkdir()
+    settings, _ = api_settings(tmp_path / "off", auth_disabled=True, tokens_file=None)
+    store = Store(f"sqlite:///{tmp_path / 'off.db'}")
+    store.create_schema()
+    with TestClient(create_app(settings, store)) as client:
+        for path in ("/api/v1/health", "/api/v1/ready"):
+            assert client.get(path).json()["auth_disabled"] is True
+    store.dispose()
+
+
 def test_render_metrics_escapes_labels_and_formats_numbers():
     from seamless_migrate.metrics import _escape, _num, advisor_calls, render_metrics
 
@@ -494,6 +533,77 @@ def test_render_metrics_escapes_labels_and_formats_numbers():
     assert 'seamless_advisor_calls_total{tool="tool\\"x",outcome="error"} 1' in text
     assert "seamless_tick_seconds_count 4" in text and "seamless_tick_slow_total 1" in text
     assert text.endswith("\n")
+
+
+def test_the_cutover_refusals_gauge_counts_the_migrations_dashboard_lists_so():
+    """SDD §18: the migrations in precopy, syncing or awaiting_cutover whose last pass found what
+    their cutover will refuse - not one in another phase, not one whose pass found nothing."""
+    from seamless_migrate.metrics import render_metrics
+
+    refusal = ["the NIC 00:50:56:40:d5:b3 of portal-02 on 'dc2-prod': port p-1 holds 10.2.0.32"]
+    migrations = [
+        make_migration(id=f"mig-{i:010x}", phase=phase, cutover_refusals=refusals)
+        for i, (phase, refusals) in enumerate(
+            [
+                (Phase.precopy, refusal),
+                (Phase.syncing, refusal * 2),  # one migration, however many problems
+                (Phase.awaiting_cutover, refusal),
+                (Phase.awaiting_cutover, []),  # its last pass found nothing
+                (Phase.failed, refusal),  # refused already: Needs attention lists it as failed
+                (Phase.ready, refusal),  # a retry: its pre-copy looks again
+            ]
+        )
+    ]
+    text = render_metrics(migrations, {}, {})
+    assert "# TYPE seamless_cutover_refusals gauge" in text
+    assert "\nseamless_cutover_refusals 3\n" in text
+
+
+# routes test_role_matrix cannot drive, and the test that checks their role instead
+MATRIX_EXCEPTIONS = {
+    ("GET", "/events/stream"): "test_sse_route_requires_viewer (a stream never ends)",
+    ("POST", "/demo/vms/{id}/power"): (
+        "test_the_demo_power_route_sets_a_fake_source_vms_power_and_exists_only_in_demo_mode"
+    ),
+}
+
+
+def _route_key(app, method, path):
+    """(method, path template with every placeholder written {id}) of the route serving path: of
+    the templates that match, the one with the fewest placeholders, as a literal route wins."""
+    matching = [
+        template
+        for template, operations in app.openapi()["paths"].items()
+        if method.lower() in operations
+        and re.match("^" + re.sub(r"\\\{[^}]+\\\}", "[^/]+", re.escape(template)) + "$", path)
+    ]
+    assert matching, f"no route serves {method} {path}"
+    template = min(matching, key=lambda t: t.count("{"))
+    return method, re.sub(r"\{[^}]+\}", "{id}", template[len("/api/v1") :])
+
+
+def test_the_role_matrix_covers_every_route_sdd_12_lists(api):
+    """SDD §12: test_role_matrix drives every route with the role the table gives it - a route
+    added without its matrix row, or a row whose role drifted from the table, fails here - and
+    every public route answers without a token."""
+    from seamless_migrate.config import find_repo_root
+
+    sdd = (find_repo_root() / "docs" / "SDD.md").read_text(encoding="utf-8")
+    documented = {
+        (m, re.sub(r"\{[^}]+\}", "{id}", p)): role
+        for m, p, role in re.findall(
+            r"^\| (GET|POST|PUT|PATCH|DELETE) \| `([^`]+)` \| (\w+)", sdd, re.M
+        )
+    }
+    matrix = {_route_key(api.client.app, m, p): r.value for m, p, r, _ in ROUTES}
+    expected = {
+        key: role
+        for key, role in documented.items()
+        if role != "public" and key not in MATRIX_EXCEPTIONS
+    }
+    assert matrix == expected
+    for method, path in [key for key, role in documented.items() if role == "public"]:
+        assert api.client.request(method, "/api/v1" + path).status_code not in (401, 403), path
 
 
 def test_every_route_is_documented_in_sdd_12(api):

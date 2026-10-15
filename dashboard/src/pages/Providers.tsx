@@ -1,7 +1,7 @@
 import { ArrowRight, Check, HardDrive, KeyRound, Minus, Pencil, Plus, RefreshCw, Server, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useCheckAllProviders, useCheckProvider, useDeleteProvider, useProviders } from '../api/hooks';
+import { useCheckAllProviders, useCheckProvider, useDeleteProvider, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import type { Provider } from '../api/types';
 import { Button } from '../components/Button';
@@ -15,6 +15,7 @@ import { ProviderStatusBadge } from '../components/StatusBadge';
 import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative } from '../lib/format';
+import { deleteRefusal, plansThatNeed } from '../lib/providerUse';
 import { hasRole } from '../lib/roles';
 import { presetFor } from '../lib/distributions';
 import { storageBackends, storageSummary } from '../lib/storage';
@@ -117,6 +118,9 @@ function ProviderCard({
   const check = useCheckProvider();
   const remove = useDeleteProvider();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // the plans that still need it: Delete waits for them, as the API refuses it (SDD §12, §16)
+  const plans = usePlans();
+  const refusal = plans.data ? deleteRefusal(plansThatNeed(provider.id, plans.data)) : null;
   const ch = provider.conversion_host;
   const preset = presetFor(provider.distribution, provider.kind);
 
@@ -203,23 +207,24 @@ function ProviderCard({
             })
           }
         >
-          Check
+          {/* the card's heading shows the provider: it is named for assistive technology only (SDD §16) */}
+          Check<span className="sr-only"> {provider.name}</span>
         </Button>
         <Link to={`/inventory/${provider.id}`} className={buttonClassName('ghost', 'md')}>
           <HardDrive aria-hidden className="size-4" />
-          Inventory
+          Inventory<span className="sr-only"> of {provider.name}</span>
         </Link>
         <Button variant="ghost" icon={Pencil} onClick={onEdit} disabledReason={canEdit ? null : 'Editing a provider requires the admin role.'}>
-          Edit
+          Edit<span className="sr-only"> {provider.name}</span>
         </Button>
         <Button
           variant="ghost"
           icon={Trash2}
           onClick={() => setConfirmDelete(true)}
           className="ml-auto"
-          disabledReason={canEdit ? null : 'Deleting a provider requires the admin role.'}
+          disabledReason={canEdit ? refusal : 'Deleting a provider requires the admin role.'}
         >
-          Delete
+          Delete<span className="sr-only"> {provider.name}</span>
         </Button>
       </footer>
 
@@ -232,7 +237,7 @@ function ProviderCard({
         consequences={[
           { kind: 'removed', text: 'the provider in Seamless, with the sign-in details and SSH key stored for it' },
           { kind: 'kept', text: 'the cloud itself: nothing changes there' },
-          { kind: 'then', text: 'plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it' },
+          { kind: 'then', text: 'finished plans keep its id: none of them needs it any more' },
         ]}
         confirmLabel="Delete provider"
         requireText={provider.id}

@@ -113,11 +113,32 @@ test('light theme switches the token values', async ({ page }) => {
     .toBe('rgb(248, 250, 252)');
 });
 
+test('the theme chosen stays after a reload, light and dark (QASuite UI-07)', async ({ page }) => {
+  await signIn(page);
+  // the sidebar toggle is labelled by its visible text: the theme it switches to
+  const toggle = page.locator('aside').getByRole('button', { name: /^(light|dark) theme$/i });
+  const background = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  // dark is the default (SDD §16)
+  await expect(toggle).toHaveText(/^light theme$/i);
+  await toggle.click();
+  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await page.reload();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await expect.poll(background).toBe('rgb(248, 250, 252)');
+  await expect(toggle).toHaveText(/^dark theme$/i);
+  // and back: the dark choice stays too
+  await toggle.click();
+  await page.reload();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+  await expect.poll(background).toBe('rgb(15, 23, 42)');
+  await expect(toggle).toHaveText(/^light theme$/i);
+});
+
 test('an admin connects a Kolla-Ansible source and tests the connection', async ({ page }) => {
   await signIn(page);
   await page.goto('/providers');
   await page.getByRole('button', { name: /^add provider$/i }).first().click();
-  const dialog = page.getByRole('dialog', { name: /connect a cloud/i });
+  const dialog = page.getByRole('dialog', { name: /^add provider$/i });
   await dialog.getByText('Kolla-Ansible', { exact: true }).click();
   await dialog.getByLabel(/^name/i).fill('Kolla Browser Test');
   await expect(dialog.getByLabel(/^id/i)).toHaveValue('kolla-browser-test');
@@ -167,6 +188,31 @@ test("the plans list keeps each plan's progress and clouds on a phone, without s
   // the clouds column is hidden on a phone: the same text stands under the name, visible
   await expect(row.getByText(/^RHOSP 17\.1 — DC1 → RHOSO 18\.0 — Production$/).filter({ visible: true })).toHaveCount(1);
 });
+
+for (const width of [320, 768, 1280]) {
+  test(`at ${width} px a plan's done count names its cancelled migrations on a line of its own: the bar keeps its width and no cell spills (QASuite UI-28, SDD §16)`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await signIn(page, 'viewer');
+    await page.goto('/plans');
+    // Legacy apps keeps a VM whose migration was cancelled (plan-95a7e3f1 in src/api/mockData.ts)
+    const row = page
+      .getByRole('table', { name: /migration plans/i })
+      .getByRole('row')
+      .filter({ has: page.getByRole('link', { name: 'Legacy apps' }) });
+    await expect(row.getByText('1 cancelled').filter({ visible: true })).toHaveCount(1);
+    await page.evaluate(() => document.fonts.ready);
+    const sideways = await page.locator('.table-wrap').first().evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(sideways, 'the list scrolls sideways').toBeLessThanOrEqual(1);
+    // without a cancelled count the bar is 81 px wide at 320, 50 at 768 and 106 at 1280; beside one it was 13 px or none
+    const bar = await row.getByRole('progressbar').filter({ visible: true }).boundingBox();
+    expect(bar?.width ?? 0, 'the done bar').toBeGreaterThanOrEqual(40);
+    // beside the bar the count ran into the status badge at 320 px and out of the Done column at 768 px
+    const spills = await row.evaluate((tr) => Array.from(tr.children).filter((c) => c.scrollWidth > c.clientWidth + 1).map((c) => c.textContent));
+    expect(spills, 'cells whose content runs over their edge').toEqual([]);
+  });
+}
 
 test('no page scrolls sideways on a 320 px wide screen (NFR-08: WCAG 2.2 reflow)', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 800 });
@@ -241,7 +287,7 @@ test('the error summaries of the plan, policy and provider dialogs keep their li
 
   await page.goto('/providers');
   await page.getByRole('button', { name: /^add provider$/i }).first().click();
-  const provider = page.getByRole('dialog', { name: /connect a cloud/i });
+  const provider = page.getByRole('dialog', { name: /^add provider$/i });
   await provider.getByRole('button', { name: /^add provider$/i }).click();
   await expect(provider.getByRole('alert').first()).toBeVisible();
   expect(await targets(), 'provider dialog').toEqual([]);

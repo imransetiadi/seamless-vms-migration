@@ -141,11 +141,59 @@ describe('MigrationActions', () => {
     renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
     const group = screen.getByRole('group', { name: /migration actions/i });
     await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`cut over ${migration.vm.name} once pre-copy converges`, 'i') });
-    expect(dialog).toHaveTextContent(/starts once pre-copy has converged/i);
+    // maker-checker with no other approval: a request, not a start (SDD §16)
+    const dialog = await screen.findByRole('alertdialog', { name: new RegExp(`request the cutover of ${migration.vm.name}`, 'i') });
+    expect(dialog).toHaveTextContent(/starts once another approver approves it and pre-copy has converged/i);
     await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
     expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('precopy');
+  });
+
+  it.each([
+    // [require_approval, require_distinct_approver, what the dialog says of an approval, whether the request records one]
+    [false, true, null, false], // a plan made without approval keeps the distinct-approver default
+    [false, false, 'This also records your approval', true],
+    [true, false, 'This also records your approval', true],
+    [true, true, 'Your request is not an approval', false],
+  ] as const)(
+    'claims an approval in the Cut over dialog only when the request records one (approval %s, distinct approver %s; SDD §5.4, §16)',
+    async (requireApproval, distinct, says, records) => {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      const migration = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-5003, ready
+      migration.approvals = [];
+      const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+      plan.require_approval = requireApproval;
+      plan.require_distinct_approver = distinct;
+      const role: Role = 'approver';
+      renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+      const group = screen.getByRole('group', { name: /migration actions/i });
+      await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
+      const dialog = await screen.findByRole('alertdialog');
+      for (const sentence of ['This also records your approval', 'Your request is not an approval']) {
+        if (sentence === says) expect(dialog).toHaveTextContent(sentence);
+        else expect(dialog).not.toHaveTextContent(sentence);
+      }
+      expect(dialog).toHaveTextContent(/the migration can be rolled back until it is finalized\./i);
+      await user.click(within(dialog).getByRole('button', { name: /^(start|request) cutover$/i }));
+      await waitFor(() => expect(server.migrations.find((x) => x.id === migration.id)?.cutover_requested).toBe(true));
+      // what the dialog said is what the request recorded
+      expect(server.migrations.find((x) => x.id === migration.id)!.approvals.some((a) => a.actor === 'sari')).toBe(records);
+    },
+  );
+
+  it('claims an approval in the Force cutover dialog only when forcing records one (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const { button, server, migration } = setup('db-mysql-02', 'approver');
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    // a plan made without approval keeps the distinct-approver default: forcing records no approval
+    plan.require_approval = false;
+    plan.require_distinct_approver = true;
+    await user.click(button(/^force cutover$/i));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Force the cutover of db-mysql-02?' });
+    expect(dialog).not.toHaveTextContent('This also records your approval');
+    expect(dialog).not.toHaveTextContent('Another approver still approves the cutover');
+    expect(dialog).toHaveTextContent('The window and a free cutover slot still apply.');
   });
 
   it('forces the cutover of a warm migration before it converged, with a reason (SDD §5.4, ADV-16)', async () => {
@@ -244,7 +292,7 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
   });
 
-  it('warns in Finalize while the source VM runs again (SDD §8.1, ADV-19)', async () => {
+  it('keeps Finalize unavailable while the source VM runs again, saying why, as the API refuses it (SDD §8.1)', async () => {
     const user = userEvent.setup({ delay: null });
     const server = createTestServer();
     const migration = server.migrations.find((m) => m.vm.name === 'web-cache-01') as Migration;
@@ -252,9 +300,12 @@ describe('MigrationActions', () => {
     const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
     const role: Role = 'approver';
     renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
-    await user.click(within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /finalize/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /finalize web-cache-01/i });
-    expect(dialog).toHaveTextContent('The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.');
+    const finalize = within(screen.getByRole('group', { name: /migration actions/i })).getByRole('button', { name: /^finalize$/i });
+    expect(finalize).toHaveAttribute('aria-disabled', 'true');
+    expect(finalize).toHaveAccessibleDescription('The source VM runs again: stop it, or roll it back, before finalizing.');
+    await user.click(finalize);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('completed');
   });
 
   it('says a retry starts the migration over, not from a checkpoint (the API clears it)', async () => {
@@ -346,15 +397,69 @@ describe('MigrationActions', () => {
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.phase).toBe('rolling_back'));
   });
 
+  it("leads an advisor-held migration's next step with its recommendation, ahead of its own actions (SDD §16)", async () => {
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.id === 'mig-b2c4d6e871')!;
+    expect(migration.advisor_hold).toBeTruthy();
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={'approver' as Role} />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    const link = within(group).getByRole('link', { name: 'See the recommendation' });
+    expect(link).toHaveAttribute('href', `/advisor/recommendations/${migration.advisor_hold}`);
+    expect(group.firstElementChild).toBe(link);
+  });
+
+  it('offers no recommendation link where no advisor decision waits', () => {
+    setup('app-billing-01', 'approver');
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    expect(within(group).queryByRole('link', { name: 'See the recommendation' })).toBeNull();
+  });
+
+  it('says in the Approve dialog that approving a requested cutover starts it and stops the source VM (SDD §5.4, §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((x) => x.id === 'mig-9e4f6a8b53')!; // vm-fileserver-01, vmware_cold, ready
+    Object.assign(migration, { approvals: [], cutover_requested: true, cutover_requested_by: 'rina', advisor_hold: null });
+    const plan = server.plans.find((p) => p.id === migration.plan_id)!;
+    Object.assign(plan, { require_approval: true, require_distinct_approver: true, auto_cutover: false, cutover_window: null });
+    const role: Role = 'approver';
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={role} />, { server, token: role });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^approve$/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: `Approve the cutover of ${migration.vm.name}?` });
+    expect(dialog).toHaveTextContent('Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts');
+    expect(dialog).not.toHaveTextContent('still waits for');
+    await user.click(within(dialog).getByRole('button', { name: 'Approve and cut over' }));
+    await waitFor(() => expect(server.migrations.find((x) => x.id === migration.id)!.approvals.map((a) => a.actor)).toEqual(['sari']));
+  });
+
   it('lets an approver request the cutover of a converged warm migration', async () => {
     const user = userEvent.setup({ delay: null });
     const { button, server, migration } = setup('app-billing-01', 'approver');
 
     expect(screen.getByText(/next:/i)).toHaveTextContent(/cut over|approve/i);
     await user.click(button(/^cut over/i));
-    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01/i });
+    // its plan wants another approver and none approved: the dialog asks to request it (SDD §16)
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
     expect(dialog).toHaveTextContent(/source VM will be stopped/i);
-    await user.click(within(dialog).getByRole('button', { name: /start cutover/i }));
+    await user.click(within(dialog).getByRole('button', { name: /request cutover/i }));
+    await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
+  });
+
+  it('repeats in the Cut over dialog what the cutover will refuse, and still lets the cutover be requested (SDD §16)', async () => {
+    const user = userEvent.setup({ delay: null });
+    const server = createTestServer();
+    const migration = server.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
+    const problem = "the NIC 00:50:56:00:00:01 of app-billing-01 on 'app-net': port port-old holds its MAC";
+    migration.cutover_refusals = [problem];
+    const plan = server.plans.find((p) => p.id === migration.plan_id) ?? null;
+    renderWithApp(<MigrationActions migration={migration} plan={plan} role={"approver" as Role} />, { server, token: 'approver' });
+    const group = screen.getByRole('group', { name: /migration actions/i });
+    await user.click(within(group).getByRole('button', { name: /^cut over/i }));
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
+    const refusals = within(dialog).getByRole('note', { name: 'Cutover will refuse' });
+    expect(refusals).toHaveTextContent(problem);
+    await user.click(within(dialog).getByRole('button', { name: /request cutover/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
   });
 
@@ -371,11 +476,11 @@ describe('MigrationActions', () => {
     const group = screen.getByRole('group', { name: /migration actions/i });
 
     await user.click(within(group).getByRole('button', { name: /^cut over$/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /cut over app-billing-01 now/i });
+    const dialog = await screen.findByRole('alertdialog', { name: /request the cutover of app-billing-01/i });
     const ignore = within(dialog).getByRole('checkbox', { name: /ignore the cutover window/i });
     expect(ignore).not.toBeChecked();
     await user.click(ignore);
-    await user.click(within(dialog).getByRole('button', { name: /^start cutover$/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^request cutover$/i }));
     await waitFor(() => expect(server.migrations.find((m) => m.id === migration.id)?.cutover_requested).toBe(true));
     expect(server.migrations.find((m) => m.id === migration.id)?.force_window).toBe(true);
   });

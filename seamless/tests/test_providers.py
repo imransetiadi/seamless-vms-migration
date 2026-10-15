@@ -8,7 +8,7 @@ from seamless_migrate.config import Settings
 from seamless_migrate.domain.enums import ProviderKind, ProviderRole
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory, is_legacy_os
 from seamless_migrate.providers import registry
-from seamless_migrate.providers.base import ProviderError, provider_caps
+from seamless_migrate.providers.base import ProviderError, VMNotFound, provider_caps
 from seamless_migrate.providers.fake import FakeDestinationProvider, FakeSourceProvider
 from seamless_migrate.providers.openstack import OpenStackProvider
 from seamless_migrate.providers.vmware import VMwareProvider
@@ -41,15 +41,19 @@ async def test_fake_openstack_inventory_has_required_traits():
     assert isinstance(inv, SourceInventory) and inv.networks and inv.projects
     caps = await src.check()
     assert caps["admin"] is True and "compute_microversion" in caps
-    with pytest.raises(ProviderError):
+    # the cloud answers it has no such VM: VMNotFound, a ProviderError (SDD §10)
+    with pytest.raises(VMNotFound):
         await src.get_vm("does-not-exist")
 
 
 async def test_fake_vmware_mixed_cbt():
     src = FakeSourceProvider(ProviderKind.vmware, seed=42)
     vms = await src.list_vms()
-    assert len(vms) == 12
+    assert len(vms) == 13
     assert {v.cbt_enabled for v in vms} == {True, False}
+    # SDD §7.4: the demo VM whose warm passes meet what the cutover will refuse
+    faults = {v.name: v.tags.get("demo-fault") for v in vms if v.tags.get("demo-fault")}
+    assert faults == {"dc2-portal-02": "cutover-refusal"}
     assert any(v.snapshot_count > 0 for v in vms) and any(v.snapshot_count == 0 for v in vms)
     assert any(d.independent for v in vms for d in v.disks)
     assert any(v.tools_ok is False for v in vms)
@@ -77,6 +81,9 @@ async def test_fake_destination_inventory_and_servers():
     await dst.delete_server("srv-1")
     assert "srv-1" in dst.deleted
     assert await dst.find_server("web-01") is not None
+    # the demo destination holds no port another migration could collide with (SDD §10)
+    assert await dst.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == []
+    await dst.delete_port("port-gone")
 
 
 def test_registry_returns_fake_in_demo():
@@ -123,6 +130,11 @@ class FakeCompute:
         return list(self._servers.values())
 
     def get_server(self, server_id):
+        if server_id not in self._servers:
+            import openstack.exceptions
+
+            # what the SDK raises on HTTP 404
+            raise openstack.exceptions.NotFoundException(f"No Server found for {server_id}")
         return self._servers[server_id]
 
     def volume_attachments(self, server):
@@ -535,6 +547,24 @@ async def test_openstack_transitional_nova_states_are_reported(stub_openstack):
     stub_openstack(conn)
     [vm] = await OpenStackProvider(make_provider(), settings()).list_vms()
     assert vm.power_state == "transitioning"
+
+
+async def test_openstack_get_vm_tells_a_server_the_cloud_lacks_from_a_failing_cloud(stub_openstack):
+    """SDD §8.1, §10: the source watch clears a source that ran again once its cloud says the VM is
+    gone - a 404 is VMNotFound; any other failure stays a plain ProviderError (not gone)."""
+    conn = fake_conn()
+    stub_openstack(conn)
+    provider = OpenStackProvider(make_provider(), settings())
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("srv-gone")
+
+    def unreachable(server_id):
+        raise RuntimeError("Unable to establish connection to https://nova:8774")
+
+    conn.compute.get_server = unreachable
+    with pytest.raises(ProviderError) as failed:
+        await provider.get_vm("srv-1")
+    assert not isinstance(failed.value, VMNotFound)
 
 
 async def test_openstack_image_booted_server_gets_image_root_disk(stub_openstack):
@@ -1018,7 +1048,7 @@ async def test_vmware_power_on_and_inventory(tmp_path):
         await provider_for([PoweredOffVM(task_state="error")]).power_on("5012-abcd")
     with pytest.raises(ProviderError, match="not found"):
         await provider_for([vm]).power_on("missing")
-    with pytest.raises(ProviderError, match="not found"):
+    with pytest.raises(VMNotFound, match="not found"):
         await provider_for([vm]).get_vm("missing")
     inv = await provider_for([vm]).inventory()
     assert inv.networks == {} and inv.projects == []  # the fake vim has no Network type
@@ -1065,8 +1095,100 @@ async def test_vmware_get_vm_and_power_on_use_the_uuid_index(tmp_path):
     await provider.power_on("5012-abcd")
     assert len(vm.tasks) == 1 and len(lookups) == 2
     assert not any("VirtualMachine" in t for t in walked)
-    with pytest.raises(ProviderError, match="not found"):
+    with pytest.raises(VMNotFound, match="not found"):
         await provider.get_vm("missing")  # falls back to the walk, then fails
+
+
+def _vcenter(tmp_path, vms, find=None):
+    """A VMwareProvider over ``vms``; ``find`` replaces the uuid index (None: no index at all)."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+
+    def service_instance(**_):
+        si = fake_service_instance(vms)
+        content = si.RetrieveContent()
+        content.searchIndex = NS(FindByUuid=find) if find else NS()
+        return si
+
+    return VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+
+
+async def test_vmware_get_vm_never_calls_a_vm_gone_while_one_it_cannot_read_may_be_it(tmp_path):
+    """SDD §10 (review RV3-04): when the uuid index cannot answer (a fault, or none) the walk over
+    every VM decides - and a VM whose configuration vCenter cannot read may be the one sought, so
+    "not found" is no answer: a ProviderError, which leaves the source-running alert as it is."""
+    unreadable = PoweredOffVM(state="poweredOn")
+    unreadable.config = None
+
+    def faulting(dc, uuid, is_vm, instance):
+        raise RuntimeError("vmodl.fault.SystemError")
+
+    for find in (faulting, None):
+        provider = _vcenter(tmp_path, [unreadable], find=find)
+        with pytest.raises(ProviderError, match="cannot be read") as failed:
+            await provider.get_vm("5012-abcd")
+        assert not isinstance(failed.value, VMNotFound), find
+    # addressed by its moId, the unreadable VM is the one sought: there, not gone
+    with pytest.raises(ProviderError, match="configuration is unavailable") as failed:
+        await _vcenter(tmp_path, [unreadable]).get_vm("vm-101")
+    assert not isinstance(failed.value, VMNotFound)
+
+
+async def test_vmware_get_vm_without_an_index_still_calls_a_vm_gone_once_it_read_every_vm(
+    tmp_path,
+):
+    """SDD §10: with every VM readable, the walk is vCenter's answer: no such VM is VMNotFound."""
+
+    def faulting(dc, uuid, is_vm, instance):
+        raise RuntimeError("vmodl.fault.SystemError")
+
+    provider = _vcenter(tmp_path, [PoweredOffVM(state="poweredOn")], find=faulting)
+    assert (await provider.get_vm("5012-abcd")).source_id == "5012-abcd"
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("missing")
+
+
+async def test_vmware_get_vm_of_an_inaccessible_vm_is_not_vm_not_found(tmp_path):
+    """SDD §10 (review RV-06): vCenter leaves a VM's config unset while its files are unreachable
+    (a datastore outage) - FindByUuid still finds it: the VM is there, not gone. A VMNotFound would
+    let the source watch clear the running flag of a VM that exists."""
+    secret_dir = tmp_path / "secrets" / "vcenter-dc2"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "username").write_text("u")
+    (secret_dir / "password").write_text("p")
+    vm = PoweredOffVM(state="poweredOn")
+    vm.config = None
+
+    def service_instance(**_):
+        si = fake_service_instance([vm])
+        content = si.RetrieveContent()
+        content.searchIndex = NS(
+            FindByUuid=lambda dc, uuid, is_vm, instance: vm if uuid == "5012-abcd" else None
+        )
+        return si
+
+    provider = VMwareProvider(
+        make_provider(
+            id="vcenter", kind=ProviderKind.vmware, credentials_secret="vcenter-dc2", cloud=None
+        ),
+        settings(secrets_dir=tmp_path / "secrets"),
+        connector=service_instance,
+        vim=FAKE_VIM,
+    )
+    with pytest.raises(ProviderError, match="configuration is unavailable") as failed:
+        await provider.get_vm("5012-abcd")
+    assert not isinstance(failed.value, VMNotFound)
+    with pytest.raises(VMNotFound, match="not found"):
+        await provider.get_vm("missing")  # vCenter has no such VM: gone
 
 
 async def test_vmware_used_bytes_come_from_the_disk_layout(tmp_path):
@@ -1206,6 +1328,63 @@ def test_openstack_connect_builds_kwargs_from_clouds_yaml(monkeypatch, tmp_path)
         osp.connect(make_provider(cloud=None), settings())
     assert osp._truthy("Yes") and osp._truthy(" true ") and not osp._truthy("no")
     assert osp._truthy(1) and not osp._truthy(0)
+
+
+async def test_openstack_destination_ports_match_every_filter_and_delete_is_idempotent():
+    """SDD §10 (§7.2 VMware networks, review RT-11): ports() returns the ports matching every
+    filter given, checked again here in case the server ignores one, with the MAC compared in
+    lower case and an address in its canonical form; delete_port takes a port already gone as
+    deleted."""
+    queries, deleted = [], []
+
+    def port(port_id, mac, ips, network="net-1", device="", name=""):
+        return NS(
+            id=port_id,
+            name=name,
+            network_id=network,
+            device_id=device,
+            mac_address=mac,
+            fixed_ips=[{"subnet_id": "sub-1", "ip_address": ip} for ip in ips],
+        )
+
+    everything = [
+        port("p1", "00:50:56:00:00:01", ["10.0.0.5"], name="web-01-NIC-0-VLAN-app-net"),
+        port("p2", "fa:16:3e:00:00:02", ["10.0.0.6", "fd00::6"], device="srv-1"),
+        port("p3", "00:50:56:00:00:01", ["192.0.2.5"], network="net-2"),
+    ]
+
+    class Network:
+        def ports(self, **query):
+            queries.append(query)
+            return list(everything)  # a server that ignores every filter
+
+        def delete_port(self, port_id, ignore_missing=True):
+            deleted.append((port_id, ignore_missing))
+
+    dst = make_provider(
+        id="dst", kind=ProviderKind.rhoso, role=ProviderRole.destination, cloud="dst"
+    )
+    provider = OpenStackProvider(dst, settings(), connect_fn=lambda p, s: NS(network=Network()))
+    assert await provider.ports(network_id="net-1", mac_address="00:50:56:00:00:01") == [
+        {
+            "id": "p1",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": "net-1",
+            "device_id": "",
+            "mac_address": "00:50:56:00:00:01",
+            "fixed_ips": ["10.0.0.5"],
+        }
+    ]
+    assert queries[-1] == {"network_id": "net-1", "mac_address": "00:50:56:00:00:01"}
+    assert [p["id"] for p in await provider.ports(mac_address="00:50:56:00:00:01")] == ["p1", "p3"]
+    # Neutron keeps a MAC in lower case: one asked for in upper case is the same MAC
+    assert [p["id"] for p in await provider.ports(mac_address="FA:16:3E:00:00:02")] == ["p2"]
+    assert queries[-1] == {"mac_address": "fa:16:3e:00:00:02"}
+    assert [p["id"] for p in await provider.ports(ip_address="fd00:0::6")] == ["p2"]
+    assert queries[-1] == {"fixed_ips": ["ip_address=fd00::6"]}
+    assert [p["id"] for p in await provider.ports()] == ["p1", "p2", "p3"]
+    await provider.delete_port("p1")
+    assert deleted == [("p1", True)]
 
 
 async def test_openstack_free_quota_console_delete_and_project_lookup(tmp_path):

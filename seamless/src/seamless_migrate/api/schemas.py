@@ -6,8 +6,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import DecisionType, DerivedPlanStatus, Role, Strategy
+from ..domain.enums import DecisionType, DerivedPlanStatus, Phase, Role, Strategy
 from ..domain.models import (
+    AdvisorNote,
     AdvisorPolicy,
     AdvisorRecommendation,
     Plan,
@@ -93,9 +94,11 @@ class StrategyRequest(_Body):
 
 
 class PlanOut(Plan):
-    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle."""
+    """A plan as every plan route returns it (SDD §4.2): its derived status beside the lifecycle,
+    and how many of its migrations are in each phase (§8.1, §11)."""
 
     derived_status: DerivedPlanStatus
+    migration_counts: dict[Phase, int] = Field(default_factory=dict)
 
 
 class PlanFinalizeRequest(_Body):
@@ -145,6 +148,18 @@ class RecommendationPage(BaseModel):
     limit: int
 
 
+class AdvisorNoteEntry(AdvisorNote):
+    """An advisor note with the migration it belongs to (SDD §12 ``GET /advisor/notes``)."""
+
+    migration_id: str
+    plan_id: str
+    vm_name: str
+
+
+class AdvisorNoteList(BaseModel):
+    items: list[AdvisorNoteEntry]
+
+
 class OrchestratorHealth(BaseModel):
     running: bool
     last_tick_age_s: float | None
@@ -153,12 +168,13 @@ class OrchestratorHealth(BaseModel):
 
 
 class Health(BaseModel):
-    auth_disabled: bool
     status: Literal["ok", "degraded"]
     version: str
     demo: bool
     #: a demo's time compression: its downtime clock runs in model time (SDD §5.2, ADV-16)
     demo_speed: float | None = None
+    #: authentication is off: Sign in offers to continue without a token only then (SDD §12, §16)
+    auth_disabled: bool
     db: Literal["ok", "error"]
     orchestrator: OrchestratorHealth
 

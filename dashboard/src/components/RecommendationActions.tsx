@@ -1,13 +1,16 @@
 import { Replace, ThumbsUp } from 'lucide-react';
 import { useRef, useState, type RefObject } from 'react';
 import { useDecideRecommendation, useMe, usePlan, usePolicies } from '../api/hooks';
-import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type Strategy } from '../api/types';
+import { ACTION_TEXT_MAX, OVERRIDE_REASON_MIN, type AdvisorRecommendation, type Migration, type MigrationSummary, type Strategy, type VMRef } from '../api/types';
 import { optionLabel } from '../lib/advisor';
 import { resolvePolicy } from '../lib/policies';
-import { OWN_DECISION } from '../lib/roles';
+import { OWN_DECISION, ownReason } from '../lib/roles';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { SelectField, TextAreaField } from './Field';
+
+/** What the actions read of a migration, or of its summary: its plan, its VM and the strategies eligible now (SDD §4). */
+export type ActionMigration = Pick<Migration, 'plan_id'> & { vm: Pick<VMRef, 'source_id'> } & (Pick<Migration, 'estimates'> | Pick<MigrationSummary, 'eligible_strategies'>);
 
 /**
  * Approve the advisor's option or override it with another eligible one (SDD §14.6). Callers render it
@@ -20,7 +23,7 @@ export function RecommendationActions({
   onDecided,
 }: {
   rec: AdvisorRecommendation;
-  migration: Migration;
+  migration: ActionMigration;
   /** Where focus goes after a decision, when these actions may go with it (SDD §16). */
   focusAfterRef?: RefObject<HTMLElement>;
   /** Says what was decided, for the page's live region. */
@@ -29,7 +32,8 @@ export function RecommendationActions({
   const decide = useDecideRecommendation(rec.id);
   const policies = usePolicies();
   const [open, setOpen] = useState<'approve' | 'override' | null>(null);
-  const eligible = migration.estimates.filter((e) => e.eligible).map((e) => e.strategy);
+  // a summary names them as the API reads its estimates (SDD §4)
+  const eligible = 'eligible_strategies' in migration ? migration.eligible_strategies : migration.estimates.filter((e) => e.eligible).map((e) => e.strategy);
   const recommended = rec.recommendation.option;
   const canApprove = recommended !== null && eligible.includes(recommended as Strategy);
   // another eligible option: running the recommended one is approving it (SDD §16)
@@ -64,9 +68,9 @@ export function RecommendationActions({
   const pinned = usePlan(migration.plan_id).data?.strategy_overrides[migration.vm.source_id];
   const pinnedReason = pinned ? `The plan sets the strategy of ${name} (${optionLabel(pinned)}): change it in the plan.` : null;
   const approveReason = own
-    ? OWN_DECISION
+    ? ownReason(OWN_DECISION, me)
     : (pinnedReason ?? (rec.decision.status === 'approved' ? 'The decision is already approved.' : canApprove ? null : 'The recommended option is not eligible for this VM now.'));
-  const overrideReason = own ? OWN_DECISION : (pinnedReason ?? (alternatives.length ? null : 'No other option is eligible for this VM.'));
+  const overrideReason = own ? ownReason(OWN_DECISION, me) : (pinnedReason ?? (alternatives.length ? null : 'No other option is eligible for this VM.'));
   return (
     <>
       <div role="group" aria-label={`Decide on the recommendation for ${name}`} className="mt-2 flex flex-wrap gap-2">

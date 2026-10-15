@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { renderWithApp } from '../test/utils';
+import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import AdvisorPolicies from './AdvisorPolicies';
 
 const FINANCE = 'Finance — approval required';
@@ -66,6 +66,25 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     }
   });
 
+  it('names the field of each number it refuses: the summary lists them together', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });
+    await screen.findByRole('heading', { level: 2, name: '1 policy' });
+    await user.click(screen.getByRole('button', { name: 'New policy' }));
+    const dialog = await screen.findByRole('dialog', { name: 'New policy' });
+    await user.type(within(dialog).getByLabelText(/^Name/), 'Numbers');
+    await user.clear(within(dialog).getByLabelText('Threshold (%)'));
+    await user.type(within(dialog).getByLabelText('Threshold (%)'), '101');
+    await user.clear(within(dialog).getByLabelText(/^minimum evidence/i));
+    await user.type(within(dialog).getByLabelText(/^minimum evidence/i), '1.5');
+    await user.click(within(dialog).getByRole('button', { name: 'Create policy' }));
+    const summary = await within(dialog).findByRole('alert');
+    expect(within(summary).getAllByRole('link').map((a) => a.textContent)).toEqual([
+      'Enter the threshold as a percent from 0 to 100.',
+      'Enter the minimum evidence as a whole number from 0 to 100.',
+    ]);
+  });
+
   it('creates a policy for chosen plans once the form says what to fix', async () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies' });
@@ -107,6 +126,29 @@ describe('Advisor policies page (SDD §14.6, §16, ADV-04)', () => {
     const names = screen.getAllByRole('article').map((a) => within(a).getByRole('heading', { level: 3 }).textContent);
     expect(names).toEqual(['Spark — stricter', FINANCE, 'Built-in default']);
     expect(card('Spark — stricter')).toHaveTextContent('Plan Shared Ceph handover — analytics');
+  });
+
+  it('scrolls a failed save into view (SDD §16)', async () => {
+    const recorder = recordScrolls();
+    try {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      const handle = server.handle.bind(server);
+      server.handle = (method, path, query, body, token) =>
+        method === 'PUT' && path.startsWith('/advisor/policies/')
+          ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
+          : handle(method, path, query, body, token);
+      renderWithApp(<AdvisorPolicies />, { route: '/advisor/policies', server });
+      await screen.findByRole('heading', { level: 2, name: '1 policy' });
+      await user.click(within(card(FINANCE)).getByRole('button', { name: `Edit ${FINANCE}` }));
+      const dialog = await screen.findByRole('dialog', { name: 'Edit policy' });
+      await user.click(within(dialog).getByRole('button', { name: 'Save policy' }));
+      const alert = await within(dialog).findByRole('alert');
+      expect(alert).toHaveTextContent('The policy was not saved');
+      expect(recorder.scrolls.map((s) => s.element)).toContain(alert);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('keeps Cancel focusable while the policy is saved, saying why (SDD §16)', async () => {

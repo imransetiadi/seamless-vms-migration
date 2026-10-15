@@ -80,7 +80,8 @@ function validate(f: FormState): { errors: Errors; spec: AdvisorPolicySpec | nul
   if (!(threshold >= 0 && threshold <= 100)) e.threshold = 'Enter the threshold as a percent from 0 to 100.';
   const minEvidence = f.minEvidence.trim() === '' ? Number.NaN : Number(f.minEvidence);
   if (!Number.isInteger(minEvidence) || minEvidence < 0 || minEvidence > POLICY_MIN_EVIDENCE_MAX) {
-    e.minEvidence = `Enter a whole number from 0 to ${POLICY_MIN_EVIDENCE_MAX}.`;
+    // the summary lists it beside the threshold's: it names its field, as that one does
+    e.minEvidence = `Enter the minimum evidence as a whole number from 0 to ${POLICY_MIN_EVIDENCE_MAX}.`;
   }
   if (Object.keys(e).length > 0) return { errors: e, spec: null };
   return {
@@ -331,7 +332,7 @@ export function PolicyDialog({ open, policy, defaultThreshold, returnFocusRef, o
             onChange={(on) => set('requireDistinctApprover', on)}
           />
 
-          {save.error && <ErrorBanner error={save.error} title={policy ? 'The policy was not saved' : 'The policy was not created'} />}
+          {save.error && <ErrorBanner error={save.error} title={policy ? 'The policy was not saved' : 'The policy was not created'} reveal />}
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">

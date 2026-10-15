@@ -79,6 +79,7 @@ def test_catalog_is_complete():
         "SRC_VM_ERROR_STATE",
         "SRC_VM_TRANSITIONAL_STATE",
         "SRC_VM_DUPLICATE_NAME",
+        "SRC_VM_VOLUME_DETACHED",
         "SRC_VM_MULTIATTACH",
         "SRC_VM_EPHEMERAL_ROOT",
         "MAP_NETWORK_MISSING",

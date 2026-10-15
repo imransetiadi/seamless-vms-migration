@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import tomllib
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from seamless_migrate.ai.redaction import redact
 from seamless_migrate.config import find_repo_root
 
 ROOT = find_repo_root()
@@ -297,9 +299,9 @@ def test_seamless_up_and_demo_check_localhost_once_healthy(target):
 
 
 def test_seamless_check_runs_the_ci_checks_that_run_locally():
-    """``make seamless-check`` is "everything CI runs that can run locally" (QASuite §13): the
-    control-plane coverage gate (NFR-11), the playbook syntax checks and ansible-lint, with CI's
-    threshold, playbooks and lint targets."""
+    """``make seamless-check`` runs CI's checks that need only the venv and the dashboard's
+    node_modules (SDD §17.1, QASuite §13): the control-plane coverage gate (NFR-11), the playbook
+    syntax checks and ansible-lint, with CI's threshold, playbooks and lint targets."""
     recipe = _makefile_target_recipe("seamless-check")
     gate = re.search(r"--cov-fail-under=(\d+)", _ci_step_run("Unit and integration tests"))
     assert gate and "--cov=seamless_migrate" in recipe
@@ -314,9 +316,85 @@ def test_seamless_check_runs_the_ci_checks_that_run_locally():
     make_lint = re.search(targets, recipe)
     assert ci_lint and make_lint
     assert make_lint.group(1).split() == ci_lint.group(1).split()
+    # ansible-test sanity on a copied collection tree, as upstream runs it (QASuite §14.2)
+    assert "scripts/collection-sanity.sh" in _ci_step_run("ansible-test sanity")
+    assert "scripts/collection-sanity.sh" in recipe
     # the venv the target runs in has what the gate needs
     extras = tomllib.loads((ROOT / "seamless" / "pyproject.toml").read_text())["project"]
     assert any(req.startswith("pytest-cov") for req in extras["optional-dependencies"]["dev"])
+
+
+def test_seamless_check_says_which_ci_checks_it_leaves_out():
+    """SDD §17.1: ``make seamless-check`` is not all of CI. Its comment, ``make seamless-help``
+    and the README name what it leaves out - each a CI check the recipe does not run - and the
+    README says how to run each, so a contributor who passed it knows what CI still runs."""
+    recipe = _makefile_target_recipe("seamless-check")
+    makefile = (ROOT / "Makefile").read_text()
+    lines = makefile.splitlines()
+    start = lines.index("seamless-check:")
+    comment = []
+    for line in reversed(lines[:start]):
+        if not line.startswith("#"):
+            break
+        comment.insert(0, line)
+    comment_text = "\n".join(comment)
+    help_line = next(line for line in lines if line.strip().startswith('@echo "  seamless-check '))
+    readme = (ROOT / "README.md").read_text()
+    # the block a contributor reads under ``make seamless-check``, to the end of its code fence
+    start_check = readme.index("make seamless-check")
+    readme_block = readme[start_check : readme.index("```", start_check)]
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for where, text in (
+        ("the Makefile comment", comment_text),
+        ("make seamless-help", help_line),
+        ("the README", readme),
+    ):
+        claims = [phrase for phrase in ("every CI check", "Everything CI runs") if phrase in text]
+        assert not claims, f"{where} claims all of CI: {claims}"
+    # each a CI check the recipe leaves out, with how to run it in the README
+    for command in (
+        "npm run test:e2e",
+        "demo-cutover-refusal-browser.mjs",
+        "demo-approval-browser.mjs",
+        "demo-signin-browser.mjs",
+        "demo-keyboard-browser.mjs",
+        "demo-stream-browser.mjs",
+        "demo-overview-browser.mjs",
+        "SEAMLESS_TEST_PG_URL",
+        "pip-audit",
+        "npm audit",
+        "trivy config",
+    ):
+        assert command in ci, command
+        assert command not in recipe, command
+        assert command in readme_block, command
+    for left_out in (
+        "Playwright",
+        "browser journeys",
+        "PostgreSQL",
+        "audits",
+        "trivy",
+        "manifest",
+        "image",
+    ):
+        assert left_out in comment_text, left_out
+        assert left_out in help_line, left_out
+
+
+def test_ci_and_seamless_check_run_the_demo07_script():
+    """DEMO-07 (QASuite §6.6, §14.7) runs where the control plane is tested - CI's control-plane
+    job and ``make seamless-check`` - since the script needs only the installed control plane. CI
+    installs into the runner's Python, not a venv, so it names the ``seamless`` on its PATH."""
+    script = "tests/e2e/demo-cutover-refusal.sh"
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["control-plane"]["steps"]
+    step = next((s for s in steps if s.get("name", "").startswith("DEMO-07")), None)
+    assert step is not None, [s.get("name") for s in steps]
+    ci = _ci_step_run("DEMO-07")
+    assert script in ci and "SEAMLESS=seamless" in ci
+    # its run takes about 15 s: a hang fails the step, not the job's whole time budget
+    assert 0 < step.get("timeout-minutes", 0) <= 5
+    assert script in _makefile_target_recipe("seamless-check")
 
 
 def test_seamless_check_fails_when_any_playbook_syntax_check_fails(tmp_path):
@@ -376,6 +454,73 @@ def test_strict_gitleaks_config_never_allowlists_a_secret_path():
         paths += [re.compile(p) for p in block.get("paths", [])]
     covered = [path for path in SECRET_PATHS if any(rx.search(path) for rx in paths)]
     assert covered == [], f".gitleaks.toml allowlists secret files: {covered}"
+
+
+def _ids_carrying_a_secret(nodeids: list[str]) -> list[str]:
+    """The tests among ``nodeids`` whose ids hold what the control plane redacts as a secret (SDD
+    §13.4), by test name only: their ids are never repeated."""
+    return sorted({nodeid.split("[")[0] for nodeid in nodeids if redact(nodeid) != nodeid})
+
+
+def test_ci_runs_the_demo07_browser_journey_against_a_built_dashboard():
+    """The dashboard-only DEMO-07 journey (QASuite §14.7) runs in CI's dashboard-e2e job, where
+    Playwright's Chromium is installed, after the build its server serves and a control-plane
+    install. CI installs into the runner's Python, not a venv, so it names the ``seamless`` on its
+    PATH; a hang fails the step, not the job's time budget."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["dashboard-e2e"]["steps"]
+    script = "demo-cutover-refusal-browser.mjs"
+    at = next((i for i, step in enumerate(steps) if script in step.get("run", "")), None)
+    assert at is not None, [step.get("name") or step.get("uses") for step in steps]
+    journey = steps[at]
+    assert "SEAMLESS=seamless" in journey["run"]
+    assert 0 < journey.get("timeout-minutes", 0) <= 5
+    before = " ".join(f"{step.get('uses', '')} {step.get('run', '')}" for step in steps[:at])
+    assert "npm run build" in before and "actions/setup-python" in before
+    assert re.search(r"pip install -e \.", before), before
+
+
+def test_ci_runs_the_maker_checker_browser_journey_after_the_demo07_one():
+    """The maker-checker journey (QASuite §14.7, SDD §5.4) runs in the same dashboard-e2e job,
+    after the DEMO-07 journey's build and install, with the runner's ``seamless`` and a time
+    bound of its own."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = workflow["jobs"]["dashboard-e2e"]["steps"]
+    runs = [step.get("run", "") for step in steps]
+    at = next((i for i, run in enumerate(runs) if "demo-approval-browser.mjs" in run), None)
+    assert at is not None, [step.get("name") or step.get("uses") for step in steps]
+    demo07 = next(i for i, run in enumerate(runs) if "demo-cutover-refusal-browser.mjs" in run)
+    assert at > demo07 and "SEAMLESS=seamless" in runs[at]
+    assert 0 < steps[at].get("timeout-minutes", 0) <= 5
+
+
+def test_no_test_id_carries_a_secret():
+    """A parametrized case's id comes from its arguments, and ids reach pytest's cache - which the
+    working-tree scan of ``make seamless-check`` reads (S-17) - ``-v`` output and CI logs. So no id
+    may hold a secret: such a case gets explicit ``ids``."""
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=ROOT / "seamless",
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    ids = [line for line in run.stdout.splitlines() if "::" in line]
+    assert ids, run.stdout[-1000:] + run.stderr[-1000:]
+    leaking = _ids_carrying_a_secret(ids)
+    assert leaking == [], f"test ids that carry a secret - give their cases ids=: {leaking}"
+
+
+def test_the_id_check_names_the_tests_whose_ids_carry_a_pem_key_or_a_url_password():
+    pem = "-----BEGIN RSA PRIVATE KEY-----" + "K" * 40 + "-----END RSA PRIVATE KEY-----"
+    url = "postgresql://svc:" + "pw" + "@db.example/seamless"
+    ids = [
+        f"tests/t.py::test_pem[x {pem} y]",
+        f"tests/t.py::test_url[{url}]",
+        "tests/t.py::test_plain[the cut splits a PEM key]",
+        "tests/t.py::test_unparametrized",
+    ]
+    assert _ids_carrying_a_secret(ids) == ["tests/t.py::test_pem", "tests/t.py::test_url"]
 
 
 def test_the_containers_stop_grace_leaves_room_for_the_orchestrator_to_stop():
@@ -442,3 +587,107 @@ def test_makefile_recipes_edit_files_in_place_portably():
 
     bare = [line for line in _makefile_recipe_lines() if re.search(r"\bsed -i(\s|$)", line)]
     assert not bare, bare
+
+
+#: a stand-in Galaxy API key: the publish tests follow where scripts/publish.sh hands it
+GALAXY_KEY = "dummy-galaxy-key"
+
+
+def _publish(
+    tmp_path: Path,
+    *args: str,
+    key: str | None = GALAXY_KEY,
+    stale: bool = True,
+    builds: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run scripts/publish.sh in a scratch checkout with stub tools, and return the run and the
+    stubs' log. Galaxy lacks the version (curl answers 404); with ``stale`` an earlier build's
+    tarball is there; ``make build`` writes a fresh one when ``builds``; ansible-galaxy logs its
+    arguments, its Galaxy server variables and the tarball it was given."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "galaxy.yml").write_text(
+        "namespace: os_migrate\nname: os_migrate\nversion: 9.9.9\n"
+    )
+    tarball = "os_migrate-os_migrate-9.9.9.tar.gz"
+    if stale:
+        (checkout / tarball).write_text("stale\n")
+    log = tmp_path / "calls.log"
+    record = 'printf "%s\\n" "$(basename "$0") $*" >> "$CALLS_LOG"\n'
+    fakes = {
+        "yq": '#!/bin/sh\ncase "$2" in .namespace|.name) echo os_migrate;;'
+        " .version) echo 9.9.9;; esac\n",
+        "jq": "#!/bin/sh\nexit 0\n",
+        "curl": "#!/bin/sh\n" + record + "echo 404\n",
+        "make": "#!/bin/sh\n" + record + (f"echo fresh > {tarball}\n" if builds else ""),
+        "ansible-galaxy": "#!/bin/sh\n"
+        + record
+        + 'env | grep "^ANSIBLE_GALAXY_SERVER" | sort >> "$CALLS_LOG"\n'
+        + 'printf "published: %s\\n" "$(cat "$3")" >> "$CALLS_LOG"\n',
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in fakes.items():
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "CALLS_LOG": str(log)}
+    if key is not None:
+        env["ANSIBLE_GALAXY_API_KEY"] = key
+    run = subprocess.run(
+        ["bash", str(ROOT / "scripts" / "publish.sh"), *args],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return run, log.read_text() if log.exists() else ""
+
+
+def test_publish_builds_the_tarball_it_publishes_even_when_one_is_there(tmp_path):
+    """The documented release (docs/src/devel/releasing.rst) builds before its pull request and
+    publishes after checking out the merge commit. scripts/publish.sh published the tarball it
+    found, a build of another tree, which may hold local secrets when it was made before galaxy.yml
+    mirrored the .gitignore files (Security.md R-26). It now builds the tarball it publishes."""
+    run, log = _publish(tmp_path)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "make build" in log.splitlines()
+    assert "published: fresh" in log
+    assert "published: stale" not in log
+
+
+def test_publish_never_publishes_a_tarball_its_own_build_did_not_write(tmp_path):
+    run, log = _publish(tmp_path, builds=False)
+
+    assert run.returncode != 0
+    assert "did not write os_migrate-os_migrate-9.9.9.tar.gz" in run.stderr
+    assert "published:" not in log
+
+
+def test_publish_hands_the_galaxy_key_to_ansible_galaxy_through_its_environment_only(tmp_path):
+    """CLAUDE.md §4: a key reaches a process only through its environment, never its command line,
+    which ps shows every user of the host. ansible-galaxy gets the key as a Galaxy server's token
+    variable."""
+    run, log = _publish(tmp_path)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    lines = log.splitlines()
+    calls = [line for line in lines if line.split(" ")[0] in ("curl", "make", "ansible-galaxy")]
+    assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in calls
+    assert not [call for call in calls if GALAXY_KEY in call], calls
+    assert "ANSIBLE_GALAXY_SERVER_LIST=release_galaxy" in lines
+    assert "ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_URL=https://galaxy.ansible.com/" in lines
+    assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
+
+
+def test_publish_warns_when_the_key_is_on_its_own_command_line(tmp_path):
+    """``-k`` still works, for the releases that pass it, but says how to keep the key off the
+    command line; ansible-galaxy gets the key through its environment either way."""
+    run, log = _publish(tmp_path, "-k", GALAXY_KEY, key=None)
+
+    assert run.returncode == 0, run.stdout + run.stderr
+    lines = log.splitlines()
+    assert "export ANSIBLE_GALAXY_API_KEY" in run.stderr
+    assert f"ANSIBLE_GALAXY_SERVER_RELEASE_GALAXY_TOKEN={GALAXY_KEY}" in lines
+    assert "ansible-galaxy collection publish os_migrate-os_migrate-9.9.9.tar.gz" in lines

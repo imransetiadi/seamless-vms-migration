@@ -1,6 +1,6 @@
 # Roll the selected workloads back: delete their destination servers (and,
-# with os_migrate_rollback_delete_dest_volumes, the destination volumes and
-# warm state) and start the source servers again.
+# with os_migrate_rollback_delete_dest_volumes, the destination volumes,
+# emptying the warm state) and start the source servers again.
 - name: Roll back workloads
   hosts: migrator
   environment:

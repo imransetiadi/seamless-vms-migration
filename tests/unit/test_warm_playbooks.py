@@ -1,4 +1,4 @@
-"""Runs the warm playbooks with ansible-playbook.
+"""Runs the warm playbooks - and the cold import's record for a rollback - with ansible-playbook.
 
 The collection is copied into a temporary collections path; only the modules
 that talk to clouds or conversion hosts (and the conversion host lookup) are
@@ -33,6 +33,10 @@ STUBBED = (
     "import_workload_prelim",
     "import_workload_dst_check",
     "import_workload_src_check",
+    "import_workload_export_volumes",
+    "import_workload_transfer_volumes",
+    "import_workload_src_cleanup",
+    "import_workload_dst_failure_cleanup",
     "import_workload_warm_snapshot",
     "import_workload_warm_sync",
     "import_workload_create_instance",
@@ -78,6 +82,9 @@ def load(path):
 
 
 def save(path, state):
+    # as WarmState.save does: the first record creates the state directory
+    if not os.path.isdir(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path))
     with open(path + ".tmp", "w") as f:
         json.dump(state, f)
     os.rename(path + ".tmp", path)
@@ -94,6 +101,9 @@ elif NAME == "import_workload_prelim":
         result = {"changed": True, "server_name": name,
                   "log_file": os.path.join(args["log_dir"], name + ".log"),
                   "state_file": os.path.join(args["log_dir"], name + ".state")}
+elif NAME == "import_workload_dst_check" and args.get("network_as_warnings"):
+    result = {"changed": False,
+              "cutover_refusals": world.get("refusals", {}).get(name, [])}
 elif NAME == "os_conversion_host_info":
     result = {"changed": False, "openstack_conversion_host": {
         "id": "src-conv", "address": "10.0.0.10", "status": "ACTIVE", "name": args["server"]}}
@@ -141,21 +151,45 @@ elif NAME == "import_workload_rollback":
     exists = os.path.exists(path)
     state = load(path)
     result = {"changed": False, "deleted_server_id": state["destination_server_id"],
-              "deleted_volume_ids": [], "state_deleted": False}
+              "deleted_volume_ids": [], "state_cleared": False}
     if exists:
         result["changed"] = True
         state["destination_server_id"] = None
         if args["delete_dest_volumes"]:
             result["deleted_volume_ids"] = sorted(
                 v["dest_id"] for v in state["dest_volumes"].values())
-            state["dest_volumes"] = {}
-            if state["pending_snapshot"] is None:
-                os.remove(path)
-                result["state_deleted"] = True
-            else:
-                save(path, state)
-        else:
-            save(path, state)
+            # as the module does: the record is emptied, the file stays (SDD 6.3)
+            state["dest_volumes"], state["passes"] = {}, []
+            result["state_cleared"] = True
+        save(path, state)
+elif NAME == "import_workload_export_volumes":
+    result = {"changed": True, "transfer_uuid": "uuid-cold-" + name, "volume_map": {
+        "/dev/vda": {"source_id": "svol-%%s-vda" %% name, "size": 1, "bootable": True,
+                     "name": "os-migrate-" + name},
+        "/dev/vdb": {"source_id": "svol-%%s-vdb" %% name, "size": 2, "bootable": False,
+                     "name": name + "-data"}}}
+elif NAME == "import_workload_transfer_volumes":
+    volume_map = dict((dev, dict(entry, dest_id="dvol-%%s-%%s" %% (name, dev.split("/")[-1])))
+                      for dev, entry in args["volume_map"].items())
+    if args.get("warm_state_dir"):
+        # as the module does: each volume recorded as soon as Cinder created it (SDD 6.3)
+        path = state_path(args["warm_state_dir"])
+        state = load(path)
+        for dev, entry in volume_map.items():
+            state["dest_volumes"][dev] = dict(
+                (key, entry[key]) for key in ("dest_id", "size", "bootable", "name"))
+        save(path, state)
+    if [NAME, name] in world.get("fail_after", []):
+        # cut short after creating its volumes: the module crashes and returns no volume_map
+        print(json.dumps({"failed": True, "msg": "MODULE FAILURE: attach refused"}))
+        sys.exit(1)
+    result = {"changed": True, "volume_map": volume_map, "block_device_mapping": [
+        {"boot_index": 0 if dev == "/dev/vda" else -1,
+         "delete_on_termination": dev == "/dev/vda", "destination_type": "volume",
+         "device_name": dev.split("/")[-1], "source_type": "volume",
+         "uuid": volume_map[dev]["dest_id"]} for dev in sorted(volume_map)]}
+elif NAME in ("import_workload_src_cleanup", "import_workload_dst_failure_cleanup"):
+    result = {"changed": True}
 elif NAME == "server_action":
     result = {"changed": True}
 elif NAME == "server_info":
@@ -230,6 +264,12 @@ class Env:
                 "resources": [server_data("srv-1", "vm1"), server_data("srv-2", "vm2")],
             }, f)
         self.state_dir = os.path.join(self.data_dir, "workload_warm")
+        # the cold role reads the clouds file for its source volume API version (synthetic)
+        with open(os.path.join(self.data_dir, "clouds.yaml"), "w") as f:
+            yaml.safe_dump({"clouds": {
+                "src": {"auth": {"auth_url": "https://src.example.invalid:5000/v3"}},
+                "dst": {"auth": {"auth_url": "https://dst.example.invalid:5000/v3"}},
+            }}, f)
         self.world = {}
 
     def state(self, server_id):
@@ -314,6 +354,26 @@ PRECOPY = [
 ]
 
 
+def test_a_pass_records_what_the_cutover_will_refuse(env):
+    """SDD 6.6, 7.2: each pre-copy pass writes, beside the workload's warm state, what its
+    destination check found that the cutover will refuse - and a later pass replaces it."""
+
+    def refusals(server_id):
+        with open(os.path.join(env.state_dir, server_id + ".refusals.json")) as f:
+            return json.load(f)
+
+    problem = "Destination prerequisites not met: port p2 on network 'gone' does not resolve"
+    env.world["refusals"] = {"vm1": [problem]}
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    assert refusals("srv-1") == [problem]
+    assert refusals("srv-2") == []
+    env.world["refusals"] = {}  # fixed meanwhile
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+    assert refusals("srv-1") == []
+
+
 def test_warm_playbooks_story(env):
     # 1. First pre-copy: a full pass per workload.
     rc, out, calls = env.run("import_workloads_precopy")
@@ -328,6 +388,9 @@ def test_warm_playbooks_story(env):
     assert sync["state_dir"] == env.state_dir
     assert env.state("srv-1")["passes"][0]["kind"] == "full"
     assert env.state("srv-1")["pending_snapshot"] is None
+    # a pass makes no port or floating IP: their problems are warnings there (SDD 6.6)
+    check = next(c["args"] for c in calls if c["module"] == "import_workload_dst_check")
+    assert check["network_as_warnings"] is True
 
     # 2. Another pre-copy pass is a delta pass.
     rc, out, calls = env.run("import_workloads_precopy")
@@ -351,6 +414,9 @@ def test_warm_playbooks_story(env):
     ]
     sync = next(c["args"] for c in calls if c["module"] == "import_workload_warm_sync")
     assert sync["pass_kind"] == "final"
+    # the cutover's check refuses them before the source stops
+    check = next(c["args"] for c in calls if c["module"] == "import_workload_dst_check")
+    assert "network_as_warnings" not in check
     create = next(c["args"] for c in calls if c["module"] == "import_workload_create_instance")
     assert create["warm_state_dir"] == env.state_dir
     assert [m["uuid"] for m in create["block_device_mapping"]] == ["dvol-vm1"]
@@ -392,7 +458,10 @@ def test_warm_playbooks_story(env):
     assert rollback["match_by_name"] is False
     conversion = [c for c in calls if c["module"] == "os_conversion_host_info"]
     assert len(conversion) == 1 and conversion[0]["args"]["cloud"] == "src"
-    assert env.state("srv-1") is None and env.state("srv-2") is None
+    for server_id in ("srv-1", "srv-2"):  # emptied, not removed (SDD 6.3)
+        state = env.state(server_id)
+        assert (state["dest_volumes"], state["passes"]) == ({}, []), server_id
+        assert state["destination_server_id"] is None and state["pending_snapshot"] is None
 
 
 def test_failed_precopy_removes_the_snapshot_and_reports(env):
@@ -415,7 +484,7 @@ def test_failed_precopy_removes_the_snapshot_and_reports(env):
 
 def test_cutover_rerun_refuses_a_failed_destination_server(env):
     """A recorded destination server in ERROR is not 'already cut over'."""
-    rc, out, _ = env.run("import_workloads_cutover")
+    rc, out = env.run("import_workloads_cutover")[:2]
     assert rc == 0, out
     env.world["server_status"] = {"dst-vm1": "ERROR"}
 
@@ -434,7 +503,7 @@ def test_cutover_rerun_refuses_a_failed_destination_server(env):
 def test_cutover_rerun_finishes_a_healthy_destination_server(env):
     """SDD §6.5: the re-run neither stops, syncs nor creates again; it finishes the recorded
     server (ACTIVE, missing floating IPs), which an earlier attempt may have left half done."""
-    rc, out, _ = env.run("import_workloads_cutover")
+    rc, out = env.run("import_workloads_cutover")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("import_workloads_cutover")
@@ -449,7 +518,7 @@ def test_cutover_rerun_finishes_a_healthy_destination_server(env):
 
 
 def test_rollback_passes_the_destination_conversion_host(env):
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run(
@@ -462,7 +531,7 @@ def test_rollback_passes_the_destination_conversion_host(env):
 
 
 def test_rollback_keeps_destination_volumes_by_default(env):
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("rollback_workloads", os_migrate_rollback_all=True)
@@ -474,10 +543,56 @@ def test_rollback_keeps_destination_volumes_by_default(env):
     assert not [c for c in calls if c["module"] == "os_conversion_host_info"]
 
 
+def test_a_rollback_can_leave_the_source_as_it_is(env):
+    """SDD 6.5, 7 (COLD-02): the cleanup before a cold cutover removes what a warm pre-copy left
+    and leaves the source as it is - a retry may keep it stopped with an open clock; any other
+    rollback starts it."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_rollback_delete_dest_volumes=True,
+        os_migrate_rollback_start_source=False,
+    )
+
+    assert rc == 0, out
+    assert modules_for(calls, "vm1", "srv-1") == ["import_workload_rollback"]
+    # the volumes are gone, the record is emptied - the file stays (SDD 6.3)
+    assert (env.state("srv-1")["dest_volumes"], env.state("srv-1")["passes"]) == ({}, [])
+    assert "source server left as it was" in out
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
+    assert rc == 0, out
+    assert modules_for(calls, "vm2", "srv-2") == ["import_workload_rollback", "server_action:start"]
+
+
+def test_a_rollback_can_leave_the_ports_alone(env):
+    """SDD 6.5 (review RV-02): a cancel's cleanup passes os_migrate_rollback_delete_ports false, which
+    reaches the module as delete_ports; any other rollback deletes the workload's ports."""
+    rc, out = env.run("import_workloads_precopy")[:2]
+    assert rc == 0, out
+
+    rc, out, calls = env.run(
+        "rollback_workloads",
+        os_migrate_workloads_filter=[{"regex": "^vm1$"}],
+        os_migrate_rollback_delete_ports=False,
+    )
+    assert rc == 0, out
+    rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
+    assert [r["delete_ports"] for r in rollback] == [False]
+
+    rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm2$"}])
+    assert rc == 0, out
+    rollback = [c["args"] for c in calls if c["module"] == "import_workload_rollback"]
+    assert [r["delete_ports"] for r in rollback] == [True]
+
+
 def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     """SDD 6.5: without a workload filter a rollback would revert every cut-over workload of the
     data dir; it refuses unless os_migrate_rollback_all is true. An exact filter rolls back one."""
-    rc, out, _ = env.run("import_workloads_precopy")
+    rc, out = env.run("import_workloads_precopy")[:2]
     assert rc == 0, out
 
     rc, out, calls = env.run("rollback_workloads")
@@ -488,3 +603,84 @@ def test_rollback_refuses_the_catch_all_filter_without_confirmation(env):
     rc, out, calls = env.run("rollback_workloads", os_migrate_workloads_filter=[{"regex": "^vm1$"}])
     assert rc == 0, out
     assert len([c for c in calls if c["module"] == "import_workload_rollback"]) == 1
+
+
+# --- the cold import's record (SDD 6.3, 6.5, 7) --------------------------------------------
+
+# vm1's volumes as the transfer stub created them, recorded as the warm path records its own
+RECORDED = {
+    "/dev/vda": {"dest_id": "dvol-vm1-vda", "size": 1, "bootable": True, "name": "os-migrate-vm1"},
+    "/dev/vdb": {"dest_id": "dvol-vm1-vdb", "size": 2, "bootable": False, "name": "vm1-data"},
+}
+
+COLD = {
+    "os_migrate_workloads_filter": [{"regex": "^vm1$"}],
+    "os_migrate_workload_stop_before_migration": True,
+    "os_migrate_conversion_host_ssh_user": "cloud-user",
+    "os_migrate_dst_filters": {},
+}
+
+
+def test_the_cold_import_records_its_volumes_and_server_for_a_rollback(env):
+    """The owner's choice (2026-10-14): a cold rollback deletes exactly the volumes the cold
+    import created - a cold retry never reuses them - so the import records them as soon as its
+    transfer created them, and the server as soon as Nova accepts it."""
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc == 0, out
+    # each writes its part of the record itself: no other task records the volumes (SDD 6.5)
+    for module in ("import_workload_transfer_volumes", "import_workload_create_instance"):
+        args = next(c["args"] for c in calls if c["module"] == module)
+        assert args["warm_state_dir"] == env.state_dir, module
+    state = env.state("srv-1")
+    assert state["dest_volumes"] == RECORDED
+    assert state["destination_server_id"] == "dst-vm1"
+    assert state["passes"] == []
+    assert env.state("srv-2") is None  # filtered out
+
+
+def test_a_failed_cold_import_keeps_the_record_of_the_volumes_it_created(env):
+    """A failure after the transfer: with the failure cleanup off nothing else knows the volumes
+    the transfer created, and with it on the record of a volume already gone costs nothing."""
+    env.world["fail"] = [["import_workload_create_instance", "vm1"]]
+    for cleanup in (False, True):
+        rc, out, calls = env.run(
+            "import_workloads", os_migrate_workload_cleanup_on_failure=cleanup, **COLD
+        )
+
+        assert rc != 0, out
+        assert env.state("srv-1")["dest_volumes"] == RECORDED
+        cleaned = [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+        assert bool(cleaned) is cleanup
+
+
+def test_a_cold_transfer_cut_short_leaves_the_record_of_the_volumes_it_created(env):
+    """SDD 6.3 (review lead B): the transfer created the volumes, then failed before it returned
+    its volume_map - the failure cleanup cannot see them, and a rollback deletes them by the
+    record alone."""
+    env.world["fail_after"] = [["import_workload_transfer_volumes", "vm1"]]
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc != 0, out
+    assert env.state("srv-1")["dest_volumes"] == RECORDED
+    assert not [c for c in calls if c["module"] == "import_workload_dst_failure_cleanup"]
+    assert not [c for c in calls if c["module"] == "import_workload_create_instance"]
+
+
+def test_a_cold_import_without_data_copy_records_the_server_and_no_volume(env):
+    """data_copy false: the server boots from volumes the import did not create, so only the
+    server is recorded - a rollback must never delete those volumes (SDD 6.3)."""
+    with open(os.path.join(env.data_dir, "workloads.yml")) as f:
+        workloads = yaml.safe_load(f)
+    workloads["resources"][0]["_migration_params"]["data_copy"] = False
+    with open(os.path.join(env.data_dir, "workloads.yml"), "w") as f:
+        yaml.safe_dump(workloads, f)
+
+    rc, out, calls = env.run("import_workloads", **COLD)
+
+    assert rc == 0, out
+    assert not [c for c in calls if c["module"] == "import_workload_transfer_volumes"]
+    state = env.state("srv-1")
+    assert state["destination_server_id"] == "dst-vm1"
+    assert state["dest_volumes"] == {}

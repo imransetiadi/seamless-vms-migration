@@ -114,10 +114,10 @@ describe('advisor recommendation wording (SDD §14.4, §16)', () => {
 
   it('says a pending decision is waiting for approval, and why; a policy that asks first shows its threshold on the Recommended line', () => {
     const asked = rec({}, { reason_code: 'POLICY_REQUIRES_APPROVAL', ...BY_CODE.POLICY_REQUIRES_APPROVAL });
-    expect(decisionText(asked)).toBe('Waiting for approval — policy finance requires approval');
+    expect(decisionText(asked)).toBe('Waiting for approval by an admin — policy finance requires approval');
     expect(recommendedText(asked)).toBe('Warm migration · 57% confidence (threshold 60%)');
     const thin = rec({ confidence: 0.83 }, { reason_code: 'INSUFFICIENT_EVIDENCE', ...BY_CODE.INSUFFICIENT_EVIDENCE });
-    expect(decisionText(thin)).toBe('Waiting for approval — too little evidence to apply it automatically (83% ≥ 60%)');
+    expect(decisionText(thin)).toBe('Waiting for approval by an admin — too little evidence to apply it automatically (83% ≥ 60%)');
     expect(recommendedText(thin)).toBe('Warm migration · 83% confidence');
   });
 

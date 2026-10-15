@@ -194,3 +194,209 @@ This project follows a simple changelog to satisfy collection metadata validatio
   project's default group, and that refusal came only after the source had
   stopped. Export the workload again. A port with an empty list, such as one
   with port security off, is not affected.
+- ``import_workload_dst_check`` takes ``network_as_warnings`` (default
+  ``false``), and the warm pre-copy role sets it before each pre-copy or sync
+  pass. A pass makes no port or floating IP, so their problems are now
+  warnings in its log, which say the cutover will refuse them, and only the
+  server's own prerequisites (flavor, image, security groups, key pair) fail
+  it. Before, such a problem failed a pass that may copy a disk for hours,
+  although it could be fixed while the copy ran. The cutover's check still
+  refuses it before the source stops.
+- ``import_from_hypervisor`` never lets qemu guess a disk's format. It takes
+  each disk's format from the instance's ``disk.info``, where Nova records it,
+  and passes it to ``qemu-img info -f`` and ``qemu-nbd --format``. Before, the
+  format came from ``qemu-img info`` without ``-f``: a raw disk whose first
+  block the guest had written as a qcow2 header was exported as qcow2, and
+  ``qemu-nbd``, run with sudo, followed the backing file that header named,
+  reading a file of the hypervisor into the destination volume. The role stops
+  before any export when ``disk.info`` is missing or unreadable, or records no
+  single plain format for a disk. It no longer exports the config drive
+  (``disk.config``): Nova gives the destination server its own. Disks are
+  picked by file name only: an instances path containing ``disk``, any
+  character, then ``info`` no longer hides every disk.
+- The cold import (``import_workloads``) records its workload for a rollback,
+  in the state file the warm path keeps: each volume its transfer creates, as
+  soon as Cinder created it and before its data is copied
+  (``import_workload_transfer_volumes`` with the new option
+  ``warm_state_dir``), so a transfer that fails or is cut short leaves the
+  record of every volume it created, and the server, as soon as Nova accepts
+  it (``import_workload_create_instance`` with ``warm_state_dir``). A rollback with
+  ``os_migrate_rollback_delete_dest_volumes`` then deletes exactly those
+  volumes and keeps any other volume attached to the server. Before, a cold
+  rollback found the server by name and left its data volumes behind,
+  unrecorded: a cold retry creates new volumes, so they were never used or
+  deleted again. A workload imported before keeps the old behaviour.
+- ``rollback_workloads.yml`` takes ``os_migrate_rollback_start_source``
+  (default ``true``): ``false`` leaves the source server as it is. Seamless
+  Migrate uses it before a cold cutover of a migration an earlier warm
+  pre-copy left data for, to remove those volumes and the warm state without
+  starting a source a retry may keep stopped.
+- ``import_workload_rollback`` waits for a destination volume Cinder is
+  already deleting, such as the boot volume Nova deletes together with its
+  server (``delete_on_termination``), instead of deleting it a second time,
+  which Cinder refuses: a cold rollback no longer fails before it starts the
+  source.
+- ``import_workload_rollback`` takes ``delete_ports`` (default ``true``), and
+  ``rollback_workloads.yml`` ``os_migrate_rollback_delete_ports``: ``false``
+  deletes no destination port. Seamless Migrate's cleanup after a cancel
+  uses it, as it made no port and an unbound one keyed to the VM's source
+  port may belong to another migration of the same VM.
+- ``import_workload_rollback`` with ``match_by_name`` looks a server up by
+  name only when the workload has no state file at all; a state file that
+  records no server means Nova never accepted one, so a same-named server
+  is another one and is kept.
+- A volume transfer that fails before its port forwarding starts (no free
+  port on the destination conversion host, an SSH error) reports its own
+  error. Before, its teardown read the PID of a forwarding process that did
+  not exist, so it ended in ``AttributeError`` and skipped releasing the
+  ports it had claimed, which then stayed claimed on the conversion host.
+- A rollback with ``os_migrate_rollback_delete_dest_volumes`` empties the
+  workload's warm state record instead of removing the file
+  (``import_workload_rollback`` returns ``state_cleared`` in place of
+  ``state_deleted``). The file is the sign that the workload's migration
+  recorded it: a later rollback with ``os_migrate_rollback_match_by_name``
+  then never takes a same-named server, such as another workload's, for the
+  workload's. Before, a cleanup before a re-run removed the file and the next
+  rollback matched any server by its name.
+- ``import_workload_rollback`` finds the destination server Nova accepted
+  while its answer was lost by the recorded volumes the server holds, when
+  the workload's record names no server or one Nova no longer has (an
+  operator deleted the recorded server and retried). The single server named
+  like the workload that holds one of them, attached through Nova and not to
+  the destination conversion host, is the workload's and is deleted. Before,
+  it kept running beside the restarted source. A same-named server holding
+  none of them is kept, also with ``os_migrate_rollback_match_by_name``, and
+  two such servers are an error.
+- The volume transfers create each destination volume without waiting, hand
+  it to the record (the cold import's ``warm_state_dir``) as soon as Cinder
+  accepted it, then wait for it and set its bootable flag. A volume Cinder
+  puts in ``error`` is recorded too, and a rollback deletes it with its
+  quota. A volume whose record cannot be written is deleted once Cinder
+  settled it, before the transfer fails. Before, a failure while the SDK
+  waited for the volume lost its id.
+- A cold re-run's transfer removes the volume an earlier attempt recorded for
+  each device before it creates any volume: the cold path never reuses a
+  volume, so an earlier attempt's data volume, left detached when its server
+  was deleted, no longer drops out of the record unremoved. A volume only the
+  destination conversion host holds (a transfer cut short) is detached from
+  it, under the host's attach lock, and deleted. A volume another server
+  holds (a server renamed rather than deleted) is that server's and only
+  leaves the record. Each deleted volume is waited for until Cinder no longer
+  has it, within the transfer's timeout; one Cinder is already deleting, such
+  as the boot volume Nova deletes with its server, is not deleted a second
+  time, and one that began going while the transfer deleted it - Cinder
+  refusing that delete - is waited for the same way. A volume the transfer
+  cannot detach or delete otherwise, one that leaves
+  ``deleting`` without going, or one still there at the timeout, fails the
+  transfer before it creates a volume, with the record unchanged. Before, a
+  re-run failed on every retry, with the source stopped, when it sent a
+  second delete to such a boot volume, and a stop during the removal could
+  leave a volume it had just created unrecorded.
+- A volume Cinder no longer has reads as gone with the openstacksdk 4.x the
+  collection runs on, whose ``get_volume_by_id`` raises ``NotFoundException``
+  for a missing volume instead of returning ``None`` as its docstring says.
+  Before, every check for a gone volume raised instead. A cold rollback then
+  failed once Nova had deleted the boot volume with its server, before
+  starting the source; a warm pass failed on a recorded volume that was
+  gone instead of creating a new one; and a cold re-run failed on an
+  earlier attempt's boot volume. The unit tests' fake cloud now raises the
+  same way.
+- The collection artifact leaves out the Seamless Migrate control plane,
+  dashboard and deployment around the collection (``seamless/``,
+  ``dashboard/``, ``deploy/``, the agent configuration and the product's
+  ``RELEASING.md``), and everything the
+  checkout's ``.gitignore`` files name, at the depths they name it.
+  ``ansible-galaxy collection build`` packs files from disk rather than from
+  git, so a tarball built at the repository root (``make build``,
+  ``scripts/publish.sh``) could carry local secrets: the cloud credentials
+  ``make generate-auth-files`` writes to ``tests/auth_tenant.yml``,
+  ``clouds.yml`` files, ``secrets/``, ``.env`` files and the track checkouts
+  under ``.worktrees/``. ``galaxy.yml``'s ``build_ignore`` now mirrors the
+  ``.gitignore`` patterns, and a unit test derives a sample from every
+  pattern. Never publish a tarball built before this change.
+- Every detach of a volume from a server ends within the module's
+  ``timeout``: the source VM's data volumes, the conversion hosts, the warm
+  passes and the rollback. openstacksdk 4.21's ``detach_volume`` with
+  ``wait=True`` ignores its ``timeout`` and waits without bound for the
+  volume to be ``available``, so a detach that never ended hung the module,
+  holding the conversion host's attach lock in a locked section. A detach
+  now asks Nova without waiting, then polls the volume until it no longer
+  lists that server's attachment and, unless another server still holds
+  it, until Cinder shows it ``available``. A volume that goes to ``error``
+  raises, and a detach still not done at the timeout fails with ``Timed out
+  after N s waiting to detach volume V from server S``.
+- A cold export that fails puts back what it took.
+  ``import_workload_export_volumes`` fails with its volume map, which records
+  each port as soon as it is claimed, so the role's rescue runs
+  ``import_workload_src_cleanup``: it stops the transfer's NBD exports and
+  frees those ports. Before it fails, the export attaches the data volumes
+  it detached, and no server holds, back to the source VM through the API
+  alone, as a conversion host still unreachable stops the cleanup, then
+  deletes the root copy no server holds, and its snapshot or image, the same
+  way; never the source VM's own boot volume. Before,
+  the export failed without the map, nothing was put back, and the rollback
+  started the source VM without the data volumes the export had detached. The
+  source cleanup
+  takes such a partial map: it detaches each volume this transfer attached to
+  the conversion host - marked before the export asked Nova to attach it, once
+  openstacksdk's own checks passed, whether or not its device was recorded or
+  the attach's answer was lost; when the attach call fails, the export, still
+  holding the attach lock, waits up to two minutes while Cinder shows the volume
+  ``reserved`` or ``attaching`` and keeps the mark only if Cinder then lists the
+  conversion
+  host or the attach is still under way; never a shared multi-attach volume
+  another migration's export attached - re-attaches the data volumes, and
+  removes the
+  root copy, its snapshot or the image only
+  when the export made them, never the VM's own boot volume. The export
+  creates the root snapshot, the root copy and the image without
+  openstacksdk's own wait, which raises with the resource made, records
+  each at once, then waits for it within the module's timeout: a snapshot
+  or copy that went to ``error``, or an image still saving, was left
+  behind, and a copy left so failed the rescue. The cleanup re-attaches the
+  data volumes first and tries every step: a root copy Cinder will not
+  delete no longer keeps the data volumes off the source VM, and the cleanup
+  fails at the end with ``Source cleanup incomplete: ...`` naming each step
+  it could not do. The failure's map carries no volume or VM names, which the
+  cleanup never reads: Ansible prints the failed result, and Seamless Migrate
+  retried a stuck detach of a volume whose name held "timeout".
+- A wait for a conversion host's attach or port lock gives up once ssh to the
+  host has failed for 15 minutes without a break, with ``Lock timeout:
+  conversion host ADDRESS unreachable over SSH for N s, waiting for LOCK``,
+  which Seamless Migrate retries as transient. It tried up to 1800 times, each
+  try up to the 10 s connect timeout, about 5.5 hours, while a cold cutover's
+  source stayed stopped. The window rides out a conversion host reboot or a
+  network blip, and the step then completes. One failed connection, or a lock
+  another migration holds, starts the window again. The source cleanup's own
+  SSH check rides out the same window, then fails with ``SSH timeout:
+  conversion host ADDRESS unreachable over SSH for N s, waiting for the source
+  cleanup``: a reboot that starts outside a lock wait, mid-export or
+  mid-transfer, left volumes on the conversion host that only the cleanup gives
+  back, and a cleanup that failed at once let the rollback start the source VM
+  without them. The other modules' checks still fail at once. The export's
+  wait for its NBD exports, and the transfer's waits for the forwarded exports
+  and an nbdkit socket, give up the same way after the window (``SSH timeout:
+  ...``), where they tried ``timeout`` times, about 5.5 hours by default. So does
+  the probe for a free port, which read ssh's 255 as a port in use and walked
+  every ephemeral port, about 45 hours; it tries the same port again once a
+  second while ssh fails, so an ssh that fails at once, a refused connection
+  or a dropped route, ends in the same give-up, not in ``No free ports on
+  conversion host!``. A failed transfer releases its ports only if one ssh
+  check then reaches the conversion host, where a second wait for the port
+  lock of a host it cannot reach held the source another 15 minutes and
+  replaced its error; a release that fails is logged, never raised over the
+  transfer's error. A give-up reads ``Lock timeout`` or ``SSH timeout`` only:
+  the wait that would give up with any other prefix, which Seamless Migrate
+  would not retry, fails as it starts.
+- The warm state file (``workload_warm/{server}.json``) is synced to disk, its
+  directory after the rename too, so the rename outlives a crash: a rollback
+  reads there which destination volumes and server to delete. A filesystem
+  that cannot sync a directory still gets the file.
+- The roles' loops over workloads (``import_workloads``,
+  ``import_workloads_warm``, ``export_workloads``, ``import_from_hypervisor``)
+  label each item with its id only. Ansible printed the whole workload, or
+  its name, on each include and result line, and Seamless Migrate classifies
+  a failure as transient by the playbook output: a workload whose name or
+  boot image properties (Nova's ``os_shutdown_timeout``) held "timeout" made
+  a failure meant to be permanent, such as a stuck detach, be retried. The
+  lines now read ``(item=<id>)``.

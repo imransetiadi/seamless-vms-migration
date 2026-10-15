@@ -33,6 +33,8 @@ FINANCE_PLAN = "Finance apps (RHOSP 17.1 → RHOSO)"
 #: Finance VMs the demo leaves unplanned, so a new plan can take them (SDD §10): one VM has one
 #: migration across plans (§5.4), and the finance plan holds the rest for good once it completes.
 UNPLANNED_FINANCE_VMS = frozenset({"report-01", "batch-01"})
+#: left for the operator to plan: its warm passes meet what the cutover will refuse (SDD §7.4)
+UNPLANNED_VMWARE_VMS = frozenset({"dc2-portal-02"})
 VMWARE_PLAN = "DC2 VMware exit"
 DEMO_PLAN_NAMES = (FINANCE_PLAN, VMWARE_PLAN)
 DEMO_ACTOR = "demo"
@@ -115,7 +117,7 @@ async def _plans(settings: Settings) -> list[Plan]:
             description="VMware exit for DC2; cutovers wait for an approver.",
             source_provider_id="vcenter-dc2",
             destination_provider_id="rhoso18",
-            vm_ids=[vm.source_id for vm in vmware_vms],
+            vm_ids=[vm.source_id for vm in vmware_vms if vm.name not in UNPLANNED_VMWARE_VMS],
             mappings=Mappings(networks={"DC2-Prod": "dc2-prod", "DC2-DMZ": "dc2-dmz"}),
             downtime_slo_s=900,
             require_approval=True,

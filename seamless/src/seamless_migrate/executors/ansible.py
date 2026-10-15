@@ -32,6 +32,7 @@ from ..domain.enums import ProviderKind, Strategy, SyncPassKind
 from ..domain.models import (
     Mappings,
     Migration,
+    Nic,
     NicOverride,
     Plan,
     Provider,
@@ -62,6 +63,8 @@ from .base import PermanentStepError, StepContext, StepName, StepResult, Transie
 log = logging.getLogger(__name__)
 
 KIT_PLAYBOOK = "os_migrate.vmware_migration_kit.migration"
+#: the name the migration kit gives the port it creates for a NIC: "{vm}-NIC-{n}-VLAN-{network}"
+KIT_PORT_NAME = re.compile(r"-NIC-\d+-VLAN-")
 SERVER_TYPE = "openstack.compute.Server"
 OPENSTACK = frozenset({Strategy.cold, Strategy.warm})
 VMWARE = frozenset({Strategy.vmware_cold, Strategy.vmware_warm})
@@ -281,15 +284,19 @@ def _resolved_ref(ref: dict[str, Any], networks: Sequence[dict[str, Any]], what:
     return _scoped_ref(ref, network)
 
 
-def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def resolve_network_refs(
+    doc: dict[str, Any], networks: Sequence[dict[str, Any]], deferred: list[str] | None = None
+) -> dict[str, Any]:
     """Return a copy of an exported ``workloads.yml`` whose server ports and floating IPs name the
     RHOSO network the rule of SDD §7.3 step 0 resolves (``network_details``): the credential's own
     keeps ``%auth%`` as the reference's project and domain, another project's - the only one of
     its name - neither; every fixed IP reference becomes address-only, so Neutron finds the
     address in that network's subnets (SDD §7.2, §6.6). ``PermanentStepError`` names a port whose
-    network does not resolve: raised before the import stops the source. A floating IP's that does
-    not resolve keeps its reference: in auto mode a detached floating IP with the address needs
-    no network, and the destination check judges it before the stop."""
+    network does not resolve: raised before the import stops the source. Given ``deferred`` (a
+    warm pre-copy or sync run, which makes no port), the failure is added there instead and the
+    port keeps its references as exported. A floating IP's network that does not resolve keeps
+    its reference: in auto mode a detached floating IP with the address needs no network, and
+    the destination check judges it before the stop."""
     out = copy.deepcopy(doc)
     for resource in out.get("resources") or []:
         if resource.get("type") != SERVER_TYPE:
@@ -298,7 +305,15 @@ def resolve_network_refs(doc: dict[str, Any], networks: Sequence[dict[str, Any]]
         for port in server.get("ports") or []:
             params = port.get("params") or {}
             what = f"the port {params.get('mac_address')} of {server.get('name')}"
-            params["network_ref"] = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            try:
+                ref = _resolved_ref(params.get("network_ref") or {}, networks, what)
+            except PermanentStepError as exc:
+                if deferred is None:
+                    raise
+                # the cutover resolves it again and stops there, before the source stops
+                deferred.append(str(exc))
+                continue
+            params["network_ref"] = ref
             params["fixed_ips_refs"] = [
                 {"ip_address": ref["ip_address"]}
                 for ref in params.get("fixed_ips_refs") or []
@@ -318,15 +333,17 @@ EXPORT_RECORD = "rewrite.json"
 
 
 def export_record(
-    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None
+    mappings: Mappings, nic_overrides: Mapping[str, NicOverride] | None, name: str | None
 ) -> dict[str, Any]:
     """The export record (SDD §7.2): the mappings a rewrite applies - the plan's overlaid with the
-    migration's resolved ones - and the VM's NIC override entries."""
+    migration's resolved ones -, the VM's NIC override entries and the exported server's name, by
+    which each run selects its workload (a renamed VM is exported again, review lead A)."""
     return {
         "mappings": mappings.model_dump(mode="json"),
         "nic_overrides": {
             mac: entry.model_dump(mode="json") for mac, entry in (nic_overrides or {}).items()
         },
+        "name": name,
     }
 
 
@@ -345,10 +362,12 @@ def _apply_port_mode(
     networks: Sequence[dict[str, Any]] | None = None,
     record: dict[str, Any] | None = None,
     exports: bool = False,
+    deferred: list[str] | None = None,
 ) -> bool:
     """Write the plan's port_creation_mode into an existing export before a run, and resolve its
     network references again with the destination's ``networks`` when given, unless the run
     replaces the export: it ``exports`` anyway (the cold cutover), or True is returned (SDD §7.2).
+    A warm pass passes ``deferred``, where a port network that does not resolve is added.
 
     True when the run must export the workload again: a cutover in "neutron" mode whose ports were
     exported without their security groups, or of a VM with NIC overrides, or that had some at the
@@ -371,7 +390,7 @@ def _apply_port_mode(
     doc = set_port_creation_mode(doc, mode)
     # a new export is resolved after it instead: the one it replaces may no longer resolve
     if networks and not (reexport or exports):
-        doc = resolve_network_refs(doc, networks)
+        doc = resolve_network_refs(doc, networks, deferred)
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
     return reexport
 
@@ -486,15 +505,58 @@ def build_vars(
     )
     # SDD §6.4: keep mapped volume types (apply_mappings rewrote them to RHOSO types)
     out["os_migrate_workloads_preserve_volume_type"] = bool(ctx.plan.mappings.volume_types)
-    if m.strategy == Strategy.cold and step == StepName.ROLLBACK and m.downtime_started_at:
+    # the cleanup after a cancel is the only step that asks for delete_dest_volumes (SDD §5.1)
+    cancel_cleanup = step == StepName.ROLLBACK and bool(ctx.options.get("delete_dest_volumes"))
+    if (
+        m.strategy == Strategy.cold
+        and step == StepName.ROLLBACK
+        and m.downtime_started_at
+        and not cancel_cleanup
+    ):
         # the cold path records no destination server id: the rollback matches by name — only
         # after the stop, since the role creates the server after it; before it a same-named
         # server is not this migration's (a cutover refused or skipped for a collision, SDD §7.2)
         out["os_migrate_rollback_match_by_name"] = True
-    if step == StepName.ROLLBACK and ctx.options.get("delete_dest_volumes"):
-        # cleanup after a cancel: the destination volumes of the abandoned pass go too
+    if (
+        m.strategy == Strategy.cold
+        and step == StepName.CUTOVER
+        and _leftover(rdir / "osm", m.vm.source_id)
+    ):
+        # the cleanup before the export removes what an earlier attempt left, and leaves the
+        # source as it is: a retry may keep it stopped (SDD §7, COLD-02, the owner's choice)
+        out["os_migrate_rollback_delete_dest_volumes"] = True
+        out["os_migrate_rollback_start_source"] = False
+    if cancel_cleanup:
+        # it touches only what the migration recorded of its own: its rollback removed its server
+        # and ports and started its source, and the VM it released may since be another plan's,
+        # whose server, ports and stopped source are not this migration's (SDD §5.1, review RV-02)
+        out["os_migrate_rollback_start_source"] = False
+        out["os_migrate_rollback_delete_ports"] = False
+    if step == StepName.ROLLBACK and (
+        cancel_cleanup
+        or (m.strategy == Strategy.cold and _cold_volumes_recorded(rdir / "osm", m.vm.source_id))
+    ):
+        # cleanup after a cancel: the destination volumes of the abandoned pass go too; and a
+        # cold rollback deletes the volumes the cold import recorded - a cold retry never reuses
+        # them, its transfer creates new ones (SDD §6.3, §7, the owner's choice, 2026-10-14)
         out["os_migrate_rollback_delete_dest_volumes"] = True
     return out
+
+
+def _cold_volumes_recorded(osm: Path, server_id: str) -> bool:
+    """The cold import recorded destination volumes it created for the workload (SDD §6.3)."""
+    return bool((_read_warm_state(osm, server_id) or {}).get("dest_volumes"))
+
+
+def _leftover(osm: Path, server_id: str) -> bool:
+    """What an earlier attempt of the migration left with no destination server - a warm
+    pre-copy's passes or pending source snapshot, or the volumes a cold transfer that failed or was
+    cut short recorded: a cold re-run never reuses them, so its cutover removes them first (SDD
+    §7). A record that names a server is a resumed cutover's own."""
+    state = _read_warm_state(osm, server_id) or {}
+    return bool(
+        state.get("passes") or state.get("pending_snapshot") or state.get("dest_volumes")
+    ) and not state.get("destination_server_id")
 
 
 class _Unsafe(str):
@@ -655,12 +717,99 @@ def _read_progress(path: Path) -> float | None:
     return round(sum(values) / len(values), 2) if values else None
 
 
+class Deferred(list[str]):
+    """What a warm pre-copy or sync run meets that only the cutover's ports refuse (SDD §7.2):
+    each logged once, and all of it kept for the pass's cutover_refusals."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged = 0
+
+
+def _read_refusals(path: Path) -> list[str]:
+    """What the warm role recorded that the cutover will refuse (SDD §6.6): none when it wrote no
+    list of messages."""
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(problem) for problem in found] if isinstance(found, list) else []
+
+
 def _read_warm_state(osm: Path, server_id: str) -> dict[str, Any] | None:
     path = osm / "workload_warm" / f"{server_id}.json"
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def recorded_copied_data(settings: Settings, plan_id: str, migration: Migration) -> bool | None:
+    """What the workload's record (SDD §6.3) says of the data the migration copied: whether it
+    holds destination volumes or a pending source snapshot; None without a record (the simulator,
+    VMware, a storage handover, nothing run yet) or for an id the collection would refuse as a
+    file name. An unreadable record counts as data kept: its cleanup reports what it finds (SDD
+    §5.1, §12)."""
+    if not _STATE_FILE_ID.match(migration.vm.source_id):
+        return None
+    path = (
+        run_dir(settings, plan_id, migration.id)
+        / "osm"
+        / "workload_warm"
+        / f"{migration.vm.source_id}.json"
+    )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return True
+    return bool(record.get("dest_volumes") or record.get("pending_snapshot"))
+
+
+#: a source id the collection accepts as a state file name (warm_migration._SAFE_SERVER_ID)
+_STATE_FILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _ensure_record(osm: Path, server_id: str, server_name: str) -> None:
+    """Write the workload's record - no volume, pass or server - before a cold cutover's
+    playbooks when it has none: the file is the sign that the migration records its workload, so
+    its rollbacks never take a same-named server it does not record for the migration's (SDD §6.3,
+    §7, review RV3-03). An id the collection would refuse as a file name writes nothing."""
+    if not _STATE_FILE_ID.match(server_id):
+        return
+    path = osm / "workload_warm" / f"{server_id}.json"
+    if path.exists():
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    record = {
+        "server_id": server_id,
+        "server_name": server_name,
+        "transfer_uuid": None,
+        "dest_volumes": {},
+        "passes": [],
+        "pending_snapshot": None,
+        "destination_server_id": None,
+    }
+    # as WarmState.save: mode 0600, synced, renamed into place - then the directory is synced
+    # too, so the rename outlives a crash: a missing record would let a later rollback take a
+    # same-named server by its name (review RV4-07)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    try:
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        # some filesystems (network or FUSE mounts) cannot sync a directory: the record is written
+        # and synced all the same, and failing every cold cutover there would gain nothing
+        log.warning("could not sync %s after writing the workload record: %s", path.parent, exc)
 
 
 @dataclass(frozen=True)
@@ -733,14 +882,23 @@ class AnsibleExecutor:
 
     # -- steps ---------------------------------------------------------------------------------
     def _playbooks(
-        self, step: StepName, strategy: Strategy, osm: Path, reexport: bool = False
+        self,
+        step: StepName,
+        strategy: Strategy,
+        osm: Path,
+        reexport: bool = False,
+        leftover: bool = False,
     ) -> list[_Playbook]:
         exported = (osm / "workloads.yml").exists() and not reexport
         export = [] if exported else [_Playbook("export_workloads.yml")]
         if strategy == Strategy.cold:
             if step == StepName.CUTOVER:
+                # what an earlier attempt left goes before the stop, right after the export: the
+                # cleanup selects the workload by its name of now (SDD §7, review lead A)
+                cleanup = [_Playbook("rollback_workloads.yml")] if leftover else []
                 return [
                     _Playbook("export_workloads.yml"),
+                    *cleanup,
                     _Playbook("import_workloads.yml", stops_source=True),
                 ]
             if step == StepName.ROLLBACK:
@@ -771,6 +929,11 @@ class AnsibleExecutor:
         osm = rdir / "osm"
         reexport = False
         networks: list[dict[str, Any]] | None = None
+        # a warm pre-copy or sync run makes no port: what only the cutover's ports would meet is
+        # logged, and the cutover refuses it before the source stops (SDD §7.2)
+        deferred: Deferred | None = (
+            Deferred() if step in (StepName.PRECOPY, StepName.SYNC) else None
+        )
         if strategy in (Strategy.cold, Strategy.warm):
             vm_id = ctx.migration.vm.source_id
             nics = ctx.plan.nic_overrides.get(vm_id)
@@ -797,16 +960,30 @@ class AnsibleExecutor:
                 step == StepName.CUTOVER and not finishing,
                 bool(nics),
                 networks,
-                export_record(mappings, nics) if judged else None,
+                export_record(mappings, nics, ctx.migration.vm.name) if judged else None,
                 any(p.name == "export_workloads.yml" for p in self._playbooks(step, strategy, osm)),
+                deferred,
             )
-        playbooks = self._playbooks(step, strategy, osm, reexport=reexport)
+            await self._log_deferred(ctx, deferred)
+        leftover = (
+            strategy == Strategy.cold
+            and step == StepName.CUTOVER
+            and await asyncio.to_thread(_leftover, osm, ctx.migration.vm.source_id)
+        )
+        playbooks = self._playbooks(step, strategy, osm, reexport=reexport, leftover=leftover)
         if not playbooks:
             raise PermanentStepError(f"step {step} does not apply to strategy {strategy}")
         if step == StepName.CUTOVER:
             await self._refuse_name_collision(ctx)
+        if strategy == Strategy.cold and step == StepName.CUTOVER:
+            await asyncio.to_thread(
+                _ensure_record, osm, ctx.migration.vm.source_id, ctx.migration.vm.name
+            )
         # the kit powers the VM off at the cutover: its networks are settled before it runs
-        network_map = await self._vmware_network_map(ctx) if strategy in VMWARE else None
+        network_map = None
+        if strategy in VMWARE:
+            network_map = await self._vmware_network_map(ctx, deferred)
+            await self._log_deferred(ctx, deferred)
         passes_before = 0
         if strategy == Strategy.warm:
             state_before = await asyncio.to_thread(
@@ -814,6 +991,10 @@ class AnsibleExecutor:
             )
             passes_before = len((state_before or {}).get("passes") or [])
         started = utcnow()
+        refusals_file = osm / "workload_warm" / f"{ctx.migration.vm.source_id}.refusals.json"
+        if deferred is not None and strategy == Strategy.warm:
+            # the role writes it during the pass: an earlier pass's is not this one's (SDD §6.6)
+            remove_quietly(refusals_file)
         stop_skipped = await self._execute(
             rdir,
             osm,
@@ -825,6 +1006,7 @@ class AnsibleExecutor:
             ctx,
             effective_mappings(ctx.plan.mappings, ctx.migration.resolved_mappings),
             networks,
+            deferred,
         )
         if stop_skipped and strategy == Strategy.cold:
             # the cold role skips every task (the stop included) when the destination already
@@ -834,7 +1016,15 @@ class AnsibleExecutor:
                 "has a server with that name and nothing was migrated; delete or rename it, "
                 "or roll the migration back"
             )
-        return await self._result(step, strategy, ctx, osm, started, passes_before)
+        result = await self._result(step, strategy, ctx, osm, started, passes_before)
+        if deferred is not None:
+            # SDD §7.2: what this pass met that the cutover refuses before the source stops -
+            # what the executor deferred and, on the OpenStack warm path, the destination check's
+            found = list(deferred)
+            if strategy == Strategy.warm:
+                found += await asyncio.to_thread(_read_refusals, refusals_file)
+            result.cutover_refusals = list(dict.fromkeys(found))
+        return result
 
     async def _refuse_name_collision(self, ctx: StepContext) -> None:
         """Before the first cutover attempt, refuse a destination server that carries the VM's name.
@@ -955,16 +1145,23 @@ class AnsibleExecutor:
         # none listed (an older provider): nothing to resolve against
         return list(getattr(inventory, "network_details", None) or [])
 
-    async def _vmware_network_map(self, ctx: StepContext) -> dict[str, str]:
+    async def _vmware_network_map(
+        self, ctx: StepContext, deferred: list[str] | None = None
+    ) -> dict[str, str]:
         """The migration kit's network_map (SDD §7.2): each NIC of the VM by the kit's key to
         "{network id},{subnet id}" of the RHOSO network its port group resolves to - the plan's
         mapping of it, else the same name, by the rule of §7.3 step 0 - and of the subnet that
         holds its IPv4 guest addresses. Refused before the kit runs: a network that does not
         resolve, one the credential may not put a port on (§6.6), addresses the kit's port cannot
         take, two NICs one key would send to different values - a NIC with no IPv4 address takes
-        any of its network's; networks that cannot be read are a transient failure."""
+        any of its network's -, a MAC or address another port of the network holds; networks or
+        ports that cannot be read are a transient failure. Given ``deferred`` (a pre-copy or sync
+        run, in which the kit makes no port), the network the credential may not use and the
+        held MAC or address are added there instead and the NIC is mapped, and ports that cannot
+        be read are logged."""
+        dst = self.providers.get(ctx.destination)
         try:
-            inventory = await self.providers.get(ctx.destination).inventory()
+            inventory = await dst.inventory()
         except ProviderError as exc:
             raise TransientStepError(f"could not read the destination's networks: {exc}") from exc
         networks = list(getattr(inventory, "network_details", None) or [])
@@ -1000,16 +1197,34 @@ class AnsibleExecutor:
                 continue
             refused = port_refusal(network, roles)
             if refused:
-                problems.append(
+                problem = (
                     f"{what} cannot go to RHOSO network {name!r} "
                     f"(project {network.get('project_id')}): {refused}"
                 )
-                continue
+                if deferred is None:
+                    problems.append(problem)
+                    continue
+                # the kit makes the port at the cutover only: the NIC is mapped meanwhile
+                deferred.append(problem)
             own = [s for s in subnets if s.get("network_id") == network.get("id")]
             subnet, why = kit_subnet(nic, own)
             if why:
                 problems.append(f"{what} on {name!r}: {why}")
                 continue
+            try:
+                held = await self._held_by_another_port(dst, str(network["id"]), nic)
+            except TransientStepError as exc:
+                if deferred is None:
+                    raise
+                await ctx.log(
+                    f"{what} on {name!r}: {exc}; the cutover reads them again before the power-off"
+                )
+                held = None
+            if held:
+                if deferred is None:
+                    problems.append(f"{what} on {name!r}: {held}")
+                    continue
+                deferred.append(f"{what} on {name!r}: {held}")
             key, value = kit_network_key(nic), kit_network_value(network, subnet)
             if key is None:
                 # the kit would drop a distributed port group's NIC that a name keys
@@ -1028,6 +1243,46 @@ class AnsibleExecutor:
             raise PermanentStepError("; ".join(problems))
         return out
 
+    @staticmethod
+    async def _log_deferred(ctx: StepContext, deferred: Deferred | None) -> None:
+        """Log, once each, what a warm pass did not refuse and the cutover will (SDD §7.2); the
+        list keeps it for the pass's cutover_refusals."""
+        if deferred is None:
+            return
+        for problem in deferred[deferred.logged :]:
+            await ctx.log(f"the cutover will refuse this before the source stops: {problem}")
+        deferred.logged = len(deferred)
+
+    @staticmethod
+    async def _held_by_another_port(dst: Any, network_id: str, nic: Nic) -> str | None:
+        """What another port of the network holds of what the kit asks Neutron for after the
+        power-off: the NIC's MAC, else one of its IPv4 addresses (SDD §7.2)."""
+        try:
+            if nic.mac:
+                for port in await dst.ports(network_id=network_id, mac_address=nic.mac.lower()):
+                    return f"port {port['id']} holds its MAC {nic.mac}"
+            for address in kit_ipv4(nic.fixed_ips):
+                for port in await dst.ports(network_id=network_id, ip_address=address):
+                    return f"port {port['id']} holds {address}"
+        except ProviderError as exc:
+            raise TransientStepError(f"could not read the destination's ports: {exc}") from exc
+        return None
+
+    @staticmethod
+    async def _delete_kit_ports(dst: Any, nics: list[Nic]) -> list[str]:
+        """Delete the migration kit's ports of the VM (SDD §7.2): Nova only unbinds a port it did
+        not create when it deletes the server, and the port would keep the NIC's MAC and addresses.
+        They are the unbound ports with one of the NICs' MACs and the kit's name form; a port bound
+        to a server is never deleted."""
+        deleted: list[str] = []
+        for mac in sorted({nic.mac.lower() for nic in nics if nic.mac}):
+            for port in await dst.ports(mac_address=mac):
+                if port.get("device_id") or not KIT_PORT_NAME.search(str(port.get("name") or "")):
+                    continue
+                await dst.delete_port(port["id"])
+                deleted.append(str(port["id"]))
+        return deleted
+
     async def _lookup_server(self, ctx: StepContext) -> str | None:
         try:
             return await self.providers.get(ctx.destination).find_server(ctx.migration.vm.name)
@@ -1038,6 +1293,8 @@ class AnsibleExecutor:
     async def _vmware_rollback(self, ctx: StepContext) -> StepResult:
         m = ctx.migration
         vm = m.vm
+        if ctx.options.get("delete_dest_volumes"):
+            return await self._vmware_cancel_cleanup(ctx)
         try:
             dst = self.providers.get(ctx.destination)
             server_id = m.destination_server_id
@@ -1048,10 +1305,29 @@ class AnsibleExecutor:
                 server_id = await dst.find_server(vm.name)
             if server_id:
                 await dst.delete_server(server_id)
+            deleted_ports = await self._delete_kit_ports(dst, vm.nics)
             await self.providers.get(ctx.source).power_on(vm.source_id)
         except ProviderError as exc:
             raise TransientStepError(f"rollback: {exc}") from exc
-        return StepResult(details={"source_running": True, "deleted_server": server_id})
+        return StepResult(
+            details={
+                "source_running": True,
+                "deleted_server": server_id,
+                "deleted_ports": deleted_ports,
+            }
+        )
+
+    async def _vmware_cancel_cleanup(self, ctx: StepContext) -> StepResult:
+        """A cancel's cleanup on VMware deletes only a server the migration recorded: no lookup by
+        name, no kit port, no power-on - the VM it released may since be another plan's (SDD §5.1,
+        §7.2, review RV-01, RV-02)."""
+        server_id = ctx.migration.destination_server_id
+        if server_id:
+            try:
+                await self.providers.get(ctx.destination).delete_server(server_id)
+            except ProviderError as exc:
+                raise TransientStepError(f"rollback: {exc}") from exc
+        return StepResult(details={"deleted_server": server_id, "deleted_ports": []})
 
     async def _finalize(self, ctx: StepContext) -> StepResult:
         if not ctx.options.get("delete_source"):
@@ -1120,6 +1396,7 @@ class AnsibleExecutor:
         ctx: StepContext | None,
         mappings: Mappings | None,
         networks: Sequence[dict[str, Any]] | None = None,
+        deferred: list[str] | None = None,
     ) -> bool:
         """Run the playbooks; True when the source-stop task of one of them was skipped."""
         vars_path = workdir / "vars.yml"
@@ -1158,9 +1435,24 @@ class AnsibleExecutor:
                     planned = ctx.migration.vm.source_id if ctx is not None else None
                     mode = ctx.plan.port_creation_mode if ctx is not None else None
                     nics = ctx.plan.nic_overrides.get(planned or "") if ctx is not None else None
-                    await asyncio.to_thread(
-                        self._rewrite_workloads, osm, mappings, planned, mode, nics, networks
+                    volumes = (
+                        [d.id for d in ctx.migration.vm.disks if d.kind == "volume"]
+                        if ctx is not None
+                        else None
                     )
+                    await asyncio.to_thread(
+                        self._rewrite_workloads,
+                        osm,
+                        mappings,
+                        planned,
+                        mode,
+                        nics,
+                        networks,
+                        deferred,
+                        volumes,
+                    )
+                    if ctx is not None:
+                        await self._log_deferred(ctx, deferred)
         finally:
             # synchronous on purpose: runs even when the step task is being cancelled
             remove_quietly(*cleanup)
@@ -1174,11 +1466,14 @@ class AnsibleExecutor:
         port_mode: str | None = None,
         nic_overrides: Mapping[str, NicOverride] | None = None,
         networks: Sequence[dict[str, Any]] | None = None,
+        deferred: list[str] | None = None,
+        validated_volumes: Sequence[str] | None = None,
     ) -> None:
-        """Keep only the planned server of the export, apply the mappings, the VM's NIC
+        """Keep only the planned server of the export, check that it still lists every volume
+        the migration validated (``validated_volumes``), apply the mappings, the VM's NIC
         overrides and the plan's port_creation_mode, and resolve the network references against
-        the destination's ``networks``; once all of it succeeded, write the export record (SDD
-        §7.2)."""
+        the destination's ``networks`` - a warm pass adds a port network that does not resolve
+        to ``deferred`` -; once all of it succeeded, write the export record (SDD §7.2)."""
         path = osm / "workloads.yml"
         if not path.exists():
             raise PermanentStepError("export_workloads.yml did not produce workloads.yml")
@@ -1208,11 +1503,28 @@ class AnsibleExecutor:
             doc = set_port_creation_mode(doc, port_mode)
         # written first: a rollback reads the planned server from it, should an override fail
         path.write_text(yaml.safe_dump(doc, sort_keys=False))
+        if validated_volumes:
+            # a volume detached from the VM since - by an operator, or by an earlier attempt's
+            # export that failed after it detached the data volumes - would be left out of the
+            # import, and the migration would succeed without that disk (review RV6-01)
+            kept = [r for r in doc.get("resources") or [] if r.get("type") == SERVER_TYPE]
+            listed = {
+                (volume.get("_info") or {}).get("id")
+                for resource in kept
+                for volume in (resource.get("params") or {}).get("volumes") or []
+            }
+            lacking = [v for v in validated_volumes if v not in listed]
+            if lacking:
+                raise PermanentStepError(
+                    "the export lists none of the volume(s) " + ", ".join(lacking) + " the VM "
+                    "had at validation: attach them to the source VM again (an earlier attempt "
+                    "may have left them detached) and retry (SDD §7.2)"
+                )
         if nic_overrides:
             doc = apply_nic_overrides(doc, nic_overrides)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         if networks:
-            doc = resolve_network_refs(doc, networks)
+            doc = resolve_network_refs(doc, networks, deferred)
             path.write_text(yaml.safe_dump(doc, sort_keys=False))
         missing = ports_without_security_groups(doc) if port_mode == "neutron" else []
         if missing:
@@ -1222,7 +1534,9 @@ class AnsibleExecutor:
                 "security groups: recreated through Neutron they would get the project's default "
                 "group. Update the os-migrate collection, or recreate the ports with Nova."
             )
-        record = export_record(mappings or Mappings(), nic_overrides)
+        exported = [r for r in doc.get("resources") or [] if r.get("type") == SERVER_TYPE]
+        name = (exported[0].get("params") or {}).get("name") if exported else None
+        record = export_record(mappings or Mappings(), nic_overrides, name)
         (osm / EXPORT_RECORD).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
 
     def _playbook_arg(self, name: str) -> str:

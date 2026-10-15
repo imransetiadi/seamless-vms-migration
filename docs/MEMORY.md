@@ -97,9 +97,11 @@ Step by step for the three product triggers:
    size bucket, strategy, number of passes, final delta, estimated vs actual downtime. This is the raw
    material for the PRD's estimate-accuracy goal (G2) and for calibrating the estimator.
 2. **Failure** (`on_failure`, any step): the service first **searches** with
-   `"{strategy} {step} {error_class}: {message[:200]}"`, attaches up to three hits as an advisory note and
-   emits `advisor.similar_incidents`; then it **remembers** a `bug` lesson with concepts
-   `["seamless", strategy, step]`. Searching before writing keeps the new lesson from matching itself — the order to verify in `ai/knowledge.py`.
+   `"{strategy} {step} {error_class}: {message[:200]}"`, then **remembers** a `bug` lesson with concepts
+   `["seamless", strategy, step]`, and returns up to three hits as an advisory note. Searching before writing
+   keeps the new lesson from matching itself (`ai/knowledge.py`). The orchestrator attaches the note to the
+   migration and only then emits `advisor.similar_incidents`, so the refresh the event asks for reads the note
+   (SDD §14.3).
 3. **Rollback** (`on_rolled_back`): a `workflow` lesson records what was rolled back and why, i.e. the
    recovery procedure that worked.
 

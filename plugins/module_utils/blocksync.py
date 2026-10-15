@@ -509,7 +509,8 @@ class _ReceiveSession:
         started = time.monotonic()
         dest_size = _fd_size(self.fd)
         try:
-            self.proc = subprocess.Popen(
+            # a script run on the conversion host, not an Ansible module: no run_command there
+            self.proc = subprocess.Popen(  # pylint: disable=ansible-bad-function
                 self.sender_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -728,6 +729,7 @@ class _ReceiveSession:
         if rc is not None and rc < 0:
             # Killed by a signal (e.g. the OOM killer): not a protocol issue.
             raise BlocksyncError(
+                # pylint: disable-next=invalid-unary-operand-type
                 "%s (the sender was killed by signal %d)" % (message, -rc),
                 exit_code=EXIT_USAGE,
             )
@@ -1092,4 +1094,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # the conversion hosts run it as a script: its exit status is the protocol's (no module)
+    sys.exit(main())  # pylint: disable=ansible-bad-function

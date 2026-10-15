@@ -3,6 +3,7 @@ import { ApiClient } from './client';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { createMockFetch, MockServer, PLAN_EDITABLE_FIELDS } from './mock';
+import { summaryOf } from '../lib/summary';
 import { streamEvents } from './stream';
 import {
   ADVISOR_NOTE_KINDS,
@@ -13,6 +14,9 @@ import {
   PROVIDER_STATUSES,
   SEVERITIES,
   STRATEGIES,
+  type AdvisorNote,
+  type AdvisorNoteList,
+  type MigrationSummary,
   type AdvisorPolicy,
   type AdvisorRecommendation,
   type AdvisorStatus,
@@ -287,6 +291,19 @@ describe('mock API', () => {
     expect(actions(cold.id)).not.toContain('cleanup');
   });
 
+  it('cancels a rolled-back migration and cleans up the data path its rollback kept, like the API (SDD §5.1)', async () => {
+    const { server, client } = setup('operator');
+    const actions = (id: string) =>
+      server.events.filter((e) => e.migration_id === id && e.kind === 'migration.action').map((e) => e.data.action);
+    const rolled = byPhase(server, 'rolled_back');
+    // a warm migration whose rollback kept its destination volumes and warm state for a retry
+    rolled.strategy = 'warm';
+    rolled.sync_passes = server.migrations.find((m) => m.vm.name === 'app-billing-01')!.sync_passes.map((p) => ({ ...p }));
+    const cancelled = await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
+    expect(cancelled.phase).toBe('cancelled');
+    expect(actions(rolled.id).slice(-2)).toEqual(['cancel', 'cleanup']);
+  });
+
   it('reopens a completed plan at a retry, and refuses one whose provider is gone, like the API (SDD §5.1)', async () => {
     const { server, client } = setup('operator');
     const rolled = byPhase(server, 'rolled_back');
@@ -551,6 +568,21 @@ describe('mock API', () => {
     expect(m.sync_passes.length).toBe(listed.length + 1);
     expect(m.sync_passes.at(-1)!.kind).not.toBe('final');
     expect(Date.parse(m.sync_passes.at(-1)!.started_at)).toBeGreaterThanOrEqual(restarted);
+  });
+
+  it('empties what the passes said the cutover would refuse once the cutover gets past it, as the control plane does (SDD §7.2)', async () => {
+    const { server } = setup('approver');
+    const m = server.migrations.find((x) => x.strategy === 'cold' && x.phase === 'ready')!;
+    const plan = server.plans.find((p) => p.id === m.plan_id)!;
+    plan.status = 'running';
+    plan.cutover_window = null;
+    m.cutover_refusals = ["port p2 on network 'gone' does not resolve"];
+    const approver = new ApiClient({ getToken: () => 'approver', fetchImpl: createMockFetch(server) });
+    await approver.post(`/migrations/${m.id}/cutover`, {});
+    await secondApprover(server, m.id); // maker-checker (ADV-17)
+    for (let t = 0; t < 200 && m.phase !== 'verifying'; t++) server.tick();
+    expect(m.phase).toBe('verifying');
+    expect(m.cutover_refusals).toEqual([]);
   });
 
   it('records a cold copy as a full pass and keeps its bytes, as the API executors do (SDD §4.2)', async () => {
@@ -1058,6 +1090,44 @@ describe('mock API', () => {
     expect(m.approvals.map((a) => a.actor)).toEqual(['ana']);
   });
 
+  it('refuses to cancel a plan while an unstarted migration has its source stopped, before cancelling anything, like the API (SDD §12)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const mine = server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').sort((a, b) => (a.id < b.id ? -1 : 1));
+    expect(mine.length).toBeGreaterThan(1);
+    // the last one in id order: a cancel loop would reach the others first
+    const last = mine.at(-1)!;
+    Object.assign(last, { phase: 'ready', downtime_started_at: '2026-10-08T10:00:00Z', downtime_ended_at: null });
+    const before = mine.map((m) => m.phase);
+    const res = server.handle('POST', '/plans/plan-c81d44a0/cancel', new URLSearchParams(), {}, 'operator');
+    expect(res.status).toBe(409);
+    expect((res.body as { error: { message: string } }).error.message).toMatch(new RegExp(`${last.vm.name}; cut it over`));
+    expect(mine.map((m) => m.phase)).toEqual(before);
+  });
+
+  it('cancels a plan like the API: its unstarted migrations cancelled, a running plan paused first, a started migration named (SDD §12)', () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const call = (id: string, token = 'operator') => server.handle('POST', `/plans/${id}/cancel`, new URLSearchParams(), { reason: 'made by mistake' }, token);
+    expect(call('plan-c81d44a0', 'viewer').status).toBe(403);
+    expect(call('plan-4f2a9c1e')).toMatchObject({ status: 409, body: { error: { message: 'pause the plan before cancelling it' } } });
+    const started = call('plan-7b3e0d52');
+    expect(started.status).toBe(409);
+    expect((started.body as { error: { message: string } }).error.message).toMatch(/^only a plan whose migrations have not started can be cancelled: .+ \(syncing\)/);
+    const before = server.events.length;
+    const done = call('plan-c81d44a0');
+    expect(done.status).toBe(200);
+    expect(done.body).toMatchObject({ status: 'cancelled', derived_status: 'cancelled' });
+    expect(new Set(server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').map((m) => m.phase))).toEqual(new Set(['cancelled']));
+    const events = server.events.slice(before);
+    const n = server.migrations.filter((m) => m.plan_id === 'plan-c81d44a0').length;
+    const operator = (server.handle('GET', '/me', new URLSearchParams(), undefined, 'operator').body as { name: string }).name;
+    expect(events.filter((e) => e.kind === 'plan.cancelled')).toMatchObject([{ plan_id: 'plan-c81d44a0', actor: operator, data: { reason: 'made by mistake', migrations: n } }]);
+    // terminal: no validation, start or edit, and a second cancel answers the plan as it is
+    expect(server.handle('POST', '/plans/plan-c81d44a0/validate', new URLSearchParams(), {}, 'operator').status).toBe(409);
+    expect(server.handle('POST', '/plans/plan-c81d44a0/start', new URLSearchParams(), {}, 'operator').status).toBe(409);
+    expect(call('plan-c81d44a0')).toMatchObject({ status: 200, body: { status: 'cancelled' } });
+    expect(server.events.slice(before).filter((e) => e.kind === 'plan.cancelled')).toHaveLength(1);
+  });
+
   it('cancels a removed VM\u2019s failed migration at validation like the API, unless its cutover stopped the source (SDD §5.4)', () => {
     const { server } = setup('operator');
     const plan = server.plans.find((p) => p.id === 'plan-c81d44a0')!;
@@ -1149,9 +1219,54 @@ describe('mock API', () => {
     expect(listed).not.toContain('plan-extra008');
     server.plans.splice(server.plans.findIndex((p) => p.id === 'plan-extra000'), 9);
     other.status = 'completed';
-    // a rolled-back VM lets it go: a retry refuses when the provider is gone (SDD §5.1)
+    // a rolled-back VM that kept no copied data lets it go: a retry refuses when the provider is gone (SDD §5.1)
     first!.phase = 'rolled_back';
+    first!.sync_passes = [];
     second!.phase = 'cancelled';
+    expect(remove().status).toBe(204);
+  });
+
+  it('keeps a provider while a rolled-back VM keeps its copied data, like the API: until a cancel cleans it up (SDD §12, §5.1)', async () => {
+    const { server, client } = setup('admin');
+    const rolled = byPhase(server, 'rolled_back');
+    const plan = server.plans.find((p) => p.id === rolled.plan_id)!;
+    const id = plan.destination_provider_id;
+    const users = server.plans.filter((p) => p.source_provider_id === id || p.destination_provider_id === id);
+    for (const p of users) p.status = 'completed';
+    const passes = server.migrations.find((m) => m.vm.name === 'app-billing-01')!.sync_passes.map((p) => ({ ...p }));
+    for (const m of server.migrations.filter((x) => users.some((p) => p.id === x.plan_id))) m.phase = 'finalized';
+    const remove = () => server.handle('DELETE', `/providers/${id}`, new URLSearchParams(), undefined, 'admin');
+    const tail = 'a plan needs its providers until it completes and its VMs are finalized';
+    const provider = server.providers.find((p) => p.id === id)!;
+    // a rolled-back VM that recorded no passes kept nothing: it lets the provider go
+    rolled.phase = 'rolled_back';
+    rolled.sync_passes = [];
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    // a warm rollback kept the destination volumes and warm state for a retry, and a cancel cleans them up with the provider
+    rolled.strategy = 'warm';
+    rolled.sync_passes = passes;
+    expect(remove()).toMatchObject({
+      status: 409,
+      body: { error: { message: `provider is used by plan(s) that still need it: ${plan.id} ("${plan.name}", 1 rolled-back VM keeping its copied data); ${tail}` } },
+    });
+    const second = server.migrations.find((m) => m.plan_id === plan.id && m.id !== rolled.id)!;
+    second.phase = 'rolled_back';
+    second.strategy = 'warm';
+    second.sync_passes = passes.map((p) => ({ ...p }));
+    expect(remove().body).toMatchObject({ error: { message: expect.stringContaining(`("${plan.name}", 2 rolled-back VMs keeping their copied data)`) } });
+    second.phase = 'completed';
+    expect(remove().body).toMatchObject({
+      error: { message: expect.stringContaining(`("${plan.name}", 1 VM not finalized, 1 rolled-back VM keeping its copied data)`) },
+    });
+    second.phase = 'finalized';
+    // a cold rollback deleted what the cold import copied, though its cutover lists a pass (SDD §5.1, §12)
+    rolled.strategy = 'cold';
+    expect(remove().status).toBe(204);
+    server.providers.push(provider);
+    rolled.strategy = 'warm';
+    // the cancel cleans up what the rollback kept (the mock's cleanup ends at once): the provider goes
+    await client.post<Migration>(`/migrations/${rolled.id}/cancel`, { reason: 'not migrated after all' });
     expect(remove().status).toBe(204);
   });
 
@@ -1282,6 +1397,52 @@ describe('mock advisor recommendations, like the API (SDD §12, §14.4)', () => 
   });
 });
 
+describe('mock migration summaries, like the API (SDD §4, §12, perf audit PF-02)', () => {
+  it('lists each migration as its summary, in the same order, filtered and paged alike; another view is 422', async () => {
+    const { client } = setup('viewer');
+    const full = await client.get<Migration[]>('/migrations');
+    expect(await client.get<MigrationSummary[]>('/migrations', { query: { view: 'summary' } })).toEqual(full.map(summaryOf));
+    const planId = full[0]!.plan_id;
+    const page = { plan_id: planId, limit: 2, offset: 1 };
+    expect(await client.get('/migrations', { query: { ...page, view: 'summary' } })).toEqual((await client.get<Migration[]>('/migrations', { query: page })).map(summaryOf));
+    expect(await client.get('/migrations', { query: { view: 'full' } })).toEqual(full);
+    await expect(client.get('/migrations', { query: { view: 'everything' } })).rejects.toMatchObject({ status: 422 });
+  });
+});
+
+describe('mock advisor notes, like the API (SDD §12, perf audit PF-02)', () => {
+  const notes = (client: ApiClient, query: Record<string, string | number | undefined> = {}) => client.get<AdvisorNoteList>('/advisor/notes', { query });
+  const note = (kind: AdvisorNote['kind'], at: string, summary: string): AdvisorNote => ({ kind, source: 'rules', summary, confidence: null, data: {}, created_at: at });
+
+  it("lists every migration's notes but strategy notes, newest first; the same time keeps creation and note order", async () => {
+    const { server, client } = setup('viewer');
+    for (const m of server.migrations) m.advisor_notes = [];
+    const [first, second] = server.migrations as [Migration, Migration];
+    first.advisor_notes = [note('classification', '2026-10-08T09:00:00Z', 'tier'), note('strategy', '2026-10-08T11:00:00Z', 'legacy'), note('screen', '2026-10-08T08:00:00Z', 'screened')];
+    second.advisor_notes = [note('verification', '2026-10-08T10:00:00Z', 'boot'), note('similar_incidents', '2026-10-08T09:00:00Z', 'similar')];
+    const { items } = await notes(client);
+    expect(items.map((n) => [n.migration_id, n.kind])).toEqual([
+      [second.id, 'verification'],
+      [first.id, 'classification'],
+      [second.id, 'similar_incidents'],
+      [first.id, 'screen'],
+    ]);
+    expect(items[0]).toEqual({ ...second.advisor_notes[0], migration_id: second.id, plan_id: second.plan_id, vm_name: second.vm.name });
+    expect((await notes(client, { limit: 2 })).items.map((n) => n.kind)).toEqual(['verification', 'classification']);
+    // 20 unless asked otherwise, at most 200
+    second.advisor_notes.push(...Array.from({ length: 25 }, (_, i) => note('classification', new Date(Date.parse('2026-10-07T00:00:00Z') - i * 60_000).toISOString(), `tier ${i}`)));
+    expect((await notes(client)).items).toHaveLength(20);
+    expect((await notes(client, { limit: 200 })).items).toHaveLength(29);
+    for (const limit of [0, 201]) await expect(notes(client, { limit })).rejects.toMatchObject({ status: 422 });
+  });
+
+  it('needs a token, and any role', async () => {
+    // no token at all is auth turned off, as in the API: an anonymous admin
+    await expect(notes(setup('nonsense').client)).rejects.toMatchObject({ status: 401 });
+    expect((await notes(setup('viewer').client)).items.length).toBeGreaterThan(0);
+  });
+});
+
 describe('mock audit trail, like the API (SDD §14.5)', () => {
   it('lists only audit events with audit=true, newest last', async () => {
     const { client } = setup('viewer');
@@ -1378,7 +1539,12 @@ describe('mock advisor policies, approval and override, like the API (SDD §14.6
     const db = server.migrations.find((m) => m.vm.name === 'analytics-db')!;
     expect([db.strategy, db.advisor_hold]).toEqual(['cold', null]);
     expect(server.plans.find((p) => p.id === 'plan-c81d44a0')!.strategy_overrides).toMatchObject({ [db.vm.source_id]: 'cold' });
-    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({ kind: 'decision.overridden', actor: 'user:rina', data: { before: { status: 'pending_approval' } } });
+    // the trail itself says why (SDD §14.5)
+    expect(server.events.filter((e) => e.data.target_id === id).at(-1)).toMatchObject({
+      kind: 'decision.overridden',
+      actor: 'user:rina',
+      data: { before: { status: 'pending_approval', reason_text: null }, after: { status: 'overridden', reason_text: 'The change window fits a cold cutover' } },
+    });
   });
 
   it('refuses what the API refuses: 403 below admin, 409 for a legacy, an older or a started one, and PUT …/strategy while held', async () => {
@@ -1458,7 +1624,7 @@ describe('mock validation decides like the API (SDD §14.4)', () => {
       target_id: rec!.id,
       model_version: 'jev-1.13.0',
       before: null,
-      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', policy_id: 'global-default', threshold_used: 0.6 },
+      after: { status: 'auto_applied', final_option: 'cold', reason_code: 'ABOVE_THRESHOLD_AUTO_APPLY', reason_text: null, policy_id: 'global-default', threshold_used: 0.6 },
     });
     expect(server.events.filter((e) => e.migration_id === db.id && e.kind === 'advisor.strategy')).toEqual([]);
     // the input snapshot is named by the SHA-256 of its canonical JSON
@@ -1691,6 +1857,12 @@ describe('mock convergence, Force cutover and data checks, like the API (SDD §5
     return new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
   }
   const REASON = 'The change window closes in 20 minutes';
+
+  it('says on GET /health that authentication is off: no token is the anonymous admin (SDD §12, §13.1)', async () => {
+    const { client } = setup(null);
+    expect(await client.get<{ auth_disabled: boolean }>('/health')).toMatchObject({ auth_disabled: true });
+    expect(await client.get('/me')).toEqual({ name: 'anonymous', role: 'admin' });
+  });
 
   it('answers GET /health with its demo speed: the mock runs model time at wall speed', async () => {
     const { client } = setup('viewer');
@@ -1960,6 +2132,25 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
     expect((await viewer.get<Plan[]>('/plans')).find((p) => p.id === pilot.id)!.derived_status).toBe('finalized');
   });
 
+  it('returns every plan with its migrations counted by phase, which a client cannot set (SDD §4, §8.1, PF-02)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const counted = (planId: string) => {
+      const counts: Record<string, number> = {};
+      for (const m of server.migrations.filter((x) => x.plan_id === planId)) counts[m.phase] = (counts[m.phase] ?? 0) + 1;
+      return counts;
+    };
+    const viewer = as(server, 'viewer');
+    const all = await viewer.get<Plan[]>('/plans');
+    for (const plan of all) expect(plan.migration_counts).toEqual(counted(plan.id));
+    expect(all.some((p) => Object.keys(p.migration_counts).length > 1)).toBe(true);
+    // derived on every answer: a migration that moves moves its count
+    byName(server, 'web-cache-01').phase = 'finalized';
+    const pilot = await viewer.get<Plan>('/plans/plan-2d5c8b93');
+    expect(pilot.migration_counts).toEqual(counted('plan-2d5c8b93'));
+    // the API's: a PATCH may not carry it
+    await expect(as(server, 'operator').patch(`/plans/${pilot.id}`, { migration_counts: { completed: 9 } })).rejects.toMatchObject({ status: 422 });
+  });
+
   it('splits completed into awaiting finalize and finalized', async () => {
     const server = new MockServer({ now: () => NOW, seed: 1 });
     const stats = await as(server, 'viewer').get<Stats>('/stats?plan_id=plan-2d5c8b93');
@@ -1993,6 +2184,32 @@ describe('mock finalize queue, like the API (SDD §8.1, ADV-19)', () => {
       message: 'the finalize began deleting the source VM: finalize it again',
     });
     expect(web01.phase).toBe('completed');
+  });
+
+  it('refuses to finalize while the source VM runs again, skips it in a bulk finalize, and finishes a finalize that began deleting it, like the API (SDD §8.1)', async () => {
+    const server = new MockServer({ now: () => NOW, seed: 1 });
+    const plan = server.plans.find((p) => p.id === 'plan-4f2a9c1e')!;
+    const web01 = byName(server, 'web-01');
+    await as(server, 'operator').post(`/demo/vms/${web01.vm.source_id}/power`, { state: 'on' });
+    server.tick();
+    expect([web01.phase, web01.source_running_at !== null]).toEqual(['completed', true]);
+    const reason = 'the source VM runs again: stop it, or roll it back, before finalizing';
+    await expect(as(server, 'approver').post(`/migrations/${web01.id}/finalize`, { confirm: web01.vm.name, delete_source: true })).rejects.toMatchObject({
+      status: 409,
+      message: reason,
+    });
+    const wave = plan.waves.find((w) => w.id === web01.wave_id)!;
+    const out = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: wave.id, confirm: wave.name });
+    // the watch's tick moved the wave on: whatever else completed is finalized, web-01 is skipped with the reason
+    expect(out.skipped).toEqual([{ migration_id: web01.id, reason }]);
+    expect(out.finalized).not.toContain(web01.id);
+    expect(web01.phase).toBe('completed');
+    // a finalize that began deleting the source is finalized again from its own page; a bulk finalize skips it too
+    web01.checkpoint = 'finalizing';
+    const again = await as(server, 'approver').post<PlanFinalizeResult>(`/plans/${plan.id}/finalize`, { wave_id: wave.id, confirm: wave.name });
+    expect(again.skipped).toEqual([{ migration_id: web01.id, reason }]);
+    await as(server, 'approver').post(`/migrations/${web01.id}/finalize`, { confirm: web01.vm.name, delete_source: true });
+    expect(web01.phase).toBe('finalized');
   });
 
   it("refuses to change a plan's providers while one of its migrations is failed, like the API (SDD §12)", async () => {

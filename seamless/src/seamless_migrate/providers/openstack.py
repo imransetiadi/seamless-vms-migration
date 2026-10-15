@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import math
 import threading
@@ -19,7 +20,7 @@ from ..guest_os import identify
 from ..planning.preflight import DestinationInventory, SourceInventory
 from ..security.secrets import SecretNotFound, openstack_cloud_entry
 from ..storage import storage_family
-from .base import ProviderError, missing_dependency
+from .base import ProviderError, VMNotFound, missing_dependency
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ def _attr(obj: Any, *names: str, default: Any = None) -> Any:
         if value is not None:
             return value
     return default
+
+
+def _canonical_ip(address: str) -> str:
+    """An address as Neutron writes it; a string that is no address stays as it is."""
+    try:
+        return str(ipaddress.ip_address(address))
+    except ValueError:
+        return address
 
 
 def _truthy(value: Any) -> bool:
@@ -177,6 +186,18 @@ class OpenStackProvider:
     async def find_server(self, name: str) -> str | None:
         return await self._run(self._find_server, name)
 
+    async def ports(
+        self,
+        *,
+        network_id: str | None = None,
+        mac_address: str | None = None,
+        ip_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self._run(self._ports, network_id, mac_address, ip_address)
+
+    async def delete_port(self, port_id: str) -> None:
+        await self._run(self._delete_port, port_id)
+
     # -- implementation (runs in worker threads) ----------------------------------------------
     def _check(self) -> dict[str, Any]:
         conn = self._connection()
@@ -227,7 +248,14 @@ class OpenStackProvider:
 
     def _get_vm(self, source_id: str) -> VMRef:
         conn = self._connection()
-        return _MapContext(conn).server_to_vmref(conn.compute.get_server(source_id))
+        import openstack.exceptions
+
+        try:
+            server = conn.compute.get_server(source_id)
+        except openstack.exceptions.NotFoundException:
+            # Nova answered 404: it has no such server (SDD §10), not an unreachable cloud
+            raise VMNotFound(f"{self.provider.id}: VM {source_id!r} not found") from None
+        return _MapContext(conn).server_to_vmref(server)
 
     def _project_name(self, conn: Any) -> str:
         pid = _attr(conn, "current_project_id", default="")
@@ -375,6 +403,50 @@ class OpenStackProvider:
         conn = self._connection()
         server = conn.compute.find_server(name, ignore_missing=True)
         return None if server is None else str(_attr(server, "id"))
+
+    def _ports(
+        self, network_id: str | None, mac_address: str | None, ip_address: str | None
+    ) -> list[dict[str, Any]]:
+        """The ports matching every filter given (SDD §10); Neutron keeps MACs in lower case and
+        addresses in their canonical form, and each filter is checked again on what it returns."""
+        mac = mac_address.lower() if mac_address is not None else None
+        address = _canonical_ip(ip_address) if ip_address is not None else None
+        query: dict[str, Any] = {}
+        if network_id is not None:
+            query["network_id"] = network_id
+        if mac is not None:
+            query["mac_address"] = mac
+        if address is not None:
+            query["fixed_ips"] = [f"ip_address={address}"]
+        out: list[dict[str, Any]] = []
+        for port in self._connection().network.ports(**query):
+            fixed = [
+                str(ip.get("ip_address"))
+                for ip in _attr(port, "fixed_ips", default=None) or []
+                if ip.get("ip_address")
+            ]
+            port_mac = str(_attr(port, "mac_address", default="") or "").lower()
+            port_network = str(_attr(port, "network_id", default="") or "")
+            if network_id is not None and port_network != network_id:
+                continue
+            if mac is not None and port_mac != mac:
+                continue
+            if address is not None and address not in (_canonical_ip(a) for a in fixed):
+                continue
+            out.append(
+                {
+                    "id": str(_attr(port, "id")),
+                    "name": str(_attr(port, "name", default="") or ""),
+                    "network_id": port_network,
+                    "device_id": str(_attr(port, "device_id", default="") or ""),
+                    "mac_address": port_mac,
+                    "fixed_ips": fixed,
+                }
+            )
+        return out
+
+    def _delete_port(self, port_id: str) -> None:
+        self._connection().network.delete_port(port_id, ignore_missing=True)
 
 
 def _os_hint(properties: Mapping[str, Any]) -> str | None:

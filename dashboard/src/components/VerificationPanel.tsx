@@ -1,6 +1,6 @@
 import { Activity, CircleCheck, CircleMinus, CircleX, Pencil } from 'lucide-react';
 import { useId, useRef, useState, type FormEvent } from 'react';
-import { useMigrations, usePatchPlan } from '../api/hooks';
+import { useMigrationSummaries, usePatchPlan } from '../api/hooks';
 import type { Migration, Plan, Role, VerificationCheck } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatDateTime, formatRelative } from '../lib/format';
@@ -147,7 +147,8 @@ export function VerificationPanel({ migration: m, plan, role, onSaved }: { migra
   // the plan's edit rules (SDD §12): a migration in flight keeps the plan as it is. Only a draft or validated plan is
   // editable at all, so only then are its migrations loaded — a running plan's page is where live events refetch them
   const editable = plan?.status === 'draft' || plan?.status === 'validated';
-  const siblings = useMigrations({ plan_id: m.plan_id }, { enabled: editable });
+  // whether the plan can be edited: its migrations as summaries (SDD §16, perf audit PF-02)
+  const siblings = useMigrationSummaries({ plan_id: m.plan_id }, { enabled: editable });
   const edit = plan ? planActions(plan, role, siblings.data ?? [m]).edit : { enabled: false, reason: 'The plan is loading.' };
   const record = m.verification;
   const caption = useId();

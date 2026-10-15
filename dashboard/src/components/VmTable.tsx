@@ -1,9 +1,11 @@
 import { CircleCheck, CircleHelp, CircleX, Pause, Power, PowerOff, RefreshCw, SearchX, type LucideIcon } from 'lucide-react';
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { POWER_STATES, type GuestOS, type PowerState, type ProviderKind, type VMRef } from '../api/types';
 import { cn } from '../lib/cn';
 import { formatBytes, formatNumber } from '../lib/format';
-import type { Tone } from '../lib/phase';
+import { phaseMeta, type Tone } from '../lib/phase';
+import type { Holder } from '../lib/holds';
 import { readinessFlags, readinessLevel, type ReadinessFlag, type ReadinessLevel } from '../lib/readiness';
 import { sortBy, nextSort, type SortState } from '../lib/sort';
 import { severityMeta, TONE_CLASSES } from '../lib/status';
@@ -29,6 +31,7 @@ type SortKey = 'name' | 'project' | 'power' | 'cpu' | 'disk' | 'used' | 'readine
 type ReadinessFilter = 'all' | ReadinessLevel;
 
 type OsFilter = 'all' | 'linux' | 'windows' | 'legacy' | 'unknown';
+type PlanFilter = 'all' | 'free' | 'held';
 
 interface Row {
   vm: VMRef;
@@ -48,6 +51,11 @@ export interface VmTableProps {
   pageSize?: number;
   /** The search the table opens with: a link to one VM (SDD §16, ADV-02). */
   initialQuery?: string;
+  /**
+   * The plans whose migrations hold each VM, by source id (SDD §5.4, §16): named in the readiness cell, with a Plan
+   * filter; null while they cannot be known (the table says so), undefined where the caller does not track them.
+   */
+  holders?: ReadonlyMap<string, readonly Holder[]> | null;
 }
 
 function PowerCell({ state }: { state: PowerState }) {
@@ -74,13 +82,14 @@ function ReadinessCell({ flags, level }: { flags: ReadinessFlag[]; level: Readin
 }
 
 /** Inventory table with search, power/readiness/project filters, sorting and optional selection. */
-export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '' }: VmTableProps) {
+export function VmTable({ vms, providerKind, selected, onSelectedChange, caption = 'Virtual machines', pageSize = 200, initialQuery = '', holders }: VmTableProps) {
   const searchId = useId();
   const [query, setQuery] = useState(initialQuery);
   const [power, setPower] = useState<PowerState | 'all'>('all');
   const [readiness, setReadiness] = useState<ReadinessFilter>('all');
   const [project, setProject] = useState('all');
   const [os, setOs] = useState<OsFilter>('all');
+  const [plan, setPlan] = useState<PlanFilter>('all');
   const [sort, setSort] = useState<SortState<SortKey> | null>(null);
   const [limit, setLimit] = useState(pageSize);
   const selectAllRef = useRef<HTMLInputElement>(null);
@@ -116,9 +125,11 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
       if (readiness === 'ready' && level !== 'ready') return false;
       if (readiness === 'attention' && level === 'ready') return false;
       if (readiness === 'blocker' && level !== 'blocker') return false;
+      // the VMs no plan holds, or those one holds (SDD §16): unknown holders filter nothing
+      if (holders && plan !== 'all' && holders.has(vm.source_id) !== (plan === 'held')) return false;
       return !q || haystack.includes(q);
     });
-  }, [rows, query, power, project, readiness, os]);
+  }, [rows, query, power, project, readiness, os, plan, holders]);
 
   const sorted = useMemo(
     () =>
@@ -144,7 +155,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
   );
 
   const visible = sorted.slice(0, limit);
-  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all';
+  const filtersActive = query !== '' || power !== 'all' || readiness !== 'all' || project !== 'all' || os !== 'all' || plan !== 'all';
   // the header checkbox acts on every matching VM, also the rows not rendered yet: the labels say so
   const allMatchingShown = visible.length === filtered.length;
   const visibleIds = new Set(visible.map((r) => r.vm.source_id));
@@ -167,6 +178,7 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
     setReadiness('all');
     setProject('all');
     setOs('all');
+    setPlan('all');
     // the button goes away with the filters: the search field keeps the focus (SDD §16)
     searchRef.current?.focus();
   };
@@ -250,6 +262,19 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
             options={[{ value: 'all', label: 'All' }, ...projects.map((p) => ({ value: p, label: p }))]}
           />
         )}
+        {holders && (
+          <SelectField
+            label="Plan"
+            className="md:w-40"
+            value={plan}
+            onChange={(e) => setPlan(e.target.value as PlanFilter)}
+            options={[
+              { value: 'all', label: 'All' },
+              { value: 'free', label: 'Not in a plan' },
+              { value: 'held', label: 'In a plan' },
+            ]}
+          />
+        )}
         {filtersActive && filtered.length > 0 && (
           <Button variant="ghost" onClick={clearFilters} className="md:mb-0.5">
             Clear filters
@@ -257,6 +282,10 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
         )}
       </div>
 
+      {holders === null && (
+        // never read as free while the plans that may hold them are unknown (SDD §16)
+        <p className="text-xs text-status-warning">Which plans hold these VMs is unknown: the plans or their migrations could not be loaded.</p>
+      )}
       <p role="status" className="text-xs text-muted-foreground">
         {showing}
         {selectable && `, ${formatNumber(selected?.size ?? 0)} selected`}
@@ -336,6 +365,16 @@ export function VmTable({ vms, providerKind, selected, onSelectedChange, caption
                     </th>
                     <td>
                       <ReadinessCell flags={flags} level={level} />
+                      {holders?.get(vm.source_id)?.map((h) => (
+                        // the plan whose migration holds it (SDD §5.4, §16): beside the name, never in the row header
+                        <span key={h.planId} className="mt-0.5 block text-xs text-muted-foreground">
+                          In plan{' '}
+                          <Link to={`/plans/${encodeURIComponent(h.planId)}`} className="underline underline-offset-4">
+                            {h.planName}
+                          </Link>
+                          , phase {phaseMeta(h.phase).label}
+                        </span>
+                      ))}
                     </td>
                     <td className="hidden text-muted-foreground md:table-cell">{vm.project ?? '—'}</td>
                     <td>

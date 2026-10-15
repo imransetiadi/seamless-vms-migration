@@ -10,7 +10,19 @@ from fastapi.testclient import TestClient
 
 from seamless_migrate.api.app import create_app
 from seamless_migrate.domain.enums import Phase, PlanStatus, Role, Strategy, SyncPassKind
-from seamless_migrate.domain.models import Estimate, Migration, Plan, Provider, SyncPass, utcnow
+from seamless_migrate.domain.models import (
+    AppProbe,
+    Approval,
+    Estimate,
+    Finding,
+    ForceCutover,
+    Migration,
+    PhaseChange,
+    Plan,
+    Provider,
+    SyncPass,
+    utcnow,
+)
 from seamless_migrate.store import AsyncStore, Store
 from tests.api_support import DESTINATION, SOURCE, Api, api_settings, write_tokens
 from tests.factories import make_plan, make_vm
@@ -404,6 +416,39 @@ def test_plan_routes_derive_the_status_without_loading_migrations(api, monkeypat
     assert "migration" not in listed_kinds
 
 
+def test_plans_carry_their_migration_counts_by_phase(api):
+    """SDD §4, §8.1, §11 (PF-02): every plan route returns how many of the plan's migrations are
+    in each phase, from the query that derives its status: {} before the first validation; a
+    client cannot set it."""
+    vm_ids = first_clean_vms(api, n=3)
+    spec = {"source_provider_id": "src-osp", "destination_provider_id": "dst-rhoso"}
+    created = api.post(
+        "/api/v1/plans", Role.operator, json={**spec, "name": "counts", "vm_ids": vm_ids[:2]}
+    )
+    plan = created.json()
+    assert plan["migration_counts"] == {}
+    # a plan never validated has no migration: its own counts, never another plan's
+    other = api.post(
+        "/api/v1/plans", Role.operator, json={**spec, "name": "draft", "vm_ids": vm_ids[2:]}
+    ).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = [x for x in api.store.list("migration", Migration) if x.plan_id == plan["id"]]
+    api.store.put("migration", first.model_copy(update={"phase": Phase.completed}))
+    api.store.put("migration", second.model_copy(update={"phase": Phase.finalized}))
+    one = api.get(f"/api/v1/plans/{plan['id']}", Role.viewer).json()
+    many = {p["id"]: p for p in api.get("/api/v1/plans", Role.viewer).json()}
+    assert one["migration_counts"] == many[plan["id"]]["migration_counts"]
+    assert one["migration_counts"] == {"completed": 1, "finalized": 1}
+    assert many[other["id"]]["migration_counts"] == {}
+    # the API's: a client cannot set it
+    patched = api.client.patch(
+        f"/api/v1/plans/{plan['id']}",
+        headers=api.h(Role.operator),
+        json={"migration_counts": {"completed": 9}},
+    )
+    assert patched.status_code == 422
+
+
 def test_plan_finalize_route_needs_an_approver_and_the_scope_named(api):
     """SDD §8.1, §12: POST /plans/{id}/finalize — 403 below approver, 400 for a wrong name,
     404 for an unknown wave, 409 when nothing in scope is completed."""
@@ -791,6 +836,164 @@ def seed_migrations(store: Store) -> dict[str, Migration]:
     return out
 
 
+SUMMARY_FIELDS = {
+    "id",
+    "plan_id",
+    "wave_id",
+    "vm",
+    "strategy",
+    "phase",
+    "phase_since",
+    "preflight_ran",
+    "eligible_strategies",
+    "progress_pct",
+    "estimate",
+    "actual_downtime_s",
+    "downtime_started_at",
+    "downtime_ended_at",
+    "approvals",
+    "cutover_requested",
+    "cutover_requested_by",
+    "force_cutover",
+    "force_window",
+    "advisor_hold",
+    "review_required",
+    "review_reason",
+    "error",
+    "source_running_at",
+    "findings",
+    "suggested_probes",
+    "cutover_refusals",
+    "created_at",
+    "updated_at",
+}
+
+
+def test_a_summary_list_holds_the_fields_the_overview_reads(api, monkeypatch):
+    """SDD §4, §12 GET /migrations?view=summary (perf audit PF-02): each migration as a
+    MigrationSummary - its list fields as the full list has them, phase_since the last
+    PhaseChange's time (created_at without one) - in the same order, filtered and paged alike."""
+    from datetime import timedelta
+
+    async def no_watch() -> None:
+        return None
+
+    # the demo source watch runs every tick here: the demo cloud has no "vm-completed", so it would
+    # clear that migration's source_running_at (VMNotFound, SDD §8.1) between the two reads compared
+    monkeypatch.setattr(api.client.app.state.services.orchestrator, "_watch_sources_once", no_watch)
+    migs = seed_migrations(api.store)
+    awaiting = migs["awaiting"]
+    at = utcnow()
+    awaiting.phase_history = [
+        PhaseChange(
+            from_phase=None,
+            to_phase=Phase.pending,
+            at=at - timedelta(hours=3),
+            reason="created by validation",
+            actor="alice",
+        ),
+        PhaseChange(
+            from_phase=Phase.syncing,
+            to_phase=Phase.awaiting_cutover,
+            at=at,
+            reason="converged",
+            actor="system",
+        ),
+    ]
+    awaiting.approvals = [Approval(actor="rina", at=at, comment="checked")]
+    awaiting.cutover_requested, awaiting.cutover_requested_by = True, "bayu"
+    # every field told apart from the others, so a summary field copied from a wrong one shows
+    awaiting.vm = awaiting.vm.model_copy(update={"name": "db-awaiting", "project": "finance"})
+    awaiting.phase_history.insert(
+        1,
+        PhaseChange(
+            from_phase=Phase.validating,
+            to_phase=Phase.ready,
+            at=at - timedelta(hours=2),
+            reason="pre-flight passed",
+            actor="alice",
+        ),
+    )
+    awaiting.actual_downtime_s = 33.0
+    awaiting.estimate = awaiting.estimates[1]
+    awaiting.suggested_probes = [AppProbe(kind="tcp", port=5432)]
+    awaiting.wave_id, awaiting.progress_pct = "wave-0000beef", 42.5
+    awaiting.advisor_hold = "rec-000000000077"
+    awaiting.force_cutover = ForceCutover(
+        actor="dewi", at=at, reason="the window closes", delta_bytes=7, estimated_downtime_s=60.0
+    )
+    awaiting.findings = [Finding(code="SRC_VM_MULTIATTACH", severity="warning", message="x")]
+    awaiting.cutover_refusals = ["the NIC of db-awaiting on 'app': port p holds its MAC"]
+    awaiting.updated_at = at + timedelta(minutes=5)
+    api.store.put("migration", awaiting)
+    completed = migs["completed"]
+    completed.downtime_ended_at = completed.downtime_started_at + timedelta(minutes=9)
+    completed.source_running_at = at + timedelta(minutes=1)
+    api.store.put("migration", completed)
+    ready, failed = migs["ready"], migs["failed"]
+    ready.force_window = True
+
+    def change(src, dst, reason):
+        return PhaseChange(from_phase=src, to_phase=dst, at=at, reason=reason, actor="alice")
+
+    # a history that never reached an assessment, and one that reached it as blocked only
+    ready.phase_history = [change(None, Phase.pending, "created by validation")]
+    api.store.put("migration", ready)
+    failed.review_required, failed.review_reason = True, "a database VM without a probe"
+    failed.phase_history = [
+        change(None, Phase.pending, "created by validation"),
+        change(Phase.pending, Phase.validating, "pre-flight validation"),
+        change(Phase.validating, Phase.blocked, "blocked by VM_VGPU"),
+    ]
+    api.store.put("migration", failed)
+
+    full = api.get("/api/v1/migrations").json()
+    listed = api.get("/api/v1/migrations", params={"view": "summary"})
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()
+    assert [r["id"] for r in rows] == [m["id"] for m in full]
+    for row, m in zip(rows, full, strict=True):
+        assert set(row) == SUMMARY_FIELDS, row["id"]
+        assert row["vm"] == {
+            "source_id": m["vm"]["source_id"],
+            "name": m["vm"]["name"],
+            "project": m["vm"]["project"],
+        }
+        derived = {"vm", "phase_since", "preflight_ran", "eligible_strategies"}
+        for field in SUMMARY_FIELDS - derived:
+            assert row[field] == m[field], (row["id"], field)
+        since = m["phase_history"][-1]["at"] if m["phase_history"] else m["created_at"]
+        assert row["phase_since"] == since, row["id"]
+        assessed = any(c["to_phase"] in ("ready", "blocked") for c in m["phase_history"])
+        assert row["preflight_ran"] is assessed, row["id"]
+        eligible = [e["strategy"] for e in m["estimates"] if e["eligible"]]
+        assert row["eligible_strategies"] == eligible, row["id"]
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[awaiting.id]["approvals"][0]["actor"] == "rina"
+    assert by_id[awaiting.id]["phase_since"] != by_id[awaiting.id]["created_at"]
+    assert by_id[awaiting.id]["preflight_ran"] is True
+    assert by_id[migs["ready"].id]["preflight_ran"] is False
+    assert by_id[migs["failed"].id]["preflight_ran"] is True
+    assert by_id[migs["completed"].id]["preflight_ran"] is False  # seeded without a history
+    assert by_id[awaiting.id]["eligible_strategies"] == ["cold", "warm"]
+    # under half the bytes even for these small seeded migrations (a real one is mostly history,
+    # VM details, notes, estimates and passes)
+    assert len(listed.content) * 2 < len(api.get("/api/v1/migrations").content)
+    # the full list stays the default; filters and pages apply to summaries too
+    assert api.get("/api/v1/migrations", params={"view": "full"}).json() == full
+    plan_id = awaiting.plan_id
+    assert [
+        r["id"]
+        for r in api.get(
+            "/api/v1/migrations",
+            params={"view": "summary", "plan_id": plan_id, "phase": "awaiting_cutover"},
+        ).json()
+    ] == [awaiting.id]
+    paged = api.get("/api/v1/migrations", params={"view": "summary", "limit": 2, "offset": 1})
+    assert [r["id"] for r in paged.json()] == [m["id"] for m in full[1:3]]
+    assert api.get("/api/v1/migrations", params={"view": "everything"}).status_code == 422
+
+
 def test_migration_actions_transitions(api):
     migs = seed_migrations(api.store)
     base = "/api/v1/migrations"
@@ -974,6 +1177,32 @@ def test_finalize_confirm_mismatch_400(api):
         json={"confirm": "vm-completed", "delete_source": True},
     )
     assert res.status_code == 200 and res.json()["phase"] == "finalized"
+
+
+def test_finalize_is_refused_while_the_source_vm_runs_again(api, monkeypatch):
+    """SDD §8.1, §12 (the owner's choice, 2026-10-13): 409 while the source watch sees the source
+    VM running again; once it saw it stopped (source_running_at cleared), it finalizes."""
+
+    async def no_watch() -> None:
+        return None
+
+    # the flag is set and cleared here by hand: the demo source watch, which runs every tick, would
+    # clear it on its own - the demo cloud has no "vm-completed" (VMNotFound, SDD §8.1)
+    monkeypatch.setattr(api.client.app.state.services.orchestrator, "_watch_sources_once", no_watch)
+    migs = seed_migrations(api.store)
+    completed = migs["completed"]
+    completed.source_running_at = completed.downtime_started_at
+    api.store.put("migration", completed)
+    url = f"/api/v1/migrations/{completed.id}/finalize"
+    refused = api.post(url, Role.approver, json={"confirm": "vm-completed", "delete_source": True})
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["message"] == (
+        "the source VM runs again: stop it, or roll it back, before finalizing"
+    )
+    completed.source_running_at = None
+    api.store.put("migration", completed)
+    done = api.post(url, Role.approver, json={"confirm": "vm-completed"})
+    assert done.status_code == 200 and done.json()["phase"] == "finalized"
 
 
 def test_events_since(api):
@@ -1182,6 +1411,181 @@ def test_a_completed_plan_keeps_its_providers_while_a_migration_holds_its_vm(api
     for m in (first, second):
         api.store.put("migration", m)
     assert delete().status_code == 204
+
+
+def test_a_cancelled_migrations_pending_cleanup_keeps_its_providers(api):
+    """SDD §12/§5.1 (review RR-08): a migration cancelled with a data path keeps checkpoint
+    "cleanup" until its cleanup records an outcome, and the cleanup needs both providers to remove
+    what the data path left - in a cancelled plan (the rest never started) as in a completed one."""
+    vm_ids = first_clean_vms(api, n=2)
+    body = {
+        "name": "cancelled mid-copy",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    first, second = api.store.list("migration", Migration, plan_id=plan["id"])
+    first.phase, first.checkpoint = Phase.cancelled, "cleanup"
+    second.phase = Phase.cancelled
+    for m in (first, second):
+        api.store.put("migration", m)
+    stored = api.store.get("plan", plan["id"], Plan)
+    stored.status = PlanStatus.cancelled
+    api.store.put("plan", stored)
+    delete = lambda provider: api.client.delete(  # noqa: E731
+        f"/api/v1/providers/{provider}", headers=api.h(Role.admin)
+    )
+    for provider in ("dst-rhoso", "src-osp"):
+        refused = delete(provider)
+        assert refused.status_code == 409, (provider, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("cancelled mid-copy", '
+            "1 cancelled VM still being cleaned up); a plan needs its providers until it completes "
+            "and its VMs are finalized"
+        )
+    # in a completed plan, beside a VM not finalized
+    stored.status = PlanStatus.completed
+    api.store.put("plan", stored)
+    second.phase = Phase.completed
+    api.store.put("migration", second)
+    assert (
+        '("cancelled mid-copy", 1 VM not finalized, 1 cancelled VM still being cleaned up)'
+        in delete("dst-rhoso").json()["error"]["message"]
+    )
+    second.phase = Phase.finalized
+    api.store.put("migration", second)
+    # its cleanup recorded an outcome: removed - or failed, and left to rollback_workloads.yml
+    first.checkpoint = "cleaned"
+    api.store.put("migration", first)
+    assert delete("dst-rhoso").status_code == 204
+    first.checkpoint = "cleanup_failed"
+    api.store.put("migration", first)
+    assert delete("src-osp").status_code == 204
+
+
+def test_a_rolled_back_migration_keeping_its_copied_data_keeps_its_providers(api):
+    """SDD §12/§5.1 (review RV-04): a warm rollback deletes only the destination server and keeps
+    the destination volumes and warm state for a retry; a cancel of the rolled-back migration
+    removes them, and that cleanup needs both providers - so one that recorded passes keeps them
+    until it is cancelled and cleaned up, while one that recorded none lets them go."""
+    vm_ids = first_clean_vms(api, n=3)
+    body = {
+        "name": "rolled back mid-plan",
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    warm, other, third = api.store.list("migration", Migration, plan_id=plan["id"])
+    now = utcnow()
+    passes = [SyncPass(number=1, kind=SyncPassKind.full, started_at=now, ended_at=now)]
+    warm.strategy, warm.phase, warm.sync_passes = Strategy.warm, Phase.rolled_back, passes
+    other.phase = Phase.rolled_back  # nothing copied kept: its VM and the providers are free
+    third.phase = Phase.finalized
+    for m in (warm, other, third):
+        api.store.put("migration", m)
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    delete = lambda provider: api.client.delete(  # noqa: E731
+        f"/api/v1/providers/{provider}", headers=api.h(Role.admin)
+    )
+    for provider in ("dst-rhoso", "src-osp"):
+        refused = delete(provider)
+        assert refused.status_code == 409, (provider, refused.text)
+        assert refused.json()["error"]["message"] == (
+            f'provider is used by plan(s) that still need it: {plan["id"]} ("rolled back mid-plan"'
+            ", 1 rolled-back VM keeping its copied data); a plan needs its providers until it "
+            "completes and its VMs are finalized"
+        )
+    other.strategy, other.sync_passes = Strategy.warm, passes
+    api.store.put("migration", other)
+    assert (
+        '("rolled back mid-plan", 2 rolled-back VMs keeping their copied data)'
+        in delete("dst-rhoso").json()["error"]["message"]
+    )
+    # beside a VM not finalized and a cancelled one still being cleaned up
+    other.phase, other.sync_passes = Phase.failed, []
+    third.phase, third.checkpoint = Phase.cancelled, "cleanup"
+    for m in (other, third):
+        api.store.put("migration", m)
+    assert (
+        '("rolled back mid-plan", 1 VM not finalized, 1 rolled-back VM keeping its copied data, '
+        "1 cancelled VM still being cleaned up)" in delete("dst-rhoso").json()["error"]["message"]
+    )
+    other.phase = Phase.rolled_back
+    third.phase, third.checkpoint = Phase.finalized, None
+    for m in (other, third):
+        api.store.put("migration", m)
+    # the cancel removes what the rollback kept (SDD §5.1); once its cleanup recorded that, the
+    # providers go
+    res = api.post(f"/api/v1/migrations/{warm.id}/cancel", Role.operator, json={"reason": "kept"})
+    assert res.status_code == 200 and res.json()["phase"] == "cancelled", res.text
+    wait_for(lambda: api.get(f"/api/v1/migrations/{warm.id}").json()["checkpoint"] == "cleaned")
+    assert delete("dst-rhoso").status_code == 204
+
+
+def _rolled_back_in_a_completed_plan(api, name, strategy, sync_passes=()):
+    vm_ids = first_clean_vms(api, n=1)
+    body = {
+        "name": name,
+        "source_provider_id": "src-osp",
+        "destination_provider_id": "dst-rhoso",
+        "vm_ids": vm_ids,
+    }
+    plan = api.post("/api/v1/plans", Role.operator, json=body).json()
+    assert api.post(f"/api/v1/plans/{plan['id']}/validate", Role.operator).status_code == 200
+    (m,) = api.store.list("migration", Migration, plan_id=plan["id"])
+    m.strategy, m.phase, m.sync_passes = strategy, Phase.rolled_back, list(sync_passes)
+    api.store.put("migration", m)
+    done = api.store.get("plan", plan["id"], Plan)
+    done.status = PlanStatus.completed
+    api.store.put("plan", done)
+    return plan, m
+
+
+def _record(api, plan, m, **record):
+    """The workload's record (SDD §6.3), as the collection keeps it in the migration's run dir."""
+    from seamless_migrate.executors.ansible import run_dir
+
+    path = run_dir(api.settings, plan["id"], m.id) / "osm" / "workload_warm"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / f"{m.vm.source_id}.json").write_text(json.dumps({
+        "server_id": m.vm.source_id, "dest_volumes": {}, "passes": [], "pending_snapshot": None,
+        "destination_server_id": None, **record,
+    }))  # fmt: skip
+
+
+def test_a_rolled_back_migration_whose_record_keeps_volumes_keeps_its_providers(api):
+    """SDD §12, §5.1 (review RV3-05): a warm first pass that failed after creating its destination
+    volumes recorded no pass; rolled back, the migration keeps them all the same - its record says
+    so - and its providers stay until a cancel cleans them up."""
+    plan, m = _rolled_back_in_a_completed_plan(api, "first pass failed", Strategy.warm)
+    delete = lambda: api.client.delete(  # noqa: E731
+        "/api/v1/providers/dst-rhoso", headers=api.h(Role.admin)
+    )
+    _record(api, plan, m, dest_volumes={"/dev/vda": {"dest_id": "dvol-1", "size": 20}})
+    refused = delete()
+    assert refused.status_code == 409, refused.text
+    assert "1 rolled-back VM keeping its copied data" in refused.json()["error"]["message"]
+    _record(api, plan, m, pending_snapshot={"transfer_uuid": "uuid-1"})  # source temporaries
+    assert delete().status_code == 409
+    _record(api, plan, m)  # emptied: nothing kept
+    assert delete().status_code == 204
+
+
+def test_a_rolled_back_cold_migration_frees_its_providers(api):
+    """SDD §12, §5.1 (review RV3-07): a cold cutover lists a full pass, but the cold rollback
+    deleted what the cold import recorded - without a record holding anything, the rolled-back cold
+    migration keeps no copied data, and its providers can go."""
+    now = utcnow()
+    passes = [SyncPass(number=1, kind=SyncPassKind.full, started_at=now, ended_at=now)]
+    plan, m = _rolled_back_in_a_completed_plan(api, "cold, rolled back", Strategy.cold, passes)
+    res = api.client.delete("/api/v1/providers/dst-rhoso", headers=api.h(Role.admin))
+    assert res.status_code == 204, res.text
 
 
 def test_a_plan_that_has_not_completed_names_its_status_in_the_refusal(api):

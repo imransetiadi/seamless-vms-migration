@@ -1,5 +1,5 @@
 import { useRef } from 'react';
-import type { Migration } from '../api/types';
+import type { Migration, MigrationLike } from '../api/types';
 import type { FindingRow } from '../components/FindingsList';
 import { groupFindings, type FindingGroup } from './findings';
 
@@ -13,7 +13,7 @@ interface Built extends PlanFindings {
   from: Array<Pick<Migration, 'id' | 'findings'> & { name: string }>;
 }
 
-function sameSources(from: Built['from'], list: Migration[]): boolean {
+function sameSources(from: Built['from'], list: readonly MigrationLike[]): boolean {
   return (
     from.length === list.length &&
     list.every((m, i) => from[i]?.id === m.id && from[i]?.name === m.vm.name && from[i]?.findings === m.findings)
@@ -25,7 +25,7 @@ function sameSources(from: Built['from'], list: Migration[]): boolean {
  * until a migration's findings or VM name change or migrations come or go: a live progress event patches a
  * migration every second, and that must not rebuild, re-sort and redraw the plan's whole findings list.
  */
-export function usePlanFindings(list: Migration[]): PlanFindings {
+export function usePlanFindings(list: readonly MigrationLike[]): PlanFindings {
   const built = useRef<Built | null>(null);
   if (!built.current || !sameSources(built.current.from, list)) {
     const rows = list.flatMap((m) => m.findings.map((f) => ({ ...f, vmName: m.vm.name, migrationId: m.id })));

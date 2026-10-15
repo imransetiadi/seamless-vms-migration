@@ -290,9 +290,16 @@ class Verifier:
 
         key = "floating_ips" if cfg.probe_address == "floating" else "fixed_ips"
         address = next((ip for p in ports for ip in (p.get(key) or []) if ip), None)
+        # a destination that simulates its guests answers their TCP checks too (demo, SDD §7.4)
+        simulates = vm is not None and callable(getattr(self.dst, "probe_service", None))
         for port in probe_ports:
             if address is None:
                 checks.append(_check(f"tcp:{port}", False, f"no {cfg.probe_address} address"))
+                continue
+            if simulates:
+                tcp = AppProbe(kind="tcp", port=int(port))
+                answer = await self._run_app_probe(server_id, vm, tcp, address)
+                checks.append(_check(f"tcp:{port}", answer.result == "passed", answer.detail))
                 continue
             ok, detail = await self._probe(address, int(port))
             checks.append(_check(f"tcp:{port}", ok, detail))

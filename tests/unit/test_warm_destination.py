@@ -185,6 +185,35 @@ def test_create_instance_module_finishes_a_recorded_server(tmp_path):
     ]
 
 
+def test_create_instance_module_finishes_a_recorded_server_an_operator_renamed(tmp_path):
+    """SDD §6 (lead 8, decided): a recorded server an operator renamed is finished like any
+    recorded server. A refusal would fail the cutover after the source stopped, and the automatic
+    rollback (SDD §8, plan.verification.auto_rollback, on by default) would then delete that very
+    server - the one the rename set aside - with the recorded volumes; a fresh server cannot be
+    built from those volumes anyway, as the renamed server holds them."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_create_instance as create_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    dst.servers["dst-srv"].name = "vm1-aside"
+    finished = []
+
+    def record_fips(self, conn, sdk_srv):
+        finished.append(sdk_srv.id)
+
+    with mock.patch.object(server.Server, "create") as create, mock.patch.object(
+        server.Server, "_create_floating_ips", record_fips
+    ):
+        result = fake.run_module(create_module, _create_instance_args(state_dir), dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["server_id"] == "dst-srv"
+    create.assert_not_called()
+    assert finished == ["dst-srv"]
+    assert "dst-srv" in dst.servers
+
+
 # --- rollback ------------------------------------------------------------------
 
 
@@ -199,7 +228,7 @@ def test_rollback_deletes_recorded_server_and_keeps_volumes(tmp_path):
         "deleted_volume_ids": [],
         "kept_volume_ids": [],
         "deleted_port_ids": [],
-        "state_deleted": False,
+        "state_cleared": False,
     }
     assert "dst-srv" not in dst.servers and "other" in dst.servers
     assert {"dvol-boot", "dvol-data", "unrelated"} <= set(dst.volumes)
@@ -224,9 +253,11 @@ def test_rollback_deletes_volumes_and_state_when_asked(tmp_path):
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
     assert result["kept_volume_ids"] == ["dvol-extra"]
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
     assert set(dst.volumes) == {"unrelated", "dvol-extra"}
-    assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
+    # emptied, not removed: the sign that the migration recorded the workload (SDD 6.3)
+    state = WarmState.load(state_dir, "srv-1")
+    assert state.exists() and (state.dest_volumes, state.passes) == ({}, [])
 
 
 def test_rollback_keeps_state_while_a_snapshot_is_pending(tmp_path):
@@ -237,7 +268,7 @@ def test_rollback_keeps_state_while_a_snapshot_is_pending(tmp_path):
         delete_volumes=True
     )
 
-    assert result["state_deleted"] is False
+    assert result["state_cleared"] is True
     state = WarmState.load(state_dir, "srv-1")
     assert state.pending_snapshot == pending  # source temporaries still to clean up
     assert state.dest_volumes == {} and state.passes == []
@@ -274,8 +305,8 @@ def test_rollback_keeps_volumes_held_by_another_server(tmp_path):
     assert result["kept_volume_ids"] == ["dvol-data"]
     assert "dvol-data" in dst.volumes
     assert not [c for c in dst.calls_to("detach_volume") if c[1]["volume"] == "dvol-data"]
-    assert result["state_deleted"] is True  # the kept volume is no longer recorded
-    assert not os.path.exists(WarmState.path_for(state_dir, "srv-1"))
+    assert result["state_cleared"] is True  # the kept volume is no longer recorded
+    assert WarmState.load(state_dir, "srv-1").dest_volumes == {}
 
 
 def test_rollback_without_a_conversion_host_keeps_every_attached_volume(tmp_path):
@@ -403,10 +434,40 @@ def test_rollback_module(tmp_path):
     assert result["changed"] is True
     assert result["deleted_server_id"] == "dst-srv"
     assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]
-    assert result["state_deleted"] is True
+    assert result["state_cleared"] is True
 
     again = fake.run_module(rollback_module, args, dst)
     assert again["changed"] is False
+
+
+def test_rollback_module_deletes_no_port_when_told(tmp_path):
+    """SDD 6.4, 6.6 (review RV-02): a cancel's cleanup deletes no port - it made none, and an unbound
+    port keyed to the VM's source port may be another plan's migration of the VM."""
+    from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+        import_workload_rollback as rollback_module,
+    )
+
+    dst, state_dir = migrated(tmp_path)
+    dst.add_port("p-plan-b", "fa:16:3e:00:00:01", description="os-migrate:sp-1")  # unbound
+    port = {
+        "type": "openstack.network.ServerPort",
+        "params": {"mac_address": "fa:16:3e:00:00:01"},
+        "_info": {"id": "sp-1", "device_id": "srv-1", "device_owner": "compute:nova"},
+    }
+    args = {
+        "cloud": "dst",
+        "data": fake.workload_data(ports=[port]),
+        "state_dir": state_dir,
+        "delete_dest_volumes": True,
+        "delete_ports": False,
+    }
+
+    result = fake.run_module(rollback_module, args, dst)
+
+    assert result["_exit_code"] in (None, 0), result
+    assert result["deleted_port_ids"] == []
+    assert "p-plan-b" in dst.ports
+    assert result["deleted_volume_ids"] == ["dvol-boot", "dvol-data"]  # its own data path still goes
 
 
 def test_rollback_module_deletes_the_workloads_neutron_ports(tmp_path):

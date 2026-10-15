@@ -168,15 +168,24 @@ workload.yml:
 
 RETURN = r"""
 transfer_uuid:
-  description: UUID to identify this transfer when needed
-  returned: Only on success.
+  description:
+    - UUID to identify this transfer when needed.
+    - A failed export returns it too, for the source cleanup.
+  returned: always
   type: str
   sample: 9b8a64b3-c976-4103-b34e-995e4ab9f57b
 volume_map:
   description:
     - Mapping of source volume devices to NBD export URLs.
     - This structure only has source-related fields filled out.
-  returned: Only after successfully moving volumes on source cloud.
+    - A failed export returns what it got to - each port is recorded as soon
+      as it is claimed - so the role's rescue (import_workload_src_cleanup)
+      puts back what it took - its NBD exports and ports, detached data
+      volumes, attachments to the conversion host, the root copy, its
+      snapshot or image (Seamless Migrate SDD 6.6). Its entries lack C(name),
+      which the cleanup never reads, as Ansible prints a failed result and a
+      volume or VM name in it would steer how the failure is classified.
+  returned: always
   type: dict
   sample:
     "volume_map": {
@@ -207,6 +216,7 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     OpenstackVolumeExport,
 )
 
+import traceback
 import uuid
 
 
@@ -370,7 +380,29 @@ def run_module():
         timeout=timeout,
     )
 
-    source_host.prepare_exports()
+    try:
+        source_host.prepare_exports()
+    except Exception as err:  # pylint: disable=broad-except
+        # The data volumes this export detached go back to the source VM, and the
+        # root copy no server holds goes, through the API alone; then it fails
+        # with the map, so the role's rescue puts back the rest (Seamless Migrate
+        # SDD 6.6, review RV6-01, RV8-01, RV9-03). No step over SSH here: the
+        # conversion host may be what failed.
+        source_host.reattach_detached_volumes()
+        source_host.remove_unheld_root_copy()
+        module.fail_json(
+            msg=str(err),
+            exception=traceback.format_exc(),
+            transfer_uuid=source_host.transfer_uuid,
+            # without the names, which the rescue never reads: Ansible prints this
+            # result on the task's line, and a tenant's volume or VM name holding
+            # "timeout" would make the failure transient (Seamless Migrate SDD 6.6,
+            # 7.2, review RV8-05)
+            volume_map={
+                path: {key: value for key, value in mapping.items() if key != "name"}
+                for path, mapping in source_host.volume_map.items()
+            },
+        )
 
     result["transfer_uuid"] = source_host.transfer_uuid
     result["volume_map"] = source_host.volume_map

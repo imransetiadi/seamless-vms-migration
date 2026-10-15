@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import type { Migration, PhaseChange, Plan, Wave } from '../api/types';
-import { completedSince, finalizedText, finalizeQueue, inScope, isOverdue, queueByWave, skippedVms } from './finalize';
+import { bulkFinalize, completedSince, everySourceRunsText, finalizedText, finalizeQueue, inScope, isOverdue, queueByWave, skippedVms, skipsText } from './finalize';
+import { summaryOf } from './summary';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations[0]!;
@@ -26,6 +27,14 @@ describe('the finalize queue (SDD §8.1, ADV-19)', () => {
     const m = completedAt('mig-1', '2026-10-07T11:00:00Z'); // 73 h before NOW
     expect(isOverdue(m, 72, NOW)).toBe(true);
     expect(isOverdue(m, 74, NOW)).toBe(false);
+  });
+
+  it("takes a summary's phase start as its completion time, as the migration's history gives it (SDD §4, perf audit PF-02)", () => {
+    const m = completedAt('mig-1', '2026-10-07T11:00:00Z');
+    expect(completedSince(summaryOf(m))).toBe('2026-10-07T11:00:00Z');
+    expect(isOverdue(summaryOf(m), 72, NOW)).toBe(true);
+    expect(isOverdue(summaryOf(m), 74, NOW)).toBe(false);
+    expect(completedSince(summaryOf({ ...m, phase: 'rolling_back' }))).toBeNull();
   });
 
   it('scopes a wave by its VMs, as the API does, and the plan by its own migrations', () => {
@@ -80,5 +89,31 @@ describe('the finalize queue (SDD §8.1, ADV-19)', () => {
     const old = completedAt('mig-old', '2026-10-08T10:00:00Z');
     const done = { ...base, id: 'mig-done', phase: 'finalized' as const };
     expect(finalizeQueue([young, done, old]).map((m) => m.id)).toEqual(['mig-old', 'mig-young']);
+  });
+});
+
+describe('a bulk finalize and a source VM running again (SDD §8.1, §16)', () => {
+  const named = (id: string, name: string, extra: Partial<Migration> = {}) => completedAt(id, '2026-10-09T12:00:00Z', { vm: { ...base.vm, name }, ...extra });
+  const RUNS = { source_running_at: '2026-10-10T11:00:00Z' };
+
+  it('finalizes the VMs whose source is stopped and skips every one whose source runs again, one whose finalize began deleting it too', () => {
+    const stopped = named('mig-1', 'web-01');
+    const running = named('mig-2', 'web-02', RUNS);
+    const finalizing = named('mig-3', 'web-03', { ...RUNS, checkpoint: 'finalizing' });
+    expect(bulkFinalize([stopped, running, finalizing])).toEqual({ finalizes: [stopped], skips: [running, finalizing] });
+  });
+
+  it('says why a bulk finalize is unavailable while the source VM of every VM in its scope runs again', () => {
+    expect(everySourceRunsText([named('mig-1', 'web-01', RUNS)])).toBe('The source VM of web-01 runs again: stop it, or roll it back, before finalizing.');
+    expect(everySourceRunsText([named('mig-1', 'web-01', RUNS), named('mig-2', 'web-02', RUNS)])).toBe(
+      'The source VM of each of the 2 VMs awaiting finalize runs again: stop them, or roll them back, before finalizing.',
+    );
+  });
+
+  it('names the VMs a bulk finalize skips because their source VM runs again', () => {
+    expect(skipsText([named('mig-1', 'web-01', RUNS)])).toBe('web-01 is skipped: its source VM runs again. Stop it, or roll it back, before finalizing it.');
+    expect(skipsText([named('mig-1', 'web-01', RUNS), named('mig-2', 'web-02', RUNS)])).toBe(
+      '2 VMs are skipped, as their source VMs run again: web-01, web-02. Stop them, or roll them back, before finalizing them.',
+    );
   });
 });

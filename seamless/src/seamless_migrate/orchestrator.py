@@ -79,6 +79,7 @@ from .domain.models import (
     utcnow,
 )
 from .events import EventBus, emit
+from .executors.ansible import recorded_copied_data
 from .executors.base import (
     PermanentStepError,
     StepContext,
@@ -100,6 +101,7 @@ from .planning.estimator import (
 from .planning.preflight import (
     flavor_prestaged,
     has_blocker,
+    keep_detached_volumes,
     keypair_prestaged,
     resolve_mappings,
     run_preflight,
@@ -107,7 +109,7 @@ from .planning.preflight import (
 from .planning.probes import suggest_probes
 from .planning.selector import eligibility, select_strategy
 from .planning.waves import heuristic_tier, plan_waves
-from .providers.base import ProviderError
+from .providers.base import ProviderError, VMNotFound
 from .store import AsyncStore, ConflictError, NotFound, Store, VersionedDocuments
 from .verification import VerificationResult, Verifier, review_reason
 
@@ -137,6 +139,8 @@ REVALIDATABLE = frozenset({P.pending, P.blocked, P.ready})
 REMOVABLE = REVALIDATABLE | {P.failed, P.validating}
 #: a migration in any other phase holds its VM: no other plan may migrate it (SDD §5.4)
 RELEASES_VM = frozenset({P.cancelled, P.finalized, P.rolled_back})
+#: a plan is cancelled only while none of its migrations started (SDD §12)
+UNSTARTED = frozenset({P.pending, P.blocked, P.ready})
 #: validations and retries claim VMs across plans one at a time under this lock (SDD §5.4);
 #: it is taken after a plan lock and before a migration lock
 VM_CLAIMS = "vm-claims"
@@ -163,6 +167,12 @@ _RELEASES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def cleanup_pending(m: Migration) -> bool:
+    """A cancel's cleanup that has not recorded its outcome: it runs again at the next start, and
+    it needs both providers to remove what the cancelled data path left (SDD §5.1, §12)."""
+    return m.phase == P.cancelled and m.checkpoint == "cleanup"
+
+
 def blocks_plan_change(m: Migration) -> bool:
     """A migration in flight or whose source VM is stopped keeps its plan as it is (SDD §12)."""
     return m.phase in IN_FLIGHT_PHASES or fsm.source_stopped(m)
@@ -183,6 +193,31 @@ def failed_provider_change_refusal(failed: list[str]) -> str:
     return (
         f"roll back or cancel the failed {noun} ({', '.join(failed[:10])}) before changing the "
         "plan's providers: its rollback acts on the clouds its attempt used"
+    )
+
+
+def started_refusal(started: Iterable[Migration], limit: int = 10) -> str:
+    """The 409 of a plan cancel while migrations of the plan have started (SDD §12): each VM with
+    its phase, at most ``limit`` and how many are left out."""
+    named = sorted(f"{m.vm.name} ({m.phase})" for m in started)
+    rest = len(named) - limit
+    listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
+    return (
+        f"only a plan whose migrations have not started can be cancelled: {listed}; cancel a "
+        "failed or rolled-back migration on its own first, which cleans up what it copied"
+    )
+
+
+def stopped_refusal(stopped: Iterable[Migration], limit: int = 10) -> str:
+    """The 409 of a plan cancel while a migration that has not started has its source stopped
+    (SDD §12): an open downtime clock a retry kept (§5.2) - a cancel cannot restart the source
+    (§5.1), so it is cut over first. At most ``limit`` VMs and how many are left out."""
+    named = sorted(m.vm.name for m in stopped)
+    rest = len(named) - limit
+    listed = ", ".join(named[:limit]) + (f" and {rest} more" if rest > 0 else "")
+    return (
+        f"the source VM is stopped after a failed cutover: {listed}; cut it over before "
+        "cancelling the plan - a cancel cannot restart it"
     )
 
 
@@ -249,6 +284,8 @@ OWN_CUTOVER = "You requested this cutover. Another approver must approve it."
 #: the approver who forces a cutover is held to the requester's rule (SDD §5.4)
 OWN_FORCE = "You forced this cutover. Another approver must approve it."
 OWN_DECISION = "You requested this decision. Another approver must decide it."
+#: a finalize refused while the source watch sees the source VM running (SDD §8.1)
+SOURCE_RUNS_AGAIN = "the source VM runs again: stop it, or roll it back, before finalizing"
 
 
 def _refuse_unchangeable(m: Migration) -> None:
@@ -474,13 +511,24 @@ class Orchestrator:
         version: int,
         steps: list[tuple[Phase, str, dict[str, Any] | None]],
         actor: str = "system",
+        *,
+        created: dict[str, Any] | None = None,
     ) -> tuple[Migration, int]:
         """Several transitions in one write — a crash or a failed event write never splits them
-        (SDD §8) — then one ``migration.phase`` event each."""
+        (SDD §8) — then one ``migration.phase`` event each. Version 0 creates the migration, and
+        ``created`` is then the data of the ``migration.created`` event that comes first."""
         new = m
         for to, reason, _ in steps:
             new = fsm.transition(new, to, reason, actor, now=self._now())
         version = await self._save(new, version)
+        if created is not None:
+            await self._emit(
+                "migration.created",
+                f"migration of {new.vm.name} created",
+                migration=new,
+                actor=actor,
+                data=created,
+            )
         before = m.phase
         for to, reason, data in steps:
             await self._emit(
@@ -573,8 +621,11 @@ class Orchestrator:
         async with self._lock(f"plan:{plan_id}"):
             # SDD §8: refused before waiting for the claims — another plan's validation may hold
             # them for minutes, and the tick starts a running plan's steps under this lock
-            if (await self._plan(plan_id)).status == PlanStatus.running:
+            status = (await self._plan(plan_id)).status
+            if status == PlanStatus.running:
                 raise NotAllowed("pause the plan before validating it again")
+            if status == PlanStatus.cancelled:
+                raise NotAllowed("a cancelled plan cannot be validated")  # terminal (SDD §12)
             async with self._claims():
                 return await self._validate_plan(plan_id, actor)
 
@@ -586,6 +637,8 @@ class Orchestrator:
         seen = plan.model_dump(mode="json", include=_VALIDATION_WATCHES)
         if plan.status == PlanStatus.running:
             raise NotAllowed("pause the plan before validating it again")
+        if plan.status == PlanStatus.cancelled:
+            raise NotAllowed("a cancelled plan cannot be validated")
         repeated = repeated_vm_ids(plan.vm_ids)
         if repeated:
             # SDD §5.4: two migrations of one VM would both cut it over
@@ -727,24 +780,37 @@ class Orchestrator:
                         f"advisor decision {decision.status}: {final} "
                         f"(confidence {advice.confidence:.2f})"
                     )
-            migration = existing.get(vm.source_id) or await self._create_migration(
-                plan, vm, strategy, actor, migration_id=migration_id
-            )
             # a decision that waits for approval holds the migration from the same write on
             # (SDD §5.4, §14.6); any other validation clears an earlier hold
             waiting = decision is not None and decision.status == DecisionStatus.pending_approval
-            migration = await self._apply_validation(
-                migration.id,
-                plan,
-                vm,
-                strategy,
-                why,
-                estimates,
-                findings,
-                actor,
-                resolved,
-                hold=rec_id if waiting else None,
-            )
+            hold = rec_id if waiting else None
+            # each migration is written once (SDD §5.4): a new one created already assessed
+            if current is None:
+                migration = await self._create_migration(
+                    plan,
+                    vm,
+                    strategy,
+                    actor,
+                    migration_id=migration_id,
+                    why=why,
+                    estimates=estimates,
+                    findings=findings,
+                    resolved=resolved,
+                    hold=hold,
+                )
+            else:
+                migration = await self._apply_validation(
+                    current.id,
+                    plan,
+                    vm,
+                    strategy,
+                    why,
+                    estimates,
+                    findings,
+                    actor,
+                    resolved,
+                    hold=hold,
+                )
             # recorded only when this validation took the choice (ready or blocked now): one that
             # went in flight meanwhile was left alone and runs what it ran
             validated = migration.phase in (P.ready, P.blocked)
@@ -828,13 +894,18 @@ class Orchestrator:
         actor: str,
         *,
         migration_id: str | None = None,
+        why: str,
+        estimates: list[Estimate],
+        findings: list[Finding],
+        resolved: Mappings | None = None,
+        hold: str | None = None,
     ) -> Migration:
+        """A new migration, created already assessed (SDD §5.4): its history from pending through
+        validating to ready or blocked in one write, then migration.created and the phase events."""
         now = self._now()
-        wave = plan.wave_of(vm.source_id)
         migration = Migration(
             id=migration_id or new_migration_id(),
             plan_id=plan.id,
-            wave_id=wave.id if wave else None,
             vm=vm,
             strategy=strategy,
             phase=P.pending,
@@ -847,19 +918,63 @@ class Orchestrator:
                     actor=actor,
                 )
             ],
-            bytes_total=vm.used_bytes,
             created_at=now,
             updated_at=now,
         )
-        await self.db.put("migration", migration, expected_version=0)
-        await self._emit(
-            "migration.created",
-            f"migration of {vm.name} created",
-            migration=migration,
-            actor=actor,
-            data={"vm": vm.name, "source_id": vm.source_id, "strategy": str(strategy)},
+        final = self._assess(
+            migration, plan, vm, strategy, why, estimates, findings, resolved, hold
+        )
+        migration, _ = await self._transitions(
+            migration,
+            0,
+            [(P.validating, "pre-flight validation", None), final],
+            actor,
+            created={"vm": vm.name, "source_id": vm.source_id, "strategy": str(strategy)},
         )
         return migration
+
+    @staticmethod
+    def _assess(
+        m: Migration,
+        plan: Plan,
+        vm: VMRef,
+        strategy: Strategy,
+        why: str,
+        estimates: list[Estimate],
+        findings: list[Finding],
+        resolved: Mappings | None,
+        hold: str | None,
+    ) -> tuple[Phase, str, dict[str, Any] | None]:
+        """Write a validation's assessment into ``m``; return its last transition: to ready, or
+        to blocked by a blocker or when no strategy is eligible (SDD §5.4, §9)."""
+        no_eligible = not any(e.eligible for e in estimates)
+        wave = plan.wave_of(vm.source_id)
+        m.vm = vm
+        m.strategy = strategy
+        m.estimates = estimates
+        m.estimate = next((e for e in estimates if e.strategy == strategy), None)
+        m.findings = findings
+        # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
+        m.suggested_probes = suggest_probes(vm)
+        m.resolved_mappings = resolved or Mappings()
+        m.wave_id = wave.id if wave else None
+        m.bytes_total = vm.used_bytes
+        m.advisor_hold = hold
+        # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
+        # stay - strategy notes of earlier versions are listed as legacy recommendations
+        m.error = None
+        # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
+        # this validation carries over to the new strategy, findings and estimate
+        m.approvals = []
+        _clear_request(m)
+        if no_eligible:
+            details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
+            m.error = f"no eligible strategy ({details})"[:1000]
+        if has_blocker(findings) or no_eligible:
+            codes = [f.code for f in findings if f.severity == "blocker"]
+            reason = f"blocked by {', '.join(codes)}" if codes else "no eligible strategy"
+            return P.blocked, reason, {"findings": codes}
+        return P.ready, why, {"strategy": str(strategy)}
 
     async def _apply_validation(
         self,
@@ -875,48 +990,23 @@ class Orchestrator:
         *,
         hold: str | None = None,
     ) -> Migration:
-        no_eligible = not any(e.eligible for e in estimates)
-        blocked = has_blocker(findings) or no_eligible
         async with self._lock(mid):
             m, v = await self._load(mid)
             # SDD §5.4: one left in validating by an interrupted validation is taken over as it is
             # (validations of a plan run one at a time under its lock: none is at work on it)
             if m.phase not in REVALIDATABLE and m.phase != P.validating:
                 return m  # already in flight or finished: leave it alone
+            steps: list[tuple[Phase, str, dict[str, Any] | None]] = []
             if m.phase != P.validating:
-                m, v = await self._transition(m, v, P.validating, "pre-flight validation", actor)
-            wave = plan.wave_of(vm.source_id)
-            m.vm = vm
-            m.strategy = strategy
-            m.estimates = estimates
-            m.estimate = next((e for e in estimates if e.strategy == strategy), None)
-            m.findings = findings
-            # what the rules would probe (SDD §9.6): inactive until a person adds it to the plan
-            m.suggested_probes = suggest_probes(vm)
-            m.resolved_mappings = resolved or Mappings()
-            m.wave_id = wave.id if wave else None
-            m.bytes_total = vm.used_bytes
-            m.advisor_hold = hold
-            # SDD §14.4: strategy decisions are recommendations now; the notes a migration has
-            # stay - strategy notes of earlier versions are listed as legacy recommendations
-            m.error = None
-            # a fresh assessment needs a fresh approval (SDD §5.4): nothing approved before
-            # this validation carries over to the new strategy, findings and estimate
-            m.approvals = []
-            _clear_request(m)
-            if no_eligible:
-                details = "; ".join(f"{e.strategy}: {', '.join(e.reasons)}" for e in estimates)
-                m.error = f"no eligible strategy ({details})"[:1000]
-            if blocked:
-                codes = [f.code for f in findings if f.severity == "blocker"]
-                reason = f"blocked by {', '.join(codes)}" if codes else "no eligible strategy"
-                m, v = await self._transition(
-                    m, v, P.blocked, reason, actor, data={"findings": codes}
-                )
-            else:
-                m, v = await self._transition(
-                    m, v, P.ready, why, actor, data={"strategy": str(strategy)}
-                )
+                steps.append((P.validating, "pre-flight validation", None))
+            if any(change.to_phase == P.cutover for change in m.phase_history):
+                # a disk the VM had at a cutover attempt never leaves the migration by a
+                # validation: an attempt's cold export may have left it detached (SDD §5.4)
+                vm, detached = keep_detached_volumes(m.vm, vm)
+                findings = [*findings, *detached]
+            final = self._assess(m, plan, vm, strategy, why, estimates, findings, resolved, hold)
+            # both transitions in one write (SDD §5.4)
+            m, v = await self._transitions(m, v, [*steps, final], actor)
         return m
 
     async def _record_strategy_recommendation(
@@ -1102,6 +1192,45 @@ class Orchestrator:
 
         plan = await self._update_plan(plan.id, pause)
         await self._emit("plan.paused", f"{plan.name} paused", plan_id=plan.id, actor=actor)
+        return plan
+
+    async def cancel_plan(self, plan_id: str, actor: str, reason: str | None = None) -> Plan:
+        """Retire a plan none of whose migrations started (SDD §12): each is cancelled as
+        :meth:`cancel` does, then the plan becomes ``cancelled``. Nothing is deleted (§11): its
+        VMs are free for another plan and its providers for deletion; its history stays."""
+        async with self._lock(f"plan:{plan_id}"):  # SDD §8: no validation, start or step meanwhile
+            plan = await self._plan(plan_id)
+            if plan.status == PlanStatus.cancelled:
+                return plan
+            if plan.status == PlanStatus.running:
+                raise NotAllowed("pause the plan before cancelling it")
+            # SDD §5.4: a validation in another process claims VMs under this lock too
+            async with self._claims():
+                migrations = await self.db.list("migration", Migration, plan_id=plan_id)
+                started = [m for m in migrations if m.phase not in UNSTARTED | {P.cancelled}]
+                if started:
+                    raise NotAllowed(started_refusal(started))
+                todo = sorted((m for m in migrations if m.phase != P.cancelled), key=lambda m: m.id)
+                # SDD §12: refused before any migration is cancelled - one cancel() would refuse
+                # midway, after the ones sorted before it were cancelled for good
+                stopped = [m for m in todo if fsm.source_stopped(m)]
+                if stopped:
+                    raise NotAllowed(stopped_refusal(stopped))
+                why = f"plan cancelled: {reason}" if reason else "plan cancelled"
+                for m in todo:
+                    await self.cancel(m.id, actor, why)
+
+                def retire(fresh: Plan) -> None:
+                    fresh.status = PlanStatus.cancelled
+
+                plan = await self._update_plan(plan_id, retire)
+        await self._emit(
+            "plan.cancelled",
+            f"{plan.name} cancelled",
+            plan_id=plan_id,
+            actor=actor,
+            data={"reason": reason, "migrations": len(todo)},
+        )
         return plan
 
     # ------------------------------------------------------------------------------------------
@@ -1382,6 +1511,10 @@ class Orchestrator:
                     f"{m.vm.name} is being validated and cannot be cancelled; validate the plan "
                     "again - it finishes the migration, or cancels it once its VM left vm_ids"
                 )
+            if by_validation and m.phase not in REMOVABLE:
+                # SDD §5.4: an operator moved it meanwhile (a rollback, even a finished one an
+                # operator may cancel): the operator's move stands
+                raise NotAllowed(f"{m.vm.name} moved to {m.phase} meanwhile")
             why = fsm.refusal(m, P.cancelled)
             if why is not None:
                 if P.cancelled not in fsm.TRANSITIONS[m.phase]:
@@ -1389,10 +1522,10 @@ class Orchestrator:
                 raise NotAllowed(f"{m.vm.name} cannot be cancelled: {why}")  # e.g. source stopped
             m.advisor_hold = None  # a cancelled migration takes no decision (SDD §14.6)
             # SDD §5.1: in precopy or syncing a pass runs, waits for its retry (the cancel ends
-            # the retries, §8) or has just finished unrecorded; with the passes a migration
-            # recorded, that data path left snapshots, temporary and destination volumes behind,
-            # and `cancelled` is terminal: no later action could remove them
-            data_path = m.phase in (P.precopy, P.syncing) or bool(m.sync_passes)
+            # the retries, §8) or has just finished unrecorded; a migration that keeps copied data
+            # left snapshots, temporary and destination volumes behind, and `cancelled` is
+            # terminal: no later action could remove them
+            data_path = m.phase in (P.precopy, P.syncing) or await self.copied_data(m)
             if data_path:
                 m.checkpoint = "cleanup"  # saved with cancelled: a crash cannot lose the cleanup
             m, v = await self._transition(
@@ -1415,6 +1548,20 @@ class Orchestrator:
             )
         self.wake()
         return m
+
+    async def copied_data(self, m: Migration) -> bool:
+        """Whether the migration keeps copied data (SDD §5.1, §12): what its workload's record
+        says - destination volumes or a pending source snapshot - and, where no record can tell,
+        recorded passes of a strategy other than cold (a cold rollback deletes what it copied)."""
+        recorded = await asyncio.to_thread(recorded_copied_data, self.settings, m.plan_id, m)
+        if recorded is not None:
+            return recorded
+        return m.strategy != Strategy.cold and bool(m.sync_passes)
+
+    async def keeps_copied_data(self, m: Migration) -> bool:
+        """A rolled-back migration that keeps copied data: a cancel of it cleans the data up, a
+        cleanup that needs both providers (SDD §5.1, §12)."""
+        return m.phase == P.rolled_back and await self.copied_data(m)
 
     async def _cleanup_after_cancel(
         self, m: Migration, step: asyncio.Task[Any] | None, actor: str
@@ -1500,7 +1647,7 @@ class Orchestrator:
         (SDD §5.1)."""
         async with self._lock(mid):
             m, v = await self._load(mid)
-            if m.phase == P.cancelled and m.checkpoint == "cleanup":
+            if cleanup_pending(m):
                 m.checkpoint = outcome
                 await self._save(m, v)
 
@@ -1511,6 +1658,11 @@ class Orchestrator:
             m, v = await self._load(mid)
             if m.phase != P.completed:
                 raise NotAllowed(f"only completed migrations can be finalized ({m.phase})")
+            # SDD §8.1 (the owner's choice, 2026-10-13): a source running again diverged - a
+            # finalize would keep it, or delete it with what it wrote since; one that began
+            # deleting it finishes, as a rollback is refused then
+            if m.source_running_at is not None and m.checkpoint != "finalizing":
+                raise NotAllowed(SOURCE_RUNS_AGAIN)
             if confirm != m.vm.name:
                 raise BadRequest("confirm must equal the VM name")
             plan = await self._plan(m.plan_id)
@@ -1579,6 +1731,11 @@ class Orchestrator:
         finalized: list[Migration] = []
         skipped: list[dict[str, str]] = []
         for m in sorted(waiting, key=lambda x: x.vm.name):
+            if m.source_running_at is not None:
+                # SDD §8.1: every VM whose source runs again, also one whose finalize began deleting
+                # it - its own Finalize is its way out - so the plan's summaries tell what this does
+                skipped.append({"migration_id": m.id, "reason": SOURCE_RUNS_AGAIN})
+                continue
             try:
                 finalized.append(
                     await self.finalize(m.id, actor, delete_source=delete_source, confirm=m.vm.name)
@@ -1668,8 +1825,15 @@ class Orchestrator:
                 if plan.source_provider_id not in clients:
                     clients[plan.source_provider_id] = await self.source_client(plan)
                 vm = await clients[plan.source_provider_id].get_vm(m.vm.source_id)
+            except VMNotFound:
+                # SDD §8.1 (the owner's choice, 2026-10-14): the cloud says the VM is gone - a
+                # finalize deleted it, a handover rebuilt it, or someone deleted the source after
+                # it ran again: nothing left to keep or roll back to, so a flag set clears
+                if m.source_running_at is not None:
+                    await self._source_gone(m.id)
+                continue
             except (ProviderError, NotFound):
-                continue  # gone (a finalize deleted it, a handover rebuilt it) or unreachable
+                continue  # unreachable, or the plan is gone: the flag stays as it is
             except Exception:
                 log.warning("source watch failed for %s", m.id, exc_info=True)
                 continue
@@ -1703,6 +1867,22 @@ class Orchestrator:
                     migration=cur,
                     data={"power_state": str(vm.power_state)},
                 )
+
+    async def _source_gone(self, mid: str) -> None:
+        """Clear source_running_at of a completed migration whose source VM its cloud no longer
+        has (SDD §8.1), with migration.source_stopped marked gone."""
+        async with self._lock(mid):
+            cur, v = await self._load(mid)
+            if cur.phase != P.completed or cur.source_running_at is None:
+                return
+            cur.source_running_at = None
+            await self._save(cur, v)
+        await self._emit(
+            "migration.source_stopped",
+            f"{cur.vm.name}: the source VM no longer exists - nothing left to keep or roll back to",
+            migration=cur,
+            data={"power_state": None, "gone": True},
+        )
 
     async def set_strategy(self, mid: str, strategy: Strategy | str, actor: str) -> Migration:
         strategy = Strategy(strategy)
@@ -1887,9 +2067,7 @@ class Orchestrator:
         for m in await self.db.list("migration", Migration):
             if m.phase in fsm.RESUMABLE_PHASES:
                 self._launch(m.id)
-            elif (
-                m.phase == P.cancelled and m.checkpoint == "cleanup" and m.id not in self._cleanups
-            ):
+            elif cleanup_pending(m) and m.id not in self._cleanups:
                 # a cleanup a stop or a crash cut short runs again (SDD §5.1)
                 self._cleanups[m.id] = asyncio.create_task(
                     self._cleanup_after_cancel(m, None, "system"), name=f"cleanup:{m.id}"
@@ -1941,6 +2119,8 @@ class Orchestrator:
             self._last_tick_at = started  # heartbeat: the loop is alive even during a long tick
             try:
                 await self.tick()
+                # SDD §12: the streams send what another process (the CLI) wrote to the store
+                await self.bus.catch_up()
                 self._tick_errors = 0
             except asyncio.CancelledError:
                 raise
@@ -2627,6 +2807,9 @@ class Orchestrator:
             )
             cur.progress_pct = 100.0
             cur.checkpoint = f"{step}:{next_pass_number(cur)}"
+            if result.cutover_refusals is not None:
+                # SDD §7.2: what this pass met that the cutover refuses, saved with the pass
+                cur.cutover_refusals = list(result.cutover_refusals)
             cur, v = await self._record_pass(cur, v, sync_pass, plan)
             rule, why = self._converged(cur, plan)
             if rule is not None:
@@ -2655,6 +2838,8 @@ class Orchestrator:
                     cur.destination_server_id = result.destination_server_id
                     await self._save(cur, v)
                 return
+            # SDD §7.2: the cutover got past what the passes said it would refuse
+            cur.cutover_refusals = []
             if result.sync_pass is not None:
                 cur, v = await self._record_pass(cur, v, result.sync_pass, plan)
             cur.destination_server_id = result.destination_server_id or cur.destination_server_id
@@ -2908,6 +3093,10 @@ class Orchestrator:
                     cur, v = await self._load(mid)
                     cur.advisor_notes.append(note)
                     await self._save(cur, v)
+                # SDD §14.3: announced once saved - the refresh it asks for (§16) reads the note
+                await self._emit(
+                    "advisor.similar_incidents", note.summary, migration=cur, data=note.data
+                )
 
 
 def phases(migrations: Iterable[Migration]) -> Counter[str]:

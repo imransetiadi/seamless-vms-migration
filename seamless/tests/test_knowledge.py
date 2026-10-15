@@ -51,8 +51,9 @@ async def test_knowledge_on_failure_attaches_hits(store):
     assert remember_path == "/agentmemory/remember"
     assert remember_body["type"] == "bug"
     assert remember_body["concepts"] == ["seamless", "warm", "cutover"]
+    # SDD §14.3: the note is returned - the orchestrator announces it once it is saved
     kinds = [e.kind for e in store.events(since_seq=0)]
-    assert kinds == ["advisor.similar_incidents", "memory.lesson_saved"]
+    assert kinds == ["memory.lesson_saved"]
 
 
 async def test_knowledge_on_completed_and_rolled_back(store):

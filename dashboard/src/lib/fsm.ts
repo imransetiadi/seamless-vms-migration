@@ -15,7 +15,8 @@ export const TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = {
   completed: ['finalized', 'rolling_back'],
   failed: ['rolling_back', 'ready', 'cancelled'],
   rolling_back: ['rolled_back', 'failed'],
-  rolled_back: ['ready'],
+  // cancelled: a rolled-back VM dropped for good, its kept data path cleaned up (SDD §5.1)
+  rolled_back: ['ready', 'cancelled'],
   finalized: [],
   cancelled: [],
 };

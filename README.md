@@ -104,9 +104,19 @@ make seamless-demo               # build + start postgres, jev (if enabled) and 
 open http://127.0.0.1:8080/      # sign in at /login with the admin token (127.0.0.1: localhost may be another program)
 curl -fsS http://127.0.0.1:8080/api/v1/health
 make seamless-logs               # follow logs        make seamless-down   # stop, keep data
-make seamless-check              # every CI check that runs locally: tests with the 85 % coverage gate, ruff,
-                                 # collection tests, playbook syntax, ansible-lint, scans, dashboard
-cd dashboard && npx playwright install chromium && npm run test:e2e   # browser smoke of the built dashboard (mock mode)
+make seamless-check              # CI's checks that need only the venv and node_modules: tests with the 85 % coverage
+                                 # gate, ruff, DEMO-07, collection tests, ansible-test sanity, playbook syntax, ansible-lint,
+                                 # installed scanners, dashboard unit tests and build. The rest of CI, each on its own:
+(cd dashboard && npx playwright install chromium && npm run test:e2e)   # browser smoke of the built dashboard (mock mode)
+npm --prefix dashboard run build && node tests/e2e/demo-cutover-refusal-browser.mjs && node tests/e2e/demo-approval-browser.mjs && node tests/e2e/demo-signin-browser.mjs && node tests/e2e/demo-keyboard-browser.mjs && node tests/e2e/demo-stream-browser.mjs && node tests/e2e/demo-overview-browser.mjs
+                                 # the browser journeys: DEMO-07, maker-checker, signing in, the keyboard run, the
+                                 # event stream across a dropped connection and the Overview against /stats
+SEAMLESS_TEST_PG_URL='postgresql+psycopg://<user>:<password>@127.0.0.1:55432/<db>' make seamless-test   # PostgreSQL store tests
+seamless/.venv/bin/pip install pip-audit && seamless/.venv/bin/pip-audit && npm --prefix dashboard audit --omit=dev --audit-level=high
+                                 # the dependency audits, as CI runs them (pip-audit; npm audit)
+trivy config --severity HIGH,CRITICAL --exit-code 1 deploy   # trivy's configuration scan of the manifests (needs trivy)
+make deploy-runtime-check        # PostgreSQL and the built image under the manifests' security context; kubeconform,
+                                 # trivy's image scan and the SBOM need those tools (see .github/workflows/ci.yml)
 pre-commit install               # gitleaks, ruff, shellcheck, actionlint on each commit (.pre-commit-config.yaml)
 ```
 
@@ -139,8 +149,12 @@ control plane reaches the host's agentmemory at `http://host.containers.internal
 ```bash
 cd seamless && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'
 .venv/bin/pytest -q                        # SQLite always; PostgreSQL too when SEAMLESS_TEST_PG_URL is set
-.venv/bin/seamless serve --demo            # http://127.0.0.1:8080 (demo mode on loopback needs no token)
+SEAMLESS_SECRETS_DIR=data/secrets .venv/bin/seamless serve --demo   # http://127.0.0.1:8080 (demo mode on loopback needs no token)
 ```
+
+Sign-in details entered in the dashboard (Providers → Add or Edit) go to `SEAMLESS_SECRETS_DIR`: here 0600 files under
+`seamless/data/secrets`, which git ignores. Its default, `/var/run/secrets/seamless`, is the container's path, and a
+user cannot write it on a host.
 
 ## Deploy on OpenShift
 
@@ -195,6 +209,7 @@ them against the Kubernetes 1.30 schemas.
 | [docs/Performance.md](docs/Performance.md) | Downtime model with worked examples, targets, blocksync design, benchmarks, tuning, capacity planning |
 | [docs/superpowers/plans/](docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md) | 0.1.0 implementation plan (tasks and test names) |
 | [CLAUDE.md](CLAUDE.md) | How agents and contributors work in this repository |
+| [RELEASING.md](RELEASING.md) | How a release is gated, tagged and published as a GitHub Release: versions, tags, artifacts, notes template |
 
 ## Repository layout
 

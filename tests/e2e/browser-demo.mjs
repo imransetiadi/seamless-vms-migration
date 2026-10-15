@@ -55,7 +55,11 @@ const expectCharts = async (name, min) => {
     await page.getByRole('heading', { level: 1 }).waitFor({ timeout: 10_000 });
   }
   await page.goto(`${base}/plans`, { waitUntil: 'load' });
-  await page.locator('a[href^="/plans/plan-"]').first().click();
+  // a plan with migrations to open: on a long-lived volume the first one listed may be a draft without any
+  const plans = await fetch(`${base}/api/v1/plans`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json());
+  const withMigrations = plans.find((p) => Object.values(p.migration_counts ?? {}).some((n) => n > 0));
+  if (!withMigrations) throw new Error('no plan has a migration to open');
+  await page.locator(`a[href="/plans/${withMigrations.id}"]`).first().click();
   await page.waitForURL(/\/plans\/plan-/);
   await page.locator('a[href^="/migrations/mig-"]').first().click();
   await page.waitForURL(/\/migrations\/mig-/);

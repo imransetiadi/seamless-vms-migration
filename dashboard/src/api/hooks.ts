@@ -12,6 +12,7 @@ import { createContext, useContext } from 'react';
 import { ApiClient, ApiError } from './client';
 import { useApiQuery } from './stickyQuery';
 import type {
+  AdvisorNoteList,
   AdvisorPolicy,
   AdvisorPolicySpec,
   AdvisorRecommendation,
@@ -32,6 +33,7 @@ import type {
   Migration,
   MigrationAction,
   MigrationListQuery,
+  MigrationSummary,
   Plan,
   PlanCreate,
   PlanFinalizeRequest,
@@ -84,6 +86,7 @@ export const queryKeys = {
   /** Under `recommendations`, so a refresh of the list refreshes it too. */
   recommendation: (id: string) => ['advisor', 'recommendations', 'id', id] as const,
   snapshot: (sha256: string) => ['advisor', 'snapshot', sha256] as const,
+  advisorNotes: (limit: number) => ['advisor', 'notes', limit] as const,
   policies: ['advisor', 'policies'] as const,
 };
 
@@ -210,6 +213,29 @@ export function useMigrations(query: MigrationListQuery = {}, options: ListOptio
   });
 }
 
+/** `GET /migrations?view=summary`: each migration as its summary, the fields list pages read (SDD §4, §12). */
+export function useMigrationSummaries(query: Omit<MigrationListQuery, 'view'> = {}, options: ListOptions = {}) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.migrations({ ...query, view: 'summary' }),
+    queryFn: ({ signal }) =>
+      api.get<MigrationSummary[]>('/migrations', {
+        signal,
+        query: {
+          plan_id: query.plan_id,
+          phase: query.phase,
+          wave_id: query.wave_id,
+          limit: query.limit,
+          offset: query.offset,
+          view: 'summary',
+        },
+      }),
+    enabled: options.enabled ?? true,
+    placeholderData: options.keepPrevious ? keepPreviousData : undefined,
+    retry: noRetryOnClientErrors,
+  });
+}
+
 export function useMigration(migrationId: string | undefined) {
   const api = useApi();
   return useApiQuery({
@@ -268,6 +294,16 @@ export function useRecommendations(query: RecommendationListQuery = {}, options:
       }),
     enabled: options.enabled ?? true,
     placeholderData: options.keepPrevious ? keepPreviousData : undefined,
+    retry: noRetryOnClientErrors,
+  });
+}
+
+/** `GET /advisor/notes`: every migration's advisor notes but strategy notes, newest first (SDD §12). */
+export function useAdvisorNotes(limit: number) {
+  const api = useApi();
+  return useApiQuery({
+    queryKey: queryKeys.advisorNotes(limit),
+    queryFn: ({ signal }) => api.get<AdvisorNoteList>('/advisor/notes', { signal, query: { limit } }),
     retry: noRetryOnClientErrors,
   });
 }
@@ -456,7 +492,8 @@ export type PlanActionRequest =
   | { action: 'validate' }
   | { action: 'start' }
   | { action: 'pause' }
-  | { action: 'waves'; body?: AutoWavesRequest };
+  | { action: 'waves'; body?: AutoWavesRequest }
+  | { action: 'cancel'; body?: CancelRequest };
 
 export function usePlanAction(planId: string) {
   const api = useApi();
@@ -473,6 +510,8 @@ export function usePlanAction(planId: string) {
           return api.post<Plan>(`${base}/pause`);
         case 'waves':
           return api.post<Plan>(`${base}/waves/auto`, request.body ?? {});
+        case 'cancel':
+          return api.post<Plan>(`${base}/cancel`, request.body ?? {});
       }
     },
     onSuccess: (result, request) => {

@@ -42,8 +42,17 @@
    "phases": [
     "cutover"
    ],
-   "expected": "running",
-   "note": "re-validated while a cutover still ran"
+   "expected": "paused",
+   "note": "re-validated while a cutover still ran: only a running plan is driven (the owner's choice, 2026-10-13)"
+  },
+  {
+   "stored": "validated",
+   "phases": [
+    "precopy",
+    "awaiting_cutover"
+   ],
+   "expected": "paused",
+   "note": "a paused plan validated again while its migrations pre-copy or wait for the cutover"
   },
   {
    "stored": "running",
@@ -163,6 +172,24 @@
    ],
    "expected": "failed",
    "note": "pre-staging failed (SDD §8)"
+  },
+  {
+   "stored": "failed",
+   "phases": [
+    "rolling_back",
+    "failed"
+   ],
+   "expected": "failed",
+   "note": "its pre-staging failed: it keeps Failed, never Paused, while a migration is at work (Start again pre-stages it)"
+  },
+  {
+   "stored": "cancelled",
+   "phases": [
+    "cancelled",
+    "cancelled"
+   ],
+   "expected": "cancelled",
+   "note": "2. a cancelled plan (SDD §12): its migrations are all cancelled, so none counts; the stored status"
   }
  ]
 }

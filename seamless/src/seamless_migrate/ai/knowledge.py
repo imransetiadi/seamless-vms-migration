@@ -77,7 +77,8 @@ class KnowledgeService:
     async def on_failure(
         self, migration: Migration, step: str, error: BaseException
     ) -> AdvisorNote | None:
-        """Look up similar incidents (attached as a note) and record the failure as a lesson."""
+        """Look up similar incidents and record the failure as a lesson. The note is returned: the
+        orchestrator attaches it and only then announces it (SDD §14.3)."""
         if self.memory is None:
             return None
         strategy = str(migration.strategy)
@@ -103,15 +104,6 @@ class KnowledgeService:
                             for h in hits[:MAX_HITS]
                         ],
                     },
-                )
-                await emit(
-                    self.store,
-                    self.bus,
-                    "advisor.similar_incidents",
-                    note.summary,
-                    plan_id=migration.plan_id,
-                    migration_id=migration.id,
-                    data=note.data,
                 )
         except Exception:
             log.warning("similar-incident lookup failed", exc_info=True)

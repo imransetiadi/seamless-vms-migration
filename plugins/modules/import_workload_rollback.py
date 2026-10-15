@@ -21,19 +21,26 @@ extends_documentation_fragment:
 
 version_added: "1.1.0"
 
-author: "Seamless Migrate contributors"
+author: "Seamless Migrate contributors (!UNKNOWN)"
 
 description:
   - "Deletes the destination server recorded as C(destination_server_id) in the
     workload's warm state file C({state_dir}/{source_server_id}.json) and
-    clears the record, so a later cutover can create it again."
+    clears the record, so a later cutover can create it again. When the file
+    records no server, or Nova no longer has the recorded one, it deletes the
+    single server named like the workload that holds one of the recorded
+    volumes, attached through Nova and not to the destination conversion host:
+    built from them, it is the migration's own even when Nova's answer to its
+    create was lost. It fails if several such servers hold them."
   - "With I(delete_dest_volumes) the destination volumes are deleted too (the
-    ones recorded in the warm state and every volume attached to the deleted
-    server), and so is the warm state file. A volume that is still attached to
-    another server is detached only when that server is the destination
-    conversion host (I(conversion_host)); otherwise it is kept and listed in
-    C(kept_volume_ids). The file is kept while a source snapshot is still
-    pending, so its temporary resources can be cleaned up with
+    ones recorded in the warm state, or, for a workload without a state file,
+    every volume attached to the deleted server), and the warm state is
+    emptied: the file stays, holding no volume, pass or server, as the sign
+    that the workload's migration recorded it (C(state_cleared)). A volume
+    that is still attached to another server is detached only when that
+    server is the destination conversion host (I(conversion_host)); otherwise
+    it is kept and listed in C(kept_volume_ids). A pending source snapshot's
+    record stays, so its temporary resources can be cleaned up with
     M(os_migrate.os_migrate.import_workload_warm_snapshot)."
   - "Then deletes the destination ports created through Neutron for the
     workload's ports (C(port_creation_mode=neutron)): Nova keeps them when it
@@ -54,15 +61,17 @@ options:
     type: str
   delete_dest_volumes:
     description:
-      - Also delete the destination volumes and the warm state.
+      - Also delete the destination volumes and empty the warm state.
     required: false
     default: false
     type: bool
   match_by_name:
     description:
-      - When no destination server is recorded (for example a workload migrated
-        cold), delete the only destination server whose name is exactly the
-        workload's name. Fails if several servers have that name.
+      - When the workload has no warm state file at all (a workload migrated
+        before anything was recorded for it), delete the only destination
+        server whose name is exactly the workload's name. Fails if several
+        servers have that name. With a state file, even an empty one, no
+        server is taken by its name alone.
     required: false
     default: false
     type: bool
@@ -85,6 +94,15 @@ options:
         attached to any other server are kept.
     required: false
     type: str
+  delete_ports:
+    description:
+      - Delete the destination ports created through Neutron for the
+        workload's source ports. False for a cleanup that made no port, where
+        an unbound port keyed to the source port may belong to another
+        migration of the same VM.
+    required: false
+    default: true
+    type: bool
 """
 
 EXAMPLES = r"""
@@ -120,8 +138,11 @@ deleted_port_ids:
   type: list
   elements: str
   sample: [6f2b0c1e-2d0a-4f4e-9a55-0d1f8c3b7a21]
-state_deleted:
-  description: Whether the warm state file was removed.
+state_cleared:
+  description:
+    - Whether the workload's warm state record holds no destination volume, pass or server
+      after the rollback. The file itself stays, as the sign that the workload's migration
+      recorded it, so no later rollback takes a same-named server for the migration's.
   returned: success
   type: bool
   sample: true
@@ -149,6 +170,7 @@ def run_module():
         dst_filters=dict(type="dict", default={}),
         timeout=dict(type="int", default=DEFAULT_TIMEOUT),
         conversion_host=dict(type="str", default=None),
+        delete_ports=dict(type="bool", default=True),
     )
 
     module = AnsibleModule(argument_spec=argument_spec)
@@ -174,7 +196,9 @@ def run_module():
             dst_filters=params["dst_filters"],
             timeout=params["timeout"],
             conversion_host=params["conversion_host"],
-            source_port_ids=[port_id for port_id in source_port_ids if port_id],
+            source_port_ids=(
+                [port_id for port_id in source_port_ids if port_id] if params["delete_ports"] else []
+            ),
         ).run(delete_volumes=params["delete_dest_volumes"])
     except Exception as err:  # pylint: disable=broad-except
         module.fail_json(msg="Rollback of server %s failed: %s" % (server_id, err))

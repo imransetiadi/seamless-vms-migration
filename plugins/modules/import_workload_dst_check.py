@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Modified by the Seamless Migrate project, 2026.
 
 
 from __future__ import absolute_import, division, print_function
@@ -59,6 +60,14 @@ options:
     required: false
     type: dict
     default: {}
+  network_as_warnings:
+    description:
+      - Report the problems of the workload's ports and floating IPs as warnings instead of
+        failing. A warm pre-copy or sync pass creates neither; the cutover's check refuses
+        them before the source stops.
+    required: false
+    type: bool
+    default: false
   cloud:
     description:
       - Cloud resource from clouds.yml
@@ -84,6 +93,13 @@ EXAMPLES = r"""
 """
 
 RETURN = r"""
+cutover_refusals:
+  description:
+    - With network_as_warnings, the problems of the workload's ports and floating IPs that
+      the cutover's check will refuse before the source stops, one message each.
+  returned: when network_as_warnings is true
+  type: list
+  elements: str
 """
 
 from ansible.module_utils.basic import AnsibleModule
@@ -96,6 +112,7 @@ def run_module():
     argument_spec = os_auth.openstack_full_argument_spec(
         data=dict(type="dict", required=True),
         dst_filters=dict(type="dict", required=False, default={}),
+        network_as_warnings=dict(type="bool", required=False, default=False),
     )
 
     result = dict(
@@ -111,7 +128,18 @@ def run_module():
 
     conn = os_auth.get_connection(module)
     ser_server = server.Server.from_data(module.params["data"])
-    errors = ser_server.dst_prerequisites_errors(conn, module.params["dst_filters"])
+    warn_network = module.params["network_as_warnings"]
+    errors = ser_server.dst_prerequisites_errors(
+        conn, module.params["dst_filters"], network=not warn_network
+    )
+    if warn_network:
+        # a warm pass makes no port or floating IP: the cutover's check refuses their
+        # problems before the source stops (SDD 6.6)
+        refusals = ser_server.dst_network_errors(conn)
+        for problem in refusals:
+            module.warn("The cutover will refuse this before the source stops: " + problem)
+        # returned too, for the migration's cutover_refusals (SDD 7.2)
+        result["cutover_refusals"] = refusals
 
     if errors:
         error_msg = " ".join(errors)

@@ -8,15 +8,24 @@ import type { RecommendationPage } from '../api/types';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Advisor from './Advisor';
 
-/** A mock server whose GET /migrations fails, as a control plane with a broken database would. */
-function serverWithoutMigrations() {
+/** A mock server whose GET /advisor/notes fails, as a control plane with a broken database would. */
+function serverWithoutNotes() {
   const server = createTestServer();
   const handle = server.handle.bind(server);
   server.handle = (method, path, query, body, token) =>
-    method === 'GET' && path === '/migrations'
+    method === 'GET' && path === '/advisor/notes'
       ? { status: 503, body: { error: { code: 'unavailable', message: 'database unavailable' } } }
       : handle(method, path, query, body, token);
   return server;
+}
+
+/** Every GET the page makes, as its path and query under /api/v1. */
+function recordingReads(reads: string[]) {
+  return (mock: typeof fetch): typeof fetch =>
+    (input, init) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+      return mock(input, init);
+    };
 }
 
 function Where() {
@@ -49,7 +58,7 @@ function addRecommendations(server: MockServer, m: MockServer['migrations'][numb
 
 describe('Advisor page', () => {
   it('says the advisor notes could not be loaded instead of claiming there are none', async () => {
-    renderWithApp(<Advisor />, { server: serverWithoutMigrations() });
+    renderWithApp(<Advisor />, { server: serverWithoutNotes() });
 
     // a 5xx is retried twice with backoff before the query reports the error
     expect(await screen.findByText(/advisor notes are unavailable/i, {}, { timeout: 8000 })).toBeInTheDocument();
@@ -276,12 +285,12 @@ describe('Advisor page', () => {
     const user = userEvent.setup({ delay: null });
     renderWithApp(<Advisor />, { token: 'admin' });
     const feed = await screen.findByRole('region', { name: 'Recommendations' });
-    const waiting = await within(feed).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    const waiting = await within(feed).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     const entry = waiting.closest('li')!;
+    // its migration is read alone before the actions show (perf audit PF-02)
+    const group = await within(entry).findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
     // only the decision that waits: the others were taken
-    expect(within(feed).getAllByRole('group', { name: /^Decide on the recommendation for/ })).toEqual([
-      within(entry).getByRole('group', { name: 'Decide on the recommendation for analytics-node-2' }),
-    ]);
+    expect(within(feed).getAllByRole('group', { name: /^Decide on the recommendation for/ })).toEqual([group]);
     await user.click(within(entry).getByRole('button', { name: 'Approve' }));
     const confirm = await screen.findByRole('alertdialog', { name: 'Approve Storage handover for analytics-node-2?' });
     await user.click(within(confirm).getByRole('button', { name: 'Approve' }));
@@ -291,10 +300,49 @@ describe('Advisor page', () => {
     expect(screen.getByText('Approved: analytics-node-2 runs Storage handover.')).toHaveAttribute('role', 'status');
   });
 
+  it('reads no migration list: the notes come from GET /advisor/notes, a waiting decision reads its migration alone (perf audit PF-02)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    const reads: string[] = [];
+    renderWithApp(<Advisor />, { token: 'admin', server, wrapFetch: recordingReads(reads) });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByRole('group', { name: 'Decide on the recommendation for analytics-node-2' });
+    const notes = await screen.findByRole('region', { name: 'Recent advisor notes' });
+    const classified = await within(notes).findByText(/Classified as stateless_web/);
+    // each note names its VM with a link to its migration
+    const classifiedVm = server.migrations.find((m) => m.advisor_notes.some((n) => n.summary === classified.textContent))!;
+    expect(within(classified.closest('li')!).getByRole('link', { name: classifiedVm.vm.name })).toHaveAttribute('href', `/migrations/${classifiedVm.id}`);
+    expect(reads).toContain('/advisor/notes?limit=20');
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual([`/migrations/${held.id}`]);
+  });
+
+  it('offers nothing on a waiting decision whose migration no longer holds on it (SDD §14.6)', async () => {
+    const server = createTestServer();
+    const held = server.migrations.find((m) => m.vm.name === 'analytics-node-2')!;
+    held.advisor_hold = null;
+    const reads: string[] = [];
+    renderWithApp(<Advisor />, { token: 'admin', server, wrapFetch: recordingReads(reads) });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
+    await waitFor(() => expect(reads).toContain(`/migrations/${held.id}`));
+    // however long its read takes, no actions come: nothing waits on this decision
+    await expect(within(feed).findByRole('group', { name: /^Decide on the recommendation for/ }, { timeout: 500 })).rejects.toThrow();
+  });
+
+  it('reads no migration at all for a user who may not decide (perf audit PF-02)', async () => {
+    const reads: string[] = [];
+    renderWithApp(<Advisor />, { token: 'approver', wrapFetch: recordingReads(reads) });
+    const feed = await screen.findByRole('region', { name: 'Recommendations' });
+    await within(feed).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
+    const notes = await screen.findByRole('region', { name: 'Recent advisor notes' });
+    await within(notes).findByText(/Classified as stateless_web/);
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual([]);
+  });
+
   it('shows neither Approve nor Override without advisor.approve', async () => {
     renderWithApp(<Advisor />, { token: 'approver' });
     const feed = await screen.findByRole('region', { name: 'Recommendations' });
-    await within(feed).findByText('Decision: Waiting for approval — policy pol-finance requires approval');
+    await within(feed).findByText('Decision: Waiting for approval by an admin — policy pol-finance requires approval');
     expect(within(feed).queryByRole('group', { name: /^Decide on the recommendation for/ })).not.toBeInTheDocument();
     expect(within(feed).queryByRole('button', { name: /approve|override/i })).not.toBeInTheDocument();
   });

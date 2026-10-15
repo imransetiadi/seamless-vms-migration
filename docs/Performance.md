@@ -108,7 +108,7 @@ at 500 MiB/s)".
 |---|---|---|
 | G1a, 600 s | single 100 GiB disk: `scan` = 205 s ⇒ **475 s (7.9 min)**. 4 × 100 GiB: still 475 s with four concurrent streams, but **614 s (10.2 min)** behind a 1,190 MiB/s storage path | Met with 125 s (21 %) margin for single disks; multi-disk VMs depend on the aggregate ceiling (note 1) |
 | G1b, warm beats cold | `warm < cold ⟺ U/L > scan`. Single disk: `U/D > L/S` = **25 %** at 125 MiB/s, 50 % at 250 MiB/s, never at ≥ 500 MiB/s; four equal disks: 6.25 % at 125 MiB/s | Matches the PRD at the 1 Gbit/s planning link; on faster links a single-disk VM is cheaper cold (note 2) |
-| G1c, 360 s | `240 s + 20 s × V` ⇒ **1 volume 4.3 min, 3 → 5.0, 6 → 6.0 (the limit), 7 → 6.3** | Met up to six volumes, for any disk size; recalibrate `handover_per_volume_s` in the lab |
+| G1c, 360 s | `240 s + 20 s × V` ⇒ **1 volume 4.3 min, 3 → 5.0, 6 → 6.0 (the limit), 7 → 6.3** | Met up to six volumes, for any disk size; recalibrate `handover_per_volume_s` in the lab. The model counts the source's shutdown, but the handover's clock starts at `SHUTOFF` (SDD §7.3, `TODO(LAB)`): compare a measured downtime plus the measured shutdown |
 | G2 | after the first delta pass `c` and the per-stream scan rate are measured and the estimate is recomputed (§1); what remains is `F` and write amplification (§5.4) | Put lab-measured fixed costs into `Plan.estimator_overrides` (§6.4); PERF-E2E-G2 evaluates the final calibrated estimate |
 | NFR-02a | Feasible: BLAKE2b-128 alone runs at ≈ 1.5 GiB/s per thread on an Apple-silicon laptop and scales with threads (§5.2); the bound is storage read and SSH | Verify with `bench_blocksync.py` and `fio` on the lab hosts |
 | NFR-02b | `10 Gbit/s × 90 % = 1,125 MiB/s` ⇒ 3 streams at 400–500 MiB/s, 4 streams give margin | Consistent with "≥ 4 parallel disks" (the default `P`); a single SSH stream is window-limited on high-RTT links (§5.3) |
@@ -403,7 +403,7 @@ QASuite §9 (PERF-E2E). Downtime is `actual_downtime_s` over ≥ 10 runs.
 | P-DB 200 GiB at 10 MiB/s | LAB-W03 | `warm`, 10 G | 680 s; never converges | G2; record `change_rate_bps` | 5 → *to be filled* | *to be filled* |
 | **P-XL 500 GiB single disk, 2 MiB/s writer** | **LAB-W12** | `warm`, 10 G and 1 G | **1,294 s (21.6 min)** at `S` = 500; 1,550 s (25.8 min) at `S` = 400 | **SM-1 p95**: max of 10 runs ≤ 1,500 s ⇔ measured `S` ≥ 416 MiB/s | 5 with the defaults; tuned (§7.3): 2 at 10 G, 3 at 1 G → *to be filled* | *to be filled* |
 | P-L 200 GiB, cold | LAB-C01 (on P-L) | `cold`, 1 G | 1,253 s (20.9 min) | none (reference) | — | *to be filled* |
-| P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes | — | *to be filled* |
+| P-M, 1 / 3 / 6 volumes | LAB-H01, H02, H03 | `storage_handover`, shared Ceph | 260 / 300 / 360 s | **G1c**: ≤ 360 s up to six volumes, the measured shutdown added to the clock (SDD §7.3) | — | *to be filled* |
 | VMware 200 GiB, CBT | LAB-V02 | `vmware_warm`, 1 G | 360 s (6.0 min) | ±30 % of the model | 2 → *to be filled* | *to be filled* |
 
 ### 6.4 Calibrating the estimator
@@ -488,9 +488,10 @@ is left to the operator is the plan-level starting point, so that the very first
 | Throughput stuck near 100 MiB/s on a WAN | Single-stream SSH window (§5.3) | Parallelize disks/migrations; HPN-SSH; reduce RTT |
 | Stalls after the SSH handshake, small packets fine | MTU black hole (Geneve 1442 vs 1500/9000 paths) | Align `os_migrate_*_conversion_net_mtu`, enable `net.ipv4.tcp_mtu_probing=1` |
 | Many small VMs take far longer than data size suggests | Attach/detach serialization per conversion host | Fewer, larger waves per host pair; (future) multiple conversion-host pairs (§11) |
+| A failed cold cutover takes 15–30 minutes before its rollback | The source conversion host could not be reached over SSH (ssh exit status 255). A lock wait or a wait for the NBD exports rides out such an outage for 15 minutes, and then so does the rescue's source cleanup: a reboot or a network blip is ridden out, and the step completes, or the rescue gives the source VM every disk back before the retry (SDD §6.6, QASuite R-07). A host down for good costs one window, or both when it went down during a wait, then the retries fail at once on the export's SSH check | Check the conversion host (Nova status, console, the control plane's route to it). The window is `SSH_UNREACHABLE_S` (900 s) in `plugins/module_utils/volume_common.py`; the failure reads "Lock timeout: …" or "SSH timeout: conversion host … unreachable over SSH for N s, waiting for …" |
 | Estimate error > 30 % | Planning defaults differ from the lab; random-write amplification; no delta pass yet | Set `estimator_overrides` (§6.4); wait for the first delta pass (calibration); smaller chunk size |
 | `meets_slo` is false for the warm estimate of every single disk above ≈ 161 GiB | The default `downtime_slo_s` of 600 s leaves `scan ≤ 330 s` after `F` = 270 s (161 GiB at 500 MiB/s) | Set the SLO to the business budget: 600 for the G1a population, 1,500 for ≤ 500 GiB |
-| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each); since 376eec7 a live event about one migration reads only that one (`GET /migrations/{id}`) and splices it into the cached lists, while new migrations, plan and wave events, lists filtered by phase, wave or page, lists that do not hold it, lists being read and a failed single read still read the lists again (SDD §16); `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
+| API slow with many migrations | `GET /migrations` without `limit` sends every migration (≈ 4.5 KB each); since 376eec7 a live event about one migration reads only that one (`GET /migrations/{id}`) and splices it into the cached lists, while new migrations, plan and wave events, lists filtered by phase, wave or page, lists that do not hold it, lists being read and a failed single read still read the lists again, and so does a batch that would read more than 50 migrations one by one (a long-hidden page in a busy wave) (SDD §16); `/stats`, `/metrics` and the tick load only changed documents since 61483aa/08ec435 | Narrow queries (`plan_id`, `phase`, `limit`), SSE-driven refresh (§9.1) |
 
 ### 7.2 Conversion-host sizing and configuration
 
@@ -532,7 +533,7 @@ is left to the operator is the plan-level starting point, so that the very first
 | Ceph RBD | O(1) | O(1) copy-on-write clone (flatten is off by default) | `snapshot_s` ≈ seconds; pass time is the scan. Preferred |
 | LVM thin | O(1) | O(1) thin snapshot | similar to RBD |
 | NetApp ONTAP (NFS, iSCSI, FC) | O(1) FlexClone file/LUN clone | O(1) clone (FlexClone license required) | similar to RBD while the FlexVol has free space and snapshot reserve; without FlexClone the driver cannot clone and the warm path fails at the first pass — use cold or storage handover. Storage handover on a shared SVM is a rename (SDD §7.3.1) |
-| LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check |
+| LVM thick | O(size) | **full copy** of the volume | every pass pays a local copy before the scan — pre-copy and `snapshot` terms are much larger than the model assumes; reduce `max_sync_passes`, prefer cold/handover, or move volumes to RBD. The 0.1.0 finding catalog has no LVM finding: read `volume_backends` from the provider check. Cold: the export of a volume-booted VM makes the same full copy of the root volume, after the source stopped, so it adds root size ÷ local copy rate to the downtime, and a copy that outlasts `os_migrate_timeout` (1800 s) fails the export (raise the timeout for a root volume of several hundred GiB); deleting the copy zeroes it with Cinder's default `volume_clear`, after the destination started, or before the rollback when the cutover failed. A cold cutover step retried after a transient failure (`max_step_retries`, no rollback in between) first deletes each destination volume the failed attempt created, while the source is still stopped (SDD §6.3): on an LVM-thick destination each delete zeroes the volume, so the retry's downtime grows by their size ÷ the zeroing rate, and one still deleting at `os_migrate_timeout` fails the transfer with "Could not delete volume … it is still being deleted after 1800 s", which is permanent, so the rollback starts the source VM |
 | Image-booted VMs | — | `boot_disk_copy: true` snapshots the server to Glance and builds a volume from the image **each pass** (SDD §6.1) | minutes per pass proportional to the disk; with `boot_disk_copy: false` only data volumes sync and the destination boots from the same image name — use it whenever the image exists on the destination |
 
 ---
@@ -599,9 +600,19 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
   an idle overview costs one aggregate query; when it moved — a running plan writes a migration about every
   second — they read `(id, version)` and load only the documents that changed (`Store.versions`, `get_many`,
   61483aa): with 2 × 1,000 migrations on SQLite a call after one write fell from ≈ 220 ms to ≈ 7 ms CPU. `GET /plans` filters by `status` and pages like `/migrations`; it and
-  `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one `SELECT DISTINCT` over the indexed
+  `GET /plans/{id}` derive `derived_status` from `Store.plan_phases` (one query over the indexed
   `plan_id`/`phase` expressions, 515c351) instead of loading every migration — at 2 × 1,000 migrations on SQLite
-  226 → 39 ms and 153 → 32 ms CPU. Prefer SSE-triggered
+  226 → 39 ms and 153 → 32 ms CPU. The same query, grouped and counted since 282a81b, gives each plan its
+  `migration_counts`, so the dashboard's Plans list reads no migration (a4e40b0; before, it read every
+  migration of every plan to show "migrations done"), and the plan form reads them only while open. The Advisor
+  page reads no migration either: its notes come from `GET /advisor/notes` (33ca02a, 20 notes out of the API's
+  document cache) and a waiting decision reads its migration alone (f1b52e7); at 1,000 VMs every migration was
+  4,127.7 KiB of its 4,230 KiB load. The Overview (5f3e75b) and the plan page (c5e6896) read the migrations as
+  summaries (`GET /migrations?view=summary`, SDD §4): the fields their lists read, without the phase history, VM
+  details, advisor notes, every estimate and the passes - on the live demo 71 migrations were 350,000 bytes whole
+  (4.9 KB each) and 59,903 as summaries (844 B each on the wire; 84,729, 1,193 B each, once the plan page's fields joined them, 4ee8507 the
+  last reader), and at 1,000 VMs the Overview
+  read 4,127.7 KiB of migrations and the plan page ≈ 4 MiB. Prefer SSE-triggered
   cache invalidation in the dashboard over short-interval polling; an event about one existing migration
   re-reads that migration alone and splices it into the cached lists (SDD §16, 376eec7): at 1,000 VMs a plan a
   full list is ≈ 4.5 MB (≈ 0.5 MB gzipped) per page and event, one migration ≈ 4.5 KB.
@@ -631,7 +642,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 |---|---|
 | Size | 1 vCPU / 1–2 GiB, 20 GiB volume is generous (manifests: request 250 m / 512 Mi, limit 2 CPU / 1 GiB, 20 Gi PVC) |
 | Memory | `shared_buffers` 256 MB, `effective_cache_size` 512 MB–1 GB; `max_connections` 50 (pool ≤ 10 per process plus CLI/psql) |
-| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)` |
+| Indexes in place | `documents(kind, id)` primary key; expression indexes `ix_documents_{plan_id,phase,wave_id,status,role}` on `(kind, data->>field)` for the SQL-pushed list filters (SDD §11); `events(seq)` primary key, `events(plan_id)`, `events(migration_id)`, `events(kind, seq)` (`ix_events_kind_seq`: the audit trail's `kinds` filter and its `before` pages) |
 | Bloat | frequently updated documents: `ALTER TABLE documents SET (fillfactor = 70)` and an aggressive autovacuum (`autovacuum_vacuum_scale_factor = 0.05`) |
 | Retention | archive `events` older than 13 months ([MEMORY.md](MEMORY.md) §3.4); `VACUUM (ANALYZE)` after bulk deletes |
 | Backups | `pg_dump` nightly (encrypted) plus a restore drill each release; the dump of 1,000 migrations is tens of MiB |
@@ -641,7 +652,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | Limit | Cause | Upgrade |
 |---|---|---|
 | `/stats`, `/metrics`, `/advisor/recommendations` and the tick keep every migration in memory | `VersionedDocuments` (SDD §11) reloads only changed documents, but holds the whole kind: ≈ 5 KB per migration as a model | 0.2.0: store-side aggregates (phase counts, downtime sums) and keyset pagination |
-| `validate_plan` writes each VM separately | ≈ 10 SQL statements and as many worker-thread hops per VM (create, transitions, events): 1,000 VMs ≈ 7.9 s CPU, 14 s wall on a loaded laptop (SQLite, control-plane audit 2026-10-11), under the plan's lock; linear, within SM-2 | one transaction per VM for the migration and its events (a Store transaction API, SDD §11 first); deferred — validation runs once per plan change |
+| `validate_plan` writes each VM separately | 4 SQL statements and as many worker-thread hops per VM since fa2ebf8 — the migration written once (a new one created already assessed, an existing one taking both transitions in one write, SDD §5.4) and a versioned `put` one statement (SDD §11), then one statement per event; before, 10 per VM on a first validation and 7 on a repeat. 1,000 VMs on PostgreSQL 16 (local Colima, the orchestrator harness): first validation 10,021 → 4,018 statements, 11.95 → 6.10 s wall (2.8 → 1.5 s CPU), repeat 9.07 → 6.55 s; SQLite 1.93 → 1.12 s. Linear, under the plan's lock; within SM-2 | one transaction per VM for the migration and its events (a Store transaction API, SDD §11 first) would leave about two round trips per VM; deferred — validation runs once per plan change |
 | Single orchestrator | singleton design (D2) | 0.2.0: leader election with PostgreSQL advisory locks |
 | Event table growth | append-only; bounded by `seamless events export` and `seamless events prune` (SDD §15) on a retention schedule | partition by month for very large estates |
 
@@ -659,6 +670,7 @@ One orchestrator (SDD §20 D2), one conversion-host pair per provider, serialize
 | `seamless_step_duration_seconds_sum`, `_count{step}` | counters | mean duration per step (`prestage`, `precopy`, `sync`, `cutover`, `rollback`, `finalize`) |
 | `seamless_advisor_calls_total{tool,outcome}` | counter | Jev usage and failures (label values are defined by the implementation) |
 | `seamless_tick_seconds_sum`, `_count`, `_max`, `seamless_tick_slow_total` | summary / counter | orchestrator tick duration and ticks above half of `tick_s` (SDD §18; `/health` turns `degraded` when the loop stalls) |
+| `seamless_cutover_refusals` | gauge | migrations in `precopy`, `syncing` or `awaiting_cutover` whose last pass found what their cutover will refuse (`cutover_refusals`, SDD §7.2, §18) — the dashboard's "Cutover will refuse"; above 0, something is to fix before a cutover |
 
 The endpoint needs a viewer token unless `SEAMLESS_METRICS_PUBLIC=true`; configure the scrape with a bearer
 token Secret. Queries:
@@ -721,7 +733,7 @@ conversion hosts with `node_exporter` (CPU saturation, network throughput, disk 
 |---|---|---|
 | G1a | p90 of `actual_downtime_s` of completed `warm` migrations whose largest disk ≤ 100 GiB and total ≤ 400 GiB (gate 600 s, `n ≥ 10`) | §6.4 population query |
 | G1b | warm versus cold downtime of the same VM profile at 20 % and 40 % used (lab only: production runs one strategy per VM) | LAB-W14 |
-| G1c | p90 of `actual_downtime_s` of `storage_handover` migrations (gate 360 s) | §6.4 population query |
+| G1c | p90 of `actual_downtime_s` of `storage_handover` migrations, each with its source's measured shutdown added while the handover's clock starts at `SHUTOFF` (SDD §7.3, `TODO(LAB)`) (gate 360 s) | §6.4 population query |
 | SM-1 | median (≤ 600 s, largest disk ≤ 100 GiB) and p95 (≤ 1,500 s, largest disk ≤ 500 GiB) of warm downtime | §6.4 population query |
 | G2 | share of calibrated migrations (≥ 1 delta pass) with `abs(actual − estimate) / estimate ≤ 0.3` | jq query in §6.4 |
 | NFR-02 | MiB/s scanned per side and link utilization during pre-copy | `bench_blocksync` results, `node_exporter` |

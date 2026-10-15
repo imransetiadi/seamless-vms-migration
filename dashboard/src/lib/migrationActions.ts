@@ -1,10 +1,10 @@
-import type { Approval, Migration, Phase, Plan, Role } from '../api/types';
+import type { Approval, Migration, MigrationLike, Phase, Plan, Role } from '../api/types';
 import { completedSince, isOverdue } from './finalize';
-import { formatRelative } from './format';
+import { formatDateTime, formatDuration, formatRelative } from './format';
 import { canTransition } from './fsm';
 import { isWarmStrategy } from './phase';
 import type { Availability } from './planActions';
-import { hasRole, OWN_CUTOVER, OWN_FORCE, PERMISSIONS } from './roles';
+import { hasRole, OWN_CUTOVER, OWN_FORCE, ownReason, PERMISSIONS } from './roles';
 
 export type MigrationActionKey = 'approve' | 'cutover' | 'force-cutover' | 'sync' | 'rollback' | 'retry' | 'cancel' | 'finalize';
 
@@ -43,7 +43,7 @@ function isSingleShot(m: Migration): boolean {
  * The approvals the cutover gate counts (SDD §5.4 rule 1): all but, when the plan requires a distinct
  * approver, the requester's and the forcer's.
  */
-export function countedApprovals(m: Migration, plan: Plan | null | undefined): Approval[] {
+export function countedApprovals(m: Pick<Migration, 'approvals' | 'cutover_requested_by' | 'force_cutover'>, plan: Plan | null | undefined): Approval[] {
   // while the plan loads, the API's default holds: a distinct approver
   if (plan?.require_distinct_approver === false) return m.approvals;
   const own = new Set([m.cutover_requested_by, m.force_cutover?.actor].filter(Boolean));
@@ -53,6 +53,19 @@ export function countedApprovals(m: Migration, plan: Plan | null | undefined): A
 /** Why `actor`'s approval does not count (SDD §5.4, §16): they forced the cutover, or requested it. */
 export function uncountedReason(m: Migration, actor: string): string {
   return m.force_cutover?.actor === actor ? 'forced the cutover' : 'requested the cutover';
+}
+
+/**
+ * A cutover request that is not a start (SDD §5.4, §16): maker-checker, and no approval counts but the requester's
+ * own - `me` is the requester when nobody has requested it yet. It waits for another approver.
+ */
+export function requestWaitsForApprover(
+  m: Pick<Migration, 'approvals' | 'cutover_requested_by' | 'force_cutover'>,
+  plan: Plan | null | undefined,
+  me: string | null | undefined,
+): boolean {
+  if (!fourEyes(plan)) return false;
+  return countedApprovals({ ...m, cutover_requested_by: m.cutover_requested_by ?? me ?? null }, plan).length === 0;
 }
 
 /** Maker-checker (ADV-17): the plan wants an approval, and not from the cutover's requester. */
@@ -67,6 +80,42 @@ export function waitsOnClosedWindow(m: Migration, plan: Plan | null | undefined,
   return now < Date.parse(w.start) || now > Date.parse(w.end);
 }
 
+/** "a", "a and b", "a, b and c". */
+function inWords(parts: readonly string[]): string {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}` : (parts[0] ?? '');
+}
+
+/**
+ * What the Approve dialog says the approval leads to (SDD §5.4, §16). When the plan requires an approval, none counts
+ * yet and nothing else a person gives is missing, the approval lets the cutover start - the source VM then stops - and
+ * the button says so; otherwise the dialog names what the cutover still waits for, or why the approval changes nothing
+ * now.
+ */
+export function approveDialog(m: Migration, plan: Plan | null | undefined, now: number = Date.now()): { description: string; confirmLabel: string } {
+  const approve = (description: string) => ({ description, confirmLabel: 'Approve' });
+  if (!plan) return approve('Records your approval. What it leads to depends on the plan, which is not loaded.');
+  // a retry keeps the approvals and clears the request (SDD §5.1)
+  if (m.phase === 'failed' || m.phase === 'rolled_back') return approve('Records your approval for the next attempt: a retry keeps it, and its cutover is requested anew.');
+  if (!plan.require_approval) return approve('This plan needs no approval to cut over: yours is recorded in the audit trail.');
+  if (countedApprovals(m, plan).length > 0) return approve('Records your approval. The cutover has the approval it needs already.');
+  const w = plan.cutover_window;
+  const waits = [
+    !m.cutover_requested && !plan.auto_cutover ? 'a cutover request' : '',
+    w && !m.force_window && (now < Date.parse(w.start) || now > Date.parse(w.end)) ? `the cutover window (${formatDateTime(w.start)} → ${formatDateTime(w.end)})` : '',
+    m.advisor_hold ? "the advisor's decision" : '',
+  ].filter(Boolean);
+  if (waits.length) return approve(`Records your approval. The cutover still waits for ${inWords(waits)}.`);
+  const gate = 'the plan, its wave and a free cutover slot allow';
+  // a warm migration cuts over once it converged; a forced one after the running pass, at the downtime the force recorded
+  const passes = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
+  const when = !passes ? `as soon as ${gate}` : m.force_cutover ? `after the running pass, once ${gate}` : `once pre-copy has converged and ${gate}`;
+  const downtime = passes && m.force_cutover ? m.force_cutover.estimated_downtime_s : m.estimate?.downtime_s;
+  return {
+    description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts ${when}. Estimated downtime ${downtime === undefined ? 'unknown' : formatDuration(downtime)} against an SLO of ${formatDuration(plan.downtime_slo_s)}.`,
+    confirmLabel: 'Approve and cut over',
+  };
+}
+
 function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | undefined, now: number, user: string | undefined): Availability {
   const ok: Availability = { enabled: true, reason: null };
   const no = (reason: string): Availability => ({ enabled: false, reason });
@@ -74,8 +123,8 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
     case 'approve':
       if (APPROVAL_LASTS.has(m.phase)) {
         // maker-checker (SDD §5.4): the API refuses the requester's approval, and the forcer's
-        if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(OWN_CUTOVER);
-        if (user && m.force_cutover?.actor === user && plan?.require_distinct_approver !== false) return no(OWN_FORCE);
+        if (user && m.cutover_requested_by === user && plan?.require_distinct_approver !== false) return no(ownReason(OWN_CUTOVER, user));
+        if (user && m.force_cutover?.actor === user && plan?.require_distinct_approver !== false) return no(ownReason(OWN_FORCE, user));
         return ok;
       }
       if (BEFORE_VALIDATION.has(m.phase)) return no('Validate the plan first: validation clears approvals, so approve its new assessment.');
@@ -122,7 +171,10 @@ function phaseRule(m: Migration, key: MigrationActionKey, plan: Plan | null | un
       return canTransition(m.phase, 'cancelled') ? ok : no('Cancel is not possible once cutover has started or the migration has ended.');
     case 'finalize':
       if (m.phase === 'finalized') return no('Already finalized.');
-      return m.phase === 'completed' ? ok : no('Finalize becomes available once the migration is completed and verified.');
+      if (m.phase !== 'completed') return no('Finalize becomes available once the migration is completed and verified.');
+      // SDD §8.1 (the owner's choice): the API refuses it while the source runs again - unless a finalize began deleting
+      // the source, as a rollback is refused then
+      return m.source_running_at && m.checkpoint !== 'finalizing' ? no('The source VM runs again: stop it, or roll it back, before finalizing.') : ok;
   }
 }
 
@@ -204,6 +256,13 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
         ? { text: 'Pre-copy is running while the source VM keeps running.', action: null }
         : { text: 'Delta passes run until the change rate converges.', action: null };
     case 'awaiting_cutover':
+      if (m.cutover_refusals.length > 0) {
+        // SDD §16: the next step agrees with the warning - requested or not, the cutover would refuse them
+        return {
+          text: 'Converged, but the cutover will refuse what the last pass found. Next: fix it, then sync so a pass looks again (operator); keep-warm syncs look too.',
+          action: 'sync',
+        };
+      }
       // a request stored before ADV-17 names nobody: the wait is the gate's, as before
       if (m.cutover_requested && m.cutover_requested_by && fourEyes(plan) && countedApprovals(m, plan).length === 0) {
         return { text: `Cutover requested by ${m.cutover_requested_by}. Next: another approver approves it; keep-warm syncs run meanwhile.`, action: 'approve' };
@@ -226,6 +285,11 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'verifying':
       return { text: 'Verifying the destination VM: server state, ports, TCP probes and console.', action: null };
     case 'completed': {
+      // its finalize began deleting the source and a rollback is refused: finalizing again is the way out, also while the
+      // source runs again (SDD §8.1)
+      if (m.checkpoint === 'finalizing') {
+        return { text: 'The finalize began deleting the source VM. Next: finalize it again (approver); it can no longer be rolled back.', action: 'finalize' };
+      }
       if (m.source_running_at) {
         // the source watch saw it running (SDD §8.1): finalizing now would keep a diverged source
         return {
@@ -244,9 +308,17 @@ export function nextStep(m: Migration, plan: Plan | null | undefined, now: numbe
     case 'finalized':
       return { text: 'Finalized. The migration is done.', action: null };
     case 'failed':
-      return m.downtime_started_at && !m.downtime_ended_at
-        ? { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' }
-        : { text: 'Failed. Next: fix the cause and retry, or cancel.', action: 'retry' };
+      if (m.downtime_started_at && !m.downtime_ended_at) {
+        return { text: 'Failed after the source VM was stopped. Next: roll back to restart it, or fix the cause and retry.', action: 'rollback' };
+      }
+      if (m.cutover_refusals.length > 0 && m.error?.startsWith('cutover: ')) {
+        // SDD §16: the cutover's check refused what the passes found, before the source stopped
+        return {
+          text: "Failed: the cutover refused what the passes found, before the source stopped. Next: fix it, then retry — the retry's pass looks again — or cancel.",
+          action: 'retry',
+        };
+      }
+      return { text: 'Failed. Next: fix the cause and retry, or cancel.', action: 'retry' };
     case 'rolling_back':
       return { text: 'Rolling back: removing the destination VM and restarting the source.', action: null };
     case 'rolled_back':
@@ -264,7 +336,7 @@ function count(n: number, noun: string): string {
 }
 
 /** What validating the plan again would clear, e.g. "2 approvals and 1 cutover request"; null when nothing (SDD §5.4, §16). */
-export function clearedByValidation(migrations: readonly Migration[]): string | null {
+export function clearedByValidation(migrations: readonly MigrationLike[]): string | null {
   const touched = migrations.filter((m) => REVALIDATABLE.has(m.phase));
   const approvals = touched.reduce((n, m) => n + m.approvals.length, 0);
   const requests = touched.filter((m) => m.cutover_requested).length;

@@ -1,9 +1,10 @@
-import type { Migration, Plan, Role } from '../api/types';
+import type { MigrationLike, Plan, Role } from '../api/types';
+import { bulkFinalize, everySourceRunsText } from './finalize';
 import { blocksPlanChange, releaseGroups } from './inFlight';
 import { hasRole } from './roles';
 import { WAVE_COMPLETE_PHASES } from './waves';
 
-export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit' | 'finalize';
+export type PlanActionKey = 'validate' | 'waves' | 'start' | 'pause' | 'edit' | 'finalize' | 'cancel';
 
 export interface Availability {
   enabled: boolean;
@@ -12,6 +13,8 @@ export interface Availability {
 }
 
 const ROLE_REASON = 'Requires the operator role.';
+/** A migration that never started (SDD §12): Cancel plan cancels these; a cancelled one never counts as started. */
+const UNSTARTED = new Set(['pending', 'blocked', 'ready', 'cancelled']);
 
 /** Up to three names, then how many more. */
 function names(list: string[]): string {
@@ -24,7 +27,13 @@ function names(list: string[]): string {
  * plans (the API answers 409 while a migration is blocked or, in a plan with waves, belongs to no wave);
  * pause running plans.
  */
-export function planActions(plan: Plan, role: Role | undefined, migrations: Migration[]): Record<PlanActionKey, Availability> {
+export function planActions(plan: Plan, role: Role | undefined, migrations: readonly MigrationLike[]): Record<PlanActionKey, Availability> {
+  const finalizeGate = (): Availability => {
+    if (!hasRole(role, 'approver')) return { enabled: false, reason: 'Requires the approver role.' };
+    const queue = migrations.filter((m) => m.plan_id === plan.id && m.phase === 'completed');
+    if (queue.length === 0) return { enabled: false, reason: 'No VM awaits finalize.' };
+    return bulkFinalize(queue).finalizes.length > 0 ? { enabled: true, reason: null } : { enabled: false, reason: everySourceRunsText(queue) };
+  };
   const allowed = hasRole(role, 'operator');
   const gate = (ok: boolean, reason: string): Availability => {
     if (!allowed) return { enabled: false, reason: ROLE_REASON };
@@ -49,6 +58,27 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
         .map((m) => m.vm.name)
     : [];
 
+  // POST /plans/{id}/cancel (SDD §12) names each VM whose migration started, with its phase
+  const startedVms = migrations.filter((m) => m.plan_id === plan.id && !UNSTARTED.has(m.phase)).map((m) => `${m.vm.name} (${m.phase})`);
+  // ... and each VM whose source is stopped: a retry kept the open clock, and a cancel cannot restart it (SDD §5.1, §12)
+  const stoppedVms = migrations
+    .filter((m) => m.plan_id === plan.id && m.phase !== 'cancelled' && m.downtime_started_at && !m.downtime_ended_at)
+    .map((m) => m.vm.name);
+  const cancel = (): Availability => {
+    if (status === 'cancelled') return gate(false, 'The plan is cancelled.');
+    if (status === 'running') return gate(false, 'Pause the plan before cancelling it.');
+    if (startedVms.length) {
+      return gate(
+        false,
+        `Only a plan whose migrations have not started can be cancelled: ${names(startedVms)}. Cancel a failed or rolled-back migration on its own first.`,
+      );
+    }
+    if (stoppedVms.length) {
+      return gate(false, `The source VM is stopped after a failed cutover: ${names(stoppedVms)}. Cut it over before cancelling the plan.`);
+    }
+    return gate(true, '');
+  };
+
   const start = (): Availability => {
     // a plan whose migrations all ended is finished, whatever a re-validation stored (SDD §8.1, ADV-19)
     if (plan.derived_status === 'completed') return gate(false, 'The plan has completed: finalize or roll back its VMs.');
@@ -60,6 +90,8 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
         return gate(false, 'The plan is already running.');
       case 'completed':
         return gate(false, 'The plan has completed.');
+      case 'cancelled':
+        return gate(false, 'The plan is cancelled.');
       // 'failed': pre-staging failed; Start pre-stages the plan again (SDD §8)
       default:
         if (blocked > 0) {
@@ -78,8 +110,12 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
 
   return {
     validate: gate(
-      status !== 'running' && status !== 'completed',
-      status === 'running' ? 'Pause the plan before re-validating it.' : 'A completed plan cannot be re-validated.',
+      status !== 'running' && status !== 'completed' && status !== 'cancelled',
+      status === 'running'
+        ? 'Pause the plan before re-validating it.'
+        : status === 'cancelled'
+          ? 'A cancelled plan cannot be validated.'
+          : 'A completed plan cannot be re-validated.',
     ),
     // like the API (SDD §12): draft, validated or paused; the plan then returns to draft
     waves: gate(
@@ -90,16 +126,14 @@ export function planActions(plan: Plan, role: Role | undefined, migrations: Migr
     ),
     start: start(),
     pause: gate(status === 'running', 'Only a running plan can be paused.'),
-    // POST /plans/{id}/finalize (SDD §8.1): an approver, while a VM awaits finalize
-    finalize: !hasRole(role, 'approver')
-      ? { enabled: false, reason: 'Requires the approver role.' }
-      : migrations.some((m) => m.plan_id === plan.id && m.phase === 'completed')
-        ? { enabled: true, reason: null }
-        : { enabled: false, reason: 'No VM awaits finalize.' },
+    // POST /plans/{id}/finalize (SDD §8.1): an approver, while a VM awaits finalize whose source VM is stopped - it skips
+    // one whose source runs again
+    finalize: finalizeGate(),
     // PATCH /plans/{id} (SDD §12): only in draft or validated; saving returns the plan to draft
     edit: gate(
       (status === 'draft' || status === 'validated') && !busy,
       status === 'draft' || status === 'validated' ? (busy ?? '') : `Only a draft or validated plan can be edited (this one is ${status}).`,
     ),
+    cancel: cancel(),
   };
 }

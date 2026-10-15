@@ -429,6 +429,54 @@ async def test_a_destination_that_simulates_its_guests_answers_the_probes():
     assert result.passed is False and result.probes[0].target == "10.30.0.7:1521"
 
 
+async def test_a_destination_that_simulates_its_guests_answers_the_tcp_checks_too():
+    """Demo mode (SDD §7.4): the plan's TCP checks go to the simulated guest as its application
+    probes do - SSH answers, another port is refused - and no real connection is tried."""
+    from seamless_migrate.verification import ProbeAnswer
+
+    asked = []
+
+    class Simulated(Dest):
+        async def probe_service(self, server_id, vm, probe, address):
+            asked.append((probe.kind, probe.port, vm.guest_os.family))
+            if probe.port in (22, 3389):
+                return ProbeAnswer("passed", f"connected to {address}:{probe.port}", True)
+            if probe.port == 9999:
+                return ProbeAnswer("unreachable", f"{address}:{probe.port} unreachable", False)
+            return ProbeAnswer("failed", f"{address}:{probe.port} refused the connection", False)
+
+    async def no_network(host, port):
+        raise AssertionError(f"a real connection to {host}:{port}")
+
+    verifier = Verifier(Simulated(address="10.30.0.81"), Settings(), poll_s=0.01, probe=no_network)
+    linux = ctx(tcp_ports=[22, 8080, 9999], timeout_s=0)
+    result = await verifier.verify(linux)
+    checks = {c["name"]: (c["ok"], c["detail"]) for c in result.checks}
+    assert checks["tcp:22"] == (True, "connected to 10.30.0.81:22")
+    assert checks["tcp:8080"] == (False, "10.30.0.81:8080 refused the connection")
+    # unreached is not answered: a TCP check fails on it, as on a real timeout
+    assert checks["tcp:9999"] == (False, "10.30.0.81:9999 unreachable")
+    assert asked == [("tcp", 22, "linux"), ("tcp", 8080, "linux"), ("tcp", 9999, "linux")]
+    asked.clear()
+    windows = await verifier.verify(windows_ctx(tcp_ports=[22], windows_tcp_ports=[3389]))
+    assert {c["name"]: c["ok"] for c in windows.checks}["tcp:3389"] is True
+    assert asked == [("tcp", 3389, "windows")]
+
+
+async def test_without_its_vm_a_tcp_check_goes_to_the_address_itself(listener):
+    """The simulation answers for the VM it knows (SDD §7.4): a context without one probes the
+    address itself."""
+
+    class Simulated(Dest):
+        async def probe_service(self, server_id, vm, probe, address):
+            raise AssertionError("the simulation needs the VM")
+
+    plan = make_plan(verification=VerificationConfig(tcp_ports=[listener], timeout_s=0))
+    context = SimpleNamespace(plan=plan, migration=SimpleNamespace(destination_server_id="srv-9"))
+    result = await Verifier(Simulated(), Settings(), poll_s=0.01).verify(context)
+    assert {c["name"]: c["ok"] for c in result.checks}[f"tcp:{listener}"] is True
+
+
 async def test_demo_verification_runs_in_model_time():
     """SDD §7.5: in demo mode the timeout and the polling run divided by demo_speed."""
     clock = {"t": 0.0}

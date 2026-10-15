@@ -33,3 +33,7 @@
     client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
     client_key: "{{ os_migrate_src_client_key | default(omit) }}"
   loop: "{{ export_workloads_ids_names }}"
+  loop_control:
+    # the server id only: a name is the tenant's, and the control plane's failure classifier
+    # reads these lines (Seamless Migrate review RV7-02)
+    label: "{{ item['id'] }}"

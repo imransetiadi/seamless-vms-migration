@@ -9,15 +9,18 @@ const planWith = (status: PlanStatus): Plan => ({ ...base, status });
 const ready: Migration[] = fx.migrations.filter((m) => m.plan_id === base.id);
 
 // finalize needs a completed migration (and an approver): none of these has one
+// these migrations have not started: Cancel plan retires any plan that does not run (SDD §12)
 const EXPECTED: Record<PlanStatus, Record<PlanActionKey, boolean>> = {
-  draft: { validate: true, waves: true, start: false, pause: false, edit: true, finalize: false },
-  validated: { validate: true, waves: true, start: true, pause: false, edit: true, finalize: false },
-  running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false },
+  draft: { validate: true, waves: true, start: false, pause: false, edit: true, finalize: false, cancel: true },
+  validated: { validate: true, waves: true, start: true, pause: false, edit: true, finalize: false, cancel: true },
+  running: { validate: false, waves: false, start: false, pause: true, edit: false, finalize: false, cancel: false },
   // the API plans waves on a paused plan too, returning it to draft (SDD §12)
-  paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false },
-  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false },
+  paused: { validate: true, waves: true, start: true, pause: false, edit: false, finalize: false, cancel: true },
+  completed: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: true },
   // a plan fails when its pre-staging fails; Start pre-stages it again (SDD §8)
-  failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false },
+  failed: { validate: true, waves: false, start: true, pause: false, edit: false, finalize: false, cancel: true },
+  // terminal (SDD §12): nothing more is done with it
+  cancelled: { validate: false, waves: false, start: false, pause: false, edit: false, finalize: false, cancel: false },
 };
 
 describe('planActions', () => {
@@ -27,6 +30,29 @@ describe('planActions', () => {
       expect(actions[key].enabled, `${key} in ${status}`).toBe(enabled);
       if (!enabled) expect(actions[key].reason, `${key} in ${status}`).toBeTruthy();
     }
+  });
+
+  it('cancels a plan only while it does not run and none of its migrations started, naming those that did, as the API does (SDD §12)', () => {
+    expect(planActions(planWith('running'), 'operator', ready).cancel.reason).toBe('Pause the plan before cancelling it.');
+    expect(planActions(planWith('cancelled'), 'operator', ready).cancel.reason).toBe('The plan is cancelled.');
+    const started = ready.map((m, i) => (i === 0 ? { ...m, phase: 'failed' as const } : i === 1 ? { ...m, phase: 'cancelled' as const } : m));
+    const cancel = planActions(planWith('validated'), 'operator', started).cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toBe(`Only a plan whose migrations have not started can be cancelled: ${started[0]!.vm.name} (failed). Cancel a failed or rolled-back migration on its own first.`);
+    // a cancelled migration never counts as started
+    expect(planActions(planWith('validated'), 'operator', ready.map((m) => ({ ...m, phase: 'cancelled' as const }))).cancel.enabled).toBe(true);
+    expect(planActions(planWith('validated'), 'viewer', ready).cancel.reason).toBe('Requires the operator role.');
+  });
+
+  it('keeps Cancel plan unavailable while a migration that has not started has its source stopped, naming it to cut over first, as the API refuses it (SDD §12)', () => {
+    // a retry after a failed cutover keeps the open downtime clock (SDD §5.2), and a cancel cannot restart the source
+    const stopped = ready.map((m, i) => (i === 1 ? { ...m, phase: 'ready' as const, downtime_started_at: '2026-10-08T10:00:00Z', downtime_ended_at: null } : m));
+    const cancel = planActions(planWith('paused'), 'operator', stopped).cancel;
+    expect(cancel.enabled).toBe(false);
+    expect(cancel.reason).toBe(`The source VM is stopped after a failed cutover: ${stopped[1]!.vm.name}. Cut it over before cancelling the plan.`);
+    // a closed clock (the cutover ended, or a rollback restarted the source) does not hold it
+    const closed = stopped.map((m, i) => (i === 1 ? { ...m, downtime_ended_at: '2026-10-08T10:05:00Z' } : m));
+    expect(planActions(planWith('paused'), 'operator', closed).cancel.enabled).toBe(true);
   });
 
   it('asks to validate a draft before starting', () => {
@@ -134,6 +160,12 @@ describe('planActions', () => {
     expect(planActions(plan, 'operator', done).finalize).toEqual({ enabled: false, reason: 'Requires the approver role.' });
     const none = done.map((m) => ({ ...m, phase: 'finalized' as const }));
     expect(planActions(plan, 'approver', none).finalize).toEqual({ enabled: false, reason: 'No VM awaits finalize.' });
+    // a bulk finalize skips a VM whose source runs again (SDD §8.1, §16): with no other, it would finalize nothing
+    const runs = done.map((m, i) => (i === 0 ? { ...m, source_running_at: '2026-10-08T11:00:00Z' } : m));
+    expect(planActions(plan, 'approver', runs).finalize).toEqual({
+      enabled: false,
+      reason: `The source VM of ${runs[0]!.vm.name} runs again: stop it, or roll it back, before finalizing.`,
+    });
   });
 
   it('requires the operator role for every plan action', () => {

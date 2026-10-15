@@ -6,20 +6,22 @@ import {
   RefreshCw,
   RotateCcw,
   ThumbsUp,
-  TriangleAlert,
   Undo2,
   Zap,
   type LucideIcon,
 } from 'lucide-react';
 import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useMe, useMigrationAction, type MigrationActionRequest } from '../api/hooks';
 import { ACTION_TEXT_MAX, FORCE_REASON_MIN, type Migration, type Plan, type Role } from '../api/types';
+import { waitingDecision } from '../lib/advisor';
+import { buttonClassName } from '../lib/buttonStyles';
 import { cn } from '../lib/cn';
 import { forcedDowntime } from '../lib/forcedEstimate';
 import { formatBytes, formatDateTime, formatDuration } from '../lib/format';
 import { hasDataPath } from '../lib/fsm';
 import { isWarmStrategy } from '../lib/phase';
-import { MIGRATION_ACTION_ORDER, migrationActions, nextStep, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
+import { approveDialog, MIGRATION_ACTION_ORDER, migrationActions, nextStep, requestWaitsForApprover, waitsOnClosedWindow, type MigrationActionKey } from '../lib/migrationActions';
 import { Button } from './Button';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TextAreaField } from './Field';
@@ -85,6 +87,8 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const me = useMe().data?.name;
   const availability = migrationActions(m, role, plan, undefined, me);
   const fourEyes = Boolean(plan?.require_approval && plan.require_distinct_approver);
+  // a request or a force records the user's approval only without a distinct approver (SDD §5.4, §16)
+  const recordsApproval = plan?.require_distinct_approver === false;
   if (planUnavailable && availability.cutover.enabled) {
     availability.cutover = { enabled: false, reason: 'The plan could not be loaded: its cutover window and approval policy are unknown.' };
   } else if (planLoading && availability.cutover.enabled) {
@@ -94,7 +98,11 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const forcing = waitsOnClosedWindow(m, plan, Date.now());
   // a warm cutover requested before pre-copy converged starts once it does (SDD §5.4)
   const early = isWarmStrategy(m.strategy) && m.phase !== 'awaiting_cutover';
+  // maker-checker with no other approval: the request waits for another approver, it starts nothing (SDD §16)
+  const waitsForApprover = requestWaitsForApprover(m, plan, me);
   const step = nextStep(m, plan);
+  // the advisor's decision that holds the migration, when one does (SDD §14.6)
+  const waiting = waitingDecision(m);
   const action = useMigrationAction(m.id);
   const [open, setOpen] = useState<MigrationActionKey | null>(null);
   const [comment, setComment] = useState('');
@@ -151,6 +159,7 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
   const slo = plan ? formatDuration(plan.downtime_slo_s) : null;
   const closedWindow = !windowOpen(plan);
   const common = { pending: action.isPending, error: action.error, onCancel: close };
+  const approval = approveDialog(m, plan);
 
   // the actions available now first, the next step's first; the others in a quieter row (SDD §16)
   const offered = MIGRATION_ACTION_ORDER.filter((key) => key !== 'force-cutover' || isWarmStrategy(m.strategy));
@@ -182,6 +191,12 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         {step.text}
       </p>
       <div role="group" aria-label="Migration actions" className="flex flex-wrap items-center gap-2">
+        {waiting && (
+          // SDD §16: the decision the next step asks for comes first, ahead of the migration's own actions
+          <Link to={`/advisor/recommendations/${encodeURIComponent(waiting)}`} className={buttonClassName('primary', 'lg')}>
+            See the recommendation
+          </Link>
+        )}
         {available.map((key) => {
           const primary = key === step.action;
           const destructive = key === 'rollback' || key === 'cancel' || key === 'finalize';
@@ -229,8 +244,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         icon={ICON['approve']}
         subject={`Migration ${m.id}`}
         title={`Approve the cutover of ${m.vm.name}?`}
-        description={`Records your approval. The cutover still waits for a cutover request${plan?.auto_cutover ? ' (automatic in this plan)' : ''} and the window.`}
-        confirmLabel="Approve"
+        // what the approval leads to (SDD §5.4, §16): the one the gate waits for starts the cutover and stops the source
+        description={approval.description}
+        confirmLabel={approval.confirmLabel}
         onConfirm={() => submit({ action: 'approve', body: comment.trim() ? { comment: comment.trim() } : {} })}
       >
         {commentField}
@@ -242,24 +258,34 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         icon={ICON['cutover']}
         subject={`Migration ${m.id}`}
         title={
-          forcing ? `Let ${m.vm.name} cut over outside the window?` : early ? `Cut over ${m.vm.name} once pre-copy converges?` : `Cut over ${m.vm.name} now?`
+          forcing
+            ? `Let ${m.vm.name} cut over outside the window?`
+            : waitsForApprover
+              ? `Request the cutover of ${m.vm.name}?`
+              : early
+                ? `Cut over ${m.vm.name} once pre-copy converges?`
+                : `Cut over ${m.vm.name} now?`
         }
         description={
           <>
             {forcing && plan?.cutover_window
               ? `The cutover was requested and waits for the cutover window (${formatDateTime(plan.cutover_window.start)} → ${formatDateTime(plan.cutover_window.end)}). Confirming lets it start as soon as the plan, its wave and a free cutover slot allow. `
               : ''}
-            {early && !forcing
-              ? 'The cutover is requested now and starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. '
-              : ''}
-            {early && !forcing ? 'Then the' : 'The'} source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
+            {waitsForApprover && !forcing
+              ? `The cutover is requested now and starts once another approver approves it${early ? ' and pre-copy has converged' : ''}. `
+              : early && !forcing
+                ? 'The cutover is requested now and starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. '
+                : ''}
+            {(early || waitsForApprover) && !forcing ? 'Then the' : 'The'} source VM will be stopped and the downtime clock starts. Estimated downtime {estimate}
             {slo ? ` against an SLO of ${slo}` : ''}.{' '}
             {fourEyes
               ? 'Your request is not an approval: another approver approves the cutover. The migration can be rolled back until it is finalized.'
-              : 'This also records your approval; the migration can be rolled back until it is finalized.'}
+              : recordsApproval
+                ? 'This also records your approval; the migration can be rolled back until it is finalized.'
+                : 'The migration can be rolled back until it is finalized.'}
           </>
         }
-        confirmLabel={forcing ? 'Cut over outside the window' : early ? 'Request cutover' : 'Start cutover'}
+        confirmLabel={forcing ? 'Cut over outside the window' : early || waitsForApprover ? 'Request cutover' : 'Start cutover'}
         onConfirm={() =>
           submit({
             action: 'cutover',
@@ -267,6 +293,21 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
           })
         }
       >
+        {m.cutover_refusals.length > 0 && (
+          // the passes found what the cutover will refuse (SDD §7.2): requesting stays possible, the cutover's own
+          // check stops it before the source VM stops (SDD §16)
+          <div role="note" aria-label="Cutover will refuse" className="rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-sm">
+            <p className="font-medium">The last pass found what the cutover will refuse:</p>
+            <ul className="mt-1 list-disc pl-5">
+              {m.cutover_refusals.map((problem) => (
+                <li key={problem} className="wrap-break-word">
+                  {problem}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1 text-xs text-muted-foreground">Fix it first: otherwise the cutover stops at its check, while the source VM still runs.</p>
+          </div>
+        )}
         {closedWindow && !forcing && plan?.cutover_window && (
           <label htmlFor={forceId} className="flex min-h-11 cursor-pointer items-start gap-2.5 rounded-md border border-status-warning/40 bg-status-warning/10 p-2 text-sm">
             <input id={forceId} type="checkbox" className="mt-1 size-4 accent-accent" checked={forceWindow} onChange={(e) => setForceWindow(e.target.checked)} />
@@ -298,7 +339,9 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
             {slo ? (forced !== null && plan && forced > plan.downtime_slo_s ? `, over the SLO of ${slo}` : ` against an SLO of ${slo}`) : ''}.{' '}
             {fourEyes
               ? 'Another approver still approves the cutover; the window and a free cutover slot still apply.'
-              : 'This also records your approval; the window and a free cutover slot still apply.'}
+              : recordsApproval
+                ? 'This also records your approval; the window and a free cutover slot still apply.'
+                : 'The window and a free cutover slot still apply.'}
           </>
         }
         confirmLabel="Force cutover"
@@ -393,13 +436,6 @@ export function MigrationActions({ migration: m, plan, role, planUnavailable = f
         requireText={m.vm.name}
         onConfirm={() => submit({ action: 'finalize', body: { confirm: m.vm.name, delete_source: deleteSource } })}
       >
-        {m.source_running_at && (
-          // the source watch saw it running (SDD §8.1, ADV-19)
-          <p className="flex items-start gap-2 rounded-md border border-status-danger/40 bg-status-danger/10 p-2.5 text-sm text-foreground">
-            <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-danger" />
-            The source VM runs again: what it wrote since is not on RHOSO. Stop it, or roll it back instead.
-          </p>
-        )}
         <label htmlFor={deleteId} className="flex min-h-11 cursor-pointer items-start gap-2.5 text-sm">
           <input id={deleteId} type="checkbox" className="mt-1 size-4 accent-accent" checked={deleteSource} onChange={(e) => setDeleteSource(e.target.checked)} />
           <span>

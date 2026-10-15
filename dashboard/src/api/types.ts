@@ -48,11 +48,12 @@ export type Severity = (typeof SEVERITIES)[number];
 export const ROLES = ['viewer', 'operator', 'approver', 'admin'] as const;
 export type Role = (typeof ROLES)[number];
 
-export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed'] as const;
+/** `cancelled` retires a plan none of whose migrations started (SDD §12): terminal, nothing deleted. */
+export const PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'failed', 'cancelled'] as const;
 export type PlanStatus = (typeof PLAN_STATUSES)[number];
 
 /** The plan status every view shows (SDD §8.1, ADV-19): the lifecycle, told by the plan's migrations. */
-export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed'] as const;
+export const DERIVED_PLAN_STATUSES = ['draft', 'validated', 'running', 'paused', 'completed', 'finalized', 'failed', 'cancelled'] as const;
 export type DerivedPlanStatus = (typeof DERIVED_PLAN_STATUSES)[number];
 
 export const SYNC_PASS_KINDS = ['full', 'delta', 'final'] as const;
@@ -370,6 +371,8 @@ export interface Plan {
   status: PlanStatus;
   /** Read-only: from the plan and its migrations (SDD §8.1); every view shows it, never `status`. */
   derived_status: DerivedPlanStatus;
+  /** Read-only: how many of the plan's migrations are in each phase that has any; {} before the first validation (SDD §4, §8.1). */
+  migration_counts: Partial<Record<Phase, number>>;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -649,6 +652,11 @@ export interface Migration {
   force_cutover: ForceCutover | null;
   /** What the invariants found when it completed, one "CODE: text" each (SDD §5.5). */
   data_issues: string[];
+  /**
+   * What the last warm pass met that the cutover refuses before the source stops, one message each (SDD §7.2):
+   * each pre-copy or sync pass replaces it, a successful cutover empties it.
+   */
+  cutover_refusals: string[];
   /** Demo: the model seconds the simulated steps kept the source stopped, summed while the clock is open (SDD §5.2). */
   downtime_model_s: number | null;
   /** The last verification: its checks and application probe results (SDD §7.5, ADV-18). */
@@ -667,6 +675,56 @@ export interface Migration {
   created_at: Timestamp;
   updated_at: Timestamp;
 }
+
+/** The fields of a migration a {@link MigrationSummary} keeps, as the migration has them (SDD §4). */
+export const MIGRATION_SUMMARY_FIELDS = [
+  'id',
+  'plan_id',
+  'wave_id',
+  'vm',
+  'strategy',
+  'phase',
+  'phase_since',
+  'preflight_ran',
+  'eligible_strategies',
+  'progress_pct',
+  'estimate',
+  'actual_downtime_s',
+  'downtime_started_at',
+  'downtime_ended_at',
+  'approvals',
+  'cutover_requested',
+  'cutover_requested_by',
+  'force_cutover',
+  'force_window',
+  'advisor_hold',
+  'review_required',
+  'review_reason',
+  'error',
+  'source_running_at',
+  'findings',
+  'suggested_probes',
+  'cutover_refusals',
+  'created_at',
+  'updated_at',
+] as const;
+
+/**
+ * `GET /migrations?view=summary` (SDD §4, §12): the fields of a migration the Overview's and the plan page's lists
+ * read - no passes, all the estimates, notes, history or VM details. `phase_since` is the last phase change's time,
+ * when the phase it is in began, else the creation time; `preflight_ran` whether the history reaches ready or
+ * blocked; `eligible_strategies` the estimates' eligible strategies, in their order.
+ */
+export interface MigrationSummary
+  extends Pick<Migration, Exclude<(typeof MIGRATION_SUMMARY_FIELDS)[number], 'vm' | 'phase_since' | 'preflight_ran' | 'eligible_strategies'>> {
+  vm: Pick<VMRef, 'source_id' | 'name' | 'project'>;
+  phase_since: Timestamp;
+  preflight_ran: boolean;
+  eligible_strategies: Strategy[];
+}
+
+/** A migration or its summary: what a list page reads of either (SDD §4, §16). */
+export type MigrationLike = Migration | MigrationSummary;
 
 // ---------------------------------------------------------------------------------------------
 // §4.3 Event kinds
@@ -692,6 +750,7 @@ export const PERSISTED_EVENT_KINDS = [
   'migration.source_running',
   'migration.source_stopped',
   'plan.finalized',
+  'plan.cancelled',
   'migration.approved',
   'migration.action',
   'advisor.strategy',
@@ -835,12 +894,13 @@ export interface OrchestratorHealth {
 }
 
 export interface Health {
-  auth_disabled: boolean;
   status: 'ok' | 'degraded';
   version: string;
   demo: boolean;
   /** Demo mode's time compression (SDD §7.4): a wall second is this many model seconds; null outside demo mode. */
   demo_speed: number | null;
+  /** Authentication is off (SDD §13.1): every request is the anonymous admin, so no token is needed. */
+  auth_disabled: boolean;
   db: 'ok' | 'error';
   orchestrator: OrchestratorHealth;
 }
@@ -855,7 +915,7 @@ export interface UserCreated extends Me {
 }
 
 
-type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'created_at' | 'updated_at';
+type PlanServerFields = 'id' | 'waves' | 'status' | 'derived_status' | 'migration_counts' | 'created_at' | 'updated_at';
 type PlanRequired = 'name' | 'source_provider_id' | 'destination_provider_id' | 'vm_ids';
 
 /** Plan fields minus id/waves/status/created_at/updated_at; name, providers and vm_ids required. */
@@ -890,6 +950,8 @@ export interface MigrationListQuery {
   /** Page large plans: 1…5000 (default: every migration), creation order. */
   limit?: number;
   offset?: number;
+  /** `summary`: each migration as its {@link MigrationSummary} (SDD §12); not a filter. */
+  view?: 'full' | 'summary';
 }
 
 /** The latest passes `sync_passes` keeps after the first `plan.max_sync_passes` (SDD §5.4). */
@@ -1060,6 +1122,22 @@ export interface RecommendationPage {
   total: number;
   offset: number;
   limit: number;
+}
+
+/** Bounds and default of the `limit` `GET /advisor/notes` accepts (SDD §12). */
+export const ADVISOR_NOTES_LIMIT_MAX = 200;
+export const ADVISOR_NOTES_LIMIT_DEFAULT = 20;
+
+/** An advisor note with the migration it belongs to (SDD §12 `GET /advisor/notes`). */
+export interface AdvisorNoteEntry extends AdvisorNote {
+  migration_id: string;
+  plan_id: string;
+  vm_name: string;
+}
+
+/** `GET /advisor/notes`: every migration's notes but strategy notes, newest first (SDD §12). */
+export interface AdvisorNoteList {
+  items: AdvisorNoteEntry[];
 }
 
 /** Migration actions exposed as `POST /migrations/{id}/<action>` (SDD §12). */

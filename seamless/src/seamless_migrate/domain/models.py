@@ -830,6 +830,9 @@ class Migration(_Model):
     downtime_model_s: float | None = None
     #: invariant violations found when it completed (SDD §5.5)
     data_issues: list[str] = Field(default_factory=list)
+    #: what the last warm pass met that the cutover refuses before the source stops (SDD §7.2):
+    #: each pass replaces it, a successful cutover empties it
+    cutover_refusals: list[str] = Field(default_factory=list)
     #: the last verification: its checks and application probe results (SDD §7.5, ADV-18)
     verification: VerificationRecord | None = None
     #: the rules' probe suggestion at validation (SDD §9.6): runs only once added to the plan
@@ -851,6 +854,86 @@ class Migration(_Model):
             if est.strategy == strategy:
                 return est
         return None
+
+
+class SummaryVM(_Model):
+    """The VM of a migration summary: which one, by id and name, and its project (SDD §4)."""
+
+    source_id: str
+    name: str
+    project: str | None
+
+
+class MigrationSummary(_Model):
+    """A migration's fields that the Overview's and the plan page's lists read, as the Migration has
+    them (SDD §4, ``GET /migrations?view=summary``): no passes, all the estimates, notes, history or
+    VM details. ``phase_since`` is the last PhaseChange's time, when the phase it is in began, else
+    the creation time; ``preflight_ran`` whether the history reaches ready or blocked;
+    ``eligible_strategies`` the estimates' eligible strategies, in their order."""
+
+    id: str
+    plan_id: str
+    wave_id: str | None
+    vm: SummaryVM
+    strategy: Strategy
+    phase: Phase
+    phase_since: UTCDateTime
+    preflight_ran: bool
+    eligible_strategies: list[Strategy]
+    progress_pct: float
+    estimate: Estimate | None
+    actual_downtime_s: float | None
+    downtime_started_at: UTCDateTime | None
+    downtime_ended_at: UTCDateTime | None
+    approvals: list[Approval]
+    cutover_requested: bool
+    cutover_requested_by: str | None
+    force_cutover: ForceCutover | None
+    force_window: bool
+    advisor_hold: str | None
+    review_required: bool
+    review_reason: str | None
+    error: str | None
+    source_running_at: UTCDateTime | None
+    findings: list[Finding]
+    suggested_probes: list[AppProbe]
+    cutover_refusals: list[str]
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+
+    @classmethod
+    def of(cls, m: Migration) -> MigrationSummary:
+        return cls(
+            id=m.id,
+            plan_id=m.plan_id,
+            wave_id=m.wave_id,
+            vm=SummaryVM(source_id=m.vm.source_id, name=m.vm.name, project=m.vm.project),
+            strategy=m.strategy,
+            phase=m.phase,
+            phase_since=m.phase_history[-1].at if m.phase_history else m.created_at,
+            preflight_ran=any(c.to_phase in (Phase.ready, Phase.blocked) for c in m.phase_history),
+            eligible_strategies=[e.strategy for e in m.estimates if e.eligible],
+            progress_pct=m.progress_pct,
+            estimate=m.estimate,
+            actual_downtime_s=m.actual_downtime_s,
+            downtime_started_at=m.downtime_started_at,
+            downtime_ended_at=m.downtime_ended_at,
+            approvals=m.approvals,
+            cutover_requested=m.cutover_requested,
+            cutover_requested_by=m.cutover_requested_by,
+            force_cutover=m.force_cutover,
+            force_window=m.force_window,
+            advisor_hold=m.advisor_hold,
+            review_required=m.review_required,
+            review_reason=m.review_reason,
+            error=m.error,
+            source_running_at=m.source_running_at,
+            findings=m.findings,
+            suggested_probes=m.suggested_probes,
+            cutover_refusals=m.cutover_refusals,
+            created_at=m.created_at,
+            updated_at=m.updated_at,
+        )
 
 
 #: SDD §5.4: the latest passes sync_passes keeps after the first plan.max_sync_passes

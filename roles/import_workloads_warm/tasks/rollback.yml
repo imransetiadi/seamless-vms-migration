@@ -1,7 +1,10 @@
 ---
 # Rollback of a workload: delete the destination server recorded in the
 # warm state (and, with os_migrate_rollback_delete_dest_volumes, the
-# destination volumes and the warm state), then start the source server.
+# destination volumes, emptying the warm state - the file stays), then start
+# the source server -
+# unless os_migrate_rollback_start_source is false (the cleanup before a cold
+# cutover, which leaves the source as it is).
 - name: Read the warm state of the workload
   ansible.builtin.slurp:
     src: "{{ os_migrate_warm_state_dir }}/{{ item['_info']['id'] }}.json"
@@ -69,6 +72,7 @@
     dst_filters: "{{ os_migrate_dst_filters }}"
     timeout: "{{ os_migrate_timeout }}"
     conversion_host: "{{ os_migrate_dst_conversion_host_name }}"
+    delete_ports: "{{ os_migrate_rollback_delete_ports | bool }}"
   register: import_workloads_warm_rollback
 
 - name: Report destination volumes kept because another server uses them
@@ -90,6 +94,7 @@
     ca_cert: "{{ os_migrate_src_ca_cert | default(omit) }}"
     client_cert: "{{ os_migrate_src_client_cert | default(omit) }}"
     client_key: "{{ os_migrate_src_client_key | default(omit) }}"
+  when: os_migrate_rollback_start_source | bool
 
 - name: Report the rollback
   ansible.builtin.debug:
@@ -97,4 +102,5 @@
       {{ item['params']['name'] }}: destination server
       {{ import_workloads_warm_rollback.deleted_server_id | default('none', true) }} deleted,
       {{ import_workloads_warm_rollback.deleted_volume_ids | default([]) | length }}
-      destination volume(s) deleted, source server started.
+      destination volume(s) deleted, source server
+      {{ 'started' if os_migrate_rollback_start_source | bool else 'left as it was' }}.

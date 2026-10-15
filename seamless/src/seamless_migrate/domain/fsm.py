@@ -23,7 +23,9 @@ TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     P.completed: frozenset({P.finalized, P.rolling_back}),
     P.failed: frozenset({P.rolling_back, P.ready, P.cancelled}),
     P.rolling_back: frozenset({P.rolled_back, P.failed}),
-    P.rolled_back: frozenset({P.ready}),
+    # cancelled: a rolled-back VM dropped for good; the cancel cleans up the data path its rollback
+    # kept for a retry (SDD §5.1)
+    P.rolled_back: frozenset({P.ready, P.cancelled}),
     P.finalized: frozenset(),
     P.cancelled: frozenset(),
 }

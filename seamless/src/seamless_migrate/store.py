@@ -163,6 +163,21 @@ def _matches(value: Any, wanted: Any) -> bool:
     return value == wanted
 
 
+def _index_names(conn: sa.Connection) -> set[str]:
+    """The index names the store's tables have: on PostgreSQL those of the tables their names
+    resolve to through search_path, as every statement of the store does - not the current
+    schema's, which may be the role's own and hold no table (SDD §11); every one on SQLite."""
+    if conn.dialect.name == "postgresql":
+        query = sa.text(
+            "SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid"
+            " WHERE x.indrelid IN (to_regclass(:documents), to_regclass(:events))"
+        )
+        rows = conn.execute(query, {"documents": documents.name, "events": events.name})
+    else:
+        rows = conn.execute(sa.text("SELECT name FROM sqlite_master WHERE type = 'index'"))
+    return {row[0] for row in rows}
+
+
 class Store:
     """Synchronous store; see the module docstring."""
 
@@ -174,10 +189,14 @@ class Store:
     def create_schema(self) -> None:
         metadata.create_all(self.engine, checkfirst=True)
         # create_all skips the indexes of tables that already exist, and expression indexes
-        # cannot be reflected: CREATE INDEX IF NOT EXISTS is idempotent on SQLite and PostgreSQL
+        # cannot be reflected: add the missing ones by name. A complete schema takes no DDL -
+        # PostgreSQL lets only a table's owner run CREATE INDEX, even IF NOT EXISTS, and the
+        # application role need not own the tables (SDD §11, Security.md §9.4)
         with self.engine.begin() as conn:
+            existing = _index_names(conn)
             for index in (*documents.indexes, *events.indexes):
-                conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
+                if index.name not in existing:
+                    conn.execute(sa.schema.CreateIndex(index, if_not_exists=True))
 
     def dispose(self) -> None:
         self.engine.dispose()
@@ -254,12 +273,38 @@ class Store:
     ) -> int:
         now = _now()
         key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        # a versioned write is one statement; only a refused one reads what it found (SDD §11)
+        if expected_version == 0:
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        documents.insert().values(
+                            kind=kind,
+                            id=doc_id,
+                            version=1,
+                            data=data,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            except IntegrityError:
+                raise self._refused(kind, doc_id, expected_version) from None
+            return 1
+        if expected_version is not None:
+            with self.engine.begin() as conn:
+                result = conn.execute(
+                    documents.update()
+                    .where(key & (documents.c.version == expected_version))
+                    .values(version=expected_version + 1, data=data, updated_at=now)
+                )
+            if result.rowcount != 1:
+                raise self._refused(kind, doc_id, expected_version)
+            return expected_version + 1
+        # unconditional: the next version of whatever is stored (put() retries a race)
         try:
             with self.engine.begin() as conn:
                 row = conn.execute(sa.select(documents.c.version).where(key)).first()
                 if row is None:
-                    if expected_version not in (None, 0):
-                        raise ConflictError(f"{kind} {doc_id!r} does not exist")
                     conn.execute(
                         documents.insert().values(
                             kind=kind,
@@ -272,10 +317,6 @@ class Store:
                     )
                     return 1
                 current = int(row.version)
-                if expected_version is not None and current != expected_version:
-                    raise ConflictError(
-                        f"{kind} {doc_id!r} is at version {current}, expected {expected_version}"
-                    )
                 result = conn.execute(
                     documents.update()
                     .where(key & (documents.c.version == current))
@@ -286,6 +327,18 @@ class Store:
                 return current + 1
         except IntegrityError as exc:
             raise ConflictError(f"{kind} {doc_id!r} already exists") from exc
+
+    def _refused(self, kind: str, doc_id: str, expected_version: int) -> ConflictError:
+        """Why a versioned write found no row to write: the document is missing, or at another
+        version (SDD §11)."""
+        key = (documents.c.kind == kind) & (documents.c.id == doc_id)
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.select(documents.c.version).where(key)).first()
+        if row is None:
+            return ConflictError(f"{kind} {doc_id!r} does not exist")
+        return ConflictError(
+            f"{kind} {doc_id!r} is at version {int(row.version)}, expected {expected_version}"
+        )
 
     def get_versioned(self, kind: str, id_: str, model_cls: type[M]) -> tuple[M, int]:
         with self.engine.connect() as conn:
@@ -385,24 +438,24 @@ class Store:
                     out[row.id] = (int(row.version), model_cls.model_validate(row.data))
         return out
 
-    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
-        """Each plan's distinct migration phases (SDD §8.1, §11): one ``SELECT DISTINCT`` over the
-        indexed ``plan_id`` and ``phase`` expressions; no document is loaded or validated. A plan
-        without migrations is absent from the result."""
+    def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
+        """Each plan's migration phases with how many of its migrations are in each (SDD §8.1,
+        §11): one ``SELECT ... GROUP BY`` over the indexed ``plan_id`` and ``phase`` expressions; no
+        document is loaded or validated. A plan without migrations is absent from the result."""
         wanted = list(plan_ids)
         if not wanted:
             return {}
         plan_col = documents.c.data["plan_id"].as_string()
         phase_col = documents.c.data["phase"].as_string()
         query = (
-            sa.select(plan_col, phase_col)
-            .distinct()
+            sa.select(plan_col, phase_col, sa.func.count())
             .where(documents.c.kind == "migration", plan_col.in_(wanted))
+            .group_by(plan_col, phase_col)
         )
-        out: dict[str, set[Phase]] = {}
+        out: dict[str, dict[Phase, int]] = {}
         with self.engine.connect() as conn:
-            for plan_id, phase in conn.execute(query):
-                out.setdefault(plan_id, set()).add(Phase(phase))
+            for plan_id, phase, count in conn.execute(query):
+                out.setdefault(plan_id, {})[Phase(phase)] = int(count)
         return out
 
     def delete(self, kind: str, id_: str) -> None:
@@ -621,7 +674,7 @@ class AsyncStore:
     ) -> dict[str, tuple[int, M]]:
         return await asyncio.to_thread(self.sync.get_many, kind, ids, model_cls)
 
-    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, set[Phase]]:
+    async def plan_phases(self, plan_ids: Collection[str]) -> dict[str, dict[Phase, int]]:
         return await asyncio.to_thread(self.sync.plan_phases, plan_ids)
 
     async def delete(self, kind: str, id_: str) -> None:

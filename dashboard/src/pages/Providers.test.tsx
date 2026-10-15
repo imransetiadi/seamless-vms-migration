@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
-import { createTestServer, renderWithApp } from '../test/utils';
+import { createTestServer, recordScrolls, renderWithApp } from '../test/utils';
 import Providers from './Providers';
 
 // a key-shaped string without key material (write-only upload fixture)
@@ -13,10 +13,19 @@ function renderPage(token = 'admin', server = createTestServer()) {
 
 async function openAdd(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByRole('button', { name: /^add provider$/i }));
-  return screen.findByRole('dialog', { name: /connect a cloud/i });
+  return screen.findByRole('dialog', { name: /^add provider$/i });
 }
 
 describe('Providers page', () => {
+  it('names the add dialog as its button: the action keeps one name through its flow', async () => {
+    const user = userEvent.setup({ delay: null });
+    renderPage('admin');
+    await user.click(await screen.findByRole('button', { name: /^add provider$/i }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveAccessibleName('Add provider');
+    expect(within(dialog).getByRole('button', { name: 'Add provider' })).toBeInTheDocument();
+  });
+
   it('shows sources and destinations in the direction of the migration, with the sign-in state', async () => {
     renderPage('viewer');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
@@ -35,7 +44,7 @@ describe('Providers page', () => {
     expect(screen.getByRole('button', { name: /check all/i })).toHaveAttribute('aria-disabled', 'true');
     // viewers learn the actions exist but cannot use them
     expect(screen.getByRole('button', { name: /^add provider$/i })).toHaveAttribute('aria-disabled', 'true');
-    expect(within(rhosp).getByRole('button', { name: /^edit$/i })).toHaveAttribute('aria-disabled', 'true');
+    expect(within(rhosp).getByRole('button', { name: /^edit /i })).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('keeps Cancel focusable while the provider is saved, saying why (SDD §16)', async () => {
@@ -48,7 +57,7 @@ describe('Providers page', () => {
       wrapFetch: (mock) => (input, init) => ((init?.method ?? 'GET') === 'GET' ? mock(input, init) : new Promise<Response>(() => {})),
     });
     const rhosp = await screen.findByRole('article', { name: 'RHOSP 17.1 — DC1' });
-    await user.click(within(rhosp).getByRole('button', { name: 'Edit' }));
+    await user.click(within(rhosp).getByRole('button', { name: /^edit /i }));
     const dialog = await screen.findByRole('dialog');
     await user.click(within(dialog).getByRole('button', { name: 'Save' }));
     const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
@@ -57,12 +66,29 @@ describe('Providers page', () => {
     expect(cancel).toHaveAccessibleDescription('Wait for the request to finish.');
   });
 
+  it('names its provider on each card control: a list of the page controls never reads "Edit" three times (SDD §16)', async () => {
+    const server = createTestServer();
+    renderPage('admin', server);
+    await screen.findByRole('article', { name: server.providers[0]!.name });
+    expect(server.providers.length).toBeGreaterThan(1);
+    for (const provider of server.providers) {
+      const card = screen.getByRole('article', { name: provider.name });
+      // the visible label first, then the provider the card's heading shows
+      for (const verb of ['Check', 'Edit', 'Delete']) {
+        expect(within(card).getByRole('button', { name: `${verb} ${provider.name}` })).toHaveTextContent(new RegExp(`^${verb}`));
+      }
+      expect(within(card).getByRole('link', { name: `Inventory of ${provider.name}` })).toHaveAttribute('href', `/inventory/${provider.id}`);
+    }
+    for (const bare of ['Check', 'Edit', 'Delete']) expect(screen.queryByRole('button', { name: bare })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Inventory' })).not.toBeInTheDocument();
+  });
+
   it('shows Delete to non-admins as unavailable with the reason, like Edit (SDD §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('operator');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
     const rhosp = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
-    const remove = within(rhosp).getByRole('button', { name: /^delete$/i });
+    const remove = within(rhosp).getByRole('button', { name: /^delete /i });
     expect(remove).toHaveAttribute('aria-disabled', 'true');
     expect(remove).toHaveAccessibleDescription('Deleting a provider requires the admin role.');
     await user.click(remove);
@@ -325,7 +351,7 @@ describe('Providers page', () => {
     lab.credentials_secret = 'lab-openstack';
     renderPage('admin', server);
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
-    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
     const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
     expect(within(dialog).getByRole('radio', { name: 'Secret managed outside Seamless' })).toBeChecked();
     expect(within(dialog).getByLabelText(/^secret name/i)).toHaveValue('lab-openstack');
@@ -335,7 +361,7 @@ describe('Providers page', () => {
     const user = userEvent.setup({ delay: null });
     const { server } = renderPage();
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
-    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
     const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
     expect(within(dialog).getByRole('radio', { name: /vmware vcenter/i })).toHaveAttribute('aria-disabled', 'true');
     expect(within(dialog).getByLabelText(/^id/i)).toBeDisabled();
@@ -356,7 +382,7 @@ describe('Providers page', () => {
     const user = userEvent.setup({ delay: null });
     renderPage();
     const card = await screen.findByRole('article', { name: 'OpenStack Lab (2023.1)' });
-    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
     const dialog = await screen.findByRole('dialog', { name: /edit openstack lab/i });
     const current = within(dialog).getAllByRole('radio').find((r) => (r as HTMLInputElement).checked)!;
     const vmware = within(dialog).getByRole('radio', { name: /vmware vcenter/i });
@@ -381,7 +407,7 @@ describe('Providers page', () => {
     const locked = server.providers.find((p) => p.id === running.source_provider_id);
     renderPage('admin', server);
     const card = await screen.findByRole('article', { name: locked?.name });
-    await user.click(within(card).getByRole('button', { name: /^edit$/i }));
+    await user.click(within(card).getByRole('button', { name: /^edit /i }));
     const dialog = await screen.findByRole('dialog');
     await user.type(within(dialog).getByLabelText(/^name/i), ' (renamed)');
     await user.click(within(dialog).getByRole('button', { name: /^save$/i }));
@@ -424,6 +450,33 @@ describe('Providers page', () => {
     await waitFor(() => expect(added()[0]?.credentials_updated_at).not.toBeNull());
     expect(added()).toHaveLength(1);
     expect(JSON.stringify(server.providers)).not.toContain('Hunter2-secret');
+  });
+
+  it('scrolls a failed save into view: the long form would keep it out of sight (SDD §16)', async () => {
+    const recorder = recordScrolls();
+    try {
+      const user = userEvent.setup({ delay: null });
+      const server = createTestServer();
+      // the credentials step fails (e.g. the secret store cannot be written)
+      const target = server as unknown as { setCredentials: (...args: unknown[]) => unknown };
+      target.setCredentials = () => {
+        throw new Error('secret store unavailable');
+      };
+      renderPage('admin', server);
+      const dialog = await openAdd(user);
+      await user.click(within(dialog).getByRole('radio', { name: /kolla-ansible/i }));
+      await user.type(within(dialog).getByLabelText(/^name/i), 'Kolla Lab D');
+      await user.type(within(dialog).getByLabelText(/keystone url/i), 'https://kolla-d.example.com:5000/v3');
+      await user.type(within(dialog).getByLabelText(/^user name/i), 'svc-migrate');
+      await user.type(within(dialog).getByLabelText(/^password/i), 'Hunter2-secret');
+      await user.type(within(dialog).getByLabelText(/^project$/i), 'admin');
+      await user.click(within(dialog).getByRole('button', { name: /^add and test connection$/i }));
+      const alert = await within(dialog).findByRole('alert');
+      expect(alert).toHaveTextContent(/not all changes were saved/i);
+      expect(recorder.scrolls.map((s) => s.element)).toContain(alert);
+    } finally {
+      recorder.restore();
+    }
   });
 
   it('after a connection test that did not pass, Edit again fixes the added provider instead of adding it again (SDD §16)', async () => {
@@ -473,20 +526,19 @@ describe('Providers page', () => {
     await waitFor(() => expect(within(form).getByLabelText(/^name/i)).toHaveFocus());
   });
 
-  it('names the plans that still need a provider when its deletion is refused (SDD §12)', async () => {
+  it('does not offer Delete while plans still need the provider, and says which (SDD §12, §16)', async () => {
     const user = userEvent.setup({ delay: null });
     renderPage('admin');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
     const card = within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' });
-    await user.click(within(card).getByRole('button', { name: /^delete$/i }));
-    const dialog = await screen.findByRole('alertdialog', { name: /delete rhosp 17\.1/i });
-    // what happens, row by row (SDD §16)
-    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then plans that use it keep it until they finish and their VMs are finalized, as a rollback needs it');
-    await user.type(within(dialog).getByLabelText(/type rhosp17-dc1 to confirm/i), 'rhosp17-dc1');
-    await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
-    const refusal = await within(dialog).findByRole('alert');
-    expect(refusal).toHaveTextContent('plan-4f2a9c1e ("DC1 → RHOSO production rollout", running)');
-    expect(within(from).getByRole('article', { name: 'RHOSP 17.1 — DC1' })).toBeInTheDocument();
+    const remove = within(card).getByRole('button', { name: /^delete /i });
+    await waitFor(() => expect(remove).toHaveAttribute('aria-disabled', 'true'));
+    // as the API refuses it: the plans neither completed nor cancelled, a completed one whose VMs are not finalized
+    expect(remove).toHaveAccessibleDescription(
+      'Plans still need it: “DC1 → RHOSO production rollout” (running), “Shared Ceph handover — analytics” (validated), “Pilot — static content” (1 VM not finalized) and 1 more. A plan needs its providers until it completes and its VMs are finalized.',
+    );
+    await user.click(remove);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
   it('moves the focus to the column heading once a deleted provider is gone (SDD §16)', async () => {
@@ -494,8 +546,10 @@ describe('Providers page', () => {
     renderPage('admin');
     const from = await screen.findByRole('region', { name: 'Migrate from' });
     const card = within(from).getByRole('article', { name: 'Kolla Edge (Bobcat)' });
-    await user.click(within(card).getByRole('button', { name: /^delete$/i }));
+    await user.click(within(card).getByRole('button', { name: /^delete /i }));
     const dialog = await screen.findByRole('alertdialog', { name: /delete kolla edge/i });
+    // what happens, row by row (SDD §16): no plan needs it any more
+    expect(within(dialog).getByRole('list', { name: 'What happens' })).toHaveTextContent('Then finished plans keep its id: none of them needs it any more');
     await user.type(within(dialog).getByLabelText(/type kolla-edge to confirm/i), 'kolla-edge');
     await user.click(within(dialog).getByRole('button', { name: /^delete provider$/i }));
     await waitFor(() => expect(within(from).queryByRole('article', { name: 'Kolla Edge (Bobcat)' })).not.toBeInTheDocument());

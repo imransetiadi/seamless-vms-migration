@@ -23,7 +23,7 @@ from seamless_migrate.executors.base import StepName, StepResult
 from seamless_migrate.executors.simulated import SimulatedExecutor
 from seamless_migrate.orchestrator import Orchestrator
 from seamless_migrate.planning.preflight import DestinationInventory, SourceInventory
-from seamless_migrate.providers.base import ProviderError
+from seamless_migrate.providers.base import VMNotFound
 from seamless_migrate.store import Store
 
 
@@ -39,7 +39,7 @@ class StaticSource:
 
     async def get_vm(self, source_id: str) -> VMRef:
         if source_id not in self.vms:
-            raise ProviderError(f"VM {source_id} not found")
+            raise VMNotFound(f"VM {source_id} not found")  # SDD §10
         return self.vms[source_id].model_copy(deep=True)
 
     async def inventory(self) -> SourceInventory:

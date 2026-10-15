@@ -1,10 +1,10 @@
 import { CircleAlert, TriangleAlert } from 'lucide-react';
 import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useCreatePlan, useInventory, useMigrations, usePatchPlan, usePlans, useProviders } from '../api/hooks';
+import { useCreatePlan, useInventory, useMigrationSummaries, usePatchPlan, usePlans, useProviders } from '../api/hooks';
 import { useRole } from '../api/session';
 import { isDestinationInventory, PLAN_DESCRIPTION_MAX, PLAN_NAME_MAX, type Plan, type PlanCreate, type PlanPatch, type ProviderKind, type SelectionPolicy, type Strategy } from '../api/types';
-import { heldElsewhere } from '../lib/holds';
+import { heldElsewhere, holdersOf } from '../lib/holds';
 import { parseDrafts, toDraft, type ProbeDraft } from '../lib/probes';
 import { formatMappings, parseMappings } from '../lib/mappings';
 import { hasRole } from '../lib/roles';
@@ -293,9 +293,11 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const inventory = useInventory(form.sourceId || undefined);
-  // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing
+  // VMs another plan's migration holds: validation refuses them (SDD §5.4), so say so while choosing - read only while
+  // the form is open: the page behind it reads no migration (SDD §16)
   const plans = usePlans();
-  const migrations = useMigrations();
+  // which VMs another plan holds: the migrations as summaries, read while open (SDD §5.4, §16)
+  const migrations = useMigrationSummaries({}, { enabled: open });
 
   useEffect(() => {
     if (!open) return;
@@ -354,6 +356,10 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
   // the check needs every plan and migration: without them it is unknown, not "none held" (SDD §16)
   const plansUnknown = Boolean(plans.error) && !plans.data;
   const migrationsUnknown = Boolean(migrations.error) && !migrations.data;
+  // the plan that holds each VM, named in the VM table before any is picked (SDD §16): the plan being edited never
+  // holds its own; unknown, not free, while the plans or migrations fail
+  const holders =
+    plansUnknown || migrationsUnknown ? null : plans.data && migrations.data ? holdersOf(form.sourceId, plans.data, migrations.data, plan?.id) : undefined;
   const sourceStorage = source ? storageBackends(source.capabilities) : [];
   const destinationStorage = destination ? storageBackends(destination.capabilities) : [];
   const typeFamilies = volumeTypeFamilies(selectedVms, sourceStorage);
@@ -699,6 +705,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
                 onSelectedChange={(next) => set('vmIds', next)}
                 caption={`VMs on ${source.name}`}
                 pageSize={25}
+                holders={holders}
               />
             )}
             {form.vmIds.size > 0 && (plansUnknown || migrationsUnknown) && (
@@ -1186,7 +1193,7 @@ export function PlanCreateDialog({ open, onClose, initialSourceId, initialVmIds,
             </div>
           </details>
 
-          {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} />}
+          {saving.error && <ErrorBanner error={saving.error} title={plan ? 'The plan was not saved' : 'The plan was not created'} reveal />}
         </div>
 
         <div className="flex flex-col-reverse gap-2 border-t border-border bg-card px-5 py-3 sm:flex-row sm:justify-end">

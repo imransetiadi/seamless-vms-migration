@@ -218,7 +218,7 @@ describe('axe-core: no WCAG violations', () => {
     await screen.findByRole('heading', { level: 1, name: 'Providers' }, { timeout: 8_000 });
     await settled();
     await user.click(screen.getByRole('button', { name: /^add provider$/i }));
-    const dialog = await screen.findByRole('dialog', { name: /connect a cloud/i });
+    const dialog = await screen.findByRole('dialog', { name: /^add provider$/i });
     await user.click(within(dialog).getByRole('radio', { name: /application credential/i }));
     await user.click(within(dialog).getByRole('button', { name: /configure/i }));
     await user.click(within(dialog).getByRole('checkbox', { name: /let seamless deploy/i }));

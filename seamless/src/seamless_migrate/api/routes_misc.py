@@ -18,6 +18,8 @@ from ..stats import Stats, compute_stats
 from ..store import NotFound
 from .deps import ApiError, metrics_access, require_role, services
 from .schemas import (
+    AdvisorNoteEntry,
+    AdvisorNoteList,
     AdvisorStatus,
     DataSentList,
     DemoPowerRequest,
@@ -69,11 +71,11 @@ async def _health(request: Request) -> Health:
     db_ok = await asyncio.to_thread(svc.store.ping)
     orchestrator = svc.orchestrator.health()
     return Health(
-        auth_disabled=svc.settings.auth_disabled,
         status="ok" if db_ok and orchestrator["healthy"] else "degraded",
         version=__version__,
         demo=svc.settings.demo,
         demo_speed=svc.settings.demo_speed if svc.settings.demo else None,
+        auth_disabled=svc.settings.auth_disabled,
         db="ok" if db_ok else "error",
         orchestrator=orchestrator,
     )
@@ -173,6 +175,28 @@ async def get_recommendation(
             raise NotFound("recommendation", rec_id)
         return found
     return await svc.db.get("recommendation", rec_id, AdvisorRecommendation)
+
+
+@router.get("/advisor/notes", response_model=AdvisorNoteList)
+async def list_advisor_notes(
+    request: Request,
+    limit: int = Query(20, ge=1, le=200),
+    _: Principal = Depends(require_role(Role.viewer)),
+) -> AdvisorNoteList:
+    """Every migration's advisor notes but strategy notes - those are listed as legacy
+    recommendations (SDD §14.4) -, newest first: the Advisor page reads no migration list (SDD §12,
+    §16). Notes of the same time keep the migrations' creation order and each one's note order."""
+    entries = [
+        AdvisorNoteEntry(
+            **note.model_dump(), migration_id=m.id, plan_id=m.plan_id, vm_name=m.vm.name
+        )
+        for m in await services(request).all_documents("migration", Migration)
+        for note in m.advisor_notes
+        if note.kind != "strategy"
+    ]
+    # a stable sort: equal times keep the order above
+    entries.sort(key=lambda entry: entry.created_at, reverse=True)
+    return AdvisorNoteList(items=entries[:limit])
 
 
 @router.get("/advisor/snapshots/{sha256}", response_model=AdvisorSnapshot)

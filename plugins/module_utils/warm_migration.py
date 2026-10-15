@@ -41,7 +41,9 @@ from ansible_collections.os_migrate.os_migrate.plugins.module_utils.volume_commo
     OpenStackVolumeBase,
     RemoteShell,
     destination_volume_sdk_params,
+    detach_volume_bounded,
     use_lock,
+    volume_or_none,
 )
 
 BOOT_DEVICE = "/dev/vda"
@@ -165,6 +167,19 @@ class WarmState:
             except OSError:
                 pass
             raise
+        # the directory too, so the rename outlives a crash: a rollback reads
+        # here what to delete (Seamless Migrate SDD 6.3); a filesystem that
+        # cannot sync a directory - some network or FUSE mounts - keeps the file
+        try:
+            directory = os.open(self.state_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as err:
+            logging.getLogger("osp-osp").warning(
+                "Could not sync %s after writing the warm state: %s", self.state_dir, err
+            )
 
     def delete(self):
         try:
@@ -339,8 +354,8 @@ class _WarmVolumeBase(OpenStackVolumeBase):
         self._progress_lock = threading.Lock()
 
     def _wait_detached(self, volume_id, side):
-        for _ in range(self.timeout):
-            volume = self.conn.get_volume_by_id(volume_id)
+        for second in range(self.timeout):
+            volume = volume_or_none(self.conn, volume_id)
             if volume is None or not self._volume_still_attached(volume, self._converter()):
                 return
             time.sleep(1)
@@ -356,9 +371,7 @@ class _WarmVolumeBase(OpenStackVolumeBase):
             if volume is None or not self._volume_still_attached(volume, converter):
                 continue
             self.log.info("Detaching volume %s from the %s conversion host", volume_id, side)
-            self.conn.detach_volume(
-                server=converter, volume=volume, wait=True, timeout=self.timeout
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             self._wait_detached(volume_id, side)
 
     def _forget_transfer(self, shell, transfer_uuid):
@@ -569,7 +582,7 @@ class OpenstackWarmSnapshot(_WarmVolumeBase):
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_tmp_volumes(self):
         self._detach_from_converter(
-            [entry.get("tmp_volume_id") for _, entry in sorted(self.volume_map.items())],
+            [self.volume_map[dev].get("tmp_volume_id") for dev in sorted(self.volume_map)],
             "source",
         )
 
@@ -1004,6 +1017,10 @@ class OpenstackWarmSync(_WarmVolumeBase):
             raise first_failure
 
 
+#: what the state file keeps of a destination volume (SDD 6.3)
+RECORDED_VOLUME_KEYS = ("dest_id", "size", "bootable", "name")
+
+
 def record_destination_server(state_dir, server_id, destination_server_id, server_name=None):
     """Record the destination server created for ``server_id`` (cutover)."""
     state = WarmState.load(state_dir, server_id)
@@ -1014,19 +1031,52 @@ def record_destination_server(state_dir, server_id, destination_server_id, serve
     return state
 
 
+def record_destination_volumes(state_dir, server_id, volume_map, server_name=None):
+    """Record the destination volumes a cold transfer created for ``server_id`` (SDD 6.3): each
+    device of ``volume_map`` with a ``dest_id``, with its size, bootable flag and name as the warm
+    path records its volumes, keeping what the state file already holds. A cold retry never
+    reuses them, so a cold rollback deletes exactly these (SDD 7). Returns whether the file
+    changed and the recorded volume ids; a map with no created volume writes nothing."""
+    created = dict(
+        (dev, dict((key, entry[key]) for key in RECORDED_VOLUME_KEYS if key in entry))
+        for dev, entry in (volume_map or {}).items()
+        if isinstance(entry, dict) and entry.get("dest_id")
+    )
+    if not created:
+        return False, []
+    state = WarmState.load(state_dir, server_id)
+    changed = False
+    for dev, recorded in sorted(created.items()):
+        if state.dest_volumes.get(dev) != recorded:
+            state.dest_volumes[dev] = recorded
+            changed = True
+    if server_name and not state.server_name:
+        state.server_name = server_name
+        changed = True
+    if changed:
+        state.save()
+    return changed, sorted(entry["dest_id"] for entry in created.values())
+
+
 class WarmRollback:
     """Destination-side rollback of one workload (SDD 6.5).
 
-    Deletes the destination server recorded in the warm state (or, with
-    ``match_by_name``, the only destination server with exactly the
-    workload's name, for workloads migrated without a warm state), then the
-    destination ports created through Neutron for ``source_port_ids`` - Nova
-    keeps them when it deletes their server, and a cutover can fail between
-    creating them and creating the server (SDD 6.6). With
-    ``delete_volumes`` it also deletes the destination volumes - the
-    recorded ones and every volume attached to that server - and the warm
-    state itself; the state is kept while a source snapshot is pending so
-    its temporary resources can still be cleaned up.
+    Deletes the destination server recorded in the warm state - or, when
+    none is recorded or Nova no longer has the recorded one, the single
+    server named like the workload that holds a recorded volume, built from
+    them though Nova's answer to its create was lost; with ``match_by_name``
+    and no state file at all (a workload migrated before anything was
+    recorded for it), the only destination server with exactly the
+    workload's name (SDD 6.4) - then the destination ports created through
+    Neutron for ``source_port_ids`` - Nova keeps them when it deletes their
+    server, and a cutover can fail between creating them and creating the
+    server (SDD 6.6). With ``delete_volumes`` it also deletes the
+    destination volumes - the recorded ones, or without a state file every
+    volume attached to that server - and empties the warm state: the file
+    stays, holding no volume, pass or server, as the sign that the
+    workload's migration recorded it, and a pending source snapshot's
+    record stays so its temporary resources can still be cleaned up (SDD
+    6.3).
     """
 
     def __init__(
@@ -1059,10 +1109,12 @@ class WarmRollback:
             "deleted_volume_ids": [],
             "kept_volume_ids": [],
             "deleted_port_ids": [],
-            "state_deleted": False,
+            "state_cleared": False,
         }
         recorded = self.state.exists()
-        volume_ids = [entry["dest_id"] for _, entry in sorted(self.state.dest_volumes.items())]
+        volume_ids = [
+            self.state.dest_volumes[dev]["dest_id"] for dev in sorted(self.state.dest_volumes)
+        ]
         # With a warm state its volumes are the migration's; another volume attached to the
         # destination server (e.g. by an operator after the cutover) is kept (SDD 6.5). Without
         # one (cold) the destination server's attachments are the migration's.
@@ -1105,20 +1157,22 @@ class WarmRollback:
             if recorded:
                 self.state.save()
         if recorded:
-            if self.state.pending_snapshot is None:
-                self.state.delete()
-                result["state_deleted"] = True
-            else:
+            if self.state.pending_snapshot is not None:
                 self.log.warning(
-                    "Keeping the warm state of %s: its source snapshot of transfer %s "
+                    "Keeping the pending snapshot of %s: its source snapshot of transfer %s "
                     "still has to be cleaned up",
                     self.state.server_id,
                     self.state.pending_snapshot.get("transfer_uuid"),
                 )
+            # emptied, never removed: the file is the sign that the workload's migration recorded
+            # it, so no later rollback takes a same-named server it does not record for the
+            # migration's (SDD 6.3, 6.4)
+            if self.state.dest_volumes or self.state.passes:
                 self.state.dest_volumes = {}
                 self.state.passes = []
                 self.state.save()
-            result["changed"] = True
+                result["changed"] = True
+            result["state_cleared"] = True
         return result
 
     def _delete_ports(self, deleted_server_id):
@@ -1143,10 +1197,18 @@ class WarmRollback:
 
     def _find_destination_server(self):
         if self.state.destination_server_id:
-            return self.conn.compute.find_server(
+            recorded = self.conn.compute.find_server(
                 self.state.destination_server_id, ignore_missing=True
             )
+            if recorded is not None:
+                return recorded
+        if self.state.exists():
+            # no server recorded, or the recorded one is gone - deleted since, while a re-run's
+            # create whose answer was lost left its id recorded: Nova may have accepted a create
+            # whose answer never arrived (SDD 6.4, review RV3-06, RV4-04)
+            return self._server_built_from_recorded_volumes()
         if not (self.match_by_name and self.server_name):
+            # the name serves only a workload migrated before anything was recorded for it
             return None
         # Nova filters names by regular expression; compare exactly as well.
         candidates = [
@@ -1163,6 +1225,31 @@ class WarmRollback:
             )
         return candidates[0] if candidates else None
 
+    def _server_built_from_recorded_volumes(self):
+        """The single server named like the workload that holds one of the recorded volumes,
+        attached through Nova and not to the destination conversion host: built from them, it is
+        the migration's own; a same-named server holding none of them is another one (SDD 6.4)."""
+        if not self.server_name:
+            return None
+        holders = set()
+        for entry in self.state.dest_volumes.values():
+            volume = volume_or_none(self.conn, entry["dest_id"])
+            for attachment in getattr(volume, "attachments", None) or []:
+                holder = self.conn.get_server_by_id(attachment["server_id"])
+                if holder is None or self._is_conversion_host(holder):
+                    continue
+                if holder.name == self.server_name:
+                    holders.add(holder.id)
+        if len(holders) > 1:
+            raise RuntimeError(
+                "Several destination servers named %s hold the volumes recorded for %s (%s); "
+                "refusing to guess"
+                % (self.server_name, self.state.server_id, ", ".join(sorted(holders)))
+            )
+        if not holders:
+            return None
+        return self.conn.compute.find_server(holders.pop(), ignore_missing=True)
+
     def _is_conversion_host(self, holder):
         return self.conversion_host is not None and self.conversion_host in (
             holder.id,
@@ -1172,12 +1259,17 @@ class WarmRollback:
     def _delete_volume(self, volume_id):
         """True when deleted, False when already gone, None when kept because
         another server than the destination conversion host still uses it."""
-        volume = self.conn.get_volume_by_id(volume_id)
+        volume = volume_or_none(self.conn, volume_id)
         if volume is None:
             return False
-        for _ in range(self.timeout):
-            volume = self.conn.get_volume_by_id(volume_id)
+        for second in range(self.timeout):
+            volume = volume_or_none(self.conn, volume_id)
             if volume is None:
+                return False
+            if getattr(volume, "status", None) == "deleting":
+                # Cinder deletes it already - the boot volume Nova deletes with its server
+                # (delete_on_termination): a second DELETE is refused (SDD 6.4)
+                self._wait_gone(volume_id)
                 return False
             if not volume.attachments:
                 break
@@ -1199,12 +1291,30 @@ class WarmRollback:
                     )
                     return None
                 self.log.info("Detaching volume %s from %s", volume_id, holder.id)
-                self.conn.detach_volume(
-                    server=holder, volume=volume, wait=True, timeout=self.timeout
-                )
+                detach_volume_bounded(self.conn, holder, volume, self.timeout)
             time.sleep(1)
         else:
             raise RuntimeError("Volume %s is still attached, cannot delete it" % volume_id)
         self.log.info("Deleting destination volume %s", volume_id)
-        self.conn.delete_volume(name_or_id=volume_id, wait=True, timeout=self.timeout)
+        try:
+            self.conn.delete_volume(name_or_id=volume_id, wait=True, timeout=self.timeout)
+        except Exception:  # pylint: disable=broad-except
+            # Nova may have begun deleting it since the read above: then it is going anyway
+            volume = volume_or_none(self.conn, volume_id)
+            if volume is None:
+                return False
+            if getattr(volume, "status", None) != "deleting":
+                raise
+            self._wait_gone(volume_id)
+            return False
         return True
+
+    def _wait_gone(self, volume_id):
+        """Wait until a volume Cinder is deleting is gone (SDD 6.4)."""
+        for second in range(self.timeout):
+            if volume_or_none(self.conn, volume_id) is None:
+                return
+            time.sleep(1)
+        raise RuntimeError(
+            "Volume %s is still being deleted after %s s" % (volume_id, self.timeout)
+        )

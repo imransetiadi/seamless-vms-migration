@@ -120,6 +120,25 @@ function Alerts({ m }: { m: Migration }) {
           </p>
         </div>
       )}
+      {m.cutover_refusals.length > 0 && (
+        // what the last warm pass met that the cutover refuses before the source stops (SDD §7.2, §16)
+        <div role="note" aria-label="Cutover will refuse" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
+          <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />
+          <div className="min-w-0 text-foreground">
+            <p>
+              <strong className="font-semibold">The cutover will refuse this before the source stops.</strong> Fix it first: the next pass looks
+              again, and the cutover checks before it stops the source VM.
+            </p>
+            <ul className="mt-1 list-disc pl-5">
+              {m.cutover_refusals.map((problem) => (
+                <li key={problem} className="wrap-break-word">
+                  {problem}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
       {waiting && (
         <div role="status" className="flex items-start gap-2 rounded-md border border-status-warning/40 bg-status-warning/10 p-3 text-sm">
           <Hourglass aria-hidden className="mt-0.5 size-4 shrink-0 text-status-warning" />

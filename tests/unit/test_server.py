@@ -856,3 +856,75 @@ class TestServerDstNetworkCheck(unittest.TestCase):
         self.assertIn("port p1 on network 'app'", mac)
         self.assertIn("already has MAC fa:16:3e:00:00:01", mac)
         self.assertEqual(self.errors([network_port("p1", "app", app)], mode="nova"), [])
+
+    def test_a_pass_reports_the_ports_and_floating_ips_as_warnings(self):
+        """SDD 6.6: a warm pre-copy or sync pass makes no port or floating IP, so its check
+        (network_as_warnings) reports their problems as warnings and fails only on the server's
+        own prerequisites; the cutover's check, the default, refuses them before the source
+        stops (review NC-07)."""
+        from ansible_collections.os_migrate.os_migrate.plugins.modules import (
+            import_workload_dst_check as check,
+        )
+
+        data = {
+            "type": "openstack.compute.Server",
+            "params": {
+                "name": "web-01",
+                "key_name": None,
+                "flavor_ref": {"name": "m1", "project_name": None, "domain_name": None},
+                "image_ref": None,
+                "security_group_refs": [],
+                "ports": [
+                    network_port("ok", "app", [{"ip_address": "10.0.0.5"}]),
+                    network_port(
+                        "lost", "gone", [{"ip_address": "10.0.0.6"}], mac="fa:16:3e:00:00:02"
+                    ),
+                ],
+                "floating_ips": [floating_ip("172.20.9.135", network="gone")],
+                "volumes": [],
+            },
+            "_info": {"id": "srv"},
+            "_migration_params": {"data_copy": True, "boot_disk_copy": True},
+        }
+
+        def run(**args):
+            result = fake.run_module(check, dict({"cloud": "dst", "data": data}, **args), self.dst)
+            # ansible-core 2.19 and later return a warning as a summary of its event
+            warned = [
+                w if isinstance(w, str) else w["event"]["msg"]
+                for w in result.get("warnings") or []
+            ]
+            return result, warned
+
+        cutover, warned = run()
+        self.assertTrue(cutover.get("failed"), cutover)
+        self.assertIn("port lost on network 'gone'", cutover["msg"])
+        self.assertIn("floating IP 172.20.9.135 on network 'gone'", cutover["msg"])
+        self.assertEqual(warned, [])
+
+        passing, warned = run(network_as_warnings=True)
+        self.assertFalse(passing.get("failed"), passing)
+        self.assertEqual(len(warned), 2, warned)
+        prefix = (
+            "The cutover will refuse this before the source stops: "
+            "Destination prerequisites not met: "
+        )
+        self.assertTrue(all(w.startswith(prefix) for w in warned), warned)
+        # SDD 6.6: the pass returns them too, for the migration's cutover_refusals (SDD 7.2)
+        lead = "The cutover will refuse this before the source stops: "
+        self.assertEqual(passing["cutover_refusals"], [w[len(lead):] for w in warned])
+        self.assertNotIn("cutover_refusals", cutover)
+        self.assertTrue(any("port lost on network 'gone'" in w for w in warned), warned)
+        self.assertTrue(
+            any("floating IP 172.20.9.135 on network 'gone'" in w for w in warned), warned
+        )
+
+        # the server's own prerequisites still fail the pass
+        data["params"]["key_name"] = "gone-key"
+        self.dst.compute.find_keypair = mock.Mock(
+            side_effect=openstack.exceptions.ResourceNotFound("Keypair not found")
+        )
+        keyless, warned = run(network_as_warnings=True)
+        self.assertTrue(keyless.get("failed"), keyless)
+        self.assertEqual(keyless["msg"], "Destination keypair prerequisites not met: Keypair not found")
+        self.assertEqual(len(warned), 2, warned)

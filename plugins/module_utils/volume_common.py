@@ -17,6 +17,7 @@ import tempfile
 import time
 import fcntl
 import errno
+import functools
 
 # Default timeout for OpenStack operations
 DEFAULT_TIMEOUT = 1800
@@ -40,19 +41,137 @@ except ImportError:
     DEVNULL = open(os.devnull, "r+", encoding="utf8")
 
 
+def _is_not_found(err):
+    """openstacksdk's NotFoundException (a 404), whatever its version names it."""
+    return getattr(err, "status_code", None) == 404 or any(
+        cls.__name__ == "NotFoundException" for cls in type(err).__mro__
+    )
+
+
+def volume_or_none(conn, volume_id):
+    """
+    The volume ``volume_id``, or None when Cinder no longer has it:
+    openstacksdk 4.x's get_volume_by_id raises NotFoundException for a
+    missing volume, its docstring's "else None" notwithstanding (Seamless
+    Migrate SDD 6.4, review RV4-06).
+    """
+    try:
+        return conn.get_volume_by_id(volume_id)
+    except Exception as err:  # pylint: disable=broad-except
+        if _is_not_found(err):
+            return None
+        raise
+
+
+def detach_volume_bounded(conn, server, volume, timeout):
+    """
+    Detach ``volume`` from ``server`` and wait, within ``timeout`` seconds,
+    until the volume no longer lists that server's attachment and - unless
+    another server still holds it, as it does a shared multi-attach disk, which
+    stays `in-use` - until Cinder shows it available. openstacksdk 4.x's
+    detach_volume(wait=True) ignores its timeout and waits for `available`,
+    which a shared disk never reaches (Seamless Migrate SDD 6.6, review 5,
+    RV6-01).
+    """
+    conn.detach_volume(server=server, volume=volume, wait=False)
+    for second in range(timeout):
+        current = volume_or_none(conn, volume["id"])
+        if current is None:
+            return
+        holders = set(a["server_id"] for a in getattr(current, "attachments", None) or [])
+        status = getattr(current, "status", None)
+        if status == "error":
+            raise RuntimeError(
+                "Volume %s went to error while detaching from server %s"
+                % (volume["id"], server["id"])
+            )
+        if server["id"] not in holders and (holders or status == "available"):
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        "Timed out after %s s waiting to detach volume %s from server %s"
+        % (timeout, volume["id"], server["id"])
+    )
+
+
 def _lock_host():
     """This host's name as a lock records it (SDD §6.6)."""
     host = socket.gethostname()
     return host if re.match(r"^[A-Za-z0-9._-]+$", host or "") else "unknown"
 
 
+# Cinder's statuses while Nova attaches a volume: it lists the attachment only once attached
+ATTACHING = ("reserved", "attaching")
+# how long a settle wait for them holds the attach lock: ample for Nova to finish an attach, and
+# far below what a lock wait queued behind it allows (Seamless Migrate SDD 6.6, review RV11-01)
+ATTACH_SETTLE_S = 120
+
+# ssh's own exit status when it cannot reach or log in to the host
+SSH_FAILED = 255
+# a lock wait gives up once ssh to the conversion host failed this long without a break: long
+# enough to ride out a reboot or a network blip (Seamless Migrate SDD 6.6, review RV8-01)
+SSH_UNREACHABLE_S = 900
+# the prefixes of a give-up, each the "timeout" the control plane retries as transient: an
+# SshOutage takes no other, and the control plane's tests read this tuple (Seamless Migrate SDD
+# 6.6, review RV11-05)
+GIVE_UP_PREFIXES = ("Lock timeout", "SSH timeout")
+
+
+class ConversionHostUnreachable(RuntimeError):
+    """A wait gave up: ssh to the conversion host failed for SSH_UNREACHABLE_S
+    without a break (Seamless Migrate SDD 6.6)."""
+
+
+class SshOutage:
+    """
+    How long ssh to a conversion host has failed without a break, its own exit
+    status 255: a wait that meets it gives up once that reaches
+    SSH_UNREACHABLE_S, with "{prefix}: conversion host {address} unreachable
+    over SSH for {n} s, waiting for {what}", which the control plane retries
+    (Seamless Migrate SDD 6.6, review RV8-01, RV9-02, RV9-04); the prefix is
+    one of GIVE_UP_PREFIXES (review RV11-05).
+    """
+
+    def __init__(self, address, waiting_for, prefix="SSH timeout"):
+        if prefix not in GIVE_UP_PREFIXES:
+            raise ValueError(
+                "A give-up prefix is one of %s, not %r" % (", ".join(GIVE_UP_PREFIXES), prefix)
+            )
+        self.address = address
+        self.waiting_for = waiting_for
+        self.prefix = prefix
+        self.since = None
+
+    @property
+    def failing(self):
+        """True while ssh has failed since the last try that reached the host."""
+        return self.since is not None
+
+    def seen(self, unreachable):
+        """One try: raise once ssh has failed for the window without a break."""
+        if not unreachable:
+            self.since = None
+            return
+        now = time.monotonic()
+        if self.since is None:
+            self.since = now
+        elif now - self.since >= SSH_UNREACHABLE_S:
+            raise ConversionHostUnreachable(
+                "%s: conversion host %s unreachable over SSH for %d s, waiting for %s"
+                % (self.prefix, self.address, now - self.since, self.waiting_for)
+            )
+
+
 def use_lock(lock_file):
     """Boilerplate for functions that need to take a lock."""
 
     def _decorate_lock(function):
-        def wait_for_lock(self):
+        def wait_for_lock(self, *args, **kwargs):
             if self.check_and_cleanup_lockfiles():
                 self.log.info("Cleaned up unused lockfiles before start")
+            outage = SshOutage(
+                getattr(self.shell, "address", "?"), lock_file, prefix="Lock timeout"
+            )
             for second in range(DEFAULT_TIMEOUT):
                 try:
                     self.log.info("Waiting for lock %s...", lock_file)
@@ -79,6 +198,10 @@ def use_lock(lock_file):
                         + '"',
                     ]
                     result = self.shell.cmd_val(cmd)
+                    # the conversion host cannot be reached: give up after 15 minutes
+                    # of that rather than try 1800 times; the control plane retries
+                    # a "timeout" (Seamless Migrate SDD 6.6, QASuite R-07)
+                    outage.seen(result == SSH_FAILED)
                     if result == 16:
                         self.log.info("Another conversion has the lock.")
                     elif result == 17:
@@ -92,7 +215,7 @@ def use_lock(lock_file):
             else:
                 raise RuntimeError("Unable to acquire lock " + lock_file)
             try:
-                return function(self)
+                return function(self, *args, **kwargs)
             finally:
                 try:
                     lock = lock_file + ".lock"
@@ -238,10 +361,14 @@ class OpenStackVolumeBase:
         self.shell = self.shell_factory(
             self._converter_address(), ssh_user, ssh_key_path
         )
-        self.shell.test_ssh_connection()
+        self._check_ssh()
 
         # Ports chosen for NBD export
         self.claimed_ports = []
+
+    def _check_ssh(self):
+        """Quick SSH check of the conversion host: a module fails at once."""
+        self.shell.test_ssh_connection()
 
     def _source_vm(self):
         """
@@ -272,15 +399,20 @@ class OpenStackVolumeBase:
         """Get volume by id, or None if id_maybe is None or if volume doesn't exist."""
         if not id_maybe:
             return None
-        return self.conn.get_volume_by_id(id_maybe)
+        return volume_or_none(self.conn, id_maybe)
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
-    def _detach_volumes_from_destination_converter(self):
-        """Detach volumes from conversion host."""
+    def _detach_volumes_from_destination_converter(self, volume_ids=None):
+        """
+        Detach volumes from conversion host: the volume map's destination
+        volumes, or the volumes ``volume_ids`` names (Seamless Migrate SDD 6.3).
+        """
         self.log.info("Detaching volumes from the destination conversion host.")
+        if volume_ids is None:
+            volume_ids = [mapping["dest_id"] for mapping in self.volume_map.values()]
         converter = self._converter()
-        for path, mapping in self.volume_map.items():
-            volume = self._get_volume_maybe(mapping["dest_id"])
+        for volume_id in volume_ids:
+            volume = self._get_volume_maybe(volume_id)
             if not volume:
                 continue
             if not self._volume_still_attached(volume, converter):
@@ -291,13 +423,11 @@ class OpenStackVolumeBase:
                 continue
 
             self.log.info("Detaching volume %s.", volume["id"])
-            self.conn.detach_volume(
-                server=converter, volume=volume, timeout=self.timeout, wait=True
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             for second in range(self.timeout):
                 converter = self._converter()
-                volume = self.conn.get_volume_by_id(mapping["dest_id"])
-                if not self._volume_still_attached(volume, converter):
+                volume = volume_or_none(self.conn, volume_id)
+                if volume is None or not self._volume_still_attached(volume, converter):
                     break
                 time.sleep(1)
             else:
@@ -426,7 +556,7 @@ class OpenStackVolumeBase:
                 pass
             raise
 
-    def _attach_volumes(self, conn, name, funcs):
+    def _attach_volumes(self, conn, name, funcs, mark=None):
         """
         Attach all volumes in the volume map to the specified conversion host.
         Check the list of disks before and after attaching to be absolutely
@@ -458,9 +588,37 @@ class OpenStackVolumeBase:
             disks_before = set(disks_before.split())
             self.log.debug("Initial disk list: %s", disks_before)
 
-            conn.attach_volume(
-                volume=volume, wait=True, server=host_func(), timeout=self.timeout
-            )
+            host = host_func()
+            if (
+                mark
+                and volume["status"] == "available"
+                and not self._volume_still_attached(volume, host)
+            ):
+                # openstacksdk's own checks pass, so it asks Nova to attach it:
+                # this transfer's from here on, before its device shows, even if
+                # the answer is lost - a cleanup detaches what is marked and Cinder
+                # lists on this host, never a volume another migration's export
+                # attached, which the SDK refuses (Seamless Migrate SDD 6.6,
+                # review RV8-02, RV9-01)
+                mapping[mark] = True
+            try:
+                conn.attach_volume(
+                    volume=volume, wait=False, server=host, timeout=self.timeout
+                )
+            except Exception:
+                if mark and mapping.get(mark):
+                    # Nova may have carried it out all the same, or be at it: the mark
+                    # stays only if Cinder, settled, lists this host or still shows the
+                    # attach under way - decided while this export holds the attach
+                    # lock, so no other export attached it meanwhile (Seamless Migrate
+                    # SDD 6.6, review RV10-01, RV10-02)
+                    settled = self._settled_volume(conn, volume["id"])
+                    if settled is None or not (
+                        self._volume_still_attached(settled, host)
+                        or getattr(settled, "status", None) in ATTACHING
+                    ):
+                        mapping.pop(mark, None)
+                raise
             self.log.info("Waiting for volume to appear in %s wrapper", name)
             self._wait_for_volume_dev_path(conn, volume, host_func(), self.timeout)
 
@@ -510,6 +668,22 @@ class OpenStackVolumeBase:
                     f"OpenStack: {dev_path}"
                 )
             self.volume_map[path] = update_func(mapping, dev_path)
+
+    def _settled_volume(self, conn, volume_id):
+        """
+        The volume ``volume_id`` once Cinder settled it - not `reserved` or
+        `attaching`, where Nova is still at work and Cinder lists no attachment
+        yet - within ATTACH_SETTLE_S (or the module's timeout, if shorter), else
+        as it is then; None when Cinder no longer has it. It runs under the
+        attach lock: a reservation Nova abandoned never settles (Seamless
+        Migrate SDD 6.6, review RV10-01, RV10-02, RV11-01).
+        """
+        for second in range(min(self.timeout, ATTACH_SETTLE_S)):
+            volume = volume_or_none(conn, volume_id)
+            if volume is None or getattr(volume, "status", None) not in ATTACHING:
+                return volume
+            time.sleep(1)
+        return volume_or_none(conn, volume_id)
 
     def _get_attachment(self, volume, vm):
         """
@@ -607,10 +781,17 @@ class OpenStackVolumeBase:
         # Choose ports from the available possibilities, and try to bind
         ephemeral_ports = set(range(49152, 65535))
         available_ports = ephemeral_ports - used_ports
+        # ssh's 255 is no port in use: give up after the window (SDD 6.6, review RV10-03)
+        outage = SshOutage(getattr(self.shell, "address", "?"), "a free port")
 
         try:
             port = available_ports.pop()
-            while not self._test_port_available(port):
+            while not self._test_port_available(port, outage):
+                if outage.failing:
+                    # ssh failed, not the port: the same port again once a second, so the
+                    # window ends the wait, never the port range (SDD 6.6, review RV11-03)
+                    time.sleep(1)
+                    continue
                 self.log.info("Port %d not available, trying another.", port)
                 used_ports.add(port)  # Mark used to avoid trying again
                 port = available_ports.pop()
@@ -636,12 +817,14 @@ class OpenStackVolumeBase:
         self.log.info("Cleaning used ports: %s", used_ports)
         self.__write_used_ports(used_ports)
 
-    def _test_port_available(self, port):
+    def _test_port_available(self, port, outage=None):
         """
         See if a port is open on the source conversion host by trying to listen
-        on it.
+        on it; ``outage`` notes each try that ssh itself failed.
         """
         result = self.shell.cmd_val(["timeout", "1", "nc", "-l", str(port)])
+        if outage is not None:
+            outage.seen(result == SSH_FAILED)
         # The 'timeout' command returns 124 when the command times out, meaning
         # nc was successful and the port is free.
         return result == 124
@@ -733,6 +916,73 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
         """
         raise NotImplementedError("Please Implement this method")
 
+    def reattach_detached_volumes(self):
+        """
+        After a failed export: attach each data volume of the map that no
+        server holds - the export detached it from the source VM, and never
+        attached it to the conversion host - back to the source VM. Only the
+        OpenStack API is used: the conversion host may be what failed, and the
+        source cleanup checks SSH first, so without this the rollback that
+        follows would start the source VM without them (Seamless Migrate SDD
+        6.6, review RV8-01). Best effort: what cannot be attached is left to the
+        source cleanup.
+        """
+        for path, mapping in sorted(self.volume_map.items()):
+            if path == "/dev/vda" or not mapping.get("source_id"):
+                continue  # the root disk or its copy is the source cleanup's
+            try:
+                volume = volume_or_none(self.conn, mapping["source_id"])
+                if volume is None or getattr(volume, "attachments", None):
+                    continue
+                self.log.info("Attaching %s back to the source VM", volume["id"])
+                self.conn.attach_volume(
+                    volume=volume, server=self._source_vm(), wait=True, timeout=self.timeout
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                self.log.warning(
+                    "Could not attach volume %s back to the source VM: %s",
+                    mapping["source_id"],
+                    err,
+                )
+
+    def remove_unheld_root_copy(self):
+        """
+        After a failed export, once the data volumes are back: delete the root
+        disk's copy when no server holds it, then the snapshot or the image it
+        was made from - through the OpenStack API alone, so an outage the
+        source cleanup cannot outlast leaves none of them behind (Seamless
+        Migrate SDD 6.6, review RV9-03). A copy the conversion host holds is the
+        cleanup's, and the source VM's own boot volume - what the root entry
+        names before a copy exists - is never deleted. Best effort: what cannot
+        be deleted is left to the source cleanup.
+        """
+        root = self.volume_map.get("/dev/vda")
+        if not root:
+            return
+        try:
+            volume = self._get_volume_maybe(root["source_id"])
+            if volume is not None:
+                holders = {a["server_id"] for a in getattr(volume, "attachments", None) or []}
+                if holders - {self.source_instance_id}:
+                    return  # the copy, on the conversion host: the cleanup's
+                if not holders:
+                    self.log.info("Removing copy %s of the root volume", volume.id)
+                    self.conn.delete_volume(
+                        name_or_id=volume.id, wait=True, timeout=self.timeout
+                    )
+            if root["snap_id"]:
+                self.log.info("Deleting temporary root device snapshot")
+                self.conn.delete_volume_snapshot(
+                    timeout=self.timeout, wait=True, name_or_id=root["snap_id"]
+                )
+            if root["image_id"]:
+                self.log.info("Deleting temporary root device image")
+                self.conn.delete_image(
+                    timeout=self.timeout, wait=True, name_or_id=root["image_id"]
+                )
+        except Exception as err:  # pylint: disable=broad-except
+            self.log.warning("Could not remove the copy of the root volume: %s", err)
+
     def _get_root_and_data_volumes(self):
         """
         Volume mapping step one: get the IDs and sizes of all volumes.
@@ -778,29 +1028,37 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             mapping = self.volume_map["/dev/vda"]
             volume_id = mapping["source_id"]
 
-            # Create a snapshot of the root volume
+            # Create a snapshot of the root volume. The snapshot, the copy and
+            # the image below are each created without openstacksdk's own wait,
+            # which raises with the resource made, and recorded at once, then
+            # waited for: an export failing at any point leaves the cleanup
+            # what it made to remove (Seamless Migrate SDD 6.6, review RV8-03)
             self.log.info("Boot-from-volume instance, creating boot volume snapshot")
             root_snapshot = self.conn.create_volume_snapshot(
                 force=True,
-                wait=True,
+                wait=False,
                 volume_id=volume_id,
                 name=f"{self.boot_volume_prefix}{volume_id}",
-                timeout=self.timeout,
+            )
+            self.volume_map["/dev/vda"]["snap_id"] = root_snapshot.id
+            root_snapshot = self.conn.block_storage.wait_for_status(
+                root_snapshot, status="available", failures=["error"], wait=self.timeout
             )
 
             # Create a new volume from the snapshot
             self.log.info("Creating new volume from boot volume snapshot")
             root_volume_copy = self.conn.create_volume(
-                wait=True,
+                wait=False,
                 name=f"{self.boot_volume_prefix}{volume_id}",
                 snapshot_id=root_snapshot.id,
                 size=root_snapshot.size,
-                timeout=self.timeout,
             )
 
             # Update the volume map with the new volume ID
             self.volume_map["/dev/vda"]["source_id"] = root_volume_copy.id
-            self.volume_map["/dev/vda"]["snap_id"] = root_snapshot.id
+            self.conn.block_storage.wait_for_status(
+                root_volume_copy, status="available", failures=["error"], wait=self.timeout
+            )
         elif sourcevm.image and self.ser_server.migration_params()["boot_disk_copy"]:
             self.log.info(
                 "Image-based instance, boot_disk_copy enabled: creating snapshot"
@@ -808,35 +1066,47 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             image = self.conn.compute.create_server_image(
                 name=f"{self.boot_volume_prefix}{sourcevm.name}",
                 server=sourcevm.id,
-                wait=True,
-                timeout=self.timeout,
+                wait=False,
             )
-            image = self.conn.get_image_by_id(image.id)  # refresh
-            if image.status != "active":
-                raise RuntimeError(
-                    "Could not create new image of image-based instance!"
-                )
-            volume = self.conn.create_volume(
-                image=image.id,
-                bootable=True,
-                wait=True,
-                name=image.name,
-                timeout=self.timeout,
-                size=max(image.size // (1024**3), image.min_disk),
-            )
+            # Recorded at once, the volume to come: an export failing before it
+            # exists leaves the cleanup an image to remove (Seamless Migrate SDD 6.6)
             self.volume_map["/dev/vda"] = dict(
                 source_dev=None,
-                source_id=volume["id"],
+                source_id=None,
                 dest_dev=None,
                 dest_id=None,
                 snap_id=None,
                 image_id=image.id,
-                name=volume["name"],
-                size=volume["size"],
+                name=image.name,
+                size=None,
                 port=None,
                 url=None,
                 progress=None,
-                bootable=volume["bootable"],
+                bootable=True,
+            )
+            self.conn.wait_for_image(image, timeout=self.timeout)
+            image = self.conn.get_image_by_id(image.id)  # refresh
+            if image is None or image.status != "active":
+                raise RuntimeError(
+                    "Could not create new image of image-based instance!"
+                )
+            # bootable is set once the volume is available: openstacksdk waits
+            # in the create whenever it is given
+            volume = self.conn.create_volume(
+                image=image.id,
+                wait=False,
+                name=image.name,
+                size=max(image.size // (1024**3), image.min_disk),
+            )
+            self.volume_map["/dev/vda"]["source_id"] = volume.id
+            volume = self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=self.timeout
+            )
+            self.conn.block_storage.set_volume_bootable_status(volume, True)
+            self.volume_map["/dev/vda"].update(
+                name=volume["name"],
+                size=volume["size"],
+                bootable=True,
             )
             self._update_progress("/dev/vda", 0.0)
         elif (
@@ -853,9 +1123,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                 volume_id = mapping["source_id"]
                 volume = self.conn.get_volume_by_id(volume_id)
                 self.log.info("Detaching %s from %s", volume["id"], sourcevm.id)
-                self.conn.detach_volume(
-                    server=sourcevm, volume=volume, wait=True, timeout=self.timeout
-                )
+                detach_volume_bounded(self.conn, sourcevm, volume, self.timeout)
 
     # Lock this part to have a better chance of the OpenStack device path
     # matching the device path seen inside the conversion host.
@@ -877,6 +1145,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             self.conn,
             "source",
             (self._converter, self.shell.cmd_out, update_source, volume_id),
+            mark="source_attached",
         )
 
     def _export_volumes_from_converter(self):
@@ -887,6 +1156,10 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
         self.log.info("Exporting volumes from source conversion host...")
         for path, mapping in self.volume_map.items():
             port = self._find_free_port()
+            # Recorded at once: an export failing before this disk's export is
+            # ready leaves the source cleanup its port to free (Seamless Migrate
+            # SDD 6.6, review RV6-01)
+            mapping["port"] = port
             volume_id = mapping["source_id"]
             disk = mapping["source_dev"]
             self.log.info("Exporting %s from volume %s", disk, volume_id)
@@ -946,6 +1219,9 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
 
             # Check qemu-img info on this disk to make sure it is ready
             self.log.info("Waiting for valid qemu-img info on all exports...")
+            outage = SshOutage(
+                getattr(self.shell, "address", "?"), "the NBD export of " + disk
+            )
             for second in range(self.timeout):
                 try:
                     cmd = [
@@ -956,6 +1232,7 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
                     image_info = self.shell.cmd_out(cmd)
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                 except subprocess.CalledProcessError as error:
+                    outage.seen(error.returncode == SSH_FAILED)
                     self.log.info("Got exception: %s", error)
                     self.log.info("Trying again.")
                     time.sleep(1)
@@ -965,8 +1242,6 @@ class OpenstackVolumeExport(OpenStackVolumeBase):
             else:
                 raise RuntimeError("Timed out starting nbdkit exports!")
 
-            # pylint: disable=unnecessary-dict-index-lookup
-            self.volume_map[path]["port"] = port
             self.log.info("Volume map so far: %s", self.volume_map)
 
 
@@ -1000,6 +1275,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # Verify connectivity to nbdkit socket
         self.log.info("Waiting for valid qemu-img info on nbdkit socket...")
         pending_disks = set(self.volume_map.keys())
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the nbdkit socket")
         for second in range(self.timeout):
             try:
                 for disk in pending_disks.copy():
@@ -1010,6 +1286,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
+                outage.seen(error.returncode == SSH_FAILED)
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1045,6 +1322,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         # Check qemu-img info on all the disks to make sure everything is ready
         self.log.info("Waiting for valid qemu-img info on all exports...")
         pending_disks = set(self.volume_map.keys())
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the forwarded NBD exports")
         for second in range(self.timeout):
             try:
                 for disk in pending_disks.copy():
@@ -1055,6 +1333,7 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                     self.log.info("qemu-img info for %s: %s", disk, image_info)
                     pending_disks.remove(disk)
             except subprocess.CalledProcessError as error:
+                outage.seen(error.returncode == SSH_FAILED)
                 self.log.info("Got exception: %s", error)
                 self.log.info("Trying again.")
                 time.sleep(1)
@@ -1066,8 +1345,10 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
 
     def _stop_forwarding_process(self):
         self.log.info("Stopping export forwarding on source conversion host...")
-        self.log.debug("(PID was %s)", self.forwarding_process.pid)
+        # a transfer that failed before the forwarding started has none: its own error stands,
+        # and the ports it claimed are still released after this
         if self.forwarding_process:
+            self.log.debug("(PID was %s)", self.forwarding_process.pid)
             self.forwarding_process.terminate()
 
         if self.forwarding_process_command:
@@ -1087,9 +1368,13 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
     def _create_destination_volumes(self):
         """
         Volume mapping step 5: create new volumes on the destination OpenStack,
-        and fill in dest_id with the new volumes.
+        and fill in dest_id with the new volumes. Each is handed to
+        _destination_volume_created as soon as Cinder accepted it, before it is
+        waited for - one Cinder then puts in error is recorded too - and its
+        bootable flag is set once it is available (Seamless Migrate SDD 6.3).
         """
         self.log.info("Creating volumes on destination cloud")
+        self._before_destination_volumes_created()
         # Detached-volume transfers have no workload (no ser_server).
         ser_server = getattr(self, "ser_server", None)
         for path, mapping in self.volume_map.items():
@@ -1101,8 +1386,53 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
                 self.timeout,
                 preserve_volume_type=self.preserve_volume_type,
             )
-            new_volume = self.conn.create_volume(**sdk_params)
+            sdk_params.pop("wait", None)
+            timeout = sdk_params.pop("timeout", self.timeout)
+            bootable = sdk_params.pop("bootable", None)
+            new_volume = self.conn.create_volume(wait=False, **sdk_params)
             self.volume_map[path]["dest_id"] = new_volume.id
+            try:
+                self._destination_volume_created(path)
+            except Exception:
+                self._delete_unrecorded_volume(new_volume, timeout)
+                raise
+            new_volume = self.conn.block_storage.wait_for_status(
+                new_volume, status="available", failures=["error"], wait=timeout
+            )
+            if bootable is not None:
+                self.conn.block_storage.set_volume_bootable_status(new_volume, bootable)
+
+    def _delete_unrecorded_volume(self, volume, timeout):
+        """
+        Delete a volume whose record could not be written - it would outlive
+        every rollback - once Cinder settled it: a volume still being created
+        cannot be deleted. A failure here is logged; the record's error stands.
+        """
+        try:
+            self.conn.block_storage.wait_for_status(
+                volume, status="available", failures=["error"], wait=timeout
+            )
+        except Exception as err:  # an errored volume is deleted all the same
+            self.log.warning("Volume %s did not become available: %s", volume.id, err)
+        try:
+            self.conn.delete_volume(name_or_id=volume.id, wait=False)
+        except Exception as err:
+            self.log.error("Could not delete the unrecorded volume %s: %s", volume.id, err)
+
+    def _before_destination_volumes_created(self):
+        """
+        Called before _create_destination_volumes creates any volume: a
+        subclass may remove what an earlier attempt left, so that no new
+        volume waits unrecorded meanwhile (Seamless Migrate SDD 6.3, review
+        RV5-01). Does nothing here.
+        """
+
+    def _destination_volume_created(self, path):
+        """
+        Called as soon as Cinder created the destination volume of ``path``,
+        before its data is copied: a subclass may record it for a rollback
+        (Seamless Migrate SDD 6.3). Does nothing here.
+        """
 
     @use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _attach_destination_volumes(self):
@@ -1315,12 +1645,29 @@ class OpenstackVolumeTransfer(OpenStackVolumeBase):
         for path, mapping in self.volume_map.items():
             volume_id = mapping["dest_id"]
             volume = self.conn.get_volume_by_id(volume_id)
-            self.conn.detach_volume(
-                server=self._converter(), timeout=self.timeout, volume=volume, wait=True
-            )
+            detach_volume_bounded(self.conn, self._converter(), volume, self.timeout)
 
 
 class OpenstackVolumeClean(OpenStackVolumeBase):
+
+    def _check_ssh(self):
+        """
+        Ride out a conversion host that cannot be reached, as a lock wait does:
+        after a reboot mid-export or mid-transfer it holds volumes only this
+        cleanup gives back to the source VM. The other modules' checks fail at
+        once (Seamless Migrate SDD 6.6, review RV9-02).
+        """
+        outage = SshOutage(getattr(self.shell, "address", "?"), "the source cleanup")
+        for second in range(DEFAULT_TIMEOUT):
+            try:
+                return self.shell.test_ssh_connection()
+            except subprocess.CalledProcessError as err:
+                if err.returncode != SSH_FAILED:
+                    raise
+                outage.seen(True)
+                self.log.info("Conversion host unreachable, waiting: %s", err)
+                time.sleep(1)
+        return self.shell.test_ssh_connection()
 
     def close_exports(self):
         """Put the source VM's volumes back where they were."""
@@ -1330,20 +1677,35 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
 
     @use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_source_converter(self):
-        """Detach volumes from conversion host."""
+        """
+        Detach volumes from conversion host: each mapped volume this transfer
+        attached there - its device recorded, or marked source_attached as soon
+        as Nova accepted the attach, so one a failed export left before its
+        device showed is detached too - that Cinder still lists there. A volume
+        another migration's export attached, a shared multi-attach volume, is
+        never: Cinder's attachment names the server, not the migration
+        (Seamless Migrate SDD 6.6, review RV6-01, RV8-02).
+        """
         self.log.info("Detaching volumes from the source conversion host.")
         converter = self._converter()
         for path, mapping in self.volume_map.items():
-            volume = self.conn.get_volume_by_id(mapping["source_id"])
+            if not (mapping.get("source_attached") or mapping.get("source_dev")):
+                continue  # this transfer never attached it
+            # an attach Nova is still at shows on this host only once done (review RV10-02)
+            volume = (
+                self._settled_volume(self.conn, mapping["source_id"])
+                if mapping["source_id"]
+                else None
+            )
+            if volume is None:
+                continue
             self.log.info("Inspecting volume %s", volume.id)
-            if mapping["source_dev"] is None:
+            if not self._volume_still_attached(volume, converter):
                 self.log.info(
                     "Volume is not attached to conversion host, skipping detach."
                 )
                 continue
-            self.conn.detach_volume(
-                server=converter, volume=volume, timeout=self.timeout, wait=True
-            )
+            detach_volume_bounded(self.conn, converter, volume, self.timeout)
             for second in range(self.timeout):
                 converter = self._converter()
                 volume = self.conn.get_volume_by_id(mapping["source_id"])
@@ -1357,42 +1719,83 @@ class OpenstackVolumeClean(OpenStackVolumeBase):
                 )
 
     def _attach_data_volumes_to_source(self):
-        """Clean up the copy of the root volume and reattach data volumes."""
+        """
+        Reattach the data volumes, then clean up the copy of the root volume,
+        its snapshot and image. The map may be one a failed export left: the
+        root entry names the source VM's own boot volume until the copy exists,
+        and that volume is never deleted (Seamless Migrate SDD 6.6, review
+        RV6-01). Every step is tried, the data volumes first: one that fails -
+        a copy Cinder will not delete - never keeps a data volume off the
+        source VM, and the cleanup fails at the end naming each step it could
+        not do (review RV8-03).
+        """
         self.log.info("Re-attaching volumes to source VM...")
-        for path, mapping in sorted(self.volume_map.items()):
-            if path == "/dev/vda":
-                # Delete the temporary copy of the source root disk
-                self.log.info("Removing copy of root volume")
-                self.conn.delete_volume(
-                    name_or_id=mapping["source_id"], wait=True, timeout=self.timeout
-                )
+        steps = [
+            (
+                "attach volume %s back to the source VM" % mapping["source_id"],
+                functools.partial(self._attach_volume_to_source, mapping["source_id"]),
+            )
+            for path, mapping in sorted(self.volume_map.items())
+            if path != "/dev/vda"
+        ]
+        root = self.volume_map.get("/dev/vda")
+        if root is not None:
+            steps.append((
+                "remove the copy %s of the root volume" % root["source_id"],
+                functools.partial(self._remove_root_volume_copy, root["source_id"]),
+            ))
+            if root["snap_id"]:
+                steps.append((
+                    "delete the root volume snapshot %s" % root["snap_id"],
+                    functools.partial(self._delete_root_snapshot, root["snap_id"]),
+                ))
+            if root["image_id"]:
+                steps.append((
+                    "delete the root image %s" % root["image_id"],
+                    functools.partial(self._delete_root_image, root["image_id"]),
+                ))
+        failures = []
+        for what, step in steps:
+            try:
+                step()
+            except Exception as err:  # pylint: disable=broad-except
+                self.log.error("Could not %s: %s", what, err)
+                failures.append("could not %s: %s" % (what, err))
+        if failures:
+            raise RuntimeError("Source cleanup incomplete: " + "; ".join(failures))
 
-                # Remove the root volume snapshot
-                if mapping["snap_id"]:
-                    self.log.info("Deleting temporary root device snapshot")
-                    self.conn.delete_volume_snapshot(
-                        timeout=self.timeout, wait=True, name_or_id=mapping["snap_id"]
-                    )
+    def _attach_volume_to_source(self, volume_id):
+        """Attach a data volume back to the source VM, unless it holds it."""
+        volume = self.conn.get_volume_by_id(volume_id)
+        sourcevm = self._source_vm()
+        if self._volume_still_attached(volume, sourcevm):
+            self.log.info("Volume %s is already attached to source VM", volume.id)
+            return
+        self.log.info("Attaching %s back to source VM", volume.id)
+        self.conn.attach_volume(
+            volume=volume, server=sourcevm, wait=True, timeout=self.timeout
+        )
 
-                # Remove root image copy, for image-launched instances
-                if mapping["image_id"]:
-                    self.log.info("Deleting temporary root device image")
-                    self.conn.delete_image(
-                        timeout=self.timeout, wait=True, name_or_id=mapping["image_id"]
-                    )
-            else:
-                # Attach data volumes back to source VM
-                volume = self.conn.get_volume_by_id(mapping["source_id"])
-                sourcevm = self._source_vm()
-                try:
-                    self._get_attachment(volume, sourcevm)
-                except RuntimeError:
-                    self.log.info("Attaching %s back to source VM", volume.id)
-                    self.conn.attach_volume(
-                        volume=volume, server=sourcevm, wait=True, timeout=self.timeout
-                    )
-                else:
-                    self.log.info(
-                        "Volume %s is already attached to source VM", volume.id
-                    )
-                    continue
+    def _remove_root_volume_copy(self, volume_id):
+        """Delete the temporary copy of the source root disk, never the source VM's own."""
+        root = self._get_volume_maybe(volume_id)
+        if root is None:
+            self.log.info("No copy of the root volume to remove")
+        elif self._volume_still_attached(root, self._source_vm()):
+            self.log.info(
+                "Volume %s is the source VM's own boot volume, keeping it", root.id
+            )
+        else:
+            self.log.info("Removing copy of root volume")
+            self.conn.delete_volume(name_or_id=root.id, wait=True, timeout=self.timeout)
+
+    def _delete_root_snapshot(self, snapshot_id):
+        self.log.info("Deleting temporary root device snapshot")
+        self.conn.delete_volume_snapshot(
+            timeout=self.timeout, wait=True, name_or_id=snapshot_id
+        )
+
+    def _delete_root_image(self, image_id):
+        """Remove the root image copy, of an image-launched instance."""
+        self.log.info("Deleting temporary root device image")
+        self.conn.delete_image(timeout=self.timeout, wait=True, name_or_id=image_id)

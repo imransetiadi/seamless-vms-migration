@@ -33,7 +33,7 @@ import type {
   VMRef,
 } from './types';
 import { canonicalJson, sha256Hex } from '../lib/canonical';
-import { pyRepr } from '../lib/format';
+import { pyNames, pyRepr } from '../lib/format';
 import { describeProbes, probesFor } from '../lib/probes';
 import { guestOsOf, identifyGuestOs } from '../lib/guestOs';
 import { addressRefusal, canonicalIp, ipInCidr, nicOverride, nicTarget, noHostAddress } from '../lib/nics';
@@ -161,7 +161,7 @@ export function strategyRecommendation(input: StrategyRecommendationInput): Advi
 type AuditEvent = Pick<Event, 'kind' | 'message' | 'actor' | 'data'>;
 
 function stateOf(d: AdvisorRecommendation['decision']) {
-  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, policy_id: d.policy_id, threshold_used: d.threshold_used };
+  return { status: d.status, final_option: d.final_option, reason_code: d.reason_code, reason_text: d.reason_text, policy_id: d.policy_id, threshold_used: d.threshold_used };
 }
 
 /** The event of the status a decision took, with what it replaced (SDD §14.5). */
@@ -932,11 +932,36 @@ export function preflight(
   }
   if (denied.length)
     add('NET_PORT_NOT_PERMITTED', 'blocker', `The RHOSO credential may not put these NICs on their network: ${denied.join('; ')}.`, NETWORK_REMEDIATION.NET_PORT_NOT_PERMITTED);
+  // a network RHOSO lacks, as the API words it (SDD §9.3): a NIC its override sends elsewhere is checked by
+  // MAP_NIC_OVERRIDE_INVALID; pre-staging creates same-named networks for OpenStack sources only - the VMware kit has
+  // no pre-stage step (§4.2, §7.2); nothing creates a network under a mapping's target name
+  const has = (names: Record<string, unknown>, name: string) => Object.prototype.hasOwnProperty.call(names, name);
+  const mappedNics = vm.nics.filter((nic) => !nicOverride(plan, vm.source_id, nic.mac)?.network);
+  const missingNets = mappedNics
+    .filter((nic) => !has(plan.mappings.networks, nic.network) && !has(destinationNetworks, nic.network))
+    .map((nic) => nic.network);
+  const badNetTargets = mappedNics
+    .filter((nic) => has(plan.mappings.networks, nic.network) && !has(destinationNetworks, plan.mappings.networks[nic.network]!))
+    .map((nic) => `${nic.network} -> ${plan.mappings.networks[nic.network]}`);
+  const prestaged = plan.prestage_resources.includes('networks') && sourceKind !== 'vmware';
+  if (missingNets.length && prestaged)
+    add(
+      'MAP_NETWORK_PRESTAGED',
+      'info',
+      `Pre-staging creates same-named RHOSO network(s): ${pyNames(missingNets)}.`,
+      'Nothing to do: pre-staging creates the network in RHOSO with the same name. Add a network mapping to use an existing RHOSO network instead.',
+    );
+  else if (missingNets.length)
+    add(
+      'MAP_NETWORK_MISSING',
+      'blocker',
+      `No mapping or same-named RHOSO network for: ${pyNames(missingNets)}.` +
+        (sourceKind === 'vmware' ? ' VMware sources are not pre-staged: map every port group.' : ''),
+      'Add a network mapping or create a same-named network in RHOSO.',
+    );
+  if (badNetTargets.length)
+    add('MAP_NETWORK_MISSING', 'blocker', `Network mapping target(s) do not exist in RHOSO: ${pyNames(badNetTargets)}.`, 'Fix the mapping: the destination network must exist.');
   for (const nic of vm.nics) {
-    const mapped = plan.mappings.networks[nic.network] ?? nic.network;
-    // a NIC its override sends elsewhere is checked by MAP_NIC_OVERRIDE_INVALID (SDD §9.3)
-    if (sourceKind !== 'vmware' && !nicOverride(plan, vm.source_id, nic.mac)?.network && !(mapped in destinationNetworks))
-      add('MAP_NETWORK_MISSING', 'blocker', `Network ${nic.network} has no mapping and no same-named RHOSO network.`, 'Add a network mapping in the plan.');
     const dstMtu = resolved.has(nic) ? resolved.get(nic)!.mtu : destinationNetworks[nicTarget(plan, vm.source_id, nic).network];
     if (nic.mtu && dstMtu && dstMtu < nic.mtu)
       add('NET_MTU_SHRINK', 'warning', `Destination MTU ${dstMtu} is smaller than the source NIC MTU ${nic.mtu} on ${nic.network}.`, 'Lower the guest MTU or enable jumbo frames on the OVN underlay.');
@@ -1060,6 +1085,7 @@ export function defaultPlanFields(now: number) {
     waves: [],
     // what the API derives from the migrations (SDD §8.1); the mock sets it on every response
     derived_status: 'draft' as const,
+    migration_counts: {} as Plan['migration_counts'],
     created_at: iso(now),
     updated_at: iso(now),
   };
@@ -1082,6 +1108,8 @@ interface MigrationSpec {
   error?: string | null;
   reviewReason?: string | null;
   notes?: Array<Omit<AdvisorNote, 'created_at'> & { ago: number }>;
+  /** What the last warm pass met that the cutover will refuse before the source stops (SDD §7.2). */
+  refusals?: string[];
   /** The strategy recommendation recorded when the migration was validated (SDD §14.4), and what a person decided later (§14.6). */
   rec?: {
     option: Strategy | null;
@@ -1204,6 +1232,8 @@ const PLAN_SPECS: PlanSpec[] = [
         id: 'mig-9e4f6a8b50', vm: 'vm-5001', strategy: 'vmware_warm', phase: 'syncing', wave: 'wave-1', enteredAgo: 9 * 60, progress: 71,
         passes: [{ kind: 'full', changedGiB: 64, durationS: 520 }, { kind: 'delta', changedGiB: 0, durationS: 0, open: true }],
         checkpoint: 'precopy',
+        // a port another VM left behind holds the NIC's MAC: the pre-copy goes on, the cutover would refuse (SDD §7.2)
+        refusals: ["the NIC 00:50:56:9a:51:01 of vm-erp-app-01 on 'VM Network ERP': port port-3c1d holds its MAC 00:50:56:9a:51:01"],
       },
       {
         id: 'mig-9e4f6a8b51', vm: 'vm-5005', strategy: 'vmware_warm', phase: 'ready', wave: 'wave-1', enteredAgo: 5 * H,
@@ -1260,6 +1290,19 @@ const PLAN_SPECS: PlanSpec[] = [
       { id: 'mig-c3d5e7f980', vm: 'lab-2b01', strategy: 'cold', phase: 'pending', enteredAgo: 2 * H },
       { id: 'mig-c3d5e7f981', vm: 'lab-2b02', strategy: 'cold', phase: 'pending', enteredAgo: 2 * H },
     ],
+  },
+  {
+    // retired before any of its migrations started (SDD §12): its VMs went to "Community lab cleanup"
+    id: 'plan-6a1b2c3d',
+    name: 'Lab trial — k8s',
+    description: 'A first try at the lab cloud, made before its source failed; cancelled.',
+    source: 'community-lab',
+    destination: 'rhoso-prod',
+    status: 'cancelled',
+    createdAgo: 5 * D,
+    overrides: { require_approval: false },
+    waves: [],
+    migrations: [{ id: 'mig-c3d5e7f970', vm: 'lab-2b01', strategy: 'cold', phase: 'cancelled', enteredAgo: 4 * D }],
   },
   {
     id: 'plan-2d5c8b93',
@@ -1631,6 +1674,7 @@ export function buildFixtures(now: number): Fixtures {
         converged_by: fixtureConvergedBy(m.strategy, m.phase, syncPasses, chosen, plan),
         force_cutover: null,
         data_issues: [],
+        cutover_refusals: m.refusals ?? [],
         downtime_model_s: null,
         verification: fixtureVerification(m.phase, downtimeEndedAt, m.error ?? null),
         suggested_probes: m.phase === 'pending' ? [] : suggestProbes(vm),

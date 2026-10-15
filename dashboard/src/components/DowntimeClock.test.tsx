@@ -87,6 +87,19 @@ describe('DowntimeClock', () => {
     expect(screen.getByText(/estimated 5m 52s/i)).toBeInTheDocument();
   });
 
+  it('shows an ended downtime rounded to the second, as the text under it and every other view give it (SDD §16)', () => {
+    render(<DowntimeClock startedAt="2026-10-08T09:00:00Z" endedAt="2026-10-08T09:11:05Z" actualS={665.798} sloS={900} estimateS={733.33} />);
+    expect(screen.getByRole('timer')).toHaveTextContent('11:06');
+    expect(screen.getByText(/^Actual 11m 06s:/)).toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Downtime against the SLO' })).toHaveAttribute('aria-valuetext', '11:06 of 15:00');
+  });
+
+  it('counts whole seconds while the downtime runs, never rounding up', () => {
+    render(<DowntimeClock startedAt="2026-10-08T11:58:24.300Z" endedAt={null} actualS={null} sloS={300} />);
+    // 95.7 s since the stop: the clock reads 1:35 until the 96th second
+    expect(screen.getByRole('timer')).toHaveTextContent('1:35');
+  });
+
   it('runs in model time in demo mode, and says so (SDD §16, ADV-16)', () => {
     render(<DowntimeClock startedAt="2026-10-08T11:59:55Z" endedAt={null} actualS={null} sloS={600} demoSpeed={60} />);
     const timer = screen.getByRole('timer');

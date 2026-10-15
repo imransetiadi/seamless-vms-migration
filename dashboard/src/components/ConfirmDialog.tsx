@@ -195,7 +195,7 @@ export function ConfirmDialog({
               </p>
             </div>
           )}
-          {error !== undefined && error !== null && <ErrorBanner error={error} title={`${confirmLabel} failed`} />}
+          {error !== undefined && error !== null && <ErrorBanner error={error} title={`${confirmLabel} failed`} reveal />}
         </div>
         <div data-testid="confirm-actions" className="flex flex-col-reverse gap-2 border-t border-border bg-muted/30 px-5 py-4 sm:flex-row sm:justify-end">
           {/* unavailable while the request runs, yet focusable and saying why (SDD §16) */}

@@ -103,8 +103,10 @@ class FileSecretStore:
                         os.unlink(tmp)
                     raise
         except OSError as exc:
+            # the default directory is one a user cannot write on a host run (SDD §13.3)
             raise SecretStoreError(
-                f"cannot write the secret store at {self.root}: {exc.strerror}"
+                f"cannot write the secret store at {self.root}: {exc.strerror}; "
+                "set SEAMLESS_SECRETS_DIR to a directory this process can write"
             ) from None
 
     def delete(self, name: str) -> None:

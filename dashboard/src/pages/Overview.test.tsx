@@ -2,11 +2,105 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import type { Migration } from '../api/types';
+import { formatPct } from '../lib/format';
 import { TONE_CLASSES } from '../lib/status';
 import { createTestServer, renderWithApp } from '../test/utils';
 import Overview from './Overview';
 
+/** Every GET the page makes, as its path and query under /api/v1. */
+function recordingReads(reads: string[]) {
+  return (mock: typeof fetch): typeof fetch =>
+    (input, init) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'GET') reads.push(String(input).replace(/^.*\/api\/v1/, ''));
+      return mock(input, init);
+    };
+}
+
 describe('Overview page (mock data)', () => {
+  it('reads the migrations as summaries, never every migration whole (SDD §16, perf audit PF-02)', async () => {
+    const reads: string[] = [];
+    renderWithApp(<Overview />, { wrapFetch: recordingReads(reads) });
+    await screen.findByRole('region', { name: 'Needs attention' });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    await screen.findAllByRole('link', { name: /^[a-z0-9-]+$/ });
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual(['/migrations?view=summary']);
+  });
+
+  it('leaves a cancelled plan out of the strictest SLO: it migrates nothing more (SDD §12)', async () => {
+    const server = createTestServer();
+    const cancelled = server.plans.find((p) => p.status === 'cancelled');
+    if (!cancelled) throw new Error('fixture without a cancelled plan');
+    cancelled.downtime_slo_s = 60;
+    const others = server.plans.filter((p) => p.status !== 'draft' && p.status !== 'cancelled').map((p) => p.downtime_slo_s);
+    expect(Math.min(...others)).toBeGreaterThan(60);
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const summaries = await screen.findAllByText(/the (Strictest )?SLO of /);
+    for (const summary of summaries) expect(summary).not.toHaveTextContent('1m 00s');
+  });
+
+  it('names the cancelled migrations its done count leaves out, as the Plans list does, and none when there are none (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    const n = ofPlan.length - 1;
+    await waitFor(() => expect(item).toHaveTextContent(`${n} of ${n} done, 1 cancelled, downtime SLO`));
+    const others = server.plans.filter(
+      (p) => p.id !== plan.id && p.status !== 'cancelled' && !server.migrations.some((m) => m.plan_id === p.id && m.phase === 'cancelled'),
+    );
+    expect(others.length).toBeGreaterThan(0);
+    for (const other of others) {
+      const row = screen.getByRole('link', { name: other.name }).closest('li')!;
+      expect(row).not.toHaveTextContent(/cancelled/);
+    }
+  });
+
+  it('counts plan progress over the migrations that are not cancelled, and a cancelled plan shows none (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    const ofPlan = server.migrations.filter((m) => m.plan_id === plan.id);
+    for (const m of ofPlan) m.phase = 'finalized';
+    ofPlan[0]!.phase = 'cancelled';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    const n = ofPlan.length - 1;
+    await waitFor(() => expect(item).toHaveTextContent(`${n} of ${n} done`));
+    const cancelled = server.plans.find((p) => p.status === 'cancelled')!;
+    const gone = screen.getByRole('link', { name: cancelled.name }).closest('li')!;
+    expect(gone).not.toHaveTextContent(/of \d+ done/);
+    expect(gone).toHaveTextContent('Nothing left to do');
+  });
+
+  it('marks a Completed plan where nothing was migrated, as every view does (SDD §16)', async () => {
+    const server = createTestServer();
+    const plan = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    for (const m of server.migrations.filter((x) => x.plan_id === plan.id)) m.phase = 'rolled_back';
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: plan.name })).closest('li')!;
+    expect(within(item).getByRole('button', { name: 'Completed' })).toHaveAccessibleDescription('Nothing was migrated: every migration rolled back.');
+  });
+
+  it('counts a plan before its first validation by its VMs, as the plans list does (SDD §16)', async () => {
+    const server = createTestServer();
+    const template = server.plans.find((p) => p.name === 'Pilot — static content')!;
+    server.plans.push({ ...template, id: 'plan-0d0d0d0d', name: 'Not validated yet', vm_ids: ['vm-a', 'vm-b', 'vm-c'], waves: [], status: 'draft' });
+    renderWithApp(<Overview />, { route: '/', server, token: 'viewer' });
+    const item = (await screen.findByRole('link', { name: 'Not validated yet' })).closest('li')!;
+    await waitFor(() => expect(item).toHaveTextContent('0 of 3 done'));
+  });
+
+  it('reads the summaries of the plan in its address alone (SDD §16, perf audit PF-02)', async () => {
+    const reads: string[] = [];
+    const server = createTestServer();
+    const plan = server.plans[0]!;
+    renderWithApp(<Overview />, { server, route: `/?plan=${plan.id}`, wrapFetch: recordingReads(reads) });
+    await waitFor(() => expect(reads.some((r) => r.startsWith('/migrations'))).toBe(true));
+    expect(reads.filter((r) => r.startsWith('/migrations'))).toEqual([`/migrations?plan_id=${plan.id}&view=summary`]);
+  });
+
   it("keeps the figures readable while another plan's statistics load: greyed and busy, never faded (SDD §16)", async () => {
     const user = userEvent.setup({ delay: null });
     let hold = false;
@@ -44,10 +138,57 @@ describe('Overview page (mock data)', () => {
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument();
     const total = await screen.findByRole('group', { name: 'Migrations' });
-    expect(total).toHaveTextContent(String(server.migrations.length));
+    // a cancelled migration is never done: Migrations counts the others (SDD §16)
+    expect(total).toHaveTextContent(String(server.migrations.filter((m) => m.phase !== 'cancelled').length));
     const failed = server.migrations.filter((m) => m.phase === 'failed').length;
     expect(screen.getByRole('group', { name: 'Failed' })).toHaveTextContent(String(failed));
     expect(screen.getByRole('group', { name: 'SLO compliance' })).toHaveTextContent('%');
+  });
+
+  it('shows the rolled-back migrations beside Failed, in the warning tone, so the tiles never read as all clear (SDD §16)', async () => {
+    const { server } = renderWithApp(<Overview />);
+    const rolled = server.migrations.filter((m) => m.phase === 'rolled_back').length;
+    expect(rolled).toBeGreaterThan(0);
+    const tile = await screen.findByRole('group', { name: 'Rolled back' });
+    expect(tile).toHaveTextContent(String(rolled));
+    expect(tile).toHaveTextContent('the source VM runs again: retry or cancel');
+    expect(within(tile).getByText(String(rolled))).toHaveClass(TONE_CLASSES.warning.text);
+    // beside Failed, in the strip's order
+    const names = within(screen.getByRole('region', { name: 'Key metrics' })).getAllByRole('group').map((g) => g.getAttribute('aria-label'));
+    expect(names.slice(names.indexOf('Failed'), names.indexOf('Failed') + 2)).toEqual(['Failed', 'Rolled back']);
+  });
+
+  it('reads Rolled back as none, in the plain tone, when no migration rolled back', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations) if (m.phase === 'rolled_back') m.phase = 'ready';
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Rolled back' });
+    expect(tile).toHaveTextContent('0');
+    expect(tile).toHaveTextContent('none');
+    expect(within(tile).getByText('0')).not.toHaveClass(TONE_CLASSES.warning.text);
+  });
+
+  it("counts the migrations that are not cancelled, as each plan's done count does, and names the cancelled ones (SDD §16)", async () => {
+    const server = createTestServer();
+    const cancelled = server.migrations.filter((m) => m.phase === 'cancelled').length;
+    expect(cancelled).toBe(2);
+    const counted = server.migrations.length - cancelled;
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Migrations' });
+    expect(within(tile).getByText(String(counted))).toBeInTheDocument();
+    expect(tile).toHaveTextContent('2 cancelled, not counted');
+    // Finalized's share is of those
+    const finalized = server.migrations.filter((m) => m.phase === 'finalized').length;
+    expect(screen.getByRole('group', { name: 'Finalized' })).toHaveTextContent(`${formatPct((finalized / counted) * 100)} of all`);
+  });
+
+  it('names no cancelled migration in the Migrations hint when none was cancelled', async () => {
+    const server = createTestServer();
+    for (const m of server.migrations) if (m.phase === 'cancelled') m.phase = 'ready';
+    renderWithApp(<Overview />, { server });
+    const tile = await screen.findByRole('group', { name: 'Migrations' });
+    expect(tile).toHaveTextContent(String(server.migrations.length));
+    expect(tile).not.toHaveTextContent('cancelled');
   });
 
   it('splits Completed into Awaiting finalize and Finalized (SDD §4.2, ADV-19)', async () => {
@@ -273,6 +414,7 @@ describe('Overview page (mock data)', () => {
     expect(screen.getByText(/unknown: the plans could not be loaded/i)).toBeInTheDocument();
     const metrics = screen.getByRole('region', { name: /key metrics/i });
     expect(within(metrics).getByRole('group', { name: 'Failed' })).toHaveTextContent('Failed—');
+    expect(within(metrics).getByRole('group', { name: 'Rolled back' })).toHaveTextContent('Rolled back—');
   });
 
   it('never reads a failed plans load as all clear while the migrations load (SDD §16)', async () => {

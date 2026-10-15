@@ -1,8 +1,8 @@
 import { Bot, ShieldCheck } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { Migration, Plan } from '../api/types';
-import { APPROVALS_SHOWN, approvalKindLabel, pendingApprovals, type ApprovalKind } from '../lib/approvals';
+import type { Plan } from '../api/types';
+import { APPROVALS_SHOWN, approvalKindLabel, pendingApprovals, type ApprovalKind, type ApprovalMigration } from '../lib/approvals';
 import { Button } from './Button';
 import { EmptyState } from './EmptyState';
 import { Panel } from './Panel';
@@ -15,7 +15,7 @@ const KIND_ICONS = { cutover: ShieldCheck, advisor_decision: Bot } as const;
 
 export interface PendingApprovalsProps {
   /** Null when the migrations could not be loaded: every pending approval is unknown. */
-  migrations: Migration[] | null;
+  migrations: readonly ApprovalMigration[] | null;
   plans: ReadonlyMap<string, Plan>;
   plansUnknown: boolean;
 }

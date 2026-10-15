@@ -3,11 +3,12 @@
  * TanStack Query cache fresh: progress events patch cached migrations in place; persisted events
  * invalidate the affected queries in small batches (NFR-08: live updates ≤ 2 s).
  */
-import type { QueryClient, QueryKey } from '@tanstack/react-query';
+import type { Query, QueryClient, QueryKey } from '@tanstack/react-query';
 import { createContext, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
+import { isSummaryList, summaryOf } from '../lib/summary';
 import { endedPassBytes } from '../lib/transfer';
 import type { StreamStatus } from './stream';
-import type { Event, Migration, MigrationListQuery, SyncPass } from './types';
+import { AUDIT_EVENT_KINDS, type Event, type Migration, type MigrationListQuery, type MigrationSummary, type SyncPass } from './types';
 
 export type LiveStatus = StreamStatus | 'idle';
 
@@ -99,6 +100,35 @@ export function refetchAfterReconnect(queryClient: QueryClient): (status: LiveSt
 }
 
 /**
+ * The queries the event stream keeps fresh: each of their changes comes as an event (SDD §16) - the migration lists and
+ * pages, the plans, the figures, the providers, the advisor's recommendations, notes and policies, the event lists.
+ */
+export const STREAM_KEPT: readonly QueryKey[] = [
+  ['migrations'],
+  ['migration'],
+  ['plans'],
+  ['stats'],
+  ['providers'],
+  ['advisor', 'recommendations'],
+  ['advisor', 'notes'],
+  ['advisor', 'policies'],
+  ['events', 'tail'],
+];
+
+/**
+ * While the stream is open, the window regaining focus reads nothing it keeps fresh (SDD §16): what the events held
+ * while the page was hidden ask for is read once, and a list whose changes they brought is not read again (NFR-03).
+ * One whose last read failed is still read on focus, as they all are while the stream is not open. Returns how to stop.
+ */
+export function keepStreamFresh(queryClient: QueryClient, status: () => LiveStatus): () => void {
+  const refetchOnWindowFocus = (query: Query) => status() !== 'open' || query.state.status === 'error';
+  for (const queryKey of STREAM_KEPT) queryClient.setQueryDefaults(queryKey, { refetchOnWindowFocus });
+  return () => {
+    for (const queryKey of STREAM_KEPT) queryClient.setQueryDefaults(queryKey, {});
+  };
+}
+
+/**
  * One flush: the queries it reads again (by hash), those a splice left to that read while it ran, and when it began.
  */
 interface Batch {
@@ -107,20 +137,56 @@ interface Batch {
   at: number;
 }
 
+/** The most migrations one batch reads one by one; past it the batch reads the lists and pages again (SDD §16). */
+export const MAX_SPLICED = 50;
+
+/** Whether the page is hidden (a background tab), and a way to hear when it is shown again (SDD §16). */
+export interface PageVisibility {
+  hidden(): boolean;
+  /** Calls `listener` when the page is shown again; returns how to stop. */
+  onVisible(listener: () => void): () => void;
+}
+
+/** The browser's page visibility: `document.visibilityState` and its `visibilitychange` event. */
+export const documentVisibility: PageVisibility = {
+  hidden: () => typeof document !== 'undefined' && document.visibilityState === 'hidden',
+  onVisible: (listener) => {
+    if (typeof document === 'undefined') return () => {};
+    const onChange = () => {
+      if (document.visibilityState !== 'hidden') listener();
+    };
+    document.addEventListener('visibilitychange', onChange);
+    return () => document.removeEventListener('visibilitychange', onChange);
+  },
+};
+
 /**
  * Creates an invalidator that coalesces query invalidations into one flush per `delayMs`. With `fetchMigration`,
  * `refreshMigration(id)` reads that one migration once per flush and puts it into the cached lists that hold it
- * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise.
+ * (SDD §16): at 1,000 VMs a plan a list is megabytes, read again on every event otherwise. While the page is hidden
+ * the flush waits, and runs once when the page is shown again (§16).
  */
-export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400, fetchMigration?: (id: string) => Promise<Migration>) {
+export function createBatchedInvalidator(
+  queryClient: QueryClient,
+  delayMs = 400,
+  fetchMigration?: (id: string) => Promise<Migration>,
+  visibility: PageVisibility = documentVisibility,
+) {
   const pending = new Map<string, QueryKey>();
   const migrations = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+  // a background tab reads nothing again: what waits is flushed once the page is shown (SDD §16)
+  const schedule = () => {
+    if (!visibility.hidden()) timer ??= setTimeout(flush, delayMs);
+  };
+  const stopWatching = visibility.onVisible(() => {
+    if (!disposed && (pending.size > 0 || migrations.size > 0)) timer ??= setTimeout(flush, 0);
+  });
   const invalidate = (queryKey: QueryKey) => {
     if (disposed) return;
     pending.set(JSON.stringify(queryKey), queryKey);
-    timer ??= setTimeout(flush, delayMs);
+    schedule();
   };
   const splice = async (id: string, read: (id: string) => Promise<Migration>, batch: Batch) => {
     let fresh: Migration;
@@ -156,22 +222,47 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
       const index = list.findIndex((m) => m.id === id);
       const narrowed = filter.phase !== undefined || filter.wave_id !== undefined || filter.limit !== undefined || filter.offset !== undefined;
       if (!narrowed && index < 0 && filter.plan_id !== undefined && filter.plan_id !== fresh.plan_id) continue;
+      // a summary list takes the migration's summary, as the API builds it (SDD §16)
+      const entry = isSummaryList(query.queryKey) ? summaryOf(fresh) : fresh;
       // filtered by phase, wave or page it may gain, lose or shift; a missing member, or a read under way, is read again
       if (narrowed || index < 0 || query.state.fetchStatus === 'fetching') invalidate(query.queryKey);
-      else queryClient.setQueryData<Migration[]>(query.queryKey, list.map((m, i) => (i === index ? fresh : m)));
+      else queryClient.setQueryData<(Migration | MigrationSummary)[]>(query.queryKey, list.map((m, i) => (i === index ? entry : m)));
     }
   };
   const flush = () => {
     timer = null;
+    // hidden since the timer started: it waits for the page to be shown
+    if (visibility.hidden()) return;
     // the queries this batch reads again (the active ones invalidateQueries refetches), filled below before any splice
     // reaches the lists - each awaits its read first
     const batch: Batch = { refreshed: new Set(), relied: new Set(), at: Date.now() };
-    const ids = [...migrations];
+    let ids = [...migrations];
     migrations.clear();
+    if (ids.length > MAX_SPLICED) {
+      // more than one by one is worth - a long-hidden page in a busy wave: the lists and pages are read again (SDD §16)
+      pending.set(JSON.stringify(['migrations']), ['migrations']);
+      pending.set(JSON.stringify(['migration']), ['migration']);
+      ids = [];
+    }
+    // a page that shows neither a migration nor any migration list takes no read (SDD §16): a query is shown while an
+    // enabled observer holds it - a disabled one (a closed form, a panel whose plan cannot be edited) or one kept in
+    // the cache after its page closed shows nothing
+    const lists = queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).some((query) => query.isActive());
+    let unread = false;
     for (const id of ids) {
+      const page = queryClient.getQueryCache().find({ queryKey: ['migration', id], exact: true });
       // a read of it under way may have started before the event: it waits for the next batch
       if (queryClient.isFetching({ queryKey: ['migration', id] }) > 0) migrations.add(id);
-      else if (fetchMigration) void splice(id, fetchMigration, batch);
+      else if (!lists && !page?.isActive()) {
+        // read by nothing, but marked stale where it is cached: a page that shows it later, Back included, reads it
+        // again as it opens instead of showing it as it was before the event (SDD §16)
+        if (page) void queryClient.invalidateQueries({ queryKey: ['migration', id], exact: true, refetchType: 'none' });
+        unread = true;
+      } else if (fetchMigration) void splice(id, fetchMigration, batch);
+    }
+    // and so are the lists it may be in
+    if (unread && queryClient.getQueryCache().findAll({ queryKey: ['migrations'] }).length > 0) {
+      void queryClient.invalidateQueries({ queryKey: ['migrations'], refetchType: 'none' });
     }
     const keys = [...pending.entries()];
     pending.clear();
@@ -188,7 +279,7 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
         });
       }
     }
-    if (pending.size > 0 || migrations.size > 0) timer ??= setTimeout(flush, delayMs);
+    if (pending.size > 0 || migrations.size > 0) schedule();
   };
   return {
     invalidate,
@@ -199,16 +290,31 @@ export function createBatchedInvalidator(queryClient: QueryClient, delayMs = 400
         return;
       }
       migrations.add(id);
-      timer ??= setTimeout(flush, delayMs);
+      schedule();
     },
     dispose() {
       disposed = true;
+      stopWatching();
       if (timer) clearTimeout(timer);
       timer = null;
       pending.clear();
       migrations.clear();
     },
   };
+}
+
+/** A cached list of whole migrations, not of summaries (SDD §16). */
+function fullList(query: Query): boolean {
+  return !isSummaryList(query.queryKey);
+}
+
+/**
+ * An updater for the cached migration lists that patches the one migration in a list that holds it. A list that does
+ * not hold it gets `undefined`, which TanStack Query takes as "no update": its data, `dataUpdatedAt` and observers are
+ * left alone, so nothing reading it draws again on every progress event (SDD §16).
+ */
+function holding<M extends { id: string }>(id: string, patch: (m: M) => M) {
+  return (old: M[] | undefined): M[] | undefined => (old?.some((m) => m.id === id) ? old.map(patch) : undefined);
 }
 
 /** Applies one streamed event to the query cache. */
@@ -236,7 +342,12 @@ export function applyEventToCache(
     const patch = (m: Migration): Migration =>
       m.id === id ? { ...m, progress_pct: pct, bytes_transferred: done === null ? m.bytes_transferred : endedPassBytes(m) + done } : m;
     queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+    queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'], predicate: fullList }, holding(id, patch));
+    // a summary holds neither the passes nor the bytes: it takes the percentage alone (SDD §16)
+    queryClient.setQueriesData<MigrationSummary[]>(
+      { queryKey: ['migrations'], predicate: (query) => isSummaryList(query.queryKey) },
+      holding(id, (m) => (m.id === id ? { ...m, progress_pct: pct } : m)),
+    );
     return;
   }
 
@@ -252,7 +363,8 @@ export function applyEventToCache(
         return { ...m, sync_passes: passes, bytes_transferred: endedPassBytes({ ...m, sync_passes: passes }) };
       };
       queryClient.setQueryData<Migration>(['migration', id], (old) => (old ? patch(old) : old));
-      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'] }, (old) => old?.map(patch));
+      // a summary list has no passes: the read the event asks for brings what the pass changed
+      queryClient.setQueriesData<Migration[]>({ queryKey: ['migrations'], predicate: fullList }, holding(id, patch));
     }
   }
 
@@ -277,8 +389,13 @@ export function applyEventToCache(
   // not memory.lesson_saved: a lesson changes no migration, list or figure, and the Events page and the timeline take
   // it from the stream (SDD §16)
   if (kind.startsWith('migration.') || kind.startsWith('advisor.')) {
-    // advisor.strategy announces a recorded recommendation (SDD §14.4)
-    if (kind.startsWith('advisor.')) invalidate(['advisor', 'recommendations']);
+    // a Force cutover is an audit event too (SDD §5.4, §14.5): the live audit page reads the audit lists
+    if ((AUDIT_EVENT_KINDS as readonly string[]).includes(kind)) invalidate(['events', 'tail']);
+    // advisor.strategy announces a recorded recommendation (SDD §14.4); a note is the Advisor page's too (§16)
+    if (kind.startsWith('advisor.')) {
+      invalidate(['advisor', 'recommendations']);
+      invalidate(['advisor', 'notes']);
+    }
     // one migration that exists already: read it alone and put it into the lists (SDD §16)
     const one = kind !== 'migration.created' ? event.migration_id : null;
     if (one && refreshMigration) refreshMigration(one);
@@ -287,7 +404,8 @@ export function applyEventToCache(
       if (event.migration_id) invalidate(['migration', event.migration_id]);
     }
     invalidate(['stats']);
-    if (event.plan_id && (kind === 'migration.phase' || kind === 'migration.created')) invalidate(['plans', event.plan_id]);
+    // the plan list with its plan: their status and migration counts follow the phases (SDD §16)
+    if (kind === 'migration.phase' || kind === 'migration.created') invalidate(['plans']);
     return;
   }
   if (kind.startsWith('plan.') || kind.startsWith('wave.')) {

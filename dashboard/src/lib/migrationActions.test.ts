@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { buildFixtures } from '../api/mockData';
 import { PHASES, type Migration, type Phase, type Plan, type Strategy } from '../api/types';
-import { clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, uncountedReason, type MigrationActionKey } from './migrationActions';
-import { OWN_CUTOVER, OWN_FORCE } from './roles';
+import { formatDateTime, formatDuration } from './format';
+import { approveDialog, clearedByStrategyChange, clearedByValidation, countedApprovals, migrationActions, nextStep, requestWaitsForApprover, uncountedReason, type MigrationActionKey } from './migrationActions';
+import { AUTH_OFF_HINT, OWN_CUTOVER, OWN_FORCE } from './roles';
 
 const fx = buildFixtures(Date.parse('2026-10-08T12:00:00Z'));
 const base = fx.migrations.find((m) => m.vm.name === 'app-billing-01') as Migration;
@@ -29,7 +30,8 @@ const ENABLED_FOR_APPROVER: Record<Phase, MigrationActionKey[]> = {
   // an approval given ahead of a retry lasts through it (SDD §5.1, §16)
   failed: ['approve', 'rollback', 'retry', 'cancel'],
   rolling_back: [],
-  rolled_back: ['approve', 'retry'],
+  // a rolled-back VM can be dropped for good: the cancel cleans up what its rollback kept (SDD §5.1)
+  rolled_back: ['approve', 'retry', 'cancel'],
   cancelled: [],
 };
 
@@ -54,6 +56,15 @@ describe('migrationActions rules', () => {
     const verifying = migrationActions(migration('verifying'), 'approver').finalize;
     expect(verifying.enabled).toBe(false);
     expect(verifying.reason).toMatch(/completed/i);
+  });
+
+  it('keeps Finalize unavailable while the source VM runs again, as the API refuses it, unless a finalize began deleting it (SDD §8.1)', () => {
+    const running = migrationActions(migration('completed', { source_running_at: '2026-10-08T11:00:00Z' }), 'approver');
+    expect(running.finalize).toEqual({ enabled: false, reason: 'The source VM runs again: stop it, or roll it back, before finalizing.' });
+    expect(running.rollback.enabled).toBe(true);
+    // its finalize began deleting the source and a rollback is refused then: finalizing again is the way out
+    const finalizing = migrationActions(migration('completed', { source_running_at: '2026-10-08T11:00:00Z', checkpoint: 'finalizing' }), 'approver');
+    expect([finalizing.finalize.enabled, finalizing.rollback.enabled]).toEqual([true, false]);
   });
 
   it('keeps Rollback from a completed migration whose finalize began deleting the source, and offers Finalize again (SDD §8.1)', () => {
@@ -191,6 +202,18 @@ describe('migrationActions rules', () => {
     expect(migrationActions(requested, 'approver', undefined, now, 'sari').approve.enabled).toBe(false);
   });
 
+  it('says, with authentication off, how to get past a maker-checker refusal (SDD §13, §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_distinct_approver: true };
+    const now = Date.parse('2026-10-08T12:00:00Z');
+    // every request is anonymous with authentication off: nobody else exists to approve
+    const requested = migration('awaiting_cutover', { cutover_requested: true, cutover_requested_by: 'anonymous', approvals: [] });
+    expect(migrationActions(requested, 'admin', plan, now, 'anonymous').approve).toEqual({ enabled: false, reason: `${OWN_CUTOVER} ${AUTH_OFF_HINT}` });
+    const forced = migration('syncing', { force_cutover: { ...FORCED, actor: 'anonymous' }, approvals: [] });
+    expect(migrationActions(forced, 'admin', plan, now, 'anonymous').approve).toEqual({ enabled: false, reason: `${OWN_FORCE} ${AUTH_OFF_HINT}` });
+    // a named user gets the API's words alone
+    expect(migrationActions({ ...requested, cutover_requested_by: 'sari' }, 'approver', plan, now, 'sari').approve.reason).toBe(OWN_CUTOVER);
+  });
+
   it('counts the approvals the gate counts: all but the requester\'s under a distinct approver (SDD §5.4)', () => {
     const plan = fx.plans.find((p) => p.id === base.plan_id)!;
     const at = '2026-10-08T11:00:00Z';
@@ -236,6 +259,59 @@ describe('migrationActions rules', () => {
     const cold = migration('ready', { approvals: [], estimate: { ...base.estimate!, downtime_s: 300 } }, 'cold');
     expect(nextStep(cold, plan).text).toBe('Ready. Next: an approver requests the cutover and another approves it; the source VM stops for about 5 min.');
     expect(nextStep(cold, { ...plan, require_distinct_approver: false }).text).toBe('Ready. Next: an approver starts the cutover; the source VM stops for about 5 min.');
+  });
+
+  it('knows when a cutover request only waits for another approver (maker-checker, SDD §5.4, §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: true, require_distinct_approver: true };
+    const at = '2026-10-08T11:00:00Z';
+    const ready = migration('ready', { approvals: [] }, 'cold');
+    expect(requestWaitsForApprover(ready, plan, 'sari')).toBe(true);
+    // another approver approved ahead: sari's request starts it
+    expect(requestWaitsForApprover({ ...ready, approvals: [{ actor: 'rina', at, comment: null }] }, plan, 'sari')).toBe(false);
+    // sari's own approval stops counting once she requests
+    expect(requestWaitsForApprover({ ...ready, approvals: [{ actor: 'sari', at, comment: null }] }, plan, 'sari')).toBe(true);
+    // the request already made by rina: sari's approval counts for it
+    const requested = { ...ready, cutover_requested: true, cutover_requested_by: 'rina', approvals: [{ actor: 'sari', at, comment: null }] };
+    expect(requestWaitsForApprover(requested, plan, 'sari')).toBe(false);
+    // without maker-checker the request is the approval, and without approval nothing waits
+    expect(requestWaitsForApprover(ready, { ...plan, require_distinct_approver: false }, 'sari')).toBe(false);
+    expect(requestWaitsForApprover(ready, { ...plan, require_approval: false }, 'sari')).toBe(false);
+  });
+
+  const REFUSAL = "the NIC 00:50:56:40:d5:b3 of dc2-portal-02 on 'dc2-prod': port demo-port-1 holds 10.2.0.32";
+
+  it('says to fix what the cutover will refuse, then sync, while the migration waits for its cutover (SDD §16)', () => {
+    const plan = { ...fx.plans.find((p) => p.id === base.plan_id)!, require_approval: false };
+    const fixFirst = {
+      text: 'Converged, but the cutover will refuse what the last pass found. Next: fix it, then sync so a pass looks again (operator); keep-warm syncs look too.',
+      action: 'sync',
+    };
+    expect(nextStep(migration('awaiting_cutover', { cutover_refusals: [REFUSAL] }), plan)).toEqual(fixFirst);
+    // requested or not: the requested cutover would refuse it as well (requesting stays possible)
+    const requested = migration('awaiting_cutover', { cutover_refusals: [REFUSAL], cutover_requested: true, cutover_requested_by: 'sari', approvals: [] });
+    expect(nextStep(requested, { ...plan, require_approval: true, require_distinct_approver: true })).toEqual(fixFirst);
+    // once a pass finds none, the cutover is next again
+    expect(nextStep(migration('awaiting_cutover', { cutover_refusals: [] }), plan).action).toBe('cutover');
+    // while the passes run, the next pass looks again by itself
+    expect(nextStep(migration('syncing', { cutover_refusals: [REFUSAL] }), plan).text).toBe('Delta passes run until the change rate converges.');
+  });
+
+  it("says a cutover failed on what it refused, and that the retry's pass looks again (SDD §16)", () => {
+    const refused = migration('failed', { cutover_refusals: [REFUSAL], error: `cutover: ${REFUSAL}` });
+    expect(nextStep(refused, null)).toEqual({
+      text: "Failed: the cutover refused what the passes found, before the source stopped. Next: fix it, then retry — the retry's pass looks again — or cancel.",
+      action: 'retry',
+    });
+    // another step's failure keeps its own next step, whatever the passes found, and so does a cutover that
+    // failed on something the passes did not find
+    expect(nextStep(migration('failed', { cutover_refusals: [REFUSAL], error: 'sync: the NBD export closed' }), null).text).toBe(
+      'Failed. Next: fix the cause and retry, or cancel.',
+    );
+    expect(nextStep(migration('failed', { cutover_refusals: [], error: 'cutover: a server named app-billing-01 exists' }), null).text).toBe(
+      'Failed. Next: fix the cause and retry, or cancel.',
+    );
+    // after the source stopped, rolling back comes first, as before
+    expect(nextStep(migration('failed', { cutover_refusals: [REFUSAL], error: `cutover: ${REFUSAL}`, downtime_started_at: '2026-10-08T11:00:00Z' }), null).action).toBe('rollback');
   });
 
   it('offers Force cutover to an approver while the passes of a warm migration run, and says why elsewhere (SDD §5.4, ADV-16)', () => {
@@ -297,6 +373,12 @@ describe('migrationActions rules', () => {
     expect(nextStep(migration('completed', { phase_history: [] }), plan, now).text).toBe(
       'Verified on RHOSO. Next: finalize to clean up the source (approver), or roll back if needed.',
     );
+    // its finalize began deleting the source: finalizing again is the way out, never a rollback - also while the source
+    // runs again (SDD §8.1)
+    const again = { text: 'The finalize began deleting the source VM. Next: finalize it again (approver); it can no longer be rolled back.', action: 'finalize' };
+    for (const m of [{ ...completed(10), checkpoint: 'finalizing' }, { ...completed(80), checkpoint: 'finalizing', source_running_at: '2026-10-08T11:00:00Z' }]) {
+      expect(nextStep(m, plan, now)).toEqual(again);
+    }
   });
 
   it('names the next step', () => {
@@ -324,5 +406,87 @@ describe('what re-validation or a strategy change clears (SDD §5.4)', () => {
     expect(clearedByStrategyChange(migration('ready', { approvals: [approval], cutover_requested: true }))).toBe('1 approval and the cutover request');
     expect(clearedByStrategyChange(migration('ready', { cutover_requested: true }))).toBe('the cutover request');
     expect(clearedByStrategyChange(migration('ready'))).toBeNull();
+  });
+});
+
+describe('approveDialog (SDD §5.4, §16)', () => {
+  const now = Date.parse('2026-10-08T12:00:00Z');
+  const gate: Plan = {
+    ...(fx.plans.find((p) => p.id === base.plan_id) as Plan),
+    require_approval: true,
+    require_distinct_approver: true,
+    auto_cutover: false,
+    cutover_window: null,
+  };
+  const later = { start: '2026-10-09T22:00:00Z', end: '2026-10-10T02:00:00Z' };
+  // another approver requested it and none counts yet: the approval is the one the gate waits for
+  const requested = (phase: Phase, overrides: Partial<Migration> = {}, strategy: Strategy = 'cold') =>
+    migration(phase, { approvals: [], cutover_requested: true, cutover_requested_by: 'rina', advisor_hold: null, force_cutover: null, force_window: false, ...overrides }, strategy);
+  const estimate = (m: Migration) => `Estimated downtime ${formatDuration(m.estimate!.downtime_s)} against an SLO of ${formatDuration(gate.downtime_slo_s)}.`;
+
+  it('says the approval starts the cutover, and stops the source VM, when it is all the gate waits for', () => {
+    for (const m of [requested('ready'), requested('awaiting_cutover', {}, 'warm')]) {
+      expect(approveDialog(m, gate, now)).toEqual({
+        description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts as soon as the plan, its wave and a free cutover slot allow. ${estimate(m)}`,
+        confirmLabel: 'Approve and cut over',
+      });
+    }
+  });
+
+  it('needs no request in a plan that cuts over automatically, nor a window it bypasses', () => {
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), { ...gate, auto_cutover: true }, now).confirmLabel).toBe('Approve and cut over');
+    expect(approveDialog(requested('ready', { force_window: true }), { ...gate, cutover_window: later }, now).confirmLabel).toBe('Approve and cut over');
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: { start: '2026-10-08T11:00:00Z', end: '2026-10-08T13:00:00Z' } }, now).confirmLabel).toBe('Approve and cut over');
+  });
+
+  it('starts a warm cutover once pre-copy converges, or after the running pass when forced', () => {
+    const early = requested('precopy', {}, 'warm');
+    expect(approveDialog(early, gate, now).description).toBe(
+      `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts once pre-copy has converged and the plan, its wave and a free cutover slot allow. ${estimate(early)}`,
+    );
+    const forced = requested('syncing', { cutover_requested_by: 'rina', force_cutover: FORCED }, 'warm');
+    expect(approveDialog(forced, gate, now)).toEqual({
+      description: `Your approval lets the cutover start: the source VM will then be stopped and the downtime clock starts after the running pass, once the plan, its wave and a free cutover slot allow. Estimated downtime ${formatDuration(FORCED.estimated_downtime_s)} against an SLO of ${formatDuration(gate.downtime_slo_s)}.`,
+      confirmLabel: 'Approve and cut over',
+    });
+  });
+
+  it('names what the cutover still waits for, with Approve', () => {
+    const window = `the cutover window (${formatDateTime(later.start)} → ${formatDateTime(later.end)})`;
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), gate, now)).toEqual({
+      description: 'Records your approval. The cutover still waits for a cutover request.',
+      confirmLabel: 'Approve',
+    });
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: later }, now).description).toBe(`Records your approval. The cutover still waits for ${window}.`);
+    // a window that has ended holds the cutover too
+    const ended = { start: '2026-10-07T22:00:00Z', end: '2026-10-08T02:00:00Z' };
+    expect(approveDialog(requested('ready'), { ...gate, cutover_window: ended }, now).description).toBe(
+      `Records your approval. The cutover still waits for the cutover window (${formatDateTime(ended.start)} → ${formatDateTime(ended.end)}).`,
+    );
+    expect(approveDialog(requested('ready', { cutover_requested: false, cutover_requested_by: null }), { ...gate, cutover_window: later }, now).description).toBe(
+      `Records your approval. The cutover still waits for a cutover request and ${window}.`,
+    );
+    expect(approveDialog(requested('ready', { advisor_hold: 'rec-1' }), gate, now)).toEqual({
+      description: "Records your approval. The cutover still waits for the advisor's decision.",
+      confirmLabel: 'Approve',
+    });
+  });
+
+  it('says when an approval counts already, the plan needs none, a retry keeps it or the plan is not loaded', () => {
+    const counted = requested('ready', { approvals: [{ actor: 'bayu', at: '2026-10-08T11:30:00Z', comment: null }] });
+    expect(approveDialog(counted, gate, now)).toEqual({ description: 'Records your approval. The cutover has the approval it needs already.', confirmLabel: 'Approve' });
+    expect(approveDialog(requested('ready'), { ...gate, require_approval: false }, now)).toEqual({
+      description: 'This plan needs no approval to cut over: yours is recorded in the audit trail.',
+      confirmLabel: 'Approve',
+    });
+    for (const phase of ['failed', 'rolled_back'] as const) {
+      expect(approveDialog(requested(phase), gate, now)).toEqual({
+        description: 'Records your approval for the next attempt: a retry keeps it, and its cutover is requested anew.',
+        confirmLabel: 'Approve',
+      });
+    }
+    for (const plan of [null, undefined]) {
+      expect(approveDialog(requested('ready'), plan, now)).toEqual({ description: 'Records your approval. What it leads to depends on the plan, which is not loaded.', confirmLabel: 'Approve' });
+    }
   });
 });

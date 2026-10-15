@@ -1,14 +1,25 @@
 import type { Migration, Plan } from '../api/types';
-import { isOverdue } from './finalize';
+import type { ApprovalMigration } from './approvals';
+import { isOverdue, type Completable } from './finalize';
 import { countedApprovals } from './migrationActions';
 import { formatRelative } from './format';
 import type { Tone } from './phase';
 import { isWaveActive } from './waves';
 
 const SINGLE_SHOT = new Set(['cold', 'storage_handover', 'vmware_cold']);
+/** Where what the warm passes found still stands before the cutover (SDD §7.2, §16). */
+const REFUSABLE = new Set(['precopy', 'syncing', 'awaiting_cutover']);
+
+/** What Needs attention reads of a migration, or of its summary (SDD §4, §16). */
+export type AttentionMigration = ApprovalMigration &
+  Completable &
+  Pick<
+    Migration,
+    'downtime_started_at' | 'downtime_ended_at' | 'source_running_at' | 'error' | 'review_required' | 'review_reason' | 'findings' | 'cutover_refusals'
+  >;
 
 export interface AttentionItem {
-  migration: Migration;
+  migration: AttentionMigration;
   tone: Extract<Tone, 'danger' | 'warning' | 'info'>;
   reason: string;
   nextAction: string;
@@ -29,7 +40,7 @@ function windowState(plan: Plan | undefined, now: number): 'none' | 'open' | 'cl
  * to give is listed once on the Overview, in Pending approvals (lib/approvals.ts, SDD §16, ADV-20): the gate's
  * own count, so the requester's approval does not count under maker-checker.
  */
-function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: number): AttentionItem | null {
+function gateItem(m: AttentionMigration, plan: Plan | undefined, now: number, rank: number): AttentionItem | null {
   if (plan && plan.require_approval && countedApprovals(m, plan).length === 0) return null;
   if (plan && !plan.auto_cutover && !m.cutover_requested) {
     return {
@@ -58,7 +69,7 @@ function gateItem(m: Migration, plan: Plan | undefined, now: number, rank: numbe
  * for unknown, never left out (SDD §16).
  */
 export function attentionItems(
-  migrations: Migration[],
+  migrations: readonly AttentionMigration[],
   plans: ReadonlyMap<string, Plan>,
   now = Date.now(),
   { plansUnknown = false }: { plansUnknown?: boolean } = {},
@@ -93,6 +104,19 @@ export function attentionItems(
         reason: `Review required${m.review_reason ? `: ${m.review_reason}` : ''}`,
         nextAction: 'Check the advisor notes and the destination VM',
         rank: 2,
+      };
+    } else if (m.cutover_refusals.length > 0 && REFUSABLE.has(m.phase)) {
+      // SDD §16: fixing what the cutover will refuse comes before what it waits for; an approval stays in
+      // Pending approvals
+      const n = m.cutover_refusals.length;
+      const fix = n === 1 ? 'Fix it' : 'Fix them';
+      item = {
+        migration: m,
+        tone: 'warning',
+        reason: `Cutover will refuse ${n} problem${n === 1 ? '' : 's'}`,
+        nextAction:
+          m.phase === 'awaiting_cutover' ? `${fix}, then Sync now (operator)` : `${fix} before it converges: the next pass looks again (operator)`,
+        rank: 3,
       };
     } else if (m.phase === 'awaiting_cutover') {
       item =
@@ -134,6 +158,9 @@ export function attentionItems(
         nextAction: 'Finalize or roll it back (approver)',
         rank: 6,
       };
+    } else if (m.phase === 'rolled_back') {
+      // SDD §16: it waits for a person to fix the cause and retry it, or to cancel it - the least urgent entry
+      item = { migration: m, tone: 'info', reason: 'Rolled back — the source VM runs again', nextAction: 'Fix the cause, then retry or cancel (operator)', rank: 7 };
     }
     if (item) items.push(item);
   }

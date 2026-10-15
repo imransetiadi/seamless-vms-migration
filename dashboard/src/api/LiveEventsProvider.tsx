@@ -1,14 +1,15 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useApi } from './hooks';
-import { applyEventToCache, createBatchedInvalidator, LiveContext, LiveEventHub, refetchAfterReconnect } from './live';
+import { applyEventToCache, createBatchedInvalidator, keepStreamFresh, LiveContext, LiveEventHub, refetchAfterReconnect } from './live';
 import { streamEvents } from './stream';
 import type { Migration } from './types';
 
 /**
  * Owns the app's single SSE connection while `enabled` (i.e. signed in). The first connection
  * streams live events only; reconnects resume with `since=<last seq>` (SDD §12), and every query
- * is refetched once the stream is open again (SDD §16).
+ * is refetched once the stream is open again (SDD §16). While it is open, the window regaining
+ * focus reads nothing it keeps fresh (§16).
  */
 export function LiveEventsProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
   const api = useApi();
@@ -25,6 +26,7 @@ export function LiveEventsProvider({ enabled, children }: { enabled: boolean; ch
     const batch = createBatchedInvalidator(queryClient, 400, (id) => api.get<Migration>(`/migrations/${encodeURIComponent(id)}`));
     const unsubscribe = hub.subscribe((event) => applyEventToCache(queryClient, event, batch.invalidate, batch.refreshMigration));
     const refetch = refetchAfterReconnect(queryClient);
+    const stopKeeping = keepStreamFresh(queryClient, () => hub.getSnapshot().status);
     void streamEvents(null, hub.publish, controller.signal, {
       client: api,
       onStatus: (status) => {
@@ -37,6 +39,7 @@ export function LiveEventsProvider({ enabled, children }: { enabled: boolean; ch
       controller.abort();
       unsubscribe();
       batch.dispose();
+      stopKeeping();
     };
   }, [api, enabled, hub, queryClient]);
 

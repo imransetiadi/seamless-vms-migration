@@ -1,5 +1,6 @@
 import ast
 import copy
+import importlib
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from seamless_migrate.executors.ansible import (
     KIT_PLAYBOOK,
     STOP_TASK,
     AnsibleExecutor,
+    Deferred,
     ansible_yaml,
     apply_mappings,
     build_inventory,
@@ -98,6 +100,22 @@ class FakeImpl:
     async def power_on(self, source_id):
         self.calls.append(("power_on", source_id))
 
+    async def ports(self, *, network_id=None, mac_address=None, ip_address=None):
+        """The destination's ports matching every filter given (SDD §10)."""
+        if self.registry.ports_error:
+            raise ProviderError("ports: HTTP 503")
+        return [
+            dict(p)
+            for p in self.registry.ports
+            if (network_id is None or p["network_id"] == network_id)
+            and (mac_address is None or p["mac_address"] == mac_address)
+            and (ip_address is None or ip_address in p["fixed_ips"])
+        ]
+
+    async def delete_port(self, port_id):
+        self.calls.append(("delete_port", port_id))
+        self.registry.ports = [p for p in self.registry.ports if p["id"] != port_id]
+
     async def inventory(self):
         """The destination's networks, for the network references (SDD §7.2)."""
         self.calls.append(("inventory",))
@@ -142,6 +160,9 @@ class FakeRegistry:
         # more subnets, after each network's one
         self.subnets: list[dict] = []
         self.inventory_error = False
+        # the destination's ports (SDD §10 DestinationProvider.ports)
+        self.ports: list[dict] = []
+        self.ports_error = False
 
     def get(self, provider):
         return FakeImpl(self)
@@ -1046,6 +1067,250 @@ async def test_vmware_rollback_deletes_destination_and_powers_on_source(env):
     assert read_log(env.log) == []
 
 
+async def test_vmware_rollback_deletes_the_kits_ports_of_the_vm(env):
+    """SDD §7.2: the kit creates each port and gives Nova its id, and Nova only unbinds such a port
+    when it deletes the server - it would keep the NIC's MAC and addresses and refuse the next
+    attempt. The rollback deletes, after the server, the unbound ports with one of the VM's NIC
+    MACs and the kit's name form; any other port is kept (review RT-11)."""
+    mac = "00:50:56:00:00:01"
+    nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
+
+    def port(port_id, name, mac=mac, device_id=""):
+        return {
+            "id": port_id,
+            "name": name,
+            "network_id": "net-app-net-mine",
+            "device_id": device_id,
+            "mac_address": mac,
+            "fixed_ips": ["10.0.0.5"],
+        }
+
+    env.registry.ports = [
+        port("kit", "web-01-NIC-0-VLAN-app-net"),
+        port("bound", "web-01-NIC-0-VLAN-app-net", device_id="srv-other"),
+        port("named-otherwise", "my-port"),
+        port("other-mac", "web-01-NIC-1-VLAN-app-net", mac="00:50:56:00:00:99"),
+    ]
+    ctx, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_cold,
+        source=VCENTER,
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    result = await env.executor.run(StepName.ROLLBACK, ctx)
+    assert env.registry.calls == [
+        ("delete_server", "dst-9"),
+        ("delete_port", "kit"),
+        ("power_on", "srv-1"),
+    ]
+    assert result.details["deleted_ports"] == ["kit"]
+    assert [p["id"] for p in env.registry.ports] == ["bound", "named-otherwise", "other-mac"]
+    # ports that cannot be read: the rollback is retried, the source not yet started
+    env.registry.calls.clear()
+    env.registry.ports_error = True
+    with pytest.raises(TransientStepError, match="rollback: ports: HTTP 503"):
+        await env.executor.run(StepName.ROLLBACK, ctx)
+    assert ("power_on", "srv-1") not in env.registry.calls
+
+
+async def test_vmware_runs_refuse_a_nic_whose_mac_or_address_another_port_holds(env):
+    """SDD §7.2: the kit asks Neutron for each NIC's MAC and IPv4 addresses after it powered the VM
+    off; another port of the NIC's network holding either is refused before the kit, naming the
+    port (review RT-11)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_cold, "source": VCENTER, "mappings": Mappings()}
+
+    async def refused(error=PermanentStepError):
+        ran = len(read_log(env.log))
+        ctx, rec = ctx_for(env, nics=[nic], **kit)
+        with pytest.raises(error) as exc:
+            await env.executor.run(StepName.CUTOVER, ctx)
+        # nothing ran: the VM keeps running
+        assert len(read_log(env.log)) == ran and rec.downtime_marks == 0
+        return str(exc.value)
+
+    held = {
+        "id": "port-old",
+        "name": "web-01-NIC-0-VLAN-app-net",
+        "network_id": net["id"],
+        "device_id": "",
+        "mac_address": "00:50:56:00:00:01",
+        "fixed_ips": ["10.0.0.9"],
+    }
+    env.registry.ports.append(held)
+    assert await refused() == (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    held.update(mac_address="fa:16:3e:00:00:09", fixed_ips=["10.0.0.5"])
+    assert await refused() == (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds 10.0.0.5"
+    )
+    # ports that cannot be read: transient, before the kit
+    env.registry.ports_error = True
+    assert "could not read the destination's ports" in await refused(TransientStepError)
+    env.registry.ports_error = False
+    # a port of another network holds nothing the kit asks this network for
+    held.update(network_id="net-elsewhere", mac_address="00:50:56:00:00:01")
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "app-net": f"{net['id']},sub-{net['id']}"
+    }
+
+
+async def test_a_warm_pass_returns_the_refusals_its_destination_check_recorded(env, monkeypatch):
+    """SDD §6.6, §7.2: the warm role writes what the destination check found that the cutover
+    will refuse beside the warm state; the pass returns it for the migration, a later pass that
+    meets none returns none, and a run that left no such file is not read as the last one's."""
+    problem = "Destination prerequisites not met: port p2 on network 'gone' does not resolve"
+    monkeypatch.setenv("ANSIBLE_FAKE_REFUSALS", json.dumps([problem, problem]))
+    ctx, _ = ctx_for(env)
+    # once each
+    assert (await env.executor.run(StepName.PRECOPY, ctx)).cutover_refusals == [problem]
+    monkeypatch.delenv("ANSIBLE_FAKE_REFUSALS")
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+    # a stale file from an earlier pass is removed before the run
+    stale = run_dir(env) / "osm" / "workload_warm" / "srv-1.refusals.json"
+    stale.write_text(json.dumps(["stale"]))
+    monkeypatch.setenv("ANSIBLE_FAKE_NO_REFUSALS_FILE", "1")
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+    # not a pass: nothing to record
+    assert (await env.executor.run(StepName.CUTOVER, ctx)).cutover_refusals is None
+
+
+async def test_a_vmware_warm_pass_returns_what_the_cutover_will_refuse(env):
+    """SDD §7.2: a vmware_warm pass returns, once each, the problems it logs instead of refusing -
+    and a pass after they are fixed returns none."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_warm, "source": VCENTER, "mappings": Mappings()}
+    holder = {
+        "id": "port-old",
+        "name": "web-01-NIC-0-VLAN-app-net",
+        "network_id": net["id"],
+        "device_id": "",
+        "mac_address": "00:50:56:00:00:01",
+        "fixed_ips": ["10.0.0.9"],
+    }
+    env.registry.ports.append(holder)
+    held = (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    assert (await env.executor.run(StepName.PRECOPY, ctx)).cutover_refusals == [held]
+    env.registry.ports.remove(holder)
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    assert (await env.executor.run(StepName.SYNC, ctx)).cutover_refusals == []
+
+
+async def test_a_vmware_warm_pass_logs_what_only_the_cutovers_ports_meet(env):
+    """SDD §7.2: the kit makes the ports only at the cutover, after the power-off. A vmware_warm
+    pre-copy or sync run maps a NIC whose network the credential may not use, or whose MAC or
+    address another port holds, as usual and logs the problem, as it logs ports that cannot be
+    read; the cutover refuses it. A NIC the map cannot take still stops every run (review
+    NC-07)."""
+    net = next(n for n in env.registry.networks if n["name"] == "app-net")
+    nic = Nic(
+        network="app-net", mac="00:50:56:00:00:01", fixed_ips=["10.0.0.5"], network_key="app-net"
+    )
+    kit = {"strategy": Strategy.vmware_warm, "source": VCENTER, "mappings": Mappings()}
+    later = "the cutover will refuse this before the source stops: "
+    env.registry.ports.append(
+        {
+            "id": "port-old",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": net["id"],
+            "device_id": "",
+            "mac_address": "00:50:56:00:00:01",
+            "fixed_ips": ["10.0.0.9"],
+        }
+    )
+    held = (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': port port-old holds its MAC "
+        "00:50:56:00:00:01"
+    )
+    for step in (StepName.PRECOPY, StepName.SYNC):
+        ctx, rec = ctx_for(env, nics=[nic], **kit)
+        await env.executor.run(step, ctx)
+        assert read_log(env.log)[-1]["vars"]["network_map"] == {
+            "app-net": f"{net['id']},sub-{net['id']}"
+        }
+        assert rec.logs.count(later + held) == 1
+        # logged before the kit ran
+        assert rec.logs.index(later + held) < rec.logs.index(f"running {KIT_PLAYBOOK}")
+
+    # the cutover refuses it before the power-off
+    ran = len(read_log(env.log))
+    ctx, rec = ctx_for(env, nics=[nic], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    assert str(exc.value) == held
+    assert len(read_log(env.log)) == ran and rec.downtime_marks == 0
+
+    # ports that cannot be read: logged in a pass, transient at the cutover
+    env.registry.ports_error = True
+    ctx, rec = ctx_for(env, nics=[nic], **kit)
+    await env.executor.run(StepName.SYNC, ctx)
+    assert (
+        "the NIC 00:50:56:00:00:01 of web-01 on 'app-net': could not read the destination's "
+        "ports: ports: HTTP 503; the cutover reads them again before the power-off"
+    ) in rec.logs
+    assert not any(ln.startswith(later) for ln in rec.logs)
+    ctx, _ = ctx_for(env, nics=[nic], **kit)
+    with pytest.raises(TransientStepError, match="could not read the destination's ports"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    env.registry.ports_error = False
+
+    # another project's shared network, from a member's token: mapped and logged in a pass
+    env.registry.networks.append(dst_net("shared-net", own=False))
+    shared = Nic(
+        network="shared-net",
+        mac="00:50:56:00:00:04",
+        fixed_ips=["10.0.0.7"],
+        network_key="dvportgroup-9",
+    )
+    member = DST.model_copy(update={"capabilities": {"roles": ["member", "reader"]}})
+    plan = make_plan(id="plan-00c0ffee", mappings=Mappings())
+    vm = make_vm(source_id="srv-1", name="web-01", nics=[shared])
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.vmware_warm)
+    ctx, rec = make_ctx(plan, mig, VCENTER, member, env.settings)
+    await env.executor.run(StepName.PRECOPY, ctx)
+    assert read_log(env.log)[-1]["vars"]["network_map"] == {
+        "dvportgroup-9": "net-shared-net-theirs,sub-net-shared-net-theirs"
+    }
+    [refused] = [ln for ln in rec.logs if ln.startswith(later)]
+    assert refused.startswith(
+        later + "the NIC 00:50:56:00:00:04 of web-01 cannot go to RHOSO network 'shared-net' "
+        "(project admin): "
+    )
+    assert "Neutron lets only the admin or advsvc role" in refused
+    ctx, _ = make_ctx(plan, mig, VCENTER, member, env.settings)
+    with pytest.raises(PermanentStepError, match="Neutron lets only the admin or advsvc role"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+
+    # a NIC the map cannot take still stops a pass, before the kit
+    ran = len(read_log(env.log))
+    gone = Nic(
+        network="gone-net", mac="00:50:56:00:00:09", fixed_ips=["10.0.0.9"], network_key="gone-net"
+    )
+    ctx, _ = ctx_for(env, nics=[nic, gone], **kit)
+    with pytest.raises(PermanentStepError) as exc:
+        await env.executor.run(StepName.PRECOPY, ctx)
+    assert str(exc.value) == (
+        "the NIC 00:50:56:00:00:09 of web-01 cannot go to RHOSO network 'gone-net': there is no "
+        "network named 'gone-net'"
+    )
+    assert len(read_log(env.log)) == ran
+
+
 async def test_progress_tail_reports_pct(env, monkeypatch):
     monkeypatch.setenv("ANSIBLE_FAKE_SLEEP", "0.5")
     ctx, rec = ctx_for(env, strategy=Strategy.cold)
@@ -1084,6 +1349,43 @@ def test_workload_file_stem_matches_the_collection():
         namespace["workload_file_stem"](n) for n in names
     ]
     assert all("/" not in workload_file_stem(n) for n in names)
+
+
+def _give_up_prefixes(source: str) -> list[str]:
+    """The prefixes a give-up of the collection's SshOutage can carry: its GIVE_UP_PREFIXES, the
+    only ones an SshOutage takes, in whatever form a call or a subclass passes one (review
+    RV11-05)."""
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) == "GIVE_UP_PREFIXES" for target in node.targets
+        ):
+            return list(ast.literal_eval(node.value))
+    pytest.fail("volume_common.py declares no GIVE_UP_PREFIXES")
+
+
+def test_the_collections_conversion_host_failures_are_classified_as_the_sdd_says():
+    """SDD §6.6, QASuite R-07: a lock wait, the source cleanup's SSH check or a wait for the NBD
+    exports that cannot reach the conversion host is retried - the host may be rebooting - and a
+    detach that never ends is not (review RV6-01, RV9-02, RV9-04). The messages are read from the
+    collection's source, each prefix its waits use included, so rewording one cannot move it out
+    of its class."""
+    source = (
+        Path(__file__).resolve().parents[2] / "plugins/module_utils/volume_common.py"
+    ).read_text()
+    templates = re.findall(r'"([^"]*%[sd][^"]*)"', source)
+    unreachable = next(t for t in templates if "unreachable over SSH" in t)
+    stuck = next(t for t in templates if "waiting to detach volume" in t)
+    prefixes = sorted(_give_up_prefixes(source))
+    waits = {
+        "Lock timeout": "/var/lock/v2v-source-volume-lock",
+        "SSH timeout": "the source cleanup",
+    }
+
+    assert prefixes == sorted(waits)
+    for prefix in prefixes:
+        message = unreachable % (prefix, "10.1.0.10", 66, waits[prefix])
+        assert classify_failure(message) is TransientStepError, message
+    assert classify_failure(stuck % (1800, "vol-1", "srv-1")) is PermanentStepError
 
 
 def test_transient_vs_permanent_failure_classifier():
@@ -1447,6 +1749,12 @@ class FailingImpl:
     async def inventory(self):
         raise ProviderError("inventory: connection refused")
 
+    async def ports(self, **filters):
+        raise ProviderError("ports: connection refused")
+
+    async def delete_port(self, port_id):
+        raise ProviderError(f"delete port {port_id}: HTTP 503")
+
 
 class FailingRegistry(FakeRegistry):
     def get(self, provider):
@@ -1497,16 +1805,481 @@ async def test_cutover_refuses_a_pre_existing_destination_server(env):
 def test_cold_rollback_before_any_stop_never_matches_by_name(env):
     """SDD §7.2: the cold role creates the destination server after it stops the source, so
     before a stop a same-named server is not this migration's — a cutover refused or skipped
-    for a name collision is rolled back without deleting it (or, after a cancel, its volumes)."""
-    for options in ({}, {"delete_dest_volumes": True}):
-        ctx, _ = ctx_for(env, strategy=Strategy.cold)
-        ctx.options.update(options)
-        assert ctx.migration.downtime_started_at is None
-        rollback = build_vars(StepName.ROLLBACK, ctx)
-        assert "os_migrate_rollback_match_by_name" not in rollback
-        stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
-        stopped.options.update(options)
-        assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+    for a name collision is rolled back without deleting it. A cancel's cleanup never matches by
+    name, stopped or not (SDD §5.1, review RV-01): the migration's rollback already removed its
+    server, and the VM it released may since be another plan's."""
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    assert ctx.migration.downtime_started_at is None
+    assert "os_migrate_rollback_match_by_name" not in build_vars(StepName.ROLLBACK, ctx)
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_match_by_name"] is True
+    for cleanup in (ctx, stopped):
+        cleanup.options["delete_dest_volumes"] = True
+        assert "os_migrate_rollback_match_by_name" not in build_vars(StepName.ROLLBACK, cleanup)
+
+
+def test_a_cancels_cleanup_touches_only_the_migrations_own_data_path(env):
+    """SDD §5.1 (review RV-01, RV-02): the cleanup after a cancel - the rollback step with
+    delete_dest_volumes - matches no server by name, deletes no port and leaves the source as it
+    is: its rollback removed its server and ports and started its source, and the VM it released
+    may since be another plan's. A rollback deletes its ports and starts its source as before."""
+    for strategy in (Strategy.cold, Strategy.warm):
+        cleanup, _ = ctx_for(
+            env, strategy=strategy, downtime_started_at=utcnow(), downtime_ended_at=utcnow()
+        )
+        cleanup.options["delete_dest_volumes"] = True
+        v = build_vars(StepName.ROLLBACK, cleanup)
+        assert v["os_migrate_rollback_delete_dest_volumes"] is True, strategy
+        assert v["os_migrate_rollback_start_source"] is False, strategy
+        assert v["os_migrate_rollback_delete_ports"] is False, strategy
+        assert "os_migrate_rollback_match_by_name" not in v, strategy
+        rollback, _ = ctx_for(env, strategy=strategy, downtime_started_at=utcnow())
+        v = build_vars(StepName.ROLLBACK, rollback)
+        assert "os_migrate_rollback_start_source" not in v, strategy
+        assert "os_migrate_rollback_delete_ports" not in v, strategy
+
+
+def test_a_cold_rollback_deletes_the_volumes_the_cold_import_recorded(env):
+    """SDD §6.3/§7 (the owner's choice, 2026-10-14): a cold retry never reuses the volumes the
+    cold import created - its transfer creates new ones - so a cold rollback deletes exactly the
+    volumes the import recorded; without such a record it deletes the server alone, as before,
+    never a volume it cannot tell is the migration's. A warm rollback keeps its volumes for a
+    retry."""
+    stopped, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, stopped)
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"server_id": "srv-1", "server_name": "web-01", "dest_volumes": {}, "passes": []}
+    # the server alone: the import copied no disk (data_copy false), it created no volume
+    path.write_text(json.dumps({**record, "destination_server_id": "dst-1"}))
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, stopped)
+    record["dest_volumes"] = {"/dev/vdb": {"dest_id": "dvol-1"}}
+    path.write_text(json.dumps(record))
+    assert build_vars(StepName.ROLLBACK, stopped)["os_migrate_rollback_delete_dest_volumes"] is True
+    # with no server recorded, a cold re-run removes them first: it never reuses them (SDD §7)
+    assert build_vars(StepName.CUTOVER, stopped)["os_migrate_rollback_delete_dest_volumes"] is True
+    warm, _ = ctx_for(env, strategy=Strategy.warm, downtime_started_at=utcnow())
+    assert "os_migrate_rollback_delete_dest_volumes" not in build_vars(StepName.ROLLBACK, warm)
+
+
+def _state_file(env, state):
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"server_id": "srv-1", "server_name": "web-01", **state}))
+    return path
+
+
+async def test_a_cold_cutover_first_removes_what_an_earlier_warm_pre_copy_left(env):
+    """SDD §7 (COLD-02, the owner's choice, 2026-10-14): a warm migration rolled back keeps its
+    pre-copy volumes for a retry; switched to cold, its cutover first runs the rollback playbook
+    with the volumes deleted and the source left as it is (a retry may keep it stopped), matching
+    no server by name - before the export and the stop."""
+    _state_file(
+        env,
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True}},
+            "passes": [{"number": 1, "kind": "full"}],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    ctx, rec = ctx_for(env, strategy=Strategy.cold)
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_workloads.yml",
+        "rollback_workloads.yml",
+        "import_workloads.yml",
+    ]
+    cleanup = calls[1]["vars"]
+    assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
+    assert cleanup["os_migrate_rollback_start_source"] is False
+    assert "os_migrate_rollback_match_by_name" not in cleanup
+    assert rec.downtime_marks == 1  # the import stopped the source, the cleanup did not
+
+
+async def test_a_cold_cutover_first_removes_the_volumes_an_earlier_cold_attempt_recorded(env):
+    """SDD §7 (review lead B): a cold transfer that failed or was cut short recorded the volumes it
+    created and no server; a cold re-run never reuses them, and its own record would replace
+    theirs - so the cutover deletes them first, as a warm pre-copy's, leaving the source as it is
+    (a retry keeps it stopped, its clock open) and matching no server by name."""
+    _state_file(
+        env,
+        {
+            "dest_volumes": {
+                "/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True, "name": "web-01"}
+            },
+            "passes": [],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_workloads.yml",
+        "rollback_workloads.yml",
+        "import_workloads.yml",
+    ]
+    cleanup = calls[1]["vars"]
+    assert cleanup["os_migrate_rollback_delete_dest_volumes"] is True
+    assert cleanup["os_migrate_rollback_start_source"] is False
+    assert "os_migrate_rollback_match_by_name" not in cleanup
+
+
+# the export module's failure as Ansible prints it when a detach timed out (review RV6-01)
+EXPORT_TIMED_OUT = (
+    '{"changed": false, "module_stderr": "Traceback (most recent call last):\\n'
+    '  File \\"volume_common.py\\", line 75, in detach_volume_bounded\\n'
+    "openstack.exceptions.ResourceTimeout: Timeout waiting for Volume:vol-quorum to transition "
+    'to available\\n", "msg": "MODULE FAILURE\\nSee stdout/stderr for the exact error", "rc": 1}'
+)
+
+
+async def test_a_retried_cold_cutover_refuses_an_export_without_a_disk_the_vm_was_validated_with(
+    env, monkeypatch
+):
+    """SDD §7.2 (review RV6-01): attempt 1 stopped the VM and its export detached the shared disk,
+    then failed transiently; the retry exports the VM again from Nova's attachments, without that
+    disk - the step fails permanently, naming it, before any import playbook runs, rather than
+    migrate the VM one disk short."""
+    from tests.executor_support import make_ctx
+    from tests.factories import make_disk, make_migration, make_plan, make_vm
+
+    vm = make_vm(
+        source_id="srv-1",
+        name="web-01",
+        disks=[
+            make_disk(id="vol-1"),
+            make_disk(id="vol-quorum", bootable=False, device="/dev/vdb", multiattach=True),
+            make_disk(id="vol-data", bootable=False, device="/dev/vdc"),
+        ],
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings)
+
+    # attempt 1: the export lists all three; the import then fails as a detach timeout does
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-1,vol-quorum,vol-data")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL_ON", "import_workloads.yml")
+    monkeypatch.setenv("ANSIBLE_FAKE_FAIL", EXPORT_TIMED_OUT)
+    with pytest.raises(TransientStepError):
+        await env.executor.run(StepName.CUTOVER, ctx)
+
+    # the retry: Nova no longer lists the shared disk on the source VM
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-1,vol-data")
+    monkeypatch.delenv("ANSIBLE_FAKE_FAIL")
+    before = len(read_log(env.log))
+    with pytest.raises(PermanentStepError, match="vol-quorum") as refused:
+        await env.executor.run(StepName.CUTOVER, ctx)
+    # it asks for the disk back and offers no validation: one would drop the disk (RV7-01)
+    assert "attach them to the source VM again" in str(refused.value)
+    assert "validate the plan" not in str(refused.value)
+    retried = [c["playbook"] for c in read_log(env.log)[before:]]
+    assert "import_workloads.yml" not in retried
+    assert retried[-1] == "export_workloads.yml"
+
+
+async def test_the_export_is_checked_against_the_vms_volumes_only(env, monkeypatch):
+    """SDD §7.2 (review RV6-01): an image-booted VM's root and ephemeral disks are no Cinder
+    volumes and never appear among the exported volumes - only the validated volumes must."""
+    from tests.executor_support import make_ctx
+    from tests.factories import make_disk, make_migration, make_plan, make_vm
+
+    vm = make_vm(
+        source_id="srv-1",
+        name="web-01",
+        disks=[
+            make_disk(id="srv-1-root", kind="image_root", volume_type=None),
+            make_disk(id="srv-1-ephemeral", kind="ephemeral", bootable=False, device=None),
+            make_disk(id="vol-data", bootable=False, device="/dev/vdb"),
+        ],
+    )
+    plan = make_plan(id="plan-00c0ffee", mappings=MAPPINGS)
+    mig = make_migration(id="mig-00000000aa", plan_id=plan.id, vm=vm, strategy=Strategy.cold)
+    ctx, _ = make_ctx(plan, mig, SRC, DST, env.settings)
+    monkeypatch.setenv("ANSIBLE_FAKE_VOLUME_IDS", "vol-data")
+
+    await env.executor.run(StepName.CUTOVER, ctx)
+
+    assert "import_workloads.yml" in [c["playbook"] for c in read_log(env.log)]
+
+
+def test_a_cold_cutover_writes_the_workloads_record_before_its_playbooks(env, monkeypatch):
+    """SDD §6.3, §7 (review RV3-03): with no record yet, the control plane writes one - no volume,
+    pass or server - before a cold cutover's playbooks; a record already there is left as it is."""
+    import asyncio
+
+    path = run_dir(env) / "osm" / "workload_warm" / "srv-1.json"
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    asyncio.run(env.executor.run(StepName.CUTOVER, ctx))
+    assert json.loads(path.read_text()) == {
+        "server_id": "srv-1",
+        "server_name": "web-01",
+        "transfer_uuid": None,
+        "dest_volumes": {},
+        "passes": [],
+        "pending_snapshot": None,
+        "destination_server_id": None,
+    }
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    recorded = {"server_id": "srv-1", "server_name": "web-01", "destination_server_id": "dst-1"}
+    path.write_text(json.dumps(recorded))
+    resumed, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    asyncio.run(env.executor.run(StepName.CUTOVER, resumed))
+    assert json.loads(path.read_text()) == recorded
+    # a warm cutover's record is the warm path's own: the control plane writes none for it
+    path.unlink()
+    written = []
+    monkeypatch.setattr(
+        "seamless_migrate.executors.ansible._ensure_record", lambda *args: written.append(args)
+    )
+    warm, _ = ctx_for(env, strategy=Strategy.warm, downtime_started_at=utcnow())
+    asyncio.run(env.executor.run(StepName.CUTOVER, warm))
+    assert written == []
+    asyncio.run(env.executor.run(StepName.CUTOVER, resumed))
+    assert written == [(run_dir(env) / "osm", "srv-1", "web-01")]
+
+
+def test_the_workloads_record_is_synced_before_and_after_its_rename(tmp_path, monkeypatch):
+    """SDD §6.3, §7 (review RV4-07): the record is synced whole before it is renamed into place,
+    as WarmState.save syncs its file, and its directory after the rename - a crash right after the
+    write leaves neither an empty nor a missing record, which would let a later rollback take a
+    same-named server by its name."""
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("fsync", stat.S_ISDIR(st.st_mode), st.st_ino, st.st_size))
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", os.stat(src).st_ino))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+
+    path = tmp_path / "osm" / "workload_warm" / "srv-1.json"
+    record, directory = path.stat(), path.parent.stat()
+    assert [event[:3] for event in events] == [
+        ("fsync", False, record.st_ino),
+        ("replace", record.st_ino),
+        ("fsync", True, directory.st_ino),
+    ]
+    assert events[0][3] == record.st_size  # the whole record was written when it was synced
+
+
+def test_a_directory_that_cannot_be_synced_still_gets_the_workloads_record(
+    tmp_path, monkeypatch, caplog
+):
+    """Review RV4-07: some filesystems (network or FUSE mounts) refuse to sync a directory; the
+    record is written and synced all the same, and the cutover goes on with a warning - failing
+    every cold cutover there would gain nothing."""
+    import errno
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with caplog.at_level(logging.WARNING, logger="seamless_migrate.executors.ansible"):
+        _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+
+    path = tmp_path / "osm" / "workload_warm" / "srv-1.json"
+    assert json.loads(path.read_text())["server_id"] == "srv-1"
+    assert "could not sync" in caplog.text and "Invalid argument" in caplog.text
+
+
+def test_a_workloads_record_that_cannot_be_synced_is_an_error(tmp_path, monkeypatch):
+    """Review RV4-07: only the directory's sync is best-effort - a record file that cannot be
+    synced fails its write, and so the cutover, before its playbooks stop the source."""
+    import errno
+    import stat
+
+    from seamless_migrate.executors.ansible import _ensure_record
+
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "Input/output error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError, match="Input/output error"):
+        _ensure_record(tmp_path / "osm", "srv-1", "web-01")
+    assert not (tmp_path / "osm" / "workload_warm" / "srv-1.json").exists()
+
+
+def test_the_workloads_record_tells_whether_the_migration_keeps_copied_data(env):
+    """SDD §5.1, §12 (review RV3-05, RV3-07): destination volumes or a pending source snapshot in
+    the record are copied data; an emptied record is none; no record cannot tell; a record that
+    cannot be read counts as data kept - its cleanup reports what it finds."""
+    from seamless_migrate.executors.ansible import recorded_copied_data
+
+    ctx, _ = ctx_for(env, strategy=Strategy.warm)
+    m, settings = ctx.migration, env.executor.settings
+    assert recorded_copied_data(settings, ctx.plan.id, m) is None
+    path = _state_file(env, {"dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}}})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    _state_file(env, {"dest_volumes": {}, "pending_snapshot": {"transfer_uuid": "uuid-1"}})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    _state_file(env, {"dest_volumes": {}, "passes": [], "pending_snapshot": None})
+    assert recorded_copied_data(settings, ctx.plan.id, m) is False
+    path.write_text("{not json")
+    assert recorded_copied_data(settings, ctx.plan.id, m) is True
+    # a source id the collection would refuse as a file name is never made into a path: with
+    # "../srv-1" the record would be read from outside workload_warm
+    (path.parent.parent / "srv-1.json").write_text(json.dumps({"dest_volumes": {"x": {}}}))
+    outside = m.model_copy(update={"vm": m.vm.model_copy(update={"source_id": "../srv-1"})})
+    assert recorded_copied_data(settings, ctx.plan.id, outside) is None
+
+
+@pytest.fixture
+def collection(tmp_path_factory, monkeypatch):
+    """The repository's collection, importable as ansible_collections.os_migrate.os_migrate."""
+    layout = tmp_path_factory.mktemp("coll")
+    namespace = layout / "ansible_collections" / "os_migrate"
+    namespace.mkdir(parents=True)
+    (namespace / "os_migrate").symlink_to(find_repo_root())
+    monkeypatch.syspath_prepend(str(layout))
+    importlib.invalidate_caches()
+    package = "ansible_collections.os_migrate.os_migrate"
+    wm = importlib.import_module(f"{package}.plugins.module_utils.warm_migration")
+    fake = importlib.import_module(f"{package}.tests.unit.fake_openstack")
+    return wm, fake
+
+
+def role_rollback(wm, cloud, state_dir, variables):
+    """What rollback.yml makes import_workload_rollback do with the variables the control plane
+    passed (the role's defaults where it passed none)."""
+    return wm.WarmRollback(
+        cloud,
+        wm.WarmState.load(str(state_dir), "srv-1"),
+        server_name="web-01",
+        match_by_name=bool(variables.get("os_migrate_rollback_match_by_name", False)),
+        timeout=5,
+        conversion_host=variables.get("os_migrate_dst_conversion_host_name"),
+    ).run(delete_volumes=bool(variables.get("os_migrate_rollback_delete_dest_volumes", False)))
+
+
+def _foreign_server(cloud):
+    """Another plan's VM named web-01 in the destination project, with its boot volume."""
+    cloud.add_server("plan-b-web-01", "web-01")
+    cloud.add_volume(
+        "plan-b-boot", "web-01", 20, bootable=True, server_id="plan-b-web-01", device="/dev/vda"
+    )
+
+
+async def test_after_a_resumed_cold_cutovers_cleanup_no_rollback_deletes_a_same_named_server(
+    env, collection, monkeypatch
+):
+    """SDD §6.3, §7 (review RV3-03): the cleanup before a resumed cold cutover deletes the volumes
+    an earlier transfer recorded and empties the record instead of removing it; when the cold role
+    then skips the VM for a same-named server that appeared meanwhile, the rollback after the stop
+    - match_by_name - still finds the record and never deletes that server."""
+    wm, fake = collection
+    path = _state_file(
+        env,
+        {
+            "dest_volumes": {
+                "/dev/vda": {"dest_id": "dvol-1", "size": 20, "bootable": True, "name": "web-01"}
+            },
+            "passes": [],
+            "pending_snapshot": None,
+            "destination_server_id": None,
+        },
+    )
+    cloud = fake.FakeCloud("dst")
+    cloud.add_conversion_host("conv-dst", "192.0.2.10")
+    cloud.add_volume("dvol-1", "web-01", 20, bootable=True)
+    _foreign_server(cloud)
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")  # prelim skips web-01
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    with pytest.raises(PermanentStepError, match="roll the migration back"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert calls[1]["playbook"] == "rollback_workloads.yml"
+    cleanup = role_rollback(wm, cloud, path.parent, calls[1]["vars"])
+    assert cleanup["deleted_volume_ids"] == ["dvol-1"] and path.exists()
+    env.log.write_text("")
+    await env.executor.run(StepName.ROLLBACK, ctx)
+    (rollback,) = read_log(env.log)
+    assert rollback["vars"]["os_migrate_rollback_match_by_name"] is True
+    role_rollback(wm, cloud, path.parent, rollback["vars"])
+    assert "plan-b-web-01" in cloud.servers and "plan-b-boot" in cloud.volumes
+
+
+async def test_a_cold_cutover_that_recorded_nothing_never_rolls_back_by_name(
+    env, collection, monkeypatch
+):
+    """SDD §6.3, §7: a cold cutover that failed after the stop before its transfer recorded a
+    volume still leaves the record the control plane wrote before its playbooks, so its rollback
+    never takes a same-named server that appeared meanwhile for the migration's."""
+    wm, fake = collection
+    cloud = fake.FakeCloud("dst")
+    cloud.add_conversion_host("conv-dst", "192.0.2.10")
+    _foreign_server(cloud)
+    monkeypatch.setenv("ANSIBLE_FAKE_STOP_SKIPPED", "1")
+    ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+    with pytest.raises(PermanentStepError, match="roll the migration back"):
+        await env.executor.run(StepName.CUTOVER, ctx)
+    env.log.write_text("")
+    await env.executor.run(StepName.ROLLBACK, ctx)
+    (rollback,) = read_log(env.log)
+    result = role_rollback(wm, cloud, run_dir(env) / "osm" / "workload_warm", rollback["vars"])
+    assert result["deleted_server_id"] is None
+    assert "plan-b-web-01" in cloud.servers and "plan-b-boot" in cloud.volumes
+
+
+async def test_a_cold_cutover_keeps_a_cold_record_and_a_warm_record_with_its_server(env):
+    """SDD §7: a cold record (volumes and a server, no pass) is a resumed cutover's own, and a
+    warm record that names a destination server is not a pre-copy's leftover: neither is removed."""
+    for state in (
+        # the cold import's record of an interrupted attempt
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}},
+            "passes": [],
+            "destination_server_id": "dst-1",
+        },
+        # a warm cutover's server
+        {
+            "dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}},
+            "passes": [{"number": 1}],
+            "destination_server_id": "dst-1",
+        },
+    ):
+        path = _state_file(env, state)
+        if env.log.exists():
+            env.log.write_text("")  # this case's runs only
+        ctx, _ = ctx_for(env, strategy=Strategy.cold, downtime_started_at=utcnow())
+        await env.executor.run(StepName.CUTOVER, ctx)
+        assert [c["playbook"] for c in read_log(env.log)] == [
+            "export_workloads.yml",
+            "import_workloads.yml",
+        ], state
+        assert "os_migrate_rollback_start_source" not in build_vars(StepName.CUTOVER, ctx)
+        path.unlink()
+    # a pending source snapshot alone (a first pass cut short) is a leftover too
+    _state_file(env, {"dest_volumes": {}, "passes": [], "pending_snapshot": {"transfer_uuid": "u"}})
+    cold, _ = ctx_for(env, strategy=Strategy.cold)
+    assert build_vars(StepName.CUTOVER, cold)["os_migrate_rollback_start_source"] is False
+    warm, _ = ctx_for(env, strategy=Strategy.warm)
+    assert "os_migrate_rollback_start_source" not in build_vars(StepName.CUTOVER, warm)
 
 
 def _finished_cutover_state(env, record_server=True):
@@ -1557,6 +2330,50 @@ async def test_warm_cutover_rerun_without_a_recorded_server_stays_a_permanent_fa
     retry, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[first.sync_pass])
     with pytest.raises(PermanentStepError, match="recorded no new pass"):
         await env.executor.run(StepName.CUTOVER, retry)
+
+
+async def test_a_vmware_cancels_cleanup_deletes_only_a_recorded_server(env):
+    """SDD §7.2 (review RV-01, RV-02): a cancel's cleanup on VMware looks up no server by name,
+    deletes no kit port and powers nothing on - another plan may migrate the VM it released, with
+    a same-named server, kit ports of the VM's MACs and a source its cutover stopped."""
+    mac = "00:50:56:00:00:01"
+    nic = Nic(network="app-net", mac=mac, fixed_ips=["10.0.0.5"], network_key="app-net")
+    env.registry.existing = {"web-01"}  # another plan's server of the VM
+    env.registry.ports = [
+        {
+            "id": "kit-of-plan-b",
+            "name": "web-01-NIC-0-VLAN-app-net",
+            "network_id": "net-app-net-mine",
+            "device_id": "",
+            "mac_address": mac,
+            "fixed_ips": ["10.0.0.5"],
+        }
+    ]
+    for strategy in (Strategy.vmware_warm, Strategy.vmware_cold):
+        env.registry.calls.clear()
+        ctx, _ = ctx_for(
+            env,
+            strategy=strategy,
+            source=VCENTER,
+            nics=[nic],
+            downtime_started_at=utcnow(),
+            downtime_ended_at=utcnow(),
+        )
+        ctx.options["delete_dest_volumes"] = True
+        await env.executor.run(StepName.ROLLBACK, ctx)
+        assert env.registry.calls == [], strategy
+    assert [p["id"] for p in env.registry.ports] == ["kit-of-plan-b"]
+    # a server the migration recorded is its own: the cleanup deletes it
+    recorded, _ = ctx_for(
+        env,
+        strategy=Strategy.vmware_warm,
+        source=VCENTER,
+        nics=[nic],
+        destination_server_id="dst-9",
+    )
+    recorded.options["delete_dest_volumes"] = True
+    await env.executor.run(StepName.ROLLBACK, recorded)
+    assert env.registry.calls == [("delete_server", "dst-9")]
 
 
 async def test_vmware_rollback_deletes_by_name_only_after_a_stop(env):
@@ -1963,6 +2780,92 @@ async def test_a_warm_cutover_resolves_its_export_again_without_exporting(env):
     )
 
 
+async def test_a_warm_pass_logs_a_port_network_it_cannot_resolve_and_the_cutover_refuses_it(env):
+    """SDD §7.2: a warm pre-copy or sync run makes no port. A port's network name that does not
+    resolve is logged, and the port keeps its references as exported; the cutover resolves them
+    again and stops there, before the source stops (review NC-07)."""
+    env.registry.networks = [dst_net("rhoso-app"), dst_net("rhoso-app", project_id="finance-rhoso")]
+    env.registry.networks[1]["id"] = "net-rhoso-app-second"
+    problem = (
+        "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
+        "web-01 cannot go to RHOSO network 'rhoso-app': "
+    )
+    precopy, rec = ctx_for(env)
+    result = await env.executor.run(StepName.PRECOPY, precopy)
+    assert result.sync_pass is not None
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    [line] = [ln for ln in rec.logs if ln.startswith(problem)]
+    assert "2 networks of the credential's project" in line
+    # logged before the pass ran
+    assert rec.logs.index(line) < rec.logs.index("running import_workloads_precopy.yml")
+    # and returned for the migration's cutover_refusals (SDD §7.2)
+    lead = "the cutover will refuse this before the source stops: "
+    assert result.cutover_refusals == [line[len(lead) :]]
+    # kept as exported, the mapping applied: the destination check (SDD §6.6) warns about it
+    [port] = exported_server(env)["params"]["ports"]
+    assert port["params"]["network_ref"] == {
+        "name": "rhoso-app",
+        "project_name": "finance-rhoso",
+        "domain_name": "Default",
+    }
+    assert port["params"]["fixed_ips_refs"][0]["subnet_ref"]["name"] == "app-subnet"
+    # the rewrite finished: the next run does not export again
+    assert (run_dir(env) / "osm" / "rewrite.json").exists()
+
+    sync, rec = ctx_for(env)
+    synced = await env.executor.run(StepName.SYNC, sync)
+    assert [c["playbook"] for c in read_log(env.log)][2:] == ["import_workloads_precopy.yml"]
+    assert sum(ln.startswith(problem) for ln in rec.logs) == 1
+    assert synced.cutover_refusals == [line[len(lead) :]]
+
+    cutover, rec = ctx_for(env)
+    with pytest.raises(PermanentStepError, match="2 networks of the credential's project"):
+        await env.executor.run(StepName.CUTOVER, cutover)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == []
+    assert rec.downtime_marks == 0
+    assert not any(ln.startswith(problem) for ln in rec.logs)
+
+    # the operator maps the network to one that resolves: the retry exports again, resolved
+    retry, rec = ctx_for(env, mappings=_edited(networks={"app-net": "rhoso-dmz"}))
+    env.registry.networks.append(dst_net("rhoso-dmz"))
+    await env.executor.run(StepName.CUTOVER, retry)
+    assert [c["playbook"] for c in read_log(env.log)][3:] == [
+        "export_workloads.yml",
+        "import_workloads_cutover.yml",
+    ]
+    assert exported_server(env)["params"]["ports"][0]["params"]["network_ref"] == {
+        "name": "rhoso-dmz",
+        "project_name": "%auth%",
+        "domain_name": "%auth%",
+    }
+
+
+async def test_a_pass_logs_each_problem_it_defers_once():
+    """SDD §7.2: what a warm pass does not refuse is logged once, however many places look."""
+    logged: list[str] = []
+
+    async def log(line):
+        logged.append(line)
+
+    ctx = SimpleNamespace(log=log)
+    problem = "the port fa:16:3e:00:00:01 of web-01 cannot go to RHOSO network 'gone'"
+    deferred = Deferred()
+    deferred.append(problem)
+    await AnsibleExecutor._log_deferred(ctx, deferred)
+    await AnsibleExecutor._log_deferred(ctx, deferred)
+    # a cutover defers nothing
+    await AnsibleExecutor._log_deferred(ctx, None)
+    assert logged == [
+        "the cutover will refuse this before the source stops: the port fa:16:3e:00:00:01 of "
+        "web-01 cannot go to RHOSO network 'gone'"
+    ]
+    # logged once, and kept for the pass's cutover_refusals (SDD §7.2)
+    assert list(deferred) == [problem]
+
+
 async def test_an_unreadable_destination_keeps_the_exported_network_references(env):
     """SDD §7.2: the destination's networks cannot be read - the run logs it and keeps the
     references as exported; the destination check (§6.6) still looks them up before the stop."""
@@ -2141,12 +3044,54 @@ async def test_the_export_record_holds_what_the_rewrite_applied(env):
         "nic_overrides": {
             "fa:16:3e:00:00:01": {"network": "rhoso-dmz", "fixed_ips": ["192.168.10.5"]}
         },
+        "name": "web-01",
     }
     # an entry whose MAC no exported port has: the rewrite fails after the export, before the stop
     gone, _ = nic_ctx(env, Strategy.warm, {"fa:16:3e:00:00:99": {"network": "rhoso-dmz"}})
     with pytest.raises(PermanentStepError, match="fa:16:3e:00:00:99"):
         await env.executor.run(StepName.CUTOVER, gone)
     assert not record.exists()
+
+
+async def test_a_renamed_vm_is_exported_again_before_its_next_run(env, monkeypatch):
+    """SDD §7.2 (review lead A): the export record holds the exported server's name - a source VM
+    renamed since (and validated again) is exported again before its next run, which selects its
+    workload by its name of now; the old export would match nothing."""
+    first, _ = ctx_for(env, strategy=Strategy.warm)
+    result = await env.executor.run(StepName.PRECOPY, first)
+    env.log.write_text("")
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web-01-renamed")
+    renamed, _ = ctx_for(env, strategy=Strategy.warm, sync_passes=[result.sync_pass])
+    renamed.migration.vm = renamed.migration.vm.model_copy(update={"name": "web-01-renamed"})
+    await env.executor.run(StepName.SYNC, renamed)
+    assert [c["playbook"] for c in read_log(env.log)] == [
+        "export_workloads.yml",
+        "import_workloads_precopy.yml",
+    ]
+    assert json.loads((run_dir(env) / "osm" / "rewrite.json").read_text())["name"] == (
+        "web-01-renamed"
+    )
+
+
+async def test_a_cold_cutovers_cleanup_selects_the_workload_by_its_name_of_now(env, monkeypatch):
+    """SDD §7 (review lead A): the cleanup before a cold cutover runs after the cutover's export,
+    so a source VM renamed since the earlier attempt is selected by its new name."""
+    _state_file(
+        env,
+        {"dest_volumes": {"/dev/vda": {"dest_id": "dvol-1"}}, "passes": [{"number": 1}]},
+    )
+    monkeypatch.setenv("ANSIBLE_FAKE_VM_NAME", "web-01-renamed")
+    ctx, _ = ctx_for(env, strategy=Strategy.cold)
+    ctx.migration.vm = ctx.migration.vm.model_copy(update={"name": "web-01-renamed"})
+    await env.executor.run(StepName.CUTOVER, ctx)
+    calls = read_log(env.log)
+    assert [c["playbook"] for c in calls] == [
+        "export_workloads.yml",
+        "rollback_workloads.yml",
+        "import_workloads.yml",
+    ]
+    assert calls[1]["vars"]["os_migrate_workloads_filter"] == [{"regex": "^web\\-01\\-renamed$"}]
+    assert calls[1]["servers"] == ["web-01-renamed"]  # what the cleanup reads: the new export
 
 
 async def test_an_export_without_a_record_is_exported_again(env):

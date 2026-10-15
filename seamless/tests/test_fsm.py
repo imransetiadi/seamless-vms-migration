@@ -22,7 +22,8 @@ ALLOWED = {
     P.completed: {P.finalized, P.rolling_back},
     P.failed: {P.rolling_back, P.ready, P.cancelled},
     P.rolling_back: {P.rolled_back, P.failed},
-    P.rolled_back: {P.ready},
+    # cancelled: a rolled-back VM dropped for good, its kept data path cleaned up (SDD §5.1)
+    P.rolled_back: {P.ready, P.cancelled},
     P.finalized: set(),
     P.cancelled: set(),
 }
@@ -64,6 +65,23 @@ def test_failed_to_cancelled_requires_no_downtime():
     )
     with pytest.raises(fsm.InvalidTransition):
         fsm.transition(stopped, Phase.cancelled, "source was stopped")
+
+
+@pytest.mark.parametrize("phase", [P.pending, P.blocked, P.ready])
+@pytest.mark.parametrize(("started", "ended"), [(False, False), (True, False), (True, True)])
+def test_an_unstarted_migration_is_refused_a_cancel_only_while_its_source_is_stopped(
+    phase, started, ended
+):
+    """SDD §12: Cancel plan checks fsm.source_stopped on every migration it would cancel - pending,
+    blocked or ready - before cancelling any; that covers every refusal of the move to cancelled
+    from those phases, so no cancel refuses midway (and a new rule must keep this so)."""
+    at = datetime(2026, 10, 8, tzinfo=UTC)
+    m = make_migration(
+        phase=phase,
+        downtime_started_at=at if started else None,
+        downtime_ended_at=at + timedelta(minutes=5) if ended else None,
+    )
+    assert (fsm.refusal(m, P.cancelled) is not None) == fsm.source_stopped(m)
 
 
 def test_no_cancel_while_the_source_vm_is_stopped():

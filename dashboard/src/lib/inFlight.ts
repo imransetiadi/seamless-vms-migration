@@ -7,7 +7,7 @@ import type { Migration, Phase } from '../api/types';
 export const IN_FLIGHT_PHASES: ReadonlySet<Phase> = new Set<Phase>(['precopy', 'syncing', 'awaiting_cutover', 'cutover', 'verifying', 'rolling_back', 'completed']);
 
 /** A migration in flight, or whose source VM is stopped, keeps its plan from being edited or re-waved (SDD §12). */
-export function blocksPlanChange(m: Migration): boolean {
+export function blocksPlanChange(m: Pick<Migration, 'phase' | 'downtime_started_at' | 'downtime_ended_at'>): boolean {
   return IN_FLIGHT_PHASES.has(m.phase) || (Boolean(m.downtime_started_at) && !m.downtime_ended_at);
 }
 
@@ -29,7 +29,7 @@ export interface ReleaseGroup {
 }
 
 /** The migrations that block a plan change, grouped by what releases them, most urgent first; no empty group. */
-export function releaseGroups(busy: readonly Migration[]): ReleaseGroup[] {
+export function releaseGroups(busy: readonly (Pick<Migration, 'phase'> & { vm: Pick<Migration['vm'], 'name'> })[]): ReleaseGroup[] {
   const names: string[][] = [[], [], []];
   for (const m of busy) names[m.phase === 'failed' ? 0 : m.phase === 'completed' ? 2 : 1]!.push(m.vm.name);
   return RELEASES.flatMap((r, i) => {

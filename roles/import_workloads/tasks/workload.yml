@@ -138,6 +138,9 @@
         nbdkit_socket_uri: "{{ item['_migration_params']['nbdkit_socket_uri'] | default(omit) }}"
         nbdkit_export_name: "{{ item['_migration_params']['nbdkit_export_name'] | default(omit) }}"
         preserve_volume_type: "{{ os_migrate_workloads_preserve_volume_type }}"
+        # records each volume as soon as Cinder created it: a rollback deletes
+        # exactly those, as a cold retry never reuses them (Seamless Migrate SDD 6.3, 7)
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
       register: transfer
       when:
         - prelim is defined and prelim.changed
@@ -152,6 +155,8 @@
         client_key: "{{ os_migrate_dst_client_key | default(omit) }}"
         data: "{{ item }}"
         block_device_mapping: "{{ transfer.block_device_mapping | default([]) }}"
+        # records the server as soon as Nova accepts it, for a rollback (SDD 6.5)
+        warm_state_dir: "{{ os_migrate_warm_state_dir | default(os_migrate_data_dir ~ '/workload_warm') }}"
       register: os_migrate_destination_instance
       when:
         - prelim is defined and prelim.changed

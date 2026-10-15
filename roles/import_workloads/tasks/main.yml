@@ -43,3 +43,7 @@
 - name: Import workloads
   ansible.builtin.include_tasks: workload.yml
   loop: "{{ filtered_workloads }}"
+  loop_control:
+    # only the VM id on the include line: the whole workload there - names, metadata, a boot
+    # image's properties - is data the control plane's failure classifier would read
+    label: "{{ item['_info']['id'] }}"
