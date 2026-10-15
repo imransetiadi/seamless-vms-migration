@@ -28,11 +28,16 @@ The binding specification is [`docs/SDD.md`](../docs/SDD.md) (section numbers be
 
 ```bash
 cd seamless
-uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev,jev,openstack,vmware]'
-.venv/bin/pytest -q                                               # SQLite
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev,jev,collection]'   # add vmware for a real vCenter
+# or, with uv: uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev,jev,collection]'
+.venv/bin/pytest -q                                               # SQLite (make seamless-test)
 SEAMLESS_TEST_PG_URL=postgresql+psycopg://… .venv/bin/pytest -q   # + PostgreSQL store tests
-.venv/bin/ruff check .
+.venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests   # as CI lints
 ```
+
+The `collection` extra (ansible-core, ansible-lint, openstacksdk) is what `make seamless-check`, run
+from the repository root, needs for the collection's tests; that target runs every CI check this venv
+and the dashboard's `node_modules` can run (`make seamless-help` lists what it leaves out).
 
 Live integration tests are skipped unless enabled: `SEAMLESS_LIVE_JEV=1` (needs
 `TYPESAFE_API_KEY` and `npx`) and `SEAMLESS_LIVE_MEMORY=1` (needs `SEAMLESS_MEMORY_URL`).

@@ -384,6 +384,46 @@ def test_seamless_check_says_which_ci_checks_it_leaves_out():
         assert left_out in help_line, left_out
 
 
+def _seamless_readme_development_block() -> str:
+    """The commands of seamless/README.md's Development section."""
+    text = (ROOT / "seamless" / "README.md").read_text(encoding="utf-8")
+    section = text.split("## Development", 1)[1].split("\n## ", 1)[0]
+    match = re.search(r"```bash\n(.*?)```", section, re.S)
+    assert match, "seamless/README.md's Development section has no bash block"
+    return match.group(1)
+
+
+def _install_extras(command: str) -> set[str]:
+    """The extras of a ``pip install -e '.[...]'`` command."""
+    match = re.search(r"-e '\.\[([^\]]+)\]'", command)
+    assert match, command
+    return set(match.group(1).split(","))
+
+
+def test_the_seamless_readme_gives_the_commands_the_makefile_and_ci_run():
+    """Audit B-29: seamless/README.md's development commands drifted from what CI and ``make
+    seamless-check`` run: a venv without the collection extra, which ``make seamless-check``
+    needs for the collection's tests, and ``ruff check .``, another set of paths than CI lints.
+    Every install line takes at least the extras ``make seamless-check`` asks for, the lint line
+    is CI's, and the tests run as ``make seamless-test`` runs them."""
+    block = _seamless_readme_development_block()
+    # the venv `make seamless-check` asks for: CI's checks that need only it, the collection's too
+    hint = next(
+        line
+        for line in _makefile_target_recipe("seamless-check").splitlines()
+        if "Create the venv first" in line
+    )
+    installs = [line for line in block.splitlines() if "pip install" in line]
+    assert installs, block
+    for line in installs:
+        assert _install_extras(line) >= _install_extras(hint), (line, hint)
+    lint = _ci_step_run("Lint (ruff)").strip()
+    assert ".venv/bin/" + lint.replace("&& ruff ", "&& .venv/bin/ruff ") in block, (lint, block)
+    assert "cd seamless && .venv/bin/pytest -q" in _makefile_target_recipe("seamless-test")
+    # the plain run, as the target runs it; the PostgreSQL line prefixes its URL to the same command
+    assert any(line.startswith(".venv/bin/pytest -q") for line in block.splitlines()), block
+
+
 def test_ci_and_seamless_check_run_the_demo07_script():
     """DEMO-07 (QASuite §6.6, §14.7) runs where the control plane is tested - CI's control-plane
     job and ``make seamless-check`` - since the script needs only the installed control plane. CI
