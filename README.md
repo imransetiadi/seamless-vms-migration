@@ -209,6 +209,7 @@ them against the Kubernetes 1.30 schemas.
 | [docs/Performance.md](docs/Performance.md) | Downtime model with worked examples, targets, blocksync design, benchmarks, tuning, capacity planning |
 | [docs/superpowers/plans/](docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md) | 0.1.0 implementation plan (tasks and test names) |
 | [CLAUDE.md](CLAUDE.md) | How agents and contributors work in this repository |
+| [RELEASING.md](RELEASING.md) | How a release is gated, tagged and published as a GitHub Release: versions, tags, artifacts, notes template |
 
 ## Repository layout
 
