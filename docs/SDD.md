@@ -1894,6 +1894,10 @@ auth lockout of §15.1), 500 (`internal_error`, message never carries internals)
 (`provider_error`, the redacted provider message), 503 (`/ready` while degraded). Every response,
 including error responses written by the server-error handler, carries the security headers of
 Security.md R-05.
+A request body with a field the route does not take is refused with 422 (`validation_error`, naming
+the field) — on `POST /plans` and `POST /providers` as on `PATCH /plans/{id}` and `PATCH /providers/{id}`
+— so a misspelt guard (`requrie_approval`, `verify_tsl`) never silently yields a plan or provider
+without it; a stored document keeps loading with fields a later version added (§11).
 Authentication: `Authorization: Bearer <token>` (§13).
 A request body holds at most 1 MiB (1,048,576 bytes). A larger `Content-Length`, or a chunked body
 that grows past it, is refused with 413 before the body is parsed: the framework parses a route's
@@ -1914,7 +1918,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | GET | `/users` | admin | — | List of `{name, role}` from bootstrap tokens and database users; no token or digest |
 | POST | `/users` | admin | `{name, role?}` | `201 {name, role, token}`; token shown once, `Cache-Control: no-store`; authentication must be enabled; role defaults to viewer |
 | GET | `/providers` | viewer | — | `Provider[]` |
-| POST | `/providers` | admin | `Provider` (status fields ignored) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
+| POST | `/providers` | admin | `Provider` (status fields ignored; a field `Provider` does not have: 422) | `201 Provider`; 409 when the id exists or its managed secret names would be another provider's, 422 for a secret name §13.3 refuses |
 | GET | `/providers/{id}` | viewer | — | `Provider` |
 | PATCH | `/providers/{id}` | admin | any of `name`, `endpoint`, `cloud`, `credentials_secret`, `region`, `verify_tls`, `ca_cert_path`, `conversion_host`, `distribution` (`id`, `kind`, `role` and the server-owned fields are immutable: 422); resets `status` to `unknown`; 409 while a `running` or `paused` plan uses the provider; 422 for a secret name §13.3 refuses (only the fields set are checked) | `Provider` |
 | PUT | `/providers/{id}/credentials` | admin | write-only: OpenStack/RHOSO `{auth_url?, username, password, project_name, user_domain_name?, project_domain_name?, interface?}` or `{auth_url?, application_credential_id, application_credential_secret, interface?}`; VMware `{username, password, datacenter?}` (§13.3) | `Provider` (`credentials_secret`, `credentials_updated_at` set; no value returned) |
@@ -1923,7 +1927,7 @@ migration the dashboard puts that migration into such lists, reading a list agai
 | POST | `/providers/{id}/check` | operator | — | `Provider` (status/capabilities refreshed) |
 | GET | `/providers/{id}/inventory` | viewer | — | `VMRef[]` (source) or `DestinationInventory` (destination) |
 | GET | `/plans` | viewer | query `status`, `limit` (1…1000, default all), `offset` (default 0); creation order | `Plan[]` |
-| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them) | `201 Plan` |
+| POST | `/plans` | operator | `PlanCreate` = Plan fields minus `id,waves,status,created_at,updated_at` (`name`, `source_provider_id`, `destination_provider_id`, `vm_ids` required; `vm_ids` without repeats, else 422 — one VM, one migration; 422 also for a `verification` port outside 1…65535 or a negative `timeout_s` (0 checks once without polling), an application probe (`verification.app_probes`, `probe_overrides`, §7.5) with a port outside 1…65535, an http(s) `path` that does not start with `/` or is longer than 200 characters, or an `expect_status` outside 100…599, and more than 10 probes for one VM, a `nic_overrides` entry whose key is not a MAC (six hex pairs; stored lower case), with neither field, an empty `fixed_ips`, a value that is not an IP address or the same address twice, and a `cutover_window` whose `end` is not after its `start` — the gate would never open; `validate_plan` refuses a stored plan with them; a field `PlanCreate` does not have — a misspelt one too — is refused with 422, never dropped) | `201 Plan` |
 | GET | `/plans/{id}` | viewer | — | `Plan` |
 | PATCH | `/plans/{id}` | operator | partial `PlanCreate` (only in `draft`/`validated`, and 409 while a migration of the plan is in flight — `precopy`, `syncing`, `awaiting_cutover`, `cutover`, `verifying`, `rolling_back`, `completed` (not yet finalized) or with its source stopped: a changed provider, mapping or strategy would cut over, verify or roll back against what the migration was not built for; a `failed` migration with a running source stays editable, to fix the cause before a retry — except its providers: a changed `source_provider_id` or `destination_provider_id` is refused (409) while a migration of the plan is `failed`, since its rollback acts on the clouds its attempt used (it matches the destination server by name on the cold path) — roll it back or cancel it first; the 409 names each such VM with what releases it — roll back or retry a `failed` one whose source is stopped, finish, roll back or cancel one in flight, finalize or roll back a `completed` one (§8.1); resets status to `draft`); setting `require_approval`, `require_distinct_approver`, `auto_cutover` or `cutover_window` needs role **approver** (also on `POST /plans`); an operator may still include a policy field at its default value (`POST`) or at the plan's current value (`PATCH`) — only a change needs the approver | `Plan` |
 | POST | `/plans/{id}/waves/auto` | operator | `{"max_wave_size": int = 10}`, 1–1000 (422 outside); in `draft`, `validated` or `paused` (409 otherwise, and while a migration of the plan is in flight, as for `PATCH`: the plan returns to `draft`, which the tick does not drive) | `Plan` |
@@ -2442,7 +2446,8 @@ The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `
 `plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
-refuse. Commands operating on the store use the same
+refuse; a key `PlanCreate` has no field for is refused on a create as on an update (`fields cannot be
+changed: …`, as `PATCH /plans/{id}` answers, §12) — a typo is never dropped. Commands operating on the store use the same
 settings as `serve` (they open the DB directly; a running server sees changes on its next tick, and its event
 stream sends their events, §12). An
 update follows `PATCH /plans/{id}` (§12): a `draft` or `validated` plan only, refused while a migration of
