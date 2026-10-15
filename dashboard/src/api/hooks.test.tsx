@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider, type QueryKey } from '@tanstack/react-query';
-import { renderHook } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import type { ReactNode } from 'react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiProvider } from './ApiProvider';
 import { ApiClient } from './client';
-import { fetchEventTail, queryKeys, useCheckAllProviders, useDeleteProvider, useMigrationAction, usePlanAction, useSetStrategy } from './hooks';
+import { fetchEventTail, queryKeys, useCheckAllProviders, useDeleteProvider, useMigrationAction, usePlanAction, useSetStrategy, useStats } from './hooks';
+import { LiveContext, LiveEventHub } from './live';
 import { createMockFetch, MockServer } from './mock';
 
 function setup() {
@@ -51,19 +52,49 @@ describe('fetchEventTail', () => {
   });
 });
 
-/** A hook's wrapper over the mock API as `token`, with a query cache to seed and inspect. */
-function hookSetup(token: string) {
+/** A hook's wrapper over the mock API as `token`, with a query cache to seed and inspect, and every request's URL. */
+function hookSetup(token: string, hub?: LiveEventHub) {
   const server = new MockServer({ now: () => Date.parse('2026-10-08T12:00:00Z'), seed: 1 });
-  const client = new ApiClient({ getToken: () => token, fetchImpl: createMockFetch(server) });
+  const mockFetch = createMockFetch(server);
+  const urls: string[] = [];
+  const client = new ApiClient({
+    getToken: () => token,
+    fetchImpl: (input, init) => {
+      urls.push(String(input));
+      return mockFetch(input, init);
+    },
+  });
   const queryClient = new QueryClient();
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <ApiProvider client={client}>{children}</ApiProvider>
+      <ApiProvider client={client}>{hub ? <LiveContext.Provider value={hub}>{children}</LiveContext.Provider> : children}</ApiProvider>
     </QueryClientProvider>
   );
   const invalidated = (queryKey: QueryKey) => queryClient.getQueryState(queryKey)?.isInvalidated ?? false;
-  return { server, client, queryClient, wrapper, invalidated };
+  const reads = (path: string) => urls.filter((url) => url.includes(path)).length;
+  return { server, client, queryClient, wrapper, invalidated, reads };
 }
+
+describe('useStats', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('reads the figures again every 15 s only while the stream is not open, which keeps them (SDD §16, audit C-20)', async () => {
+    vi.useFakeTimers();
+    const hub = new LiveEventHub();
+    const { wrapper, reads } = hookSetup('viewer', hub);
+    const { unmount } = renderHook(() => useStats(), { wrapper });
+    await vi.waitFor(() => expect(reads('/stats')).toBe(1));
+
+    act(() => hub.setStatus('open'));
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(reads('/stats')).toBe(1);
+
+    act(() => hub.setStatus('reconnecting'));
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(reads('/stats')).toBe(2);
+    unmount();
+  });
+});
 
 describe('usePlanAction', () => {
   it('refreshes the recommendations after a validation, which records them (SDD §14.4)', async () => {
