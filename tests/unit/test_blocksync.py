@@ -918,3 +918,95 @@ def test_receiver_rejects_protocol_violations(tmp_path, scenario, message, untou
     assert caught.value.exit_code == blocksync.EXIT_PROTOCOL
     if untouched:
         assert read(dst) == original, "a rejected frame must not reach the destination"
+
+
+# --- The device's identity (SDD 6.2: the RV12-03 hazard on the warm path) --------------------------
+
+
+def test_a_sender_never_reads_a_device_another_volume_holds(tmp_path, monkeypatch):
+    """SDD 6.2: the kernel gives a freed /dev/vdX path to the next disk attached. With
+    --expect-serial the sender checks the virtio serial of the device it opened before it reads a
+    byte: one another volume holds exits 3, and nothing is sent."""
+    src = write(tmp_path / "src", rand_bytes(2 * CHUNK, 31))
+    monkeypatch.setattr(blocksync, "device_serial", lambda fd: "vol-other-0123456789")
+    out = io.BytesIO()
+
+    with pytest.raises(blocksync.BlocksyncError) as excinfo:
+        blocksync.run_sender(
+            src, CHUNK, 1, io.BytesIO(), out, expect_serial="vol-mine-0123456789-tail"
+        )
+
+    assert excinfo.value.exit_code == 3 and "vol-other" in str(excinfo.value)
+    assert out.getvalue() == b""
+
+
+def test_a_receiver_never_writes_a_device_another_volume_holds(tmp_path, monkeypatch):
+    """SDD 6.2: the receiver writes its device - one another volume took the path of would be
+    written into. It checks the serial of the device it opened first, and exits 3."""
+    src = write(tmp_path / "src", rand_bytes(2 * CHUNK, 32))
+    dst = zero_file(tmp_path / "dst", 2 * CHUNK)
+    monkeypatch.setattr(blocksync, "device_serial", lambda fd: "vol-other-0123456789")
+
+    with pytest.raises(blocksync.BlocksyncError) as excinfo:
+        blocksync.run_receiver(
+            dst, CHUNK, 1, sender_cmd(src), expect_serial="vol-mine-0123456789-tail"
+        )
+
+    assert excinfo.value.exit_code == 3
+    assert read(dst) == bytes(2 * CHUNK)  # not a byte written
+
+
+def test_a_device_whose_serial_matches_is_synced(tmp_path, monkeypatch):
+    data = rand_bytes(3 * CHUNK, 33)
+    src = write(tmp_path / "src", data)
+    dst = zero_file(tmp_path / "dst", len(data))
+    monkeypatch.setattr(blocksync, "device_serial", lambda fd: "vol-mine-0123456789-")
+
+    summary = blocksync.run_receiver(
+        dst, CHUNK, 1, sender_cmd(src), expect_serial="vol-mine-0123456789-tail"
+    )
+
+    assert summary.ok and read(dst) == data
+
+
+def test_a_device_without_a_serial_is_used_as_given(tmp_path):
+    """SDD 6.2: a regular file, or a disk that is not virtio-blk, shows no serial: used as given -
+    by the CLI, as the warm sync runs it."""
+    data = rand_bytes(3 * CHUNK, 34)
+    src = write(tmp_path / "src", data)
+    dst = zero_file(tmp_path / "dst", len(data))
+    cmd = [
+        PYTHON, BLOCKSYNC, "receive", "--device", dst, "--chunk-size", str(CHUNK),
+        "--progress-interval", "0", "--expect-serial", "dst-volume-id", "--",
+        PYTHON, BLOCKSYNC, "send", "--device", src, "--chunk-size", str(CHUNK),
+        "--expect-serial", "src-volume-id",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+                          check=False)
+
+    assert proc.returncode == 0, proc.stderr
+    assert read(dst) == data
+
+
+@pytest.mark.parametrize(
+    "content, serial",
+    [(b"vol-mine-0123456789-", "vol-mine-0123456789-"), (b"", None), (None, None)],
+    ids=["its serial", "an empty serial", "no serial file"],
+)
+def test_the_serial_read_is_the_opened_devices_own(tmp_path, monkeypatch, content, serial):
+    """SDD 6.2: the serial comes from /sys/dev/block/<major>:<minor>/serial of the device the
+    descriptor is open on - no path that another disk could take in between; a regular file has
+    none."""
+    import stat as stat_module
+    import types
+
+    sysfs = tmp_path / "sys-dev-block"
+    (sysfs / "252:16").mkdir(parents=True)
+    if content is not None:
+        (sysfs / "252:16" / "serial").write_bytes(content)
+    monkeypatch.setattr(blocksync, "SYS_DEV_BLOCK", str(sysfs))
+    device = types.SimpleNamespace(st_mode=stat_module.S_IFBLK | 0o660, st_rdev=os.makedev(252, 16))
+    regular = os.stat(write(tmp_path / "disk", b"x"))
+
+    assert blocksync._serial_of(device) == serial
+    assert blocksync._serial_of(regular) is None

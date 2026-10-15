@@ -47,6 +47,7 @@ import json
 import math
 import os
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -395,6 +396,50 @@ def _json_line(payload):
     return json.dumps(payload, separators=(",", ":"))
 
 
+#: where the kernel lists block devices by major:minor; a virtio-blk disk shows its serial there
+SYS_DEV_BLOCK = "/sys/dev/block"
+
+
+def _serial_of(st):
+    """The virtio-blk serial of the block device ``st`` (an ``os.stat`` result) describes - the
+    volume id Nova gave the disk, cut to 20 characters - or None: a regular file, a device that
+    shows no serial (not virtio-blk)."""
+    if not stat.S_ISBLK(st.st_mode):
+        return None
+    path = os.path.join(
+        SYS_DEV_BLOCK, "%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev)), "serial"
+    )
+    try:
+        with open(path, "rb") as f:
+            serial = f.read().decode("utf-8", "replace").strip("\x00").strip()
+    except (IOError, OSError):
+        return None
+    return serial or None
+
+
+def device_serial(fd):
+    """The virtio-blk serial of the device open on ``fd``: read through the descriptor's own
+    device numbers, so no disk can take the path between the check and the use."""
+    return _serial_of(os.fstat(fd))
+
+
+def _check_identity(fd, device, expected):
+    """With ``expected`` (a volume id): fail before any I/O unless the device open on ``fd`` is
+    that volume's disk. The kernel gives a freed /dev/vdX path to the next disk attached, so a path
+    another volume took would be read, or written into (Seamless Migrate SDD 6.2). A device that
+    shows no serial is used as given."""
+    if not expected:
+        return
+    serial = device_serial(fd)
+    if serial is None:
+        _log("warning: %s shows no virtio serial; used as given" % device)
+        return
+    if not expected.startswith(serial):
+        raise ProtocolError(
+            "%s is the disk of volume %s, not of volume %s" % (device, serial, expected)
+        )
+
+
 def _parse_send_progress(line):
     if not line.startswith("{"):
         return None
@@ -418,6 +463,7 @@ def run_sender(
     out,
     progress_cb=None,
     progress_interval=DEFAULT_PROGRESS_INTERVAL,
+    expect_serial=None,
 ):
     """Sender side of protocol v1.
 
@@ -429,6 +475,7 @@ def run_sender(
     workers = _validate_workers(workers)
     fd = os.open(device, os.O_RDONLY)
     try:
+        _check_identity(fd, device, expect_serial)
         size = _fd_size(fd)
         count = chunk_count(size, chunk_size)
         out.write(_HELLO.pack(PROTOCOL_MAGIC, PROTOCOL_VERSION, chunk_size, size))
@@ -844,6 +891,7 @@ def run_receiver(
     assume_zero=False,
     progress_cb=None,
     progress_interval=DEFAULT_PROGRESS_INTERVAL,
+    expect_serial=None,
 ):
     """Receiver side of protocol v1.
 
@@ -859,6 +907,7 @@ def run_receiver(
         raise BlocksyncError("a sender command is required")
     fd = os.open(device, os.O_RDWR)
     try:
+        _check_identity(fd, device, expect_serial)
         session = _ReceiveSession(
             fd,
             chunk_size,
@@ -928,19 +977,31 @@ def _build_parser():
             help="read-ahead hashing threads (default %(default)s)",
         )
 
+    def identity_option(sub):
+        sub.add_argument(
+            "--expect-serial",
+            metavar="ID",
+            default=None,
+            help="volume id the device's virtio serial must be a prefix of (checked on the opened "
+            "device before any I/O; a device without a serial is used as given)",
+        )
+
     send = commands.add_parser(
         "send",
         help="stream changed chunks (stdin: digests, stdout: frames)",
     )
     device_options(send)
+    identity_option(send)
 
     receive = commands.add_parser(
         "receive",
         help="spawn the sender given after '--' and apply its frames",
         usage="%(prog)s --device PATH [--chunk-size N] [--workers W] "
-        "[--assume-zero] [--progress-interval S] -- SENDER_COMMAND [ARGS...]",
+        "[--assume-zero] [--progress-interval S] [--expect-serial ID] "
+        "-- SENDER_COMMAND [ARGS...]",
     )
     device_options(receive)
+    identity_option(receive)
     receive.add_argument(
         "--assume-zero",
         action="store_true",
@@ -1004,6 +1065,7 @@ def _cmd_send(args):
             sys.stdin.buffer,
             sys.stdout.buffer,
             progress_cb=_print_send_progress,
+            expect_serial=args.expect_serial,
         )
     except BrokenPipeError:
         _silence_stdout()
@@ -1041,6 +1103,7 @@ def _cmd_receive(args, sender_cmd):
             assume_zero=args.assume_zero,
             progress_cb=_print_receive_progress,
             progress_interval=args.progress_interval,
+            expect_serial=args.expect_serial,
         )
     except BlocksyncError as err:
         return _fail_receive(err.exit_code, str(err))

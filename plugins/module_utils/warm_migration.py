@@ -293,6 +293,8 @@ def blocksync_receive_command(
     assume_zero=False,
     progress_interval=blocksync.DEFAULT_PROGRESS_INTERVAL,
     python="python3",
+    source_serial=None,
+    dest_serial=None,
 ):
     """Shell words that run ``blocksync receive`` on the destination host.
 
@@ -302,6 +304,8 @@ def blocksync_receive_command(
     conversion-host link key belongs to that user. Every word is quoted for
     the destination shell, and the sender's remote words are quoted once
     more for the source shell, so device paths are never interpreted.
+    ``source_serial`` and ``dest_serial`` are the volume ids each end's
+    device must show as its virtio serial (Seamless Migrate SDD 6.2).
     """
     script = blocksync_script_path(transfer_uuid)
     sender_remote = [
@@ -310,6 +314,8 @@ def blocksync_receive_command(
         "--chunk-size", str(int(chunk_size)),
         "--workers", str(int(workers)),
     ]
+    if source_serial:
+        sender_remote += ["--expect-serial", source_serial]
     sender = ["sudo", "-n", "-u", ssh_user, "--"] + list(source_ssh)
     sender += [shlex.quote(word) for word in sender_remote]
     receiver = [
@@ -321,6 +327,8 @@ def blocksync_receive_command(
     ]
     if assume_zero:
         receiver.append("--assume-zero")
+    if dest_serial:
+        receiver += ["--expect-serial", dest_serial]
     return [shlex.quote(word) for word in receiver + ["--"] + sender]
 
 
@@ -714,6 +722,8 @@ class OpenstackWarmSync(_WarmVolumeBase):
             entry = source_map[dev]
             self.volume_map[dev] = {
                 "source_id": entry["source_id"],
+                # the volume attached at source_dev, which blocksync checks (SDD 6.2)
+                "tmp_volume_id": entry.get("tmp_volume_id"),
                 "source_dev": entry["source_dev"],
                 "dest_id": self.state.dest_volumes[dev]["dest_id"],
                 "dest_dev": None,
@@ -941,6 +951,8 @@ class OpenstackWarmSync(_WarmVolumeBase):
             assume_zero=mapping["assume_zero"],
             progress_interval=self.progress_interval,
             python=self.python_interpreter,
+            source_serial=mapping.get("tmp_volume_id"),
+            dest_serial=mapping.get("dest_id"),
         )
         self.log.info("Synchronising %s: %s", dev, " ".join(command))
         self._update_progress(dev, 0.0)

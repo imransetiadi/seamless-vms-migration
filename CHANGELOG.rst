@@ -364,6 +364,15 @@ This project follows a simple changelog to satisfy collection metadata validatio
   release that fails, and takes no port lock for a map that records no port:
   a port lock another migrator holds made it give up before the handback, and
   the rollback started the source VM without its data volumes.
+- The warm sync has blocksync check each device it opens. ``blocksync send``
+  and ``receive`` take ``--expect-serial ID`` and fail with exit 3, before
+  they read or write a byte, when the virtio serial of the device they opened
+  names another volume. The warm sync passes the temporary volume's id to the
+  sender and the destination volume's id to the receiver. The kernel gives a
+  freed ``/dev/vdX`` path to the next disk attached, so a path another volume
+  took after the attach was read, or written into. The check reads the opened
+  descriptor's own device, so nothing can take the path in between. A device
+  without a serial (a regular file, a disk not virtio-blk) is used as given.
 - After an attach call that succeeded, the wait for the volume's device path,
   which holds the conversion host's attach lock, fails at once when Cinder
   shows the volume ``available`` again or in ``error`` with no attachment:
