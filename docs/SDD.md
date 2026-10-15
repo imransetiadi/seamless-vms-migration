@@ -125,6 +125,7 @@ Phase          = pending | validating | blocked | ready | precopy | syncing | aw
 Severity       = blocker | warning | info
 Role           = viewer | operator | approver | admin          (ordered, see §13)
 PlanStatus     = draft | validated | running | paused | completed | failed | cancelled
+DerivedPlanStatus = draft | validated | running | paused | completed | finalized | failed | cancelled   # §4.2, §8.1: what every view shows, derived from the migrations, never stored
 SyncPassKind   = full | delta | final
 DecisionType   = migration_strategy | workload_tier | verification_review | console_screening   (§14.4)
 DecisionStatus = auto_applied | pending_approval | approved | overridden | below_threshold | fallback_rules
@@ -1747,10 +1748,10 @@ names:
 | | Oracle (`oracle`, token `ora`) | tcp 1521 |
 | | MongoDB (`mongo`) · Cassandra · Db2 (`db2`) | tcp 27017 · tcp 9042 · tcp 50000 |
 | | Elasticsearch (`elastic`) · CouchDB | http 9200 `/` · http 5984 `/` |
-| `middleware_queue` | RabbitMQ (`rabbit`) · Kafka · ActiveMQ/Artemis · Redis · Memcached · NATS · ZooKeeper | tcp 5672 · 9092 · 61616 · 6379 · 11211 · 4222 · 2181 |
+| `middleware_queue` | RabbitMQ (`rabbit`) · Kafka · ActiveMQ/Artemis (`activemq`, `artemis`, token `amq`) · Redis · Memcached (`memcache`) · NATS · ZooKeeper | tcp 5672 · 9092 · 61616 · 6379 · 11211 · 4222 · 2181 |
 | | Tomcat, JBoss, WildFly · WebLogic · WebSphere | http 8080 `/` · http 7001 `/` · http 9080 `/` |
 | `stateless_web` | any | http 80 `/` |
-| `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller · DNS · Kerberos | tcp 389 · tcp 53 · tcp 88 |
+| `infrastructure_service` | LDAP, FreeIPA, Active Directory, domain controller (`ldap`, `freeipa`, `active-directory`, `activedirectory`, `domain-controller`, `domaincontroller`; tokens `ad`, `dc`, `ipa`, `idm`) · DNS (`dns`; tokens `bind`, `ns`, `ns1`, `ns2`) · Kerberos | tcp 389 · tcp 53 · tcp 88 |
 | `legacy_os`, `manual_review`, a service the table does not name | — | none |
 
 Validation records the suggestion in `Migration.suggested_probes`. A suggestion never runs: the verification
@@ -1854,7 +1855,7 @@ that does not own the tables start the control plane — the application role of
 `events` is insert-only — once the owner role created or upgraded the schema.
 
 Document kinds: `provider`, `plan`, `migration`, `recommendation` (§14.4), `advisor_snapshot` (§14.5),
-`advisor_policy` (§14.6).
+`advisor_policy` (§14.6), `user` (§13.1).
 
 `Store` API: `put(kind, model, expected_version=None)` (optimistic concurrency; raises
 `ConflictError`; a versioned write is one statement — an `INSERT` for `expected_version=0`, where a document that
@@ -1872,6 +1873,10 @@ a value that only grows), `versions(kind) -> [(id, version)]` (in creation order
 `get_many(kind, ids, model_cls) -> {id: (version, model)}` (the ids that still exist), `plan_phases(plan_ids) -> {plan_id: {phase: count}}` (one
 `SELECT … GROUP BY` over the `plan_id` and `phase` expressions, no document loaded — the plan routes derive
 `derived_status` and `migration_counts` from it, §8.1), `delete(kind, id)`,
+`get_versioned(kind, id, model_cls) -> (model, version)` (one read that returns the version too: `plan apply`'s
+compare-and-write, §15), `create_user(user, actor) -> Event` (§13.1: the `user` document and its `user.created` event in
+one transaction; a `ConflictError` for a name that exists in any case), `delete_events_before(before) -> int` (`events
+prune`, §15),
 `append_event(event) -> Event`, `events(since_seq=0, plan_id=None, migration_id=None, limit=500, kinds=None, tail=False,
 before_seq=None)` (`kinds` serves `GET /events?audit=true`). SQLite runs with WAL and `check_same_thread=False`; PostgreSQL uses a pooled engine
 (`pool_pre_ping=True`, pool size 5). Calls are executed in a thread (`asyncio.to_thread`) by async
@@ -2430,6 +2435,10 @@ seamless events prune (--before ISO | --older-than-days N) --confirm        # au
 seamless version
 ```
 
+The bracketed values are the §9.1 knobs' illustrative inputs: `estimate` with `--link-mbps` unset uses
+`EstimatorParams.link_bps`, the plan default of 131,072,000 B/s (125 MiB/s, about 1,048.6 Mbit/s); `--link-mbps 1000` is
+125,000,000 B/s.
+
 `plan apply` accepts the `PlanCreate` schema in YAML and runs the checks of `POST /plans` on it, in the
 same order and with the same messages (§12: the name and description lengths, repeated `vm_ids`, the plan
 settings, `estimator_overrides`), so it never stores a plan the API and the dashboard's plan form would
@@ -2983,6 +2992,12 @@ characters as in the API's 502 (`redact_cut`, §13.4). A write that lost a race 
 * Single replica in 0.1.0 (the orchestrator is a singleton). HA via PostgreSQL + leader election is
   a 0.2.0 item. The OpenShift kustomization includes a PostgreSQL StatefulSet (or points at an
   existing database through the `seamless-db` Secret).
+* Backups (optional, `deploy/openshift/backup/`): a CronJob runs `pg_dump -Fc` nightly from the database's own
+  image into the `seamless-backups` PVC under the restricted security context, with its own NetworkPolicies
+  (egress to PostgreSQL, ingress from the backup pods), keeping `BACKUP_KEEP_DAYS` days; `restore-job.yaml` and
+  the README beside it are the restore runbook — Secrets, then the database, then the data PVC. The data PVC
+  (Ansible run directories, the recorded warm state) is backed up by the cluster's volume snapshots or
+  Velero/OADP; the Compose stack keeps its `pg_dump` recipe in `deploy/compose/README.md`.
 
 ### 17.1 Local stack: Docker Compose on a dedicated Colima profile
 
@@ -3049,7 +3064,11 @@ tests/unit/test_warm_migration.py             tests/unit/test_warm_destination.p
 tests/unit/test_warm_playbooks.py             tests/perf/bench_blocksync.py
 seamless/ (pyproject.toml, Containerfile, src/seamless_migrate/…, tests/…)
 dashboard/ (package.json, src/…, design-system/…, e2e/…)
-deploy/openshift/   deploy/kubernetes/   deploy/compose/   scripts/compose-init.sh   tests/e2e/
+deploy/openshift/   deploy/openshift/backup/   deploy/kubernetes/   deploy/compose/   tests/e2e/
+scripts/compose-init.sh   scripts/check-readonly-runtime.sh   scripts/collection-sanity.sh   scripts/vendor-openstack-cloud.sh
+.github/workflows/{ci,codeql}.yml   .github/dependabot.yml   .pre-commit-config.yaml   .gitleaks.toml   .gitleaks-tree.toml
+.dockerignore   seamless/.containerignore   RELEASING.md   NOTICE   CONTRIBUTING.md   SECURITY.md   CODE_OF_CONDUCT.md   CONTRIBUTORS.md   CODEOWNERS
+docs/advisor/   docs/audits/   docs/UI-UX-AUDIT-2026-10-15.md   AUDIT-UI-UX-BY-GEMINI.md
 docs/{PRD,SDD,MEMORY,QASuite,Security,Performance}.md
 docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 .mcp.json   .claude/settings.json   CLAUDE.md
@@ -3064,4 +3083,12 @@ docs/superpowers/plans/2026-10-08-seamless-rhoso-migration.md
 | D1 | Hash-scan floor for warm passes (whole device read per pass) | accepted; mitigated with per-disk parallelism and read-ahead workers | 0.2.0: changed-extent sources that remove the scan — Ceph-direct `rbd diff` between pass snapshots (opt-in, Ceph credentials) and hypervisor-assisted tracking via libvirt checkpoints / incremental backup on the source compute nodes (builds on the existing `import_from_hypervisor` access model) |
 | D2 | Single-replica orchestrator | accepted | PostgreSQL + leader election — 0.2.0 |
 | D3 | Network cut-over (FIP/DNS/BGP) | out of scope; hooks documented | customer demand for OVN BGP integration |
-| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL` |
+| D4 | Jev provider (TypeSafe cloud) | off by default; data minimized | self-hosted compatible endpoint via `JEV_API_BASE_URL`; partly decided by the §13.4 knobs (`SEAMLESS_JEV_DEPLOYMENT`, `SEAMLESS_JEV_ENDPOINT_HOST`, `SEAMLESS_CONSOLE_SCREENING_SEND_TO_REMOTE`, `TODO(ADV-06)`) |
+| D5 | Dashboard navigation item **Users** for non-admins: hidden (today) or soft-disabled with the reason, as every other action (§16) | hidden | owner decision (audit C-01) |
+| D6 | Collection identity on Galaxy: FQCN `os_migrate.os_migrate` 1.1.0 with the fork's own metadata; a version scheme that cannot collide with a future upstream 1.1.0; whether `scripts/publish.sh` stays | FQCN kept for upstreamability; the tarball is attached to GitHub Releases and never published to Galaxy (RELEASING.md) | owner decision (audit D-10) |
+| D7 | Python floor of the conversion hosts (§6.2: 3.6, RHEL 8 `platform-python`); nothing runs the tests on 3.6 | 3.6 kept, untested | a 3.6 job for `test_blocksync.py`, or a 3.9 floor (audit A-12) |
+| D8 | SSH trust on both data-path hops: host keys (SEC-02) and the dst→src link key (SEC-06) | `StrictHostKeyChecking=no` with the compensating controls of Security.md §6; the executor's `SEAMLESS_ANSIBLE_HOST_KEY_CHECKING` (§15.1) | 0.2.0 (audit A-01, A-02) |
+| D9 | Backups of the cluster deployment: the optional CronJob of §17, or the cluster's backup product (Velero/OADP) as the standard | CronJob shipped | owner decision (audit D-06) |
+| D10 | The commit trailer's model name (CLAUDE.md §2.7) | fixed `Claude Opus 5.5` | owner decision (audit F-13) |
+| D11 | Product documents in the collection artifact (the SDD, PRD, QASuite, Security and Performance documents are packed; audit material and agent plans are not) | packed | owner decision (audit D-21) |
+| D12 | The `TODO(…): confirm` markers of this document — LAB, ADV-04, ADV-06, ADV-17, ADV-18, ADV-19 — each a default taken without the owner's word | the defaults as written | each is an owner decision; remove the marker when decided (audit D-20) |
