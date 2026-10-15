@@ -3349,23 +3349,34 @@ Upstream phases as releases.openstack.org shows them on 2026-10-16:
 * A destination's check reports `release_range`, `release`, `support_tier` and `policy_profile` (§10, §10.1's
   `destination_release`), and `block_storage_microversion` beside `compute_microversion`.
 
-### 21.4 Capability floor per strategy (planned pre-flight, 0.2.0)
+### 21.4 Capability floor per strategy (0.2.0: the pre-flight judges it since T4)
 
 | Capability | Needed by | Floor | Checked by |
 |---|---|---|---|
 | Keystone v3, a project-scoped token | every strategy | — | the provider check (authentication) |
-| Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` |
-| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source today; the destination, planned) |
-| Block Storage v3 | every strategy | 3.0 | the provider check |
-| Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | `storage_backends` (today) |
+| Compute API | every strategy | 2.60 (multi-attach); openstacksdk caps its calls (§21.7) | `compute_microversion` (`DST_CAPABILITY_MISSING`) |
+| Compute 2.85 (`delete_on_termination` update) | `storage_handover` (§7.3 step 0) | 2.85 | the handover's step 0 (the source); the pre-flight (the destination, `DST_CAPABILITY_MISSING`) |
+| Block Storage v3 | every strategy | 3.0 | the provider check; `block_storage_microversion` (`DST_CAPABILITY_MISSING`) |
+| Cinder manage and a mapped backend of the same driver family (§7.3.1) | `storage_handover` | the `admin` role | the strategy selector (eligibility) and `storage_backends` (§7.3.1) |
 | Glance v2 | an image-booted VM | — | the provider check |
-| Neutron ports with fixed IPs, MAC and port security | every strategy (§6.6) | — | Neutron's extensions (planned) |
+| Neutron ports with fixed IPs, MAC and port security | every strategy (§6.6) | — | Neutron's extensions (planned, after LAB-D04; see below) |
 | A conversion host image the roles support (§21.6) | `cold`, `warm`, `vmware_cold`, `vmware_warm` | — | pre-staging |
 | VDDK on the destination conversion host | `vmware_cold`, `vmware_warm` | — | the vmware-migration-kit |
 
-Planned findings (§9.3 when implemented): `DST_CAPABILITY_MISSING` (blocker; it names the capability and the strategy
-that needs it) and `DST_RELEASE_OUTSIDE_SUPPORT` (warning: a Tier 3 or Outside destination, with the reason: End of
-Life upstream, below the floor, newer than validated, or not detected).
+Findings (plan task T4; each enters §9.3's catalog with its code):
+
+* `DST_CAPABILITY_MISSING` (blocker) judges the destination's check report (§10): `compute_microversion` below 2.60
+  (every strategy) or below 2.85 (`storage_handover`), and `block_storage_microversion` below 3.0 (every strategy). A
+  maximum the check could not read (`""`) is not judged. One finding per strategy set - every strategy, or
+  `storage_handover` alone - names each missing capability, the floor and the maximum read. Cinder manage stays with
+  the strategy selector, which makes `storage_handover` ineligible without the destination's `admin`, and with §7.3.1's
+  backend checks. The Neutron row is not judged yet: the collection sets a port's port security only when it recreates
+  ports through Neutron (`port_creation_mode: "neutron"`, §6.6), and which extension each port mode needs waits for the
+  lab (LAB-D04) - a blocker must not rest on an assumption (Jev 0.88).
+* `DST_RELEASE_OUTSIDE_SUPPORT` (warning, every strategy) when the check's `support_tier` is `tier3` or `outside`, with
+  its reason (End of Life upstream, below the floor, newer than validated, not detected), or when it reports
+  `declared_outside_range`: the declared series is not what the APIs read, and the tier is the range's. RHOSO 18.0
+  (`validated`) never gets it. Behaviour follows capabilities: the warning blocks nothing.
 
 ### 21.5 Policy profiles and roles
 
@@ -3416,7 +3427,7 @@ Life upstream, below the floor, newer than validated, or not detected).
 | the series table, detection and tiers (§21.1–§21.3) | §10.1, `planning/platforms.py` (binding) | T1 |
 | `Provider.release: str|null`, the declared series | §4.2, §12 (binding); the dashboard's form, §16, with T8 | T2 |
 | `check()` keys `release_range`, `release`, `support_tier`, `policy_profile`, `tls`; `Provider.policy_profile` | §10, §10.1, §4.2, §12 (binding) | T3 |
-| findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §9.3 | T4 |
+| findings `DST_CAPABILITY_MISSING` (blocker), `DST_RELEASE_OUTSIDE_SUPPORT` (warning) | §21.4 (binding); §9.3 with the catalog | T4 |
 | `NET_PORT_NOT_PERMITTED` by the policy profile (§21.5) | §6.6, §9.3 | T5 |
 | destination-neutral texts: findings, events, the CLI and the dashboard name the destination provider | §9.3, §16 | T6 |
 | conversion host images (§21.6) | §6.5, Performance.md | T7 |
